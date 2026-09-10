@@ -42,6 +42,14 @@ macro_rules! define_id {
                 Self(v)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(s).map(Self)
+            }
+        }
     };
 }
 
@@ -76,5 +84,13 @@ mod tests {
         assert_eq!(json, format!("\"{id}\""));
         let back: RunId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn ids_roundtrip_through_str() {
+        let id = AgentId::generate();
+        let parsed: AgentId = id.to_string().parse().unwrap();
+        assert_eq!(parsed, id);
+        assert!("not-a-uuid".parse::<AgentId>().is_err());
     }
 }

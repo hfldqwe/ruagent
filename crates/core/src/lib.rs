@@ -15,10 +15,11 @@ pub mod usage;
 
 pub use agent::{AgentCard, HarnessKind, ReasoningEffort};
 pub use event::{
-    ContentBlock, PermissionOption, PermissionResolution, PlanEntry, PlanEntryStatus, RunEvent,
+    ContentBlock, PermissionChoice, PermissionKind, PermissionResolution, PlanEntry,
+    PlanEntryStatus, RunEvent,
 };
 pub use id::{AgentId, RunId, TaskId};
 pub use routing::{RouteSource, RoutingDecision};
 pub use run::{Run, RunParams, RunStatus, StopReason};
 pub use task::{EdgeKind, Task, TaskCreator, TaskEdge, TaskStatus};
-pub use usage::{ModelPrice, UsageTotals};
+pub use usage::ContextUsage;

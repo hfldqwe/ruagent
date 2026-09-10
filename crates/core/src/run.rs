@@ -3,7 +3,7 @@
 
 use crate::id::{AgentId, RunId, TaskId};
 
-use crate::usage::UsageTotals;
+use crate::usage::ContextUsage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +60,7 @@ pub enum StopReason {
     Cancelled,
     /// Token budget for the run was exhausted.
     MaxTokens,
-    /// Turn budget for the run was exhausted.
+    /// Turn budget for the run was exhausted (ACP `max_turn_requests`).
     MaxTurns,
     /// The agent refused the request.
     Refusal,
@@ -105,7 +105,10 @@ pub struct Run {
     pub acp_session_id: Option<String>,
     /// Per-run isolated working directory (git worktree). See design §8.2.
     pub workspace: Option<String>,
-    pub usage: UsageTotals,
+    /// Last context-usage snapshot reported by the agent, if any.
+    pub context_usage: Option<ContextUsage>,
+    /// Cumulative session cost in USD reported by the agent, if any.
+    pub cost_usd: Option<f64>,
     /// Human-readable failure cause when `status == Failed`.
     pub error: Option<String>,
     pub stop_reason: Option<StopReason>,
@@ -124,7 +127,8 @@ impl Run {
             status: RunStatus::Queued,
             acp_session_id: None,
             workspace: None,
-            usage: UsageTotals::default(),
+            context_usage: None,
+            cost_usd: None,
             error: None,
             stop_reason: None,
             created_at: now,
@@ -154,6 +158,7 @@ mod tests {
             RunParams::for_agent(AgentId::generate()),
         );
         assert_eq!(r.status, RunStatus::Queued);
-        assert!(r.usage.is_zero());
+        assert!(r.context_usage.is_none());
+        assert!(r.cost_usd.is_none());
     }
 }

@@ -9,10 +9,11 @@
 
 use crate::routing::RoutingDecision;
 use crate::run::{RunStatus, StopReason};
-use crate::usage::UsageTotals;
+use crate::usage::ContextUsage;
 use serde::{Deserialize, Serialize};
 
-/// A content block, mirroring the ACP content model.
+/// A content block, mirroring the ACP content model (M1 subset: text,
+/// image, resource-link, resource — audio is dropped by the mapping layer).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -32,13 +33,15 @@ pub enum ContentBlock {
     Resource {
         uri: String,
         mime_type: Option<String>,
-        /// Base64-encoded bytes, when the agent inlined them.
+        /// Text payload, when the agent embedded a text resource.
+        text: Option<String>,
+        /// Base64-encoded bytes, when the agent embedded a binary resource.
         blob: Option<String>,
     },
 }
 
 impl ContentBlock {
-    /// Plain-text projection (empty for non-text blocks).
+    /// Plain-text projection (None for non-text blocks).
     pub fn as_text(&self) -> Option<&str> {
         match self {
             ContentBlock::Text { text } => Some(text),
@@ -54,7 +57,6 @@ pub enum PlanEntryStatus {
     Pending,
     InProgress,
     Completed,
-    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,14 +65,24 @@ pub struct PlanEntry {
     pub status: PlanEntryStatus,
 }
 
-/// Options offered by an agent for a permission request (ACP semantics).
+/// The semantic kind of a permission choice (ACP `PermissionOptionKind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PermissionOption {
+pub enum PermissionKind {
     AllowOnce,
     AllowAlways,
     RejectOnce,
     RejectAlways,
+}
+
+/// One selectable answer of a permission request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionChoice {
+    /// Agent-assigned id of the option (needed to answer).
+    pub option_id: String,
+    /// Human-readable label.
+    pub name: String,
+    pub kind: PermissionKind,
 }
 
 /// Who resolved a permission request. See design §9.2.
@@ -98,38 +110,37 @@ pub enum RunEvent {
     /// as the agent received it, for context observability (§8.1).
     ContextInjected { render: String },
     /// ACP `agent_message_chunk`.
-    AgentMessageChunk {
-        content: Vec<ContentBlock>,
-        thinking: Option<String>,
-    },
+    AgentMessageChunk { content: Vec<ContentBlock> },
     /// ACP `agent_thought_chunk`.
     AgentThoughtChunk { content: Vec<ContentBlock> },
     /// ACP `tool_call`.
     ToolCall {
         tool_call_id: String,
-        tool_name: String,
-        input: serde_json::Value,
+        /// Human-readable title (ACP v1 stable has no programmatic name).
+        title: String,
+        raw_input: serde_json::Value,
     },
     /// ACP `tool_call_update` (partial output of a running tool call).
     ToolCallUpdate {
         tool_call_id: String,
         content: Vec<ContentBlock>,
+        raw_output: Option<serde_json::Value>,
     },
     /// ACP `plan`.
     Plan { entries: Vec<PlanEntry> },
-    /// ACP `usage_update`.
-    UsageUpdate { usage: UsageTotals },
+    /// ACP `usage_update` (context occupancy + optional cumulative cost).
+    UsageUpdate { usage: ContextUsage },
     /// The agent asked for permission; surfaced to the policy center.
     PermissionRequested {
         tool_call_id: String,
-        tool_name: String,
-        input: serde_json::Value,
-        options: Vec<PermissionOption>,
+        title: String,
+        raw_input: serde_json::Value,
+        choices: Vec<PermissionChoice>,
     },
     /// The policy center resolved a permission request (who + what).
     PermissionResolved {
         tool_call_id: String,
-        outcome: PermissionOption,
+        outcome: PermissionKind,
         resolution: PermissionResolution,
     },
     /// Terminal: the agent reported a stop reason.
@@ -153,18 +164,24 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "hello".into(),
                 }],
-                thinking: None,
             },
             RunEvent::ToolCall {
                 tool_call_id: "tc1".into(),
-                tool_name: "fs.write".into(),
-                input: serde_json::json!({"path": "a.txt"}),
+                title: "Read file".into(),
+                raw_input: serde_json::json!({"path": "a.txt"}),
             },
             RunEvent::UsageUpdate {
-                usage: UsageTotals {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    ..Default::default()
+                usage: ContextUsage {
+                    used: 10,
+                    size: 100,
+                    cost_usd: Some(0.01),
+                },
+            },
+            RunEvent::PermissionResolved {
+                tool_call_id: "tc1".into(),
+                outcome: PermissionKind::AllowOnce,
+                resolution: PermissionResolution::Rule {
+                    rule_id: "allow-reads".into(),
                 },
             },
         ];

@@ -1,9 +1,22 @@
-//! ruagent-acp: ACP client (JSON-RPC over stdio) and harness adapters
+//! ruagent-acp: ACP client (JSON-RPC over stdio) and harness adapters.
 //!
-//! Part of the ruagent workspace. See docs/plans/2026-09-11-ruagent-design.md.
+//! The M1 execution model is connection-per-run: spawn a fresh agent
+//! subprocess per run, initialize, create a session (with MCP injection),
+//! stream one prompt to completion. Session resume and multiplexed
+//! connections arrive in M2 (design §5, §4.2).
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_skeleton() {}
+pub mod fs_tools;
+pub mod map;
+pub mod permission;
+pub mod run;
+
+pub use run::{RunOptions, RunOutcome, run_once, split_command_line};
+
+/// Errors from the ACP layer.
+#[derive(Debug, thiserror::Error)]
+pub enum AcpError {
+    #[error("ACP protocol error: {0}")]
+    Protocol(#[from] agent_client_protocol::Error),
+    #[error("invalid agent command `{0}`")]
+    Command(String),
 }

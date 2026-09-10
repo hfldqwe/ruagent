@@ -1,9 +1,527 @@
-//! ruagent-store: Repository traits and SQLite/LanceDB/JSONL implementations
+//! ruagent-store: persistence for the daemon.
 //!
-//! Part of the ruagent workspace. See docs/plans/2026-09-11-ruagent-design.md.
+//! Design §10: queryable state lives in SQLite (WAL mode, single-writer
+//! actor, group commits); high-volume run events are append-only JSONL
+//! transcripts; vectors (M3) go to embedded LanceDB. Postgres is a
+//! productization-time swap behind these traits.
+
+pub mod migrations;
+pub mod sqlite;
+pub mod transcript;
+
+pub use sqlite::{Db, DbError};
+pub use transcript::{TranscriptWriter, read_transcript, transcript_path};
+
+use chrono::{DateTime, Utc};
+use ruagent_core::{Run, RunStatus, StopReason, Task, TaskEdge, TaskStatus};
+
+/// Envelope of a stored run event.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TranscriptLine {
+    pub ts: DateTime<Utc>,
+    pub seq: u64,
+    pub event: ruagent_core::RunEvent,
+}
+
+// ---------------------------------------------------------------------------
+// Task repository
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Insert a new task.
+    pub async fn insert_task(&self, task: &Task) -> Result<(), DbError> {
+        let t = task.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title, intent, status, creator, project, pinned_agent, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    t.id.to_string(),
+                    t.title,
+                    t.intent,
+                    task_status_to_str(t.status),
+                    serde_json::to_string(&t.creator).expect("TaskCreator serializes"),
+                    t.project,
+                    t.pinned_agent.map(|a| a.to_string()),
+                    t.created_at.to_rfc3339(),
+                    t.updated_at.to_rfc3339(),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Update task status (and timestamp).
+    pub async fn update_task_status(
+        &self,
+        id: ruagent_core::TaskId,
+        status: TaskStatus,
+    ) -> Result<(), DbError> {
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![
+                    id.to_string(),
+                    task_status_to_str(status),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Fetch one task by id.
+    pub async fn get_task(&self, id: ruagent_core::TaskId) -> Result<Option<Task>, DbError> {
+        self.call(move |conn| -> Result<Option<Task>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, intent, status, creator, project, pinned_agent, created_at, updated_at
+                 FROM tasks WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query([id.to_string()])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(task_from_row(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+
+    /// List tasks by status (all statuses when `None`), newest first.
+    pub async fn list_tasks(&self, status: Option<TaskStatus>) -> Result<Vec<Task>, DbError> {
+        self.call(move |conn| -> Result<Vec<Task>, rusqlite::Error> {
+            let (sql, param): (&str, Vec<String>) = match status {
+                Some(s) => (
+                    "SELECT id, title, intent, status, creator, project, pinned_agent, created_at, updated_at
+                     FROM tasks WHERE status = ?1 ORDER BY created_at DESC",
+                    vec![task_status_to_str(s).to_string()],
+                ),
+                None => (
+                    "SELECT id, title, intent, status, creator, project, pinned_agent, created_at, updated_at
+                     FROM tasks ORDER BY created_at DESC",
+                    vec![],
+                ),
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(param), |row| {
+                    task_from_row(row)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+
+    /// Insert a typed task edge (idempotent).
+    pub async fn insert_edge(&self, edge: TaskEdge) -> Result<(), DbError> {
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO task_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    edge.from.to_string(),
+                    edge.to.to_string(),
+                    edge_kind_to_str(edge.kind),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Edges leaving a task.
+    pub async fn edges_from(&self, from: ruagent_core::TaskId) -> Result<Vec<TaskEdge>, DbError> {
+        self.call(move |conn| -> Result<Vec<TaskEdge>, rusqlite::Error> {
+            let mut stmt =
+                conn.prepare("SELECT from_id, to_id, kind FROM task_edges WHERE from_id = ?1")?;
+            let rows = stmt
+                .query_map([from.to_string()], edge_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run repository
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Insert a new run.
+    pub async fn insert_run(&self, run: &Run) -> Result<(), DbError> {
+        let r = run.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO runs (id, task_id, agent, params, status, acp_session_id, workspace,
+                                   context_used, context_size, cost_usd, error, stop_reason,
+                                   created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    r.id.to_string(),
+                    r.task_id.to_string(),
+                    r.params.agent.to_string(),
+                    serde_json::to_string(&r.params).expect("RunParams serializes"),
+                    run_status_to_str(r.status),
+                    r.acp_session_id,
+                    r.workspace,
+                    r.context_usage.map(|u| u.used),
+                    r.context_usage.map(|u| u.size),
+                    r.cost_usd,
+                    r.error,
+                    r.stop_reason.map(stop_reason_to_str),
+                    r.created_at.to_rfc3339(),
+                    r.updated_at.to_rfc3339(),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Persist the full mutable state of a run (the orchestrator owns the
+    /// `Run` struct and writes it back on every transition).
+    pub async fn update_run(&self, run: &Run) -> Result<(), DbError> {
+        let r = run.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE runs SET status = ?2, acp_session_id = ?3, workspace = ?4,
+                                 context_used = ?5, context_size = ?6, cost_usd = ?7,
+                                 error = ?8, stop_reason = ?9, updated_at = ?10
+                 WHERE id = ?1",
+                rusqlite::params![
+                    r.id.to_string(),
+                    run_status_to_str(r.status),
+                    r.acp_session_id,
+                    r.workspace,
+                    r.context_usage.map(|u| u.used),
+                    r.context_usage.map(|u| u.size),
+                    r.cost_usd,
+                    r.error,
+                    r.stop_reason.map(stop_reason_to_str),
+                    r.updated_at.to_rfc3339(),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Fetch one run by id.
+    pub async fn get_run(&self, id: ruagent_core::RunId) -> Result<Option<Run>, DbError> {
+        self.call(move |conn| -> Result<Option<Run>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
+                        context_used, context_size, cost_usd, error, stop_reason, created_at, updated_at
+                 FROM runs WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query([id.to_string()])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(run_from_row(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+
+    /// All runs of a task, oldest first.
+    pub async fn list_runs_for_task(
+        &self,
+        task_id: ruagent_core::TaskId,
+    ) -> Result<Vec<Run>, DbError> {
+        self.call(move |conn| -> Result<Vec<Run>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
+                        context_used, context_size, cost_usd, error, stop_reason, created_at, updated_at
+                 FROM runs WHERE task_id = ?1 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map([task_id.to_string()], run_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+
+    /// All runs in a given status (daemon recovery: find interrupted).
+    pub async fn list_runs_by_status(&self, status: RunStatus) -> Result<Vec<Run>, DbError> {
+        self.call(move |conn| -> Result<Vec<Run>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
+                        context_used, context_size, cost_usd, error, stop_reason, created_at, updated_at
+                 FROM runs WHERE status = ?1 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map([run_status_to_str(status)], run_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row mapping
+// ---------------------------------------------------------------------------
+
+/// Adapt a domain parse error into a sqlite conversion error.
+fn conv(e: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let id: String = row.get("id")?;
+    let creator: String = row.get("creator")?;
+    let pinned: Option<String> = row.get("pinned_agent")?;
+    let created: String = row.get("created_at")?;
+    let updated: String = row.get("updated_at")?;
+    let status: String = row.get("status")?;
+    Ok(Task {
+        id: id.parse().map_err(conv)?,
+        title: row.get("title")?,
+        intent: row.get("intent")?,
+        status: task_status_from_str(&status),
+        creator: serde_json::from_str(&creator).map_err(conv)?,
+        project: row.get("project")?,
+        pinned_agent: pinned.map(|s| s.parse().map_err(conv)).transpose()?,
+        created_at: DateTime::parse_from_rfc3339(&created)
+            .map_err(conv)?
+            .with_timezone(&Utc),
+        updated_at: DateTime::parse_from_rfc3339(&updated)
+            .map_err(conv)?
+            .with_timezone(&Utc),
+    })
+}
+
+fn edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEdge> {
+    let from: String = row.get("from_id")?;
+    let to: String = row.get("to_id")?;
+    let kind: String = row.get("kind")?;
+    Ok(TaskEdge {
+        from: from.parse().map_err(conv)?,
+        to: to.parse().map_err(conv)?,
+        kind: edge_kind_from_str(&kind),
+    })
+}
+
+fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    let id: String = row.get("id")?;
+    let task_id: String = row.get("task_id")?;
+    let params: String = row.get("params")?;
+    let status: String = row.get("status")?;
+    let created: String = row.get("created_at")?;
+    let updated: String = row.get("updated_at")?;
+    let context_used: Option<u64> = row.get("context_used")?;
+    let context_size: Option<u64> = row.get("context_size")?;
+    Ok(Run {
+        id: id.parse().map_err(conv)?,
+        task_id: task_id.parse().map_err(conv)?,
+        params: serde_json::from_str(&params).map_err(conv)?,
+        status: run_status_from_str(&status),
+        acp_session_id: row.get("acp_session_id")?,
+        workspace: row.get("workspace")?,
+        context_usage: match (context_used, context_size) {
+            (Some(used), Some(size)) => Some(ruagent_core::ContextUsage {
+                used,
+                size,
+                cost_usd: None,
+            }),
+            _ => None,
+        },
+        cost_usd: row.get("cost_usd")?,
+        error: row.get("error")?,
+        stop_reason: row
+            .get::<_, Option<String>>("stop_reason")?
+            .map(|s| stop_reason_from_str(&s)),
+        created_at: DateTime::parse_from_rfc3339(&created)
+            .map_err(conv)?
+            .with_timezone(&Utc),
+        updated_at: DateTime::parse_from_rfc3339(&updated)
+            .map_err(conv)?
+            .with_timezone(&Utc),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Enum <-> string mappings (SQLite stores TEXT)
+// ---------------------------------------------------------------------------
+
+fn task_status_to_str(s: TaskStatus) -> &'static str {
+    match s {
+        TaskStatus::Pending => "pending",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Done => "done",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn task_status_from_str(s: &str) -> TaskStatus {
+    match s {
+        "in_progress" => TaskStatus::InProgress,
+        "blocked" => TaskStatus::Blocked,
+        "done" => TaskStatus::Done,
+        "cancelled" => TaskStatus::Cancelled,
+        _ => TaskStatus::Pending,
+    }
+}
+
+fn edge_kind_to_str(k: ruagent_core::EdgeKind) -> &'static str {
+    match k {
+        ruagent_core::EdgeKind::DependsOn => "depends_on",
+        ruagent_core::EdgeKind::SpawnedBy => "spawned_by",
+        ruagent_core::EdgeKind::Reviews => "reviews",
+        ruagent_core::EdgeKind::FanoutOf => "fanout_of",
+    }
+}
+
+fn edge_kind_from_str(s: &str) -> ruagent_core::EdgeKind {
+    match s {
+        "spawned_by" => ruagent_core::EdgeKind::SpawnedBy,
+        "reviews" => ruagent_core::EdgeKind::Reviews,
+        "fanout_of" => ruagent_core::EdgeKind::FanoutOf,
+        _ => ruagent_core::EdgeKind::DependsOn,
+    }
+}
+
+fn run_status_to_str(s: RunStatus) -> &'static str {
+    match s {
+        RunStatus::Queued => "queued",
+        RunStatus::Spawning => "spawning",
+        RunStatus::Running => "running",
+        RunStatus::WaitingPermission => "waiting_permission",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
+fn run_status_from_str(s: &str) -> RunStatus {
+    match s {
+        "spawning" => RunStatus::Spawning,
+        "running" => RunStatus::Running,
+        "waiting_permission" => RunStatus::WaitingPermission,
+        "completed" => RunStatus::Completed,
+        "failed" => RunStatus::Failed,
+        "cancelled" => RunStatus::Cancelled,
+        "interrupted" => RunStatus::Interrupted,
+        _ => RunStatus::Queued,
+    }
+}
+
+fn stop_reason_to_str(s: StopReason) -> &'static str {
+    match s {
+        StopReason::EndTurn => "end_turn",
+        StopReason::Cancelled => "cancelled",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurns => "max_turns",
+        StopReason::Refusal => "refusal",
+        StopReason::Error => "error",
+    }
+}
+
+fn stop_reason_from_str(s: &str) -> StopReason {
+    match s {
+        "cancelled" => StopReason::Cancelled,
+        "max_tokens" => StopReason::MaxTokens,
+        "max_turns" => StopReason::MaxTurns,
+        "refusal" => StopReason::Refusal,
+        "error" => StopReason::Error,
+        _ => StopReason::EndTurn,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn crate_skeleton() {}
+    use super::*;
+    use ruagent_core::{RunParams, TaskCreator};
+
+    #[tokio::test]
+    async fn task_roundtrip_and_status_update() {
+        let db = Db::open_in_memory().unwrap();
+        let mut t = Task::new("title", "intent", TaskCreator::Human);
+        db.insert_task(&t).await.unwrap();
+
+        let got = db.get_task(t.id).await.unwrap().expect("task present");
+        assert_eq!(got, t);
+
+        db.update_task_status(t.id, TaskStatus::Done).await.unwrap();
+        let got = db.get_task(t.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Done);
+        assert!(got.updated_at >= t.updated_at);
+        t.status = TaskStatus::Done;
+        t.updated_at = got.updated_at;
+
+        // list by status
+        let done = db.list_tasks(Some(TaskStatus::Done)).await.unwrap();
+        assert_eq!(done, vec![t.clone()]);
+        let pending = db.list_tasks(Some(TaskStatus::Pending)).await.unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_roundtrip_and_update() {
+        let db = Db::open_in_memory().unwrap();
+        let task = Task::new("t", "i", TaskCreator::Human);
+        db.insert_task(&task).await.unwrap();
+
+        let mut run = Run::new(
+            task.id,
+            RunParams::for_agent(ruagent_core::AgentId::generate()),
+        );
+        db.insert_run(&run).await.unwrap();
+
+        run.status = RunStatus::Running;
+        run.acp_session_id = Some("sess-1".into());
+        run.context_usage = Some(ruagent_core::ContextUsage {
+            used: 10,
+            size: 100,
+            cost_usd: None,
+        });
+        run.cost_usd = Some(0.02);
+        run.error = None;
+        run.updated_at = Utc::now();
+        db.update_run(&run).await.unwrap();
+
+        let got = db.get_run(run.id).await.unwrap().expect("run present");
+        assert_eq!(got.status, RunStatus::Running);
+        assert_eq!(got.acp_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(got.cost_usd, Some(0.02));
+        assert_eq!(got.context_usage.map(|u| u.used), Some(10));
+
+        let runs = db.list_runs_for_task(task.id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edges_are_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let a = Task::new("a", "i", TaskCreator::Human);
+        let b = Task::new("b", "i", TaskCreator::Human);
+        db.insert_task(&a).await.unwrap();
+        db.insert_task(&b).await.unwrap();
+
+        let edge = TaskEdge {
+            from: a.id,
+            to: b.id,
+            kind: ruagent_core::EdgeKind::Reviews,
+        };
+        db.insert_edge(edge).await.unwrap();
+        db.insert_edge(edge).await.unwrap(); // ignored
+
+        let edges = db.edges_from(a.id).await.unwrap();
+        assert_eq!(edges, vec![edge]);
+    }
 }
