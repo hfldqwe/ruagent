@@ -5,7 +5,10 @@ use crate::sqlite::DbError;
 
 /// Embedded migration scripts, in order. The index in the array is the
 /// schema version.
-pub const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+pub const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_agents.sql"),
+];
 
 /// Apply all pending migrations.
 pub fn apply(conn: &mut rusqlite::Connection) -> Result<(), DbError> {

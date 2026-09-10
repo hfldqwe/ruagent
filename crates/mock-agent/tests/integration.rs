@@ -30,10 +30,30 @@ async fn drive(opts: RunOptions, answer: Option<PermissionAnswer>) -> Driven {
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let (ask_tx, mut ask_rx) = mpsc::unbounded_channel();
 
+    // The decider owns PermissionResolved attribution (mirrors the
+    // daemon's policy center).
+    let decider_tx = ev_tx.clone();
     let answerer = tokio::spawn(async move {
         while let Some(ask) = ask_rx.recv().await {
-            let PermissionAsk { answer: tx, .. } = ask;
-            let _ = tx.send(answer.clone().unwrap_or(PermissionAnswer::Cancel));
+            let PermissionAsk {
+                tool_call_id,
+                choices,
+                answer: tx,
+                ..
+            } = ask;
+            let ans = answer.clone().unwrap_or(PermissionAnswer::Cancel);
+            if let PermissionAnswer::Select(id) = &ans
+                && let Some(choice) = choices.iter().find(|c| &c.option_id == id)
+            {
+                let _ = decider_tx.send(RunEvent::PermissionResolved {
+                    tool_call_id,
+                    outcome: choice.kind,
+                    resolution: ruagent_core::PermissionResolution::Rule {
+                        rule_id: "test-policy".into(),
+                    },
+                });
+            }
+            let _ = tx.send(ans);
         }
     });
 

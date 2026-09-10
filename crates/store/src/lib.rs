@@ -268,6 +268,71 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
+// Agent registry
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Insert or replace an agent by name (id preserved if the name exists).
+    pub async fn upsert_agent(&self, card: &ruagent_core::AgentCard) -> Result<(), DbError> {
+        let c = card.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO agents (name, id, harness, card) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(name) DO UPDATE SET harness = ?3, card = ?4",
+                rusqlite::params![
+                    c.name,
+                    c.id.to_string(),
+                    format!("{:?}", c.harness),
+                    serde_json::to_string(&c).expect("AgentCard serializes"),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// The stable id for an agent name, if registered.
+    pub async fn agent_id_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<ruagent_core::AgentId>, DbError> {
+        let name = name.to_string();
+        let row: Option<String> = self
+            .call(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                let mut stmt = conn.prepare("SELECT id FROM agents WHERE name = ?1")?;
+                let mut rows = stmt.query([&name])?;
+                match rows.next()? {
+                    Some(row) => Ok(Some(row.get(0)?)),
+                    None => Ok(None),
+                }
+            })
+            .await??;
+        match row {
+            Some(s) => Ok(Some(s.parse().map_err(conv)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All registered agents.
+    pub async fn list_agents(&self) -> Result<Vec<ruagent_core::AgentCard>, DbError> {
+        self.call(
+            move |conn| -> Result<Vec<ruagent_core::AgentCard>, rusqlite::Error> {
+                let mut stmt = conn.prepare("SELECT card FROM agents ORDER BY name")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let card: String = row.get(0)?;
+                        serde_json::from_str(&card).map_err(conv)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await?
+        .map_err(DbError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Row mapping
 // ---------------------------------------------------------------------------
 
@@ -503,6 +568,36 @@ mod tests {
 
         let runs = db.list_runs_for_task(task.id).await.unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_upsert_preserves_id() {
+        let db = Db::open_in_memory().unwrap();
+        let mut card = ruagent_core::AgentCard {
+            id: ruagent_core::AgentId::generate(),
+            name: "claude".into(),
+            harness: ruagent_core::HarnessKind::ClaudeCode,
+            command: None,
+            description: "v1".into(),
+            model: None,
+            reasoning_effort: None,
+            context_window: None,
+            mcp_profile: None,
+            tags: vec![],
+            enabled: true,
+        };
+        db.upsert_agent(&card).await.unwrap();
+
+        // Same name, different content: id stays, card updates.
+        card.description = "v2".into();
+        card.id = ruagent_core::AgentId::generate();
+        db.upsert_agent(&card).await.unwrap();
+
+        let id = db.agent_id_by_name("claude").await.unwrap().unwrap();
+        let all = db.list_agents().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].description, "v2");
+        assert_ne!(id, card.id, "stored id must be the first one");
     }
 
     #[tokio::test]

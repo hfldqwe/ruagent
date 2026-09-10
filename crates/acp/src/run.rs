@@ -143,25 +143,10 @@ pub async fn run_once(
                             RequestPermissionOutcome::Cancelled,
                         ));
                     }
-                    let ev_spawn = ev.clone();
                     cx.spawn(async move {
+                        // The decider (policy center) emits PermissionResolved
+                        // when it answers — attribution lives there, not here.
                         let answer = rx.await.unwrap_or(PermissionAnswer::Cancel);
-                        let _ = ev_spawn.send(ruagent_core::RunEvent::PermissionResolved {
-                            tool_call_id: tool_call_id.clone(),
-                            outcome: match &answer {
-                                PermissionAnswer::Select(id) => choices
-                                    .iter()
-                                    .find(|c| &c.option_id == id)
-                                    .map(|c| c.kind)
-                                    .unwrap_or(ruagent_core::PermissionKind::RejectOnce),
-                                PermissionAnswer::Cancel => {
-                                    ruagent_core::PermissionKind::RejectOnce
-                                }
-                            },
-                            resolution: ruagent_core::PermissionResolution::Rule {
-                                rule_id: "m1-policy".into(),
-                            },
-                        });
                         match answer {
                             PermissionAnswer::Select(id) => responder.respond(
                                 RequestPermissionResponse::new(RequestPermissionOutcome::Selected(

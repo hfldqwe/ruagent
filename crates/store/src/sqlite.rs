@@ -29,6 +29,9 @@ impl Db {
     /// Open (or create) the database at `path`, apply migrations, and
     /// start the writer thread.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = rusqlite::Connection::open(path)?;
         Self::configure_and_spawn(conn)
     }

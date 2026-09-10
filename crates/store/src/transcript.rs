@@ -30,8 +30,9 @@ impl TranscriptWriter {
         })
     }
 
-    /// Append one event. Flushes every 16 events to bound loss on crash
-    /// without paying an fsync per event (group commit, design §10).
+    /// Append one event, flushed immediately: `BufWriter::flush` is a
+    /// plain write syscall (no fsync), so per-event flushing is cheap and
+    /// keeps replay-from-file correct for live SSE subscribers.
     pub fn append(&mut self, event: &ruagent_core::RunEvent) -> std::io::Result<()> {
         let line = TranscriptLine {
             ts: chrono::Utc::now(),
@@ -41,14 +42,17 @@ impl TranscriptWriter {
         serde_json::to_writer(&mut self.file, &line)?;
         self.file.write_all(b"\n")?;
         self.seq += 1;
-        if self.seq.is_multiple_of(16) {
-            self.file.flush()?;
-        }
+        self.file.flush()?;
         Ok(())
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
+    }
+
+    /// The sequence number the next appended event will receive.
+    pub fn next_seq(&self) -> u64 {
+        self.seq
     }
 }
 
