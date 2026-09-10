@@ -45,14 +45,20 @@ enum Cmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve { addr, root } => {
             let addr: std::net::SocketAddr = addr.parse().context("invalid listen address")?;
             let root = root.unwrap_or_else(ruagent_daemon::default_root);
-            ruagent_daemon::serve(root, addr).await
+            // Only serve needs a runtime; the other subcommands are sync
+            // (reqwest::blocking's internal runtime must never be dropped
+            // inside an async context).
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?;
+            runtime.block_on(ruagent_daemon::serve(root, addr))
         }
         Cmd::Agents => list_agents(&cli.url),
         Cmd::Status => status(&cli.url),

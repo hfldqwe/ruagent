@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Real-harness smoke tests: local, manual, never in CI (design §12.5).
+# Run with: cargo test -p ruagent-daemon --features smoke --test smoke -- --nocapture --test-threads=1
+smoke = []
+
 [dependencies]
 ruagent-core.workspace = true
 ruagent-acp.workspace = true
