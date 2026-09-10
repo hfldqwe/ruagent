@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ruagent_core::{AgentCard, HarnessKind, ReasoningEffort};
+use ruagent_orchestrator::RoutingConfig;
 use ruagent_policy::PolicyConfig;
 
 /// Everything the daemon needs at boot.
@@ -16,6 +17,7 @@ pub struct DaemonConfig {
     pub agents: Vec<AgentCard>,
     pub mcp: McpConfig,
     pub policy: PolicyConfig,
+    pub routing: RoutingFile,
 }
 
 impl DaemonConfig {
@@ -54,11 +56,21 @@ impl DaemonConfig {
         let policy = PolicyConfig::parse(&policy_text)
             .with_context(|| format!("parsing {policy_path:?}"))?;
 
+        let routing_path = config_dir.join("routing.toml");
+        if !routing_path.exists() {
+            std::fs::write(&routing_path, DEFAULT_ROUTING_TOML)
+                .with_context(|| format!("writing {routing_path:?}"))?;
+        }
+        let routing_text = std::fs::read_to_string(&routing_path)?;
+        let routing =
+            parse_routing(&routing_text).with_context(|| format!("parsing {routing_path:?}"))?;
+
         Ok(Self {
             root,
             agents,
             mcp,
             policy,
+            routing,
         })
     }
 
@@ -356,5 +368,69 @@ servers = ["fs", "all"]
         assert!(cfg.agent("claude").is_some());
         assert!(cfg.default_agent().is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// routing.toml
+// ---------------------------------------------------------------------------
+
+/// `routing.toml` as written by users: agents by NAME.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RoutingFile {
+    #[serde(default)]
+    pub routes: Vec<RouteEntry>,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RouteEntry {
+    pub project: Option<String>,
+    pub title_contains: Option<String>,
+    pub agent: String,
+}
+
+fn parse_routing(text: &str) -> Result<RoutingFile> {
+    Ok(toml::from_str(text)?)
+}
+
+const DEFAULT_ROUTING_TOML: &str = r#"# ruagent routing rules (design §5.4/§9.1).
+# Cascade: explicit --agent > first matching route > default.
+# The LLM router tier is a pluggable future addition (off by default).
+
+# [[routes]]
+# project = "ruagent"
+# agent = "claude"
+
+# default = "claude"
+"#;
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn routing_file_parses() {
+        let f = parse_routing(
+            r#"
+[[routes]]
+project = "ruagent"
+agent = "claude"
+
+[[routes]]
+title_contains = "review"
+agent = "opencode"
+
+default = "dsh"
+"#,
+        )
+        .unwrap();
+        assert_eq!(f.routes.len(), 2);
+        assert_eq!(f.default.as_deref(), Some("dsh"));
+    }
+
+    #[test]
+    fn default_routing_toml_parses() {
+        assert!(parse_routing(DEFAULT_ROUTING_TOML).is_ok());
     }
 }

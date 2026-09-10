@@ -16,6 +16,7 @@ ruagent-core.workspace = true
 ruagent-acp.workspace = true
 ruagent-store.workspace = true
 ruagent-policy.workspace = true
+ruagent-orchestrator.workspace = true
 agent-client-protocol = "2.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }

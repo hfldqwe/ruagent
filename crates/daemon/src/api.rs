@@ -30,7 +30,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route("/api/v1/tasks/{id}/runs", post(start_run))
+        .route("/api/v1/tasks/{id}/fanout", post(start_fanout))
+        .route("/api/v1/tasks/{id}/pipeline", post(start_pipeline))
         .route("/api/v1/runs/{id}", get(get_run))
+        .route("/api/v1/runs/{id}/select", post(select_run))
         .route("/api/v1/runs/{id}/events", get(run_events))
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
@@ -184,7 +187,10 @@ async fn get_task(
         .await?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
     let runs = state.mgr.db().list_runs_for_task(id).await?;
-    Ok(Json(serde_json::json!({ "task": task, "runs": runs })))
+    let selected_run_id = state.mgr.db().selected_run(id).await?;
+    Ok(Json(
+        serde_json::json!({ "task": task, "runs": runs, "selected_run_id": selected_run_id }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -209,13 +215,39 @@ async fn start_run(
         .await?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
 
-    let agent = req.agent.unwrap_or_else(|| {
-        state
-            .config
-            .default_agent()
-            .map(|a| a.name.clone())
-            .unwrap_or_default()
-    });
+    // Routing provenance (design §5.4): explicit when named, cascade
+    // otherwise — the cascade DECIDES the agent, not just records it.
+    let (agent, decision) = if let Some(name) = req.agent.as_deref() {
+        let card = state
+            .mgr
+            .agent(name)
+            .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{name}`")))?;
+        (
+            name.to_string(),
+            ruagent_core::RoutingDecision::explicit(card.id),
+        )
+    } else {
+        let mut t = task.clone();
+        t.pinned_agent = None; // the API pin is `agent`, not the task's
+        if let Some(decision) = routing_decision(&state, &t) {
+            let id = decision.primary();
+            let card = state
+                .mgr
+                .agents()
+                .into_iter()
+                .find(|c| c.id == id)
+                .ok_or_else(|| ApiError::bad_request("routing decision named an unknown agent"))?;
+            (card.name.clone(), decision)
+        } else {
+            let card = state.config.default_agent().ok_or_else(|| {
+                ApiError::bad_request("no agent specified and no default configured")
+            })?;
+            (
+                card.name.clone(),
+                ruagent_core::RoutingDecision::default_agent(card.id),
+            )
+        }
+    };
     let card = state
         .mgr
         .agent(&agent)
@@ -235,9 +267,97 @@ async fn start_run(
             prompt,
             mcp,
             req.cwd.map(std::path::PathBuf::from),
+            Some(decision),
         )
         .await?;
     Ok(Json(run))
+}
+
+#[derive(Deserialize)]
+struct FanOutRequest {
+    agents: Vec<String>,
+    prompt: Option<String>,
+}
+
+/// Fan-out compare (design §5.2): same prompt to N agents in parallel.
+async fn start_fanout(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(req): Json<FanOutRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let task_id: ruagent_core::TaskId = task_id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    let task = state
+        .mgr
+        .db()
+        .get_task(task_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    let prompt = req.prompt.unwrap_or_else(|| task.intent.clone());
+    let runs = state.mgr.start_fanout(&task, &req.agents, prompt).await?;
+    Ok(Json(serde_json::json!({ "runs": runs })))
+}
+
+#[derive(Deserialize)]
+struct PipelineRequest {
+    steps: Vec<PipelineStepDto>,
+    prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PipelineStepDto {
+    agent: String,
+    prompt: Option<String>,
+}
+
+/// Pipeline (design §5.2): sequential sub-tasks with bounded handoff.
+async fn start_pipeline(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(req): Json<PipelineRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let task_id: ruagent_core::TaskId = task_id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    let task = state
+        .mgr
+        .db()
+        .get_task(task_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    let base_prompt = req.prompt.unwrap_or_else(|| task.intent.clone());
+    let steps: Vec<ruagent_orchestrator::PipelineStep> = req
+        .steps
+        .into_iter()
+        .map(|s| ruagent_orchestrator::PipelineStep {
+            agent: s.agent,
+            prompt: s.prompt,
+        })
+        .collect();
+    let task_ids = state.mgr.start_pipeline(&task, steps, base_prompt).await?;
+    Ok(Json(serde_json::json!({ "tasks": task_ids })))
+}
+
+/// Select the winning run of a task (fan-out comparison outcome).
+async fn select_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let run_id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid run id"))?;
+    let run = state
+        .mgr
+        .db()
+        .get_run(run_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    if run.status != RunStatus::Completed {
+        return Err(ApiError::bad_request("only completed runs can be selected"));
+    }
+    state.mgr.db().set_selected_run(run.task_id, run_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_run(
@@ -377,6 +497,39 @@ async fn resolve_permission(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the routing file's agent NAMES into ids and run the cascade.
+fn routing_decision(state: &AppState, task: &Task) -> Option<ruagent_core::RoutingDecision> {
+    let by_name: std::collections::HashMap<String, &ruagent_core::AgentCard> = state
+        .mgr
+        .agents()
+        .into_iter()
+        .map(|a| (a.name.clone(), a))
+        .collect();
+    let resolve = |name: &str| by_name.get(name).map(|c| c.id.to_string());
+    let config = ruagent_orchestrator::RoutingConfig {
+        routes: state
+            .config
+            .routing
+            .routes
+            .iter()
+            .filter_map(|r| {
+                resolve(&r.agent).map(|id| ruagent_orchestrator::RoutingRule {
+                    project: r.project.clone(),
+                    title_contains: r.title_contains.clone(),
+                    agent: id,
+                })
+            })
+            .collect(),
+        default: state
+            .config
+            .routing
+            .default
+            .as_deref()
+            .and_then(|d| resolve(d)),
+    };
+    ruagent_orchestrator::route(task, &config)
+}
 
 fn parse_task_status(s: &str) -> Option<TaskStatus> {
     match s {

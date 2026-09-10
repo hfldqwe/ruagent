@@ -116,6 +116,47 @@ impl Db {
         .map_err(DbError::from)
     }
 
+    /// Mark the winning run of a task (fan-out selection, design §5.2).
+    pub async fn set_selected_run(
+        &self,
+        task_id: ruagent_core::TaskId,
+        run_id: ruagent_core::RunId,
+    ) -> Result<(), DbError> {
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE tasks SET selected_run_id = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![
+                    task_id.to_string(),
+                    run_id.to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// The selected winning run of a task, if any.
+    pub async fn selected_run(
+        &self,
+        task_id: ruagent_core::TaskId,
+    ) -> Result<Option<ruagent_core::RunId>, DbError> {
+        let row: Option<String> = self
+            .call(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                let mut stmt = conn.prepare("SELECT selected_run_id FROM tasks WHERE id = ?1")?;
+                let mut rows = stmt.query([task_id.to_string()])?;
+                match rows.next()? {
+                    Some(row) => Ok(row.get(0)?),
+                    None => Ok(None),
+                }
+            })
+            .await??;
+        match row {
+            Some(s) => Ok(Some(s.parse().map_err(conv)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Insert a typed task edge (idempotent).
     pub async fn insert_edge(&self, edge: TaskEdge) -> Result<(), DbError> {
         self.call(move |conn| {
@@ -158,9 +199,9 @@ impl Db {
         self.call(move |conn| {
             conn.execute(
                 "INSERT INTO runs (id, task_id, agent, params, status, acp_session_id, workspace,
-                                   context_used, context_size, cost_usd, error, stop_reason,
+                                   context_used, context_size, cost_usd, error, result, stop_reason,
                                    created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     r.id.to_string(),
                     r.task_id.to_string(),
@@ -173,6 +214,7 @@ impl Db {
                     r.context_usage.map(|u| u.size),
                     r.cost_usd,
                     r.error,
+                    r.result,
                     r.stop_reason.map(stop_reason_to_str),
                     r.created_at.to_rfc3339(),
                     r.updated_at.to_rfc3339(),
@@ -191,7 +233,7 @@ impl Db {
             conn.execute(
                 "UPDATE runs SET status = ?2, acp_session_id = ?3, workspace = ?4,
                                  context_used = ?5, context_size = ?6, cost_usd = ?7,
-                                 error = ?8, stop_reason = ?9, updated_at = ?10
+                                 error = ?8, result = ?9, stop_reason = ?10, updated_at = ?11
                  WHERE id = ?1",
                 rusqlite::params![
                     r.id.to_string(),
@@ -202,6 +244,7 @@ impl Db {
                     r.context_usage.map(|u| u.size),
                     r.cost_usd,
                     r.error,
+                    r.result,
                     r.stop_reason.map(stop_reason_to_str),
                     r.updated_at.to_rfc3339(),
                 ],
@@ -216,7 +259,7 @@ impl Db {
         self.call(move |conn| -> Result<Option<Run>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
-                        context_used, context_size, cost_usd, error, stop_reason, created_at, updated_at
+                        context_used, context_size, cost_usd, error, result, stop_reason, created_at, updated_at
                  FROM runs WHERE id = ?1",
             )?;
             let mut rows = stmt.query([id.to_string()])?;
@@ -237,7 +280,7 @@ impl Db {
         self.call(move |conn| -> Result<Vec<Run>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
-                        context_used, context_size, cost_usd, error, stop_reason, created_at, updated_at
+                        context_used, context_size, cost_usd, error, result, stop_reason, created_at, updated_at
                  FROM runs WHERE task_id = ?1 ORDER BY created_at ASC",
             )?;
             let rows = stmt
@@ -254,7 +297,7 @@ impl Db {
         self.call(move |conn| -> Result<Vec<Run>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
-                        context_used, context_size, cost_usd, error, stop_reason, created_at, updated_at
+                        context_used, context_size, cost_usd, error, result, stop_reason, created_at, updated_at
                  FROM runs WHERE status = ?1 ORDER BY created_at ASC",
             )?;
             let rows = stmt
@@ -450,6 +493,7 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         },
         cost_usd: row.get("cost_usd")?,
         error: row.get("error")?,
+        result: row.get("result")?,
         stop_reason: row
             .get::<_, Option<String>>("stop_reason")?
             .map(|s| stop_reason_from_str(&s)),

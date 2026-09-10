@@ -10,9 +10,10 @@ use ruagent_acp::adapter::HarnessAdapter as _;
 use ruagent_acp::permission::{PermissionAnswer, PermissionAsk};
 use ruagent_acp::{RunOptions, adapter_for, run_once};
 use ruagent_core::{
-    AgentCard, PermissionKind, PermissionResolution, Run, RunEvent, RunId, RunParams, RunStatus,
-    StopReason, Task, TaskStatus,
+    AgentCard, PermissionKind, PermissionResolution, RouteSource, RoutingDecision, Run, RunEvent,
+    RunId, RunParams, RunStatus, StopReason, Task, TaskStatus,
 };
+use ruagent_orchestrator::{self, PipelineStep, Topology};
 use ruagent_policy::{PermissionAction, PermissionPolicy};
 use ruagent_store::{Db, TranscriptLine, TranscriptWriter, transcript_path};
 use tokio::sync::{broadcast, mpsc};
@@ -49,18 +50,26 @@ pub struct RunManager {
     root: PathBuf,
     agents: HashMap<String, AgentCard>,
     policy: PermissionPolicy,
+    mcp: crate::config::McpConfig,
     broadcast: broadcast::Sender<StreamMsg>,
     pending: PendingMap,
 }
 
 impl RunManager {
-    pub fn new(db: Db, root: PathBuf, agents: Vec<AgentCard>, policy: PermissionPolicy) -> Self {
+    pub fn new(
+        db: Db,
+        root: PathBuf,
+        agents: Vec<AgentCard>,
+        policy: PermissionPolicy,
+        mcp: crate::config::McpConfig,
+    ) -> Self {
         let (broadcast, _) = broadcast::channel(1024);
         Self {
             db,
             root,
             agents: agents.into_iter().map(|a| (a.name.clone(), a)).collect(),
             policy,
+            mcp,
             broadcast,
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -139,6 +148,7 @@ impl RunManager {
         prompt: String,
         mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
         cwd_override: Option<PathBuf>,
+        routed: Option<RoutingDecision>,
     ) -> Result<Run> {
         let card = self
             .agent(agent_name)
@@ -188,6 +198,7 @@ impl RunManager {
                 prompt,
                 mcp_servers,
                 cwd,
+                routed,
             )
             .await
             {
@@ -202,6 +213,127 @@ impl RunManager {
         });
 
         Ok(returned)
+    }
+
+    /// Fan out: same prompt to N agents in parallel on one task
+    /// (design §5.2). Every run records its routing provenance.
+    pub async fn start_fanout(
+        &self,
+        task: &Task,
+        agents: &[String],
+        prompt: String,
+    ) -> Result<Vec<Run>> {
+        let topology = Topology::FanOut {
+            agents: agents.to_vec(),
+        };
+        let plan = ruagent_orchestrator::plan(task, &topology)?;
+        let mut runs = Vec::new();
+        for planned in &plan.runs {
+            let card = self
+                .agent(&planned.agent)
+                .with_context(|| format!("unknown agent `{}`", planned.agent))?;
+            let decision = RoutingDecision {
+                agents: vec![card.id],
+                source: RouteSource::Explicit,
+                rationale: Some("fan-out member".into()),
+            };
+            let mcp = self.mcp_for(card);
+            let run = self
+                .start_run(
+                    task,
+                    &planned.agent,
+                    prompt.clone(),
+                    mcp,
+                    None,
+                    Some(decision),
+                )
+                .await?;
+            runs.push(run);
+        }
+        Ok(runs)
+    }
+
+    /// Pipeline: sequential sub-tasks with handoff (design §5.2). Returns
+    /// the sub-task ids; the driver runs in the background.
+    pub async fn start_pipeline(
+        self: &Arc<Self>,
+        task: &Task,
+        steps: Vec<PipelineStep>,
+        base_prompt: String,
+    ) -> Result<Vec<ruagent_core::TaskId>> {
+        let topology = Topology::Pipeline { steps };
+        let plan = ruagent_orchestrator::plan(task, &topology)?;
+        for planned in &plan.runs {
+            if planned.task.id != task.id {
+                self.db.insert_task(&planned.task).await?;
+            }
+        }
+        for edge in &plan.edges {
+            self.db.insert_edge(*edge).await?;
+        }
+        let task_ids: Vec<ruagent_core::TaskId> = plan.runs.iter().map(|r| r.task.id).collect();
+
+        let mgr = Arc::clone(self);
+        let base = task.clone();
+        tokio::spawn(async move {
+            let mut handoff: Option<String> = None;
+            for planned in &plan.runs {
+                let prompt = match (&planned.prompt, &handoff) {
+                    (Some(p), _) => p.clone(),
+                    (None, Some(up)) => compose_handoff(&base.intent, up),
+                    (None, None) => base.intent.clone(),
+                };
+                let card = match mgr.agent(&planned.agent) {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(agent = %planned.agent, "pipeline step agent missing");
+                        break;
+                    }
+                };
+                let decision = RoutingDecision {
+                    agents: vec![card.id],
+                    source: RouteSource::Explicit,
+                    rationale: Some(format!("pipeline step (upstream: {})", handoff.is_some())),
+                };
+                let mcp = mgr.mcp_for(card);
+                let run = match mgr
+                    .start_run(
+                        &planned.task,
+                        &planned.agent,
+                        prompt,
+                        mcp,
+                        None,
+                        Some(decision),
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(error = %e, "pipeline step failed to start");
+                        break;
+                    }
+                };
+                let final_run = match wait_terminal(&mgr.db, run.id).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(error = %e, "pipeline wait failed");
+                        break;
+                    }
+                };
+                if final_run.status != RunStatus::Completed {
+                    tracing::warn!(run_id = %run.id, status = ?final_run.status, "pipeline step did not complete; stopping chain");
+                    break;
+                }
+                handoff = final_run.result;
+            }
+        });
+        Ok(task_ids)
+    }
+
+    /// MCP servers for an agent's configured profile (design §7.1).
+    fn mcp_for(&self, card: &AgentCard) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+        self.mcp
+            .expand_profile(card.mcp_profile.as_deref(), &card.name)
     }
 }
 
@@ -220,6 +352,7 @@ async fn supervise(
     prompt: String,
     mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
     cwd: PathBuf,
+    routed: Option<RoutingDecision>,
 ) -> Result<()> {
     let transcripts_dir = root.join("data").join("transcripts");
     let mut transcript = TranscriptWriter::create(transcript_path(&transcripts_dir, &run.id))
@@ -236,6 +369,14 @@ async fn supervise(
         });
     };
 
+    if let Some(decision) = routed {
+        emit(
+            &mut transcript,
+            &broadcast,
+            &run,
+            RunEvent::Routed { decision },
+        );
+    }
     emit(
         &mut transcript,
         &broadcast,
@@ -261,6 +402,7 @@ async fn supervise(
     let mut ask_open = true;
     let mut done = false;
     let mut done_at: Option<tokio::time::Instant> = None;
+    let mut result_text = String::new();
 
     loop {
         // The prompt response can beat late notifications through the
@@ -279,6 +421,13 @@ async fn supervise(
         tokio::select! {
             maybe_ev = ev_rx.recv(), if ev_open => match maybe_ev {
                 Some(event) => {
+                    if let RunEvent::AgentMessageChunk { content } = &event {
+                        for block in content {
+                            if let Some(text) = block.as_text() {
+                                result_text.push_str(text);
+                            }
+                        }
+                    }
                     if let RunEvent::UsageUpdate { usage } = &event {
                         run.context_usage = Some(*usage);
                         if usage.cost_usd.is_some() {
@@ -353,6 +502,9 @@ async fn supervise(
                         run.status = RunStatus::Completed;
                         run.stop_reason = Some(outcome.stop_reason);
                         run.acp_session_id = Some(outcome.session_id);
+                        if !result_text.is_empty() {
+                            run.result = Some(result_text.clone());
+                        }
                         emit(&mut transcript, &broadcast, &run, RunEvent::Stopped {
                             stop_reason: outcome.stop_reason,
                         });
@@ -413,4 +565,63 @@ fn append_event(transcript: &mut TranscriptWriter, run: &Run, event: &RunEvent) 
         tracing::warn!(run_id = %run.id, error = %e, "transcript append failed");
     }
     line
+}
+
+/// Compose a handoff prompt: bounded upstream result (design §5.2 —
+/// bounded summary until the M3 injection contract lands).
+fn compose_handoff(intent: &str, upstream: &str) -> String {
+    const MAX_UPSTREAM_CHARS: usize = 4000;
+    let bounded: String = if upstream.chars().count() > MAX_UPSTREAM_CHARS {
+        let cut: String = upstream.chars().take(MAX_UPSTREAM_CHARS).collect();
+        format!(
+            "{cut}
+…[upstream result truncated at {MAX_UPSTREAM_CHARS} chars]"
+        )
+    } else {
+        upstream.to_string()
+    };
+    format!(
+        "{intent}
+
+--- Upstream result (handoff) ---
+{bounded}
+--- End upstream result ---
+
+Continue from the upstream result."
+    )
+}
+
+/// Wait for a run to reach a terminal state (poll; 30-minute ceiling).
+async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1800);
+    loop {
+        let run = db
+            .get_run(run_id)
+            .await?
+            .with_context(|| "run vanished while waiting")?;
+        if run.status.is_terminal() {
+            return Ok(run);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pipeline step timed out (30 min)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_is_bounded() {
+        let long = "x".repeat(10_000);
+        let p = compose_handoff("do things", &long);
+        assert!(p.chars().count() < 5_000, "handoff must be bounded");
+        assert!(p.contains("truncated"));
+        let p = compose_handoff("intent", "short");
+        assert!(p.contains("short"));
+        assert!(p.contains("Upstream result"));
+    }
 }

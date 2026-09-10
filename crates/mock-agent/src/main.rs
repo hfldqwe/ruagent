@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
                             notify(SessionUpdate::UsageUpdate(
                                 UsageUpdate::new(120, 200_000).cost(Cost::new(0.001, "USD")),
                             ))?;
+                            // Real agents stream chunks for a while before
+                            // their final response; an instant response
+                            // races the client's dispatch and loses chunks.
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
                         Behavior::ToolCall => {
@@ -80,6 +84,7 @@ async fn main() -> Result<()> {
                                     "done after tool call (prompt was: {text})"
                                 ))),
                             )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
                         Behavior::Permission => {
@@ -137,6 +142,7 @@ async fn main() -> Result<()> {
                                             ))),
                                         )),
                                     ))?;
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                                     responder.respond(PromptResponse::new(StopReason::EndTurn))
                                 })?;
                             Ok(())
@@ -162,6 +168,7 @@ async fn main() -> Result<()> {
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new("planned work")),
                             )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
                         Behavior::Crash => {

@@ -64,7 +64,13 @@ async fn start_daemon() -> String {
         }
         db.upsert_agent(card).await.unwrap();
     }
-    let mgr = Arc::new(RunManager::new(db, root, agents, cfg.policy.to_policy()));
+    let mgr = Arc::new(RunManager::new(
+        db,
+        root,
+        agents,
+        cfg.policy.to_policy(),
+        cfg.mcp.clone(),
+    ));
     let app = ruagent_daemon::api::router(AppState {
         mgr,
         config: Arc::new(cfg),

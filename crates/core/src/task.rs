@@ -51,11 +51,11 @@ pub enum TaskCreator {
     /// The human owner, via CLI or panel.
     Human,
     /// An agent (e.g. a judge or leader run that spawned sub-work).
-    Agent(AgentId),
+    Agent { id: AgentId },
     /// A deterministic routing/scheduling rule (name identifies the rule).
-    Rule(String),
+    Rule { name: String },
     /// A schedule trigger (name identifies the schedule).
-    Schedule(String),
+    Schedule { name: String },
 }
 
 /// A durable intent: what should be done. Runs are execution attempts
@@ -112,5 +112,13 @@ mod tests {
         assert_eq!(json, r#"{"kind":"human"}"#);
         let back: TaskCreator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, TaskCreator::Human);
+        // Internally-tagged enums need struct variants — every variant
+        // must roundtrip (the pipeline creator hit this in the wild).
+        let rule = TaskCreator::Rule {
+            name: "pipeline".into(),
+        };
+        let back: TaskCreator =
+            serde_json::from_str(&serde_json::to_string(&rule).unwrap()).unwrap();
+        assert_eq!(back, rule);
     }
 }

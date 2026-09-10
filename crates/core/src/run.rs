@@ -111,6 +111,9 @@ pub struct Run {
     pub cost_usd: Option<f64>,
     /// Human-readable failure cause when `status == Failed`.
     pub error: Option<String>,
+    /// Final agent text (aggregated message chunks) on completion — the
+    /// compare/handoff unit for fan-out and pipeline topologies.
+    pub result: Option<String>,
     pub stop_reason: Option<StopReason>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -130,6 +133,7 @@ impl Run {
             context_usage: None,
             cost_usd: None,
             error: None,
+            result: None,
             stop_reason: None,
             created_at: now,
             updated_at: now,

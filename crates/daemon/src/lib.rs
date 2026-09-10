@@ -76,6 +76,7 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         root.clone(),
         agents,
         config.policy.to_policy(),
+        config.mcp.clone(),
     ));
 
     let state = api::AppState {

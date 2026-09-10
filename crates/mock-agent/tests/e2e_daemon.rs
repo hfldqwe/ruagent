@@ -17,6 +17,14 @@ struct TestDaemon {
 }
 
 async fn start_daemon(agents_toml: &str, policy_toml: &str) -> TestDaemon {
+    start_daemon_with_routing(agents_toml, policy_toml, "").await
+}
+
+async fn start_daemon_with_routing(
+    agents_toml: &str,
+    policy_toml: &str,
+    routing_toml: &str,
+) -> TestDaemon {
     let root = std::env::temp_dir().join(format!(
         "ruagent-e2e-{}-{}",
         std::process::id(),
@@ -32,6 +40,9 @@ async fn start_daemon(agents_toml: &str, policy_toml: &str) -> TestDaemon {
     )
     .unwrap();
     std::fs::write(config_dir.join("policy.toml"), policy_toml).unwrap();
+    if !routing_toml.is_empty() {
+        std::fs::write(config_dir.join("routing.toml"), routing_toml).unwrap();
+    }
 
     let cfg = DaemonConfig::load(&root).unwrap();
     let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
@@ -47,6 +58,7 @@ async fn start_daemon(agents_toml: &str, policy_toml: &str) -> TestDaemon {
         root.clone(),
         agents,
         cfg.policy.to_policy(),
+        cfg.mcp.clone(),
     ));
 
     let app = ruagent_daemon::api::router(AppState {
@@ -348,4 +360,204 @@ async fn poll_until(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// M2 topology tests
+// ---------------------------------------------------------------------------
+
+fn two_mock_agents_toml() -> String {
+    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    format!(
+        "[agent.mocka]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"echo mock\"\n\n[agent.mockb]\nharness = \"mock\"\ncommand = \"{bin} --behavior plan\"\ndescription = \"plan mock\"\n"
+    )
+}
+
+async fn wait_task_done(http: &reqwest::Client, url: &str, task_id: &str) -> serde_json::Value {
+    poll_until(http, &format!("{url}/api/v1/tasks/{task_id}"), |v| {
+        v["task"]["status"] == "done"
+    })
+    .await
+}
+
+#[tokio::test]
+async fn fanout_compares_and_selects() {
+    let d = start_daemon(&two_mock_agents_toml(), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "compare", "intent": "hello fanout" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+
+    let fan: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/fanout", d.url))
+        .json(&serde_json::json!({ "agents": ["mocka", "mockb"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let runs = fan["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "two parallel runs");
+
+    // Both complete with distinct results.
+    let mut results = Vec::new();
+    for r in runs {
+        let rid = r["id"].as_str().unwrap();
+        let final_run = poll_until(&http, &format!("{}/api/v1/runs/{rid}", d.url), |v| {
+            v["status"] == "completed"
+        })
+        .await;
+        results.push(final_run["result"].as_str().unwrap_or("").to_string());
+    }
+    assert!(results.iter().any(|r| r.contains("echo: hello fanout")));
+    assert!(results.iter().any(|r| r.contains("planned work")));
+
+    // Select the winner: the echo run.
+    let detail = wait_task_done(&http, &d.url, task_id).await;
+    let all_runs = detail["runs"].as_array().unwrap();
+    let winner = all_runs
+        .iter()
+        .find(|r| r["result"].as_str().unwrap_or("").contains("echo:"))
+        .unwrap();
+    let winner_id = winner["id"].as_str().unwrap();
+    let status = http
+        .post(format!("{}/api/v1/runs/{winner_id}/select", d.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(status.is_success());
+
+    let detail: serde_json::Value = http
+        .get(format!("{}/api/v1/tasks/{task_id}", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["selected_run_id"].as_str(), Some(winner_id));
+}
+
+#[tokio::test]
+async fn pipeline_hands_off_upstream_result() {
+    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let agents = format!(
+        "[agent.mock]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"echo mock\"\n"
+    );
+    let d = start_daemon(&agents, "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "pipe", "intent": "say alpha" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+
+    let pipe: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/pipeline", d.url))
+        .json(&serde_json::json!({
+            "steps": [
+                { "agent": "mock" },
+                { "agent": "mock" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sub_tasks = pipe["tasks"].as_array().unwrap();
+    assert_eq!(sub_tasks.len(), 2, "one sub-task per step");
+
+    // Both steps complete; the second one's prompt carried the first one's
+    // result (the mock echoes its prompt, so "alpha" must appear again).
+    let first = wait_task_done(&http, &d.url, sub_tasks[0].as_str().unwrap()).await;
+    let second = wait_task_done(&http, &d.url, sub_tasks[1].as_str().unwrap()).await;
+
+    let r1 = first["runs"][0]["result"].as_str().unwrap_or("");
+    let r2 = second["runs"][0]["result"].as_str().unwrap_or("");
+    assert!(r1.contains("echo: say alpha"), "step 1: {r1}");
+    assert!(
+        r2.contains("alpha") && r2.contains("Upstream result"),
+        "step 2 must receive the handoff: {r2}"
+    );
+}
+
+#[tokio::test]
+async fn routing_rule_picks_agent_without_explicit_pin() {
+    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let agents = format!(
+        "[agent.mocka]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"a\"\n\n[agent.mockb]\nharness = \"mock\"\ncommand = \"{bin} --behavior plan\"\ndescription = \"b\"\n"
+    );
+    let routing = "[[routes]]\nproject = \"proj-x\"\nagent = \"mockb\"\n\ndefault = \"mocka\"\n";
+    let d = start_daemon_with_routing(&agents, "default = \"ask\"\n", routing).await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(
+            &serde_json::json!({ "title": "routed", "intent": "hello route", "project": "proj-x" }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+
+    // No agent named: the rule must pick mockb (plan behavior).
+    let run: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/runs", d.url))
+        .json(&serde_json::json!({ "prompt": "hello route" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    let final_run = poll_until(&http, &format!("{}/api/v1/runs/{run_id}", d.url), |v| {
+        v["status"] == "completed"
+    })
+    .await;
+    let result = final_run["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("planned work"),
+        "rule must route to mockb; run = {final_run}"
+    );
+
+    // And the Routed event with rule provenance is on the stream.
+    let sse = http
+        .get(format!("{}/api/v1/runs/{run_id}/events", d.url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        sse.contains("\"type\":\"routed\"") && sse.contains("rule"),
+        "routed event with rule provenance expected"
+    );
 }
