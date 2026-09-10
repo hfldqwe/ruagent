@@ -1,0 +1,7 @@
+[package]
+name = "ruagent-mock-agent"
+description = "Scriptable mock ACP agent — the CI test backbone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

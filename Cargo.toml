@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["cli", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hfldqwe/ruagent"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# internal
+ruagent-core = { path = "crates/core" }
+ruagent-acp = { path = "crates/acp" }
+ruagent-daemon = { path = "crates/daemon" }
+ruagent-graph = { path = "crates/graph" }
+ruagent-memory = { path = "crates/memory" }
+ruagent-mock-agent = { path = "crates/mock-agent" }
+ruagent-mcp = { path = "crates/mcp" }
+ruagent-orchestrator = { path = "crates/orchestrator" }
+ruagent-policy = { path = "crates/policy" }
+ruagent-store = { path = "crates/store" }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

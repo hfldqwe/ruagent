@@ -1,0 +1,7 @@
+[package]
+name = "ruagent-policy"
+description = "Permission cascade, routing rules, cost policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

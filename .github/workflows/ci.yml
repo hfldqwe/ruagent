@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # Windows is a first-class platform (design §3) but costs 2x CI minutes,
+  # so it runs on main pushes only.
+  rust-windows:
+    name: Rust (windows)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        shell: bash
+        run: cargo test --workspace
+
+  panel:
+    name: Panel (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: has-panel
+        run: echo "ok=$(test -f panel/package.json && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.has-panel.outputs.ok == 'true'
+        with:
+          node-version: 22
+      - name: Build
+        if: steps.has-panel.outputs.ok == 'true'
+        working-directory: panel
+        run: |
+          npm ci
+          npm run build
