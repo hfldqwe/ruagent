@@ -26,6 +26,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/stats", get(stats))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route("/api/v1/tasks/{id}/runs", post(start_run))
@@ -105,6 +106,11 @@ impl axum::response::IntoResponse for ApiError {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok", "service": "ruagent" }))
+}
+
+async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let stats = state.mgr.db().agent_stats().await?;
+    Ok(Json(serde_json::json!({ "agents": stats })))
 }
 
 async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {

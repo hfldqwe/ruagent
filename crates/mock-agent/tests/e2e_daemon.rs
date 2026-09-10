@@ -62,11 +62,12 @@ async fn start_daemon(agents_toml: &str, policy_toml: &str) -> TestDaemon {
     }
 }
 
-fn chrono_tag() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
+/// Unique dir component. Windows SystemTime granularity (~0.5-15ms) makes
+/// nanosecond stamps collide between parallel tests — hence a counter.
+static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn chrono_tag() -> u64 {
+    DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 fn mock_agent_toml(behavior: &str) -> String {

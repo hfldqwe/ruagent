@@ -38,14 +38,9 @@ description = "DeepSeek Harness (native ACP)"
 "#;
 
 async fn start_daemon() -> String {
-    let root = std::env::temp_dir().join(format!(
-        "ruagent-smoke-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("ruagent-smoke-{}-{}", std::process::id(), seq));
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("agents.toml"), REAL_AGENTS_TOML).unwrap();

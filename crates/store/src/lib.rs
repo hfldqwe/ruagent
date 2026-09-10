@@ -268,6 +268,54 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
+// Observability aggregations (design §8.1)
+// ---------------------------------------------------------------------------
+
+/// Cost/usage totals grouped by agent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentStats {
+    pub agent: String,
+    pub runs: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub total_cost_usd: f64,
+    pub last_run_at: Option<String>,
+}
+
+impl Db {
+    /// Aggregate run outcomes and costs per agent.
+    pub async fn agent_stats(&self) -> Result<Vec<AgentStats>, DbError> {
+        self.call(move |conn| -> Result<Vec<AgentStats>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT a.name AS name,
+                        COUNT(*) AS runs,
+                        SUM(CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                        SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                        COALESCE(SUM(r.cost_usd), 0.0) AS total_cost,
+                        MAX(r.created_at) AS last_run
+                 FROM runs r JOIN agents a ON a.id = r.agent
+                 GROUP BY a.name ORDER BY total_cost DESC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(AgentStats {
+                        agent: row.get("name")?,
+                        runs: row.get("runs")?,
+                        completed: row.get("completed")?,
+                        failed: row.get("failed")?,
+                        total_cost_usd: row.get("total_cost")?,
+                        last_run_at: row.get("last_run")?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .map_err(DbError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent registry
 // ---------------------------------------------------------------------------
 
@@ -568,6 +616,44 @@ mod tests {
 
         let runs = db.list_runs_for_task(task.id).await.unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_stats_aggregate_costs() {
+        let db = Db::open_in_memory().unwrap();
+        let card = ruagent_core::AgentCard {
+            id: ruagent_core::AgentId::generate(),
+            name: "claude".into(),
+            harness: ruagent_core::HarnessKind::ClaudeCode,
+            command: None,
+            description: String::new(),
+            model: None,
+            reasoning_effort: None,
+            context_window: None,
+            mcp_profile: None,
+            tags: vec![],
+            enabled: true,
+        };
+        db.upsert_agent(&card).await.unwrap();
+        let task = Task::new("t", "i", TaskCreator::Human);
+        db.insert_task(&task).await.unwrap();
+        for (status, cost) in [
+            (RunStatus::Completed, 0.5),
+            (RunStatus::Completed, 0.25),
+            (RunStatus::Failed, 0.1),
+        ] {
+            let mut run = Run::new(task.id, RunParams::for_agent(card.id));
+            run.status = status;
+            run.cost_usd = Some(cost);
+            db.insert_run(&run).await.unwrap();
+        }
+        let stats = db.agent_stats().await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].agent, "claude");
+        assert_eq!(stats[0].runs, 3);
+        assert_eq!(stats[0].completed, 2);
+        assert_eq!(stats[0].failed, 1);
+        assert!((stats[0].total_cost_usd - 0.85).abs() < 1e-9);
     }
 
     #[tokio::test]
