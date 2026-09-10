@@ -521,12 +521,7 @@ fn routing_decision(state: &AppState, task: &Task) -> Option<ruagent_core::Routi
                 })
             })
             .collect(),
-        default: state
-            .config
-            .routing
-            .default
-            .as_deref()
-            .and_then(|d| resolve(d)),
+        default: state.config.routing.default.as_deref().and_then(resolve),
     };
     ruagent_orchestrator::route(task, &config)
 }

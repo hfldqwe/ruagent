@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ruagent_core::{AgentCard, HarnessKind, ReasoningEffort};
-use ruagent_orchestrator::RoutingConfig;
 use ruagent_policy::PolicyConfig;
 
 /// Everything the daemon needs at boot.
@@ -397,12 +396,13 @@ fn parse_routing(text: &str) -> Result<RoutingFile> {
 const DEFAULT_ROUTING_TOML: &str = r#"# ruagent routing rules (design §5.4/§9.1).
 # Cascade: explicit --agent > first matching route > default.
 # The LLM router tier is a pluggable future addition (off by default).
+# NOTE: top-level keys (default) must come BEFORE any [[routes]] section.
+
+# default = "claude"
 
 # [[routes]]
 # project = "ruagent"
 # agent = "claude"
-
-# default = "claude"
 "#;
 
 #[cfg(test)]
@@ -411,8 +411,12 @@ mod routing_tests {
 
     #[test]
     fn routing_file_parses() {
+        // Top-level keys must come BEFORE [[routes]] sections: in TOML,
+        // a key after an array-of-tables header belongs to that table.
         let f = parse_routing(
             r#"
+default = "dsh"
+
 [[routes]]
 project = "ruagent"
 agent = "claude"
@@ -420,8 +424,6 @@ agent = "claude"
 [[routes]]
 title_contains = "review"
 agent = "opencode"
-
-default = "dsh"
 "#,
         )
         .unwrap();

@@ -322,7 +322,7 @@ mod tests {
 
         // No pin, rule matches by project.
         let d = route(&t, &config).unwrap();
-        assert_eq!(d.source, RouteSource::Rule { .. });
+        assert!(matches!(d.source, RouteSource::Rule { .. }));
         assert_eq!(d.primary(), claude_id);
 
         // Explicit pin wins.

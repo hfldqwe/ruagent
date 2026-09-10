@@ -281,7 +281,7 @@ impl RunManager {
                 let prompt = match (&planned.prompt, &handoff) {
                     (Some(p), _) => p.clone(),
                     (None, Some(up)) => compose_handoff(&base.intent, up),
-                    (None, None) => base.intent.clone(),
+                    (None, None) => base_prompt.clone(),
                 };
                 let card = match mgr.agent(&planned.agent) {
                     Some(c) => c,
