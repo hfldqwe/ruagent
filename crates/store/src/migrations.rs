@@ -9,6 +9,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_agents.sql"),
     include_str!("migrations/0003_m2_results.sql"),
+    include_str!("migrations/0004_memory.sql"),
 ];
 
 /// Apply all pending migrations.
