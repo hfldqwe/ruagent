@@ -11,10 +11,10 @@ use ruagent_acp::permission::{PermissionAnswer, PermissionAsk};
 use ruagent_acp::{RunOptions, adapter_for, run_once};
 use ruagent_core::{
     AgentCard, PermissionKind, PermissionResolution, RouteSource, RoutingDecision, Run, RunEvent,
-    RunId, RunParams, RunStatus, StopReason, Task, TaskStatus,
+    RunId, RunParams, RunStatus, StopReason, Task, TaskCreator, TaskStatus,
 };
 use ruagent_orchestrator::{self, PipelineStep, Topology};
-use ruagent_policy::{PermissionAction, PermissionPolicy};
+use ruagent_policy::PermissionPolicy;
 use ruagent_store::{Db, TranscriptLine, TranscriptWriter, transcript_path};
 use tokio::sync::{broadcast, mpsc};
 
@@ -38,6 +38,18 @@ type PendingEntry = (
 /// Map key: `<run_id>:<tool_call_id>`.
 type PendingMap = Arc<Mutex<HashMap<String, PendingEntry>>>;
 
+/// Where a run executes (design SS8.2: per-run isolation).
+#[derive(Debug, Clone)]
+pub enum WorkspaceSpec {
+    /// Fresh empty dir under `<root>/workspaces/run-<id>` (default).
+    Fresh,
+    /// Explicit working directory.
+    Cwd(PathBuf),
+    /// A git worktree of `repo` on a per-run branch - fan-out agents
+    /// never step on each other (design SS5.2/SS8.2).
+    Worktree { repo: PathBuf },
+}
+
 /// Messages broadcast to live subscribers (SSE/WS).
 #[derive(Debug, Clone)]
 pub enum StreamMsg {
@@ -53,6 +65,11 @@ pub struct RunManager {
     mcp: crate::config::McpConfig,
     broadcast: broadcast::Sender<StreamMsg>,
     pending: PendingMap,
+    /// Resolved id of the approver agent, if configured (tier 2).
+    approver_id: Option<ruagent_core::AgentId>,
+    /// Asks waiting for the approver agent.
+    approver_tx: mpsc::UnboundedSender<PendingPermission>,
+    approver_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<PendingPermission>>>,
 }
 
 impl RunManager {
@@ -64,6 +81,20 @@ impl RunManager {
         mcp: crate::config::McpConfig,
     ) -> Self {
         let (broadcast, _) = broadcast::channel(1024);
+        let (approver_tx, approver_rx) = mpsc::unbounded_channel();
+        // Resolve the approver name into its stable id (if registered).
+        let approver_id = policy
+            .approver
+            .as_ref()
+            .and_then(|a| agents.iter().find(|c| c.name == a.agent).map(|c| c.id));
+        if let Some(approver) = &policy.approver
+            && approver_id.is_none()
+        {
+            tracing::warn!(
+                agent = %approver.agent,
+                "approver agent configured but not registered; tier 2 disabled"
+            );
+        }
         Self {
             db,
             root,
@@ -72,7 +103,90 @@ impl RunManager {
             mcp,
             broadcast,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            approver_id,
+            approver_tx,
+            approver_rx: std::sync::Mutex::new(Some(approver_rx)),
         }
+    }
+
+    /// Start the approver loop (call once after wrapping in Arc).
+    pub fn start_approver_loop(self: &Arc<Self>) {
+        let Some(mut rx) = self.approver_rx.lock().expect("approver rx").take() else {
+            return;
+        };
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(ask) = rx.recv().await {
+                let mgr = Arc::clone(&mgr);
+                tokio::spawn(async move {
+                    if let Err(e) = mgr.run_approver(ask).await {
+                        tracing::warn!(error = %e, "approver run failed; ask stays with the human");
+                    }
+                });
+            }
+        });
+    }
+
+    /// Tier 2: let the approver agent decide a parked ask (design SS9.2).
+    /// Fail-closed: any failure leaves the ask parked for the human.
+    async fn run_approver(&self, ask: PendingPermission) -> Result<()> {
+        let approver = self
+            .policy
+            .approver
+            .as_ref()
+            .context("approver not configured")?;
+        let card = self
+            .agent(&approver.agent)
+            .with_context(|| format!("approver agent `{}` missing", approver.agent))?;
+
+        let prompt = format!(
+            "An agent requests permission to run: {}\nInput: {}\n\nReply with exactly: ALLOW or REJECT",
+            ask.title, ask.raw_input
+        );
+        let mut task = Task::new(
+            format!("approve: {}", ask.title),
+            prompt.clone(),
+            TaskCreator::Rule {
+                name: "approver".into(),
+            },
+        );
+        task.project = Some("ruagent-internal".into());
+        self.db.insert_task(&task).await?;
+
+        let mcp = self.mcp_for(card);
+        let run = self
+            .start_run(
+                &task,
+                &approver.agent,
+                prompt,
+                mcp,
+                WorkspaceSpec::Fresh,
+                Some(RoutingDecision::explicit(card.id)),
+            )
+            .await?;
+        let final_run = wait_terminal(&self.db, run.id).await?;
+        if final_run.status != RunStatus::Completed {
+            anyhow::bail!("approver run {:?}: no verdict", final_run.status);
+        }
+        let text = final_run.result.unwrap_or_default().to_lowercase();
+        // REJECT first: an ambiguous "allow or reject" echo must not allow.
+        let want = if text.contains("reject") {
+            [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
+        } else if text.contains("allow") {
+            [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+        } else {
+            anyhow::bail!("approver verdict unclear: {text:?}");
+        };
+        let Some(choice) = ask.choices.iter().find(|c| want.contains(&c.kind)) else {
+            anyhow::bail!("no matching option offered for the verdict");
+        };
+
+        let key = format!("{}:{}", ask.run_id, ask.tool_call_id);
+        self.resolve_internal(
+            &key,
+            PermissionAnswer::Select(choice.option_id.clone()),
+            PermissionResolution::ApproverAgent { agent: card.id },
+        )
     }
 
     pub fn broadcast(&self) -> broadcast::Receiver<StreamMsg> {
@@ -110,16 +224,23 @@ impl RunManager {
     /// Answer a parked permission ask (the human inbox path). `key` is
     /// `<run_id>:<tool_call_id>` as listed by `pending_permissions`.
     pub fn resolve_permission(&self, key: &str, answer: PermissionAnswer) -> Result<()> {
+        self.resolve_internal(key, answer, PermissionResolution::Human)
+    }
+
+    fn resolve_internal(
+        &self,
+        key: &str,
+        answer: PermissionAnswer,
+        resolution: PermissionResolution,
+    ) -> Result<()> {
         let entry = self
             .pending
             .lock()
             .expect("pending lock")
             .remove(key)
-            .with_context(|| format!("no pending permission `{key}`"))?;
+            .with_context(|| format!("no pending permission `{key}` (already resolved?)"))?;
         let (pending, ev_tx, answer_tx) = entry;
 
-        // Emit the resolution event into the run's stream (attribution:
-        // human, since rules would have auto-answered at arrival).
         let outcome = match &answer {
             PermissionAnswer::Select(id) => pending
                 .choices
@@ -132,7 +253,7 @@ impl RunManager {
         let _ = ev_tx.send(RunEvent::PermissionResolved {
             tool_call_id: pending.tool_call_id.clone(),
             outcome,
-            resolution: PermissionResolution::Human,
+            resolution,
         });
         answer_tx
             .send(answer)
@@ -147,7 +268,7 @@ impl RunManager {
         agent_name: &str,
         prompt: String,
         mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
-        cwd_override: Option<PathBuf>,
+        workspace_spec: WorkspaceSpec,
         routed: Option<RoutingDecision>,
     ) -> Result<Run> {
         let card = self
@@ -159,11 +280,35 @@ impl RunManager {
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
 
-        // Per-run isolated workspace (design §8.2; git worktrees in M2).
-        let workspace = cwd_override
-            .unwrap_or_else(|| self.root.join("workspaces").join(format!("run-{}", run.id)));
-        std::fs::create_dir_all(&workspace)
-            .with_context(|| format!("creating workspace {}", workspace.display()))?;
+        // Per-run isolated workspace (design §8.2).
+        let workspace = match workspace_spec {
+            WorkspaceSpec::Fresh => {
+                let dir = self.root.join("workspaces").join(format!("run-{}", run.id));
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("creating workspace {}", dir.display()))?;
+                dir
+            }
+            WorkspaceSpec::Cwd(dir) => dir,
+            WorkspaceSpec::Worktree { repo } => {
+                let dir = self.root.join("worktrees").join(format!("run-{}", run.id));
+                let branch = format!("ruagent/run-{}", run.id);
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["worktree", "add", "-b", &branch])
+                    .arg(&dir)
+                    .output()
+                    .with_context(|| "spawning git for worktree add")?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "git worktree add failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                tracing::info!(branch = %branch, worktree = %dir.display(), "worktree created");
+                dir
+            }
+        };
         run.workspace = Some(workspace.to_string_lossy().into_owned());
 
         run.status = RunStatus::Spawning;
@@ -180,6 +325,8 @@ impl RunManager {
         let broadcast = self.broadcast.clone();
         let pending = self.pending.clone();
         let policy = self.policy.clone();
+        let approver_id = self.approver_id;
+        let approver_tx = self.approver_tx.clone();
         let task_id = task.id;
         let run_id = run.id;
         let cwd = workspace.clone();
@@ -192,6 +339,8 @@ impl RunManager {
                 broadcast,
                 pending,
                 policy,
+                approver_id,
+                approver_tx,
                 run.clone(),
                 task_id,
                 spec,
@@ -222,6 +371,7 @@ impl RunManager {
         task: &Task,
         agents: &[String],
         prompt: String,
+        repo: Option<PathBuf>,
     ) -> Result<Vec<Run>> {
         let topology = Topology::FanOut {
             agents: agents.to_vec(),
@@ -238,13 +388,17 @@ impl RunManager {
                 rationale: Some("fan-out member".into()),
             };
             let mcp = self.mcp_for(card);
+            let spec = match &repo {
+                Some(r) => WorkspaceSpec::Worktree { repo: r.clone() },
+                None => WorkspaceSpec::Fresh,
+            };
             let run = self
                 .start_run(
                     task,
                     &planned.agent,
                     prompt.clone(),
                     mcp,
-                    None,
+                    spec,
                     Some(decision),
                 )
                 .await?;
@@ -302,7 +456,7 @@ impl RunManager {
                         &planned.agent,
                         prompt,
                         mcp,
-                        None,
+                        WorkspaceSpec::Fresh,
                         Some(decision),
                     )
                     .await
@@ -346,6 +500,8 @@ async fn supervise(
     broadcast: broadcast::Sender<StreamMsg>,
     pending: PendingMap,
     policy: PermissionPolicy,
+    approver_id: Option<ruagent_core::AgentId>,
+    approver_tx: mpsc::UnboundedSender<PendingPermission>,
     mut run: Run,
     task_id: ruagent_core::TaskId,
     spec: ruagent_acp::SpawnSpec,
@@ -454,15 +610,16 @@ async fn supervise(
                         raw_input: raw_input.clone(),
                         choices: choices.clone(),
                     };
-                    match policy.decide(&title) {
-                        action @ (PermissionAction::Allow | PermissionAction::Reject) => {
-                            let wanted = if matches!(action, PermissionAction::Allow) {
+                    let asking = run.params.agent.to_string();
+                    let approver = approver_id.map(|i| i.to_string());
+                    match policy.path(&title, Some(&asking), approver.as_deref()) {
+                        ruagent_policy::PermissionPath::Auto(action) => {
+                            let wanted = if matches!(action, ruagent_policy::PermissionAction::Allow) {
                                 [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
                             } else {
                                 [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
                             };
-                            let choice = choices.iter().find(|c| wanted.contains(&c.kind));
-                            match choice {
+                            match choices.iter().find(|c| wanted.contains(&c.kind)) {
                                 Some(c) => {
                                     emit(&mut transcript, &broadcast, &run, RunEvent::PermissionResolved {
                                         tool_call_id: tool_call_id.clone(),
@@ -479,8 +636,17 @@ async fn supervise(
                                 }
                             }
                         }
-                        PermissionAction::Ask => {
-                            // Park for the human inbox (fail-closed default).
+                        ruagent_policy::PermissionPath::Delegate => {
+                            // Park for the human (override still possible)
+                            // AND hand to the approver agent (tier 2).
+                            let key = format!("{}:{}", info.run_id, info.tool_call_id);
+                            pending
+                                .lock()
+                                .expect("pending lock")
+                                .insert(key, (info.clone(), ev_tx.clone(), answer));
+                            let _ = approver_tx.send(info);
+                        }
+                        ruagent_policy::PermissionPath::Human => {
                             let key = format!("{}:{}", info.run_id, info.tool_call_id);
                             pending
                                 .lock()

@@ -60,6 +60,7 @@ async fn start_daemon_with_routing(
         cfg.policy.to_policy(),
         cfg.mcp.clone(),
     ));
+    mgr.start_approver_loop();
 
     let app = ruagent_daemon::api::router(AppState {
         mgr,
@@ -560,4 +561,205 @@ async fn routing_rule_picks_agent_without_explicit_pin() {
         sse.contains("\"type\":\"routed\"") && sse.contains("rule"),
         "routed event with rule provenance expected"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M2 worktree isolation (design SS8.2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fanout_with_repo_gives_each_run_its_own_worktree() {
+    // A real git repo to isolate in.
+    static REPO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = REPO_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let repo = std::env::temp_dir().join(format!("ruagent-repo-{}-{}", std::process::id(), seq));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("hello.txt"), "base").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let d = start_daemon(
+        &two_mock_agents_toml(),
+        "default = \"ask\"
+",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "wt", "intent": "hello wt" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+
+    let fan: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/fanout", d.url))
+        .json(&serde_json::json!({
+            "agents": ["mocka", "mockb"],
+            "repo": repo.to_string_lossy().replace('\\', "/")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let runs = fan["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+
+    let mut workspaces = Vec::new();
+    for r in runs {
+        let rid = r["id"].as_str().unwrap();
+        let final_run = poll_until(&http, &format!("{}/api/v1/runs/{rid}", d.url), |v| {
+            v["status"] == "completed"
+        })
+        .await;
+        let ws = final_run["workspace"].as_str().unwrap().to_string();
+        // The worktree contains the repo's file and is under worktrees/.
+        assert!(ws.replace('\\', "/").contains("/worktrees/"), "ws = {ws}");
+        assert!(
+            std::path::Path::new(&ws).join("hello.txt").is_file(),
+            "repo content in {ws}"
+        );
+        // And it is a real worktree on its own branch.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(branch.starts_with("ruagent/run-"), "branch = {branch}");
+        workspaces.push(ws);
+    }
+    assert_ne!(
+        workspaces[0], workspaces[1],
+        "runs must not share a worktree"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+// ---------------------------------------------------------------------------
+// M2 approver agent (design SS9.2, tier 2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn approver_agent_answers_ask_unattended() {
+    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    // worker: permission behavior (asks before writing)
+    // approver: approve behavior (replies exactly ALLOW)
+    let agents = format!(
+        "[agent.worker]\nharness = \"mock\"\ncommand = \"{bin} --behavior permission\"\ndescription = \"asks\"\n\n[agent.approver]\nharness = \"mock\"\ncommand = \"{bin} --behavior approve\"\ndescription = \"approves\"\n"
+    );
+    let policy = "[permissions]\ndefault = \"ask\"\n\n[permissions.approver]\nagent = \"approver\"\nhigh_risk = [\"delete\"]\n";
+    let d = start_daemon(&agents, policy).await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "unattended", "intent": "write something" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+
+    let run: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/runs", d.url))
+        .json(&serde_json::json!({ "agent": "worker", "prompt": "write something" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+
+    // The run completes WITHOUT any human action: the approver agent
+    // answered the parked ask.
+    let sse = http
+        .get(format!("{}/api/v1/runs/{run_id}/events", d.url))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        sse.contains("permission allowed"),
+        "worker proceeds after approval"
+    );
+    assert!(
+        sse.contains("\"source\":\"approver_agent\""),
+        "approver attribution recorded"
+    );
+
+    // The inbox is empty afterwards (the approver consumed the ask).
+    let pending: serde_json::Value = http
+        .get(format!("{}/api/v1/permissions", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(pending["pending"].as_array().unwrap().is_empty());
+
+    // And the approver's decision run exists as a real, traced task.
+    let tasks: serde_json::Value = http
+        .get(format!("{}/api/v1/tasks", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let approve_task = tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["title"].as_str().unwrap_or("").starts_with("approve:"))
+        .expect("approver run recorded as a task");
+    assert_eq!(approve_task["status"], "done");
 }

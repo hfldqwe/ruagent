@@ -71,6 +71,7 @@ async fn start_daemon() -> String {
         cfg.policy.to_policy(),
         cfg.mcp.clone(),
     ));
+    mgr.start_approver_loop();
     let app = ruagent_daemon::api::router(AppState {
         mgr,
         config: Arc::new(cfg),

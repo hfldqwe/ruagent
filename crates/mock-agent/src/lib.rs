@@ -10,7 +10,7 @@
 use agent_client_protocol::schema::v1::ContentBlock;
 
 /// All selectable behaviors.
-pub const BEHAVIORS: &[&str] = &["echo", "toolcall", "permission", "plan", "crash"];
+pub const BEHAVIORS: &[&str] = &["echo", "toolcall", "permission", "plan", "crash", "approve"];
 
 /// What the mock agent does when prompted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,8 @@ pub enum Behavior {
     Plan,
     /// Stream one chunk, then exit(1) — simulates a crashed harness.
     Crash,
+    /// Reply with exactly "ALLOW" — plays the approver agent in tests.
+    Approve,
 }
 
 impl Behavior {
@@ -35,6 +37,7 @@ impl Behavior {
             "permission" => Some(Behavior::Permission),
             "plan" => Some(Behavior::Plan),
             "crash" => Some(Behavior::Crash),
+            "approve" => Some(Behavior::Approve),
             _ => None,
         }
     }

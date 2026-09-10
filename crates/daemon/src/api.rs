@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::config::DaemonConfig;
-use crate::runs::{PendingPermission, RunManager};
+use crate::runs::{PendingPermission, RunManager, WorkspaceSpec};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -198,6 +198,8 @@ struct StartRunRequest {
     agent: Option<String>,
     prompt: Option<String>,
     cwd: Option<String>,
+    /// Git repo to isolate this run in (worktree on a per-run branch).
+    repo: Option<String>,
 }
 
 async fn start_run(
@@ -259,16 +261,16 @@ async fn start_run(
         .mcp
         .expand_profile(card.mcp_profile.as_deref(), &card.name);
 
+    let workspace_spec = match (req.cwd.as_deref(), req.repo.as_deref()) {
+        (Some(cwd), _) => WorkspaceSpec::Cwd(std::path::PathBuf::from(cwd)),
+        (None, Some(repo)) => WorkspaceSpec::Worktree {
+            repo: std::path::PathBuf::from(repo),
+        },
+        (None, None) => WorkspaceSpec::Fresh,
+    };
     let run = state
         .mgr
-        .start_run(
-            &task,
-            &agent,
-            prompt,
-            mcp,
-            req.cwd.map(std::path::PathBuf::from),
-            Some(decision),
-        )
+        .start_run(&task, &agent, prompt, mcp, workspace_spec, Some(decision))
         .await?;
     Ok(Json(run))
 }
@@ -277,6 +279,8 @@ async fn start_run(
 struct FanOutRequest {
     agents: Vec<String>,
     prompt: Option<String>,
+    /// Git repo: every fan-out member gets its own worktree (design SS8.2).
+    repo: Option<String>,
 }
 
 /// Fan-out compare (design §5.2): same prompt to N agents in parallel.
@@ -295,7 +299,15 @@ async fn start_fanout(
         .await?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
     let prompt = req.prompt.unwrap_or_else(|| task.intent.clone());
-    let runs = state.mgr.start_fanout(&task, &req.agents, prompt).await?;
+    let runs = state
+        .mgr
+        .start_fanout(
+            &task,
+            &req.agents,
+            prompt,
+            req.repo.map(std::path::PathBuf::from),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "runs": runs })))
 }
 

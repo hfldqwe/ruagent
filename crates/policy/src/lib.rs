@@ -17,11 +17,37 @@ pub enum PermissionAction {
     Ask,
 }
 
+/// The full resolution path for a permission request (design SS9.2):
+/// rules auto-answer; the approver agent delegates; the human inbox is
+/// the fail-closed floor. High-risk titles and the approver's own runs
+/// always go to the human.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermissionPath {
+    /// A deterministic rule decided.
+    Auto(PermissionAction),
+    /// The configured approver agent decides (unattended operation).
+    Delegate,
+    /// Park in the human inbox.
+    Human,
+}
+
 /// The M1 permission rule set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionPolicy {
     pub default: PermissionAction,
     pub rules: Vec<PermissionRule>,
+    /// Approver agent name (tier 2). None disables delegation.
+    pub approver: Option<ApproverConfig>,
+}
+
+/// Tier-2 configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApproverConfig {
+    /// Agent name that decides on behalf of the human.
+    pub agent: String,
+    /// Title substrings that ALWAYS escalate to the human, regardless of
+    /// the approver (design SS9.2 hard constraint).
+    pub high_risk: Vec<String>,
 }
 
 /// One rule: matches when the tool title contains `title_contains`.
@@ -44,6 +70,40 @@ impl PermissionPolicy {
         }
         self.default
     }
+
+    /// The full path for a request, honoring the approver tier.
+    /// `asking_agent` is the agent of the run that asked (as an id
+    /// string); `approver_agent_id` is the resolved approver id.
+    pub fn path(
+        &self,
+        title: &str,
+        asking_agent: Option<&str>,
+        approver_agent_id: Option<&str>,
+    ) -> PermissionPath {
+        let action = self.decide(title);
+        if !matches!(action, PermissionAction::Ask) {
+            return PermissionPath::Auto(action);
+        }
+        let Some(approver) = &self.approver else {
+            return PermissionPath::Human;
+        };
+        // High-risk titles always escalate to the human.
+        let lower = title.to_lowercase();
+        if approver
+            .high_risk
+            .iter()
+            .any(|h| lower.contains(&h.to_lowercase()))
+        {
+            return PermissionPath::Human;
+        }
+        // The approver cannot approve runs it participates in.
+        if let (Some(asking), Some(approver_id)) = (asking_agent, approver_agent_id)
+            && asking == approver_id
+        {
+            return PermissionPath::Human;
+        }
+        PermissionPath::Delegate
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +123,18 @@ pub struct PermissionsConfig {
     pub default: Option<String>,
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+    #[serde(default)]
+    pub approver: Option<ApproverFileConfig>,
+}
+
+/// `[permissions.approver]` section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApproverFileConfig {
+    /// Agent name that decides on behalf of the human.
+    pub agent: String,
+    /// Title substrings that always escalate to the human.
+    #[serde(default)]
+    pub high_risk: Vec<String>,
 }
 
 /// One `[[permissions.rules]]` entry.
@@ -98,6 +170,10 @@ impl PolicyConfig {
                     })
                 })
                 .collect(),
+            approver: self.permissions.approver.as_ref().map(|a| ApproverConfig {
+                agent: a.agent.clone(),
+                high_risk: a.high_risk.clone(),
+            }),
         }
     }
 }
@@ -129,6 +205,7 @@ mod tests {
                     action: PermissionAction::Reject,
                 },
             ],
+            approver: None,
         };
         assert_eq!(policy.decide("Read file"), PermissionAction::Allow);
         assert_eq!(policy.decide("WRITE FILE now"), PermissionAction::Reject);
@@ -150,6 +227,60 @@ action = "allow"
         assert_eq!(policy.default, PermissionAction::Ask);
         assert_eq!(policy.decide("Read file"), PermissionAction::Allow);
         assert_eq!(policy.decide("Delete repo"), PermissionAction::Ask);
+    }
+
+    #[test]
+    fn approver_tier_delegates_with_constraints() {
+        let policy = PermissionPolicy {
+            default: PermissionAction::Ask,
+            rules: vec![],
+            approver: Some(ApproverConfig {
+                agent: "claude".into(),
+                high_risk: vec!["delete".into()],
+            }),
+        };
+        let approver_id = "approver-uuid";
+        // Normal ask from another agent -> delegate.
+        assert_eq!(
+            policy.path("Write file", Some("other-uuid"), Some(approver_id)),
+            PermissionPath::Delegate
+        );
+        // The approver's own run -> human (no self-approval).
+        assert_eq!(
+            policy.path("Write file", Some(approver_id), Some(approver_id)),
+            PermissionPath::Human
+        );
+        // High-risk -> human, always.
+        assert_eq!(
+            policy.path("Delete the repo", Some("other-uuid"), Some(approver_id)),
+            PermissionPath::Human
+        );
+        // No approver configured -> human.
+        let no_approver = PermissionPolicy {
+            default: PermissionAction::Ask,
+            rules: vec![],
+            approver: None,
+        };
+        assert_eq!(
+            no_approver.path("Write file", Some("other-uuid"), None),
+            PermissionPath::Human
+        );
+        // Rules still auto-answer before any delegation.
+        let ruled = PermissionPolicy {
+            default: PermissionAction::Ask,
+            rules: vec![PermissionRule {
+                title_contains: "read".into(),
+                action: PermissionAction::Allow,
+            }],
+            approver: Some(ApproverConfig {
+                agent: "claude".into(),
+                high_risk: vec![],
+            }),
+        };
+        assert_eq!(
+            ruled.path("Read file", Some("x"), Some("y")),
+            PermissionPath::Auto(PermissionAction::Allow)
+        );
     }
 
     #[test]

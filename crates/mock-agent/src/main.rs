@@ -171,6 +171,13 @@ async fn main() -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
+                        Behavior::Approve => {
+                            notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("ALLOW")),
+                            )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
                         Behavior::Crash => {
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new("about to crash")),

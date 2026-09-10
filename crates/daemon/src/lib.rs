@@ -78,6 +78,7 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         config.policy.to_policy(),
         config.mcp.clone(),
     ));
+    mgr.start_approver_loop();
 
     let state = api::AppState {
         mgr,
