@@ -18,6 +18,9 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [agent, setAgent] = useState<string>("");
   const [prompt, setPrompt] = useState("");
   const [streamRun, setStreamRun] = useState<string | null>(null);
+  const [selectedRun, setSelectedRun] = useState<string | null>(null);
+  const [fanoutOpen, setFanoutOpen] = useState(false);
+  const [fanoutAgents, setFanoutAgents] = useState<string[]>([]);
   const [lines, setLines] = useState<TranscriptLine[]>([]);
   const [liveStatus, setLiveStatus] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -28,6 +31,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
       .then((r) => {
         setTask(r.task);
         setRuns(r.runs);
+        setSelectedRun((r as { selected_run_id?: string | null }).selected_run_id ?? null);
       })
       .catch(() => {});
   };
@@ -113,8 +117,94 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
             <button className="primary" onClick={start}>
               Run
             </button>
+            <button onClick={() => setFanoutOpen((v) => !v)}>Fan out…</button>
           </div>
+          {fanoutOpen && (
+            <div className="fanout">
+              <p className="muted">
+                Same prompt to several agents in parallel; compare the results and pick one
+                (design &sect;5.2).
+              </p>
+              <div className="row">
+                {agents
+                  .filter((a) => a.enabled)
+                  .map((a) => (
+                    <label key={a.name} className="check">
+                      <input
+                        type="checkbox"
+                        checked={fanoutAgents.includes(a.name)}
+                        onChange={(e) =>
+                          setFanoutAgents((prev) =>
+                            e.target.checked
+                              ? [...prev, a.name]
+                              : prev.filter((n) => n !== a.name),
+                          )
+                        }
+                      />
+                      {a.name}
+                    </label>
+                  ))}
+                <button
+                  className="primary"
+                  disabled={fanoutAgents.length < 2}
+                  onClick={async () => {
+                    const { runs } = await api.fanout(
+                      id,
+                      fanoutAgents,
+                      prompt.trim() || task!.intent,
+                    );
+                    setFanoutOpen(false);
+                    setFanoutAgents([]);
+                    if (runs[0]) setStreamRun(runs[0].id);
+                    refresh();
+                  }}
+                >
+                  Fan out ({fanoutAgents.length})
+                </button>
+              </div>
+            </div>
+          )}
         </div>
+      )}
+
+      {runs.length > 1 && (
+        <>
+          <h3>Comparison</h3>
+          <div className="compare">
+            {runs.map((r) => (
+              <div
+                key={r.id}
+                className={selectedRun === r.id ? "card compare-card selected" : "card compare-card"}
+              >
+                <div className="row">
+                  <StatusDot status={r.status} />
+                  <strong>{agentName(agents, r)}</strong>
+                  {r.cost_usd != null && <span className="muted">${r.cost_usd.toFixed(4)}</span>}
+                  {selectedRun === r.id && <span className="tag">selected</span>}
+                </div>
+                <pre className="raw">
+                  {r.result ?? "(no result yet)"}
+                </pre>
+                <div className="row">
+                  <button className="link" onClick={() => setStreamRun(r.id)}>
+                    view stream
+                  </button>
+                  {r.status === "completed" && selectedRun !== r.id && (
+                    <button
+                      className="primary"
+                      onClick={async () => {
+                        await api.selectRun(r.id);
+                        refresh();
+                      }}
+                    >
+                      Select
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
       )}
 
       <h3>Runs</h3>
@@ -154,6 +244,11 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
       )}
     </div>
   );
+}
+
+function agentName(agents: AgentInfo[], run: Run): string {
+  // Runs store agent ids; the compare view wants names.
+  return agents.find((a) => a.id === run.params.agent)?.name ?? run.params.agent.slice(0, 8);
 }
 
 function fmtTokens(n: number): string {

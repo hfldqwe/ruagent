@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
-import { api, type AgentInfo, type PendingPermission, type Task } from "./api";
+import { api, type AgentInfo, type AgentStats, type McpRegistry, type PendingPermission, type Task } from "./api";
 import { TaskDetail } from "./views/TaskDetail";
 
-type Tab = "tasks" | "agents" | "permissions";
+type Tab = "tasks" | "agents" | "stats" | "permissions";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("tasks");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [stats, setStats] = useState<AgentStats[]>([]);
+  const [mcp, setMcp] = useState<McpRegistry | null>(null);
   const [pending, setPending] = useState<PendingPermission[]>([]);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -16,12 +18,26 @@ export default function App() {
     api.tasks().then(setTasks).catch((e) => setError(String(e)));
     api.agents().then(setAgents).catch(() => {});
     api.pendingPermissions().then(setPending).catch(() => {});
+    api.stats().then(setStats).catch(() => {});
   };
 
   useEffect(() => {
     refresh();
+    api.mcp().then(setMcp).catch(() => {});
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
+  }, []);
+
+  // Deep links: #task/<id> opens that task (also makes the compare view
+  // reachable by URL).
+  useEffect(() => {
+    const apply = () => {
+      const m = window.location.hash.match(/^#task\/([\w-]+)/);
+      setSelectedTask(m ? m[1] : null);
+    };
+    apply();
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
   }, []);
 
   const tabButton = (t: Tab, label: string, badge?: number) => (
@@ -44,17 +60,31 @@ export default function App() {
         <span className="brand">ruagent</span>
         {tabButton("tasks", "Tasks")}
         {tabButton("agents", "Agents")}
+        {tabButton("stats", "Stats")}
         {tabButton("permissions", "Permissions", pending.length)}
       </header>
       {error && <div className="error">{error}</div>}
       <main>
         {tab === "tasks" &&
           (selectedTask ? (
-            <TaskDetail id={selectedTask} onBack={() => setSelectedTask(null)} />
+            <TaskDetail
+              id={selectedTask}
+              onBack={() => {
+                setSelectedTask(null);
+                history.replaceState(null, "", location.pathname);
+              }}
+            />
           ) : (
-            <TaskList tasks={tasks} onSelect={setSelectedTask} />
+            <TaskList
+              tasks={tasks}
+              onSelect={(id) => {
+                setSelectedTask(id);
+                location.hash = `task/${id}`;
+              }}
+            />
           ))}
-        {tab === "agents" && <AgentsView agents={agents} />}
+        {tab === "agents" && <AgentsView agents={agents} mcp={mcp} />}
+        {tab === "stats" && <StatsView stats={stats} />}
         {tab === "permissions" && <PermissionsView pending={pending} onChanged={refresh} />}
       </main>
     </div>
@@ -107,7 +137,7 @@ function TaskList({ tasks, onSelect }: { tasks: Task[]; onSelect: (id: string) =
   );
 }
 
-function AgentsView({ agents }: { agents: AgentInfo[] }) {
+function AgentsView({ agents, mcp }: { agents: AgentInfo[]; mcp: McpRegistry | null }) {
   return (
     <div>
       {agents.map((a) => (
@@ -121,6 +151,62 @@ function AgentsView({ agents }: { agents: AgentInfo[] }) {
           <p className="muted">{a.description}</p>
         </div>
       ))}
+      <h3>MCP registry</h3>
+      {mcp && mcp.servers.length > 0 ? (
+        mcp.servers.map((s) => (
+          <div key={s.name} className="card">
+            <div className="row">
+              <strong>{s.name}</strong>
+              {s.inject_for && <span className="tag">{s.inject_for.join(", ")}</span>}
+            </div>
+            <p className="muted">{s.url ?? s.command}</p>
+          </div>
+        ))
+      ) : (
+        <p className="muted">
+          No MCP servers registered. Add them to mcp.toml (design &sect;7.1: injection is an
+          overlay &mdash; each CLI&rsquo;s own config is never touched).
+        </p>
+      )}
+      {mcp && mcp.profiles.length > 0 && (
+        <p className="muted">
+          Profiles: {mcp.profiles.map((p) => `${p.name} (${p.servers.length})`).join(" · ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function StatsView({ stats }: { stats: AgentStats[] }) {
+  if (stats.length === 0) return <p className="muted">No runs recorded yet.</p>;
+  return (
+    <div className="card">
+      <table className="stats">
+        <thead>
+          <tr>
+            <th>agent</th>
+            <th>runs</th>
+            <th>completed</th>
+            <th>failed</th>
+            <th>cost</th>
+            <th>last run</th>
+          </tr>
+        </thead>
+        <tbody>
+          {stats.map((s) => (
+            <tr key={s.agent}>
+              <td>{s.agent}</td>
+              <td>{s.runs}</td>
+              <td>{s.completed}</td>
+              <td>{s.failed}</td>
+              <td>${s.total_cost_usd.toFixed(4)}</td>
+              <td className="muted">
+                {s.last_run_at ? new Date(s.last_run_at).toLocaleString() : "-"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

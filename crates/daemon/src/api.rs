@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/mcp", get(mcp_registry))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route("/api/v1/tasks/{id}/runs", post(start_run))
@@ -116,6 +117,33 @@ async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>,
     Ok(Json(serde_json::json!({ "agents": stats })))
 }
 
+/// The MCP registry as configured (design SS7.1). Live health pinging
+/// arrives with the M3 platform MCP server.
+async fn mcp_registry(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let servers: Vec<serde_json::Value> = state
+        .config
+        .mcp
+        .servers
+        .iter()
+        .map(|(name, e)| {
+            serde_json::json!({
+                "name": name,
+                "command": e.command,
+                "url": e.url,
+                "inject_for": e.inject_for,
+            })
+        })
+        .collect();
+    let profiles: Vec<serde_json::Value> = state
+        .config
+        .mcp
+        .profiles
+        .iter()
+        .map(|(name, servers)| serde_json::json!({ "name": name, "servers": servers }))
+        .collect();
+    Json(serde_json::json!({ "servers": servers, "profiles": profiles }))
+}
+
 async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
     let agents: Vec<serde_json::Value> = state
         .mgr
@@ -123,6 +151,7 @@ async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
         .into_iter()
         .map(|a| {
             serde_json::json!({
+                "id": a.id.to_string(),
                 "name": a.name,
                 "harness": format!("{:?}", a.harness),
                 "description": a.description,
