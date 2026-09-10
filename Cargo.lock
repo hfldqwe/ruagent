@@ -1848,6 +1848,14 @@ dependencies = [
 [[package]]
 name = "ruagent-graph"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ruagent-store",
+ "rusqlite",
+ "serde",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "ruagent-mcp"
