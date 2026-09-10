@@ -1,6 +1,6 @@
 # ruagent 设计文档
 
-日期：2026-09-11 ｜ 状态：已与所有者逐段确认 ｜ 修订：v1（④ 待 KG/Karpathy 专项调研补强）
+日期：2026-09-11 ｜ 状态：已与所有者逐段确认 ｜ 修订：v1.1（§6.6 按专项调研落地，见 docs/research/2026-09-11-knowledge-graph-karpathy.md）
 
 调研依据见 `docs/research/`（OpenViking / Multica+LoopX / ACP 生态 / Agno / Agent 工程实践 五份报告）。
 
@@ -190,11 +190,29 @@ SQLite（结构）+ LanceDB（向量）之上盖 URI 寻址层，经 MCP 工具�
 
 daemon 内嵌 MCP server（rmcp）：记忆/知识查写 + 平台操作（查任务、领工作），经统一 MCP 配置注入每个 agent。这是外部 CLI 吃到中央记忆的**唯一接缝**。
 
-### 6.6 KG/Karpathy 补强方向（专项调研进行中，落地后修订本节）
+### 6.6 KG/Karpathy 补强（专项调研已落地，2026-09-11 修订）
 
-1. **记忆层级以 LLM OS 隐象重构**：上下文=RAM（注入即换页）/ MCP pull=按需读盘 / 知识库=冷存储
-2. **Entities 升级为真属性图**：类型化节点/边 + 双时间线有效性（valid_from/valid_to，事件时间 vs 知悉时间）+ 多跳查询进 MCP
-3. **混合检索融合**：向量 + 关键词 + 图遍历三路召回；社区摘要类 LLM 重活以分层目录摘要替代（避开成本陷阱）
+调研报告：`docs/research/2026-09-11-knowledge-graph-karpathy.md`。要点与修正：
+
+- **认知修正（nanochat）**：Karpathy 的真实记忆方案不是向量库，而是「Claude Code + read-arxiv-paper skill + `knowledge/` 目录里 agent 写的带标签 Markdown 摘要 + 私有 CLAUDE.md」。**单用户规模下，"文件系统 + agent 写的带标签 Markdown + 私有指令文件"在信任、可调试性、成本上胜过嵌入管道——语义检索是叠加在上面的加速器，不是基座。**
+- **记忆层级 = LLM OS 隐喻**（Karpathy 2023）：上下文=RAM（注入即换页，按"下一步"优化而非单个 prompt）/ MCP pull=按需读盘 / 知识库=冷存储 / compaction=逐出。
+
+M3 实现蓝图（borrow-list，按价值排序）：
+
+1. **双时间线属性图**（Graphiti 核心，全场最高价值点）：`edges` 带 `valid_at/invalid_at`（事件时间 T）+ `created_at/expired_at`（知悉时间 T'）；**失效不删除** → 支持"任意时点为真"查询；索引 `invalid_at` 供"当前事实"扫描。
+2. **Episodes 非有损基座**：原始轮次先落库（同步、微秒级），内容哈希去重使摄取幂等；实体/边引用来源 episodes——**抽取逻辑升级后图可重建**（SQLite 是真相，LanceDB 是派生索引）。
+3. **检索零 LLM**：LanceDB ANN（语义）+ SQLite FTS5（BM25）+ 递归 CTE 图游走（1-2 跳）→ **RRF 融合** → 时间过滤（`valid_at ≤ now < invalid_at`）+ 新近度衰减（VikingMem time-weighted recall）。LLM 预算全部放在**写路径**（摊销到未来所有查询）。
+4. **分层摘要 L0/L1/L2**（token 经济引擎）：~256 字摘要（嵌入、检索单元）/ ~4K 概览（重排单元）/ 全文按需。
+5. **两条写入路径**：显式 `/remember`（高信任、保留原文）+ 自动抽取（便宜模型、哈希缓存、schema 约束、低置信度直至巩固）。VikingMem 原则 1：**选择性胜过完整性**。
+6. **schema 驱动记忆类型 + `memory_diffs` 审计日志**（before/after/原因码跳过记录）。
+7. **记忆即文件**：底层 SQLite+LanceDB，对外暴露为可浏览文件树（Markdown+frontmatter）——人可审计、agent 可 ls/read、git 免费版本化；索引丢失可优雅降级（Letta MemFS / Karpathy knowledge/ / viking:// 同族设计）。
+8. **梦境化巩固**（Letta dreaming / sleep-time compute）：后台/夜间任务重读近期会话蒸馏教训，永不阻塞 agent。
+9. **实体消解廉价版**：嵌入+FTS5 出候选 → 仅在合并有后果时用 LLM 确认；边去重搜索限定同实体对（Graphiti 自己的复杂度削减）。
+10. **抽取管道防脆弱**：严格 JSON schema + 重试修复 + 失败保底存原始 episode；嵌入模型 id+维度随 LanceDB 表版本化（防锁死，LightRAG 教训）。
+
+**避坑清单**：查询路径零 LLM；社区摘要离线算（Leiden 夜间任务，写路径只做增量）；不批量全量重建；每阶段可独立禁用+延迟熔断（OpenViking 5s/30s 模式）。
+
+最小 schema 起点见调研报告 §3.3（episodes/entities/edges/memories/memory_diffs + FTS5 虚表 + 派生 LanceDB 表）。
 
 ## 7. MCP / Skill 管理
 
