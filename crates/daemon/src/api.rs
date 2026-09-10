@@ -34,6 +34,23 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
         .with_state(state)
+        .fallback_service(panel_service())
+}
+
+/// Serve the built web panel (SPA) when `panel/dist` exists; the API
+/// works fine without it. Override with `RUAGENT_PANEL_DIST`.
+fn panel_service() -> tower_http::services::ServeDir<tower_http::services::ServeFile> {
+    use tower_http::services::{ServeDir, ServeFile};
+    let dist = std::env::var("RUAGENT_PANEL_DIST")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("panel/dist"));
+    if !dist.join("index.html").is_file() {
+        tracing::info!(
+            dist = %dist.display(),
+            "panel not built — serving API only (cd panel && npm run build)"
+        );
+    }
+    ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")))
 }
 
 /// Error type that renders as (status, message).
