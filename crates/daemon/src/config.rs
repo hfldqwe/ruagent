@@ -303,8 +303,15 @@ const DEFAULT_MCP_TOML: &str = r#"# ruagent MCP registry. See design §7.1.
 # [mcp.fetch]
 # url = "https://mcp.example.com/sse"
 
+# The platform's own MCP server: memory, knowledge and task tools for
+# every agent (design SS6.5). Requires the ruagent binary reachable as
+# `ruagent` on PATH and a running daemon (`ruagent serve`).
+[mcp.ruagent]
+command = "ruagent"
+args = ["mcp-serve"]
+
 [profile.default]
-servers = []
+servers = ["ruagent"]
 "#;
 
 const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: deterministic rules, design §9.2).

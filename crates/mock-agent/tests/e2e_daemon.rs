@@ -53,6 +53,9 @@ async fn start_daemon_with_routing(
         }
         db.upsert_agent(card).await.unwrap();
     }
+    let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
+        .await
+        .unwrap();
     let mgr = Arc::new(RunManager::new(
         db,
         root.clone(),
@@ -65,6 +68,7 @@ async fn start_daemon_with_routing(
     let app = ruagent_daemon::api::router(AppState {
         mgr,
         config: Arc::new(cfg),
+        knowledge: Arc::new(knowledge),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -762,4 +766,55 @@ async fn approver_agent_answers_ask_unattended() {
         .find(|t| t["title"].as_str().unwrap_or("").starts_with("approve:"))
         .expect("approver run recorded as a task");
     assert_eq!(approve_task["status"], "done");
+}
+
+// ---------------------------------------------------------------------------
+// M3: memory injection into run prompts (design SS6.4 push path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn memories_are_injected_into_run_prompts() {
+    let d = start_daemon(&mock_agent_toml("echo"), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    // Write a user observation through the API (the MCP tool's backend).
+    let w: serde_json::Value = http
+        .post(format!("{}/api/v1/memory/write", d.url))
+        .json(&serde_json::json!({
+            "store": "observation",
+            "namespace": "user",
+            "content": "the user prefers concise answers"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(w["outcome"].as_str().unwrap().contains("Inserted"), "{w}");
+
+    // Search finds it.
+    let hits: serde_json::Value = http
+        .get(format!("{}/api/v1/memory/search?q=concise", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1);
+
+    // The echo mock echoes its FULL prompt — so the injected memory block
+    // must appear in the run's result.
+    let (text, sse) = drive_run(&http, &d.url, "hello injection").await;
+    assert!(text.contains("hello injection"), "{text}");
+    assert!(
+        text.contains("the user prefers concise answers"),
+        "injected memory visible in the agent's prompt echo: {text}"
+    );
+    assert!(
+        sse.contains("\"type\":\"context_injected\""),
+        "ContextInjected event on the stream"
+    );
+    assert!(sse.contains("<relevant_memories>"), "tagged block rendered");
 }

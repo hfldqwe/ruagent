@@ -64,6 +64,9 @@ async fn start_daemon() -> String {
         }
         db.upsert_agent(card).await.unwrap();
     }
+    let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
+        .await
+        .unwrap();
     let mgr = Arc::new(RunManager::new(
         db,
         root,
@@ -75,6 +78,7 @@ async fn start_daemon() -> String {
     let app = ruagent_daemon::api::router(AppState {
         mgr,
         config: Arc::new(cfg),
+        knowledge: Arc::new(knowledge),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

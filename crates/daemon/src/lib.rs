@@ -80,9 +80,32 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
     ));
     mgr.start_approver_loop();
 
+    // Knowledge base: hash embedder by default (offline boot); set
+    // RUAGENT_EMBEDDER=fastembed for real semantics (model downloads on
+    // first use — the daemon never blocks on it by default).
+    let knowledge = match std::env::var("RUAGENT_EMBEDDER").as_deref() {
+        Ok("fastembed") => match ruagent_knowledge::FastEmbedder::try_new().await {
+            Ok(fe) => {
+                ruagent_knowledge::Knowledge::with_embedder(
+                    &root,
+                    db.clone(),
+                    std::sync::Arc::new(fe),
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "fastembed unavailable; falling back to hash embedder");
+                ruagent_knowledge::Knowledge::open(&root, db.clone()).await
+            }
+        },
+        _ => ruagent_knowledge::Knowledge::open(&root, db.clone()).await,
+    }
+    .with_context(|| "opening knowledge base")?;
+
     let state = api::AppState {
         mgr,
         config: Arc::new(config),
+        knowledge: Arc::new(knowledge),
     };
     let app = api::router(state);
 

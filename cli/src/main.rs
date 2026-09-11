@@ -36,6 +36,9 @@ enum Cmd {
     Agents,
     /// List tasks.
     Status,
+    /// Run the platform MCP server over stdio (spawned by agents; talks
+    /// to the daemon at RUAGENT_URL).
+    McpServe,
     /// Run a prompt as a one-off task and stream the result.
     Run {
         prompt: String,
@@ -62,6 +65,17 @@ fn main() -> Result<()> {
         }
         Cmd::Agents => list_agents(&cli.url),
         Cmd::Status => status(&cli.url),
+        Cmd::McpServe => {
+            // serve_stdio is async: drive it on its own runtime (the rest
+            // of the CLI is sync for reqwest::blocking, see M1 lessons).
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?;
+            runtime
+                .block_on(ruagent_mcp::serve_stdio())
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
         Cmd::Run { prompt, agent } => run(&cli.url, &prompt, agent.as_deref()),
     }
 }

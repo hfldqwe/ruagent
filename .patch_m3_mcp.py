@@ -1,4 +1,30 @@
-//! ruagent-mcp: the platform's own MCP server (design §6.5).
+# M3 #21 part 3: the mcp crate — the platform MCP server bridge
+# run: python .patch_m3_mcp.py
+
+cargo = '''[package]
+name = "ruagent-mcp"
+description = "MCP registry and the platform's own MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rmcp = { version = "3", features = ["server", "transport-io"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+'''
+open('crates/mcp/Cargo.toml', 'w', encoding='utf-8').write(cargo)
+print("mcp Cargo.toml written")
+
+lib = '''//! ruagent-mcp: the platform's own MCP server (design SS6.5).
 //!
 //! A thin stdio-to-HTTP bridge: agents spawn `ruagent mcp-serve` (it is
 //! registered in mcp.toml and injected into every session); the tools
@@ -6,9 +32,10 @@
 //! harnesses need to reach the central memory, knowledge, and task
 //! state — no SDK adapters (the Agno lesson).
 
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, schemars, tool, tool_router};
 
 /// Configuration for the bridge.
 #[derive(Debug, Clone)]
@@ -31,6 +58,7 @@ impl BridgeConfig {
 pub struct PlatformTools {
     config: BridgeConfig,
     http: reqwest::Client,
+    tool_router: ToolRouter<Self>,
 }
 
 impl PlatformTools {
@@ -38,6 +66,7 @@ impl PlatformTools {
         Self {
             config,
             http: reqwest::Client::new(),
+            tool_router: Self::tool_router(),
         }
     }
 }
@@ -46,9 +75,7 @@ impl PlatformTools {
 impl PlatformTools {
     // -- memory ---------------------------------------------------------
 
-    #[tool(
-        description = "Search the user's long-term memories (facts, preferences, lessons learned across sessions). Use this before asking the user something they may have already told you."
-    )]
+    #[tool(description = "Search the user's long-term memories (facts, preferences, lessons learned across sessions). Use this before asking the user something they may have already told you.")]
     async fn memory_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -69,9 +96,7 @@ impl PlatformTools {
         Ok(hits_to_text(&resp["hits"]))
     }
 
-    #[tool(
-        description = "Store a long-term memory about the user, a project, or a lesson learned. Stores: profile (user facts), observation (general), procedure (how-to, project/global), lesson (project/global). Namespaces: user, global, project:<name>, agent:<name>. Optionally pass supersedes=<memory id> to replace it."
-    )]
+    #[tool(description = "Store a long-term memory about the user, a project, or a lesson learned. Stores: profile (user facts), observation (general), procedure (how-to, project/global), lesson (project/global). Namespaces: user, global, project:<name>, agent:<name>. Optionally pass supersedes=<memory id> to replace it.")]
     async fn memory_write(
         &self,
         Parameters(params): Parameters<WriteParams>,
@@ -94,17 +119,12 @@ impl PlatformTools {
             .json()
             .await
             .map_err(rpc_error)?;
-        Ok(format!(
-            "memory write: {}",
-            resp["outcome"].as_str().unwrap_or("?")
-        ))
+        Ok(format!("memory write: {}", resp["outcome"].as_str().unwrap_or("?")))
     }
 
     // -- knowledge ------------------------------------------------------
 
-    #[tool(
-        description = "Search the knowledge base of ingested documents (hybrid semantic + keyword search)."
-    )]
+    #[tool(description = "Search the knowledge base of ingested documents (hybrid semantic + keyword search).")]
     async fn knowledge_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -125,9 +145,7 @@ impl PlatformTools {
         Ok(hits_to_text(&resp["hits"]))
     }
 
-    #[tool(
-        description = "Ingest a document (markdown, notes, code) into the knowledge base so it becomes searchable."
-    )]
+    #[tool(description = "Ingest a document (markdown, notes, code) into the knowledge base so it becomes searchable.")]
     async fn knowledge_ingest(
         &self,
         Parameters(params): Parameters<IngestParams>,
@@ -154,11 +172,9 @@ impl PlatformTools {
         ))
     }
 
-    // -- platform ops (the symmetric design, §7.2) -----------------------
+    // -- platform ops (the symmetric design, SS7.2) ----------------------
 
-    #[tool(
-        description = "List the platform's tasks (durable work items) with their status. Optionally filter by status: pending|in_progress|blocked|done|cancelled."
-    )]
+    #[tool(description = "List the platform's tasks (durable work items) with their status. Optionally filter by status: pending|in_progress|blocked|done|cancelled.")]
     async fn list_tasks(
         &self,
         Parameters(params): Parameters<TaskFilterParams>,
@@ -181,7 +197,7 @@ impl PlatformTools {
         let mut out = String::new();
         for t in tasks.iter().take(20) {
             out.push_str(&format!(
-                "[{}] {} ({})\n",
+                "[{}] {} ({})\\n",
                 t["status"].as_str().unwrap_or("?"),
                 t["title"].as_str().unwrap_or("?"),
                 t["id"].as_str().unwrap_or("?")
@@ -194,14 +210,14 @@ impl PlatformTools {
     }
 }
 
-#[tool_handler]
 impl ServerHandler for PlatformTools {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "ruagent platform tools: search/write the user's long-term memory, \
-             search/ingest the knowledge base, and list platform tasks. \
-             Prefer memory_search before asking the user for known facts.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(
+                "ruagent platform tools: search/write the user's long-term memory, \\
+                 search/ingest the knowledge base, and list platform tasks. \\
+                 Prefer memory_search before asking the user for known facts.",
+            )
     }
 }
 
@@ -246,15 +262,12 @@ fn hits_to_text(hits: &serde_json::Value) -> String {
     }
     hits.iter()
         .map(|h| {
-            let content = h["content"]
-                .as_str()
-                .or_else(|| h["result"].as_str())
-                .unwrap_or("?");
+            let content = h["content"].as_str().or_else(|| h["result"].as_str()).unwrap_or("?");
             let source = h["document"].as_str().unwrap_or("memory");
             format!("[{source}] {content}")
         })
         .collect::<Vec<_>>()
-        .join("\n---\n")
+        .join("\\n---\\n")
 }
 
 fn rpc_error(e: impl std::fmt::Display) -> rmcp::ErrorData {
@@ -263,10 +276,79 @@ fn rpc_error(e: impl std::fmt::Display) -> rmcp::ErrorData {
 
 /// Run the MCP server over stdio (the `ruagent mcp-serve` subcommand).
 pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    use rmcp::service::{serve_server, InitializeResult};
     let handler = PlatformTools::new(BridgeConfig::from_env());
     let transport = rmcp::transport::stdio();
-    let server = rmcp::service::serve_server(handler, transport).await?;
-    let reason = server.waiting().await?;
-    tracing::info!(?reason, "mcp server stopped");
+    let server = serve_server(handler, transport).await?;
+    let _join: InitializeResult = server.waiting().await?;
     Ok(())
 }
+'''
+open('crates/mcp/src/lib.rs', 'w', encoding='utf-8').write(lib)
+print("mcp lib.rs written")
+
+# ---- CLI: mcp-serve subcommand ----
+p = 'cli/Cargo.toml'
+s = open(p, encoding='utf-8').read()
+if 'ruagent-mcp' not in s:
+    s = s.replace('ruagent-daemon.workspace = true',
+                  'ruagent-daemon.workspace = true\nruagent-mcp.workspace = true')
+    open(p, 'w', encoding='utf-8').write(s)
+    print("cli dep added")
+
+p = 'cli/src/main.rs'
+s = open(p, encoding='utf-8').read()
+s = s.replace('''    /// Run a prompt as a one-off task and stream the result.
+    Run {''',
+'''    /// Run the platform MCP server over stdio (spawned by agents; talks
+    /// to the daemon at RUAGENT_URL).
+    McpServe,
+    /// Run a prompt as a one-off task and stream the result.
+    Run {''')
+s = s.replace('''        Cmd::Run { prompt, agent } => run(&cli.url, &prompt, agent.as_deref()),''',
+'''        Cmd::McpServe => ruagent_mcp::serve_stdio().await.map_err(|e| anyhow::anyhow!("{e}")),
+        Cmd::Run { prompt, agent } => run(&cli.url, &prompt, agent.as_deref()),''')
+open(p, 'w', encoding='utf-8').write(s)
+print("cli subcommand added")
+
+# ---- default mcp.toml registers the platform server ----
+p = 'crates/daemon/src/config.rs'
+s = open(p, encoding='utf-8').read()
+s = s.replace('''const DEFAULT_MCP_TOML: &str = r#"# ruagent MCP registry. See design SS7.1.
+# Injection is an overlay: each CLI's own MCP config is never touched.
+#
+# [mcp.filesystem]
+# command = "npx @modelcontextprotocol/server-filesystem"
+# args = ["--root", "C:/projects"]
+# inject_for = ["claude", "opencode"]     # optional membership filter
+#
+# [mcp.fetch]
+# url = "https://mcp.example.com/sse"
+
+[profile.default]
+servers = []
+"#;''',
+'''const DEFAULT_MCP_TOML: &str = r#"# ruagent MCP registry. See design SS7.1.
+# Injection is an overlay: each CLI's own MCP config is never touched.
+#
+# [mcp.filesystem]
+# command = "npx @modelcontextprotocol/server-filesystem"
+# args = ["--root", "C:/projects"]
+# inject_for = ["claude", "opencode"]     # optional membership filter
+#
+# [mcp.fetch]
+# url = "https://mcp.example.com/sse"
+
+# The platform's own MCP server: memory, knowledge, task tools for
+# every agent (design SS6.5). Requires the ruagent binary reachable as
+# `ruagent` on PATH and a running daemon (`ruagent serve`).
+[mcp.ruagent]
+command = "ruagent"
+args = ["mcp-serve"]
+
+[profile.default]
+servers = ["ruagent"]
+"#;''')
+open(p, 'w', encoding='utf-8').write(s)
+print("default mcp.toml registers the platform server")
+'''

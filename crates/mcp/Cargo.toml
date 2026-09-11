@@ -5,3 +5,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+rmcp = { version = "3", features = ["server", "client", "transport-io", "schemars"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+ruagent-daemon.workspace = true
+ruagent-store.workspace = true
+ruagent-knowledge.workspace = true
+axum = "0.8"

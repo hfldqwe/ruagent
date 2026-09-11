@@ -1,0 +1,24 @@
+[package]
+name = "ruagent-knowledge"
+description = "Vector knowledge base: chunking, embeddings, LanceDB + FTS hybrid retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ruagent-store.workspace = true
+lancedb = { version = "0.38", features = ["remote"] }
+arrow-array = "55"
+arrow-schema = "55"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "sync"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+thiserror = "2"
+tracing = "0.1"
+fastembed = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

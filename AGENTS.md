@@ -26,6 +26,9 @@ Dependency direction is strictly downward; `core` must stay I/O-free.
 ## Commands
 
 ```bash
+# Build prerequisite: protoc on PATH (lancedb needs it).
+#   Windows: install under %USERPROFILE%/.protoc and add its bin to PATH, or `choco install protobuf`
+#   Linux:   `sudo apt-get install protobuf-compiler`
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace

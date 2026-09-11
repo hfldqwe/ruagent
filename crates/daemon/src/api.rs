@@ -19,6 +19,7 @@ use crate::runs::{PendingPermission, RunManager, WorkspaceSpec};
 pub struct AppState {
     pub mgr: std::sync::Arc<RunManager>,
     pub config: std::sync::Arc<DaemonConfig>,
+    pub knowledge: std::sync::Arc<ruagent_knowledge::Knowledge>,
 }
 
 /// Build the API router.
@@ -28,6 +29,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/mcp", get(mcp_registry))
+        .route("/api/v1/memory/write", post(memory_write))
+        .route("/api/v1/memory/search", get(memory_search))
+        .route("/api/v1/memory/list", get(memory_list))
+        .route("/api/v1/knowledge/ingest", post(knowledge_ingest))
+        .route("/api/v1/knowledge/search", get(knowledge_search))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route("/api/v1/tasks/{id}/runs", post(start_run))
@@ -538,6 +544,139 @@ async fn resolve_permission(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Memory + knowledge (design SS6.5: the only seam external CLIs need)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MemoryWriteRequest {
+    /// profile | observation | procedure | lesson
+    store: String,
+    /// user | global | project:<x> | agent:<x>
+    namespace: String,
+    content: String,
+    #[serde(default)]
+    supersedes: Option<i64>,
+}
+
+async fn memory_write(
+    State(state): State<AppState>,
+    Json(req): Json<MemoryWriteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = match req.store.as_str() {
+        "profile" => ruagent_memory::MemoryStore::Profile,
+        "procedure" => ruagent_memory::MemoryStore::Procedure,
+        "lesson" => ruagent_memory::MemoryStore::Lesson,
+        _ => ruagent_memory::MemoryStore::Observation,
+    };
+    let Some(namespace) = ruagent_memory::Namespace::parse(&req.namespace) else {
+        return Err(ApiError::bad_request(format!(
+            "invalid namespace `{}` (user | global | project:<x> | agent:<x>)",
+            req.namespace
+        )));
+    };
+    let episode = ruagent_memory::episode::record_episode(
+        state.mgr.db(),
+        ruagent_memory::episode::EpisodeKind::McpWrite,
+        &req.content,
+        None,
+    )
+    .await?;
+    let outcome = ruagent_memory::write_memory(
+        state.mgr.db(),
+        &ruagent_memory::MemoryWrite {
+            store,
+            namespace,
+            content: req.content,
+            confidence: 0.9,
+            source_episode: Some(episode),
+            supersedes: req.supersedes,
+        },
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "outcome": format!("{outcome:?}") }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn memory_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hits =
+        ruagent_memory::query::search_fts(state.mgr.db(), &q.q, q.limit.unwrap_or(8)).await?;
+    Ok(Json(serde_json::json!({ "hits": hits })))
+}
+
+async fn memory_list(
+    State(state): State<AppState>,
+    Query(q): Query<MemoryListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = match q.store.as_str() {
+        "profile" => ruagent_memory::MemoryStore::Profile,
+        "procedure" => ruagent_memory::MemoryStore::Procedure,
+        "lesson" => ruagent_memory::MemoryStore::Lesson,
+        _ => ruagent_memory::MemoryStore::Observation,
+    };
+    let namespace = q.namespace.clone().unwrap_or_else(|| "user".into());
+    let hits = ruagent_memory::query::current_memories(
+        state.mgr.db(),
+        store,
+        &namespace,
+        q.limit.unwrap_or(50),
+    )
+    .await?;
+    let counts = ruagent_memory::query::store_counts(state.mgr.db()).await?;
+    Ok(Json(
+        serde_json::json!({ "memories": hits, "counts": counts }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct MemoryListQuery {
+    store: String,
+    namespace: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeIngestRequest {
+    name: String,
+    content: String,
+}
+
+async fn knowledge_ingest(
+    State(state): State<AppState>,
+    Json(req): Json<KnowledgeIngestRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let chunks = state
+        .knowledge
+        .ingest(&req.name, &req.content)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "chunks": chunks })))
+}
+
+async fn knowledge_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hits = state
+        .knowledge
+        .search(&q.q, q.limit.unwrap_or(8))
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "hits": hits })))
+}
 
 /// Resolve the routing file's agent NAMES into ids and run the cascade.
 fn routing_decision(state: &AppState, task: &Task) -> Option<ruagent_core::RoutingDecision> {

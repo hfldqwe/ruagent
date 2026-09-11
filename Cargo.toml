@@ -15,6 +15,7 @@ ruagent-core = { path = "crates/core" }
 ruagent-acp = { path = "crates/acp" }
 ruagent-daemon = { path = "crates/daemon" }
 ruagent-graph = { path = "crates/graph" }
+ruagent-knowledge = { path = "crates/knowledge" }
 ruagent-memory = { path = "crates/memory" }
 ruagent-mock-agent = { path = "crates/mock-agent" }
 ruagent-mcp = { path = "crates/mcp" }

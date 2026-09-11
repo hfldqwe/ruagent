@@ -311,6 +311,16 @@ impl RunManager {
         };
         run.workspace = Some(workspace.to_string_lossy().into_owned());
 
+        // Push path of the injection contract (design SS6.4): bounded
+        // tagged memory blocks prepended to the prompt; the render is
+        // also emitted as a ContextInjected event for observability.
+        let injection = render_run_injection(&self.db, task).await;
+        let prompt = if injection.is_empty() {
+            prompt
+        } else {
+            format!("{injection}\n---\n{prompt}")
+        };
+
         run.status = RunStatus::Spawning;
         run.updated_at = chrono::Utc::now();
         self.db.insert_run(&run).await?;
@@ -348,6 +358,7 @@ impl RunManager {
                 mcp_servers,
                 cwd,
                 routed,
+                injection,
             )
             .await
             {
@@ -509,6 +520,7 @@ async fn supervise(
     mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
     cwd: PathBuf,
     routed: Option<RoutingDecision>,
+    injection: String,
 ) -> Result<()> {
     let transcripts_dir = root.join("data").join("transcripts");
     let mut transcript = TranscriptWriter::create(transcript_path(&transcripts_dir, &run.id))
@@ -531,6 +543,16 @@ async fn supervise(
             &broadcast,
             &run,
             RunEvent::Routed { decision },
+        );
+    }
+    if !injection.is_empty() {
+        emit(
+            &mut transcript,
+            &broadcast,
+            &run,
+            RunEvent::ContextInjected {
+                render: injection.clone(),
+            },
         );
     }
     emit(
@@ -774,6 +796,47 @@ async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
         );
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+}
+
+/// Assemble the push-path injection for a run (design SS6.4): user
+/// profile + user observations, bounded by the default budget.
+async fn render_run_injection(db: &Db, task: &Task) -> String {
+    use ruagent_memory::query::current_memories;
+    use ruagent_memory::{InjectionBudget, MemoryForInjection, MemoryStore, render_injection};
+    let mut mems: Vec<MemoryForInjection> = Vec::new();
+    if let Ok(profile) = current_memories(db, MemoryStore::Profile, "user", 5).await {
+        mems.extend(profile.into_iter().map(|m| MemoryForInjection {
+            tag: "user_profile",
+            content: m.content,
+            updated_at: m.updated_at,
+        }));
+    }
+    if let Ok(obs) = current_memories(db, MemoryStore::Observation, "user", 8).await {
+        mems.extend(obs.into_iter().map(|m| MemoryForInjection {
+            tag: "relevant_memories",
+            content: m.content,
+            updated_at: m.updated_at,
+        }));
+    }
+    if let Some(project) = &task.project
+        && let Ok(obs) = current_memories(
+            db,
+            MemoryStore::Observation,
+            &format!("project:{project}"),
+            8,
+        )
+        .await
+    {
+        mems.extend(obs.into_iter().map(|m| MemoryForInjection {
+            tag: "project_context",
+            content: m.content,
+            updated_at: m.updated_at,
+        }));
+    }
+    if mems.is_empty() {
+        return String::new();
+    }
+    render_injection(&mems, &InjectionBudget::default())
 }
 
 #[cfg(test)]

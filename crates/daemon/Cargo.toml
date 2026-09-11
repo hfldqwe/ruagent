@@ -17,6 +17,9 @@ ruagent-acp.workspace = true
 ruagent-store.workspace = true
 ruagent-policy.workspace = true
 ruagent-orchestrator.workspace = true
+ruagent-memory.workspace = true
+ruagent-knowledge.workspace = true
+ruagent-graph.workspace = true
 agent-client-protocol = "2.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
@@ -32,4 +35,5 @@ futures = "0.3"
 tokio-stream = "0.1"
 
 [dev-dependencies]
+ruagent-knowledge.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
