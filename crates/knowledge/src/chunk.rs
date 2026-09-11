@@ -78,11 +78,17 @@ mod tests {
             // The successor's head must be a substring of its
             // predecessor — that IS the overlap.
             let head: String = w[1].chars().take(90).collect();
+            let tail: String = w[0]
+                .chars()
+                .rev()
+                .take(60)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             assert!(
                 w[0].contains(&head),
-                "chunks must overlap: ...{:?} / {:?}...",
-                &w[0][w[0].len().saturating_sub(60)..],
-                &head
+                "chunks must overlap: ...{tail:?} / {head:?}..."
             );
         }
     }

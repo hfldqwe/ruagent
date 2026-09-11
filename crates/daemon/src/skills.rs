@@ -42,10 +42,10 @@ fn frontmatter_field(md: &str, field: &str) -> Option<String> {
     let fm = md.strip_prefix("---\n")?;
     let end = fm.find("\n---")?;
     for line in fm[..end].lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim() == field {
-                return Some(v.trim().trim_matches('"').to_string());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim() == field
+        {
+            return Some(v.trim().trim_matches('"').to_string());
         }
     }
     None
@@ -55,7 +55,7 @@ fn frontmatter_field(md: &str, field: &str) -> Option<String> {
 /// name collisions — closer scope is more specific).
 pub fn discover(platform_dir: &Path, project_dir: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
-    let mut add_dir = |dir: &Path, source: &str, skills: &mut Vec<Skill>| {
+    let add_dir = |dir: &Path, source: &str, skills: &mut Vec<Skill>| {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -97,10 +97,10 @@ pub fn install_skill(skill_dir: &Path, target_base: &Path) -> Result<bool> {
     let target = target_base.join(&name);
     let src_md = std::fs::read_to_string(skill_dir.join("SKILL.md"))
         .with_context(|| format!("reading {}", skill_dir.join("SKILL.md").display()))?;
-    if let Ok(existing) = std::fs::read_to_string(target.join("SKILL.md")) {
-        if existing == src_md {
-            return Ok(false); // already in sync
-        }
+    if let Ok(existing) = std::fs::read_to_string(target.join("SKILL.md"))
+        && existing == src_md
+    {
+        return Ok(false); // already in sync
     }
     // Wipe and re-copy for a clean refresh.
     let _ = std::fs::remove_dir_all(&target);
