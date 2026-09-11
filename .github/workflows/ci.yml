@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
-        run: choco install -y protobuf
+        run: choco install -y protoc
       - name: Test
         run: cargo test --workspace
         # The lancedb/datafusion graph is heavy; allow a generous timeout
