@@ -197,6 +197,10 @@ impl RunManager {
         &self.db
     }
 
+    pub fn root(&self) -> PathBuf {
+        self.root.clone()
+    }
+
     pub fn transcripts_dir(&self) -> PathBuf {
         self.root.join("data").join("transcripts")
     }

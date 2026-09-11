@@ -29,6 +29,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/mcp", get(mcp_registry))
+        .route("/api/v1/skills", get(list_skills))
+        .route("/api/v1/skills/sync", post(sync_skills))
         .route("/api/v1/memory/write", post(memory_write))
         .route("/api/v1/memory/search", get(memory_search))
         .route("/api/v1/memory/list", get(memory_list))
@@ -121,6 +123,37 @@ async fn health() -> Json<serde_json::Value> {
 async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let stats = state.mgr.db().agent_stats().await?;
     Ok(Json(serde_json::json!({ "agents": stats })))
+}
+
+/// Discovered skills (platform library + the daemon's working-dir
+/// project skills).
+async fn list_skills(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let root = state.mgr.root();
+    let platform = root.join("skills");
+    let project = std::path::PathBuf::from(".ruagent").join("skills");
+    let skills = crate::skills::discover(&platform, Some(&project));
+    Json(serde_json::json!({ "skills": skills }))
+}
+
+/// Sync skills into every enabled harness's skill directories under the
+/// daemon's working directory (design SS7.2).
+async fn sync_skills(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = state.mgr.root();
+    let platform = root.join("skills");
+    let project = std::path::PathBuf::from(".ruagent").join("skills");
+    let skills = crate::skills::discover(&platform, Some(&project));
+    let harnesses: Vec<String> = state
+        .mgr
+        .agents()
+        .into_iter()
+        .filter(|a| a.enabled)
+        .map(|a| format!("{:?}", a.harness).to_lowercase())
+        .collect();
+    let (installed, skipped) = crate::skills::sync(&skills, std::path::Path::new("."), &harnesses)
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(
+        serde_json::json!({ "installed": installed, "skipped": skipped }),
+    ))
 }
 
 /// The MCP registry as configured (design SS7.1). Live health pinging

@@ -6,6 +6,7 @@
 pub mod api;
 pub mod config;
 pub mod runs;
+pub mod skills;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -79,6 +80,17 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         config.mcp.clone(),
     ));
     mgr.start_approver_loop();
+
+    // Bootstrap the bundled operator skill into the platform library
+    // (design SS7.2 + SS23: teach agents to operate the platform).
+    {
+        let platform_skills = root.join("skills");
+        std::fs::create_dir_all(&platform_skills)?;
+        let bundled = std::path::PathBuf::from("skills/ruagent-operator");
+        if bundled.join("SKILL.md").is_file() {
+            skills::install_skill(&bundled, &platform_skills)?;
+        }
+    }
 
     // Knowledge base: hash embedder by default (offline boot); set
     // RUAGENT_EMBEDDER=fastembed for real semantics (model downloads on

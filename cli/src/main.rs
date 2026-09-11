@@ -39,6 +39,10 @@ enum Cmd {
     /// Run the platform MCP server over stdio (spawned by agents; talks
     /// to the daemon at RUAGENT_URL).
     McpServe,
+    /// List discovered skills (platform + project).
+    Skills,
+    /// Sync skills into every enabled harness's skill directories.
+    SkillsSync,
     /// Run a prompt as a one-off task and stream the result.
     Run {
         prompt: String,
@@ -65,6 +69,8 @@ fn main() -> Result<()> {
         }
         Cmd::Agents => list_agents(&cli.url),
         Cmd::Status => status(&cli.url),
+        Cmd::Skills => skills_cmd(&cli.url, false),
+        Cmd::SkillsSync => skills_cmd(&cli.url, true),
         Cmd::McpServe => {
             // serve_stdio is async: drive it on its own runtime (the rest
             // of the CLI is sync for reqwest::blocking, see M1 lessons).
@@ -237,4 +243,40 @@ fn print_event(event: &serde_json::Value) {
         }
         _ => {}
     }
+}
+
+fn skills_cmd(url: &str, do_sync: bool) -> Result<()> {
+    if do_sync {
+        let resp: serde_json::Value = client()
+            .post(format!("{url}/api/v1/skills/sync"))
+            .send()
+            .context("daemon unreachable (is `ruagent serve` running?)")?
+            .error_for_status()?
+            .json()?;
+        println!(
+            "installed {} new, {} already in sync",
+            resp["installed"], resp["skipped"]
+        );
+        return Ok(());
+    }
+    let resp: serde_json::Value = client()
+        .get(format!("{url}/api/v1/skills"))
+        .send()
+        .context("daemon unreachable (is `ruagent serve` running?)")?
+        .error_for_status()?
+        .json()?;
+    let skills = resp["skills"].as_array().context("bad response")?;
+    if skills.is_empty() {
+        println!("no skills (add them to ~/.ruagent/skills/ or .ruagent/skills/)");
+        return Ok(());
+    }
+    for s in skills {
+        println!(
+            "{:<8} {:<20} {}",
+            s["source"].as_str().unwrap_or("?"),
+            s["name"].as_str().unwrap_or("?"),
+            s["description"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
 }
