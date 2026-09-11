@@ -26,3 +26,9 @@ ruagent-store = { path = "crates/store" }
 [profile.release]
 lto = "thin"
 strip = "debuginfo"
+
+# The lancedb/datafusion graph produces huge test binaries; full debuginfo
+# overflows the linker on CI runners (collect2 bus error). Line tables
+# keep backtraces useful at a fraction of the memory.
+[profile.test]
+debug = "line-tables-only"
