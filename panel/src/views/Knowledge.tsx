@@ -2,9 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { api, type KnowledgeDocument, type SearchHit } from "../api";
-import { Empty, Modal, Spinner, relTime, useToast } from "../ui";
+import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
+import { useI18n } from "../i18n";
 
 export function Knowledge() {
+  const { t } = useI18n();
   const [docs, setDocs] = useState<KnowledgeDocument[] | null>(null);
   const [embedder, setEmbedder] = useState("");
   const [ingesting, setIngesting] = useState(false);
@@ -62,13 +64,11 @@ export function Knowledge() {
   return (
     <div>
       <div className="view-bar">
-        <h2>Knowledge</h2>
-        <span className="muted">
-          documents every agent can search ({embedder || "…"})
-        </span>
+        <h2>{t("knowledge.title")}</h2>
+        <span className="muted">{t("knowledge.subtitle")} ({embedder || "…"})</span>
         <span className="grow" />
         <button className="primary" onClick={() => setIngesting(true)}>
-          + Ingest Document
+          + {t("knowledge.ingest")}
         </button>
       </div>
 
@@ -76,24 +76,24 @@ export function Knowledge() {
         <input
           autoFocus
           className="grow"
-          placeholder="Search documents (semantic + keyword)…"
+          placeholder={t("knowledge.search")}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && search()}
         />
         <button className="primary" onClick={search}>
-          Search
+          {t("common.search")}
         </button>
         {hits ? (
           <button className="link" onClick={() => { setHits(null); setQuery(""); }}>
-            clear
+            {t("common.clear")}
           </button>
         ) : null}
       </div>
 
       {hits ? (
         hits.length === 0 ? (
-          <Empty icon="🔍" title="No results" hint="Try different keywords, or ingest more documents." />
+          <Empty icon="🔍" title={t("knowledge.noResults")} />
         ) : (
           <div className="card">
             {hits.map((h) => (
@@ -108,12 +108,12 @@ export function Knowledge() {
           </div>
         )
       ) : docs === null ? (
-        <Spinner label="Loading documents…" />
+        <Spinner label={`${t("knowledge.title")}…`} />
       ) : docs.length === 0 ? (
         <Empty
           icon="📚"
-          title="No documents ingested"
-          hint="Paste markdown or notes — they get chunked, embedded, and become searchable by every agent (knowledge_search MCP tool)."
+          title={t("knowledge.empty.title")}
+          hint={t("knowledge.empty.hint")}
         />
       ) : (
         <div className="card">
@@ -122,7 +122,7 @@ export function Knowledge() {
               <div
                 role="button"
                 tabIndex={0}
-                aria-label={`Toggle chunks of ${d.name}`}
+                aria-label={`${d.name}`}
                 className="row-btn"
                 onClick={() => openChunks(d.id)}
                 onKeyDown={(e) => {
@@ -134,16 +134,16 @@ export function Knowledge() {
               >
                 <span className="doc-icon">📄</span>
                 <strong>{d.name}</strong>
-                <span className="muted">{d.chunk_count} chunks</span>
+                <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
                 <span className="grow" />
-                <span className="time">{relTime(d.created_at)}</span>
+                <span className="time">{<RelTime iso={d.created_at} />}</span>
                 <button
                   className="danger sm"
                   onClick={async (e) => {
                     e.stopPropagation();
                     try {
                       await api.knowledgeDelete(d.id);
-                      toast("ok", `deleted ${d.name}`);
+                      toast("ok", t("knowledge.deleted", { name: d.name }));
                       refresh();
                     } catch (err) {
                       toast("err", String(err));
@@ -187,20 +187,21 @@ export function Knowledge() {
 function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested: () => void }) {
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
+  const { t } = useI18n();
   const toast = useToast();
   return (
-    <Modal title="Ingest document" onClose={onClose} wide>
+    <Modal title={t("knowledge.ingest.title")} onClose={onClose} wide>
       <label className="field">
-        <span>Name</span>
+        <span>{t("knowledge.ingest.name")}</span>
         <input
           autoFocus
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="deploy-runbook"
+          placeholder={t("knowledge.ingest.namePh")}
         />
       </label>
       <label className="field">
-        <span>Content (markdown / notes / code — chunked at ~800 chars with overlap)</span>
+        <span>{t("knowledge.ingest.content")}</span>
         <textarea
           rows={12}
           value={content}
@@ -215,14 +216,14 @@ function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested:
           onClick={async () => {
             try {
               const r = await api.knowledgeIngest(name.trim(), content);
-              toast("ok", `ingested ${r.chunks} chunks`);
+              toast("ok", t("knowledge.ingested", { n: r.chunks }));
               onIngested();
             } catch (e) {
               toast("err", String(e));
             }
           }}
         >
-          Ingest
+          {t("knowledge.ingest.btn")}
         </button>
       </div>
     </Modal>

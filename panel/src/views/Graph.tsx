@@ -2,9 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { api, type GraphEdge, type GraphEntity } from "../api";
-import { Empty, Modal, Spinner, dateOf, useToast } from "../ui";
+import { Empty, Markdown, Modal, Spinner, useToast } from "../ui";
+import { dateOf, useI18n } from "../i18n";
 
 export function Graph() {
+  const { t } = useI18n();
   const [entities, setEntities] = useState<[GraphEntity, number][] | null>(null);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<GraphEntity | null>(null);
@@ -40,11 +42,11 @@ export function Graph() {
   return (
     <div>
       <div className="view-bar">
-        <h2>Entity graph</h2>
-        <span className="muted">facts with two timelines — invalidation, never deletion</span>
+        <h2>{t("graph.title")}</h2>
+        <span className="muted">{t("graph.subtitle")}</span>
         <span className="grow" />
         <button className="primary" onClick={() => setCreating(true)}>
-          + Entity
+          + {t("graph.newEntity")}
         </button>
       </div>
 
@@ -61,12 +63,12 @@ export function Graph() {
       {selected ? (
         <EntityDetail entity={selected} onBack={() => setSelected(null)} />
       ) : entities === null ? (
-        <Spinner label="Loading entities…" />
+        <Spinner label={`${t("graph.title")}…`} />
       ) : entities.length === 0 ? (
         <Empty
           icon="🕸️"
-          title="No entities yet"
-          hint="Create entities and facts — they power multi-hop reasoning (graph facts are queryable by agents)."
+          title={t("graph.empty.title")}
+          hint={t("graph.empty.hint")}
         />
       ) : (
         <div className="card">
@@ -115,6 +117,7 @@ function kindIcon(kind: string | null): string {
 }
 
 function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => void }) {
+  const { t } = useI18n();
   const [facts, setFacts] = useState<GraphEdge[] | null>(null);
   const [neighbors, setNeighbors] = useState<[GraphEntity, number][] | null>(null);
   const [at, setAt] = useState("");
@@ -147,15 +150,15 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
         {entity.kind ? <span className="tag">{entity.kind}</span> : null}
         <span className="grow" />
         <button className="primary" onClick={() => setAddingFact(true)}>
-          + Fact
+          + {t("graph.addFact")}
         </button>
       </div>
       {entity.summary ? <p className="muted intent">{entity.summary}</p> : null}
 
       <div className="card">
         <div className="row tight">
-          <strong>Facts</strong>
-          <span className="muted">as of…</span>
+          <strong>{t("graph.facts")}</strong>
+          <span className="muted">{t("graph.asOf")}</span>
           <input
             className="mono sm"
             placeholder="As of date (e.g. 2026-01-15)…"
@@ -172,25 +175,22 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
                 loadFacts();
               }}
             >
-              back to now
+              {t("graph.backToNow")}
             </button>
           ) : null}
         </div>
         {facts === null ? (
           <Spinner />
         ) : facts.length === 0 ? (
-          <p className="muted pad">
-            No facts {at ? `as of ${dateOf(at)}` : "currently"} — add one, or the timeline may
-            have moved on.
-          </p>
+          <p className="muted pad">{t("graph.noFacts")}</p>
         ) : (
           <table className="stats facts">
             <thead>
               <tr>
-                <th>relation</th>
-                <th>fact</th>
-                <th>valid</th>
-                <th>until</th>
+                <th>{t("graph.relation")}</th>
+                <th>{t("graph.fact")}</th>
+                <th>{t("graph.valid")}</th>
+                <th>{t("graph.until")}</th>
               </tr>
             </thead>
             <tbody>
@@ -208,11 +208,11 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
       </div>
 
       <div className="card">
-        <strong>Neighborhood (2 hops)</strong>
+        <strong>{t("graph.neighbors")}</strong>
         {neighbors === null ? (
           <Spinner />
         ) : neighbors.length === 0 ? (
-          <p className="muted pad">Nothing connected yet.</p>
+          <p className="muted pad">{t("graph.noNeighbors")}</p>
         ) : (
           <div className="row wrap">
             {neighbors.map(([n, d]) => (
@@ -242,19 +242,20 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
   const [name, setName] = useState("");
   const [kind, setKind] = useState("");
   const [summary, setSummary] = useState("");
+  const { t } = useI18n();
   const toast = useToast();
   return (
-    <Modal title="New entity" onClose={onClose}>
+    <Modal title={t("graph.newEntity.title")} onClose={onClose}>
       <label className="field">
-        <span>Name</span>
+        <span>{t("graph.newEntity.name")}</span>
         <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Alice" />
       </label>
       <label className="field">
-        <span>Kind (optional)</span>
+        <span>{t("graph.newEntity.kind")}</span>
         <input value={kind} onChange={(e) => setKind(e.target.value)} placeholder="person / project / tool…" />
       </label>
       <label className="field">
-        <span>Summary (optional)</span>
+        <span>{t("graph.newEntity.summary")}</span>
         <input value={summary} onChange={(e) => setSummary(e.target.value)} />
       </label>
       <div className="row end">
@@ -264,14 +265,14 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
           onClick={async () => {
             try {
               await api.graphCreateEntity(name.trim(), kind.trim() || undefined, summary.trim() || undefined);
-              toast("ok", "entity created");
+              toast("ok", t("toast.entityCreated"));
               onCreated();
             } catch (e) {
               toast("err", String(e));
             }
           }}
         >
-          Create
+          {t("common.create")}
         </button>
       </div>
     </Modal>
@@ -292,16 +293,13 @@ function AddFactModal({
   const [factText, setFactText] = useState("");
   const [validAt, setValidAt] = useState("");
   const [busy, setBusy] = useState(false);
+  const { t } = useI18n();
   const toast = useToast();
   return (
-    <Modal title={`Add fact about ${source.name}`} onClose={onClose}>
-      <p className="muted">
-        A fact is a dated edge. If a fact with the same source → target + relation already exists,
-        it is <strong>invalidated at this fact's valid date</strong> — never deleted, so
-        "what was true as of X" always stays answerable.
-      </p>
+    <Modal title={t("graph.addFact.title", { name: source.name })} onClose={onClose}>
+      <p className="muted"><Markdown>{t("graph.addFact.desc")}</Markdown></p>
       <label className="field">
-        <span>Target entity (name — created if new)</span>
+        <span>{t("graph.addFact.target")}</span>
         <input
           autoFocus
           value={targetName}
@@ -310,19 +308,19 @@ function AddFactModal({
         />
       </label>
       <label className="field">
-        <span>Relation</span>
+        <span>{t("graph.addFact.relation")}</span>
         <input value={relation} onChange={(e) => setRelation(e.target.value)} placeholder="works_at" />
       </label>
       <label className="field">
-        <span>Fact text</span>
+        <span>{t("graph.addFact.text")}</span>
         <input
           value={factText}
           onChange={(e) => setFactText(e.target.value)}
-          placeholder="Alice works at Acme"
+          placeholder={t("graph.addFact.textPh")}
         />
       </label>
       <label className="field">
-        <span>Valid from (optional — YYYY-MM-DD or RFC3339; empty = now)</span>
+        <span>{t("graph.addFact.valid")}</span>
         <input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder="2026-01-15" />
       </label>
       <div className="row end">
@@ -340,7 +338,7 @@ function AddFactModal({
                 fact_text: factText.trim(),
                 valid_at: validAt.trim() || undefined,
               });
-              toast("ok", "fact added");
+              toast("ok", t("toast.factAdded"));
               onAdded();
             } catch (e) {
               toast("err", String(e));
@@ -349,7 +347,7 @@ function AddFactModal({
             }
           }}
         >
-          Add fact
+          {t("graph.addFact.btn")}
         </button>
       </div>
     </Modal>

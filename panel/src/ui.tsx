@@ -1,5 +1,5 @@
-// Shared UI primitives: toasts, modal, empty/loading states, relative
-// time, status dots, markdown, meters.
+// Shared UI primitives: toasts, modal, empty/loading states, status dots,
+// markdown, meters. Text comes from i18n at call sites.
 
 import {
   createContext,
@@ -11,9 +11,10 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { relTime, useI18n } from "./i18n";
 
 // ---------------------------------------------------------------------------
-// Toasts
+// Toasts (aria-live)
 // ---------------------------------------------------------------------------
 
 interface Toast {
@@ -69,13 +70,10 @@ export function Modal({
   }, [onClose]);
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className={wide ? "modal wide" : "modal"}
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className={wide ? "modal wide" : "modal"} onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <h3>{title}</h3>
-          <button className="link" onClick={onClose}>
+          <button className="link" onClick={onClose} aria-label="close">
             ✕
           </button>
         </div>
@@ -118,24 +116,12 @@ export function Empty({
 }
 
 // ---------------------------------------------------------------------------
-// Relative time
+// Relative time (locale-aware)
 // ---------------------------------------------------------------------------
 
-export function relTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const then = new Date(iso.endsWith("Z") || iso.includes("+") ? iso : `${iso}Z`).getTime();
-  if (Number.isNaN(then)) return iso;
-  const diff = (Date.now() - then) / 1000;
-  if (diff < 10) return "just now";
-  if (diff < 60) return `${Math.floor(diff)}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`;
-  return new Date(then).toLocaleDateString();
-}
-
-export function dateOf(iso: string): string {
-  return (iso.split("T")[0] || "").replace(/Z$/, "");
+export function RelTime({ iso }: { iso: string | null | undefined }) {
+  const { lang } = useI18n();
+  return <>{relTime(iso, lang)}</>;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,31 +129,35 @@ export function dateOf(iso: string): string {
 // ---------------------------------------------------------------------------
 
 const STATUS_COLORS: Record<string, string> = {
-  done: "#3fb950",
-  completed: "#3fb950",
-  failed: "#f85149",
-  cancelled: "#f85149",
-  interrupted: "#d29922",
-  in_progress: "#58a6ff",
-  running: "#58a6ff",
-  spawning: "#58a6ff",
-  queued: "#8b949e",
-  pending: "#8b949e",
-  waiting_permission: "#d29922",
-  blocked: "#d29922",
+  done: "var(--ok)",
+  completed: "var(--ok)",
+  failed: "var(--danger)",
+  cancelled: "var(--danger)",
+  interrupted: "var(--warn)",
+  in_progress: "var(--accent)",
+  running: "var(--accent)",
+  spawning: "var(--accent)",
+  queued: "var(--text-faint)",
+  pending: "var(--text-faint)",
+  waiting_permission: "var(--warn)",
+  blocked: "var(--warn)",
 };
 
 export function StatusDot({ status }: { status: string }) {
-  return <span className="dot" style={{ background: STATUS_COLORS[status] ?? "#8b949e" }} />;
+  return <span className="dot" style={{ background: STATUS_COLORS[status] ?? "var(--text-faint)" }} />;
 }
 
 export function StatusPill({ status }: { status: string }) {
+  const { t } = useI18n();
   return (
     <span
       className="pill"
-      style={{ color: STATUS_COLORS[status] ?? "#8b949e", borderColor: STATUS_COLORS[status] ?? "#8b949e" }}
+      style={{
+        color: STATUS_COLORS[status] ?? "var(--text-dim)",
+        borderColor: STATUS_COLORS[status] ?? "var(--line-strong)",
+      }}
     >
-      {status.replaceAll("_", " ")}
+      {t(`status.${status}`)}
     </span>
   );
 }
@@ -184,7 +174,9 @@ export function fmtTokens(n: number): string {
 
 const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const usdPrecise = new Intl.NumberFormat("en-US", {
-  style: "currency", currency: "USD", maximumFractionDigits: 4,
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 4,
 });
 
 export function fmtUsd(n: number | null | undefined): string {
@@ -196,9 +188,9 @@ export function fmtUsd(n: number | null | undefined): string {
 
 export function UsageMeter({ used, size }: { used: number; size: number }) {
   const pct = size > 0 ? Math.min(100, (used / size) * 100) : 0;
-  const color = pct > 85 ? "#f85149" : pct > 60 ? "#d29922" : "#3fb950";
+  const color = pct > 85 ? "var(--danger)" : pct > 60 ? "var(--warn)" : "var(--ok)";
   return (
-    <span className="meter" title={`${fmtTokens(used)} / ${fmtTokens(size)} tokens in context`}>
+    <span className="meter" title={`${fmtTokens(used)} / ${fmtTokens(size)}`}>
       <span className="meter-fill" style={{ width: `${pct}%`, background: color }} />
       <span className="meter-label">
         {fmtTokens(used)}/{fmtTokens(size)}

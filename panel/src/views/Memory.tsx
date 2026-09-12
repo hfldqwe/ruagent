@@ -3,7 +3,8 @@
 
 import { useEffect, useState } from "react";
 import { api, type MemoryDiff, type MemoryRow } from "../api";
-import { Empty, Modal, Spinner, dateOf, relTime, useToast } from "../ui";
+import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
+import { dateOf, useI18n } from "../i18n";
 
 const STORES = ["profile", "observation", "procedure", "lesson"] as const;
 type Store = (typeof STORES)[number];
@@ -17,6 +18,7 @@ const NAMESPACES: Record<Store, string[]> = {
 };
 
 export function Memory() {
+  const { t } = useI18n();
   const [counts, setCounts] = useState<[string, string, number][] | null>(null);
   const [store, setStore] = useState<Store>("observation");
   const [namespace, setNamespace] = useState("user");
@@ -54,10 +56,8 @@ export function Memory() {
   return (
     <div>
       <div className="view-bar">
-        <h2>Memory</h2>
-        <span className="muted">
-          what the platform remembers — every agent reads this via MCP
-        </span>
+        <h2>{t("memory.title")}</h2>
+        <span className="muted">{t("memory.subtitle")}</span>
         <span className="grow" />
         <div className="seg">
           <button className={tab === "browse" ? "on" : ""} onClick={() => setTab("browse")}>
@@ -69,7 +69,7 @@ export function Memory() {
         </div>
         {tab === "browse" && (
           <button className="primary" onClick={() => setWriting(true)}>
-            + Write Memory
+            + {t("memory.write")}
           </button>
         )}
       </div>
@@ -109,7 +109,7 @@ export function Memory() {
           </div>
 
           {memories === null ? (
-            <Spinner label="Loading memories…" />
+            <Spinner label={`${t("memory.title")}…`} />
           ) : memories.length === 0 ? (
             <Empty
               icon="🧠"
@@ -142,6 +142,7 @@ export function Memory() {
 }
 
 function NewNamespaceInput({ store, onCreated }: { store: Store; onCreated: (ns: string) => void }) {
+  const { t } = useI18n();
   const [value, setValue] = useState("");
   const [open, setOpen] = useState(false);
   const prefix = store === "profile" ? "" : store === "observation" ? "project:" : "global";
@@ -169,7 +170,7 @@ function NewNamespaceInput({ store, onCreated }: { store: Store; onCreated: (ns:
           </span>
         ) : (
           <button className="link" onClick={() => setOpen(true)}>
-            + namespace
+            + {t("memory.nsNew")}
           </button>
         )
       ) : null}
@@ -178,6 +179,7 @@ function NewNamespaceInput({ store, onCreated }: { store: Store; onCreated: (ns:
 }
 
 function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () => void }) {
+  const { t } = useI18n();
   const [editing, setEditing] = useState(false);
   const superseded = memory.superseded_at != null;
 
@@ -187,23 +189,23 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
         <span className="tag">{memory.store}</span>
         <span className="tag">{memory.namespace}</span>
         {superseded ? (
-          <span className="tag warn">superseded {dateOf(memory.superseded_at!)}</span>
+          <span className="tag warn">{t("memory.superseded")} {dateOf(memory.superseded_at!)}</span>
         ) : (
-          <span className="tag ok">current</span>
+          <span className="tag ok">{t("memory.current")}</span>
         )}
         {memory.supersedes != null ? (
-          <span className="muted mono">replaces #{memory.supersedes}</span>
+          <span className="muted mono">{t("memory.replaces", { id: memory.supersedes })}</span>
         ) : null}
         <span className="grow" />
-        <span className="muted time" title={memory.updated_at}>
-          {relTime(memory.updated_at)} · #{memory.id}
+        <span className="time" title={memory.updated_at}>
+          <RelTime iso={memory.updated_at} /> · #{memory.id}
         </span>
       </div>
       <p className={superseded ? "memory-content old" : "memory-content"}>{memory.content}</p>
       {!superseded && (
         <div className="row tight">
           <button className="link" onClick={() => setEditing(true)}>
-            supersede
+            {t("memory.supersede")}
           </button>
         </div>
       )}
@@ -231,13 +233,11 @@ function EditModal({
   onSaved: () => void;
 }) {
   const [content, setContent] = useState(memory.content);
+  const { t } = useI18n();
   const toast = useToast();
   return (
-    <Modal title={`Supersede memory #${memory.id}`} onClose={onClose}>
-      <p className="muted">
-        The old content stays in history (audit log keeps the trail); the new content becomes
-        current in <code>{memory.store}/{memory.namespace}</code>.
-      </p>
+    <Modal title={t("memory.supersede.title", { id: memory.id })} onClose={onClose}>
+      <p className="muted">{t("memory.supersede.desc")}</p>
       <textarea rows={4} value={content} onChange={(e) => setContent(e.target.value)} />
       <div className="row end">
         <button
@@ -252,7 +252,7 @@ function EditModal({
             }
           }}
         >
-          Supersede
+          {t("memory.supersede.btn")}
         </button>
       </div>
     </Modal>
@@ -271,30 +271,26 @@ function WriteModal({
   onWritten: () => void;
 }) {
   const [content, setContent] = useState("");
+  const { t } = useI18n();
   const toast = useToast();
   return (
-    <Modal title="Write memory" onClose={onClose}>
-      <p className="muted">
-        One concise fact per write. This memory will be injected into future runs (bounded) and
-        is searchable by every agent via <code>memory_search</code>.
-      </p>
+    <Modal title={t("memory.write.title")} onClose={onClose}>
+      <p className="muted">{t("memory.write.desc")}</p>
       <label className="field">
-        <span>
-          Store / namespace (governed: profile=user-only, procedure/lesson=project/global)
-        </span>
+        <span>{t("memory.write.govern")}</span>
         <div className="row tight mono">
           <span className="tag">{store}</span>
           <span className="tag">{namespace}</span>
         </div>
       </label>
       <label className="field">
-        <span>Content</span>
+        <span>{t("memory.write.content")}</span>
         <textarea
           autoFocus
           rows={4}
           value={content}
           onChange={(e) => setContent(e.target.value)}
-          placeholder="the deploy script lives in scripts/release.sh"
+          placeholder={t("memory.write.placeholder")}
         />
       </label>
       <div className="row end">
@@ -311,7 +307,7 @@ function WriteModal({
             }
           }}
         >
-          Write
+          {t("memory.write.btn")}
         </button>
       </div>
     </Modal>
@@ -319,11 +315,12 @@ function WriteModal({
 }
 
 function AuditView() {
+  const { t } = useI18n();
   const [diffs, setDiffs] = useState<MemoryDiff[] | null>(null);
   useEffect(() => {
     api.memoryDiffs(200).then(setDiffs).catch(() => setDiffs([]));
   }, []);
-  if (!diffs) return <Spinner label="Loading audit log…" />;
+  if (!diffs) return <Spinner label={`${t("memory.audit")}…`} />;
   if (diffs.length === 0)
     return <Empty icon="📜" title="No memory writes yet" hint="Every write decision lands here." />;
   return (

@@ -611,3 +611,93 @@ table.data th { color: var(--text-faint); font-weight: 550; font-size: 11.5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+
+/* ============================================================================
+   Home overview + language toggle
+   ========================================================================== */
+
+.home-hero h1 {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 4px 0 2px;
+}
+.home-hero p { margin: 0 0 20px; max-width: 640px; }
+.home h2 {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-dim);
+  margin: 26px 0 12px;
+  letter-spacing: 0.02em;
+}
+
+.stat-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.stat-big {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text);
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+.step-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.step-card p { margin: 4px 0 10px; font-size: 13px; }
+
+.guide-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 8px;
+}
+.guide-card {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--text);
+  text-align: left;
+  transition: border-color 100ms, background 100ms;
+}
+.guide-card:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.guide-card p { margin: 3px 0 0; font-size: 12.5px; }
+.guide-icon { font-size: 18px; margin-top: 1px; }
+
+.lang-toggle {
+  margin-left: auto;
+  padding: 1px 8px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  border-radius: 10px;
+}
+.sidebar-foot { display: flex; align-items: center; gap: 8px; }
+
+.kanban-open { font-size: 11px; display: block; margin-top: 4px; opacity: 0.7; }

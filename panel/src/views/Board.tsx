@@ -1,17 +1,14 @@
-// Board: kanban by status + list toggle + task creation (Multica-parity).
+// Board: kanban by status + list toggle + task creation.
 
 import { useEffect, useState } from "react";
 import { api, type Task } from "../api";
-import { Empty, Modal, Spinner, StatusDot, relTime, useToast } from "../ui";
+import { useI18n } from "../i18n";
+import { Empty, Modal, RelTime, Spinner, StatusDot, useToast } from "../ui";
 
-const COLUMNS: { id: string; label: string }[] = [
-  { id: "pending", label: "Pending" },
-  { id: "in_progress", label: "In progress" },
-  { id: "blocked", label: "Blocked" },
-  { id: "done", label: "Done" },
-];
+const COLUMNS = ["pending", "in_progress", "blocked", "done"] as const;
 
 export function Board({ onOpen }: { onOpen: (id: string) => void }) {
+  const { t } = useI18n();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [view, setView] = useState<"board" | "list">("board");
   const [creating, setCreating] = useState(false);
@@ -19,73 +16,84 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
   const refresh = () => api.tasks().then(setTasks).catch(() => setTasks([]));
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 3000);
-    return () => clearInterval(t);
+    const i = setInterval(refresh, 3000);
+    return () => clearInterval(i);
   }, []);
 
-  if (!tasks) return <Spinner label="Loading tasks…" />;
+  if (!tasks)
+    return <Spinner label={`${t("board.title")}…`} />;
   return (
     <div>
       <div className="view-bar">
-        <h2>Tasks</h2>
-        <span className="muted">{tasks.length} total</span>
+        <h2>{t("board.title")}</h2>
+        <span className="muted">{t("board.total", { n: tasks.length })}</span>
         <span className="grow" />
         <div className="seg">
           <button className={view === "board" ? "on" : ""} onClick={() => setView("board")}>
-            Board
+            {t("board.board")}
           </button>
           <button className={view === "list" ? "on" : ""} onClick={() => setView("list")}>
-            List
+            {t("board.list")}
           </button>
         </div>
         <button className="primary" onClick={() => setCreating(true)}>
-          + New task
+          + {t("board.new")}
         </button>
       </div>
 
       {tasks.length === 0 ? (
         <Empty
           icon="🗂️"
-          title="No tasks yet"
-          hint="Create a task, then run it on any registered agent — or fan it out to several and compare."
+          title={t("board.empty.title")}
+          hint={t("board.empty.hint")}
+          action={
+            <button className="primary" onClick={() => setCreating(true)}>
+              + {t("board.new")}
+            </button>
+          }
         />
       ) : view === "board" ? (
         <div className="kanban">
           {COLUMNS.map((col) => (
-            <div key={col.id} className="kanban-col">
+            <div key={col} className="kanban-col">
               <div className="kanban-head">
-                {col.label}
-                <span className="count">{tasks.filter((t) => t.status === col.id).length}</span>
+                {t(`board.col.${col}`)}
+                <span className="count">{tasks.filter((x) => x.status === col).length}</span>
               </div>
               {tasks
-                .filter((t) => t.status === col.id)
-                .map((t) => (
-                  <TaskCard key={t.id} task={t} onOpen={onOpen} />
+                .filter((x) => x.status === col)
+                .map((x) => (
+                  <TaskCard key={x.id} task={x} onOpen={onOpen} />
                 ))}
             </div>
           ))}
         </div>
       ) : (
         <div className="card">
-          {tasks.map((t) => (
-            <button key={t.id} className="row-btn" onClick={() => onOpen(t.id)}>
-              <StatusDot status={t.status} />
-              <span className="title">{t.title}</span>
-              {t.project ? <span className="tag">{t.project}</span> : null}
-              <span className="muted">{t.status.replaceAll("_", " ")}</span>
+          {tasks.map((x) => (
+            <button key={x.id} className="row-btn" onClick={() => onOpen(x.id)}>
+              <StatusDot status={x.status} />
+              <span className="title">{x.title}</span>
+              {x.project ? <span className="tag">{x.project}</span> : null}
+              <span className="muted">{t(`status.${x.status}`)}</span>
               <span className="grow" />
-              <span className="time">{relTime(t.created_at)}</span>
+              <span className="time">
+                <RelTime iso={x.created_at} />
+              </span>
             </button>
           ))}
         </div>
       )}
 
-      {creating && <CreateTaskModal onClose={() => setCreating(false)} onCreated={onOpen} />}
+      {creating && (
+        <CreateTaskModal onClose={() => setCreating(false)} onCreated={onOpen} />
+      )}
     </div>
   );
 }
 
 function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: string) => void }) {
+  const { t } = useI18n();
   return (
     <button className="kanban-card" onClick={() => onOpen(task.id)}>
       <div className="row tight">
@@ -93,36 +101,47 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: string) => void }
         <strong>{task.title}</strong>
       </div>
       {task.project ? <span className="tag">{task.project}</span> : null}
-      <div className="time">{relTime(task.updated_at)}</div>
+      <div className="time">
+        <RelTime iso={task.updated_at} />
+      </div>
+      <span className="kanban-open muted">{t("task.viewLog")} →</span>
     </button>
   );
 }
 
-function CreateTaskModal({
+export function CreateTaskModal({
   onClose,
   onCreated,
 }: {
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {
+  const { t } = useI18n();
   const [title, setTitle] = useState("");
   const [intent, setIntent] = useState("");
   const [project, setProject] = useState("");
+  const [busy, setBusy] = useState(false);
   const toast = useToast();
   const create = async () => {
-    if (!title.trim()) return;
+    if (!title.trim() || busy) return;
+    setBusy(true);
     try {
-      const t = await api.createTask(title.trim(), intent.trim() || title.trim(), project.trim() || undefined);
-      toast("ok", "task created");
-      onCreated(t.id);
+      const task = await api.createTask(
+        title.trim(),
+        intent.trim() || title.trim(),
+        project.trim() || undefined,
+      );
+      toast("ok", t("newtask.created"));
+      onCreated(task.id);
     } catch (e) {
       toast("err", String(e));
+      setBusy(false);
     }
   };
   return (
-    <Modal title="New task" onClose={onClose}>
+    <Modal title={t("newtask.title")} onClose={onClose}>
       <label className="field">
-        <span>Title</span>
+        <span>{t("newtask.titleLabel")}</span>
         <input
           autoFocus
           value={title}
@@ -132,7 +151,7 @@ function CreateTaskModal({
         />
       </label>
       <label className="field">
-        <span>Intent (what should be done — becomes the run prompt)</span>
+        <span>{t("newtask.intentLabel")}</span>
         <textarea
           rows={4}
           value={intent}
@@ -141,12 +160,16 @@ function CreateTaskModal({
         />
       </label>
       <label className="field">
-        <span>Project (optional — scopes project memories)</span>
-        <input value={project} onChange={(e) => setProject(e.target.value)} placeholder="ruagent…" />
+        <span>{t("newtask.projectLabel")}</span>
+        <input
+          value={project}
+          onChange={(e) => setProject(e.target.value)}
+          placeholder="ruagent…"
+        />
       </label>
       <div className="row end">
-        <button className="primary" onClick={create}>
-          Create
+        <button className="primary" disabled={busy || !title.trim()} onClick={create}>
+          {busy ? "…" : t("common.create")}
         </button>
       </div>
     </Modal>

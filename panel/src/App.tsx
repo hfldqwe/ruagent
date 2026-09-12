@@ -1,9 +1,11 @@
-// App shell: sidebar navigation + hash routing + permission badge polling.
+// App shell: sidebar navigation + language toggle + hash routing.
 
 import { useEffect, useState } from "react";
 import { api } from "./api";
+import { useI18n } from "./i18n";
 import { ToastHost } from "./ui";
 import { Board } from "./views/Board";
+import { Home } from "./views/Home";
 import { TaskDetail } from "./views/TaskDetail";
 import { Memory } from "./views/Memory";
 import { Knowledge } from "./views/Knowledge";
@@ -11,6 +13,7 @@ import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
 
 type View =
+  | { kind: "home" }
   | { kind: "board" }
   | { kind: "task"; id: string }
   | { kind: "memory" }
@@ -25,6 +28,8 @@ function parseHash(): View {
   const mTask = h.match(/^task\/([\w-]+)/);
   if (mTask) return { kind: "task", id: mTask[1] };
   switch (h) {
+    case "board":
+      return { kind: "board" };
     case "memory":
       return { kind: "memory" };
     case "knowledge":
@@ -38,11 +43,12 @@ function parseHash(): View {
     case "inbox":
       return { kind: "inbox" };
     default:
-      return { kind: "board" };
+      return { kind: "home" };
   }
 }
 
 export default function App() {
+  const { lang, setLang, t } = useI18n();
   const [view, setView] = useState<View>(() => parseHash());
   const [inboxCount, setInboxCount] = useState(0);
   const [daemonUp, setDaemonUp] = useState(true);
@@ -64,8 +70,8 @@ export default function App() {
         })
         .catch(() => setDaemonUp(false));
     poll();
-    const t = setInterval(poll, 2000);
-    return () => clearInterval(t);
+    const i = setInterval(poll, 2000);
+    return () => clearInterval(i);
   }, []);
 
   const nav = (hash: string) => {
@@ -81,25 +87,21 @@ export default function App() {
             <span className="brand-name">ruagent</span>
           </div>
           <nav>
+            <NavItem icon="🏠" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
             <NavItem
               icon="🗂️"
-              label="Board"
+              label={t("nav.board")}
               active={view.kind === "board" || view.kind === "task"}
-              onClick={() => nav("")}
+              onClick={() => nav("board")}
             />
-            <NavItem icon="🧠" label="Memory" active={view.kind === "memory"} onClick={() => nav("memory")} />
-            <NavItem
-              icon="📚"
-              label="Knowledge"
-              active={view.kind === "knowledge"}
-              onClick={() => nav("knowledge")}
-            />
-            <NavItem icon="🕸️" label="Graph" active={view.kind === "graph"} onClick={() => nav("graph")} />
-            <NavItem icon="🤖" label="Agents" active={view.kind === "agents"} onClick={() => nav("agents")} />
-            <NavItem icon="📊" label="Stats" active={view.kind === "stats"} onClick={() => nav("stats")} />
+            <NavItem icon="🧠" label={t("nav.memory")} active={view.kind === "memory"} onClick={() => nav("memory")} />
+            <NavItem icon="📚" label={t("nav.knowledge")} active={view.kind === "knowledge"} onClick={() => nav("knowledge")} />
+            <NavItem icon="🕸️" label={t("nav.graph")} active={view.kind === "graph"} onClick={() => nav("graph")} />
+            <NavItem icon="🤖" label={t("nav.agents")} active={view.kind === "agents"} onClick={() => nav("agents")} />
+            <NavItem icon="📊" label={t("nav.stats")} active={view.kind === "stats"} onClick={() => nav("stats")} />
             <NavItem
               icon="📥"
-              label="Inbox"
+              label={t("nav.inbox")}
               badge={inboxCount || undefined}
               active={view.kind === "inbox"}
               onClick={() => nav("inbox")}
@@ -107,16 +109,29 @@ export default function App() {
           </nav>
           <div className="sidebar-foot">
             {daemonUp ? (
-              <span className="conn ok">● daemon online</span>
+              <span className="conn ok">● {t("common.online")}</span>
             ) : (
-              <span className="conn err">● daemon unreachable</span>
+              <span className="conn err">● {t("common.offline")}</span>
             )}
+            <button
+              className="lang-toggle"
+              onClick={() => setLang(lang === "zh" ? "en" : "zh")}
+              title="中文 / EN"
+            >
+              {lang === "zh" ? "EN" : "中"}
+            </button>
           </div>
         </aside>
         <main className="content">
+          {view.kind === "home" && (
+            <Home
+              onOpenTask={(id) => nav(`task/${id}`)}
+              onNav={(hash) => nav(hash || "board")}
+            />
+          )}
           {view.kind === "board" && <Board onOpen={(id) => nav(`task/${id}`)} />}
           {view.kind === "task" && (
-            <TaskDetail key={view.id} id={view.id} onBack={() => nav("")} />
+            <TaskDetail key={view.id} id={view.id} onBack={() => nav("board")} />
           )}
           {view.kind === "memory" && <Memory />}
           {view.kind === "knowledge" && <Knowledge />}

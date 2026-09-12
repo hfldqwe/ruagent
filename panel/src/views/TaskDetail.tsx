@@ -1,14 +1,25 @@
-// Task detail: launcher (single/fanout/pipeline), run list with costs,
-// comparison with select, rich run timeline, task status controls.
+// Task detail: launcher (single/fanout/pipeline), run list, comparison,
+// execution log, task status controls. Fully bilingual.
 
 import { useEffect, useState } from "react";
 import { api, type AgentInfo, type Run, type Task } from "../api";
-import { Markdown, Modal, Spinner, StatusDot, StatusPill, fmtUsd, relTime, useToast } from "../ui";
+import { useI18n } from "../i18n";
+import {
+  Markdown,
+  Modal,
+  RelTime,
+  Spinner,
+  StatusDot,
+  StatusPill,
+  fmtUsd,
+  useToast,
+} from "../ui";
 import { RunTimeline } from "./RunTimeline";
 
 type Mode = "single" | "fanout" | "pipeline";
 
 export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
+  const { t } = useI18n();
   const [task, setTask] = useState<Task | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [winner, setWinner] = useState<string | null>(null);
@@ -24,7 +35,6 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
         setTask(r.task);
         setRuns(r.runs);
         setWinner(r.selected_run_id);
-        // Deep-link ergonomics: show the latest run's log without a click.
         setSelectedRun((prev) => prev ?? (r.runs[0]?.id ?? null));
         return r;
       })
@@ -33,20 +43,22 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   useEffect(() => {
     api.agents().then(setAgents).catch(() => {});
     refresh();
-    const t = setInterval(refresh, 2000);
-    return () => clearInterval(t);
+    const i = setInterval(refresh, 2000);
+    return () => clearInterval(i);
   }, [id]);
 
-  if (!task) return <Spinner label="Loading task…" />;
+  if (!task) return <Spinner label={`${t("board.title")}…`} />;
   const activeStatuses = ["queued", "spawning", "running", "waiting_permission"];
   const completed = runs.filter((r) => r.status === "completed");
   const totalCost = runs.reduce((s, r) => s + (r.cost_usd ?? 0), 0);
+  const agentName = (r: Run) =>
+    agents.find((a) => a.id === r.params.agent)?.name ?? r.params.agent.slice(0, 8);
 
   return (
     <div>
       <div className="view-bar">
         <button className="link" onClick={onBack}>
-          ← board
+          ← {t("task.back")}
         </button>
         <h2>{task.title}</h2>
         <StatusPill status={task.status} />
@@ -69,7 +81,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
       {runs.length > 1 && completed.length > 1 && (
         <>
-          <h3>Comparison</h3>
+          <h3>{t("task.comparison")}</h3>
           <div className="compare">
             {runs.map((r) => (
               <div
@@ -78,22 +90,20 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
               >
                 <div className="row">
                   <StatusDot status={r.status} />
-                  <strong>
-                    {agents.find((a) => a.id === r.params.agent)?.name ?? r.params.agent.slice(0, 8)}
-                  </strong>
+                  <strong>{agentName(r)}</strong>
                   {r.cost_usd != null ? <span className="muted">{fmtUsd(r.cost_usd)}</span> : null}
-                  {winner === r.id ? <span className="tag">winner</span> : null}
+                  {winner === r.id ? <span className="tag ok">{t("task.winner")}</span> : null}
                 </div>
                 <div className="compare-result">
                   {r.result ? (
                     <Markdown>{r.result}</Markdown>
                   ) : (
-                    <span className="muted">(no result)</span>
+                    <span className="muted">{t("task.noResult")}</span>
                   )}
                 </div>
                 <div className="row">
                   <button className="link" onClick={() => setSelectedRun(r.id)}>
-                    view log
+                    {t("task.viewLog")}
                   </button>
                   {r.status === "completed" && winner !== r.id ? (
                     <button
@@ -101,14 +111,14 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                       onClick={async () => {
                         try {
                           await api.selectRun(r.id);
-                          toast("ok", "winner selected");
+                          toast("ok", t("toast.winnerSelected"));
                           refresh();
                         } catch (e) {
                           toast("err", String(e));
                         }
                       }}
                     >
-                      Select as winner
+                      {t("task.selectWinner")}
                     </button>
                   ) : null}
                 </div>
@@ -119,11 +129,14 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
       )}
 
       <h3>
-        Runs <span className="muted">({runs.length})</span>
-        {totalCost > 0 ? <span className="muted"> · {fmtUsd(totalCost)} total</span> : null}
+        {t("task.runs")}{" "}
+        <span className="muted">
+          {t("task.runsCount", { n: runs.length })}
+          {totalCost > 0 ? ` · ${t("task.totalCost", { cost: fmtUsd(totalCost) })}` : ""}
+        </span>
       </h3>
       {runs.length === 0 ? (
-        <p className="muted pad">No runs yet — launch one above.</p>
+        <p className="muted pad">{t("task.noRuns")}</p>
       ) : (
         <div className="card">
           {runs.map((r) => (
@@ -131,7 +144,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
               key={r.id}
               role="button"
               tabIndex={0}
-              aria-label={`Open run ${r.id.slice(0, 8)} log`}
+              aria-label={agentName(r)}
               className={selectedRun === r.id ? "row-btn selected" : "row-btn"}
               onClick={() => setSelectedRun(r.id)}
               onKeyDown={(e) => {
@@ -143,21 +156,18 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
             >
               <StatusDot status={r.status} />
               <span className="mono muted">{r.id.slice(0, 8)}</span>
-              <span className="tag">
-                {agents.find((a) => a.id === r.params.agent)?.name ?? r.params.agent.slice(0, 8)}
-              </span>
+              <span className="tag">{agentName(r)}</span>
               <StatusPill status={r.status} />
               {r.context_usage ? (
                 <span className="muted">
-                  {Math.round((r.context_usage.used / r.context_usage.size) * 100)}% ctx
+                  {Math.round((r.context_usage.used / r.context_usage.size) * 100)}%
                 </span>
               ) : null}
               {r.cost_usd != null ? <span className="muted">{fmtUsd(r.cost_usd)}</span> : null}
-              {r.stop_reason ? (
-                <span className="muted">{r.stop_reason.replaceAll("_", " ")}</span>
-              ) : null}
               <span className="grow" />
-              <span className="time">{relTime(r.created_at)}</span>
+              <span className="time">
+                <RelTime iso={r.created_at} />
+              </span>
               {activeStatuses.includes(r.status) ? (
                 <button
                   className="danger sm"
@@ -165,14 +175,14 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                     e.stopPropagation();
                     try {
                       await api.cancelRun(r.id);
-                      toast("ok", "cancelling…");
+                      toast("ok", t("toast.cancelling"));
                     } catch (err) {
                       toast("err", String(err));
                     }
                     refresh();
                   }}
                 >
-                  Cancel
+                  {t("task.cancelRun")}
                 </button>
               ) : null}
             </div>
@@ -182,7 +192,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
       {selectedRun && runs.some((r) => r.id === selectedRun) ? (
         <>
-          <h3>Execution Log</h3>
+          <h3>{t("task.log")}</h3>
           <RunTimeline
             key={selectedRun}
             run={runs.find((r) => r.id === selectedRun)!}
@@ -211,6 +221,7 @@ function Launcher({
   busy: boolean;
   setBusy: (b: boolean) => void;
 }) {
+  const { t } = useI18n();
   const [mode, setMode] = useState<Mode>("single");
   const [agent, setAgent] = useState(agents[0]?.name ?? "");
   const [prompt, setPrompt] = useState("");
@@ -234,11 +245,11 @@ function Launcher({
         const run = await api.startRun(task.id, agent, p, repo.trim() || undefined);
         onLaunched(run.id);
       } else if (mode === "fanout") {
-        if (picked.length < 2) throw new Error("fan-out needs at least 2 agents");
+        if (picked.length < 2) throw new Error(t("launcher.needs2"));
         const { runs } = await api.fanout(task.id, picked, p, repo.trim() || undefined);
         onLaunched(runs[0]?.id ?? null);
       } else {
-        if (steps.length < 2) throw new Error("pipeline needs at least 2 steps");
+        if (steps.length < 2 || steps.some((s) => !s)) throw new Error(t("launcher.needs2"));
         await api.pipeline(
           task.id,
           steps.map((s) => ({ agent: s })),
@@ -246,7 +257,7 @@ function Launcher({
         onLaunched(null);
       }
       setPrompt("");
-      toast("ok", `${mode} launched`);
+      toast("ok", t("toast.launched"));
     } catch (e) {
       toast("err", String(e));
     } finally {
@@ -254,20 +265,19 @@ function Launcher({
     }
   };
 
-  if (agents.length === 0)
-    return <p className="muted pad">No enabled agents — edit ~/.ruagent/config/agents.toml.</p>;
+  if (agents.length === 0) return <p className="muted pad">{t("launcher.noAgents")}</p>;
 
   return (
     <div className="card launcher">
       <div className="seg">
         <button className={mode === "single" ? "on" : ""} onClick={() => setMode("single")}>
-          Run
+          {t("launcher.run")}
         </button>
         <button className={mode === "fanout" ? "on" : ""} onClick={() => setMode("fanout")}>
-          Fan out
+          {t("launcher.fanout")}
         </button>
         <button className={mode === "pipeline" ? "on" : ""} onClick={() => setMode("pipeline")}>
-          Pipeline
+          {t("launcher.pipeline")}
         </button>
       </div>
 
@@ -290,7 +300,7 @@ function Launcher({
               {a.name}
             </label>
           ))}
-          <span className="muted">{picked.length} selected</span>
+          <span className="muted">{t("launcher.selected", { n: picked.length })}</span>
         </div>
       )}
       {mode === "pipeline" && (
@@ -302,7 +312,7 @@ function Launcher({
                 value={s}
                 onChange={(e) => setSteps(steps.map((x, j) => (j === i ? e.target.value : x)))}
               >
-                <option value="">choose agent…</option>
+                <option value="">{t("launcher.chooseAgent")}</option>
                 {agents.map((a) => (
                   <option key={a.name} value={a.name}>
                     {a.name}
@@ -313,14 +323,14 @@ function Launcher({
               <button
                 className="sm"
                 onClick={() => setSteps(steps.filter((_, j) => j !== i))}
-                title="remove step"
+                title={t("launcher.removeStep")}
               >
                 ✕
               </button>
             </div>
           ))}
           <button className="sm" onClick={() => setSteps([...steps, ""])} disabled={steps.length >= 5}>
-            + step
+            {t("launcher.addStep")}
           </button>
         </div>
       )}
@@ -328,7 +338,7 @@ function Launcher({
       {mode !== "pipeline" && (
         <input
           className="grow"
-          placeholder="Prompt (defaults to the task intent)…"
+          placeholder={t("launcher.prompt")}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !busy && go()}
@@ -336,7 +346,7 @@ function Launcher({
       )}
       <input
         className="grow mono"
-        placeholder="Git repo for worktree isolation (optional)…"
+        placeholder={t("launcher.repo")}
         value={repo}
         onChange={(e) => setRepo(e.target.value)}
       />
@@ -347,7 +357,7 @@ function Launcher({
             disabled={busy || steps.some((s) => !s) || steps.length < 2}
             onClick={go}
           >
-            Start pipeline
+            {t("launcher.startPipeline")}
           </button>
         ) : (
           <button
@@ -355,18 +365,15 @@ function Launcher({
             disabled={busy || (mode === "fanout" && picked.length < 2)}
             onClick={go}
           >
-            {mode === "single" ? "Run" : `Fan out (${picked.length})`}
+            {mode === "single" ? t("launcher.run") : `${t("launcher.fanout")} (${picked.length})`}
           </button>
         )}
       </div>
       <details className="hint">
-        <summary className="muted">how do these differ?</summary>
-        <p className="muted">
-          <strong>Run</strong> sends the prompt to one agent. <strong>Fan out</strong> sends it to
-          several in parallel (each in its own worktree when a repo is given) and shows results
-          side by side for you to pick a winner. <strong>Pipeline</strong> chains agents — each
-          step receives the previous step's result as handoff context.
-        </p>
+        <summary className="muted">{t("launcher.hint.title")}</summary>
+        <div className="muted">
+          <Markdown>{t("launcher.hint.body")}</Markdown>
+        </div>
       </details>
     </div>
   );
@@ -385,12 +392,12 @@ function TaskStatusMenu({
   onChanged: () => void;
   onDeleted: () => void;
 }) {
+  const { t } = useI18n();
   const [confirming, setConfirming] = useState(false);
   const toast = useToast();
   const set = async (status: string) => {
     try {
       await api.updateTaskStatus(task.id, status);
-      toast("ok", `task → ${status}`);
       onChanged();
     } catch (e) {
       toast("err", String(e));
@@ -398,37 +405,34 @@ function TaskStatusMenu({
   };
   return (
     <span className="row tight">
-      <select value={task.status} onChange={(e) => set(e.target.value)} title="change task status">
+      <select value={task.status} onChange={(e) => set(e.target.value)} title={t("task.status")}>
         {["pending", "in_progress", "blocked", "done", "cancelled"].map((s) => (
           <option key={s} value={s}>
-            {s.replaceAll("_", " ")}
+            {t(`status.${s}`)}
           </option>
         ))}
       </select>
       <button className="danger sm" onClick={() => setConfirming(true)}>
-        delete
+        {t("common.delete")}
       </button>
       {confirming && (
-        <Modal title="Delete task?" onClose={() => setConfirming(false)}>
-          <p>
-            Deletes the task and its run records. Transcript files stay on disk as evidence. This
-            cannot be undone.
-          </p>
+        <Modal title={t("task.deleteConfirm.title")} onClose={() => setConfirming(false)}>
+          <p>{t("task.deleteConfirm.body")}</p>
           <div className="row end">
-            <button onClick={() => setConfirming(false)}>Keep</button>
+            <button onClick={() => setConfirming(false)}>{t("common.keep")}</button>
             <button
               className="danger"
               onClick={async () => {
                 try {
                   await api.deleteTask(task.id);
-                  toast("ok", "task deleted");
+                  toast("ok", t("toast.taskDeleted"));
                   onDeleted();
                 } catch (e) {
                   toast("err", String(e));
                 }
               }}
             >
-              Delete
+              {t("common.delete")}
             </button>
           </div>
         </Modal>

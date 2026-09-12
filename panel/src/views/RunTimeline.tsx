@@ -1,11 +1,10 @@
-// Run timeline: the execution log (Multica parity) — every event rendered
-// richly: markdown messages, expandable tool calls, permission attribution,
-// plan progress, usage meters, cancellation.
+// Run timeline: the execution log — every event rendered richly, bilingual.
 
 import { useEffect, useRef, useState } from "react";
 import type { Run } from "../api";
-import { api } from "../api";
-import { Markdown, StatusPill, UsageMeter, dateOf, fmtUsd, relTime } from "../ui";
+import { useI18n } from "../i18n";
+import { Markdown, StatusPill, UsageMeter, fmtUsd } from "../ui";
+import { dateOf } from "../i18n";
 
 interface EventLine {
   ts: string;
@@ -17,13 +16,13 @@ interface EventLine {
 }
 
 export function RunTimeline({ run, live }: { run: Run; live: boolean }) {
+  const { t } = useI18n();
   const [lines, setLines] = useState<EventLine[]>([]);
   const [ended, setEnded] = useState<string | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
-  // Replay + live tail over SSE.
   useEffect(() => {
     if (!live) return;
     setLines([]);
@@ -53,7 +52,6 @@ export function RunTimeline({ run, live }: { run: Run; live: boolean }) {
     return () => es.close();
   }, [run.id, live]);
 
-  // For completed runs: fetch the whole transcript at once.
   useEffect(() => {
     if (live) return;
     let cancelled = false;
@@ -66,7 +64,6 @@ export function RunTimeline({ run, live }: { run: Run; live: boolean }) {
           if (!line.startsWith("data: ")) continue;
           try {
             const parsed = JSON.parse(line.slice(6)) as EventLine;
-            // The end marker ({"status": ...}) has no `event` — skip it.
             if (parsed && typeof parsed.event === "object" && parsed.event !== null) {
               out.push(parsed);
             }
@@ -106,15 +103,13 @@ export function RunTimeline({ run, live }: { run: Run; live: boolean }) {
         ) : null}
         {run.cost_usd != null ? <span className="muted">{fmtUsd(run.cost_usd)}</span> : null}
         {live && !ended ? (
-          <span className="live-flag">● live</span>
+          <span className="live-flag">● {t("timeline.live")}</span>
         ) : (
-          <span className="muted">{relTime(run.updated_at)}</span>
+          <span className="time">{dateOf(run.updated_at)}</span>
         )}
       </div>
       <div className="timeline" ref={boxRef} onScroll={onScroll}>
-        {lines.length === 0 && !live ? (
-          <p className="muted pad">No events recorded.</p>
-        ) : null}
+        {lines.length === 0 && !live ? <p className="muted pad">{t("timeline.noEvents")}</p> : null}
         {lines.map((l) => (
           <EventRow key={l.seq} line={l} />
         ))}
@@ -128,7 +123,7 @@ export function RunTimeline({ run, live }: { run: Run; live: boolean }) {
             bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
           }}
         >
-          ↓ latest
+          {t("timeline.latest")}
         </button>
       )}
     </div>
@@ -136,6 +131,7 @@ export function RunTimeline({ run, live }: { run: Run; live: boolean }) {
 }
 
 function EventRow({ line }: { line: EventLine }) {
+  const { t } = useI18n();
   const e = line.event;
   switch (e.type) {
     case "agent_message_chunk": {
@@ -155,7 +151,9 @@ function EventRow({ line }: { line: EventLine }) {
       );
     }
     case "tool_call":
-      return <ToolRow ts={line.ts} id={String(e.tool_call_id)} title={String(e.title)} input={e.raw_input} />;
+      return (
+        <ToolRow id={String(e.tool_call_id)} title={String(e.title)} input={e.raw_input} />
+      );
     case "tool_call_update":
       return <ToolUpdateRow id={String(e.tool_call_id)} output={e.raw_output} />;
     case "plan": {
@@ -166,11 +164,16 @@ function EventRow({ line }: { line: EventLine }) {
           <span className="ev-icon">🗺️</span>
           <div className="plan-body">
             <div className="plan-head">
-              plan <span className="muted">{done}/{entries.length}</span>
+              {t("timeline.plan")}{" "}
+              <span className="muted">
+                {done}/{entries.length}
+              </span>
             </div>
             {entries.map((p, i) => (
               <div key={i} className={p.status === "completed" ? "plan-item done" : "plan-item"}>
-                <span className="plan-check">{p.status === "completed" ? "✓" : p.status === "in_progress" ? "◐" : "○"}</span>
+                <span className="plan-check">
+                  {p.status === "completed" ? "✓" : p.status === "in_progress" ? "◐" : "○"}
+                </span>
                 {p.content}
               </div>
             ))}
@@ -193,7 +196,7 @@ function EventRow({ line }: { line: EventLine }) {
       return (
         <div className="ev sys">
           <span className="ev-icon">🧭</span>
-          <span className="muted">routed via {level}{why}</span>
+          <span className="muted">{t("timeline.routed", { level })}{why}</span>
         </div>
       );
     }
@@ -203,8 +206,11 @@ function EventRow({ line }: { line: EventLine }) {
       return (
         <details className="ev inject">
           <summary>
-            <span className="ev-icon">🧠</span> context injected
-            <span className="muted"> {blocks.join(", ")} · {render.length} chars</span>
+            <span className="ev-icon">🧠</span> {t("timeline.injected")}
+            <span className="muted">
+              {" "}
+              {t("timeline.injectedBlocks", { blocks: blocks.join(", "), n: render.length })}
+            </span>
           </summary>
           <pre className="raw">{render}</pre>
         </details>
@@ -214,22 +220,22 @@ function EventRow({ line }: { line: EventLine }) {
       return (
         <div className="ev perm">
           <span className="ev-icon">🔐</span>
-          <span>
-            permission requested: <strong>{String(e.title)}</strong>
-          </span>
+          <span>{t("timeline.permReq", { title: String(e.title) })}</span>
         </div>
       );
     case "permission_resolved": {
       const res = e.resolution as { source: string };
-      const outcome = String(e.outcome).replaceAll("_", " ");
-      const badge =
-        res.source === "human" ? "👤 human" : res.source === "approver_agent" ? "🤖 approver" : "📜 rule";
+      const outcome = t(`status.${String(e.outcome)}`);
+      const whoKey =
+        res.source === "human"
+          ? "timeline.by.human"
+          : res.source === "approver_agent"
+            ? "timeline.by.approver"
+            : "timeline.by.rule";
       return (
         <div className="ev perm resolved">
           <span className="ev-icon">🔓</span>
-          <span>
-            {outcome} <span className="muted">by</span> {badge}
-          </span>
+          <span>{t("timeline.permRes", { outcome, who: t(whoKey) })}</span>
         </div>
       );
     }
@@ -244,7 +250,9 @@ function EventRow({ line }: { line: EventLine }) {
       return (
         <div className="ev sys">
           <span className="ev-icon">■</span>
-          <span className="muted">stopped: {String(e.stop_reason).replaceAll("_", " ")}</span>
+          <span className="muted">
+            {t("timeline.stopped", { reason: t(`status.${String(e.stop_reason)}`) })}
+          </span>
         </div>
       );
     case "error":
@@ -272,17 +280,7 @@ function MessageRow({ text }: { text: string }) {
   );
 }
 
-function ToolRow({
-  ts,
-  id,
-  title,
-  input,
-}: {
-  ts: string;
-  id: string;
-  title: string;
-  input: unknown;
-}) {
+function ToolRow({ id, title, input }: { id: string; title: string; input: unknown }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="ev tool">
@@ -290,15 +288,11 @@ function ToolRow({
         <span className="ev-icon">🔧</span>
         <strong>{title}</strong>
         <span className="muted mono">{id}</span>
-        <span className="muted time">{dateOf(ts)}</span>
         <span className="chev">{open ? "▾" : "▸"}</span>
       </button>
       {open && (
         <div className="tool-detail">
-          <div className="tool-io">
-            <span className="io-label">input</span>
-            <pre className="raw">{pretty(input)}</pre>
-          </div>
+          <pre className="raw">{pretty(input)}</pre>
         </div>
       )}
     </div>
@@ -306,12 +300,11 @@ function ToolRow({
 }
 
 function ToolUpdateRow({ id, output }: { id: string; output: unknown }) {
-  // Render updates inline under the last tool row is complex; show a
-  // compact expandable for non-empty outputs.
+  const { t } = useI18n();
   if (output == null) return null;
   return (
     <details className="ev tool-update">
-      <summary className="muted">↳ output of {id}</summary>
+      <summary className="muted">{t("timeline.toolOutput", { id })}</summary>
       <pre className="raw">{pretty(output)}</pre>
     </details>
   );
@@ -324,32 +317,4 @@ function pretty(v: unknown): string {
   } catch {
     return String(v);
   }
-}
-
-export function RunActions({ run, onDone }: { run: Run; onDone: () => void }) {
-  const busy = useRef(false);
-  const active = !["completed", "failed", "cancelled", "interrupted"].includes(run.status);
-  return (
-    <span className="run-actions">
-      {active ? (
-        <button
-          className="danger sm"
-          disabled={busy.current}
-          onClick={async () => {
-            busy.current = true;
-            try {
-              await api.cancelRun(run.id);
-              onDone();
-            } catch (e) {
-              onDone();
-              // surfaced by the caller's toast
-              void e;
-            }
-          }}
-        >
-          Cancel
-        </button>
-      ) : null}
-    </span>
-  );
 }
