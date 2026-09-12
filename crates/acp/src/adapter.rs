@@ -159,6 +159,12 @@ mod tests {
 
     #[test]
     fn spawn_spec_appends_args() {
+        // Requires the harness CLIs on PATH; skip (not fail) elsewhere —
+        // CI runners do not install dsh/opencode.
+        if ruagent_acp::resolve_program("dsh").is_none() {
+            eprintln!("skipping: dsh not on PATH");
+            return;
+        }
         let mut card = ruagent_core::AgentCard {
             id: ruagent_core::AgentId::generate(),
             name: "dsh".into(),
