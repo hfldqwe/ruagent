@@ -37,7 +37,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
     return () => clearInterval(t);
   }, [id]);
 
-  if (!task) return <Spinner label="loading task…" />;
+  if (!task) return <Spinner label="Loading task…" />;
   const activeStatuses = ["queued", "spawning", "running", "waiting_permission"];
   const completed = runs.filter((r) => r.status === "completed");
   const totalCost = runs.reduce((s, r) => s + (r.cost_usd ?? 0), 0);
@@ -129,8 +129,17 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
           {runs.map((r) => (
             <div
               key={r.id}
-              className={selectedRun === r.id ? "row clickable selected" : "row clickable"}
+              role="button"
+              tabIndex={0}
+              aria-label={`Open run ${r.id.slice(0, 8)} log`}
+              className={selectedRun === r.id ? "row-btn selected" : "row-btn"}
               onClick={() => setSelectedRun(r.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setSelectedRun(r.id);
+                }
+              }}
             >
               <StatusDot status={r.status} />
               <span className="mono muted">{r.id.slice(0, 8)}</span>
@@ -148,7 +157,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                 <span className="muted">{r.stop_reason.replaceAll("_", " ")}</span>
               ) : null}
               <span className="grow" />
-              <span className="muted time">{relTime(r.created_at)}</span>
+              <span className="time">{relTime(r.created_at)}</span>
               {activeStatuses.includes(r.status) ? (
                 <button
                   className="danger sm"
@@ -163,7 +172,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                     refresh();
                   }}
                 >
-                  cancel
+                  Cancel
                 </button>
               ) : null}
             </div>
@@ -173,7 +182,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
       {selectedRun && runs.some((r) => r.id === selectedRun) ? (
         <>
-          <h3>Execution log</h3>
+          <h3>Execution Log</h3>
           <RunTimeline
             key={selectedRun}
             run={runs.find((r) => r.id === selectedRun)!}
@@ -319,7 +328,7 @@ function Launcher({
       {mode !== "pipeline" && (
         <input
           className="grow"
-          placeholder="Prompt (defaults to the task intent)"
+          placeholder="Prompt (defaults to the task intent)…"
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !busy && go()}
@@ -327,7 +336,7 @@ function Launcher({
       )}
       <input
         className="grow mono"
-        placeholder="git repo for worktree isolation (optional, e.g. C:/src/myproject)"
+        placeholder="Git repo for worktree isolation (optional)…"
         value={repo}
         onChange={(e) => setRepo(e.target.value)}
       />

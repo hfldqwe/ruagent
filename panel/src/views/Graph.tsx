@@ -51,7 +51,7 @@ export function Graph() {
       <div className="search-bar">
         <input
           className="grow"
-          placeholder="search entities (name, summary)…"
+          placeholder="Search entities (name, summary)…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && search()}
@@ -61,7 +61,7 @@ export function Graph() {
       {selected ? (
         <EntityDetail entity={selected} onBack={() => setSelected(null)} />
       ) : entities === null ? (
-        <Spinner label="loading entities…" />
+        <Spinner label="Loading entities…" />
       ) : entities.length === 0 ? (
         <Empty
           icon="🕸️"
@@ -71,14 +71,14 @@ export function Graph() {
       ) : (
         <div className="card">
           {entities.map(([e, factCount]) => (
-            <div key={e.id} className="row clickable" onClick={() => setSelected(e)}>
+            <button key={e.id} className="row-btn" onClick={() => setSelected(e)}>
               <span className="doc-icon">{kindIcon(e.kind)}</span>
               <strong>{e.name}</strong>
               {e.kind ? <span className="tag">{e.kind}</span> : null}
               <span className="muted">{factCount} facts</span>
               <span className="grow" />
               {e.summary ? <span className="muted truncated">{e.summary}</span> : null}
-            </div>
+            </button>
           ))}
         </div>
       )}
@@ -158,7 +158,7 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
           <span className="muted">as of…</span>
           <input
             className="mono sm"
-            placeholder="now (click to time-travel)"
+            placeholder="As of date (e.g. 2026-01-15)…"
             value={at}
             onChange={(e) => setAt(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && loadFacts(at)}

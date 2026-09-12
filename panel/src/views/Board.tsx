@@ -23,7 +23,7 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
     return () => clearInterval(t);
   }, []);
 
-  if (!tasks) return <Spinner label="loading tasks…" />;
+  if (!tasks) return <Spinner label="Loading tasks…" />;
   return (
     <div>
       <div className="view-bar">
@@ -68,13 +68,14 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
       ) : (
         <div className="card">
           {tasks.map((t) => (
-            <div key={t.id} className="row clickable" onClick={() => onOpen(t.id)}>
+            <button key={t.id} className="row-btn" onClick={() => onOpen(t.id)}>
               <StatusDot status={t.status} />
               <span className="title">{t.title}</span>
               {t.project ? <span className="tag">{t.project}</span> : null}
               <span className="muted">{t.status.replaceAll("_", " ")}</span>
-              <span className="muted time">{relTime(t.created_at)}</span>
-            </div>
+              <span className="grow" />
+              <span className="time">{relTime(t.created_at)}</span>
+            </button>
           ))}
         </div>
       )}
@@ -86,14 +87,14 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
 
 function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: string) => void }) {
   return (
-    <div className="kanban-card" onClick={() => onOpen(task.id)}>
+    <button className="kanban-card" onClick={() => onOpen(task.id)}>
       <div className="row tight">
         <StatusDot status={task.status} />
         <strong>{task.title}</strong>
       </div>
       {task.project ? <span className="tag">{task.project}</span> : null}
-      <div className="muted time">{relTime(task.updated_at)}</div>
-    </div>
+      <div className="time">{relTime(task.updated_at)}</div>
+    </button>
   );
 }
 
@@ -127,7 +128,7 @@ function CreateTaskModal({
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && create()}
-          placeholder="Fix the login bug"
+          placeholder="Fix the login bug…"
         />
       </label>
       <label className="field">
@@ -141,7 +142,7 @@ function CreateTaskModal({
       </label>
       <label className="field">
         <span>Project (optional — scopes project memories)</span>
-        <input value={project} onChange={(e) => setProject(e.target.value)} placeholder="ruagent" />
+        <input value={project} onChange={(e) => setProject(e.target.value)} placeholder="ruagent…" />
       </label>
       <div className="row end">
         <button className="primary" onClick={create}>

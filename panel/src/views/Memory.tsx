@@ -69,7 +69,7 @@ export function Memory() {
         </div>
         {tab === "browse" && (
           <button className="primary" onClick={() => setWriting(true)}>
-            + Write memory
+            + Write Memory
           </button>
         )}
       </div>
@@ -109,7 +109,7 @@ export function Memory() {
           </div>
 
           {memories === null ? (
-            <Spinner label="loading memories…" />
+            <Spinner label="Loading memories…" />
           ) : memories.length === 0 ? (
             <Empty
               icon="🧠"
@@ -323,7 +323,7 @@ function AuditView() {
   useEffect(() => {
     api.memoryDiffs(200).then(setDiffs).catch(() => setDiffs([]));
   }, []);
-  if (!diffs) return <Spinner label="loading audit log…" />;
+  if (!diffs) return <Spinner label="Loading audit log…" />;
   if (diffs.length === 0)
     return <Empty icon="📜" title="No memory writes yet" hint="Every write decision lands here." />;
   return (

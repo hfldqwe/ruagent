@@ -72,7 +72,11 @@ pub fn router(state: AppState) -> Router {
 
 /// Serve the built web panel (SPA) when `panel/dist` exists; the API
 /// works fine without it. Override with `RUAGENT_PANEL_DIST`.
-fn panel_service() -> tower_http::services::ServeDir<tower_http::services::ServeFile> {
+///
+/// Cache policy: hashed `/assets/*` are immutable; the HTML shell is
+/// `no-cache` so a rebuild always lands (a stale index.html referencing
+/// a dead bundle renders a blank page).
+fn panel_service() -> CacheDir {
     use tower_http::services::{ServeDir, ServeFile};
     let dist = std::env::var("RUAGENT_PANEL_DIST")
         .map(std::path::PathBuf::from)
@@ -83,7 +87,56 @@ fn panel_service() -> tower_http::services::ServeDir<tower_http::services::Serve
             "panel not built — serving API only (cd panel && npm run build)"
         );
     }
-    ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")))
+    let inner = ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
+    CacheDir { inner }
+}
+
+/// Wraps the static service to add cache headers. Only reaches
+/// non-API paths (the router's fallback).
+#[derive(Clone)]
+struct CacheDir {
+    inner: tower_http::services::ServeDir<tower_http::services::ServeFile>,
+}
+
+impl tower::Service<axum::http::Request<axum::body::Body>> for CacheDir {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::<axum::http::Request<axum::body::Body>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        use tower::ServiceExt as _;
+        let is_asset = req.uri().path().starts_with("/assets/");
+        let mut fut = self.inner.clone().oneshot(req);
+        Box::pin(async move {
+            let resp = fut.await.map_err(|e| match e {})?;
+            // into_parts + from_parts preserves headers (Content-Type!) —
+            // Response::new(body) drops them, which breaks module-script
+            // MIME checks and renders a blank panel.
+            let (mut parts, body) = resp.into_parts();
+            let cache = if is_asset {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            parts.headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(cache),
+            );
+            Ok(axum::response::Response::from_parts(
+                parts,
+                axum::body::Body::new(body),
+            ))
+        })
+    }
 }
 
 /// Error type that renders as (status, message).

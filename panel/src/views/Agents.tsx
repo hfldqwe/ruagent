@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type AgentInfo, type AgentStats, type McpRegistry, type PendingPermission } from "../api";
-import { Empty, Modal, Spinner, relTime, useToast } from "../ui";
+import { Empty, Modal, Spinner, fmtUsd, relTime, useToast } from "../ui";
 
 // ---------------------------------------------------------------------------
 // Agents
@@ -23,7 +23,7 @@ export function Agents() {
     return () => clearInterval(t);
   }, []);
 
-  if (!agents) return <Spinner label="loading agents…" />;
+  if (!agents) return <Spinner label="Loading agents…" />;
   return (
     <div>
       <div className="view-bar">
@@ -61,7 +61,7 @@ export function Agents() {
                       <span className="muted">success</span>
                     </div>
                     <div className="stat-cell">
-                      <span className="stat-num">{s.total_cost_usd < 0.01 && s.total_cost_usd > 0 ? `$${s.total_cost_usd.toFixed(4)}` : `$${s.total_cost_usd.toFixed(2)}`}</span>
+                      <span className="stat-num">{fmtUsd(s.total_cost_usd)}</span>
                       <span className="muted">cost</span>
                     </div>
                     <div className="stat-cell">
@@ -78,7 +78,7 @@ export function Agents() {
         </div>
       )}
 
-      <h3>MCP registry</h3>
+      <h3>MCP Registry</h3>
       {mcp && mcp.servers.length > 0 ? (
         <div className="card">
           {mcp.servers.map((s) => (
@@ -112,7 +112,7 @@ export function Stats() {
     const t = setInterval(() => api.stats().then(setStats).catch(() => {}), 5000);
     return () => clearInterval(t);
   }, []);
-  if (!stats) return <Spinner label="loading stats…" />;
+  if (!stats) return <Spinner label="Loading stats…" />;
   if (stats.length === 0) return <Empty icon="📊" title="No runs recorded yet" />;
   const maxCost = Math.max(...stats.map((s) => s.total_cost_usd), 0.0001);
   return (
@@ -125,12 +125,12 @@ export function Stats() {
         <table className="stats">
           <thead>
             <tr>
-              <th>agent</th>
-              <th>runs</th>
-              <th>completed</th>
-              <th>failed</th>
-              <th>cost</th>
-              <th>last run</th>
+              <th>Agent</th>
+              <th>Runs</th>
+              <th>Completed</th>
+              <th>Failed</th>
+              <th>Cost</th>
+              <th>Last Run</th>
             </tr>
           </thead>
           <tbody>
@@ -148,11 +148,7 @@ export function Stats() {
                         style={{ width: `${(s.total_cost_usd / maxCost) * 100}%` }}
                       />
                     </span>
-                    <span className="mono">
-                      {s.total_cost_usd < 0.01 && s.total_cost_usd > 0
-                        ? `$${s.total_cost_usd.toFixed(4)}`
-                        : `$${s.total_cost_usd.toFixed(2)}`}
-                    </span>
+                    <span className="mono">{fmtUsd(s.total_cost_usd)}</span>
                   </div>
                 </td>
                 <td className="muted">{relTime(s.last_run_at)}</td>
@@ -196,7 +192,7 @@ export function Inbox() {
     }
   };
 
-  if (!pending) return <Spinner label="loading inbox…" />;
+  if (!pending) return <Spinner label="Loading inbox…" />;
   return (
     <div>
       <div className="view-bar">
@@ -220,7 +216,7 @@ export function Inbox() {
                 <span className="muted mono">{p.run_id.slice(0, 8)}</span>
               </div>
               <button className="link" onClick={() => setDetail(p)}>
-                view raw input
+                View Raw Input
               </button>
               <div className="row">
                 <button className="primary" onClick={() => resolve(p, "allow")}>

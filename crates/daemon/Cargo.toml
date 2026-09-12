@@ -23,6 +23,7 @@ ruagent-graph.workspace = true
 agent-client-protocol = "2.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
+tower = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

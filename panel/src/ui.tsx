@@ -34,7 +34,7 @@ export function ToastHost({ children }: { children: ReactNode }) {
   return (
     <ToastCtx.Provider value={push}>
       {children}
-      <div className="toasts">
+      <div className="toasts" role="status" aria-live="polite">
         {toasts.map((t) => (
           <div key={t.id} className={t.kind === "ok" ? "toast ok" : "toast err"}>
             {t.text}
@@ -182,11 +182,16 @@ export function fmtTokens(n: number): string {
   return String(n);
 }
 
+const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const usdPrecise = new Intl.NumberFormat("en-US", {
+  style: "currency", currency: "USD", maximumFractionDigits: 4,
+});
+
 export function fmtUsd(n: number | null | undefined): string {
   if (n == null) return "—";
   if (n === 0) return "$0";
-  if (n < 0.01) return `$${n.toFixed(4)}`;
-  return `$${n.toFixed(2)}`;
+  if (n < 0.01) return usdPrecise.format(n);
+  return usd.format(n);
 }
 
 export function UsageMeter({ used, size }: { used: number; size: number }) {

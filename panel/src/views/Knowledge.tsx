@@ -68,7 +68,7 @@ export function Knowledge() {
         </span>
         <span className="grow" />
         <button className="primary" onClick={() => setIngesting(true)}>
-          + Ingest document
+          + Ingest Document
         </button>
       </div>
 
@@ -76,7 +76,7 @@ export function Knowledge() {
         <input
           autoFocus
           className="grow"
-          placeholder="hybrid search (semantic + keyword)…"
+          placeholder="Search documents (semantic + keyword)…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && search()}
@@ -108,7 +108,7 @@ export function Knowledge() {
           </div>
         )
       ) : docs === null ? (
-        <Spinner label="loading documents…" />
+        <Spinner label="Loading documents…" />
       ) : docs.length === 0 ? (
         <Empty
           icon="📚"
@@ -119,12 +119,24 @@ export function Knowledge() {
         <div className="card">
           {docs.map((d) => (
             <div key={d.id}>
-              <div className="row clickable" onClick={() => openChunks(d.id)}>
+              <div
+                role="button"
+                tabIndex={0}
+                aria-label={`Toggle chunks of ${d.name}`}
+                className="row-btn"
+                onClick={() => openChunks(d.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openChunks(d.id);
+                  }
+                }}
+              >
                 <span className="doc-icon">📄</span>
                 <strong>{d.name}</strong>
                 <span className="muted">{d.chunk_count} chunks</span>
                 <span className="grow" />
-                <span className="muted time">{relTime(d.created_at)}</span>
+                <span className="time">{relTime(d.created_at)}</span>
                 <button
                   className="danger sm"
                   onClick={async (e) => {
@@ -138,7 +150,7 @@ export function Knowledge() {
                     }
                   }}
                 >
-                  delete
+                  Delete
                 </button>
               </div>
               {expanded === d.id && (
