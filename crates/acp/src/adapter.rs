@@ -161,7 +161,7 @@ mod tests {
     fn spawn_spec_appends_args() {
         // Requires the harness CLIs on PATH; skip (not fail) elsewhere —
         // CI runners do not install dsh/opencode.
-        if ruagent_acp::resolve_program("dsh").is_none() {
+        if resolve_program("dsh").is_none() {
             eprintln!("skipping: dsh not on PATH");
             return;
         }
