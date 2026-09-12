@@ -116,6 +116,22 @@ impl Db {
         .map_err(DbError::from)
     }
 
+    /// Delete a task: its runs and edges (transcript files stay on disk —
+    /// they are append-only evidence).
+    pub async fn delete_task(&self, id: ruagent_core::TaskId) -> Result<(), DbError> {
+        self.call(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute("DELETE FROM runs WHERE task_id = ?1", [id.to_string()])?;
+            conn.execute(
+                "DELETE FROM task_edges WHERE from_id = ?1 OR to_id = ?1",
+                [id.to_string()],
+            )?;
+            conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     /// Mark the winning run of a task (fan-out selection, design §5.2).
     pub async fn set_selected_run(
         &self,

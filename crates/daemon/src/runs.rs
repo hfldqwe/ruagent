@@ -70,6 +70,8 @@ pub struct RunManager {
     /// Asks waiting for the approver agent.
     approver_tx: mpsc::UnboundedSender<PendingPermission>,
     approver_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<PendingPermission>>>,
+    /// Live cancellation tokens per run (POST /runs/{id}/cancel).
+    cancellations: Arc<Mutex<HashMap<RunId, tokio_util::sync::CancellationToken>>>,
 }
 
 impl RunManager {
@@ -106,6 +108,7 @@ impl RunManager {
             approver_id,
             approver_tx,
             approver_rx: std::sync::Mutex::new(Some(approver_rx)),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,6 +128,19 @@ impl RunManager {
                 });
             }
         });
+    }
+
+    /// Cancel a live run: triggers the supervisor's cancellation branch —
+    /// the ACP driver is dropped (killing the child process group), the
+    /// run is marked cancelled and finalized like any other terminal
+    /// state. Returns false when the run is not live.
+    pub fn cancel_run(&self, run_id: RunId) -> bool {
+        self.cancellations
+            .lock()
+            .expect("cancellations lock")
+            .get(&run_id)
+            .map(|t| t.cancel())
+            .is_some()
     }
 
     /// Tier 2: let the approver agent decide a parked ask (design SS9.2).
@@ -341,13 +357,19 @@ impl RunManager {
         let policy = self.policy.clone();
         let approver_id = self.approver_id;
         let approver_tx = self.approver_tx.clone();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        self.cancellations
+            .lock()
+            .expect("cancellations lock")
+            .insert(run.id, cancel_token.clone());
+        let cancellations = self.cancellations.clone();
         let task_id = task.id;
         let run_id = run.id;
         let cwd = workspace.clone();
 
         let returned = run.clone();
         tokio::spawn(async move {
-            if let Err(err) = supervise(
+            let result = supervise(
                 db.clone(),
                 root,
                 broadcast,
@@ -363,9 +385,10 @@ impl RunManager {
                 cwd,
                 routed,
                 injection,
+                cancel_token,
             )
-            .await
-            {
+            .await;
+            if let Err(err) = result {
                 tracing::error!(run_id = %run_id, error = %err, "run supervisor failed");
                 let mut run = run;
                 run.status = RunStatus::Failed;
@@ -374,6 +397,10 @@ impl RunManager {
                 run.updated_at = chrono::Utc::now();
                 let _ = db.update_run(&run).await;
             }
+            cancellations
+                .lock()
+                .expect("cancellations lock")
+                .remove(&run_id);
         });
 
         Ok(returned)
@@ -525,6 +552,7 @@ async fn supervise(
     cwd: PathBuf,
     routed: Option<RoutingDecision>,
     injection: String,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let transcripts_dir = root.join("data").join("transcripts");
     let mut transcript = TranscriptWriter::create(transcript_path(&transcripts_dir, &run.id))
@@ -686,6 +714,31 @@ async fn supervise(
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if done => {
                 // grace tick: re-check the drain condition above
             }
+            _ = cancel_token.cancelled(), if !done => {
+                // Cancellation: dropping the driver future tears down the
+                // child process (the SDK's ChildGuard). Finalize like any
+                // other terminal state.
+                done = true;
+                run.status = RunStatus::Cancelled;
+                run.stop_reason = Some(StopReason::Cancelled);
+                run.updated_at = chrono::Utc::now();
+                emit(
+                    &mut transcript,
+                    &broadcast,
+                    &run,
+                    RunEvent::Stopped {
+                        stop_reason: StopReason::Cancelled,
+                    },
+                );
+                emit(
+                    &mut transcript,
+                    &broadcast,
+                    &run,
+                    RunEvent::StateChanged {
+                        status: RunStatus::Cancelled,
+                    },
+                );
+            }
             res = &mut driver, if !done => {
                 done = true;
                 run.updated_at = chrono::Utc::now();
@@ -718,14 +771,16 @@ async fn supervise(
                 emit(&mut transcript, &broadcast, &run, RunEvent::StateChanged {
                     status: run.status,
                 });
-                // Dead asks for a finished run can never be answered
-                // usefully; drop them so the inbox stays honest.
-                let prefix = format!("{run_id}:", run_id = run.id);
-                let mut p = pending.lock().expect("pending lock");
-                p.retain(|k, _| !k.starts_with(&prefix));
-                drop(p);
             }
         }
+    }
+
+    // Dead asks for a finished/cancelled run can never be answered
+    // usefully; drop them so the inbox stays honest.
+    {
+        let prefix = format!("{}:", run.id);
+        let mut p = pending.lock().expect("pending lock");
+        p.retain(|k, _| !k.starts_with(&prefix));
     }
 
     // Finalize only AFTER the drain: a run that is terminal in the DB or

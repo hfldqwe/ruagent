@@ -38,6 +38,20 @@ impl RunStatus {
         )
     }
 
+    /// Lowercase status name (API/panel friendly).
+    pub fn status_str(self) -> &'static str {
+        match self {
+            RunStatus::Queued => "queued",
+            RunStatus::Spawning => "spawning",
+            RunStatus::Running => "running",
+            RunStatus::WaitingPermission => "waiting_permission",
+            RunStatus::Completed => "completed",
+            RunStatus::Failed => "failed",
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::Interrupted => "interrupted",
+        }
+    }
+
     /// Whether the run ended (any terminal state, including interrupted).
     pub fn is_terminal(self) -> bool {
         matches!(

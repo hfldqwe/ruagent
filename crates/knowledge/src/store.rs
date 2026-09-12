@@ -50,6 +50,16 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+/// One ingested document (panel listing).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct KnowledgeDocument {
+    pub id: i64,
+    pub name: String,
+    pub source: String,
+    pub chunk_count: i64,
+    pub created_at: String,
+}
+
 /// The knowledge base handle. Cheap to clone.
 #[derive(Clone)]
 pub struct Knowledge {
@@ -342,6 +352,90 @@ impl Knowledge {
         }
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         Ok(hits)
+    }
+
+    /// List all documents (panel knowledge manager).
+    pub async fn list_documents(&self) -> Result<Vec<KnowledgeDocument>, KnowledgeError> {
+        Ok(self
+            .db
+            .call(|conn| -> Result<Vec<KnowledgeDocument>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, COALESCE(source, ''), chunk_count, created_at
+                     FROM documents ORDER BY created_at DESC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(KnowledgeDocument {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            source: row.get(2)?,
+                            chunk_count: row.get(3)?,
+                            created_at: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await??)
+    }
+
+    /// Chunks of one document.
+    pub async fn document_chunks(
+        &self,
+        document_id: i64,
+    ) -> Result<Vec<(i64, String)>, KnowledgeError> {
+        Ok(self
+            .db
+            .call(move |conn| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, content FROM chunks WHERE document_id = ?1 ORDER BY idx",
+                )?;
+                let rows = stmt
+                    .query_map([document_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await??)
+    }
+
+    /// Delete a document: chunks (+FTS via trigger) from SQLite, vectors
+    /// from LanceDB by chunk-id filter.
+    pub async fn delete_document(&self, document_id: i64) -> Result<u32, KnowledgeError> {
+        let chunk_ids: Vec<i64> = self
+            .db
+            .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+                let mut stmt = conn.prepare("SELECT id FROM chunks WHERE document_id = ?1")?;
+                let ids = stmt
+                    .query_map([document_id], |r| r.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(ids)
+            })
+            .await??;
+        if chunk_ids.is_empty() {
+            return Ok(0);
+        }
+        let count = chunk_ids.len() as u32;
+        let ids_for_db = chunk_ids.clone();
+        self.db
+            .call(move |conn| -> Result<(), rusqlite::Error> {
+                conn.execute("DELETE FROM chunks WHERE document_id = ?1", [document_id])?;
+                conn.execute("DELETE FROM documents WHERE id = ?1", [document_id])?;
+                let _ = ids_for_db;
+                Ok(())
+            })
+            .await??;
+        // Vectors out of LanceDB.
+        let table = self.lance.open_table(TABLE).execute().await?;
+        let filter = format!(
+            "id IN ({})",
+            chunk_ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        table.delete(&filter).await?;
+        Ok(count)
     }
 
     /// Document count + chunk count (panel / MCP browse).

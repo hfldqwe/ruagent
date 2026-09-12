@@ -76,6 +76,63 @@ pub async fn search_fts(db: &Db, query: &str, limit: u32) -> Result<Vec<MemoryRo
     .map_err(DbError::from)
 }
 
+/// One memory by id (any state, superseded included).
+pub async fn get_memory(db: &Db, id: i64) -> Result<Option<MemoryRow>, DbError> {
+    db.call(move |conn| -> Result<Option<MemoryRow>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
+                    created_at, updated_at
+             FROM memories WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_memory(row)?)),
+            None => Ok(None),
+        }
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
+/// The audit log, newest first (design SS6.3: every write decision).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryDiff {
+    pub id: i64,
+    pub ts: String,
+    pub op: String,
+    pub mem_store: Option<String>,
+    pub namespace: Option<String>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub reason: Option<String>,
+}
+
+pub async fn list_diffs(db: &Db, limit: u32) -> Result<Vec<MemoryDiff>, DbError> {
+    db.call(move |conn| -> Result<Vec<MemoryDiff>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, op, mem_store, namespace, before, after, reason
+             FROM memory_diffs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(MemoryDiff {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    op: row.get(2)?,
+                    mem_store: row.get(3)?,
+                    namespace: row.get(4)?,
+                    before: row.get(5)?,
+                    after: row.get(6)?,
+                    reason: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
 /// The `ruagent://` root listing: per-store counts of current memories.
 pub async fn store_counts(db: &Db) -> Result<Vec<(String, String, i64)>, DbError> {
     db.call(

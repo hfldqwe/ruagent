@@ -192,6 +192,35 @@ pub async fn neighbors(db: &Db, entity: i64, hops: u32) -> Result<Vec<(Entity, u
     .map_err(DbError::from)
 }
 
+/// List entities (id desc) with their current fact counts — the graph
+/// explorer's landing view.
+pub async fn list_entities(db: &Db, limit: u32) -> Result<Vec<(Entity, i64)>, DbError> {
+    db.call(move |conn| -> Result<Vec<(Entity, i64)>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.name, e.kind, e.summary,
+                    (SELECT COUNT(*) FROM entity_edges x
+                      WHERE (x.src = e.id OR x.dst = e.id) AND x.invalid_at IS NULL)
+             FROM entities e ORDER BY e.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok((
+                    Entity {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        kind: row.get(2)?,
+                        summary: row.get(3)?,
+                    },
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
 /// FTS over entity names/summaries (the keyword candidate leg of
 /// resolution and retrieval).
 pub async fn search_entities(db: &Db, query: &str, limit: u32) -> Result<Vec<Entity>, DbError> {

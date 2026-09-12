@@ -818,3 +818,185 @@ async fn memories_are_injected_into_run_prompts() {
     );
     assert!(sse.contains("<relevant_memories>"), "tagged block rendered");
 }
+
+// ---------------------------------------------------------------------------
+// M4: run cancellation (#25)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cancel_parks_then_cancels() {
+    // The permission mock parks mid-run — the perfect cancellation target.
+    let d = start_daemon(&mock_agent_toml("permission"), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "cancelme", "intent": "write something" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let run: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/runs", d.url))
+        .json(&serde_json::json!({ "agent": "mock", "prompt": "write something" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+
+    // Parked (waiting permission).
+    poll_until(&http, &format!("{}/api/v1/permissions", d.url), |v| {
+        !v["pending"].as_array().unwrap().is_empty()
+    })
+    .await;
+
+    // Cancel.
+    let status = http
+        .post(format!("{}/api/v1/runs/{run_id}/cancel", d.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+
+    let final_run = poll_until(&http, &format!("{}/api/v1/runs/{run_id}", d.url), |v| {
+        v["status"] == "cancelled"
+    })
+    .await;
+    assert_eq!(final_run["stop_reason"], "cancelled");
+
+    // The ask is gone from the inbox (cleaned up at finalize).
+    let pending: serde_json::Value = http
+        .get(format!("{}/api/v1/permissions", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(pending["pending"].as_array().unwrap().is_empty());
+
+    // Cancelling again: rejected with a clear message.
+    let resp = http
+        .post(format!("{}/api/v1/runs/{run_id}/cancel", d.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// M4: graph REST surface (#28)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn graph_endpoints_roundtrip() {
+    let d = start_daemon(&mock_agent_toml("echo"), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    // Create entities.
+    let alice: serde_json::Value = http
+        .post(format!("{}/api/v1/graph/entity", d.url))
+        .json(&serde_json::json!({ "name": "Alice", "kind": "person" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let acme: serde_json::Value = http
+        .post(format!("{}/api/v1/graph/entity", d.url))
+        .json(&serde_json::json!({ "name": "Acme", "kind": "org" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_id = alice["id"].as_i64().unwrap();
+    let acme_id = acme["id"].as_i64().unwrap();
+
+    // Add a fact valid from January.
+    let fact: serde_json::Value = http
+        .post(format!("{}/api/v1/graph/fact", d.url))
+        .json(&serde_json::json!({
+            "src": alice_id, "dst": acme_id,
+            "relation": "works_at",
+            "fact_text": "Alice works at Acme",
+            "valid_at": "2026-01-15T00:00:00Z"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Current facts.
+    let facts: serde_json::Value = http
+        .get(format!("{}/api/v1/graph/entity/{alice_id}", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(facts["facts"].as_array().unwrap().len(), 1);
+
+    // As-of before January: nothing.
+    let before: serde_json::Value = http
+        .get(format!(
+            "{}/api/v1/graph/entity/{alice_id}/facts?at=2025-12-01T00:00:00Z",
+            d.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(before["facts"].as_array().unwrap().is_empty());
+
+    // Neighbors: Alice sees Acme at hop 1.
+    let nbrs: serde_json::Value = http
+        .get(format!(
+            "{}/api/v1/graph/entity/{alice_id}/neighbors",
+            d.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(nbrs["neighbors"][0][0]["name"] == "Acme");
+
+    // Search finds Alice by name (the FTS index covers name + summary).
+    let hits: serde_json::Value = http
+        .get(format!("{}/api/v1/graph/search?q=alice", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!hits["entities"].as_array().unwrap().is_empty());
+
+    // Entity list.
+    let list: serde_json::Value = http
+        .get(format!("{}/api/v1/graph/entities", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list["entities"].as_array().unwrap().len() >= 2);
+    let _ = fact;
+}

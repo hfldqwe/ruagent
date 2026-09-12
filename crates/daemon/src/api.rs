@@ -31,18 +31,38 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/mcp", get(mcp_registry))
         .route("/api/v1/skills", get(list_skills))
         .route("/api/v1/skills/sync", post(sync_skills))
+        .route("/api/v1/graph/entities", get(graph_entities))
+        .route("/api/v1/graph/search", get(graph_search))
+        .route("/api/v1/graph/entity", post(graph_create_entity))
+        .route("/api/v1/graph/fact", post(graph_add_fact))
+        .route("/api/v1/graph/entity/{id}", get(graph_entity))
+        .route("/api/v1/graph/entity/{id}/neighbors", get(graph_neighbors))
+        .route("/api/v1/graph/entity/{id}/facts", get(graph_facts))
         .route("/api/v1/memory/write", post(memory_write))
+        .route("/api/v1/memory/supersede", post(memory_supersede))
+        .route("/api/v1/memory/diffs", get(memory_diffs))
+        .route("/api/v1/memory/{id}", get(memory_get))
         .route("/api/v1/memory/search", get(memory_search))
         .route("/api/v1/memory/list", get(memory_list))
         .route("/api/v1/knowledge/ingest", post(knowledge_ingest))
         .route("/api/v1/knowledge/search", get(knowledge_search))
+        .route("/api/v1/knowledge/documents", get(knowledge_documents))
+        .route(
+            "/api/v1/knowledge/documents/{id}",
+            axum::routing::get(knowledge_document_chunks).delete(knowledge_document_delete),
+        )
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
+        .route(
+            "/api/v1/tasks/{id}",
+            axum::routing::patch(update_task).delete(delete_task),
+        )
         .route("/api/v1/tasks/{id}/runs", post(start_run))
         .route("/api/v1/tasks/{id}/fanout", post(start_fanout))
         .route("/api/v1/tasks/{id}/pipeline", post(start_pipeline))
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/select", post(select_run))
+        .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/events", get(run_events))
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
@@ -123,6 +143,305 @@ async fn health() -> Json<serde_json::Value> {
 async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let stats = state.mgr.db().agent_stats().await?;
     Ok(Json(serde_json::json!({ "agents": stats })))
+}
+
+// ---------------------------------------------------------------------------
+// Run + task mutations (M4: Multica-parity board operations)
+// ---------------------------------------------------------------------------
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let run_id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid run id"))?;
+    if state.mgr.cancel_run(run_id) {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        // Not live: either already terminal or unknown.
+        let run = state
+            .mgr
+            .db()
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        if run.status.is_terminal() {
+            Err(ApiError::bad_request(format!(
+                "run already {}",
+                run.status.status_str()
+            )))
+        } else {
+            Err(ApiError::not_found("run not live"))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateTaskRequest {
+    status: String,
+}
+
+async fn update_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateTaskRequest>,
+) -> Result<StatusCode, ApiError> {
+    let id: ruagent_core::TaskId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    let status = parse_task_status(&req.status).ok_or_else(|| {
+        ApiError::bad_request("unknown status (pending|in_progress|blocked|done|cancelled)")
+    })?;
+    state.mgr.db().update_task_status(id, status).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id: ruagent_core::TaskId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    state.mgr.db().delete_task(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Memory management (M4: OpenViking-parity audit + supersede)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SupersedeRequest {
+    id: i64,
+    new_content: String,
+}
+
+async fn memory_supersede(
+    State(state): State<AppState>,
+    Json(req): Json<SupersedeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let old = ruagent_memory::query::get_memory(state.mgr.db(), req.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("memory not found"))?;
+    if old.superseded_at.is_some() {
+        return Err(ApiError::bad_request("memory already superseded"));
+    }
+    let outcome = ruagent_memory::write_memory(
+        state.mgr.db(),
+        &ruagent_memory::MemoryWrite {
+            store: old.store,
+            namespace: ruagent_memory::Namespace::parse(&old.namespace)
+                .ok_or_else(|| ApiError::bad_request("stored namespace unparseable"))?,
+            content: req.new_content,
+            confidence: old.confidence,
+            source_episode: None,
+            supersedes: Some(old.id),
+        },
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "outcome": format!("{outcome:?}") }),
+    ))
+}
+
+async fn memory_diffs(
+    State(state): State<AppState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let diffs = ruagent_memory::query::list_diffs(state.mgr.db(), q.limit.unwrap_or(100)).await?;
+    Ok(Json(serde_json::json!({ "diffs": diffs })))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<u32>,
+}
+
+async fn memory_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid memory id"))?;
+    let m = ruagent_memory::query::get_memory(state.mgr.db(), id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("memory not found"))?;
+    Ok(Json(serde_json::json!({ "memory": m })))
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge documents (M4)
+// ---------------------------------------------------------------------------
+
+async fn knowledge_documents(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let docs = state
+        .knowledge
+        .list_documents()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(
+        serde_json::json!({ "documents": docs, "embedder": state.knowledge.embedder_name() }),
+    ))
+}
+
+async fn knowledge_document_chunks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid document id"))?;
+    let chunks = state
+        .knowledge
+        .document_chunks(id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "chunks": chunks })))
+}
+
+async fn knowledge_document_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid document id"))?;
+    state
+        .knowledge
+        .delete_document(id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Graph (M4: the graph crate finally gets its REST surface)
+// ---------------------------------------------------------------------------
+
+async fn graph_entities(
+    State(state): State<AppState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let entities = ruagent_graph::list_entities(state.mgr.db(), q.limit.unwrap_or(50)).await?;
+    Ok(Json(serde_json::json!({ "entities": entities })))
+}
+
+async fn graph_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hits = ruagent_graph::search_entities(state.mgr.db(), &q.q, 10).await?;
+    Ok(Json(serde_json::json!({ "entities": hits })))
+}
+
+#[derive(Deserialize)]
+struct CreateEntityRequest {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+async fn graph_create_entity(
+    State(state): State<AppState>,
+    Json(req): Json<CreateEntityRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = ruagent_graph::upsert_entity(
+        state.mgr.db(),
+        &req.name,
+        req.kind.as_deref(),
+        req.summary.as_deref(),
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct AddFactRequest {
+    src: i64,
+    dst: i64,
+    relation: String,
+    fact_text: String,
+    /// RFC3339 or ISO date; None = now.
+    #[serde(default)]
+    valid_at: Option<String>,
+}
+
+async fn graph_add_fact(
+    State(state): State<AppState>,
+    Json(req): Json<AddFactRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = ruagent_graph::add_fact(
+        state.mgr.db(),
+        req.src,
+        req.dst,
+        &req.relation,
+        &req.fact_text,
+        req.valid_at.as_deref(),
+        None,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn graph_entity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid entity id"))?;
+    let facts = ruagent_graph::current_facts(state.mgr.db(), id).await?;
+    Ok(Json(serde_json::json!({ "facts": facts })))
+}
+
+#[derive(Deserialize)]
+struct NeighborsQuery {
+    #[serde(default)]
+    hops: Option<u32>,
+}
+
+async fn graph_neighbors(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<NeighborsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid entity id"))?;
+    let hops = q.hops.unwrap_or(2).min(4);
+    let neighbors = ruagent_graph::neighbors(state.mgr.db(), id, hops).await?;
+    Ok(Json(
+        serde_json::json!({ "neighbors": neighbors, "hops": hops }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct FactsQuery {
+    /// "What was true as of X" (RFC3339/ISO date); absent = current.
+    #[serde(default)]
+    at: Option<String>,
+}
+
+async fn graph_facts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<FactsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid entity id"))?;
+    let facts = match &q.at {
+        Some(at) => ruagent_graph::facts_as_of(state.mgr.db(), id, at).await?,
+        None => ruagent_graph::current_facts(state.mgr.db(), id).await?,
+    };
+    Ok(Json(serde_json::json!({ "facts": facts })))
 }
 
 /// Discovered skills (platform library + the daemon's working-dir
