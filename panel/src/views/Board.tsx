@@ -1,6 +1,7 @@
 // Board: kanban by status + list toggle + task creation.
 
 import { useEffect, useState } from "react";
+import { Button, Input, Segmented } from "antd";
 import { api, type Task } from "../api";
 import { useI18n } from "../i18n";
 import { Empty, Modal, RelTime, Spinner, StatusDot, useToast } from "../ui";
@@ -10,7 +11,7 @@ const COLUMNS = ["pending", "in_progress", "blocked", "done"] as const;
 export function Board({ onOpen }: { onOpen: (id: string) => void }) {
   const { t } = useI18n();
   const [tasks, setTasks] = useState<Task[] | null>(null);
-  const [view, setView] = useState<"board" | "list">("board");
+  const [view, setView] = useState<string>("board");
   const [creating, setCreating] = useState(false);
 
   const refresh = () => api.tasks().then(setTasks).catch(() => setTasks([]));
@@ -28,17 +29,17 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
         <h2>{t("board.title")}</h2>
         <span className="muted">{t("board.total", { n: tasks.length })}</span>
         <span className="grow" />
-        <div className="seg">
-          <button className={view === "board" ? "on" : ""} onClick={() => setView("board")}>
-            {t("board.board")}
-          </button>
-          <button className={view === "list" ? "on" : ""} onClick={() => setView("list")}>
-            {t("board.list")}
-          </button>
-        </div>
-        <button className="primary" onClick={() => setCreating(true)}>
+        <Segmented
+          value={view}
+          onChange={(v) => setView(v as string)}
+          options={[
+            { value: "board", label: t("board.board") },
+            { value: "list", label: t("board.list") },
+          ]}
+        />
+        <Button type="primary" onClick={() => setCreating(true)}>
           + {t("board.new")}
-        </button>
+        </Button>
       </div>
 
       {tasks.length === 0 ? (
@@ -47,9 +48,9 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
           title={t("board.empty.title")}
           hint={t("board.empty.hint")}
           action={
-            <button className="primary" onClick={() => setCreating(true)}>
+            <Button type="primary" onClick={() => setCreating(true)}>
               + {t("board.new")}
-            </button>
+            </Button>
           }
         />
       ) : view === "board" ? (
@@ -142,17 +143,17 @@ export function CreateTaskModal({
     <Modal title={t("newtask.title")} onClose={onClose}>
       <label className="field">
         <span>{t("newtask.titleLabel")}</span>
-        <input
+        <Input
           autoFocus
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && create()}
+          onPressEnter={create}
           placeholder="Fix the login bug…"
         />
       </label>
       <label className="field">
         <span>{t("newtask.intentLabel")}</span>
-        <textarea
+        <Input.TextArea
           rows={4}
           value={intent}
           onChange={(e) => setIntent(e.target.value)}
@@ -161,16 +162,16 @@ export function CreateTaskModal({
       </label>
       <label className="field">
         <span>{t("newtask.projectLabel")}</span>
-        <input
+        <Input
           value={project}
           onChange={(e) => setProject(e.target.value)}
           placeholder="ruagent…"
         />
       </label>
       <div className="row end">
-        <button className="primary" disabled={busy || !title.trim()} onClick={create}>
-          {busy ? "…" : t("common.create")}
-        </button>
+        <Button type="primary" loading={busy} disabled={!title.trim()} onClick={create}>
+          {t("common.create")}
+        </Button>
       </div>
     </Modal>
   );

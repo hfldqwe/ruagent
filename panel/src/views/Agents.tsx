@@ -1,7 +1,14 @@
 // Agents (cards with live stats + MCP registry), Stats, Inbox.
 
 import { useEffect, useState } from "react";
-import { api, type AgentInfo, type AgentStats, type McpRegistry, type PendingPermission } from "../api";
+import { Button, Card, Progress, Table, Tooltip } from "antd";
+import {
+  api,
+  type AgentInfo,
+  type AgentStats,
+  type McpRegistry,
+  type PendingPermission,
+} from "../api";
 import { Empty, Modal, RelTime, Spinner, fmtUsd, useToast } from "../ui";
 import { useI18n } from "../i18n";
 import { Icon } from "../icons";
@@ -41,7 +48,7 @@ export function Agents() {
             const s = stats.find((x) => x.agent === a.name);
             const success = s && s.runs > 0 ? Math.round((s.completed / s.runs) * 100) : null;
             return (
-              <div key={a.name} className={a.enabled ? "card agent-card" : "card agent-card disabled"}>
+              <Card key={a.name} className={a.enabled ? "agent-card" : "agent-card disabled"} size="small">
                 <div className="row">
                   <span className="agent-avatar">{a.name.slice(0, 2).toUpperCase()}</span>
                   <div>
@@ -49,9 +56,13 @@ export function Agents() {
                     <div className="muted">{a.harness}</div>
                   </div>
                   <span className="grow" />
-                  {a.enabled ? <span className="tag ok">{t("agents.enabled")}</span> : <span className="tag">{t("agents.disabled")}</span>}
+                  {a.enabled ? (
+                    <span className="tag ok">{t("agents.enabled")}</span>
+                  ) : (
+                    <span className="tag">{t("agents.disabled")}</span>
+                  )}
                 </div>
-                <p className="muted">{a.description}</p>
+                <p className="muted" style={{ margin: "10px 0 6px" }}>{a.description}</p>
                 {a.model ? <span className="tag mono">{a.model}</span> : null}
                 {s && s.runs > 0 ? (
                   <div className="agent-stats">
@@ -73,28 +84,30 @@ export function Agents() {
                     </div>
                   </div>
                 ) : (
-                  <p className="muted">{t("agents.noRuns")}</p>
+                  <p className="muted" style={{ margin: "10px 0 0" }}>{t("agents.noRuns")}</p>
                 )}
-              </div>
+              </Card>
             );
           })}
         </div>
       )}
 
-      <h3>{t("mcp.registry")}</h3>
+      <h3 className="sec">{t("mcp.registry")}</h3>
       {mcp && mcp.servers.length > 0 ? (
-        <div className="card">
+        <Card size="small">
           {mcp.servers.map((s) => (
             <div key={s.name} className="row">
-              <span className="doc-icon">🔌</span>
+              <span className="doc-icon">
+                <Icon name="plug" size={15} />
+              </span>
               <strong>{s.name}</strong>
               {s.inject_for ? <span className="tag">{s.inject_for.join(", ")}</span> : null}
               <span className="grow" />
               <span className="muted mono truncated">{s.url ?? s.command}</span>
             </div>
           ))}
-                    <p className="muted pad">{t("mcp.overlay")}</p>
-        </div>
+          <p className="muted pad">{t("mcp.overlay")}</p>
+        </Card>
       ) : (
         <Empty icon="plug" title={t("mcp.empty.title")} hint={t("mcp.empty.hint")} />
       )}
@@ -123,42 +136,43 @@ export function Stats() {
         <h2>{t("stats.title")}</h2>
         <span className="muted">{t("stats.subtitle")}</span>
       </div>
-      <div className="card">
-        <table className="stats">
-          <thead>
-            <tr>
-              <th>{t('stats.agent')}</th>
-              <th>{t('stats.runs')}</th>
-              <th>{t('stats.completed')}</th>
-              <th>{t('stats.failed')}</th>
-              <th>{t('stats.cost')}</th>
-              <th>{t('stats.lastRun')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {stats.map((s) => (
-              <tr key={s.agent}>
-                <td>{s.agent}</td>
-                <td>{s.runs}</td>
-                <td>{s.completed}</td>
-                <td>{s.failed}</td>
-                <td>
-                  <div className="cost-cell">
-                    <span className="cost-bar">
-                      <span
-                        className="cost-fill"
-                        style={{ width: `${(s.total_cost_usd / maxCost) * 100}%` }}
-                      />
-                    </span>
-                    <span className="mono">{fmtUsd(s.total_cost_usd)}</span>
-                  </div>
-                </td>
-                <td className="muted"><RelTime iso={s.last_run_at} /></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Card size="small">
+        <Table
+          size="small"
+          dataSource={stats}
+          rowKey="agent"
+          pagination={false}
+          columns={[
+            { title: t("stats.agent"), dataIndex: "agent" },
+            { title: t("stats.runs"), dataIndex: "runs", align: "right" },
+            { title: t("stats.completed"), dataIndex: "completed", align: "right" },
+            { title: t("stats.failed"), dataIndex: "failed", align: "right" },
+            {
+              title: t("stats.cost"),
+              dataIndex: "total_cost_usd",
+              align: "right",
+              render: (v: number) => (
+                <Tooltip title={fmtUsd(v)}>
+                  <span className="mono" style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                    <Progress
+                      percent={Math.round((v / maxCost) * 100)}
+                      showInfo={false}
+                      size={{ width: 72, height: 5 }}
+                      style={{ margin: 0 }}
+                    />
+                    {fmtUsd(v)}
+                  </span>
+                </Tooltip>
+              ),
+            },
+            {
+              title: t("stats.lastRun"),
+              dataIndex: "last_run_at",
+              render: (v: string | null) => <RelTime iso={v} />,
+            },
+          ]}
+        />
+      </Card>
     </div>
   );
 }
@@ -211,25 +225,25 @@ export function Inbox() {
       ) : (
         <div>
           {pending.map((p) => (
-            <div key={`${p.run_id}:${p.tool_call_id}`} className="card inbox-card">
+            <Card key={`${p.run_id}:${p.tool_call_id}`} size="small" className="inbox-card">
               <div className="row">
                 <span className="ev-icon"><Icon name="lock" size={13} /></span>
                 <strong>{p.title}</strong>
                 <span className="grow" />
                 <span className="muted mono">{p.run_id.slice(0, 8)}</span>
               </div>
-              <button className="link" onClick={() => setDetail(p)}>
+              <Button type="link" size="small" style={{ paddingLeft: 0 }} onClick={() => setDetail(p)}>
                 {t("inbox.viewRaw")}
-              </button>
+              </Button>
               <div className="row">
-                <button className="primary" onClick={() => resolve(p, "allow")}>
+                <Button type="primary" onClick={() => resolve(p, "allow")}>
                   {t("inbox.allow")}
-                </button>
-                <button className="danger" onClick={() => resolve(p, "reject")}>
+                </Button>
+                <Button danger onClick={() => resolve(p, "reject")}>
                   {t("inbox.reject")}
-                </button>
+                </Button>
               </div>
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -237,24 +251,24 @@ export function Inbox() {
         <Modal title={detail.title} onClose={() => setDetail(null)} wide>
           <pre className="raw">{JSON.stringify(detail.raw_input, null, 2)}</pre>
           <div className="row end">
-            <button
-              className="primary"
+            <Button
+              type="primary"
               onClick={async () => {
                 await resolve(detail, "allow");
                 setDetail(null);
               }}
             >
               Allow
-            </button>
-            <button
-              className="danger"
+            </Button>
+            <Button
+              danger
               onClick={async () => {
                 await resolve(detail, "reject");
                 setDetail(null);
               }}
             >
               Reject
-            </button>
+            </Button>
           </div>
         </Modal>
       )}

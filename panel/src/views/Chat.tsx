@@ -2,6 +2,7 @@
 // multi-turn on one persistent session.
 
 import { useEffect, useRef, useState } from "react";
+import { Button, Select } from "antd";
 import {
   api,
   type AgentInfo,
@@ -23,6 +24,24 @@ function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
   return opt.name;
 }
 
+type PickerOption =
+  | { value: string; label: string }
+  | { label: string; options: { value: string; label: string }[] };
+
+/** Group choices by the agent's grouping into Select option shape. */
+function buildOptions(choices: OptionChoice[]): PickerOption[] {
+  const groups = choices.reduce<Record<string, OptionChoice[]>>((acc, c) => {
+    const g = c.group ?? "";
+    (acc[g] ??= []).push(c);
+    return acc;
+  }, {});
+  return Object.entries(groups).flatMap(([group, list]): PickerOption[] =>
+    group
+      ? [{ label: group, options: list.map((c) => ({ value: c.value, label: c.name })) }]
+      : list.map((c) => ({ value: c.value, label: c.name })),
+  );
+}
+
 /** One select over a set of agent-advertised choices (grouped when the
  * agent groups them); config fallback / free text when it doesn't
  * advertise any. */
@@ -37,7 +56,6 @@ function OptionPicker({
   freeText,
   freeTextPh,
   onFreeText,
-  onFreeTextCommit,
   disabled,
 }: {
   label: string;
@@ -50,16 +68,13 @@ function OptionPicker({
   freeText?: boolean;
   freeTextPh?: string;
   onFreeText?: (value: string) => void;
-  onFreeTextCommit?: () => void;
   disabled?: boolean;
 }) {
   if (loading) {
     return (
       <label className="chat-field">
         <span>{label}</span>
-        <select disabled>
-          <option>…</option>
-        </select>
+        <Select loading disabled style={{ minWidth: 190 }} />
       </label>
     );
   }
@@ -67,31 +82,13 @@ function OptionPicker({
     return (
       <label className="chat-field">
         <span>{label}</span>
-        <select value={current} onChange={(e) => onPick(e.target.value)} disabled={disabled}>
-          {Object.entries(
-            choices.reduce<Record<string, OptionChoice[]>>((acc, c) => {
-              const g = c.group ?? "";
-              (acc[g] ??= []).push(c);
-              return acc;
-            }, {}),
-          ).map(([group, list]) =>
-            group ? (
-              <optgroup key={group} label={group}>
-                {list.map((c) => (
-                  <option key={c.value} value={c.value}>
-                    {c.name}
-                  </option>
-                ))}
-              </optgroup>
-            ) : (
-              list.map((c) => (
-                <option key={c.value} value={c.value}>
-                  {c.name}
-                </option>
-              ))
-            ),
-          )}
-        </select>
+        <Select
+          value={current || choices[0]?.value}
+          onChange={onPick}
+          disabled={disabled}
+          style={{ minWidth: 190 }}
+          options={buildOptions(choices)}
+        />
       </label>
     );
   }
@@ -99,13 +96,13 @@ function OptionPicker({
     return (
       <label className="chat-field">
         <span>{label}</span>
-        <select value={current} onChange={(e) => onFallbackPick(e.target.value)} disabled={disabled}>
-          {fallback.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-        </select>
+        <Select
+          value={current}
+          onChange={onFallbackPick}
+          disabled={disabled}
+          style={{ minWidth: 190 }}
+          options={fallback.map((m) => ({ value: m, label: m }))}
+        />
       </label>
     );
   }
@@ -113,11 +110,13 @@ function OptionPicker({
     return (
       <label className="chat-field">
         <span>{label}</span>
-        <input
-          className="mono sm"
-          value={current}
-          onChange={(e) => onFreeText(e.target.value)}
-          onBlur={onFreeTextCommit}
+        <Select
+          mode="tags"
+          maxCount={1}
+          value={current ? [current] : []}
+          onChange={(v) => onFreeText(v[v.length - 1] ?? "")}
+          disabled={disabled}
+          style={{ minWidth: 190 }}
           placeholder={freeTextPh}
         />
       </label>
@@ -408,29 +407,25 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         <span className="muted">{t("chat.subtitle")}</span>
         <span className="grow" />
         {chatId ? (
-          <button className="ghost sm" onClick={newChat}>
+          <Button size="small" onClick={newChat}>
             + {t("chat.new")}
-          </button>
+          </Button>
         ) : null}
       </div>
 
       <div className="chat-bar">
         <label className="chat-field">
           <span>{t("chat.agent")}</span>
-          <select
-            value={agent}
-            onChange={(e) => {
+          <Select
+            value={agent || undefined}
+            onChange={(v) => {
               if (chatId) newChat();
-              setAgent(e.target.value);
+              setAgent(v);
             }}
             disabled={streaming}
-          >
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.name}
-              </option>
-            ))}
-          </select>
+            style={{ minWidth: 150 }}
+            options={agents.map((a) => ({ value: a.name, label: a.name }))}
+          />
         </label>
         <OptionPicker
           label={t("chat.model")}
@@ -443,7 +438,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           freeText
           freeTextPh={t("chat.modelPh")}
           onFreeText={(v) => setModel(v)}
-          onFreeTextCommit={() => chatId && switchModel(model)}
           disabled={streaming}
         />
         {(options ?? [])
@@ -508,14 +502,15 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             }}
             placeholder={t("chat.inputPh")}
           />
-          <button
-            className="primary send-btn"
+          <Button
+            type="primary"
+            className="send-btn"
             disabled={streaming || starting || !input.trim()}
             onClick={send}
             title={t("chat.send")}
           >
             {starting ? "…" : <Icon name="arrowUp" size={16} />}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

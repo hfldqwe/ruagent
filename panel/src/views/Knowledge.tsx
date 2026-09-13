@@ -1,6 +1,8 @@
 // Knowledge manager: documents, ingest, hybrid search with chunk preview.
 
 import { useEffect, useState } from "react";
+import { Button, Input } from "antd";
+import { FileTextOutlined } from "@ant-design/icons";
 import { api, type KnowledgeDocument, type SearchHit } from "../api";
 import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
 import { useI18n } from "../i18n";
@@ -67,27 +69,27 @@ export function Knowledge() {
         <h2>{t("knowledge.title")}</h2>
         <span className="muted">{t("knowledge.subtitle")} ({embedder || "…"})</span>
         <span className="grow" />
-        <button className="primary" onClick={() => setIngesting(true)}>
+        <Button type="primary" onClick={() => setIngesting(true)}>
           + {t("knowledge.ingest")}
-        </button>
+        </Button>
       </div>
 
       <div className="search-bar">
-        <input
+        <Input
           autoFocus
           className="grow"
           placeholder={t("knowledge.search")}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && search()}
+          onPressEnter={search}
         />
-        <button className="primary" onClick={search}>
+        <Button type="primary" onClick={search}>
           {t("common.search")}
-        </button>
+        </Button>
         {hits ? (
-          <button className="link" onClick={() => { setHits(null); setQuery(""); }}>
+          <Button type="link" onClick={() => { setHits(null); setQuery(""); }}>
             {t("common.clear")}
-          </button>
+          </Button>
         ) : null}
       </div>
 
@@ -132,13 +134,14 @@ export function Knowledge() {
                   }
                 }}
               >
-                <span className="doc-icon">📄</span>
+                <span className="doc-icon"><FileTextOutlined /></span>
                 <strong>{d.name}</strong>
                 <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
                 <span className="grow" />
                 <span className="time">{<RelTime iso={d.created_at} />}</span>
-                <button
-                  className="danger sm"
+                <Button
+                  danger
+                  size="small"
                   onClick={async (e) => {
                     e.stopPropagation();
                     try {
@@ -151,7 +154,7 @@ export function Knowledge() {
                   }}
                 >
                   Delete
-                </button>
+                </Button>
               </div>
               {expanded === d.id && (
                 <div className="chunks">
@@ -193,7 +196,7 @@ function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested:
     <Modal title={t("knowledge.ingest.title")} onClose={onClose} wide>
       <label className="field">
         <span>{t("knowledge.ingest.name")}</span>
-        <input
+        <Input
           autoFocus
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -202,16 +205,16 @@ function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested:
       </label>
       <label className="field">
         <span>{t("knowledge.ingest.content")}</span>
-        <textarea
+        <Input.TextArea
           rows={12}
           value={content}
           onChange={(e) => setContent(e.target.value)}
-          placeholder="# Deploy runbook&#10;&#10;1. Run scripts/release.sh from the repo root…"
+          placeholder={"# Deploy runbook\n\n1. Run scripts/release.sh from the repo root…"}
         />
       </label>
       <div className="row end">
-        <button
-          className="primary"
+        <Button
+          type="primary"
           disabled={!name.trim() || !content.trim()}
           onClick={async () => {
             try {
@@ -224,7 +227,7 @@ function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested:
           }}
         >
           {t("knowledge.ingest.btn")}
-        </button>
+        </Button>
       </div>
     </Modal>
   );

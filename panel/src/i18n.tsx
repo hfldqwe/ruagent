@@ -8,6 +8,9 @@ export type Lang = "zh" | "en";
 
 const zh: Record<string, string> = {
   // nav
+  "nav.home": "首页",
+  "theme.dark": "切换到夜间",
+  "theme.light": "切换到日间",
   "nav.group.work": "工作区",
   "nav.group.knowledge": "知识与记忆",
   "nav.group.system": "系统",
@@ -288,6 +291,9 @@ const zh: Record<string, string> = {
 };
 
 const en: Record<string, string> = {
+  "nav.home": "Home",
+  "theme.dark": "Switch to dark",
+  "theme.light": "Switch to light",
   "nav.group.work": "Workspace",
   "nav.group.knowledge": "Knowledge",
   "nav.group.system": "System",

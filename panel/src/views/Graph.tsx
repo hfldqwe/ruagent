@@ -1,9 +1,36 @@
 // Graph explorer: entities, bi-temporal facts, as-of queries, neighbors.
 
 import { useEffect, useState } from "react";
+import { Button, Input, Table } from "antd";
+import {
+  UserOutlined,
+  BankOutlined,
+  AppstoreOutlined,
+  CodeSandboxOutlined,
+  ToolOutlined,
+  TagOutlined,
+} from "@ant-design/icons";
 import { api, type GraphEdge, type GraphEntity } from "../api";
 import { Empty, Markdown, Modal, Spinner, useToast } from "../ui";
 import { dateOf, useI18n } from "../i18n";
+
+function kindIcon(kind: string | null) {
+  switch (kind) {
+    case "person":
+      return <UserOutlined />;
+    case "org":
+    case "organization":
+      return <BankOutlined />;
+    case "project":
+      return <AppstoreOutlined />;
+    case "repo":
+      return <CodeSandboxOutlined />;
+    case "tool":
+      return <ToolOutlined />;
+    default:
+      return <TagOutlined />;
+  }
+}
 
 export function Graph() {
   const { t } = useI18n();
@@ -45,18 +72,18 @@ export function Graph() {
         <h2>{t("graph.title")}</h2>
         <span className="muted">{t("graph.subtitle")}</span>
         <span className="grow" />
-        <button className="primary" onClick={() => setCreating(true)}>
+        <Button type="primary" onClick={() => setCreating(true)}>
           + {t("graph.newEntity")}
-        </button>
+        </Button>
       </div>
 
       <div className="search-bar">
-        <input
+        <Input
           className="grow"
           placeholder="Search entities (name, summary)…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && search()}
+          onPressEnter={search}
         />
       </div>
 
@@ -98,24 +125,6 @@ export function Graph() {
   );
 }
 
-function kindIcon(kind: string | null): string {
-  switch (kind) {
-    case "person":
-      return "👤";
-    case "org":
-    case "organization":
-      return "🏢";
-    case "project":
-      return "🗂️";
-    case "repo":
-      return "📦";
-    case "tool":
-      return "🔧";
-    default:
-      return "🔹";
-  }
-}
-
 function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => void }) {
   const { t } = useI18n();
   const [facts, setFacts] = useState<GraphEdge[] | null>(null);
@@ -141,17 +150,17 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
   return (
     <div>
       <div className="view-bar">
-        <button className="link" onClick={onBack}>
+        <Button type="link" onClick={onBack} style={{ paddingLeft: 0 }}>
           ← graph
-        </button>
+        </Button>
         <h2>
           {kindIcon(entity.kind)} {entity.name}
         </h2>
         {entity.kind ? <span className="tag">{entity.kind}</span> : null}
         <span className="grow" />
-        <button className="primary" onClick={() => setAddingFact(true)}>
+        <Button type="primary" onClick={() => setAddingFact(true)}>
           + {t("graph.addFact")}
-        </button>
+        </Button>
       </div>
       {entity.summary ? <p className="muted intent">{entity.summary}</p> : null}
 
@@ -159,24 +168,27 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
         <div className="row tight">
           <strong>{t("graph.facts")}</strong>
           <span className="muted">{t("graph.asOf")}</span>
-          <input
-            className="mono sm"
+          <Input
+            className="mono"
+            size="small"
             placeholder="As of date (e.g. 2026-01-15)…"
             value={at}
             onChange={(e) => setAt(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && loadFacts(at)}
+            onPressEnter={() => loadFacts(at)}
             onBlur={() => loadFacts(at)}
+            style={{ width: 220 }}
           />
           {at ? (
-            <button
-              className="link"
+            <Button
+              type="link"
+              size="small"
               onClick={() => {
                 setAt("");
                 loadFacts();
               }}
             >
               {t("graph.backToNow")}
-            </button>
+            </Button>
           ) : null}
         </div>
         {facts === null ? (
@@ -184,26 +196,24 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
         ) : facts.length === 0 ? (
           <p className="muted pad">{t("graph.noFacts")}</p>
         ) : (
-          <table className="stats facts">
-            <thead>
-              <tr>
-                <th>{t("graph.relation")}</th>
-                <th>{t("graph.fact")}</th>
-                <th>{t("graph.valid")}</th>
-                <th>{t("graph.until")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {facts.map((f) => (
-                <tr key={f.id} className={f.invalid_at ? "row-old" : ""}>
-                  <td className="mono">{f.relation}</td>
-                  <td>{f.fact_text}</td>
-                  <td className="muted mono">{dateOf(f.valid_at)}</td>
-                  <td className="muted mono">{f.invalid_at ? dateOf(f.invalid_at) : "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <Table
+            className="facts"
+            size="small"
+            dataSource={facts}
+            rowKey="id"
+            pagination={false}
+            rowClassName={(f) => (f.invalid_at ? "row-old" : "")}
+            columns={[
+              { title: t("graph.relation"), dataIndex: "relation", render: (v: string) => <span className="mono">{v}</span> },
+              { title: t("graph.fact"), dataIndex: "fact_text" },
+              { title: t("graph.valid"), dataIndex: "valid_at", render: (v: string) => <span className="muted mono">{dateOf(v)}</span> },
+              {
+                title: t("graph.until"),
+                dataIndex: "invalid_at",
+                render: (v: string | null) => <span className="muted mono">{v ? dateOf(v) : "—"}</span>,
+              },
+            ]}
+          />
         )}
       </div>
 
@@ -248,19 +258,19 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
     <Modal title={t("graph.newEntity.title")} onClose={onClose}>
       <label className="field">
         <span>{t("graph.newEntity.name")}</span>
-        <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Alice" />
+        <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Alice" />
       </label>
       <label className="field">
         <span>{t("graph.newEntity.kind")}</span>
-        <input value={kind} onChange={(e) => setKind(e.target.value)} placeholder="person / project / tool…" />
+        <Input value={kind} onChange={(e) => setKind(e.target.value)} placeholder="person / project / tool…" />
       </label>
       <label className="field">
         <span>{t("graph.newEntity.summary")}</span>
-        <input value={summary} onChange={(e) => setSummary(e.target.value)} />
+        <Input value={summary} onChange={(e) => setSummary(e.target.value)} />
       </label>
       <div className="row end">
-        <button
-          className="primary"
+        <Button
+          type="primary"
           disabled={!name.trim()}
           onClick={async () => {
             try {
@@ -273,7 +283,7 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
           }}
         >
           {t("common.create")}
-        </button>
+        </Button>
       </div>
     </Modal>
   );
@@ -300,7 +310,7 @@ function AddFactModal({
       <p className="muted"><Markdown>{t("graph.addFact.desc")}</Markdown></p>
       <label className="field">
         <span>{t("graph.addFact.target")}</span>
-        <input
+        <Input
           autoFocus
           value={targetName}
           onChange={(e) => setTargetName(e.target.value)}
@@ -309,11 +319,11 @@ function AddFactModal({
       </label>
       <label className="field">
         <span>{t("graph.addFact.relation")}</span>
-        <input value={relation} onChange={(e) => setRelation(e.target.value)} placeholder="works_at" />
+        <Input value={relation} onChange={(e) => setRelation(e.target.value)} placeholder="works_at" />
       </label>
       <label className="field">
         <span>{t("graph.addFact.text")}</span>
-        <input
+        <Input
           value={factText}
           onChange={(e) => setFactText(e.target.value)}
           placeholder={t("graph.addFact.textPh")}
@@ -321,12 +331,13 @@ function AddFactModal({
       </label>
       <label className="field">
         <span>{t("graph.addFact.valid")}</span>
-        <input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder="2026-01-15" />
+        <Input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder="2026-01-15" />
       </label>
       <div className="row end">
-        <button
-          className="primary"
-          disabled={busy || !targetName.trim() || !relation.trim() || !factText.trim()}
+        <Button
+          type="primary"
+          loading={busy}
+          disabled={!targetName.trim() || !relation.trim() || !factText.trim()}
           onClick={async () => {
             setBusy(true);
             try {
@@ -348,7 +359,7 @@ function AddFactModal({
           }}
         >
           {t("graph.addFact.btn")}
-        </button>
+        </Button>
       </div>
     </Modal>
   );

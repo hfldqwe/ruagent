@@ -1,6 +1,7 @@
 // Memory browser: stores × namespaces, supersession chains, write dialog,
 // audit trail (OpenViking parity).
 
+import { Button, Input, Segmented, Select } from "antd";
 import { useEffect, useState } from "react";
 import { api, type MemoryDiff, type MemoryRow } from "../api";
 import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
@@ -59,18 +60,18 @@ export function Memory() {
         <h2>{t("memory.title")}</h2>
         <span className="muted">{t("memory.subtitle")}</span>
         <span className="grow" />
-        <div className="seg">
-          <button className={tab === "browse" ? "on" : ""} onClick={() => setTab("browse")}>
-            Browse
-          </button>
-          <button className={tab === "audit" ? "on" : ""} onClick={() => setTab("audit")}>
-            Audit log
-          </button>
-        </div>
+        <Segmented
+          value={tab}
+          onChange={(v) => setTab(v as "browse" | "audit")}
+          options={[
+            { value: "browse", label: "Browse" },
+            { value: "audit", label: "Audit log" },
+          ]}
+        />
         {tab === "browse" && (
-          <button className="primary" onClick={() => setWriting(true)}>
+          <Button type="primary" onClick={() => setWriting(true)}>
             + {t("memory.write")}
-          </button>
+          </Button>
         )}
       </div>
 
@@ -79,27 +80,20 @@ export function Memory() {
       ) : (
         <>
           <div className="filter-bar">
-            <div className="seg">
-              {STORES.map((s) => (
-                <button
-                  key={s}
-                  className={store === s ? "on" : ""}
-                  onClick={() => {
-                    setStore(s);
-                    setNamespace(NAMESPACES[s][0]);
-                  }}
-                >
-                  {s}
-                </button>
-              ))}
-            </div>
-            <select value={namespace} onChange={(e) => setNamespace(e.target.value)}>
-              {nsOptions.map((ns) => (
-                <option key={ns} value={ns}>
-                  {ns}
-                </option>
-              ))}
-            </select>
+            <Segmented
+              value={store}
+              onChange={(v) => {
+                setStore(v as Store);
+                setNamespace(NAMESPACES[v as Store][0]);
+              }}
+              options={STORES.map((s) => ({ value: s, label: s }))}
+            />
+            <Select
+              value={namespace}
+              onChange={setNamespace}
+              style={{ minWidth: 170 }}
+              options={nsOptions.map((ns) => ({ value: ns, label: ns }))}
+            />
             <NewNamespaceInput
               store={store}
               onCreated={(ns) => {
@@ -151,27 +145,28 @@ function NewNamespaceInput({ store, onCreated }: { store: Store; onCreated: (ns:
       {prefix ? (
         open ? (
           <span className="row tight">
-            <input
+            <Input
               autoFocus
-              className="mono sm"
+              className="mono"
+              size="small"
               placeholder={`${prefix}…`}
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && value.trim()) {
+              onPressEnter={() => {
+                if (value.trim()) {
                   onCreated(`${prefix}${value.trim()}`);
                   setValue("");
                   setOpen(false);
                 }
-                if (e.key === "Escape") setOpen(false);
               }}
-              style={{ width: 140 }}
+              onKeyDown={(e) => e.key === "Escape" && setOpen(false)}
+              style={{ width: 160 }}
             />
           </span>
         ) : (
-          <button className="link" onClick={() => setOpen(true)}>
+          <Button type="link" size="small" style={{ paddingLeft: 0 }} onClick={() => setOpen(true)}>
             + {t("memory.nsNew")}
-          </button>
+          </Button>
         )
       ) : null}
     </span>
@@ -204,9 +199,9 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
       <p className={superseded ? "memory-content old" : "memory-content"}>{memory.content}</p>
       {!superseded && (
         <div className="row tight">
-          <button className="link" onClick={() => setEditing(true)}>
+          <Button type="link" size="small" style={{ paddingLeft: 0 }} onClick={() => setEditing(true)}>
             {t("memory.supersede")}
-          </button>
+          </Button>
         </div>
       )}
       {editing && (
@@ -238,10 +233,10 @@ function EditModal({
   return (
     <Modal title={t("memory.supersede.title", { id: memory.id })} onClose={onClose}>
       <p className="muted">{t("memory.supersede.desc")}</p>
-      <textarea rows={4} value={content} onChange={(e) => setContent(e.target.value)} />
+      <Input.TextArea rows={4} value={content} onChange={(e) => setContent(e.target.value)} />
       <div className="row end">
-        <button
-          className="primary"
+        <Button
+          type="primary"
           onClick={async () => {
             try {
               await api.memorySupersede(memory.id, content);
@@ -253,7 +248,7 @@ function EditModal({
           }}
         >
           {t("memory.supersede.btn")}
-        </button>
+        </Button>
       </div>
     </Modal>
   );
@@ -285,7 +280,7 @@ function WriteModal({
       </label>
       <label className="field">
         <span>{t("memory.write.content")}</span>
-        <textarea
+        <Input.TextArea
           autoFocus
           rows={4}
           value={content}
@@ -294,8 +289,8 @@ function WriteModal({
         />
       </label>
       <div className="row end">
-        <button
-          className="primary"
+        <Button
+          type="primary"
           disabled={!content.trim()}
           onClick={async () => {
             try {
@@ -308,7 +303,7 @@ function WriteModal({
           }}
         >
           {t("memory.write.btn")}
-        </button>
+        </Button>
       </div>
     </Modal>
   );

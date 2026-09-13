@@ -2,10 +2,11 @@
 // steps, and a guide to every section. First thing a new user sees.
 
 import { useEffect, useState } from "react";
+import { Button, Card, Statistic } from "antd";
 import { api } from "../api";
 import { useI18n } from "../i18n";
-import { Icon, type IconName } from "../icons";
 import { Spinner } from "../ui";
+import { Icon, type IconName } from "../icons";
 import { CreateTaskModal } from "./Board";
 
 interface Overview {
@@ -76,48 +77,41 @@ export function Home({ onOpenTask, onNav }: { onOpenTask: (id: string) => void; 
 
       <div className="stat-strip">
         {stats.map((s) => (
-          <div key={s.key} className="stat-card">
-            <span className="stat-big nums">{s.value}</span>
-            <span className="muted">{t(s.key)}</span>
-          </div>
+          <Card key={s.key} size="small">
+            <Statistic value={s.value} title={<span className="muted">{t(s.key)}</span>} />
+          </Card>
         ))}
       </div>
 
-      <h2>{t("home.start.title")}</h2>
+      <h2 className="sec">{t("home.start.title")}</h2>
       <div className="steps">
-        <div className="step-card">
+        <Card size="small">
           <div className="step-num">1</div>
-          <div>
-            <strong>{t("home.step1.title")}</strong>
-            <p className="muted">{t("home.step1.desc")}</p>
-            <button className="primary sm" onClick={() => setCreating(true)}>
-              {ov.tasks === 0 ? t("home.step1.cta") : t("board.new")}
-            </button>
-          </div>
-        </div>
-        <div className="step-card">
+          <strong>{t("home.step1.title")}</strong>
+          <p className="muted">{t("home.step1.desc")}</p>
+          <Button type="primary" size="small" onClick={() => setCreating(true)}>
+            {ov.tasks === 0 ? t("home.step1.cta") : t("board.new")}
+          </Button>
+        </Card>
+        <Card size="small">
           <div className="step-num">2</div>
-          <div>
-            <strong>{t("home.step2.title")}</strong>
-            <p className="muted">{t("home.step2.desc")}</p>
-            <button className="sm" onClick={() => onNav(ov.tasks ? `task/${""}` : "")} disabled={!ov.tasks}>
-              {t("nav.board")}
-            </button>
-          </div>
-        </div>
-        <div className="step-card">
+          <strong>{t("home.step2.title")}</strong>
+          <p className="muted">{t("home.step2.desc")}</p>
+          <Button size="small" onClick={() => onNav(ov.tasks ? "board" : "board")} disabled={!ov.tasks}>
+            {t("nav.board")}
+          </Button>
+        </Card>
+        <Card size="small">
           <div className="step-num">3</div>
-          <div>
-            <strong>{t("home.step3.title")}</strong>
-            <p className="muted">{t("home.step3.desc")}</p>
-            <button className="sm" onClick={() => onNav("memory")}>
-              {t("nav.memory")}
-            </button>
-          </div>
-        </div>
+          <strong>{t("home.step3.title")}</strong>
+          <p className="muted">{t("home.step3.desc")}</p>
+          <Button size="small" onClick={() => onNav("memory")}>
+            {t("nav.memory")}
+          </Button>
+        </Card>
       </div>
 
-      <h2>{t("home.guide.title")}</h2>
+      <h2 className="sec">{t("home.guide.title")}</h2>
       <div className="guide-grid">
         {guide.map((g) => (
           <button key={g.hash || "board"} className="guide-card" onClick={() => onNav(g.hash)}>
@@ -126,7 +120,7 @@ export function Home({ onOpenTask, onNav }: { onOpenTask: (id: string) => void; 
             </span>
             <div>
               <strong>{g.label}</strong>
-              <p className="muted">{g.desc}</p>
+              <p>{g.desc}</p>
             </div>
           </button>
         ))}

@@ -1,10 +1,27 @@
-// App shell: sidebar navigation + language toggle + hash routing.
+// App shell: antd Layout sidebar + hash routing + theme/lang toggles.
 
 import { useEffect, useState } from "react";
+import {
+  Layout,
+  Menu,
+  Button,
+  Tooltip,
+} from "antd";
+import {
+  HomeOutlined,
+  MessageOutlined,
+  AppstoreOutlined,
+  CloudOutlined,
+  BookOutlined,
+  ShareAltOutlined,
+  RobotOutlined,
+  BarChartOutlined,
+  InboxOutlined,
+} from "@ant-design/icons";
 import { api } from "./api";
 import { useI18n } from "./i18n";
-import { Icon, type IconName } from "./icons";
-import { ToastHost } from "./ui";
+import { ThemeProvider, useThemeMode } from "./theme";
+import { ToastBridge } from "./ui";
 import { Board } from "./views/Board";
 import { Home } from "./views/Home";
 import { TaskDetail } from "./views/TaskDetail";
@@ -13,6 +30,8 @@ import { Knowledge } from "./views/Knowledge";
 import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
 import { Chat } from "./views/Chat";
+
+const { Sider, Content } = Layout;
 
 type View =
   | { kind: "home" }
@@ -53,7 +72,16 @@ function parseHash(): View {
 }
 
 export default function App() {
+  return (
+    <ThemeProvider>
+      <Shell />
+    </ThemeProvider>
+  );
+}
+
+function Shell() {
   const { lang, setLang, t } = useI18n();
+  const { mode, toggle } = useThemeMode();
   const [view, setView] = useState<View>(() => parseHash());
   const [inboxCount, setInboxCount] = useState(0);
   const [daemonUp, setDaemonUp] = useState(true);
@@ -83,66 +111,93 @@ export default function App() {
     window.location.hash = hash;
   };
 
+  const selected =
+    view.kind === "task" ? "board" : view.kind === "home" ? "home" : view.kind;
+
+  const items = [
+    {
+      type: "group" as const,
+      label: t("nav.group.work"),
+      children: [
+        { key: "home", icon: <HomeOutlined />, label: t("nav.home") },
+        { key: "chat", icon: <MessageOutlined />, label: t("chat.title") },
+        { key: "board", icon: <AppstoreOutlined />, label: t("nav.board") },
+      ],
+    },
+    {
+      type: "group" as const,
+      label: t("nav.group.knowledge"),
+      children: [
+        { key: "memory", icon: <CloudOutlined />, label: t("nav.memory") },
+        { key: "knowledge", icon: <BookOutlined />, label: t("nav.knowledge") },
+        { key: "graph", icon: <ShareAltOutlined />, label: t("nav.graph") },
+      ],
+    },
+    {
+      type: "group" as const,
+      label: t("nav.group.system"),
+      children: [
+        { key: "agents", icon: <RobotOutlined />, label: t("nav.agents") },
+        { key: "stats", icon: <BarChartOutlined />, label: t("nav.stats") },
+        {
+          key: "inbox",
+          icon: <InboxOutlined />,
+          label: (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              {t("nav.inbox")}
+              {inboxCount > 0 && (
+                <span className="nav-badge">{inboxCount}</span>
+              )}
+            </span>
+          ),
+        },
+      ],
+    },
+  ];
+
   return (
-    <ToastHost>
-      <div className="shell">
-        <aside className="sidebar">
-          <div className="brand" onClick={() => nav("")}>
-            <span className="brand-mark">ru</span>
-            <span className="brand-name">ruagent</span>
-          </div>
-          <nav>
-            <div className="nav-group">
-              <div className="nav-label">{t("nav.group.work")}</div>
-              <NavItem icon="home" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
-              <NavItem
-                icon="chat"
-                label={t("chat.title")}
-                active={view.kind === "chat"}
-                onClick={() => nav("chat")}
-              />
-              <NavItem
-                icon="layers"
-                label={t("nav.board")}
-                active={view.kind === "board" || view.kind === "task"}
-                onClick={() => nav("board")}
-              />
-            </div>
-            <div className="nav-group">
-              <div className="nav-label">{t("nav.group.knowledge")}</div>
-              <NavItem icon="brain" label={t("nav.memory")} active={view.kind === "memory"} onClick={() => nav("memory")} />
-              <NavItem icon="book" label={t("nav.knowledge")} active={view.kind === "knowledge"} onClick={() => nav("knowledge")} />
-              <NavItem icon="graph" label={t("nav.graph")} active={view.kind === "graph"} onClick={() => nav("graph")} />
-            </div>
-            <div className="nav-group">
-              <div className="nav-label">{t("nav.group.system")}</div>
-              <NavItem icon="bot" label={t("nav.agents")} active={view.kind === "agents"} onClick={() => nav("agents")} />
-              <NavItem icon="stats" label={t("nav.stats")} active={view.kind === "stats"} onClick={() => nav("stats")} />
-              <NavItem
-                icon="inbox"
-                label={t("nav.inbox")}
-                badge={inboxCount || undefined}
-                active={view.kind === "inbox"}
-                onClick={() => nav("inbox")}
-              />
-            </div>
-          </nav>
-          <div className="sidebar-foot">
-            {daemonUp ? (
-              <span className="conn ok">● {t("common.online")}</span>
-            ) : (
-              <span className="conn err">● {t("common.offline")}</span>
-            )}
-            <button
-              className="lang-toggle"
-              onClick={() => setLang(lang === "zh" ? "en" : "zh")}
-              title="中文 / EN"
+    <Layout style={{ minHeight: "100vh" }}>
+      <ToastBridge />
+      <Sider width={228} style={{ position: "sticky", top: 0, height: "100vh", overflow: "auto" }}>
+        <div
+          className="brand"
+          onClick={() => nav("")}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => e.key === "Enter" && nav("")}
+        >
+          <span className="brand-mark">ru</span>
+          <span className="brand-name">ruagent</span>
+        </div>
+        <Menu
+          mode="inline"
+          items={items}
+          selectedKeys={[selected]}
+          onClick={({ key }) => nav(key === "home" ? "" : key)}
+          style={{ borderInlineEnd: "none", paddingBlock: 4 }}
+        />
+        <div className="sidebar-foot">
+          <span className={`conn ${daemonUp ? "ok" : "err"}`}>
+            ● {daemonUp ? t("common.online") : t("common.offline")}
+          </span>
+          <span className="grow" />
+          <Tooltip title={mode === "dark" ? t("theme.light") : t("theme.dark")}>
+            <Button
+              size="small"
+              type="text"
+              onClick={toggle}
+              aria-label="toggle theme"
             >
-              {lang === "zh" ? "EN" : "中"}
-            </button>
-          </div>
-        </aside>
-        <main className="content">
+              {mode === "dark" ? "☀" : "☾"}
+            </Button>
+          </Tooltip>
+          <Button size="small" type="text" onClick={() => setLang(lang === "zh" ? "en" : "zh")} title="中文 / EN">
+            {lang === "zh" ? "EN" : "中"}
+          </Button>
+        </div>
+      </Sider>
+      <Layout>
+        <Content className="content">
           {view.kind === "home" && (
             <Home
               onOpenTask={(id) => nav(`task/${id}`)}
@@ -150,7 +205,7 @@ export default function App() {
             />
           )}
           {view.kind === "chat" && <Chat initialAgent={view.agent} />}
-          {view.kind === "board" && <Board onOpen={(id) => nav(`task/${id}`)} />}.
+          {view.kind === "board" && <Board onOpen={(id) => nav(`task/${id}`)} />}
           {view.kind === "task" && (
             <TaskDetail key={view.id} id={view.id} onBack={() => nav("board")} />
           )}
@@ -160,32 +215,8 @@ export default function App() {
           {view.kind === "agents" && <Agents />}
           {view.kind === "stats" && <Stats />}
           {view.kind === "inbox" && <Inbox />}
-        </main>
-      </div>
-    </ToastHost>
-  );
-}
-
-function NavItem({
-  icon,
-  label,
-  active,
-  badge,
-  onClick,
-}: {
-  icon: IconName;
-  label: string;
-  active: boolean;
-  badge?: number;
-  onClick: () => void;
-}) {
-  return (
-    <button className={active ? "nav-item active" : "nav-item"} onClick={onClick}>
-      <span className="nav-icon">
-        <Icon name={icon} size={16} />
-      </span>
-      <span>{label}</span>
-      {badge ? <span className="nav-badge">{badge}</span> : null}
-    </button>
+        </Content>
+      </Layout>
+    </Layout>
   );
 }

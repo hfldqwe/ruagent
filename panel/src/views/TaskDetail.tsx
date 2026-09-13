@@ -2,11 +2,12 @@
 // execution log, task status controls. Fully bilingual.
 
 import { useEffect, useState } from "react";
+import { Button, Checkbox, Input, Popconfirm, Segmented, Select } from "antd";
+import { CloseOutlined } from "@ant-design/icons";
 import { api, type AgentInfo, type Run, type Task } from "../api";
 import { useI18n } from "../i18n";
 import {
   Markdown,
-  Modal,
   RelTime,
   Spinner,
   StatusDot,
@@ -57,9 +58,9 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   return (
     <div>
       <div className="view-bar">
-        <button className="link" onClick={onBack}>
+        <Button type="link" onClick={onBack} style={{ paddingLeft: 0 }}>
           ← {t("task.back")}
-        </button>
+        </Button>
         <h2>{task.title}</h2>
         <StatusPill status={task.status} />
         {task.project ? <span className="tag">{task.project}</span> : null}
@@ -81,7 +82,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
       {runs.length > 1 && completed.length > 1 && (
         <>
-          <h3>{t("task.comparison")}</h3>
+          <h3 className="sec">{t("task.comparison")}</h3>
           <div className="compare">
             {runs.map((r) => (
               <div
@@ -102,12 +103,13 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                   )}
                 </div>
                 <div className="row">
-                  <button className="link" onClick={() => setSelectedRun(r.id)}>
+                  <Button type="link" size="small" style={{ paddingLeft: 0 }} onClick={() => setSelectedRun(r.id)}>
                     {t("task.viewLog")}
-                  </button>
+                  </Button>
                   {r.status === "completed" && winner !== r.id ? (
-                    <button
-                      className="primary sm"
+                    <Button
+                      type="primary"
+                      size="small"
                       onClick={async () => {
                         try {
                           await api.selectRun(r.id);
@@ -119,7 +121,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                       }}
                     >
                       {t("task.selectWinner")}
-                    </button>
+                    </Button>
                   ) : null}
                 </div>
               </div>
@@ -128,7 +130,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
         </>
       )}
 
-      <h3>
+      <h3 className="sec">
         {t("task.runs")}{" "}
         <span className="muted">
           {t("task.runsCount", { n: runs.length })}
@@ -169,8 +171,9 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                 <RelTime iso={r.created_at} />
               </span>
               {activeStatuses.includes(r.status) ? (
-                <button
-                  className="danger sm"
+                <Button
+                  danger
+                  size="small"
                   onClick={async (e) => {
                     e.stopPropagation();
                     try {
@@ -183,7 +186,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                   }}
                 >
                   {t("task.cancelRun")}
-                </button>
+                </Button>
               ) : null}
             </div>
           ))}
@@ -192,7 +195,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
       {selectedRun && runs.some((r) => r.id === selectedRun) ? (
         <>
-          <h3>{t("task.log")}</h3>
+          <h3 className="sec">{t("task.log")}</h3>
           <RunTimeline
             key={selectedRun}
             run={runs.find((r) => r.id === selectedRun)!}
@@ -234,9 +237,6 @@ function Launcher({
     if (agents.length && !agents.some((a) => a.name === agent)) setAgent(agents[0].name);
   }, [agents, agent]);
 
-  const toggle = (name: string) =>
-    setPicked((list) => (list.includes(name) ? list.filter((n) => n !== name) : [...list, name]));
-
   const go = async () => {
     setBusy(true);
     try {
@@ -269,36 +269,41 @@ function Launcher({
 
   return (
     <div className="card launcher">
-      <div className="seg">
-        <button className={mode === "single" ? "on" : ""} onClick={() => setMode("single")}>
-          {t("launcher.run")}
-        </button>
-        <button className={mode === "fanout" ? "on" : ""} onClick={() => setMode("fanout")}>
-          {t("launcher.fanout")}
-        </button>
-        <button className={mode === "pipeline" ? "on" : ""} onClick={() => setMode("pipeline")}>
-          {t("launcher.pipeline")}
-        </button>
-      </div>
+      <Segmented
+        value={mode}
+        onChange={(v) => setMode(v as Mode)}
+        options={[
+          { value: "single", label: t("launcher.run") },
+          { value: "fanout", label: t("launcher.fanout") },
+          { value: "pipeline", label: t("launcher.pipeline") },
+        ]}
+        style={{ marginBottom: 10 }}
+      />
 
       {mode === "single" && (
         <div className="row">
-          <select value={agent} onChange={(e) => setAgent(e.target.value)}>
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.name}
-              </option>
-            ))}
-          </select>
+          <Select
+            value={agent}
+            onChange={setAgent}
+            style={{ minWidth: 180 }}
+            options={agents.map((a) => ({ value: a.name, label: a.name }))}
+          />
         </div>
       )}
       {mode === "fanout" && (
         <div className="row wrap">
           {agents.map((a) => (
-            <label key={a.name} className="check">
-              <input type="checkbox" checked={picked.includes(a.name)} onChange={() => toggle(a.name)} />
+            <Checkbox
+              key={a.name}
+              checked={picked.includes(a.name)}
+              onChange={() =>
+                setPicked((list) =>
+                  list.includes(a.name) ? list.filter((n) => n !== a.name) : [...list, a.name],
+                )
+              }
+            >
               {a.name}
-            </label>
+            </Checkbox>
           ))}
           <span className="muted">{t("launcher.selected", { n: picked.length })}</span>
         </div>
@@ -308,65 +313,63 @@ function Launcher({
           {steps.map((s, i) => (
             <div key={i} className="row">
               <span className="step-n">{i + 1}</span>
-              <select
-                value={s}
-                onChange={(e) => setSteps(steps.map((x, j) => (j === i ? e.target.value : x)))}
-              >
-                <option value="">{t("launcher.chooseAgent")}</option>
-                {agents.map((a) => (
-                  <option key={a.name} value={a.name}>
-                    {a.name}
-                  </option>
-                ))}
-              </select>
+              <Select
+                value={s || undefined}
+                placeholder={t("launcher.chooseAgent")}
+                style={{ minWidth: 180 }}
+                onChange={(v) => setSteps(steps.map((x, j) => (j === i ? v : x)))}
+                options={agents.map((a) => ({ value: a.name, label: a.name }))}
+              />
               <span className="muted">→</span>
-              <button
-                className="sm"
+              <Button
+                size="small"
+                icon={<CloseOutlined />}
                 onClick={() => setSteps(steps.filter((_, j) => j !== i))}
                 title={t("launcher.removeStep")}
-              >
-                ✕
-              </button>
+              />
             </div>
           ))}
-          <button className="sm" onClick={() => setSteps([...steps, ""])} disabled={steps.length >= 5}>
+          <Button size="small" onClick={() => setSteps([...steps, ""])} disabled={steps.length >= 5}>
             {t("launcher.addStep")}
-          </button>
+          </Button>
         </div>
       )}
 
       {mode !== "pipeline" && (
-        <input
+        <Input
           className="grow"
           placeholder={t("launcher.prompt")}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !busy && go()}
+          onPressEnter={() => !busy && go()}
         />
       )}
-      <input
+      <Input
         className="grow mono"
         placeholder={t("launcher.repo")}
         value={repo}
         onChange={(e) => setRepo(e.target.value)}
+        style={{ marginTop: 8 }}
       />
       <div className="row end">
         {mode === "pipeline" ? (
-          <button
-            className="primary"
-            disabled={busy || steps.some((s) => !s) || steps.length < 2}
+          <Button
+            type="primary"
+            loading={busy}
+            disabled={steps.some((s) => !s) || steps.length < 2}
             onClick={go}
           >
             {t("launcher.startPipeline")}
-          </button>
+          </Button>
         ) : (
-          <button
-            className="primary"
-            disabled={busy || (mode === "fanout" && picked.length < 2)}
+          <Button
+            type="primary"
+            loading={busy}
+            disabled={mode === "fanout" && picked.length < 2}
             onClick={go}
           >
             {mode === "single" ? t("launcher.run") : `${t("launcher.fanout")} (${picked.length})`}
-          </button>
+          </Button>
         )}
       </div>
       <details className="hint">
@@ -393,7 +396,6 @@ function TaskStatusMenu({
   onDeleted: () => void;
 }) {
   const { t } = useI18n();
-  const [confirming, setConfirming] = useState(false);
   const toast = useToast();
   const set = async (status: string) => {
     try {
@@ -405,38 +407,36 @@ function TaskStatusMenu({
   };
   return (
     <span className="row tight">
-      <select value={task.status} onChange={(e) => set(e.target.value)} title={t("task.status")}>
-        {["pending", "in_progress", "blocked", "done", "cancelled"].map((s) => (
-          <option key={s} value={s}>
-            {t(`status.${s}`)}
-          </option>
-        ))}
-      </select>
-      <button className="danger sm" onClick={() => setConfirming(true)}>
-        {t("common.delete")}
-      </button>
-      {confirming && (
-        <Modal title={t("task.deleteConfirm.title")} onClose={() => setConfirming(false)}>
-          <p>{t("task.deleteConfirm.body")}</p>
-          <div className="row end">
-            <button onClick={() => setConfirming(false)}>{t("common.keep")}</button>
-            <button
-              className="danger"
-              onClick={async () => {
-                try {
-                  await api.deleteTask(task.id);
-                  toast("ok", t("toast.taskDeleted"));
-                  onDeleted();
-                } catch (e) {
-                  toast("err", String(e));
-                }
-              }}
-            >
-              {t("common.delete")}
-            </button>
-          </div>
-        </Modal>
-      )}
+      <Select
+        value={task.status}
+        onChange={set}
+        style={{ minWidth: 120 }}
+        title={t("task.status")}
+        options={["pending", "in_progress", "blocked", "done", "cancelled"].map((s) => ({
+          value: s,
+          label: t(`status.${s}`),
+        }))}
+      />
+      <Popconfirm
+        title={t("task.deleteConfirm.title")}
+        description={t("task.deleteConfirm.body")}
+        okText={t("common.delete")}
+        cancelText={t("common.keep")}
+        okButtonProps={{ danger: true }}
+        onConfirm={async () => {
+          try {
+            await api.deleteTask(task.id);
+            toast("ok", t("toast.taskDeleted"));
+            onDeleted();
+          } catch (e) {
+            toast("err", String(e));
+          }
+        }}
+      >
+        <Button danger size="small">
+          {t("common.delete")}
+        </Button>
+      </Popconfirm>
     </span>
   );
 }

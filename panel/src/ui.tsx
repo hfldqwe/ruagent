@@ -1,56 +1,41 @@
-// Shared UI primitives: toasts, modal, empty/loading states, status dots,
-// markdown, meters. Text comes from i18n at call sites.
+// Shared UI bridge: our small primitives on top of antd. Views keep calling
+// useToast/Modal/Empty/Spinner — the implementations are antd's now.
 
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useState,
-  type ReactNode,
-} from "react";
+import { useEffect, type ReactNode } from "react";
+import { App as AntApp, Empty as AntEmpty, Modal as AntModal, Spin } from "antd";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Icon, type IconName } from "./icons";
+import type { IconName } from "./icons";
+import { Icon } from "./icons";
 import { relTime, useI18n } from "./i18n";
 
 // ---------------------------------------------------------------------------
-// Toasts (aria-live)
+// Toasts -> antd message (via App context)
 // ---------------------------------------------------------------------------
 
-interface Toast {
-  id: number;
-  kind: "ok" | "err";
-  text: string;
+type MessageApi = ReturnType<typeof AntApp.useApp>["message"];
+
+let messageApi: MessageApi | null = null;
+
+/** Mounts once inside App; captures antd's message instance. */
+export function ToastBridge() {
+  const { message } = AntApp.useApp();
+  useEffect(() => {
+    messageApi = message;
+  }, [message]);
+  return null;
 }
 
-const ToastCtx = createContext<(kind: "ok" | "err", text: string) => void>(() => {});
+export const useToast = () =>
+  (kind: "ok" | "err", text: string) => {
+    if (messageApi) messageApi.open({ type: kind === "ok" ? "success" : "error", content: text });
+  };
 
-export function ToastHost({ children }: { children: ReactNode }) {
-  const [toasts, setToasts] = useState<Toast[]>([]);
-  const push = useCallback((kind: "ok" | "err", text: string) => {
-    const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, kind, text }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4200);
-  }, []);
-  return (
-    <ToastCtx.Provider value={push}>
-      {children}
-      <div className="toasts" role="status" aria-live="polite">
-        {toasts.map((t) => (
-          <div key={t.id} className={t.kind === "ok" ? "toast ok" : "toast err"}>
-            {t.text}
-          </div>
-        ))}
-      </div>
-    </ToastCtx.Provider>
-  );
-}
-
-export const useToast = () => useContext(ToastCtx);
+// Kept for App.tsx compatibility — the provider is antd's now.
+export const ToastHost = ({ children }: { children: ReactNode }) => <>{children}</>;
 
 // ---------------------------------------------------------------------------
-// Modal
+// Modal -> antd Modal
 // ---------------------------------------------------------------------------
 
 export function Modal({
@@ -58,39 +43,35 @@ export function Modal({
   onClose,
   children,
   wide,
+  footer,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
   wide?: boolean;
+  footer?: ReactNode;
 }) {
-  useEffect(() => {
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", esc);
-    return () => window.removeEventListener("keydown", esc);
-  }, [onClose]);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className={wide ? "modal wide" : "modal"} onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">
-          <h3>{title}</h3>
-          <button className="link" onClick={onClose} aria-label="close">
-            ✕
-          </button>
-        </div>
-        <div className="modal-body">{children}</div>
-      </div>
-    </div>
+    <AntModal
+      title={title}
+      open
+      onCancel={onClose}
+      width={wide ? 760 : 560}
+      footer={footer ?? null}
+      destroyOnHidden
+    >
+      {children}
+    </AntModal>
   );
 }
 
 // ---------------------------------------------------------------------------
-// States
+// States -> antd Spin / Empty
 // ---------------------------------------------------------------------------
 
 export const Spinner = ({ label }: { label?: string }) => (
-  <div className="state">
-    <div className="spin" />
+  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "72px 0" }}>
+    <Spin size="large" />
     {label ? <span className="muted">{label}</span> : null}
   </div>
 );
@@ -107,14 +88,23 @@ export function Empty({
   action?: ReactNode;
 }) {
   return (
-    <div className="state empty">
-      <div className="empty-icon">
-        <Icon name={icon} size={30} />
-      </div>
-      <strong>{title}</strong>
-      {hint ? <p className="muted">{hint}</p> : null}
+    <AntEmpty
+      image={<Icon name={icon} size={44} style={{ opacity: 0.35 }} />}
+      imageStyle={{ height: 52, display: "flex", justifyContent: "center" }}
+      description={
+        <div>
+          <div style={{ fontWeight: 600 }}>{title}</div>
+          {hint ? (
+            <div className="muted" style={{ maxWidth: 420, margin: "4px auto 0", fontSize: 13 }}>
+              {hint}
+            </div>
+          ) : null}
+        </div>
+      }
+      style={{ padding: "56px 0" }}
+    >
       {action}
-    </div>
+    </AntEmpty>
   );
 }
 
@@ -128,26 +118,31 @@ export function RelTime({ iso }: { iso: string | null | undefined }) {
 }
 
 // ---------------------------------------------------------------------------
-// Status
+// Status — colors valid on both light and dark surfaces
 // ---------------------------------------------------------------------------
 
 const STATUS_COLORS: Record<string, string> = {
-  done: "var(--ok)",
-  completed: "var(--ok)",
-  failed: "var(--danger)",
-  cancelled: "var(--danger)",
-  interrupted: "var(--warn)",
-  in_progress: "var(--accent)",
-  running: "var(--accent)",
-  spawning: "var(--accent)",
-  queued: "var(--text-faint)",
-  pending: "var(--text-faint)",
-  waiting_permission: "var(--warn)",
-  blocked: "var(--warn)",
+  done: "#52c41a",
+  completed: "#52c41a",
+  failed: "#ff4d4f",
+  cancelled: "#ff4d4f",
+  interrupted: "#faad14",
+  in_progress: "#d9861f",
+  running: "#d9861f",
+  spawning: "#d9861f",
+  queued: "#8a8275",
+  pending: "#8a8275",
+  waiting_permission: "#faad14",
+  blocked: "#faad14",
 };
 
 export function StatusDot({ status }: { status: string }) {
-  return <span className="dot" style={{ background: STATUS_COLORS[status] ?? "var(--text-faint)" }} />;
+  return (
+    <span
+      className="dot"
+      style={{ background: STATUS_COLORS[status] ?? "#8a8275" }}
+    />
+  );
 }
 
 export function StatusPill({ status }: { status: string }) {
@@ -156,7 +151,7 @@ export function StatusPill({ status }: { status: string }) {
     <span
       className="pill"
       style={{
-        color: STATUS_COLORS[status] ?? "var(--text-dim)",
+        color: STATUS_COLORS[status] ?? "inherit",
         borderColor: STATUS_COLORS[status] ?? "var(--line-strong)",
       }}
     >
@@ -191,13 +186,9 @@ export function fmtUsd(n: number | null | undefined): string {
 
 export function UsageMeter({ used, size }: { used: number; size: number }) {
   const pct = size > 0 ? Math.min(100, (used / size) * 100) : 0;
-  const color = pct > 85 ? "var(--danger)" : pct > 60 ? "var(--warn)" : "var(--ok)";
   return (
-    <span className="meter" title={`${fmtTokens(used)} / ${fmtTokens(size)}`}>
-      <span className="meter-fill" style={{ width: `${pct}%`, background: color }} />
-      <span className="meter-label">
-        {fmtTokens(used)}/{fmtTokens(size)}
-      </span>
+    <span title={`${fmtTokens(used)} / ${fmtTokens(size)}`} className="mono" style={{ fontSize: 12 }}>
+      {fmtTokens(used)}/{fmtTokens(size)} · {pct.toFixed(0)}%
     </span>
   );
 }
