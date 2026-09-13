@@ -5,22 +5,48 @@
 const DEFAULT_TARGET: usize = 800;
 const DEFAULT_OVERLAP: usize = 100;
 
-/// Split `text` into chunks: paragraphs first, then hard-splits any
-/// paragraph longer than the target. Consecutive chunks share
-/// `overlap` characters of tail/head.
+/// Split `text` into chunks. Heading-aware: a markdown heading starts a
+/// new section, and sections never share a chunk — a chunk about
+/// Kubernetes must not average in the pasta recipe above it (semantic
+/// dilution measured 2026-09-13: a mixed chunk ranked BELOW an
+/// unrelated one for a topic it contained).
 pub fn chunk_text(text: &str) -> Vec<String> {
     chunk_with(text, DEFAULT_TARGET, DEFAULT_OVERLAP)
 }
 
 pub fn chunk_with(text: &str, target: usize, overlap: usize) -> Vec<String> {
-    let mut pieces: Vec<String> = Vec::new();
+    // Group paragraphs into sections: a heading paragraph (# ...) starts
+    // a new section; paragraphs until the next heading belong to it.
+    let mut sections: Vec<Vec<String>> = Vec::new();
     for para in text.split("\n\n") {
         let para = para.trim();
         if para.is_empty() {
             continue;
         }
+        let is_heading = para.starts_with('#');
+        if is_heading || sections.is_empty() {
+            sections.push(Vec::new());
+        }
+        sections
+            .last_mut()
+            .expect("just pushed")
+            .push(para.to_string());
+    }
+
+    // Pack each section independently so topics never mix.
+    let mut chunks: Vec<String> = Vec::new();
+    for section in sections {
+        chunks.extend(pack_pieces(section, target, overlap));
+    }
+    chunks
+}
+
+/// Hard-split over-long pieces, then pack into chunks up to target size.
+fn pack_pieces(input: Vec<String>, target: usize, overlap: usize) -> Vec<String> {
+    let mut pieces: Vec<String> = Vec::new();
+    for para in input {
         if para.chars().count() <= target {
-            pieces.push(para.to_string());
+            pieces.push(para);
         } else {
             // Hard-split long paragraphs at target boundaries.
             let chars: Vec<char> = para.chars().collect();
@@ -29,14 +55,13 @@ pub fn chunk_with(text: &str, target: usize, overlap: usize) -> Vec<String> {
                 let end = (start + target).min(chars.len());
                 pieces.push(chars[start..end].iter().collect());
                 if end == chars.len() {
-                    break; // reached the tail — stop (no cascade of crumbs)
+                    break; // reached the tail - stop (no cascade of crumbs)
                 }
                 start = end.saturating_sub(overlap).max(start + 1);
             }
         }
     }
 
-    // Pack pieces into chunks up to target size.
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
     for piece in pieces {
@@ -91,6 +116,15 @@ mod tests {
                 "chunks must overlap: ...{tail:?} / {head:?}..."
             );
         }
+    }
+
+    #[test]
+    fn headings_start_new_chunks_no_topic_mixing() {
+        let text = "# Cooking pasta\n\nBoil water and cook spaghetti.\n\n# Kubernetes\n\nRollback uses kubectl rollout undo.";
+        let chunks = chunk_text(text);
+        assert_eq!(chunks.len(), 2, "each heading = its own chunk");
+        assert!(chunks[0].contains("spaghetti") && !chunks[0].contains("kubectl"));
+        assert!(chunks[1].contains("kubectl") && !chunks[1].contains("spaghetti"));
     }
 
     #[test]

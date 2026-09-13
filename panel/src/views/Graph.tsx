@@ -80,7 +80,7 @@ export function Graph() {
       <div className="search-bar">
         <Input
           className="grow"
-          placeholder="Search entities (name, summary)…"
+          placeholder={t("graph.searchPh")}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onPressEnter={search}
@@ -104,7 +104,7 @@ export function Graph() {
               <span className="doc-icon">{kindIcon(e.kind)}</span>
               <strong>{e.name}</strong>
               {e.kind ? <span className="tag">{e.kind}</span> : null}
-              <span className="muted">{factCount} facts</span>
+              <span className="muted">{t("graph.factCount", { n: factCount })}</span>
               <span className="grow" />
               {e.summary ? <span className="muted truncated">{e.summary}</span> : null}
             </button>
@@ -151,7 +151,7 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
     <div>
       <div className="view-bar">
         <Button type="link" onClick={onBack} style={{ paddingLeft: 0 }}>
-          ← graph
+          ← {t("graph.back")}
         </Button>
         <h2>
           {kindIcon(entity.kind)} {entity.name}
@@ -171,7 +171,7 @@ function EntityDetail({ entity, onBack }: { entity: GraphEntity; onBack: () => v
           <Input
             className="mono"
             size="small"
-            placeholder="As of date (e.g. 2026-01-15)…"
+            placeholder={t("graph.asOfPh")}
             value={at}
             onChange={(e) => setAt(e.target.value)}
             onPressEnter={() => loadFacts(at)}
@@ -258,11 +258,11 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
     <Modal title={t("graph.newEntity.title")} onClose={onClose}>
       <label className="field">
         <span>{t("graph.newEntity.name")}</span>
-        <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Alice" />
+        <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder={t("graph.namePh")} />
       </label>
       <label className="field">
         <span>{t("graph.newEntity.kind")}</span>
-        <Input value={kind} onChange={(e) => setKind(e.target.value)} placeholder="person / project / tool…" />
+        <Input value={kind} onChange={(e) => setKind(e.target.value)} placeholder={t("graph.kindPh")} />
       </label>
       <label className="field">
         <span>{t("graph.newEntity.summary")}</span>
@@ -314,12 +314,12 @@ function AddFactModal({
           autoFocus
           value={targetName}
           onChange={(e) => setTargetName(e.target.value)}
-          placeholder="Acme"
+          placeholder={t("graph.targetPh")}
         />
       </label>
       <label className="field">
         <span>{t("graph.addFact.relation")}</span>
-        <Input value={relation} onChange={(e) => setRelation(e.target.value)} placeholder="works_at" />
+        <Input value={relation} onChange={(e) => setRelation(e.target.value)} placeholder={t("graph.relationPh")} />
       </label>
       <label className="field">
         <span>{t("graph.addFact.text")}</span>
@@ -331,7 +331,7 @@ function AddFactModal({
       </label>
       <label className="field">
         <span>{t("graph.addFact.valid")}</span>
-        <Input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder="2026-01-15" />
+        <Input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder={t("graph.datePh")} />
       </label>
       <div className="row end">
         <Button

@@ -153,7 +153,7 @@ export function Knowledge() {
                     }
                   }}
                 >
-                  Delete
+                  {t("common.delete")}
                 </Button>
               </div>
               {expanded === d.id && (

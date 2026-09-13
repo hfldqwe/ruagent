@@ -17,7 +17,12 @@ impl FastEmbedder {
         // Model load can take a while (download + init): run it on the
         // blocking pool.
         let model = tokio::task::spawn_blocking(|| {
-            fastembed::TextEmbedding::try_new(Default::default())
+            // Explicit model: fastembed 6's derived default drifted to
+            // all-MiniLM-L6-v2; we pin bge-small-en-v1.5 (384d) — the
+            // identity stored with the vector table.
+            let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
+                .with_show_download_progress(false);
+            fastembed::TextEmbedding::try_new(opts)
                 .map_err(|e| EmbedError::Other(format!("fastembed init: {e}")))
         })
         .await

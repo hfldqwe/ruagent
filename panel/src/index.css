@@ -70,8 +70,8 @@ body {
 }
 
 .content {
-  padding: 24px 28px 80px;
-  max-width: 1240px;
+  padding: clamp(16px, 2vw, 36px) clamp(16px, 2.6vw, 48px) 80px;
+  max-width: 1400px;
   margin: 0 auto;
   width: 100%;
 }
@@ -85,7 +85,7 @@ body {
   margin-bottom: 18px;
   flex-wrap: wrap;
 }
-.view-bar h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.02em; color: var(--ant-color-text); }
+.view-bar h2 { margin: 0; font-size: clamp(18px, 1.4vw, 22px); font-weight: 650; letter-spacing: -0.02em; color: var(--ant-color-text); }
 .view-bar .sub { color: var(--ant-color-text-tertiary); font-size: 13px; }
 h3.sec { margin: 26px 0 12px; font-size: 13px; font-weight: 600; color: var(--ant-color-text-secondary); }
 .intent { margin: -4px 0 16px; color: var(--ant-color-text-tertiary); max-width: 720px; }
@@ -153,7 +153,8 @@ button.row-btn.selected { background: var(--ant-color-primary-bg); }
 /* Kanban -------------------------------------------------------------- */
 
 .kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-@media (max-width: 1040px) { .kanban { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1240px) { .kanban { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 700px) { .kanban { grid-template-columns: 1fr; } }
 .kanban-col {
   background: var(--ant-color-bg-layout);
   border: 1px solid var(--ant-color-border-secondary);
@@ -403,15 +404,21 @@ button.row-btn.selected { background: var(--ant-color-primary-bg); }
 /* Chat — Claude.ai-style conversation ---------------------------------- */
 
 .chat-wrap {
-  max-width: 780px;
+  max-width: min(860px, 92vw);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
   min-height: calc(100vh - 140px);
 }
+.chat-bottom {
+  position: sticky;
+  bottom: 0;
+  padding-top: 10px;
+  background: linear-gradient(180deg, transparent, var(--ant-color-bg-base) 18px);
+}
 .chat-bar {
-  display: flex; gap: 10px; align-items: flex-end;
-  padding: 8px 4px 14px;
+  display: flex; gap: 8px; align-items: flex-end;
+  padding: 0 4px 8px;
   flex-wrap: wrap;
 }
 .chat-field { display: flex; flex-direction: column; gap: 4px; }
@@ -463,7 +470,7 @@ button.row-btn.selected { background: var(--ant-color-primary-bg); }
 .chat-typing i:nth-child(3) { animation-delay: 0.3s; }
 @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.5; } 30% { transform: translateY(-3px); opacity: 1; } }
 
-.chat-input-bar { position: sticky; bottom: 0; padding: 8px 4px 6px; }
+.chat-input-bar { padding: 0 4px 2px; }
 .composer {
   display: flex; align-items: flex-end; gap: 8px;
   background: var(--ant-color-bg-container);

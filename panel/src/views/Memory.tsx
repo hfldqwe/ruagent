@@ -64,8 +64,8 @@ export function Memory() {
           value={tab}
           onChange={(v) => setTab(v as "browse" | "audit")}
           options={[
-            { value: "browse", label: "Browse" },
-            { value: "audit", label: "Audit log" },
+            { value: "browse", label: t("memory.browse") },
+            { value: "audit", label: t("memory.audit") },
           ]}
         />
         {tab === "browse" && (
@@ -86,7 +86,7 @@ export function Memory() {
                 setStore(v as Store);
                 setNamespace(NAMESPACES[v as Store][0]);
               }}
-              options={STORES.map((s) => ({ value: s, label: s }))}
+              options={STORES.map((s) => ({ value: s, label: t(`memory.store.${s}`) }))}
             />
             <Select
               value={namespace}
@@ -107,8 +107,8 @@ export function Memory() {
           ) : memories.length === 0 ? (
             <Empty
               icon="brain"
-              title={`No ${store} memories in ${namespace}`}
-              hint="Agents write here via the memory_write MCP tool; you can also write manually."
+              title={t("memory.empty.title", { store: t(`memory.store.${store}`), namespace })}
+              hint={t("memory.empty.hint")}
             />
           ) : (
             <div className="memory-list">

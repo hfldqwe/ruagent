@@ -413,6 +413,40 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         ) : null}
       </div>
 
+      <div className="chat-log grow">
+        {messages.length === 0 ? (
+          <div className="state empty">
+            <span className="empty-icon">
+              <Icon name="chat" size={30} />
+            </span>
+            <p>{t("chat.empty")}</p>
+          </div>
+        ) : (
+          messages.map((m, i) => (
+            <div
+              key={i}
+              className={
+                m.notice
+                  ? "chat-msg notice"
+                  : m.role === "user"
+                    ? "chat-msg user"
+                    : "chat-msg agent"
+              }
+            >
+              {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
+              {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
+            </div>
+          ))
+        )}
+        {streaming && (
+          <div className="chat-typing">
+            <i /> <i /> <i />
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      <div className="chat-bottom">
       <div className="chat-bar">
         <label className="chat-field">
           <span>{t("chat.agent")}</span>
@@ -454,40 +488,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             />
           ))}
       </div>
-
-      <div className="chat-log">
-        {messages.length === 0 ? (
-          <div className="state empty">
-            <span className="empty-icon">
-              <Icon name="chat" size={30} />
-            </span>
-            <p>{t("chat.empty")}</p>
-          </div>
-        ) : (
-          messages.map((m, i) => (
-            <div
-              key={i}
-              className={
-                m.notice
-                  ? "chat-msg notice"
-                  : m.role === "user"
-                    ? "chat-msg user"
-                    : "chat-msg agent"
-              }
-            >
-              {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
-              {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
-            </div>
-          ))
-        )}
-        {streaming && (
-          <div className="chat-typing">
-            <i /> <i /> <i />
-          </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
-
       <div className="chat-input-bar">
         <div className="composer">
           <textarea
@@ -512,6 +512,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             {starting ? "…" : <Icon name="arrowUp" size={16} />}
           </Button>
         </div>
+      </div>
       </div>
     </div>
   );

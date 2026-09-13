@@ -93,27 +93,56 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         }
     }
 
-    // Knowledge base: hash embedder by default (offline boot); set
-    // RUAGENT_EMBEDDER=fastembed for real semantics (model downloads on
-    // first use — the daemon never blocks on it by default).
+    // Knowledge base: real semantics by default — fastembed (bge-small)
+    // downloads its model on first use; every failure mode (offline,
+    // model download error, table built with another embedder) falls
+    // back to the offline hash embedder so the platform always boots.
+    // RUAGENT_EMBEDDER=hash forces the fallback deterministically.
+    // Model cache under the ruagent home by default (stable across cwd;
+    // pre-seeded via `ruagent models pull` or HF_ENDPOINT mirror downloads).
+    // SAFETY: single-threaded startup section before any worker threads
+    // (or async runtimes) have spawned; the only other env access is the
+    // read below.
+    if std::env::var_os("HF_HOME").is_none() {
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("HF_HOME", root.join("models").join("hub"));
+        }
+    }
     let knowledge = match std::env::var("RUAGENT_EMBEDDER").as_deref() {
-        Ok("fastembed") => match ruagent_knowledge::FastEmbedder::try_new().await {
-            Ok(fe) => {
-                ruagent_knowledge::Knowledge::with_embedder(
-                    &root,
-                    db.clone(),
-                    std::sync::Arc::new(fe),
-                )
-                .await
+        Ok("hash") => ruagent_knowledge::Knowledge::open(&root, db.clone()).await,
+        _ => {
+            let fast = ruagent_knowledge::FastEmbedder::try_new().await;
+            match fast {
+                Ok(fe) => {
+                    match ruagent_knowledge::Knowledge::with_embedder(
+                        &root,
+                        db.clone(),
+                        std::sync::Arc::new(fe),
+                    )
+                    .await
+                    {
+                        Ok(k) => Ok(k),
+                        Err(e) => {
+                            tracing::warn!(error = %e,
+                                "knowledge table was built with another embedder;                                  falling back to hash embedder (re-ingest to upgrade)");
+                            ruagent_knowledge::Knowledge::open(&root, db.clone()).await
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "fastembed unavailable (offline?); falling back to hash embedder");
+                    ruagent_knowledge::Knowledge::open(&root, db.clone()).await
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "fastembed unavailable; falling back to hash embedder");
-                ruagent_knowledge::Knowledge::open(&root, db.clone()).await
-            }
-        },
-        _ => ruagent_knowledge::Knowledge::open(&root, db.clone()).await,
+        }
     }
     .with_context(|| "opening knowledge base")?;
+    tracing::info!(
+        embedder = knowledge.embedder_name(),
+        "knowledge base embedder"
+    );
 
     // Chats (terminal-like sessions) share the permission inbox with runs:
     // every chat ask parks in the same inbox (rules → human), keyed by the

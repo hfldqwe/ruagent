@@ -258,7 +258,7 @@ export function Inbox() {
                 setDetail(null);
               }}
             >
-              Allow
+              {t("common.allow")}
             </Button>
             <Button
               danger
@@ -267,7 +267,7 @@ export function Inbox() {
                 setDetail(null);
               }}
             >
-              Reject
+              {t("common.reject")}
             </Button>
           </div>
         </Modal>
