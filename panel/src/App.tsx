@@ -158,7 +158,8 @@ function Shell() {
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <ToastBridge />
-      <Sider width={228} style={{ position: "sticky", top: 0, height: "100vh", overflow: "auto" }}>
+      <Sider width={228} className="app-sider">
+        <div className="sider-inner">
         <div
           className="brand"
           onClick={() => nav("")}
@@ -169,13 +170,15 @@ function Shell() {
           <span className="brand-mark">ru</span>
           <span className="brand-name">ruagent</span>
         </div>
-        <Menu
-          mode="inline"
-          items={items}
-          selectedKeys={[selected]}
-          onClick={({ key }) => nav(key === "home" ? "" : key)}
-          style={{ borderInlineEnd: "none", paddingBlock: 4 }}
-        />
+        <div className="sider-nav">
+          <Menu
+            mode="inline"
+            items={items}
+            selectedKeys={[selected]}
+            onClick={({ key }) => nav(key === "home" ? "" : key)}
+            style={{ borderInlineEnd: "none", paddingBlock: 4 }}
+          />
+        </div>
         <div className="sidebar-foot">
           <span className={`conn ${daemonUp ? "ok" : "err"}`}>
             ● {daemonUp ? t("common.online") : t("common.offline")}
@@ -195,6 +198,7 @@ function Shell() {
           <Button size="small" type="text" onClick={() => setLang(lang === "zh" ? "en" : "zh")} title="中文 / EN">
             {lang === "zh" ? "EN" : "中"}
           </Button>
+        </div>
         </div>
       </Sider>
       <Layout>

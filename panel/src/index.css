@@ -48,14 +48,23 @@ body {
 }
 .brand-name { font-weight: 650; font-size: 15px; color: var(--ant-color-text); }
 
+/* Sider: sticky full-height column — nav grows, footer pinned to the
+   bottom (antd's Sider children container is not a flex column, so we
+   provide our own). */
+.app-sider { position: sticky; top: 0; height: 100vh; }
+.app-sider .ant-layout-sider-children { height: 100%; }
+.sider-inner { display: flex; flex-direction: column; height: 100vh; min-height: 0; }
+.sider-nav { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
 .sidebar-foot {
   display: flex;
   align-items: center;
   gap: 4px;
   padding: 10px 12px;
-  margin-top: auto;
+  flex: none;
   border-top: 1px solid var(--ant-color-border-secondary);
 }
+.build-id { font-family: var(--ant-font-family-code, monospace); font-size: 10px; color: var(--ant-color-text-quaternary); }
 .conn { font-family: var(--ant-font-family-code, monospace); font-size: 11.5px; }
 .conn.ok { color: var(--ant-color-success); }
 .conn.err { color: var(--ant-color-error); }
