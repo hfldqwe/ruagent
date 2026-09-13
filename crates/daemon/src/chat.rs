@@ -25,12 +25,63 @@ pub struct Chat {
     pub created_at: String,
     session: ChatSession,
     last_active: Arc<Mutex<Instant>>,
+    /// Whether the memory context already went out with a prompt (once
+    /// per chat — the first message is the natural recall query).
+    memory_injected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Chat {
     pub fn send(&self, cmd: ChatCommand) -> Result<()> {
         *self.last_active.lock().expect("chat last_active lock") = Instant::now();
         self.session.send(cmd).context("sending chat command")
+    }
+
+    /// Send a user prompt; the first one carries the memory context.
+    pub async fn send_prompt(
+        &self,
+        db: &ruagent_store::Db,
+        embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
+        text: String,
+    ) -> Result<()> {
+        let context = if self
+            .memory_injected
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            None
+        } else {
+            let mut ctx = ChatManager::memory_context_for(db, &text).await;
+            // semantic leg: the first message is the query
+            let hits = crate::memembed::semantic_search(db, embedder, &text, 4, 0.34).await;
+            if !hits.is_empty() {
+                let sem = hits
+                    .iter()
+                    .map(|(_, _, _, c, _)| format!("- {}", truncate_chars(c, 180)))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    );
+                match &mut ctx {
+                    Some(c) => {
+                        c.push_str(
+                            "
+[relevant memories for this conversation]
+",
+                        );
+                        c.push_str(&sem);
+                    }
+                    None => {
+                        ctx = Some(format!(
+                            "[memory context — what the platform remembers]
+[relevant memories for this conversation]
+{sem}"
+                        ))
+                    }
+                }
+            }
+            ctx
+        };
+        self.send(ChatCommand::Prompt { text, context })
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RunEvent> {
@@ -104,9 +155,68 @@ impl ChatManager {
             .collect()
     }
 
+    /// The cross-session memory digest (L3 of the unified memory layer):
+    /// compact profile + durable observations, capped hard. Injected
+    /// ahead of a chat's first prompt so a fresh session "remembers"
+    /// the user without any recall call.
+    /// The cross-session memory context for a chat's FIRST prompt:
+    /// (a) a stable, small profile block (who the user is — always
+    /// relevant). The semantic leg (recall on the first message) is
+    /// attached by `Chat::send_prompt`.
+    pub async fn memory_context_for(db: &ruagent_store::Db, _query: &str) -> Option<String> {
+        let rows: Vec<(String, String, String)> = db
+            .call(|conn| -> Result<_, ruagent_store::DbError> {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT store, namespace, content FROM memories
+                          WHERE superseded_at IS NULL
+                            AND ((store = 'profile' AND namespace = 'user')
+                              OR (store = 'observation' AND namespace IN ('user','global'))
+                              OR (store IN ('procedure','lesson') AND namespace = 'global'))
+                          ORDER BY updated_at DESC LIMIT 12",
+                    )
+                    .map_err(ruagent_store::DbError::from)?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map_err(ruagent_store::DbError::from)?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .await
+            .ok()?
+            .ok()?;
+        if rows.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "[memory context — what the platform remembers about you and your work]
+",
+        );
+        let mut budget = 700usize;
+        for (store, ns, content) in &rows {
+            let content = content.trim();
+            let cut = content
+                .char_indices()
+                .nth(160)
+                .map_or(content.len(), |(i, _)| i);
+            let line = if cut < content.len() {
+                format!("{}…", &content[..cut])
+            } else {
+                content.to_string()
+            };
+            let entry = format!("- ({store}/{ns}) {line}");
+            if budget < entry.len() {
+                break;
+            }
+            budget -= entry.len();
+            out.push_str(&entry);
+            out.push('\n');
+        }
+        Some(out)
+    }
+
     /// Start a new chat on the given agent (optionally with a model).
     /// Workspace = a fresh dir under workspaces/chat-<id>.
-    pub fn start(&self, card: &AgentCard, model: Option<String>) -> Result<Chat> {
+    pub async fn start(&self, card: &AgentCard, model: Option<String>) -> Result<Chat> {
         let spec = ruagent_acp::adapter_for(card.harness)
             .spawn_spec(card)
             .with_context(|| format!("resolving spawn command for `{}`", card.name))?;
@@ -205,6 +315,7 @@ impl ChatManager {
             created_at: Utc::now().to_rfc3339(),
             session,
             last_active: Arc::new(Mutex::new(Instant::now())),
+            memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         self.chats
             .lock()
@@ -273,7 +384,7 @@ impl ChatManager {
             }
         }
         self.close(id);
-        let chat = self.start(card, model)?;
+        let chat = self.start(card, model).await?;
         Ok((chat, true))
     }
 
@@ -323,7 +434,7 @@ impl ChatManager {
             Some(c) => (Some(c.options_watch()), None),
             None => {
                 // Probe: start a chat, read the options, close it.
-                let chat = self.start(card, None)?;
+                let chat = self.start(card, None).await?;
                 (Some(chat.options_watch()), Some(chat.id))
             }
         };
@@ -383,5 +494,13 @@ impl ChatManager {
                 }
             }
         });
+    }
+}
+
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
     }
 }

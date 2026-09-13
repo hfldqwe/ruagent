@@ -15,14 +15,20 @@ use serde::Deserialize;
 
 const EXTRACTION_PROMPT: &str = r#"You are a memory distillation engine. Analyze the agent session transcript below and extract DURABLE knowledge — things worth remembering weeks from now. Ignore transient details (file paths being edited, one-off commands, small talk).
 
+Answer-quality signals — judge BEFORE extracting an agent statement as memory:
+- If the user CORRECTED the agent ("不对", "no, actually", "应该是…"), extract the corrected fact from the user's message, NOT the agent's wrong answer.
+- If the user explicitly confirmed ("对", "就是这样", "perfect"), raise confidence to 1.0.
+- If the agent hedged ("可能", "I think", "not sure"), lower confidence to 0.5 or skip entirely.
+- An answer the user silently accepted (moved on to a new topic) is normal confidence (0.8).
+
 Extract:
-1. memories: durable facts about the user (profile), observations, procedures (how-to knowledge), and lessons learned. Only include things that generalize beyond this single session.
+1. memories: durable facts about the user (profile), observations, procedures (how-to knowledge), and lessons learned. Only things that generalize beyond this single session. Each memory carries a confidence (0.5–1.0) from the signals above.
 2. entities: real-world objects mentioned (people, projects, tools, organizations, products). Entity identity = the real-world object, NOT its category. Merge only explicit aliases of the same object.
 3. relations: durable facts between entities (src/dst by entity name).
 
 Respond with ONLY a JSON object, no markdown fences, no commentary:
 {
-  "memories": [{"store": "profile|observation|procedure|lesson", "namespace": "user|global|project:<name>", "content": "..."}],
+  "memories": [{"store": "profile|observation|procedure|lesson", "namespace": "user|global|project:<name>", "content": "...", "confidence": 0.8}],
   "entities": [{"name": "...", "kind": "person|project|tool|org|product|concept", "summary": "one line"}],
   "relations": [{"src": "...", "dst": "...", "relation": "snake_case", "fact": "one sentence"}]
 }
@@ -46,6 +52,9 @@ struct ExtractedMemory {
     store: String,
     namespace: String,
     content: String,
+    /// 0.5–1.0, from answer-quality signals in the transcript.
+    #[serde(default)]
+    confidence: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +87,9 @@ pub struct DistillOutcome {
 pub struct Distiller {
     pub db: Db,
     pub root: PathBuf, // ruagent home (~/.ruagent)
+    /// The shared embedder (knowledge base's) for memory vectors; None
+    /// when only the hash fallback is active.
+    pub embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
 }
 
 impl Distiller {
@@ -227,8 +239,11 @@ impl Distiller {
             let _ = done_tx.send(text);
         });
 
+        // No context payload: distillation must not feed the memory
+        // layer back into itself.
         session.send(ChatCommand::Prompt {
             text: prompt.to_string(),
+            context: None,
         })?;
         let reply = match tokio::time::timeout(std::time::Duration::from_secs(300), done_rx).await {
             Ok(Ok(text)) => text,
@@ -299,7 +314,7 @@ impl Distiller {
                     store: store_t,
                     namespace: ns_t,
                     content: content.clone(),
-                    confidence: 0.8,
+                    confidence: m.confidence.unwrap_or(0.8).clamp(0.5, 1.0),
                     source_episode: None,
                     supersedes: None,
                 },
@@ -308,7 +323,18 @@ impl Distiller {
             .with_context(|| format!("writing distilled memory to {store}/{namespace}"))?;
             use ruagent_memory::write::WriteOutcome as W;
             match outcome {
-                W::Inserted(_) | W::Superseded { .. } => written += 1,
+                W::Inserted(id) => {
+                    if let Some(embedder) = self.embedder.clone() {
+                        crate::memembed::embed_row(&self.db, embedder, id, &content).await;
+                    }
+                    written += 1;
+                }
+                W::Superseded { new, .. } => {
+                    if let Some(embedder) = self.embedder.clone() {
+                        crate::memembed::embed_row(&self.db, embedder, new, &content).await;
+                    }
+                    written += 1;
+                }
                 W::SkippedDuplicate(_) => skipped += 1,
                 W::RejectedNamespace => skipped += 1,
             }

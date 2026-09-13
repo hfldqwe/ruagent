@@ -118,8 +118,14 @@ pub struct ChatOptions {
 /// Commands into a live chat session.
 #[derive(Debug)]
 pub enum ChatCommand {
-    /// Send another user message on the same session.
-    Prompt { text: String },
+    /// Send another user message on the same session. `context` (first
+    /// prompt only) is platform memory injected ahead of the user's
+    /// words — recorded as a separate ContextInjected event so
+    /// transcripts and distillation see it as context, not user speech.
+    Prompt {
+        text: String,
+        context: Option<String>,
+    },
     /// Set one advertised session option mid-session (no restart, context
     /// preserved). `id` "model" addresses the agent's model option. Replies
     /// with the refreshed option list, or the agent's rejection message.
@@ -421,11 +427,27 @@ async fn supervise_chat(
             // that's the whole point (terminal-like multi-turn).
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    ChatCommand::Prompt { text } => {
+                    ChatCommand::Prompt { text, context } => {
+                        // First-prompt platform memory: recorded as a
+                        // separate event, prepended to what the agent sees.
+                        let outgoing = match context {
+                            Some(d) if !d.trim().is_empty() => {
+                                let _ =
+                                    events.send(RunEvent::ContextInjected { render: d.clone() });
+                                format!(
+                                    "{d}
+
+---
+
+{text}"
+                                )
+                            }
+                            _ => text.clone(),
+                        };
                         let _ = events.send(RunEvent::UserMessage { text: text.clone() });
                         let prompt = PromptRequest::new(
                             session_id.clone(),
-                            vec![ContentBlock::Text(TextContent::new(text))],
+                            vec![ContentBlock::Text(TextContent::new(outgoing))],
                         );
                         let resp = connection.send_request(prompt).block_task().await;
                         match resp {

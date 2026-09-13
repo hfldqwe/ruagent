@@ -97,6 +97,12 @@ impl Knowledge {
     }
 
     /// The active embedder's identity (for diagnostics).
+    /// The shared embedder — memory embedding reuses the same model so
+    /// queries and rows live in one vector space.
+    pub fn embedder(&self) -> std::sync::Arc<dyn Embedder> {
+        self.embedder.clone()
+    }
+
     pub fn embedder_name(&self) -> &'static str {
         self.embedder.name()
     }

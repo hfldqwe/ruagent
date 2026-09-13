@@ -79,6 +79,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/{key}", get(sessions_messages))
         .route("/api/v1/sessions/{key}/distill", post(session_distill))
         .route("/api/v1/recall", get(recall))
+        .route(
+            "/api/v1/memory/backfill-embeddings",
+            post(memory_backfill_embeddings),
+        )
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
         .with_state(state)
@@ -929,6 +933,33 @@ async fn sessions_messages(
     Ok(Json(serde_json::json!({ "messages": messages })))
 }
 
+/// Backfill embeddings for existing memory rows (after an embedder
+/// change, or rows written before the semantic leg existed).
+async fn memory_backfill_embeddings(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db = state.mgr.db().clone();
+    let rows: Vec<(i64, String)> = db
+        .call(|conn| -> Result<_, ruagent_store::DbError> {
+            let mut stmt = conn
+                .prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
+                .map_err(ruagent_store::DbError::from)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(ruagent_store::DbError::from)?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    let total = rows.len();
+    let embedder = state.knowledge.embedder();
+    for (id, content) in rows {
+        crate::memembed::embed_row(&db, embedder.clone(), id, &content).await;
+    }
+    Ok(Json(serde_json::json!({ "embedded": total })))
+}
+
 // ---------------------------------------------------------------------------
 // Distillation: session → memories + graph (agent-run extraction)
 // ---------------------------------------------------------------------------
@@ -948,6 +979,7 @@ async fn session_distill(
     let distiller = crate::distill::Distiller {
         db: state.mgr.db().clone(),
         root: state.config.root.clone(),
+        embedder: Some(state.knowledge.embedder()),
     };
     let out = distiller
         .distill(&key, card)
@@ -979,7 +1011,16 @@ async fn recall(
     let conservative = q.strategy.as_deref() == Some("conservative");
     let top_n = q.top_n.unwrap_or(5).clamp(1, 20);
 
-    // Memories (FTS leg — embeddings land in the next increment).
+    // Memories — semantic leg first (same embedder as the knowledge
+    // base), FTS as the keyword fallback.
+    let semantic = crate::memembed::semantic_search(
+        state.mgr.db(),
+        state.knowledge.embedder(),
+        &q.q,
+        top_n,
+        if conservative { 0.30 } else { 0.25 },
+    )
+    .await;
     let query_text = q.q.clone();
     let memories: Vec<(i64, String, String, String)> = state
         .mgr
@@ -1019,9 +1060,29 @@ async fn recall(
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
 
-    let min_score = q.min_score.unwrap_or(0.0);
+    let min_score = q.min_score.unwrap_or(0.0) as f32;
+    let mut seen_ids: std::collections::HashSet<i64> = semantic.iter().map(|m| m.0).collect();
     let mut out_memories: Vec<serde_json::Value> = Vec::new();
+    for (id, store, ns, content, score) in &semantic {
+        out_memories.push(if conservative {
+            serde_json::json!({
+                "kind": "memory", "id": id, "store": store, "namespace": ns,
+                "title": truncate_chars(content, 60),
+                "score": (score * 100.0).round() / 100.0,
+                "hint": "call memory_get(id) for full content",
+            })
+        } else {
+            serde_json::json!({
+                "kind": "memory", "id": id, "store": store, "namespace": ns,
+                "content": content, "score": (score * 100.0).round() / 100.0,
+            })
+        });
+    }
     for (id, store, ns, content) in memories {
+        if seen_ids.contains(&id) {
+            continue;
+        }
+        seen_ids.insert(id);
         out_memories.push(if conservative {
             serde_json::json!({
                 "kind": "memory", "id": id, "store": store, "namespace": ns,
@@ -1037,7 +1098,7 @@ async fn recall(
     }
     let mut out_chunks: Vec<serde_json::Value> = Vec::new();
     for h in hits {
-        if (h.score as f64) < min_score {
+        if (h.score as f64) < min_score as f64 {
             continue;
         }
         out_chunks.push(if conservative {
@@ -1171,6 +1232,7 @@ async fn chat_start(
     let chat = state
         .chats
         .start(card, req.model)
+        .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
         "id": chat.id.to_string(),
@@ -1203,7 +1265,8 @@ async fn chat_message(
     if req.text.trim().is_empty() {
         return Err(ApiError::bad_request("empty message"));
     }
-    chat.send(ruagent_acp::chat::ChatCommand::Prompt { text: req.text })
+    chat.send_prompt(state.mgr.db(), state.knowledge.embedder(), req.text)
+        .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1394,13 +1457,24 @@ async fn memory_write(
         &ruagent_memory::MemoryWrite {
             store,
             namespace,
-            content: req.content,
+            content: req.content.clone(),
             confidence: 0.9,
             source_episode: Some(episode),
             supersedes: req.supersedes,
         },
     )
     .await?;
+    // Semantic leg: embed the row with the shared embedder.
+    use ruagent_memory::write::WriteOutcome as W;
+    let row_id = match &outcome {
+        W::Inserted(id) => Some(*id),
+        W::Superseded { new, .. } => Some(*new),
+        _ => None,
+    };
+    if let Some(id) = row_id {
+        crate::memembed::embed_row(state.mgr.db(), state.knowledge.embedder(), id, &req.content)
+            .await;
+    }
     Ok(Json(
         serde_json::json!({ "outcome": format!("{outcome:?}") }),
     ))
