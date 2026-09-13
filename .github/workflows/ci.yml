@@ -49,12 +49,13 @@ jobs:
       - name: Install protoc
         run: choco install -y protoc
       - name: Test
-        run: cargo test --workspace
-        # The lancedb/datafusion graph is heavy; allow a generous timeout
-        # and lower parallelism to dodge Windows DLL-init failures under
-        # many concurrent rustc processes.
+        # The lancedb/datafusion graph is heavy; low parallelism dodges
+        # Windows DLL-init failures, and the retry absorbs the known
+        # lance rmeta race (E0786 invalid metadata) — the second run is
+        # incremental and almost always clean.
+        run: cargo test --workspace || cargo test --workspace
         env:
-          CARGO_BUILD_JOBS: "4"
+          CARGO_BUILD_JOBS: "2"
           RUAGENT_EMBEDDER: hash
 
   panel:
