@@ -91,31 +91,40 @@ export default function App() {
             <span className="brand-name">ruagent</span>
           </div>
           <nav>
-            <NavItem icon="🏠" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
-            <NavItem
-              icon="💬"
-              label={t("chat.title")}
-              active={view.kind === "chat"}
-              onClick={() => nav("chat")}
-            />
-            <NavItem
-              icon="🗂️"
-              label={t("nav.board")}
-              active={view.kind === "board" || view.kind === "task"}
-              onClick={() => nav("board")}
-            />
-            <NavItem icon="🧠" label={t("nav.memory")} active={view.kind === "memory"} onClick={() => nav("memory")} />
-            <NavItem icon="📚" label={t("nav.knowledge")} active={view.kind === "knowledge"} onClick={() => nav("knowledge")} />
-            <NavItem icon="🕸️" label={t("nav.graph")} active={view.kind === "graph"} onClick={() => nav("graph")} />
-            <NavItem icon="🤖" label={t("nav.agents")} active={view.kind === "agents"} onClick={() => nav("agents")} />
-            <NavItem icon="📊" label={t("nav.stats")} active={view.kind === "stats"} onClick={() => nav("stats")} />
-            <NavItem
-              icon="📥"
-              label={t("nav.inbox")}
-              badge={inboxCount || undefined}
-              active={view.kind === "inbox"}
-              onClick={() => nav("inbox")}
-            />
+            <div className="nav-group">
+              <div className="nav-label">{t("nav.group.work")}</div>
+              <NavItem icon="🏠" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
+              <NavItem
+                icon="💬"
+                label={t("chat.title")}
+                active={view.kind === "chat"}
+                onClick={() => nav("chat")}
+              />
+              <NavItem
+                icon="🗂️"
+                label={t("nav.board")}
+                active={view.kind === "board" || view.kind === "task"}
+                onClick={() => nav("board")}
+              />
+            </div>
+            <div className="nav-group">
+              <div className="nav-label">{t("nav.group.knowledge")}</div>
+              <NavItem icon="🧠" label={t("nav.memory")} active={view.kind === "memory"} onClick={() => nav("memory")} />
+              <NavItem icon="📚" label={t("nav.knowledge")} active={view.kind === "knowledge"} onClick={() => nav("knowledge")} />
+              <NavItem icon="🕸️" label={t("nav.graph")} active={view.kind === "graph"} onClick={() => nav("graph")} />
+            </div>
+            <div className="nav-group">
+              <div className="nav-label">{t("nav.group.system")}</div>
+              <NavItem icon="🤖" label={t("nav.agents")} active={view.kind === "agents"} onClick={() => nav("agents")} />
+              <NavItem icon="📊" label={t("nav.stats")} active={view.kind === "stats"} onClick={() => nav("stats")} />
+              <NavItem
+                icon="📥"
+                label={t("nav.inbox")}
+                badge={inboxCount || undefined}
+                active={view.kind === "inbox"}
+                onClick={() => nav("inbox")}
+              />
+            </div>
           </nav>
           <div className="sidebar-foot">
             {daemonUp ? (

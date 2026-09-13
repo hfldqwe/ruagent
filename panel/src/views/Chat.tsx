@@ -55,7 +55,7 @@ function OptionPicker({
   if (loading) {
     return (
       <label className="chat-field">
-        <span className="muted">{label}</span>
+        <span>{label}</span>
         <select disabled>
           <option>…</option>
         </select>
@@ -65,7 +65,7 @@ function OptionPicker({
   if (choices.length > 0) {
     return (
       <label className="chat-field">
-        <span className="muted">{label}</span>
+        <span>{label}</span>
         <select value={current} onChange={(e) => onPick(e.target.value)} disabled={disabled}>
           {Object.entries(
             choices.reduce<Record<string, OptionChoice[]>>((acc, c) => {
@@ -97,7 +97,7 @@ function OptionPicker({
   if (fallback && fallback.length > 0 && onFallbackPick) {
     return (
       <label className="chat-field">
-        <span className="muted">{label}</span>
+        <span>{label}</span>
         <select value={current} onChange={(e) => onFallbackPick(e.target.value)} disabled={disabled}>
           {fallback.map((m) => (
             <option key={m} value={m}>
@@ -111,7 +111,7 @@ function OptionPicker({
   if (freeText && onFreeText) {
     return (
       <label className="chat-field">
-        <span className="muted">{label}</span>
+        <span>{label}</span>
         <input
           className="mono sm"
           value={current}
@@ -130,6 +130,8 @@ interface Message {
   text: string;
   /** assistant streaming accumulation */
   done: boolean;
+  /** system notice (model switched, permissions) — quiet, centered */
+  notice?: boolean;
 }
 
 interface ChatEvent {
@@ -211,6 +213,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           role: "assistant",
           text: `⚙️ ${optionLabel(opt, t)} → \`${value}\``,
           done: true,
+          notice: true,
         },
       ]);
     } catch (e) {
@@ -307,6 +310,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             role: "assistant",
             text: `🔐 ${t("timeline.permReq", { title: String(ev.title) })} → ${t("nav.inbox")}`,
             done: true,
+            notice: true,
           },
         ]);
         break;
@@ -361,6 +365,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             role: "assistant",
             text: `⚙️ ${t("chat.modelLive")} → \`${chat.model ?? m}\``,
             done: true,
+            notice: true,
           },
         ]);
       } else {
@@ -374,6 +379,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             role: "assistant",
             text: `⚙️ ${t("chat.modelSwitched")} → \`${chat.model ?? m}\``,
             done: true,
+            notice: true,
           },
         ]);
         attachStream(chat.id);
@@ -389,19 +395,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   if (!agents) return <Spinner label={`${t("chat.title")}…`} />;
 
   return (
-    <div>
+    <div className="chat-wrap">
       <div className="view-bar">
         <h2>{t("chat.title")}</h2>
         <span className="muted">{t("chat.subtitle")}</span>
         <span className="grow" />
         {chatId ? (
-          <button onClick={newChat}>+ {t("chat.new")}</button>
+          <button className="ghost sm" onClick={newChat}>
+            + {t("chat.new")}
+          </button>
         ) : null}
       </div>
 
-      <div className="card chat-bar">
+      <div className="chat-bar">
         <label className="chat-field">
-          <span className="muted">{t("chat.agent")}</span>
+          <span>{t("chat.agent")}</span>
           <select
             value={agent}
             onChange={(e) => {
@@ -446,36 +454,55 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           ))}
       </div>
 
-      <div className="chat-log card">
+      <div className="chat-log">
         {messages.length === 0 ? (
-          <p className="muted pad">{t("chat.empty")}</p>
+          <div className="state empty">
+            <span className="empty-icon">💬</span>
+            <p>{t("chat.empty")}</p>
+          </div>
         ) : (
           messages.map((m, i) => (
-            <div key={i} className={m.role === "user" ? "chat-msg user" : "chat-msg agent"}>
-              {m.role === "user" ? m.text : <Markdown>{m.text}</Markdown>}
+            <div
+              key={i}
+              className={
+                m.notice
+                  ? "chat-msg notice"
+                  : m.role === "user"
+                    ? "chat-msg user"
+                    : "chat-msg agent"
+              }
+            >
+              {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
             </div>
           ))
         )}
-        {streaming && <div className="chat-typing">…</div>}
+        {streaming && <div className="chat-typing">···</div>}
         <div ref={bottomRef} />
       </div>
 
       <div className="chat-input-bar">
-        <textarea
-          rows={2}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          placeholder={t("chat.inputPh")}
-        />
-        <button className="primary" disabled={streaming || starting || !input.trim()} onClick={send}>
-          {starting ? t("common.loading") : t("chat.send")}
-        </button>
+        <div className="composer">
+          <textarea
+            rows={2}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            placeholder={t("chat.inputPh")}
+          />
+          <button
+            className="primary send-btn"
+            disabled={streaming || starting || !input.trim()}
+            onClick={send}
+            title={t("chat.send")}
+          >
+            {starting ? "…" : "↑"}
+          </button>
+        </div>
       </div>
     </div>
   );

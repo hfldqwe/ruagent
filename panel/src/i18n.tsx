@@ -8,6 +8,9 @@ export type Lang = "zh" | "en";
 
 const zh: Record<string, string> = {
   // nav
+  "nav.group.work": "工作区",
+  "nav.group.knowledge": "知识与记忆",
+  "nav.group.system": "系统",
   "nav.board": "看板",
   "nav.memory": "记忆",
   "nav.knowledge": "知识库",
@@ -285,6 +288,9 @@ const zh: Record<string, string> = {
 };
 
 const en: Record<string, string> = {
+  "nav.group.work": "Workspace",
+  "nav.group.knowledge": "Knowledge",
+  "nav.group.system": "System",
   "nav.board": "Board",
   "nav.memory": "Memory",
   "nav.knowledge": "Knowledge",
