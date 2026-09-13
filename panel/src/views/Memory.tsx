@@ -112,7 +112,7 @@ export function Memory() {
             <Spinner label={`${t("memory.title")}…`} />
           ) : memories.length === 0 ? (
             <Empty
-              icon="🧠"
+              icon="brain"
               title={`No ${store} memories in ${namespace}`}
               hint="Agents write here via the memory_write MCP tool; you can also write manually."
             />
@@ -322,7 +322,7 @@ function AuditView() {
   }, []);
   if (!diffs) return <Spinner label={`${t("memory.audit")}…`} />;
   if (diffs.length === 0)
-    return <Empty icon="📜" title="No memory writes yet" hint="Every write decision lands here." />;
+    return <Empty icon="scroll" title="No memory writes yet" hint="Every write decision lands here." />;
   return (
     <div className="card">
       {diffs.map((d) => (

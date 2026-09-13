@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useI18n } from "../i18n";
+import { Icon, type IconName } from "../icons";
 import { Spinner } from "../ui";
 import { CreateTaskModal } from "./Board";
 
@@ -56,14 +57,14 @@ export function Home({ onOpenTask, onNav }: { onOpenTask: (id: string) => void; 
     { key: "home.stat.docs", value: ov.docs },
   ];
 
-  const guide: { icon: string; hash: string; label: string; desc: string }[] = [
-    { icon: "🗂️", hash: "", label: t("nav.board"), desc: t("home.guide.board") },
-    { icon: "🧠", hash: "memory", label: t("nav.memory"), desc: t("home.guide.memory") },
-    { icon: "📚", hash: "knowledge", label: t("nav.knowledge"), desc: t("home.guide.knowledge") },
-    { icon: "🕸️", hash: "graph", label: t("nav.graph"), desc: t("home.guide.graph") },
-    { icon: "🤖", hash: "agents", label: t("nav.agents"), desc: t("home.guide.agents") },
-    { icon: "📊", hash: "stats", label: t("nav.stats"), desc: t("home.guide.stats") },
-    { icon: "📥", hash: "inbox", label: t("nav.inbox"), desc: t("home.guide.inbox") },
+  const guide: { icon: IconName; hash: string; label: string; desc: string }[] = [
+    { icon: "layers", hash: "", label: t("nav.board"), desc: t("home.guide.board") },
+    { icon: "brain", hash: "memory", label: t("nav.memory"), desc: t("home.guide.memory") },
+    { icon: "book", hash: "knowledge", label: t("nav.knowledge"), desc: t("home.guide.knowledge") },
+    { icon: "graph", hash: "graph", label: t("nav.graph"), desc: t("home.guide.graph") },
+    { icon: "bot", hash: "agents", label: t("nav.agents"), desc: t("home.guide.agents") },
+    { icon: "stats", hash: "stats", label: t("nav.stats"), desc: t("home.guide.stats") },
+    { icon: "inbox", hash: "inbox", label: t("nav.inbox"), desc: t("home.guide.inbox") },
   ];
 
   return (
@@ -120,7 +121,9 @@ export function Home({ onOpenTask, onNav }: { onOpenTask: (id: string) => void; 
       <div className="guide-grid">
         {guide.map((g) => (
           <button key={g.hash || "board"} className="guide-card" onClick={() => onNav(g.hash)}>
-            <span className="guide-icon">{g.icon}</span>
+            <span className="guide-icon">
+              <Icon name={g.icon} size={18} />
+            </span>
             <div>
               <strong>{g.label}</strong>
               <p className="muted">{g.desc}</p>

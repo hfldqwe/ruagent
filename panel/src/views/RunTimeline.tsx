@@ -5,6 +5,7 @@ import type { Run } from "../api";
 import { useI18n } from "../i18n";
 import { Markdown, StatusPill, UsageMeter, fmtUsd } from "../ui";
 import { dateOf } from "../i18n";
+import { Icon } from "../icons";
 
 interface EventLine {
   ts: string;
@@ -145,7 +146,7 @@ function EventRow({ line }: { line: EventLine }) {
       if (!text) return null;
       return (
         <div className="ev thought">
-          <span className="ev-icon">💭</span>
+          <span className="ev-icon"><Icon name="thought" size={13} /></span>
           <span className="thought-text">{text}</span>
         </div>
       );
@@ -161,7 +162,7 @@ function EventRow({ line }: { line: EventLine }) {
       const done = entries.filter((x) => x.status === "completed").length;
       return (
         <div className="ev plan">
-          <span className="ev-icon">🗺️</span>
+          <span className="ev-icon"><Icon name="plan" size={13} /></span>
           <div className="plan-body">
             <div className="plan-head">
               {t("timeline.plan")}{" "}
@@ -195,7 +196,7 @@ function EventRow({ line }: { line: EventLine }) {
       const why = d.source?.rule_id ? ` · ${d.source.rule_id}` : d.rationale ? ` · ${d.rationale}` : "";
       return (
         <div className="ev sys">
-          <span className="ev-icon">🧭</span>
+          <span className="ev-icon"><Icon name="compass" size={13} /></span>
           <span className="muted">{t("timeline.routed", { level })}{why}</span>
         </div>
       );
@@ -206,7 +207,7 @@ function EventRow({ line }: { line: EventLine }) {
       return (
         <details className="ev inject">
           <summary>
-            <span className="ev-icon">🧠</span> {t("timeline.injected")}
+            <span className="ev-icon"><Icon name="brain" size={13} /></span> {t("timeline.injected")}
             <span className="muted">
               {" "}
               {t("timeline.injectedBlocks", { blocks: blocks.join(", "), n: render.length })}
@@ -219,7 +220,7 @@ function EventRow({ line }: { line: EventLine }) {
     case "permission_requested":
       return (
         <div className="ev perm">
-          <span className="ev-icon">🔐</span>
+          <span className="ev-icon"><Icon name="lock" size={13} /></span>
           <span>{t("timeline.permReq", { title: String(e.title) })}</span>
         </div>
       );
@@ -234,7 +235,7 @@ function EventRow({ line }: { line: EventLine }) {
             : "timeline.by.rule";
       return (
         <div className="ev perm resolved">
-          <span className="ev-icon">🔓</span>
+          <span className="ev-icon"><Icon name="unlock" size={13} /></span>
           <span>{t("timeline.permRes", { outcome, who: t(whoKey) })}</span>
         </div>
       );
@@ -242,14 +243,14 @@ function EventRow({ line }: { line: EventLine }) {
     case "state_changed":
       return (
         <div className="ev sys">
-          <span className="ev-icon">▶</span>
+          <span className="ev-icon"><Icon name="play" size={13} /></span>
           <StatusPill status={String(e.status)} />
         </div>
       );
     case "stopped":
       return (
         <div className="ev sys">
-          <span className="ev-icon">■</span>
+          <span className="ev-icon"><Icon name="stop" size={13} /></span>
           <span className="muted">
             {t("timeline.stopped", { reason: t(`status.${String(e.stop_reason)}`) })}
           </span>
@@ -258,7 +259,7 @@ function EventRow({ line }: { line: EventLine }) {
     case "error":
       return (
         <div className="ev err">
-          <span className="ev-icon">✖</span>
+          <span className="ev-icon"><Icon name="error" size={13} /></span>
           <span>{String(e.message)}</span>
         </div>
       );
@@ -285,7 +286,7 @@ function ToolRow({ id, title, input }: { id: string; title: string; input: unkno
   return (
     <div className="ev tool">
       <button className="tool-head" onClick={() => setOpen((v) => !v)}>
-        <span className="ev-icon">🔧</span>
+        <span className="ev-icon"><Icon name="tool" size={13} /></span>
         <strong>{title}</strong>
         <span className="muted mono">{id}</span>
         <span className="chev">{open ? "▾" : "▸"}</span>

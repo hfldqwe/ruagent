@@ -8,6 +8,7 @@ import {
   type OptionChoice,
   type SessionOptionInfo,
 } from "../api";
+import { Icon, type IconName } from "../icons";
 import { useI18n } from "../i18n";
 import { Markdown, Spinner } from "../ui";
 
@@ -132,6 +133,8 @@ interface Message {
   done: boolean;
   /** system notice (model switched, permissions) — quiet, centered */
   notice?: boolean;
+  /** icon shown on notices */
+  icon?: IconName;
 }
 
 interface ChatEvent {
@@ -211,15 +214,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         ...prev,
         {
           role: "assistant",
-          text: `⚙️ ${optionLabel(opt, t)} → \`${value}\``,
+          text: `${optionLabel(opt, t)} → \`${value}\``,
           done: true,
           notice: true,
+          icon: "settings",
         },
       ]);
     } catch (e) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", text: `⚠️ ${String(e)}`, done: true },
+        { role: "assistant", text: String(e), done: true, notice: true, icon: "warn" },
       ]);
     }
   };
@@ -298,7 +302,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         const msg = String(ev.message);
         setMessages((prev) => [
           ...prev.map((m) => (m.role === "assistant" ? { ...m, done: true } : m)),
-          { role: "assistant", text: `⚠️ ${msg}`, done: true },
+          { role: "assistant", text: msg, done: true, notice: true, icon: "warn" },
         ]);
         setStreaming(false);
         break;
@@ -308,9 +312,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           ...prev,
           {
             role: "assistant",
-            text: `🔐 ${t("timeline.permReq", { title: String(ev.title) })} → ${t("nav.inbox")}`,
+            text: `${t("timeline.permReq", { title: String(ev.title) })} → ${t("nav.inbox")}`,
             done: true,
             notice: true,
+            icon: "lock",
           },
         ]);
         break;
@@ -333,7 +338,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     } catch (e) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", text: `⚠️ ${String(e)}`, done: true },
+        { role: "assistant", text: String(e), done: true, notice: true, icon: "warn" },
       ]);
       setStreaming(false);
     }
@@ -363,9 +368,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           ...prev,
           {
             role: "assistant",
-            text: `⚙️ ${t("chat.modelLive")} → \`${chat.model ?? m}\``,
+            text: `${t("chat.modelLive")} → \`${chat.model ?? m}\``,
             done: true,
             notice: true,
+            icon: "settings",
           },
         ]);
       } else {
@@ -377,9 +383,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           ...prev,
           {
             role: "assistant",
-            text: `⚙️ ${t("chat.modelSwitched")} → \`${chat.model ?? m}\``,
+            text: `${t("chat.modelSwitched")} → \`${chat.model ?? m}\``,
             done: true,
             notice: true,
+            icon: "settings",
           },
         ]);
         attachStream(chat.id);
@@ -387,7 +394,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     } catch (e) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", text: `⚠️ ${String(e)}`, done: true },
+        { role: "assistant", text: String(e), done: true, notice: true, icon: "warn" },
       ]);
     }
   };
@@ -457,7 +464,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       <div className="chat-log">
         {messages.length === 0 ? (
           <div className="state empty">
-            <span className="empty-icon">💬</span>
+            <span className="empty-icon">
+              <Icon name="chat" size={30} />
+            </span>
             <p>{t("chat.empty")}</p>
           </div>
         ) : (
@@ -472,11 +481,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                     : "chat-msg agent"
               }
             >
+              {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
               {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
             </div>
           ))
         )}
-        {streaming && <div className="chat-typing">···</div>}
+        {streaming && (
+          <div className="chat-typing">
+            <i /> <i /> <i />
+          </div>
+        )}
         <div ref={bottomRef} />
       </div>
 
@@ -500,7 +514,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             onClick={send}
             title={t("chat.send")}
           >
-            {starting ? "…" : "↑"}
+            {starting ? "…" : <Icon name="arrowUp" size={16} />}
           </button>
         </div>
       </div>

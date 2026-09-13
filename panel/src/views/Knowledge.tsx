@@ -93,7 +93,7 @@ export function Knowledge() {
 
       {hits ? (
         hits.length === 0 ? (
-          <Empty icon="🔍" title={t("knowledge.noResults")} />
+          <Empty icon="search" title={t("knowledge.noResults")} />
         ) : (
           <div className="card">
             {hits.map((h) => (
@@ -111,7 +111,7 @@ export function Knowledge() {
         <Spinner label={`${t("knowledge.title")}…`} />
       ) : docs.length === 0 ? (
         <Empty
-          icon="📚"
+          icon="book"
           title={t("knowledge.empty.title")}
           hint={t("knowledge.empty.hint")}
         />

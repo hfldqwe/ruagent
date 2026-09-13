@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api, type AgentInfo, type AgentStats, type McpRegistry, type PendingPermission } from "../api";
 import { Empty, Modal, RelTime, Spinner, fmtUsd, useToast } from "../ui";
 import { useI18n } from "../i18n";
+import { Icon } from "../icons";
 
 // ---------------------------------------------------------------------------
 // Agents
@@ -33,7 +34,7 @@ export function Agents() {
         <span className="muted">{t("agents.subtitle")}</span>
       </div>
       {agents.length === 0 ? (
-        <Empty icon="🤖" title={t("agents.empty.title")} hint={t("agents.empty.hint")} />
+        <Empty icon="bot" title={t("agents.empty.title")} hint={t("agents.empty.hint")} />
       ) : (
         <div className="agent-grid">
           {agents.map((a) => {
@@ -95,7 +96,7 @@ export function Agents() {
                     <p className="muted pad">{t("mcp.overlay")}</p>
         </div>
       ) : (
-        <Empty icon="🔌" title={t("mcp.empty.title")} hint={t("mcp.empty.hint")} />
+        <Empty icon="plug" title={t("mcp.empty.title")} hint={t("mcp.empty.hint")} />
       )}
     </div>
   );
@@ -114,7 +115,7 @@ export function Stats() {
     return () => clearInterval(t);
   }, []);
   if (!stats) return <Spinner label={`${t("stats.title")}…`} />;
-  if (stats.length === 0) return <Empty icon="📊" title={t("stats.empty")} />;
+  if (stats.length === 0) return <Empty icon="stats" title={t("stats.empty")} />;
   const maxCost = Math.max(...stats.map((s) => s.total_cost_usd), 0.0001);
   return (
     <div>
@@ -203,7 +204,7 @@ export function Inbox() {
       </div>
       {pending.length === 0 ? (
         <Empty
-          icon="✅"
+          icon="check"
           title={t("inbox.empty.title")}
           hint={t("inbox.empty.hint")}
         />
@@ -212,7 +213,7 @@ export function Inbox() {
           {pending.map((p) => (
             <div key={`${p.run_id}:${p.tool_call_id}`} className="card inbox-card">
               <div className="row">
-                <span className="ev-icon">🔐</span>
+                <span className="ev-icon"><Icon name="lock" size={13} /></span>
                 <strong>{p.title}</strong>
                 <span className="grow" />
                 <span className="muted mono">{p.run_id.slice(0, 8)}</span>

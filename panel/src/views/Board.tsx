@@ -43,7 +43,7 @@ export function Board({ onOpen }: { onOpen: (id: string) => void }) {
 
       {tasks.length === 0 ? (
         <Empty
-          icon="🗂️"
+          icon="layers"
           title={t("board.empty.title")}
           hint={t("board.empty.hint")}
           action={

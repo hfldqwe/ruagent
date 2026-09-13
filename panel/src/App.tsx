@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
 import { useI18n } from "./i18n";
+import { Icon, type IconName } from "./icons";
 import { ToastHost } from "./ui";
 import { Board } from "./views/Board";
 import { Home } from "./views/Home";
@@ -93,15 +94,15 @@ export default function App() {
           <nav>
             <div className="nav-group">
               <div className="nav-label">{t("nav.group.work")}</div>
-              <NavItem icon="🏠" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
+              <NavItem icon="home" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
               <NavItem
-                icon="💬"
+                icon="chat"
                 label={t("chat.title")}
                 active={view.kind === "chat"}
                 onClick={() => nav("chat")}
               />
               <NavItem
-                icon="🗂️"
+                icon="layers"
                 label={t("nav.board")}
                 active={view.kind === "board" || view.kind === "task"}
                 onClick={() => nav("board")}
@@ -109,16 +110,16 @@ export default function App() {
             </div>
             <div className="nav-group">
               <div className="nav-label">{t("nav.group.knowledge")}</div>
-              <NavItem icon="🧠" label={t("nav.memory")} active={view.kind === "memory"} onClick={() => nav("memory")} />
-              <NavItem icon="📚" label={t("nav.knowledge")} active={view.kind === "knowledge"} onClick={() => nav("knowledge")} />
-              <NavItem icon="🕸️" label={t("nav.graph")} active={view.kind === "graph"} onClick={() => nav("graph")} />
+              <NavItem icon="brain" label={t("nav.memory")} active={view.kind === "memory"} onClick={() => nav("memory")} />
+              <NavItem icon="book" label={t("nav.knowledge")} active={view.kind === "knowledge"} onClick={() => nav("knowledge")} />
+              <NavItem icon="graph" label={t("nav.graph")} active={view.kind === "graph"} onClick={() => nav("graph")} />
             </div>
             <div className="nav-group">
               <div className="nav-label">{t("nav.group.system")}</div>
-              <NavItem icon="🤖" label={t("nav.agents")} active={view.kind === "agents"} onClick={() => nav("agents")} />
-              <NavItem icon="📊" label={t("nav.stats")} active={view.kind === "stats"} onClick={() => nav("stats")} />
+              <NavItem icon="bot" label={t("nav.agents")} active={view.kind === "agents"} onClick={() => nav("agents")} />
+              <NavItem icon="stats" label={t("nav.stats")} active={view.kind === "stats"} onClick={() => nav("stats")} />
               <NavItem
-                icon="📥"
+                icon="inbox"
                 label={t("nav.inbox")}
                 badge={inboxCount || undefined}
                 active={view.kind === "inbox"}
@@ -172,7 +173,7 @@ function NavItem({
   badge,
   onClick,
 }: {
-  icon: string;
+  icon: IconName;
   label: string;
   active: boolean;
   badge?: number;
@@ -180,7 +181,9 @@ function NavItem({
 }) {
   return (
     <button className={active ? "nav-item active" : "nav-item"} onClick={onClick}>
-      <span className="nav-icon">{icon}</span>
+      <span className="nav-icon">
+        <Icon name={icon} size={16} />
+      </span>
       <span>{label}</span>
       {badge ? <span className="nav-badge">{badge}</span> : null}
     </button>

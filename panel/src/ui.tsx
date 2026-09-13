@@ -11,6 +11,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Icon, type IconName } from "./icons";
 import { relTime, useI18n } from "./i18n";
 
 // ---------------------------------------------------------------------------
@@ -100,14 +101,16 @@ export function Empty({
   hint,
   action,
 }: {
-  icon: string;
+  icon: IconName;
   title: string;
   hint?: string;
   action?: ReactNode;
 }) {
   return (
     <div className="state empty">
-      <div className="empty-icon">{icon}</div>
+      <div className="empty-icon">
+        <Icon name={icon} size={30} />
+      </div>
       <strong>{title}</strong>
       {hint ? <p className="muted">{hint}</p> : null}
       {action}

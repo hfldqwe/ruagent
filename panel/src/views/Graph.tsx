@@ -66,7 +66,7 @@ export function Graph() {
         <Spinner label={`${t("graph.title")}…`} />
       ) : entities.length === 0 ? (
         <Empty
-          icon="🕸️"
+          icon="graph"
           title={t("graph.empty.title")}
           hint={t("graph.empty.hint")}
         />

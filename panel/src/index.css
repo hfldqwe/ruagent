@@ -22,11 +22,12 @@
   /* Text — ivory, warm */
   --text: #ede7db;
   --text-dim: #9f9789;
-  --text-faint: #6b665c;
+  --text-faint: #8a8275;
 
   /* Signal */
   --accent: #e8a13c;          /* signal amber — the one color */
   --accent-strong: #f0b055;
+  --ink-on-accent: #1a1611;   /* dark ink used on filled amber */
   --accent-soft: rgba(232, 161, 60, 0.13);
   --accent-glow: rgba(232, 161, 60, 0.22);
   --data: #7dd3c0;            /* live data / positive */
@@ -125,8 +126,8 @@ h1, h2, h3, h4 { text-wrap: balance; }
   cursor: pointer;
 }
 .brand-mark {
-  background: linear-gradient(135deg, #f0b055, var(--accent));
-  color: #1a1611;
+  background: var(--accent);
+  color: var(--ink-on-accent);
   font-weight: 800;
   border-radius: var(--radius-xs);
   padding: 4px 8px;
@@ -184,7 +185,8 @@ h1, h2, h3, h4 { text-wrap: balance; }
   border-radius: 2px;
   background: var(--accent);
 }
-.nav-icon { width: 18px; text-align: center; font-size: 13px; opacity: 0.9; }
+.nav-icon { width: 18px; display: inline-flex; align-items: center; justify-content: center; flex: none; opacity: 0.85; }
+.nav-item.active .nav-icon { opacity: 1; }
 .nav-badge {
   background: var(--danger);
   color: #fff;
@@ -305,16 +307,15 @@ button {
 button:hover:not(:disabled) { border-color: var(--text-faint); color: var(--text); background: var(--surface-3); }
 button:disabled { opacity: 0.4; cursor: default; }
 button.primary {
-  background: linear-gradient(180deg, var(--accent-strong), var(--accent));
+  background: var(--accent);
   border-color: transparent;
-  color: #1a1611;
+  color: var(--ink-on-accent);
   font-weight: 650;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 1px 3px rgba(232, 161, 60, 0.24);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
 }
 button.primary:hover:not(:disabled) {
-  background: linear-gradient(180deg, #f7bc67, var(--accent-strong));
-  color: #1a1611;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 2px 10px rgba(232, 161, 60, 0.32);
+  background: var(--accent-strong);
+  color: var(--ink-on-accent);
 }
 button.danger { border-color: var(--danger-soft); color: var(--danger); }
 button.danger:hover:not(:disabled) { border-color: var(--danger); background: var(--danger-soft); }
@@ -375,7 +376,7 @@ select { cursor: pointer; }
    ========================================================================== */
 
 .state { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 72px 20px; color: var(--text-dim); }
-.empty-icon { font-size: 36px; opacity: 0.85; filter: saturate(0.8); }
+.empty-icon { display: inline-flex; color: var(--text-faint); margin-bottom: 2px; }
 .state.empty strong { color: var(--text); font-size: 15px; }
 .state.empty p { margin: 0; max-width: 420px; text-align: center; font-size: 13px; line-height: 1.6; }
 
@@ -554,7 +555,7 @@ select { cursor: pointer; }
 }
 
 .ev { padding: 2.5px 0; display: flex; align-items: flex-start; gap: 8px; border-left: 2px solid transparent; }
-.ev-icon { flex: none; width: 17px; text-align: center; font-size: 12px; opacity: 0.75; }
+.ev-icon { flex: none; width: 17px; display: inline-flex; justify-content: center; opacity: 0.7; }
 .ev.msg { padding: 5px 0 5px 0; border-left: 2px solid var(--line); padding-left: 12px; margin-left: 0; }
 .ev.sys { align-items: center; }
 .ev.sys .muted { font-size: 12px; }
@@ -751,10 +752,6 @@ table.data th {
   line-height: 1.1;
   letter-spacing: -0.02em;
   color: var(--text);
-  background: linear-gradient(180deg, var(--text), #b5ad9e);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
 }
 
 .steps {
@@ -800,7 +797,7 @@ table.data th {
   transform: translateY(-1px);
 }
 .guide-card p { margin: 3px 0 0; font-size: 12.5px; line-height: 1.5; }
-.guide-icon { font-size: 18px; margin-top: 1px; }
+.guide-icon { display: inline-flex; margin-top: 2px; color: var(--accent); flex: none; }
 
 .lang-toggle {
   margin-left: auto;
@@ -885,20 +882,24 @@ table.data th {
 /* System-ish notices (model switched, permissions) stay quiet */
 .chat-msg.notice {
   align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--text-faint);
   font-size: 12px;
-  font-family: var(--mono);
   padding: 2px 0;
   margin: 4px 0;
 }
 
-.chat-typing {
-  color: var(--text-faint);
-  font-size: 12px;
-  padding: 8px 2px;
-  animation: pulse 1.6s infinite;
-  font-family: var(--mono);
+.chat-typing { display: flex; gap: 4px; padding: 10px 2px; align-self: flex-start; }
+.chat-typing i {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--text-faint);
+  animation: typing-bounce 1.2s infinite ease-in-out;
 }
+.chat-typing i:nth-child(2) { animation-delay: 0.15s; }
+.chat-typing i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.5; } 30% { transform: translateY(-3px); opacity: 1; } }
 
 /* Composer — rounded card, send button embedded bottom-right */
 .chat-input-bar {
