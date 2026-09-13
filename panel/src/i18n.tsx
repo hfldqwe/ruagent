@@ -249,6 +249,7 @@ const zh: Record<string, string> = {
   "chat.model": "模型",
   "chat.modelPh": "模型名（可选）…",
   "chat.modelSwitched": "已切换模型（新会话，上下文已重置）",
+  "chat.modelLive": "已切换模型（同一会话，上下文保留）",
   "chat.empty": "开始对话——消息会保持同一个会话，智能体记得上文。Enter 发送，Shift+Enter 换行。",
   "chat.inputPh": "输入消息…",
   "chat.send": "发送",
@@ -485,6 +486,19 @@ const en: Record<string, string> = {
   "stats.failed": "Failed",
   "stats.cost": "Cost",
   "stats.lastRun": "Last Run",
+
+  "chat.title": "Chat",
+  "chat.subtitle": "Talk to an agent continuously, terminal-style",
+  "chat.new": "New chat",
+  "chat.agent": "Agent",
+  "chat.model": "Model",
+  "chat.modelPh": "model name (optional)…",
+  "chat.modelSwitched": "Model switched (new session, context reset)",
+  "chat.modelLive": "Model switched (same session, context kept)",
+  "chat.empty":
+    "Start talking — messages share one session, the agent remembers. Enter to send, Shift+Enter for a new line.",
+  "chat.inputPh": "Type a message…",
+  "chat.send": "Send",
 
   "inbox.title": "Inbox",
   "inbox.subtitle": "Permission requests waiting on you",

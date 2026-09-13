@@ -15,6 +15,19 @@ export interface AgentInfo {
   models?: string[];
 }
 
+export interface ModelChoice {
+  value: string;
+  name: string;
+  description?: string;
+  group?: string;
+}
+
+export interface AgentModels {
+  agent: string;
+  models: ModelChoice[];
+  current: string | null;
+}
+
 export interface AgentStats {
   agent: string;
   runs: number;
@@ -150,6 +163,8 @@ const post = (path: string, body?: unknown) => send("POST", path, body);
 export const api = {
   // agents + stats
   agents: () => get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents),
+  agentModels: (name: string) =>
+    get<AgentModels>(`/api/v1/agents/${name}/models`),
   stats: () => get<{ agents: AgentStats[] }>("/api/v1/stats").then((r) => r.agents),
   mcp: () => get<McpRegistry>("/api/v1/mcp"),
 
@@ -268,7 +283,13 @@ export const api = {
     post(`/api/v1/chat/${id}/messages`, { text }),
   chatModel: (id: string, model: string | null) =>
     send("PATCH", `/api/v1/chat/${id}`, { model }).then(
-      (r) => r.json() as Promise<{ id: string; agent: string; model: string | null }>,
+      (r) =>
+        r.json() as Promise<{
+          id: string;
+          agent: string;
+          model: string | null;
+          switched: "live" | "restarted";
+        }>,
     ),
   chatClose: (id: string) => send("DELETE", `/api/v1/chat/${id}`),
 

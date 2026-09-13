@@ -2,7 +2,7 @@
 // multi-turn on one persistent session.
 
 import { useEffect, useRef, useState } from "react";
-import { api, type AgentInfo } from "../api";
+import { api, type AgentInfo, type ModelChoice } from "../api";
 import { useI18n } from "../i18n";
 import { Markdown, Spinner } from "../ui";
 
@@ -18,12 +18,15 @@ interface ChatEvent {
   [k: string]: unknown;
 }
 
-export function Chat() {
+export function Chat({ initialAgent }: { initialAgent?: string }) {
   const { t } = useI18n();
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
-  const [agent, setAgent] = useState("");
+  const [agent, setAgent] = useState(initialAgent ?? "");
   const [model, setModel] = useState("");
-  const [models, setModels] = useState<string[]>([]);
+  /** Live catalog advertised by the agent (ACP session config). */
+  const [choices, setChoices] = useState<ModelChoice[] | null>(null);
+  /** Fallback list from config (agents.toml `models`). */
+  const [configModels, setConfigModels] = useState<string[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -36,16 +39,34 @@ export function Chat() {
     api.agents().then((a) => {
       const enabled = a.filter((x) => x.enabled);
       setAgents(enabled);
-      if (enabled[0]) setAgent(enabled[0].name);
+      setAgent((cur) =>
+        cur && enabled.some((a) => a.name === cur) ? cur : (enabled[0]?.name ?? ""),
+      );
     }).catch(() => setAgents([]));
   }, []);
 
-  // model list for the selected agent (models from agents.toml + free text)
+  // Live model catalog for the selected agent: what the agent itself
+  // advertises over ACP (may probe-spawn it once, then cached server-side).
+  // Falls back to the config list, then to free text.
   useEffect(() => {
-    if (!agents) return;
-    const a = agents.find((x) => x.name === agent);
-    setModels(a?.models ?? []);
-    setModel(a?.model ?? "");
+    if (!agent) return;
+    const a = agents?.find((x) => x.name === agent);
+    setConfigModels(a?.models ?? []);
+    setChoices(null);
+    let alive = true;
+    api
+      .agentModels(agent)
+      .then((r) => {
+        if (!alive) return;
+        setChoices(r.models);
+        if (r.current) setModel(r.current);
+      })
+      .catch(() => {
+        if (alive) setChoices([]);
+      });
+    return () => {
+      alive = false;
+    };
   }, [agent, agents]);
 
   useEffect(() => {
@@ -173,21 +194,34 @@ export function Chat() {
   const switchModel = async (m: string) => {
     setModel(m);
     if (!chatId) return;
-    // Model switch restarts the session; visible history stays.
-    if (streamRef.current) streamRef.current();
     try {
       const chat = await api.chatModel(chatId, m.trim() || null);
-      setChatId(chat.id);
-      setModel(chat.model ?? "");
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          text: `⚙️ ${t("chat.modelSwitched")} → \`${m}\``,
-          done: true,
-        },
-      ]);
-      attachStream(chat.id);
+      if (chat.switched === "live") {
+        // Same session — context preserved.
+        setModel(chat.model ?? m);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: `⚙️ ${t("chat.modelLive")} → \`${chat.model ?? m}\``,
+            done: true,
+          },
+        ]);
+      } else {
+        // Restarted: new session, context reset; reattach the stream.
+        if (streamRef.current) streamRef.current();
+        setChatId(chat.id);
+        setModel(chat.model ?? m);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: `⚙️ ${t("chat.modelSwitched")} → \`${chat.model ?? m}\``,
+            done: true,
+          },
+        ]);
+        attachStream(chat.id);
+      }
     } catch (e) {
       setMessages((prev) => [
         ...prev,
@@ -229,9 +263,39 @@ export function Chat() {
         </label>
         <label className="chat-field">
           <span className="muted">{t("chat.model")}</span>
-          {models.length > 0 ? (
+          {choices === null ? (
+            <select disabled>
+              <option>{t("common.loading")}…</option>
+            </select>
+          ) : choices.length > 0 ? (
             <select value={model} onChange={(e) => switchModel(e.target.value)}>
-              {models.map((m) => (
+              {Object.entries(
+                choices.reduce<Record<string, ModelChoice[]>>((acc, c) => {
+                  const g = c.group ?? "";
+                  (acc[g] ??= []).push(c);
+                  return acc;
+                }, {}),
+              ).map(([group, list]) =>
+                group ? (
+                  <optgroup key={group} label={group}>
+                    {list.map((c) => (
+                      <option key={c.value} value={c.value}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : (
+                  list.map((c) => (
+                    <option key={c.value} value={c.value}>
+                      {c.name}
+                    </option>
+                  ))
+                ),
+              )}
+            </select>
+          ) : configModels.length > 0 ? (
+            <select value={model} onChange={(e) => switchModel(e.target.value)}>
+              {configModels.map((m) => (
                 <option key={m} value={m}>
                   {m}
                 </option>

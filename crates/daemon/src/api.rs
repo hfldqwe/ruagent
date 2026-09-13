@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/agents/{name}/models", get(agent_models))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/mcp", get(mcp_registry))
         .route("/api/v1/skills", get(list_skills))
@@ -1087,14 +1088,40 @@ async fn chat_model(
         .mgr
         .agent(&chat.agent)
         .ok_or_else(|| ApiError::bad_request("agent vanished"))?;
-    let new_chat = state
+    let (new_chat, restarted) = state
         .chats
         .switch_model(id, req.model, card)
+        .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
         "id": new_chat.id.to_string(),
         "agent": new_chat.agent,
         "model": new_chat.model,
+        // "live" = same session, context preserved; "restarted" = new one.
+        "switched": if restarted { "restarted" } else { "live" },
+    })))
+}
+
+/// The model catalog an agent advertises (ACP session configuration):
+/// cached, read from a live chat, or probed with a throwaway session.
+async fn agent_models(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let card = state
+        .mgr
+        .agent(&name)
+        .filter(|a| a.enabled)
+        .ok_or_else(|| ApiError::not_found("agent not found"))?;
+    let models = state
+        .chats
+        .agent_models(card)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "agent": name,
+        "models": models.choices,
+        "current": models.current,
     })))
 }
 
