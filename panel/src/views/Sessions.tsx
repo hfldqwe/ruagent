@@ -2,10 +2,11 @@
 // daemon (claude-code / dsh / ruagent). Index + on-demand viewer.
 
 import { useEffect, useState } from "react";
-import { Button, Segmented, Tag } from "antd";
+import { Button, Segmented, Tag, Tooltip } from "antd";
+import { ThunderboltOutlined } from "@ant-design/icons";
 import { api, type SessionRecord } from "../api";
 import { useI18n } from "../i18n";
-import { Empty, Markdown, RelTime, Spinner } from "../ui";
+import { Empty, Markdown, RelTime, Spinner, useToast } from "../ui";
 
 const SOURCE_LABEL: Record<string, string> = {
   "claude-code": "Claude Code",
@@ -29,6 +30,24 @@ export function Sessions() {
   const [sessions, setSessions] = useState<SessionRecord[] | null>(null);
   const [filter, setFilter] = useState<string>("all");
   const [open, setOpen] = useState<SessionRecord | null>(null);
+  const [distilling, setDistilling] = useState<string | null>(null);
+  const toast = useToast();
+
+  const distill = async (s: SessionRecord) => {
+    setDistilling(s.key);
+    try {
+      const r = await api.sessionDistill(s.key);
+      const d = r.distilled;
+      toast(
+        "ok",
+        `${d.memories_written} 记忆 · ${d.entities_written} 实体 · ${d.relations_written} 关系（${d.memories_skipped} 跳过）`,
+      );
+    } catch (e) {
+      toast("err", String(e));
+    } finally {
+      setDistilling(null);
+    }
+  };
 
   useEffect(() => {
     const load = () =>
@@ -98,6 +117,18 @@ export function Sessions() {
               <span className="time">
                 <RelTime iso={msToIso(s.updated_at)} />
               </span>
+              <Tooltip title={t("sessions.distillHint")}>
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<ThunderboltOutlined />}
+                  loading={distilling === s.key}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    distill(s);
+                  }}
+                />
+              </Tooltip>
             </button>
           ))}
         </div>

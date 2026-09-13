@@ -1117,12 +1117,12 @@ async fn recall(
     for e in entities {
         out_entities.push(if conservative {
             serde_json::json!({
-                "kind": "entity", "id": e.id, "name": e.name, "kind": e.kind,
+                "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
                 "hint": "call graph_entity(id) for facts",
             })
         } else {
             serde_json::json!({
-                "kind": "entity", "id": e.id, "name": e.name, "kind": e.kind,
+                "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
                 "summary": e.summary,
             })
         });

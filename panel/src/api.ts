@@ -92,6 +92,35 @@ export interface SessionRecord {
   preview: string | null;
 }
 
+export interface RecallResult {
+  strategy: string;
+  memories: {
+    kind: string;
+    id: number;
+    store: string;
+    namespace: string;
+    content?: string;
+    title?: string;
+    score?: number;
+    hint?: string;
+  }[];
+  knowledge: {
+    kind: string;
+    chunk_id: number;
+    document: string;
+    content?: string;
+    excerpt?: string;
+    score?: number;
+  }[];
+  entities: {
+    id: number;
+    name: string;
+    entity_kind?: string;
+    summary?: string;
+    hint?: string;
+  }[];
+}
+
 export interface McpRegistry {
   servers: { name: string; command: string | null; url: string | null; inject_for: string[] | null }[];
   profiles: { name: string; servers: string[] }[];
@@ -325,6 +354,25 @@ export const api = {
     get<{ messages: { role: string; text: string; ts: number }[] }>(
       `/api/v1/sessions/${key}`,
     ).then((r) => r.messages),
+
+  // distillation + recall
+  sessionDistill: (key: string) =>
+    post(`/api/v1/sessions/${key}/distill`).then(
+      (r) =>
+        r.json() as Promise<{
+          distilled: {
+            memories_written: number;
+            memories_skipped: number;
+            entities_written: number;
+            relations_written: number;
+            agent: string;
+          };
+        }>,
+    ),
+  recall: (q: string, conservative: boolean, topN = 5) =>
+    get<RecallResult>(
+      `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,
+    ),
 
   // skills
   skills: () =>

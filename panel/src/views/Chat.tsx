@@ -285,6 +285,20 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         });
         break;
       }
+      case "context_injected": {
+        const render = String(ev.render ?? "");
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: render.length > 160 ? `${render.slice(0, 160)}…` : render,
+            done: true,
+            notice: true,
+            icon: "brain",
+          },
+        ]);
+        break;
+      }
       case "stopped": {
         setMessages((prev) => {
           const next = [...prev];

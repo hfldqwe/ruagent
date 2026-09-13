@@ -100,6 +100,67 @@ impl PlatformTools {
         ))
     }
 
+    #[tool(
+        description = "Unified recall across long-term memories, knowledge base and the knowledge graph. Two strategies: aggressive (default) returns full content above a relevance threshold — use when you need ready-to-use context; conservative returns only stubs (titles, entity names, relation one-liners) — cheap to scan, then fetch what you actually need via memory_get / graph_entity. Prefer conservative when context budget matters."
+    )]
+    async fn memory_recall(
+        &self,
+        Parameters(params): Parameters<RecallParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/recall", self.config.daemon_url);
+        let strategy = if params.conservative.unwrap_or(false) {
+            "conservative".to_string()
+        } else {
+            "aggressive".to_string()
+        };
+        let top_n = params.top_n.unwrap_or(5).to_string();
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[
+                ("q", &params.query),
+                ("strategy", &strategy),
+                ("top_n", &top_n),
+            ])
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(recall_to_text(&resp))
+    }
+
+    #[tool(
+        description = "Fetch one memory's full content by id (the follow-up call for memory_recall's conservative strategy)."
+    )]
+    async fn memory_get(
+        &self,
+        Parameters(params): Parameters<GetParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/memory/{}", self.config.daemon_url, params.id);
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        let m = &resp["memory"];
+        Ok(format!(
+            "[{}/{}] {}",
+            m["store"].as_str().unwrap_or("?"),
+            m["namespace"].as_str().unwrap_or("?"),
+            m["content"].as_str().unwrap_or("?")
+        ))
+    }
+
     // -- knowledge ------------------------------------------------------
 
     #[tool(
@@ -214,6 +275,24 @@ pub struct SearchParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RecallParams {
+    #[schemars(description = "What to look for")]
+    pub query: String,
+    #[schemars(
+        description = "true = stubs only (cheap, fetch details with memory_get); false = full content (default)"
+    )]
+    pub conservative: Option<bool>,
+    #[schemars(description = "Max results per section (default 5)")]
+    pub top_n: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetParams {
+    #[schemars(description = "Memory id from recall/search results")]
+    pub id: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct WriteParams {
     #[schemars(description = "profile | observation | procedure | lesson")]
     pub store: String,
@@ -237,6 +316,61 @@ pub struct IngestParams {
 pub struct TaskFilterParams {
     #[schemars(description = "Optional status filter")]
     pub status: Option<String>,
+}
+
+/// Render a /recall response for an agent: sectioned, ids preserved
+/// (conservative stubs point at memory_get / graph_entity).
+fn recall_to_text(resp: &serde_json::Value) -> String {
+    let mut out = Vec::new();
+    for section in ["memories", "knowledge", "entities"] {
+        let items = resp[section].as_array().cloned().unwrap_or_default();
+        if items.is_empty() {
+            continue;
+        }
+        out.push(format!("## {section}"));
+        for it in items.iter() {
+            let line = match it["kind"].as_str().unwrap_or("?") {
+                "memory" => {
+                    let id = it["id"].clone();
+                    let body = it["content"]
+                        .as_str()
+                        .or_else(|| it["title"].as_str())
+                        .unwrap_or("?");
+                    let score = it["score"]
+                        .as_f64()
+                        .map(|s| format!(" ({s:.2})"))
+                        .unwrap_or_default();
+                    format!("  #{id}{score} {body}")
+                }
+                "knowledge" => {
+                    let doc = it["document"].as_str().unwrap_or("?");
+                    let body = it["content"]
+                        .as_str()
+                        .or_else(|| it["excerpt"].as_str())
+                        .unwrap_or("?");
+                    format!("  [{doc}] {body}")
+                }
+                "entity" => {
+                    let id = it["id"].clone();
+                    let name = it["name"].as_str().unwrap_or("?");
+                    match it["summary"].as_str() {
+                        Some(s) => format!("  &{id} {name} — {s}"),
+                        None => format!("  &{id} {name} (call graph tools for facts)"),
+                    }
+                }
+                _ => continue,
+            };
+            out.push(line);
+        }
+    }
+    if out.is_empty() {
+        "no results".into()
+    } else {
+        format!(
+            "{}\n(ids: #n = memory_get(n), &n = graph entity)",
+            out.join("\n")
+        )
+    }
 }
 
 fn hits_to_text(hits: &serde_json::Value) -> String {

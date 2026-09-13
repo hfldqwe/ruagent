@@ -1,9 +1,9 @@
 // Memory browser: stores × namespaces, supersession chains, write dialog,
 // audit trail (OpenViking parity).
 
-import { Button, Input, Segmented, Select } from "antd";
+import { Button, Input, Segmented, Select, Tag } from "antd";
 import { useEffect, useState } from "react";
-import { api, type MemoryDiff, type MemoryRow } from "../api";
+import { api, type MemoryDiff, type MemoryRow, type RecallResult } from "../api";
 import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
 import { dateOf, useI18n } from "../i18n";
 
@@ -25,7 +25,7 @@ export function Memory() {
   const [namespace, setNamespace] = useState("user");
   const [memories, setMemories] = useState<MemoryRow[] | null>(null);
   const [writing, setWriting] = useState(false);
-  const [tab, setTab] = useState<"browse" | "audit">("browse");
+  const [tab, setTab] = useState<"browse" | "recall" | "audit">("browse");
   const toast = useToast();
 
   const refresh = () =>
@@ -65,6 +65,7 @@ export function Memory() {
           onChange={(v) => setTab(v as "browse" | "audit")}
           options={[
             { value: "browse", label: t("memory.browse") },
+            { value: "recall", label: t("memory.recall") },
             { value: "audit", label: t("memory.audit") },
           ]}
         />
@@ -73,10 +74,13 @@ export function Memory() {
             + {t("memory.write")}
           </Button>
         )}
+        {tab === "recall" && <RecallPlayground />}
       </div>
 
       {tab === "audit" ? (
         <AuditView />
+      ) : tab === "recall" ? (
+        <div />
       ) : (
         <>
           <div className="filter-bar">
@@ -347,6 +351,88 @@ function AuditView() {
           </span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function RecallPlayground() {
+  const { t } = useI18n();
+  const [q, setQ] = useState("");
+  const [conservative, setConservative] = useState(false);
+  const [result, setResult] = useState<RecallResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const toast = useToast();
+
+  const run = async () => {
+    if (!q.trim()) return;
+    setBusy(true);
+    try {
+      setResult(await api.recall(q.trim(), conservative));
+    } catch (e) {
+      toast("err", String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="search-bar">
+        <Input
+          className="grow"
+          autoFocus
+          placeholder={t("memory.recallPh")}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onPressEnter={run}
+        />
+        <Segmented
+          value={conservative ? "conservative" : "aggressive"}
+          onChange={(v) => setConservative(v === "conservative")}
+          options={[
+            { value: "aggressive", label: t("memory.recallAggressive") },
+            { value: "conservative", label: t("memory.recallConservative") },
+          ]}
+        />
+        <Button type="primary" loading={busy} onClick={run}>
+          {t("memory.recallGo")}
+        </Button>
+      </div>
+      {result && (
+        <div className="card">
+          <div className="row tight">
+            <Tag color={result.strategy === "conservative" ? "blue" : "green"}>
+              {result.strategy}
+            </Tag>
+            <span className="muted">
+              {result.memories.length} mem · {result.knowledge.length} know ·{" "}
+              {result.entities.length} ent
+            </span>
+          </div>
+          {result.memories.map((m) => (
+            <div key={`m${m.id}`} className="search-hit">
+              <div className="row tight">
+                <span className="tag">{m.store}</span>
+                <span className="tag">{m.namespace}</span>
+                {m.score != null && <span className="muted mono">{m.score.toFixed(2)}</span>}
+              </div>
+              <p className="hit-content">{m.content ?? m.title}</p>
+            </div>
+          ))}
+          {result.knowledge.map((k) => (
+            <div key={`k${k.chunk_id}`} className="search-hit">
+              <span className="tag">{k.document}</span>
+              <p className="hit-content">{k.content ?? k.excerpt}</p>
+            </div>
+          ))}
+          {result.entities.map((e) => (
+            <div key={`e${e.id}`} className="search-hit">
+              <span className="tag">{e.name}</span>
+              {e.summary && <p className="hit-content">{e.summary}</p>}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
