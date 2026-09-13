@@ -1055,10 +1055,48 @@ async fn recall(
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
 
-    // Graph entities (name/summary match).
+    // Graph entities (name/summary match) + their currently-valid facts
+    // (the relations half of the conservative strategy's stubs).
     let entities = ruagent_graph::search_entities(state.mgr.db(), &q.q, top_n)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    let mut entity_facts: std::collections::HashMap<i64, Vec<(String, String, String)>> =
+        std::collections::HashMap::new();
+    {
+        // id -> name for rendering edge endpoints.
+        let names: std::collections::HashMap<i64, String> = state
+            .mgr
+            .db()
+            .call(|conn| -> Result<_, ruagent_store::DbError> {
+                let mut stmt = conn
+                    .prepare("SELECT id, name FROM entities")
+                    .map_err(ruagent_store::DbError::from)?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(ruagent_store::DbError::from)?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        for e in &entities {
+            if let Ok(facts) = ruagent_graph::current_facts(state.mgr.db(), e.id).await {
+                let rels = facts
+                    .iter()
+                    .map(|f| {
+                        let other = if f.src == e.id { f.dst } else { f.src };
+                        let other_name = names
+                            .get(&other)
+                            .cloned()
+                            .unwrap_or_else(|| format!("#{other}"));
+                        (f.relation.clone(), other_name, f.fact_text.clone())
+                    })
+                    .collect();
+                entity_facts.insert(e.id, rels);
+            }
+        }
+    }
 
     let min_score = q.min_score.unwrap_or(0.0) as f32;
     let mut seen_ids: std::collections::HashSet<i64> = semantic.iter().map(|m| m.0).collect();
@@ -1115,15 +1153,24 @@ async fn recall(
     }
     let mut out_entities: Vec<serde_json::Value> = Vec::new();
     for e in entities {
+        let facts = entity_facts
+            .get(&e.id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(relation, other, fact)| {
+                serde_json::json!({ "relation": relation, "with": other, "fact": fact })
+            })
+            .collect::<Vec<_>>();
         out_entities.push(if conservative {
             serde_json::json!({
                 "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
-                "hint": "call graph_entity(id) for facts",
+                "facts": facts,
             })
         } else {
             serde_json::json!({
                 "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
-                "summary": e.summary,
+                "summary": e.summary, "facts": facts,
             })
         });
     }

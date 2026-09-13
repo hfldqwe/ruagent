@@ -428,7 +428,13 @@ function RecallPlayground() {
           {result.entities.map((e) => (
             <div key={`e${e.id}`} className="search-hit">
               <span className="tag">{e.name}</span>
+              {e.entity_kind && <span className="tag">{e.entity_kind}</span>}
               {e.summary && <p className="hit-content">{e.summary}</p>}
+              {(e.facts ?? []).map((f, i) => (
+                <p key={i} className="hit-content mono" style={{ fontSize: 12 }}>
+                  —{f.relation}→ {f.with}: {f.fact}
+                </p>
+              ))}
             </div>
           ))}
         </div>

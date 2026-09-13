@@ -118,6 +118,7 @@ export interface RecallResult {
     entity_kind?: string;
     summary?: string;
     hint?: string;
+    facts?: { relation: string; with: string; fact: string }[];
   }[];
 }
 
