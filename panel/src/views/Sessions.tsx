@@ -167,8 +167,11 @@ function SessionDetail({
 }
 
 function shortProject(p: string): string {
-  const parts = p.split(/[\\/]/);
-  return parts.slice(-2).join("/").replace(/-+$/, "");
+  // ruagent-spawned agent workspaces collapse to a readable label.
+  const m = p.match(/[\/]workspaces[\/](chat|run)-([0-9a-f]{8})/);
+  if (m) return `ruagent ${m[1]} ·${m[2]}`;
+  const parts = p.split(/[\/]/);
+  return parts.slice(-2).join("/");
 }
 
 function msToIso(ms: number): string {

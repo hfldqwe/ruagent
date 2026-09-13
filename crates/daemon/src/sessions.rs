@@ -149,6 +149,17 @@ impl SessionIndexer {
         };
         let ref_path = path.to_string_lossy().into_owned();
 
+        // Empty sessions (spawned but never answered) are noise — skip.
+        // A later scan re-indexes them if the file grows.
+        if parsed.message_count == 0 {
+            let db = self.db.clone();
+            let key = key.clone();
+            let _ = db
+                .call(move |conn| conn.execute("DELETE FROM sessions WHERE key = ?1", [&key]))
+                .await;
+            return Ok(());
+        }
+
         let source = source.to_string();
         self.db
             .call(move |conn| {
@@ -201,10 +212,8 @@ impl SessionIndexer {
                     })
                 })?;
                 let mut out = Vec::new();
-                for r in rows {
-                    if let Ok(rec) = r {
-                        out.push(rec);
-                    }
+                for rec in rows.flatten() {
+                    out.push(rec);
                 }
                 Ok(out)
             })
@@ -314,10 +323,10 @@ fn parse_claude_code(text: &str) -> Parsed {
             }
             _ => {}
         }
-        if p.project.is_none() {
-            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-                p.project = Some(cwd.to_string());
-            }
+        if p.project.is_none()
+            && let Some(cwd) = v.get("cwd").and_then(|c| c.as_str())
+        {
+            p.project = Some(cwd.to_string());
         }
     }
     if p.started_at == 0 {
@@ -422,7 +431,7 @@ fn parse_dsh_jsonl(text: &str) -> Parsed {
 
 fn parse_ruagent(text: &str) -> Parsed {
     // Transcript JSONL: {"ts": "...", "seq": n, "event": {...}}. User
-    // prompts are not (yet) recorded as events; replies stream as
+    // prompts arrive as user_message events; replies stream as
     // agent_message_chunk runs closed by `stopped`.
     let mut p = Parsed::default();
     let mut current = String::new();
@@ -443,6 +452,21 @@ fn parse_ruagent(text: &str) -> Parsed {
             continue;
         };
         match event.get("type").and_then(|t| t.as_str()) {
+            Some("user_message") => {
+                if let Some(text) = event.get("text").and_then(|t| t.as_str()) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        if p.preview.is_none() {
+                            p.preview = Some(truncate(text, 140));
+                        }
+                        p.messages.push(SessionMessage {
+                            role: "user".into(),
+                            text: text.to_string(),
+                            ts,
+                        });
+                    }
+                }
+            }
             Some("agent_message_chunk") => {
                 if let Some(blocks) = event.get("content").and_then(|c| c.as_array()) {
                     for b in blocks {
@@ -484,6 +508,19 @@ fn parse_ruagent(text: &str) -> Parsed {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Parse a session file by source name — shared by the API viewer and
+/// the distiller.
+pub fn parse_file_messages(source: &str, path: &Path) -> Vec<SessionMessage> {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    match source {
+        "claude-code" => parse_claude_code(&text).messages,
+        "dsh" => parse_dsh(&bytes).messages,
+        "ruagent" => parse_ruagent(&text).messages,
+        _ => Vec::new(),
+    }
+}
 
 fn make_key(source: &str, path: &Path) -> String {
     let mut h = DefaultHasher::new();

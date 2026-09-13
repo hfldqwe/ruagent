@@ -6,6 +6,7 @@
 pub mod api;
 pub mod chat;
 pub mod config;
+pub mod distill;
 pub mod runs;
 pub mod sessions;
 pub mod skills;

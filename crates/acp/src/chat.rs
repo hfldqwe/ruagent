@@ -141,7 +141,7 @@ pub enum ChatCommand {
 pub struct ChatSession {
     cmd_tx: mpsc::UnboundedSender<ChatCommand>,
     events: tokio::sync::broadcast::Sender<RunEvent>,
-    options: std::sync::Arc<tokio::sync::watch::Sender<Option<Vec<SessionOptionState>>>>,
+    _options_tx: std::sync::Arc<tokio::sync::watch::Sender<Option<Vec<SessionOptionState>>>>,
     options_rx: tokio::sync::watch::Receiver<Option<Vec<SessionOptionState>>>,
 }
 
@@ -215,7 +215,7 @@ pub fn start_chat(
     Ok(ChatSession {
         cmd_tx,
         events: return_events,
-        options: options_tx,
+        _options_tx: options_tx,
         options_rx,
     })
 }
@@ -422,6 +422,7 @@ async fn supervise_chat(
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     ChatCommand::Prompt { text } => {
+                        let _ = events.send(RunEvent::UserMessage { text: text.clone() });
                         let prompt = PromptRequest::new(
                             session_id.clone(),
                             vec![ContentBlock::Text(TextContent::new(text))],

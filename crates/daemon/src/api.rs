@@ -77,6 +77,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/sessions", get(sessions_list))
         .route("/api/v1/sessions/{key}", get(sessions_messages))
+        .route("/api/v1/sessions/{key}/distill", post(session_distill))
+        .route("/api/v1/recall", get(recall))
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
         .with_state(state)
@@ -927,6 +929,160 @@ async fn sessions_messages(
     Ok(Json(serde_json::json!({ "messages": messages })))
 }
 
+// ---------------------------------------------------------------------------
+// Distillation: session → memories + graph (agent-run extraction)
+// ---------------------------------------------------------------------------
+
+async fn session_distill(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Any enabled agent can serve as the distiller; prefer dsh (cheap,
+    // local) then the first enabled.
+    let agents = state.mgr.agents();
+    let card = agents
+        .iter()
+        .find(|a| a.enabled && a.name == "dsh")
+        .or_else(|| agents.iter().find(|a| a.enabled))
+        .ok_or_else(|| ApiError::bad_request("no enabled agent to distill with"))?;
+    let distiller = crate::distill::Distiller {
+        db: state.mgr.db().clone(),
+        root: state.config.root.clone(),
+    };
+    let out = distiller
+        .distill(&key, card)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "distilled": out })))
+}
+
+// ---------------------------------------------------------------------------
+// Recall — two strategies (aggressive: full content above threshold;
+// conservative: stubs only, agent pulls details on demand)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RecallQuery {
+    q: String,
+    #[serde(default)]
+    strategy: Option<String>, // aggressive | conservative
+    #[serde(default)]
+    min_score: Option<f64>,
+    #[serde(default)]
+    top_n: Option<u32>,
+}
+
+async fn recall(
+    State(state): State<AppState>,
+    Query(q): Query<RecallQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let conservative = q.strategy.as_deref() == Some("conservative");
+    let top_n = q.top_n.unwrap_or(5).clamp(1, 20);
+
+    // Memories (FTS leg — embeddings land in the next increment).
+    let query_text = q.q.clone();
+    let memories: Vec<(i64, String, String, String)> = state
+        .mgr
+        .db()
+        .call(
+            move |conn| -> Result<Vec<(i64, String, String, String)>, ruagent_store::DbError> {
+                let pattern = format!("\"{}\"", query_text.replace('"', "\"\""));
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT m.id, m.store, m.namespace, m.content
+                       FROM memories_fts f JOIN memories m ON m.id = f.rowid
+                      WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL
+                      ORDER BY rank LIMIT ?2",
+                    )
+                    .map_err(ruagent_store::DbError::from)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![pattern, top_n], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })
+                    .map_err(ruagent_store::DbError::from)?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            },
+        )
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+
+    // Knowledge chunks (hybrid semantic + keyword).
+    let hits = state
+        .knowledge
+        .search(&q.q, top_n)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+
+    // Graph entities (name/summary match).
+    let entities = ruagent_graph::search_entities(state.mgr.db(), &q.q, top_n)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+
+    let min_score = q.min_score.unwrap_or(0.0);
+    let mut out_memories: Vec<serde_json::Value> = Vec::new();
+    for (id, store, ns, content) in memories {
+        out_memories.push(if conservative {
+            serde_json::json!({
+                "kind": "memory", "id": id, "store": store, "namespace": ns,
+                "title": truncate_chars(&content, 60),
+                "hint": "call memory_get(id) for full content",
+            })
+        } else {
+            serde_json::json!({
+                "kind": "memory", "id": id, "store": store, "namespace": ns,
+                "content": content,
+            })
+        });
+    }
+    let mut out_chunks: Vec<serde_json::Value> = Vec::new();
+    for h in hits {
+        if (h.score as f64) < min_score {
+            continue;
+        }
+        out_chunks.push(if conservative {
+            serde_json::json!({
+                "kind": "knowledge", "chunk_id": h.chunk_id, "document": h.document,
+                "excerpt": truncate_chars(&h.content, 80),
+            })
+        } else {
+            serde_json::json!({
+                "kind": "knowledge", "chunk_id": h.chunk_id, "document": h.document,
+                "content": h.content, "score": h.score,
+            })
+        });
+    }
+    let mut out_entities: Vec<serde_json::Value> = Vec::new();
+    for e in entities {
+        out_entities.push(if conservative {
+            serde_json::json!({
+                "kind": "entity", "id": e.id, "name": e.name, "kind": e.kind,
+                "hint": "call graph_entity(id) for facts",
+            })
+        } else {
+            serde_json::json!({
+                "kind": "entity", "id": e.id, "name": e.name, "kind": e.kind,
+                "summary": e.summary,
+            })
+        });
+    }
+
+    Ok(Json(serde_json::json!({
+        "strategy": if conservative { "conservative" } else { "aggressive" },
+        "memories": out_memories,
+        "knowledge": out_chunks,
+        "entities": out_entities,
+    })))
+}
+
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
 async fn list_permissions(State(state): State<AppState>) -> Json<serde_json::Value> {
     let pending: Vec<PendingPermission> = state.mgr.pending_permissions();
     Json(serde_json::json!({ "pending": pending }))
@@ -1172,7 +1328,7 @@ async fn chat_option(
     let id: RunId = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid chat id"))?;
-    if !state.chats.chat(id).is_some() {
+    if state.chats.chat(id).is_none() {
         return Err(ApiError::not_found("chat not found"));
     }
     match state.chats.set_option(id, req.id, req.value).await {

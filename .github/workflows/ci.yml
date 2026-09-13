@@ -31,6 +31,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+        env:
+          # Knowledge tests prefer real embeddings; offline CI uses the
+          # deterministic hash embedder fallback (same as first boot).
+          RUAGENT_EMBEDDER: hash
 
   # Windows is a first-class platform (design §3) but costs 2x CI minutes,
   # so it runs on main pushes only.
@@ -51,21 +55,21 @@ jobs:
         # many concurrent rustc processes.
         env:
           CARGO_BUILD_JOBS: "4"
+          RUAGENT_EMBEDDER: hash
 
   panel:
     name: Panel (node)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - id: has-panel
-        run: echo "ok=$(test -f panel/package.json && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v4
-        if: steps.has-panel.outputs.ok == 'true'
         with:
           node-version: 22
-      - name: Build
-        if: steps.has-panel.outputs.ok == 'true'
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+      - name: Typecheck + build
         working-directory: panel
         run: |
           npm ci
+          npx tsc -b
           npm run build

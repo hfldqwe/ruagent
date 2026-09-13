@@ -103,16 +103,32 @@ pub enum PermissionResolution {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEvent {
     /// Our own state machine moved.
-    StateChanged { status: RunStatus },
+    /// A user prompt entering the conversation (chat sessions record
+    /// these so transcripts are complete, not assistant-only).
+    UserMessage {
+        text: String,
+    },
+
+    StateChanged {
+        status: RunStatus,
+    },
     /// Why this run went to its agent(s). Always recorded (design §5.4).
-    Routed { decision: RoutingDecision },
+    Routed {
+        decision: RoutingDecision,
+    },
     /// Context blocks injected at run start (design §6.4) — rendered form
     /// as the agent received it, for context observability (§8.1).
-    ContextInjected { render: String },
+    ContextInjected {
+        render: String,
+    },
     /// ACP `agent_message_chunk`.
-    AgentMessageChunk { content: Vec<ContentBlock> },
+    AgentMessageChunk {
+        content: Vec<ContentBlock>,
+    },
     /// ACP `agent_thought_chunk`.
-    AgentThoughtChunk { content: Vec<ContentBlock> },
+    AgentThoughtChunk {
+        content: Vec<ContentBlock>,
+    },
     /// ACP `tool_call`.
     ToolCall {
         tool_call_id: String,
@@ -127,9 +143,13 @@ pub enum RunEvent {
         raw_output: Option<serde_json::Value>,
     },
     /// ACP `plan`.
-    Plan { entries: Vec<PlanEntry> },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
     /// ACP `usage_update` (context occupancy + optional cumulative cost).
-    UsageUpdate { usage: ContextUsage },
+    UsageUpdate {
+        usage: ContextUsage,
+    },
     /// The agent asked for permission; surfaced to the policy center.
     PermissionRequested {
         tool_call_id: String,
@@ -144,9 +164,13 @@ pub enum RunEvent {
         resolution: PermissionResolution,
     },
     /// Terminal: the agent reported a stop reason.
-    Stopped { stop_reason: StopReason },
+    Stopped {
+        stop_reason: StopReason,
+    },
     /// Terminal or transient error (crash, timeout, protocol violation).
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]
