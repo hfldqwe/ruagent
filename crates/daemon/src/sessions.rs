@@ -536,8 +536,10 @@ fn blocks_text(content: Option<&serde_json::Value>) -> String {
             blocks
                 .iter()
                 .filter_map(|b| {
-                    (b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                        .then(|| b.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                    if b.get("type").and_then(|t| t.as_str()) != Some("text") {
+                        return None;
+                    }
+                    Some(b.get("text").and_then(|t| t.as_str()).unwrap_or(""))
                 })
                 .collect::<Vec<_>>()
                 .join("\n")

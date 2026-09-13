@@ -78,7 +78,7 @@ async fn start_test_daemon() -> String {
         cfg.mcp.clone(),
     );
     let mgr = Arc::new(RunManager::new(
-        db,
+        db.clone(),
         root.clone(),
         agents,
         cfg.policy.to_policy(),
@@ -89,6 +89,10 @@ async fn start_test_daemon() -> String {
         config: Arc::new(cfg),
         knowledge: Arc::new(knowledge),
         chats,
+        sessions: Arc::new(ruagent_daemon::sessions::SessionIndexer::new(
+            db.clone(),
+            std::env::temp_dir(),
+        )),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

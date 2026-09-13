@@ -63,7 +63,7 @@ async fn start_daemon_with_routing(
         cfg.mcp.clone(),
     );
     let mgr = Arc::new(RunManager::new(
-        db,
+        db.clone(),
         root.clone(),
         agents,
         cfg.policy.to_policy(),

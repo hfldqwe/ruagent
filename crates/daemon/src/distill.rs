@@ -100,7 +100,7 @@ impl Distiller {
             .context("distillation agent run failed")?;
         let extraction = parse_extraction(&raw)?;
 
-        let (mem_w, mem_s) = self.write_memories(&extraction, card).await?;
+        let (mem_w, mem_s) = self.write_memories(&extraction).await?;
         let (ent_w, rel_w) = self.write_graph(&extraction).await?;
 
         let outcome = DistillOutcome {
@@ -246,11 +246,7 @@ impl Distiller {
 
     /// Insert memories with near-duplicate skip (cosine >= 0.90 against
     /// same store+namespace rows, via the shared embedder).
-    async fn write_memories(
-        &self,
-        ex: &Extraction,
-        card: &ruagent_core::AgentCard,
-    ) -> Result<(u32, u32)> {
+    async fn write_memories(&self, ex: &Extraction) -> Result<(u32, u32)> {
         let mut written = 0u32;
         let mut skipped = 0u32;
         for m in &ex.memories {
