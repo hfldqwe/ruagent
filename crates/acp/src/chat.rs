@@ -19,11 +19,11 @@ use tokio::sync::mpsc;
 use crate::AcpError;
 use crate::permission::{PermissionAnswer, PermissionAsk};
 
-/// One selectable model advertised by the agent (ACP session config,
-/// option `model`). `value` is what `set_config_option` expects — agents
-/// use their own scheme (dsh: `provider/model`).
+/// One selectable value of a session config option, as advertised by the
+/// agent. `value` is what `session/set_config_option` expects — agents
+/// use their own schemes (dsh models: `["provider","model"]`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ModelChoice {
+pub struct OptionChoice {
     pub value: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,58 +32,75 @@ pub struct ModelChoice {
     pub group: Option<String>,
 }
 
-/// Live model state of a session: the advertised choices and the current
-/// selection. `None`-valued watch = the agent advertises no model option.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct ModelsState {
-    pub choices: Vec<ModelChoice>,
+/// One advertised select option (model, reasoning effort, permission
+/// mode, …) with its choices and current selection.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SessionOptionState {
+    pub id: String,
+    pub name: String,
+    /// Semantic category when the agent states one (`model`, `thought_level`,
+    /// `mode`, …) — UX hint only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub choices: Vec<OptionChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
 }
 
-/// Extract the model option from an ACP config-option list. Prefers the
-/// option with category `model`, falling back to id `model`.
-fn extract_models(options: &[SessionConfigOption]) -> Option<ModelsState> {
-    let opt = options
+/// Extract every select-kind option the agent advertises (dsh: model +
+/// reasoning_effort; claude: mode + model + effort; others: none).
+fn extract_options(options: &[SessionConfigOption]) -> Vec<SessionOptionState> {
+    options
         .iter()
-        .find(|o| matches!(o.category, Some(SessionConfigOptionCategory::Model)))
-        .or_else(|| options.iter().find(|o| o.id.to_string() == "model"))?;
-    let SessionConfigKind::Select(select) = &opt.kind else {
-        return None;
-    };
-    let mut choices = Vec::new();
-    match &select.options {
-        SessionConfigSelectOptions::Ungrouped(entries) => {
-            for o in entries {
-                choices.push(ModelChoice {
-                    value: o.value.to_string(),
-                    name: o.name.clone(),
-                    description: o.description.clone(),
-                    group: None,
-                });
-            }
-        }
-        SessionConfigSelectOptions::Grouped(groups) => {
-            for g in groups {
-                for o in &g.options {
-                    choices.push(ModelChoice {
-                        value: o.value.to_string(),
-                        name: o.name.clone(),
-                        description: o.description.clone(),
-                        group: Some(g.name.clone()),
-                    });
+        .filter_map(|opt| {
+            let SessionConfigKind::Select(select) = &opt.kind else {
+                return None;
+            };
+            let mut choices = Vec::new();
+            match &select.options {
+                SessionConfigSelectOptions::Ungrouped(entries) => {
+                    for o in entries {
+                        choices.push(OptionChoice {
+                            value: o.value.to_string(),
+                            name: o.name.clone(),
+                            description: o.description.clone(),
+                            group: None,
+                        });
+                    }
                 }
+                SessionConfigSelectOptions::Grouped(groups) => {
+                    for g in groups {
+                        for o in &g.options {
+                            choices.push(OptionChoice {
+                                value: o.value.to_string(),
+                                name: o.name.clone(),
+                                description: o.description.clone(),
+                                group: Some(g.name.clone()),
+                            });
+                        }
+                    }
+                }
+                _ => return None,
             }
-        }
-        _ => return None,
-    }
-    if choices.is_empty() {
-        return None;
-    }
-    Some(ModelsState {
-        choices,
-        current: Some(select.current_value.to_string()),
-    })
+            if choices.is_empty() {
+                return None;
+            }
+            Some(SessionOptionState {
+                id: opt.id.to_string(),
+                name: opt.name.clone(),
+                category: opt.category.as_ref().and_then(|c| match c {
+                    SessionConfigOptionCategory::Mode => Some("mode".into()),
+                    SessionConfigOptionCategory::Model => Some("model".into()),
+                    SessionConfigOptionCategory::ModelConfig => Some("model_config".into()),
+                    SessionConfigOptionCategory::ThoughtLevel => Some("thought_level".into()),
+                    SessionConfigOptionCategory::Other(s) => Some(s.clone()),
+                    _ => None,
+                }),
+                choices,
+                current: Some(select.current_value.to_string()),
+            })
+        })
+        .collect()
 }
 
 /// Options for a chat session.
@@ -103,11 +120,13 @@ pub struct ChatOptions {
 pub enum ChatCommand {
     /// Send another user message on the same session.
     Prompt { text: String },
-    /// Switch model mid-session (no restart, context preserved). Replies
-    /// with the new current value, or the agent's rejection message.
-    SetModel {
-        model: String,
-        reply: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
+    /// Set one advertised session option mid-session (no restart, context
+    /// preserved). `id` "model" addresses the agent's model option. Replies
+    /// with the refreshed option list, or the agent's rejection message.
+    SetConfig {
+        id: String,
+        value: String,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<SessionOptionState>, String>>,
     },
     /// Close the chat (user action or idle timeout). The connection drops,
     /// which kills the child process group.
@@ -116,13 +135,14 @@ pub enum ChatCommand {
 
 /// A live chat session: cheap to clone; all clones share the underlying
 /// supervisor. The event stream is exposed via a tokio broadcast channel;
-/// the live model state via a watch channel (filled after `session/new`).
+/// the advertised session options via a watch channel (filled after
+/// `session/new`, refreshed after each `set_config_option`).
 #[derive(Clone)]
 pub struct ChatSession {
     cmd_tx: mpsc::UnboundedSender<ChatCommand>,
     events: tokio::sync::broadcast::Sender<RunEvent>,
-    models: std::sync::Arc<tokio::sync::watch::Sender<Option<ModelsState>>>,
-    models_rx: tokio::sync::watch::Receiver<Option<ModelsState>>,
+    options: std::sync::Arc<tokio::sync::watch::Sender<Option<Vec<SessionOptionState>>>>,
+    options_rx: tokio::sync::watch::Receiver<Option<Vec<SessionOptionState>>>,
 }
 
 impl ChatSession {
@@ -136,14 +156,14 @@ impl ChatSession {
         self.events.subscribe()
     }
 
-    /// The last known model state (None until the agent reports it).
-    pub fn models_now(&self) -> Option<ModelsState> {
-        self.models_rx.borrow().clone()
+    /// The advertised options, if the agent reported any yet.
+    pub fn options_now(&self) -> Option<Vec<SessionOptionState>> {
+        self.options_rx.borrow().clone()
     }
 
-    /// A receiver tracking model-state updates for this session.
-    pub fn models_watch(&self) -> tokio::sync::watch::Receiver<Option<ModelsState>> {
-        self.models_rx.clone()
+    /// A receiver tracking option-state updates for this session.
+    pub fn options_watch(&self) -> tokio::sync::watch::Receiver<Option<Vec<SessionOptionState>>> {
+        self.options_rx.clone()
     }
 }
 
@@ -166,13 +186,14 @@ pub fn start_chat(
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ChatCommand>();
     let (events_tx, _events_rx) = tokio::sync::broadcast::channel::<RunEvent>(1024);
-    let (models_tx, models_rx) = tokio::sync::watch::channel::<Option<ModelsState>>(None);
-    let models_tx = std::sync::Arc::new(models_tx);
+    let (options_tx, options_rx) =
+        tokio::sync::watch::channel::<Option<Vec<SessionOptionState>>>(None);
+    let options_tx = std::sync::Arc::new(options_tx);
 
     let supervisor_events = events_tx.clone();
     let ask = ask_tx.clone();
     let return_events = events_tx.clone();
-    let supervisor_models = models_tx.clone();
+    let supervisor_options = options_tx.clone();
 
     tokio::spawn(async move {
         if let Err(err) = supervise_chat(
@@ -180,7 +201,7 @@ pub fn start_chat(
             opts,
             cmd_rx,
             supervisor_events,
-            supervisor_models,
+            supervisor_options,
             ask,
         )
         .await
@@ -194,8 +215,8 @@ pub fn start_chat(
     Ok(ChatSession {
         cmd_tx,
         events: return_events,
-        models: models_tx,
-        models_rx,
+        options: options_tx,
+        options_rx,
     })
 }
 
@@ -204,7 +225,7 @@ async fn supervise_chat(
     opts: ChatOptions,
     mut cmd_rx: mpsc::UnboundedReceiver<ChatCommand>,
     events: tokio::sync::broadcast::Sender<RunEvent>,
-    models_tx: std::sync::Arc<tokio::sync::watch::Sender<Option<ModelsState>>>,
+    options_tx: std::sync::Arc<tokio::sync::watch::Sender<Option<Vec<SessionOptionState>>>>,
     ask_tx: mpsc::UnboundedSender<PermissionAsk>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ev_notification = events.clone();
@@ -350,13 +371,12 @@ async fn supervise_chat(
             let session = connection.send_request(new_session).block_task().await?;
             let session_id = session.session_id;
 
-            // The agent advertises its model catalog here (dsh: grouped
-            // provider/model pairs; agents without the option report none).
-            let advertised = extract_models(session.config_options.as_deref().unwrap_or(&[]));
-            if let Some(state) = &advertised {
-                models_tx.send_replace(Some(state.clone()));
-            }
-            // Which config id addresses the model option (usually "model").
+            // The agent advertises its session options here (model,
+            // reasoning effort, permission mode, …).
+            let advertised = extract_options(session.config_options.as_deref().unwrap_or(&[]));
+            options_tx.send_replace(Some(advertised));
+            // Which advertised id addresses the model option ("model" unless
+            // the agent names it differently).
             let model_config_id = session
                 .config_options
                 .as_deref()
@@ -379,9 +399,7 @@ async fn supervise_chat(
                 );
                 match connection.send_request(set).block_task().await {
                     Ok(resp) => {
-                        if let Some(state) = extract_models(&resp.config_options) {
-                            models_tx.send_replace(Some(state));
-                        }
+                        options_tx.send_replace(Some(extract_options(&resp.config_options)));
                     }
                     Err(e) => {
                         // Not all agents support config options; the chat
@@ -423,19 +441,22 @@ async fn supervise_chat(
                             }
                         }
                     }
-                    ChatCommand::SetModel { model, reply } => {
+                    ChatCommand::SetConfig { id, value, reply } => {
+                        let config_id = if id == "model" {
+                            model_config_id.clone()
+                        } else {
+                            id.clone().into()
+                        };
                         let set = SetSessionConfigOptionRequest::new(
                             session_id.clone(),
-                            model_config_id.clone(),
-                            SessionConfigOptionValue::value_id(model.clone()),
+                            config_id,
+                            SessionConfigOptionValue::value_id(value.clone()),
                         );
                         let answer = match connection.send_request(set).block_task().await {
                             Ok(resp) => {
-                                let state = extract_models(&resp.config_options);
-                                if let Some(s) = &state {
-                                    models_tx.send_replace(Some(s.clone()));
-                                }
-                                Ok(state.and_then(|s| s.current))
+                                let state = extract_options(&resp.config_options);
+                                options_tx.send_replace(Some(state.clone()));
+                                Ok(state)
                             }
                             Err(e) => Err(format!("{e}")),
                         };

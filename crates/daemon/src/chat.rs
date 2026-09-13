@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use ruagent_acp::adapter::HarnessAdapter as _;
-use ruagent_acp::chat::{ChatCommand, ChatOptions, ChatSession, ModelsState, start_chat};
+use ruagent_acp::chat::{ChatCommand, ChatOptions, ChatSession, SessionOptionState, start_chat};
 use ruagent_core::{AgentCard, RunEvent, RunId};
 use ruagent_store::{TranscriptWriter, transcript_path};
 use tokio::sync::mpsc;
@@ -37,12 +37,12 @@ impl Chat {
         self.session.subscribe()
     }
 
-    pub fn models_now(&self) -> Option<ModelsState> {
-        self.session.models_now()
+    pub fn options_now(&self) -> Option<Vec<SessionOptionState>> {
+        self.session.options_now()
     }
 
-    pub fn models_watch(&self) -> tokio::sync::watch::Receiver<Option<ModelsState>> {
-        self.session.models_watch()
+    pub fn options_watch(&self) -> tokio::sync::watch::Receiver<Option<Vec<SessionOptionState>>> {
+        self.session.options_watch()
     }
 }
 
@@ -55,9 +55,10 @@ pub struct ChatManager {
     chats: Arc<Mutex<HashMap<RunId, Chat>>>,
     park_ask: AskParker,
     mcp: crate::config::McpConfig,
-    /// Advertised model catalogs per agent name, refreshed whenever any
-    /// chat (or probe) reports one. What the panel picker shows.
-    model_cache: Arc<Mutex<HashMap<String, ModelsState>>>,
+    /// Advertised session options (model, reasoning effort, permission
+    /// mode, …) per agent name, refreshed whenever any chat or probe
+    /// reports them. What the panel pickers show.
+    model_cache: Arc<Mutex<HashMap<String, Vec<SessionOptionState>>>>,
 }
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -175,11 +176,11 @@ impl ChatManager {
             });
         }
 
-        // Model-state tracker: whenever this session's model catalog or
-        // current selection changes, refresh the per-agent cache the
-        // panel picker reads.
+        // Option-state tracker: whenever this session's advertised options
+        // or current selections change, refresh the per-agent cache the
+        // panel pickers read.
         {
-            let mut watch = session.models_watch();
+            let mut watch = session.options_watch();
             let cache = self.model_cache.clone();
             let agent_name = card.name.clone();
             tokio::spawn(async move {
@@ -239,16 +240,21 @@ impl ChatManager {
             .ok_or_else(|| anyhow::anyhow!("chat not found"))?;
         if let Some(model) = model.clone().filter(|m| !m.trim().is_empty()) {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            chat.send(ChatCommand::SetModel {
-                model: model.clone(),
+            chat.send(ChatCommand::SetConfig {
+                id: "model".into(),
+                value: model.clone(),
                 reply: tx,
             })
             .ok();
             let answer = tokio::time::timeout(MODELS_WAIT, rx).await;
             match answer {
-                Ok(Ok(Ok(current))) => {
+                Ok(Ok(Ok(options))) => {
                     // Live switch: update the registry entry in place.
-                    let effective = current.clone().or_else(|| Some(model.clone()));
+                    let effective = options
+                        .iter()
+                        .find(|o| o.category.as_deref() == Some("model") || o.id == "model")
+                        .and_then(|o| o.current.clone())
+                        .or_else(|| Some(model.clone()));
                     let mut chats = self.chats.lock().expect("chats lock");
                     if let Some(stored) = chats.get_mut(&id) {
                         stored.model = effective.clone();
@@ -271,10 +277,34 @@ impl ChatManager {
         Ok((chat, true))
     }
 
-    /// The advertised model catalog for an agent: cache, a live chat, or
-    /// a throwaway probe session (spawned, queried, closed). Empty state
-    /// means the agent doesn't advertise models.
-    pub async fn agent_models(&self, card: &AgentCard) -> Result<ModelsState> {
+    /// Set one advertised non-model session option live (reasoning
+    /// effort, permission mode, …). No restart fallback: the agent either
+    /// accepts the value or the error is surfaced.
+    pub async fn set_option(
+        &self,
+        id: RunId,
+        option_id: String,
+        value: String,
+    ) -> Result<Vec<SessionOptionState>, String> {
+        let chat = self.chat(id).ok_or_else(|| "chat not found".to_string())?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        chat.send(ChatCommand::SetConfig {
+            id: option_id,
+            value,
+            reply: tx,
+        })
+        .map_err(|e| format!("{e}"))?;
+        match tokio::time::timeout(MODELS_WAIT, rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err("chat closed".into()),
+            Err(_) => Err("agent did not answer in time".into()),
+        }
+    }
+
+    /// The advertised session options for an agent: cache, a live chat, or
+    /// a throwaway probe session (spawned, queried, closed). Empty means
+    /// the agent advertises no options (free-text model input).
+    pub async fn agent_options(&self, card: &AgentCard) -> Result<Vec<SessionOptionState>> {
         // Cache first — refreshed by every chat/probe since daemon start.
         if let Some(state) = self
             .model_cache
@@ -289,20 +319,20 @@ impl ChatManager {
             let chats = self.chats.lock().expect("chats lock");
             chats.values().find(|c| c.agent == card.name).cloned()
         };
-        let (session, probe_id) = match live {
-            Some(c) => (Some(c.models_watch()), None),
+        let (watch, probe_id) = match live {
+            Some(c) => (Some(c.options_watch()), None),
             None => {
-                // Probe: start a chat, read the catalog, close it.
+                // Probe: start a chat, read the options, close it.
                 let chat = self.start(card, None)?;
-                (Some(chat.models_watch()), Some(chat.id))
+                (Some(chat.options_watch()), Some(chat.id))
             }
         };
-        let state = match session {
-            Some(mut watch) => {
-                if watch.borrow().is_none() {
-                    let _ = tokio::time::timeout(MODELS_WAIT, watch.changed()).await;
+        let state = match watch {
+            Some(mut w) => {
+                if w.borrow().is_none() {
+                    let _ = tokio::time::timeout(MODELS_WAIT, w.changed()).await;
                 }
-                watch.borrow_and_update().clone()
+                w.borrow_and_update().clone()
             }
             None => None,
         };

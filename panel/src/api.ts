@@ -15,17 +15,26 @@ export interface AgentInfo {
   models?: string[];
 }
 
-export interface ModelChoice {
+export interface OptionChoice {
   value: string;
   name: string;
   description?: string;
   group?: string;
 }
 
-export interface AgentModels {
+/** One session config option an agent advertises (model, reasoning
+ * effort, permission mode, …). */
+export interface SessionOptionInfo {
+  id: string;
+  name: string;
+  category?: string;
+  choices: OptionChoice[];
+  current?: string | null;
+}
+
+export interface AgentOptions {
   agent: string;
-  models: ModelChoice[];
-  current: string | null;
+  options: SessionOptionInfo[];
 }
 
 export interface AgentStats {
@@ -163,8 +172,8 @@ const post = (path: string, body?: unknown) => send("POST", path, body);
 export const api = {
   // agents + stats
   agents: () => get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents),
-  agentModels: (name: string) =>
-    get<AgentModels>(`/api/v1/agents/${name}/models`),
+  agentOptions: (name: string) =>
+    get<AgentOptions>(`/api/v1/agents/${name}/options`),
   stats: () => get<{ agents: AgentStats[] }>("/api/v1/stats").then((r) => r.agents),
   mcp: () => get<McpRegistry>("/api/v1/mcp"),
 
@@ -290,6 +299,10 @@ export const api = {
           model: string | null;
           switched: "live" | "restarted";
         }>,
+    ),
+  chatSetOption: (id: string, optionId: string, value: string) =>
+    post(`/api/v1/chat/${id}/options`, { id: optionId, value }).then(
+      (r) => r.json() as Promise<{ options: SessionOptionInfo[] }>,
     ),
   chatClose: (id: string) => send("DELETE", `/api/v1/chat/${id}`),
 

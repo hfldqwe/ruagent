@@ -28,7 +28,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
-        .route("/api/v1/agents/{name}/models", get(agent_models))
+        .route("/api/v1/agents/{name}/options", get(agent_options))
+        .route("/api/v1/chat/{id}/options", post(chat_option))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/mcp", get(mcp_registry))
         .route("/api/v1/skills", get(list_skills))
@@ -1102,9 +1103,10 @@ async fn chat_model(
     })))
 }
 
-/// The model catalog an agent advertises (ACP session configuration):
-/// cached, read from a live chat, or probed with a throwaway session.
-async fn agent_models(
+/// The session options an agent advertises (model, reasoning effort,
+/// permission mode, …): cached, read from a live chat, or probed with a
+/// throwaway session.
+async fn agent_options(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1113,16 +1115,39 @@ async fn agent_models(
         .agent(&name)
         .filter(|a| a.enabled)
         .ok_or_else(|| ApiError::not_found("agent not found"))?;
-    let models = state
+    let options = state
         .chats
-        .agent_models(card)
+        .agent_options(card)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    Ok(Json(serde_json::json!({
-        "agent": name,
-        "models": models.choices,
-        "current": models.current,
-    })))
+    Ok(Json(
+        serde_json::json!({ "agent": name, "options": options }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ChatOptionRequest {
+    id: String,
+    value: String,
+}
+
+/// Set one advertised session option live on a chat (reasoning effort,
+/// permission mode, …; model goes through PATCH /chat/{id}).
+async fn chat_option(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatOptionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    if !state.chats.chat(id).is_some() {
+        return Err(ApiError::not_found("chat not found"));
+    }
+    match state.chats.set_option(id, req.id, req.value).await {
+        Ok(options) => Ok(Json(serde_json::json!({ "options": options }))),
+        Err(e) => Err(ApiError::bad_request(e)),
+    }
 }
 
 async fn chat_close(
