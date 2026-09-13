@@ -93,6 +93,12 @@ export default function App() {
           <nav>
             <NavItem icon="🏠" label={t("home.greeting") === "欢迎回来" ? "首页" : "Home"} active={view.kind === "home"} onClick={() => nav("home")} />
             <NavItem
+              icon="💬"
+              label={t("chat.title")}
+              active={view.kind === "chat"}
+              onClick={() => nav("chat")}
+            />
+            <NavItem
               icon="🗂️"
               label={t("nav.board")}
               active={view.kind === "board" || view.kind === "task"}
