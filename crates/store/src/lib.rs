@@ -692,6 +692,7 @@ mod tests {
             context_window: None,
             mcp_profile: None,
             tags: vec![],
+            models: vec![],
             enabled: true,
         };
         db.upsert_agent(&card).await.unwrap();
@@ -730,6 +731,7 @@ mod tests {
             context_window: None,
             mcp_profile: None,
             tags: vec![],
+            models: vec![],
             enabled: true,
         };
         db.upsert_agent(&card).await.unwrap();

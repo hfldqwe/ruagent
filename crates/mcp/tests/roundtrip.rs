@@ -71,6 +71,12 @@ async fn start_test_daemon() -> String {
     let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
         .await
         .unwrap();
+    let chats = ruagent_daemon::chat::ChatManager::new(
+        db.clone(),
+        root.clone(),
+        Arc::new(|_, _| {}),
+        cfg.mcp.clone(),
+    );
     let mgr = Arc::new(RunManager::new(
         db,
         root.clone(),
@@ -82,6 +88,7 @@ async fn start_test_daemon() -> String {
         mgr,
         config: Arc::new(cfg),
         knowledge: Arc::new(knowledge),
+        chats,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

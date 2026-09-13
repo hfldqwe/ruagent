@@ -6,12 +6,14 @@
 //! connections arrive in M2 (design §5, §4.2).
 
 pub mod adapter;
+pub mod chat;
 pub mod fs_tools;
 pub mod map;
 pub mod permission;
 pub mod run;
 
 pub use adapter::{SpawnSpec, StandardAdapter, adapter_for, resolve_program};
+pub use chat::{ChatCommand, ChatOptions, ChatSession, start_chat};
 pub use run::{RunOptions, RunOutcome, run_once, split_command_line};
 
 /// Errors from the ACP layer.

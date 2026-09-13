@@ -213,6 +213,38 @@ impl RunManager {
         &self.db
     }
 
+    /// Park an external ask (from the ChatManager) in the permission
+    /// inbox, scoped to the given context id (the chat id). The ask lands
+    /// in the same inbox the panel/approver loop serve, keyed
+    /// `<context_id>:<tool_call_id>`. Chat asks always reach a human
+    /// unless a rule auto-answers (no approver delegation for chats).
+    pub fn park_external_ask(self: &Arc<Self>, ask: PermissionAsk, context_id: RunId) {
+        let PermissionAsk {
+            tool_call_id,
+            title,
+            raw_input,
+            choices,
+            answer,
+        } = ask;
+        let info = PendingPermission {
+            run_id: context_id,
+            tool_call_id: tool_call_id.clone(),
+            title,
+            raw_input,
+            choices,
+        };
+        let key = format!("{}:{}", context_id, tool_call_id);
+        // Event tap: a dead channel — chat event streams come from the chat
+        // broadcast, not the pending entry. (PermissionResolved attribution
+        // events still flow through the chat session's own channel.)
+        let (dead_tx, _dead_rx) = mpsc::unbounded_channel::<RunEvent>();
+        drop(_dead_rx);
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .insert(key, (info, dead_tx, answer));
+    }
+
     pub fn root(&self) -> PathBuf {
         self.root.clone()
     }

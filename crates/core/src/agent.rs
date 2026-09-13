@@ -61,6 +61,8 @@ pub struct AgentCard {
     pub context_window: Option<u32>,
     /// Default MCP profile injected for this agent. See design §7.1.
     pub mcp_profile: Option<String>,
+    /// Selectable model ids for the chat picker (config-defined).
+    pub models: Vec<String>,
     /// Lightweight tags consumed by routing rules.
     pub tags: Vec<String>,
     pub enabled: bool,

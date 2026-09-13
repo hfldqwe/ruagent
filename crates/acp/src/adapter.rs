@@ -176,6 +176,7 @@ mod tests {
             context_window: None,
             mcp_profile: None,
             tags: vec![],
+            models: vec![],
             enabled: true,
         };
         let spec = adapter_for(HarnessKind::Dsh)

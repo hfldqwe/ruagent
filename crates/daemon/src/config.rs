@@ -100,6 +100,7 @@ struct AgentEntry {
     command: Option<String>,
     description: Option<String>,
     model: Option<String>,
+    models: Option<Vec<String>>,
     reasoning_effort: Option<String>,
     context_window: Option<u32>,
     mcp_profile: Option<String>,
@@ -133,6 +134,7 @@ fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
             command: entry.command,
             description: entry.description.unwrap_or_default(),
             model: entry.model,
+            models: entry.models.unwrap_or_default(),
             reasoning_effort,
             context_window: entry.context_window,
             mcp_profile: entry.mcp_profile,
@@ -271,18 +273,21 @@ const DEFAULT_AGENTS_TOML: &str = r#"# ruagent agent registry. See design §4.1.
 harness = "claude-code"
 command = "npx @agentclientprotocol/claude-agent-acp"
 description = "Claude Code via the official ACP adapter"
+models = ["opus", "sonnet", "haiku", "sonnet-1.5", "haiku-4.5"]
 mcp_profile = "default"
 
 [agent.opencode]
 harness = "opencode"
 command = "opencode acp"
 description = "OpenCode (native ACP)"
+models = ["glm-5.1", "qwen3.7-max-2026-05-20", "qwen3.7-max", "qwen2.5-coder", "mimo-v2.5-pro"]
 mcp_profile = "default"
 
 [agent.dsh]
 harness = "dsh"
 command = "dsh --profile acp"
 description = "DeepSeek Harness (native ACP)"
+models = ["deepseek-chat", "deepseek-reasoner", "deepseek-coder", "glm-5.1", "qwen3.7-max", "mimo-v2.5-pro"]
 mcp_profile = "default"
 
 [agent.mock]

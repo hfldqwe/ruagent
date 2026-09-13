@@ -11,9 +11,11 @@ import { Memory } from "./views/Memory";
 import { Knowledge } from "./views/Knowledge";
 import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
+import { Chat } from "./views/Chat";
 
 type View =
   | { kind: "home" }
+  | { kind: "chat" }
   | { kind: "board" }
   | { kind: "task"; id: string }
   | { kind: "memory" }
@@ -28,6 +30,8 @@ function parseHash(): View {
   const mTask = h.match(/^task\/([\w-]+)/);
   if (mTask) return { kind: "task", id: mTask[1] };
   switch (h) {
+    case "chat":
+      return { kind: "chat" };
     case "board":
       return { kind: "board" };
     case "memory":
@@ -129,7 +133,8 @@ export default function App() {
               onNav={(hash) => nav(hash || "board")}
             />
           )}
-          {view.kind === "board" && <Board onOpen={(id) => nav(`task/${id}`)} />}
+          {view.kind === "chat" && <Chat />}
+          {view.kind === "board" && <Board onOpen={(id) => nav(`task/${id}`)} />}.
           {view.kind === "task" && (
             <TaskDetail key={view.id} id={view.id} onBack={() => nav("board")} />
           )}

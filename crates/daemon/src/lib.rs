@@ -4,6 +4,7 @@
 //! ids → recover interrupted runs → serve the API.
 
 pub mod api;
+pub mod chat;
 pub mod config;
 pub mod runs;
 pub mod skills;
@@ -114,10 +115,22 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
     }
     .with_context(|| "opening knowledge base")?;
 
+    // Chats (terminal-like sessions) share the permission inbox with runs:
+    // every chat ask parks in the same inbox (rules → human), keyed by the
+    // chat id.
+    let mgr_for_chats = Arc::clone(&mgr);
+    let chats = chat::ChatManager::new(
+        db.clone(),
+        root.clone(),
+        Arc::new(move |ask, context_id| mgr_for_chats.park_external_ask(ask, context_id)),
+        config.mcp.clone(),
+    );
+
     let state = api::AppState {
         mgr,
         config: Arc::new(config),
         knowledge: Arc::new(knowledge),
+        chats,
     };
     let app = api::router(state);
 

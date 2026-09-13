@@ -241,6 +241,18 @@ const zh: Record<string, string> = {
   "timeline.plan": "计划",
   "timeline.toolOutput": "{id} 的输出",
 
+  // chat
+  "chat.title": "对话",
+  "chat.subtitle": "像终端一样和智能体连续对话",
+  "chat.new": "新对话",
+  "chat.agent": "智能体",
+  "chat.model": "模型",
+  "chat.modelPh": "模型名（可选）…",
+  "chat.modelSwitched": "已切换模型（新会话，上下文已重置）",
+  "chat.empty": "开始对话——消息会保持同一个会话，智能体记得上文。Enter 发送，Shift+Enter 换行。",
+  "chat.inputPh": "输入消息…",
+  "chat.send": "发送",
+
   // statuses
   "status.pending": "待处理",
   "status.in_progress": "进行中",

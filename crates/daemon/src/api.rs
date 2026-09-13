@@ -20,6 +20,7 @@ pub struct AppState {
     pub mgr: std::sync::Arc<RunManager>,
     pub config: std::sync::Arc<DaemonConfig>,
     pub knowledge: std::sync::Arc<ruagent_knowledge::Knowledge>,
+    pub chats: std::sync::Arc<crate::chat::ChatManager>,
 }
 
 /// Build the API router.
@@ -64,6 +65,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}/select", post(select_run))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/events", get(run_events))
+        .route("/api/v1/chat", post(chat_start).get(chat_list))
+        .route("/api/v1/chat/{id}/messages", post(chat_message))
+        .route("/api/v1/chat/{id}/events", get(chat_events))
+        .route(
+            "/api/v1/chat/{id}",
+            axum::routing::patch(chat_model).delete(chat_close),
+        )
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
         .with_state(state)
@@ -115,7 +123,7 @@ impl tower::Service<axum::http::Request<axum::body::Body>> for CacheDir {
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
         use tower::ServiceExt as _;
         let is_asset = req.uri().path().starts_with("/assets/");
-        let mut fut = self.inner.clone().oneshot(req);
+        let fut = self.inner.clone().oneshot(req);
         Box::pin(async move {
             let resp = fut.await.map_err(|e| match e {})?;
             // into_parts + from_parts preserves headers (Content-Type!) —
@@ -565,6 +573,8 @@ async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "id": a.id.to_string(),
                 "name": a.name,
                 "harness": format!("{:?}", a.harness),
+                "models": a.models,
+                "reasoning_effort": a.reasoning_effort,
                 "description": a.description,
                 "model": a.model,
                 "enabled": a.enabled,
@@ -949,6 +959,158 @@ async fn resolve_permission(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Chat: terminal-like persistent sessions (M5)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ChatStartRequest {
+    agent: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn chat_start(
+    State(state): State<AppState>,
+    Json(req): Json<ChatStartRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let card = state
+        .mgr
+        .agent(&req.agent)
+        .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{}`", req.agent)))?;
+    let chat = state
+        .chats
+        .start(card, req.model)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "id": chat.id.to_string(),
+        "agent": chat.agent,
+        "model": chat.model,
+    })))
+}
+
+async fn chat_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "chats": state.chats.list() }))
+}
+
+#[derive(Deserialize)]
+struct ChatMessageRequest {
+    text: String,
+}
+
+async fn chat_message(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatMessageRequest>,
+) -> Result<StatusCode, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    let chat = state
+        .chats
+        .chat(id)
+        .ok_or_else(|| ApiError::not_found("chat not found"))?;
+    if req.text.trim().is_empty() {
+        return Err(ApiError::bad_request("empty message"));
+    }
+    chat.send(ruagent_acp::chat::ChatCommand::Prompt { text: req.text })
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Chat SSE: replay the chat transcript, then tail live events (single
+/// event per line, no seq). `StateChanged{completed}` = end of chat.
+async fn chat_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    let chat = state
+        .chats
+        .chat(id)
+        .ok_or_else(|| ApiError::not_found("chat not found"))?;
+    let path = state.chats.transcript_path(id);
+    let replay = ruagent_store::read_transcript(&path).unwrap_or_default();
+
+    let mut live = chat.subscribe();
+    let (tx, rx_stream) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        for line in replay {
+            let _ = tx.send(sse_data(&line));
+        }
+        loop {
+            match live.recv().await {
+                Ok(event) => {
+                    let json = serde_json::to_string(&event).unwrap_or_default();
+                    let _ = tx.send(Ok(Event::default().data(json)));
+                    if let ruagent_core::RunEvent::StateChanged {
+                        status: ruagent_core::RunStatus::Completed,
+                    } = &event
+                    {
+                        let _ = tx.send(sse_end(ruagent_core::RunStatus::Completed));
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => {
+                    let _ = tx.send(sse_end(ruagent_core::RunStatus::Completed));
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(Sse::new(UnboundedReceiverStream::new(rx_stream)).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Deserialize)]
+struct ChatModelRequest {
+    model: Option<String>,
+}
+
+async fn chat_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatModelRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    let chat = state
+        .chats
+        .chat(id)
+        .ok_or_else(|| ApiError::not_found("chat not found"))?;
+    let card = state
+        .mgr
+        .agent(&chat.agent)
+        .ok_or_else(|| ApiError::bad_request("agent vanished"))?;
+    let new_chat = state
+        .chats
+        .switch_model(id, req.model, card)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "id": new_chat.id.to_string(),
+        "agent": new_chat.agent,
+        "model": new_chat.model,
+    })))
+}
+
+async fn chat_close(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    if state.chats.close(id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("chat not found"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Memory + knowledge (design SS6.5: the only seam external CLIs need)

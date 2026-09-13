@@ -12,6 +12,7 @@ export interface AgentInfo {
   description: string;
   model: string | null;
   enabled: boolean;
+  models?: string[];
 }
 
 export interface AgentStats {
@@ -253,6 +254,23 @@ export const api = {
     fact_text: string;
     valid_at?: string;
   }) => post("/api/v1/graph/fact", fact).then((r) => r.json() as Promise<{ id: number }>),
+
+  // chat
+  chatStart: (agent: string, model: string | null) =>
+    post("/api/v1/chat", { agent, model }).then(
+      (r) => r.json() as Promise<{ id: string; agent: string; model: string | null }>,
+    ),
+  chatList: () =>
+    get<{ chats: { id: string; agent: string; model: string | null; created_at: string }[] }>(
+      "/api/v1/chat",
+    ).then((r) => r.chats),
+  chatMessage: (id: string, text: string) =>
+    post(`/api/v1/chat/${id}/messages`, { text }),
+  chatModel: (id: string, model: string | null) =>
+    send("PATCH", `/api/v1/chat/${id}`, { model }).then(
+      (r) => r.json() as Promise<{ id: string; agent: string; model: string | null }>,
+    ),
+  chatClose: (id: string) => send("DELETE", `/api/v1/chat/${id}`),
 
   // skills
   skills: () =>
