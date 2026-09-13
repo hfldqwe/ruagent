@@ -274,6 +274,7 @@ const zh: Record<string, string> = {
   "chat.opt.thought": "思考力度",
   "chat.opt.reasoning_effort": "推理力度",
   "chat.opt.effort": "思考力度",
+  "chat.opt.fast": "快速模式",
   "chat.empty": "开始对话——消息会保持同一个会话，智能体记得上文。Enter 发送，Shift+Enter 换行。",
   "chat.inputPh": "输入消息…",
   "chat.send": "发送",
@@ -543,6 +544,7 @@ const en: Record<string, string> = {
   "chat.opt.thought": "Thinking effort",
   "chat.opt.reasoning_effort": "Reasoning effort",
   "chat.opt.effort": "Thinking effort",
+  "chat.opt.fast": "Fast mode",
   "chat.empty":
     "Start talking — messages share one session, the agent remembers. Enter to send, Shift+Enter for a new line.",
   "chat.inputPh": "Type a message…",

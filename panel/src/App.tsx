@@ -180,6 +180,7 @@ function Shell() {
           <span className={`conn ${daemonUp ? "ok" : "err"}`}>
             ● {daemonUp ? t("common.online") : t("common.offline")}
           </span>
+          <span className="build-id" title="panel build">b {__BUILD_ID__}</span>
           <span className="grow" />
           <Tooltip title={mode === "dark" ? t("theme.light") : t("theme.dark")}>
             <Button
