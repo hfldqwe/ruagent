@@ -80,6 +80,18 @@ export interface PendingPermission {
   choices: { option_id: string; name: string; kind: string }[];
 }
 
+export interface SessionRecord {
+  key: string;
+  source: string; // claude-code | dsh | ruagent
+  title: string | null;
+  project: string | null;
+  ref_path: string;
+  started_at: number;
+  updated_at: number;
+  message_count: number;
+  preview: string | null;
+}
+
 export interface McpRegistry {
   servers: { name: string; command: string | null; url: string | null; inject_for: string[] | null }[];
   profiles: { name: string; servers: string[] }[];
@@ -305,6 +317,14 @@ export const api = {
       (r) => r.json() as Promise<{ options: SessionOptionInfo[] }>,
     ),
   chatClose: (id: string) => send("DELETE", `/api/v1/chat/${id}`),
+
+  // session history (auto-synced)
+  sessions: () =>
+    get<{ sessions: SessionRecord[] }>("/api/v1/sessions").then((r) => r.sessions),
+  sessionMessages: (key: string) =>
+    get<{ messages: { role: string; text: string; ts: number }[] }>(
+      `/api/v1/sessions/${key}`,
+    ).then((r) => r.messages),
 
   // skills
   skills: () =>

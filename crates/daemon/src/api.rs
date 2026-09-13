@@ -21,6 +21,7 @@ pub struct AppState {
     pub config: std::sync::Arc<DaemonConfig>,
     pub knowledge: std::sync::Arc<ruagent_knowledge::Knowledge>,
     pub chats: std::sync::Arc<crate::chat::ChatManager>,
+    pub sessions: std::sync::Arc<crate::sessions::SessionIndexer>,
 }
 
 /// Build the API router.
@@ -74,6 +75,8 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/chat/{id}",
             axum::routing::patch(chat_model).delete(chat_close),
         )
+        .route("/api/v1/sessions", get(sessions_list))
+        .route("/api/v1/sessions/{key}", get(sessions_messages))
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
         .with_state(state)
@@ -894,6 +897,34 @@ async fn run_events(
     });
 
     Ok(Sse::new(UnboundedReceiverStream::new(rx_stream)).keep_alive(KeepAlive::default()))
+}
+
+// ---------------------------------------------------------------------------
+// Session history (auto-synced from claude-code / dsh / ruagent stores)
+// ---------------------------------------------------------------------------
+
+async fn sessions_list(
+    State(state): State<AppState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let sessions = state
+        .sessions
+        .list(q.limit.unwrap_or(200))
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+async fn sessions_messages(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let messages = state
+        .sessions
+        .messages(&key)
+        .await
+        .map_err(|e| ApiError::not_found(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "messages": messages })))
 }
 
 async fn list_permissions(State(state): State<AppState>) -> Json<serde_json::Value> {

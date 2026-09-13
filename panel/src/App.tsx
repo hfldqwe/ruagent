@@ -10,6 +10,7 @@ import {
 import {
   HomeOutlined,
   MessageOutlined,
+  HistoryOutlined,
   AppstoreOutlined,
   CloudOutlined,
   BookOutlined,
@@ -30,12 +31,14 @@ import { Knowledge } from "./views/Knowledge";
 import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
 import { Chat } from "./views/Chat";
+import { Sessions } from "./views/Sessions";
 
 const { Sider, Content } = Layout;
 
 type View =
   | { kind: "home" }
   | { kind: "chat"; agent?: string }
+  | { kind: "sessions" }
   | { kind: "board" }
   | { kind: "task"; id: string }
   | { kind: "memory" }
@@ -51,6 +54,7 @@ function parseHash(): View {
   if (mTask) return { kind: "task", id: mTask[1] };
   const mChat = h.match(/^chat(?:\?agent=([\w-]+))?/);
   if (mChat) return { kind: "chat", agent: mChat[1] };
+  if (h === "sessions") return { kind: "sessions" };
   switch (h) {
     case "board":
       return { kind: "board" };
@@ -121,6 +125,7 @@ function Shell() {
       children: [
         { key: "home", icon: <HomeOutlined />, label: t("nav.home") },
         { key: "chat", icon: <MessageOutlined />, label: t("chat.title") },
+        { key: "sessions", icon: <HistoryOutlined />, label: t("sessions.title") },
         { key: "board", icon: <AppstoreOutlined />, label: t("nav.board") },
       ],
     },
@@ -210,6 +215,7 @@ function Shell() {
             />
           )}
           {view.kind === "chat" && <Chat initialAgent={view.agent} />}
+          {view.kind === "sessions" && <Sessions />}
           {view.kind === "board" && <Board onOpen={(id) => nav(`task/${id}`)} />}
           {view.kind === "task" && (
             <TaskDetail key={view.id} id={view.id} onBack={() => nav("board")} />

@@ -7,6 +7,7 @@ pub mod api;
 pub mod chat;
 pub mod config;
 pub mod runs;
+pub mod sessions;
 pub mod skills;
 
 use std::net::SocketAddr;
@@ -41,6 +42,23 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
 
     let config = config::DaemonConfig::load(&root)?;
     let db = Db::open(root.join("data").join("ruagent.db")).with_context(|| "opening database")?;
+
+    // Session history auto-sync: claude-code / dsh / ruagent transcripts
+    // indexed at boot, rescanned every 60s (mtime-incremental).
+    // The user's home holds every CLI's store (~/.claude, ~/.dsh); root
+    // itself is ~/.ruagent.
+    let indexer = {
+        let home = root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        let idx = std::sync::Arc::new(sessions::SessionIndexer::new(db.clone(), home));
+        let runner = idx.clone();
+        tokio::spawn(async move {
+            runner.run().await;
+        });
+        idx
+    };
 
     // Stable agent ids: reuse the stored id per name, else register.
     let mut agents = config.agents.clone();
@@ -160,6 +178,7 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         config: Arc::new(config),
         knowledge: Arc::new(knowledge),
         chats,
+        sessions: indexer,
     };
     let app = api::router(state);
 

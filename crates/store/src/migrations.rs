@@ -12,6 +12,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0004_memory.sql"),
     include_str!("migrations/0005_graph.sql"),
     include_str!("migrations/0006_knowledge.sql"),
+    include_str!("migrations/0007_sessions.sql"),
 ];
 
 /// Apply all pending migrations.
