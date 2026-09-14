@@ -121,26 +121,30 @@ export function RelTime({ iso }: { iso: string | null | undefined }) {
 // Status — colors valid on both light and dark surfaces
 // ---------------------------------------------------------------------------
 
+// Theme-aware status colors: CSS vars defined per mode in index.css
+// (--status-ok/err/warn/idle), amber for the active states. Dots are
+// non-text marks (3:1 floor on every surface); pill text uses the same
+// vars and clears 4.5:1 in both modes.
 const STATUS_COLORS: Record<string, string> = {
-  done: "#52c41a",
-  completed: "#52c41a",
-  failed: "#ff4d4f",
-  cancelled: "#ff4d4f",
-  interrupted: "#faad14",
-  in_progress: "#d9861f",
-  running: "#d9861f",
-  spawning: "#d9861f",
-  queued: "#8a8275",
-  pending: "#8a8275",
-  waiting_permission: "#faad14",
-  blocked: "#faad14",
+  done: "var(--status-ok)",
+  completed: "var(--status-ok)",
+  failed: "var(--status-err)",
+  cancelled: "var(--status-err)",
+  interrupted: "var(--status-warn)",
+  in_progress: "var(--ant-color-primary)",
+  running: "var(--ant-color-primary)",
+  spawning: "var(--ant-color-primary)",
+  queued: "var(--status-idle)",
+  pending: "var(--status-idle)",
+  waiting_permission: "var(--status-warn)",
+  blocked: "var(--status-warn)",
 };
 
 export function StatusDot({ status }: { status: string }) {
   return (
     <span
       className="dot"
-      style={{ background: STATUS_COLORS[status] ?? "#8a8275" }}
+      style={{ background: STATUS_COLORS[status] ?? "var(--status-idle)" }}
     />
   );
 }
@@ -152,7 +156,7 @@ export function StatusPill({ status }: { status: string }) {
       className="pill"
       style={{
         color: STATUS_COLORS[status] ?? "inherit",
-        borderColor: STATUS_COLORS[status] ?? "var(--line-strong)",
+        borderColor: STATUS_COLORS[status] ?? "var(--ant-color-border)",
       }}
     >
       {t(`status.${status}`)}

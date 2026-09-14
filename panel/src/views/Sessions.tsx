@@ -2,8 +2,8 @@
 // daemon (claude-code / dsh / ruagent). Index + on-demand viewer.
 
 import { useEffect, useState } from "react";
-import { Button, Segmented, Tag, Tooltip } from "antd";
-import { ThunderboltOutlined } from "@ant-design/icons";
+import { Button, Segmented, Tooltip } from "antd";
+import { Icon } from "../icons";
 import { api, type SessionRecord } from "../api";
 import { useI18n } from "../i18n";
 import { Empty, Markdown, RelTime, Spinner, useToast } from "../ui";
@@ -14,14 +14,15 @@ const SOURCE_LABEL: Record<string, string> = {
   ruagent: "ruagent",
 };
 
-function sourceColor(s: string): string {
+function sourceHue(s: string): string {
+  // Theme-aware source dot: brand hue families, one per CLI.
   switch (s) {
     case "claude-code":
-      return "orange";
+      return "var(--ant-color-warning)"; // amber family
     case "dsh":
-      return "blue";
+      return "var(--ant-color-primary)"; // brand
     default:
-      return "green";
+      return "var(--ant-color-success)";
   }
 }
 
@@ -97,9 +98,16 @@ export function Sessions() {
               className="row-btn"
               onClick={() => setOpen(s)}
             >
-              <Tag color={sourceColor(s.source)} style={{ marginInlineEnd: 0 }}>
+              <span
+                className="tag"
+                style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+              >
+                <span
+                  className="dot"
+                  style={{ background: sourceHue(s.source), width: 6, height: 6 }}
+                />
                 {SOURCE_LABEL[s.source] ?? s.source}
-              </Tag>
+              </span>
               <span className="title">
                 <strong>{s.title || s.preview || t("sessions.untitled")}</strong>
                 {s.preview && s.title ? (
@@ -121,7 +129,7 @@ export function Sessions() {
                 <Button
                   size="small"
                   type="text"
-                  icon={<ThunderboltOutlined />}
+                  icon={<Icon name="zap" size={14} />}
                   loading={distilling === s.key}
                   onClick={(e) => {
                     e.stopPropagation();

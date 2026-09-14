@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from "react";
 import { Button, Checkbox, Input, Popconfirm, Segmented, Select } from "antd";
-import { CloseOutlined } from "@ant-design/icons";
+import { Icon } from "../icons";
 import { api, type AgentInfo, type Run, type Task } from "../api";
 import { useI18n } from "../i18n";
 import {
@@ -323,7 +323,7 @@ function Launcher({
               <span className="muted">→</span>
               <Button
                 size="small"
-                icon={<CloseOutlined />}
+                icon={<Icon name="x" size={14} />}
                 onClick={() => setSteps(steps.filter((_, j) => j !== i))}
                 title={t("launcher.removeStep")}
               />

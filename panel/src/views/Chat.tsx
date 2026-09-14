@@ -380,7 +380,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         ...prev,
         {
           role: "assistant",
-          text: `⚙️ 运行时切换 → ${r}（角色不变，会话已重启）`,
+          text: `${t("chat.runtimeSwitched")} → ${r}`,
           done: true,
           notice: true,
         },

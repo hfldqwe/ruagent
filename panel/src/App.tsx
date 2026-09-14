@@ -7,19 +7,8 @@ import {
   Button,
   Tooltip,
 } from "antd";
-import {
-  HomeOutlined,
-  MessageOutlined,
-  HistoryOutlined,
-  AppstoreOutlined,
-  CloudOutlined,
-  BookOutlined,
-  ShareAltOutlined,
-  RobotOutlined,
-  BarChartOutlined,
-  InboxOutlined,
-} from "@ant-design/icons";
 import { api } from "./api";
+import { Icon } from "./icons";
 import { useI18n } from "./i18n";
 import { ThemeProvider, useThemeMode } from "./theme";
 import { ToastBridge } from "./ui";
@@ -123,30 +112,30 @@ function Shell() {
       type: "group" as const,
       label: t("nav.group.work"),
       children: [
-        { key: "home", icon: <HomeOutlined />, label: t("nav.home") },
-        { key: "chat", icon: <MessageOutlined />, label: t("chat.title") },
-        { key: "sessions", icon: <HistoryOutlined />, label: t("sessions.title") },
-        { key: "board", icon: <AppstoreOutlined />, label: t("nav.board") },
+        { key: "home", icon: <Icon name="home" size={16} />, label: t("nav.home") },
+        { key: "chat", icon: <Icon name="chat" size={16} />, label: t("chat.title") },
+        { key: "sessions", icon: <Icon name="history" size={16} />, label: t("sessions.title") },
+        { key: "board", icon: <Icon name="grid" size={16} />, label: t("nav.board") },
       ],
     },
     {
       type: "group" as const,
       label: t("nav.group.knowledge"),
       children: [
-        { key: "memory", icon: <CloudOutlined />, label: t("nav.memory") },
-        { key: "knowledge", icon: <BookOutlined />, label: t("nav.knowledge") },
-        { key: "graph", icon: <ShareAltOutlined />, label: t("nav.graph") },
+        { key: "memory", icon: <Icon name="cloud" size={16} />, label: t("nav.memory") },
+        { key: "knowledge", icon: <Icon name="book" size={16} />, label: t("nav.knowledge") },
+        { key: "graph", icon: <Icon name="graph" size={16} />, label: t("nav.graph") },
       ],
     },
     {
       type: "group" as const,
       label: t("nav.group.system"),
       children: [
-        { key: "agents", icon: <RobotOutlined />, label: t("nav.agents") },
-        { key: "stats", icon: <BarChartOutlined />, label: t("nav.stats") },
+        { key: "agents", icon: <Icon name="bot" size={16} />, label: t("nav.agents") },
+        { key: "stats", icon: <Icon name="stats" size={16} />, label: t("nav.stats") },
         {
           key: "inbox",
-          icon: <InboxOutlined />,
+          icon: <Icon name="inbox" size={16} />,
           label: (
             <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
               {t("nav.inbox")}
@@ -197,7 +186,7 @@ function Shell() {
               onClick={toggle}
               aria-label="toggle theme"
             >
-              {mode === "dark" ? "☀" : "☾"}
+              {mode === "dark" ? <Icon name="sun" size={14} /> : <Icon name="moon" size={14} />}
             </Button>
           </Tooltip>
           <Button size="small" type="text" onClick={() => setLang(lang === "zh" ? "en" : "zh")} title="中文 / EN">
