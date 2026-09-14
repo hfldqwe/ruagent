@@ -99,8 +99,36 @@ impl SessionIndexer {
             files.push(("ruagent".into(), f));
         }
 
+        // codex: ~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl (the
+        // dsh-import-agents documented format; machines without codex
+        // have nothing to index).
+        let codex = self.home.join(".codex").join("sessions");
+        if let Some(days) = read_dirs_recursive(&codex, 3) {
+            for f in read_files_multi(&days, &["jsonl"]) {
+                if f.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
+                {
+                    files.push(("codex".into(), f));
+                }
+            }
+        }
+
         for (source, path) in files {
             self.index_file(&source, &path).await?;
+        }
+
+        // opencode: one SQLite DB holding all sessions — index each
+        // session row separately (keyed by session id, mtime = db's).
+        let oc = self
+            .home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
+        if oc.is_file()
+            && let Err(e) = self.index_opencode(&oc).await
+        {
+            tracing::debug!(error = %e, "opencode sessions not indexed");
         }
         Ok(())
     }
@@ -145,6 +173,7 @@ impl SessionIndexer {
             "claude-code" => parse_claude_code(&text),
             "dsh" => parse_dsh(&bytes),
             "ruagent" => parse_ruagent(&text),
+            "codex" => parse_codex(&text),
             _ => Parsed::default(),
         };
         let ref_path = path.to_string_lossy().into_owned();
@@ -588,6 +617,293 @@ fn read_files(p: &Path, ext: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// opencode (SQLite) + codex (rollout jsonl)
+// ---------------------------------------------------------------------------
+
+/// Index every opencode session from its SQLite database. The database
+/// is read-only-opened from the live path (opencode uses WAL; a
+/// read-only snapshot keeps us out of its way).
+impl SessionIndexer {
+    async fn index_opencode(&self, db_path: &Path) -> Result<(), ruagent_store::DbError> {
+        let db_ref = db_path.to_string_lossy().into_owned();
+        let meta = std::fs::metadata(db_path)?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let size = meta.len() as i64;
+
+        let sessions = read_opencode_sessions(db_path);
+        for s in sessions {
+            let key = format!("opencode:{}", s.session_id);
+            let known: Option<(i64, i64)> = {
+                let db = self.db.clone();
+                let key = key.clone();
+                db.call(move |conn| {
+                    conn.query_row(
+                        "SELECT mtime_ms, size_bytes FROM sessions WHERE key = ?1",
+                        [&key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .ok()
+                })
+                .await?
+            };
+            if known == Some((mtime, size)) {
+                continue;
+            }
+            let record = s.clone();
+            let db_ref = db_ref.clone();
+            self.db
+                .call(move |conn| {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sessions
+                             (key, source, title, project, ref_path, started_at, updated_at,
+                              mtime_ms, size_bytes, message_count, preview)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                        rusqlite::params![
+                            format!("opencode:{}", record.session_id),
+                            "opencode",
+                            record.title,
+                            record.project,
+                            db_ref,
+                            record.started_at,
+                            record.updated_at,
+                            mtime,
+                            size,
+                            record.message_count,
+                            record.preview,
+                        ],
+                    )
+                })
+                .await??;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpencodeSession {
+    session_id: String,
+    title: Option<String>,
+    project: Option<String>,
+    started_at: i64,
+    updated_at: i64,
+    message_count: u32,
+    preview: Option<String>,
+}
+
+/// Read sessions + text parts out of the opencode database.
+fn read_opencode_sessions(db_path: &Path) -> Vec<OpencodeSession> {
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<OpencodeSession> = Vec::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT id, title, directory, time_created, time_updated FROM session")
+    else {
+        return Vec::new();
+    };
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .ok();
+    let Some(rows) = rows else { return Vec::new() };
+    for row in rows.flatten() {
+        let (id, title, directory, created, updated) = row;
+        // text parts in order; message.data.role carries the turn role.
+        let Ok(mut parts) = conn.prepare(
+            "SELECT m.data, p.data FROM part p
+               JOIN message m ON m.id = p.message_id
+              WHERE p.session_id = ?1 ORDER BY p.time_created",
+        ) else {
+            continue;
+        };
+        let turns = parts
+            .query_map([&id], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .ok();
+        let mut messages: Vec<SessionMessage> = Vec::new();
+        if let Some(turns) = turns {
+            for (msg_data, part_data) in turns.flatten() {
+                let (Some(msg_data), Some(part_data)) = (msg_data, part_data) else {
+                    continue;
+                };
+                let Ok(md) = serde_json::from_str::<serde_json::Value>(&msg_data) else {
+                    continue;
+                };
+                let Ok(pd) = serde_json::from_str::<serde_json::Value>(&part_data) else {
+                    continue;
+                };
+                if pd.get("type").and_then(|t| t.as_str()) != Some("text") {
+                    continue;
+                }
+                let Some(text) = pd.get("text").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let role = if md.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                messages.push(SessionMessage {
+                    role: role.into(),
+                    text: text.to_string(),
+                    ts: pd.get("time").and_then(|t| t.as_i64()).unwrap_or(0),
+                });
+            }
+        }
+        if messages.is_empty() {
+            continue; // spawn noise
+        }
+        let preview = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| truncate(&m.text, 140));
+        sessions.push(OpencodeSession {
+            session_id: id,
+            title: title.filter(|t| !t.starts_with("New session")),
+            project: directory,
+            started_at: created.unwrap_or(0),
+            updated_at: updated.unwrap_or(0),
+            message_count: messages.len() as u32,
+            preview,
+        });
+    }
+    sessions
+}
+
+/// Parse a codex rollout file: response_item message events carry the
+/// conversation (payload.role + payload.content[].text).
+fn parse_codex(text: &str) -> Parsed {
+    let mut p = Parsed::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let payload = v.get("payload");
+        let Some(t) = v.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if t == "session_meta" || t == "turn_context" {
+            if p.project.is_none() {
+                p.project = payload
+                    .and_then(|pl| pl.get("cwd"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
+            }
+            continue;
+        }
+        if t != "response_item" {
+            continue;
+        }
+        let Some(pl) = payload else { continue };
+        if pl.get("type").and_then(|x| x.as_str()) != Some("message") {
+            continue;
+        }
+        let role = match pl.get("role").and_then(|r| r.as_str()) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let body: String = pl
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| {
+                        (b.get("type").and_then(|t| t.as_str()) == Some("input_text")
+                            || b.get("type").and_then(|t| t.as_str()) == Some("output_text")
+                            || b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .then(|| b.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                        .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if body.trim().is_empty() || body.starts_with("<environment_context>") {
+            continue;
+        }
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_iso_ms)
+            .unwrap_or(0);
+        if p.started_at == 0 {
+            p.started_at = ts;
+        }
+        if p.preview.is_none() && role == "user" {
+            p.preview = Some(truncate(&body, 140));
+        }
+        p.messages.push(SessionMessage {
+            role: role.into(),
+            text: body,
+            ts,
+        });
+        p.updated_at = p.updated_at.max(ts);
+    }
+    if p.updated_at == 0 {
+        p.updated_at = p.started_at;
+    }
+    p.message_count = p.messages.len() as u32;
+    p
+}
+
+/// Walk up to `depth` levels collecting all directories.
+fn read_dirs_recursive(p: &Path, depth: u32) -> Option<Vec<PathBuf>> {
+    if depth == 0 || !p.is_dir() {
+        return None;
+    }
+    let mut out = vec![p.to_path_buf()];
+    for d in read_dirs(p).unwrap_or_default() {
+        if let Some(mut sub) = read_dirs_recursive(&d, depth - 1) {
+            out.append(&mut sub);
+        }
+    }
+    Some(out)
+}
+
+fn read_files_multi(dirs: &[PathBuf], exts: &[&str]) -> Vec<PathBuf> {
+    dirs.iter()
+        .flat_map(|d| {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .filter(|e| {
+                            e.path().is_file()
+                                && e.path()
+                                    .extension()
+                                    .is_some_and(|x| exts.contains(&x.to_string_lossy().as_ref()))
+                        })
+                        .map(|e| e.path())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +935,17 @@ mod tests {
         assert_eq!(p.message_count, 2); // plugin injection skipped
         assert_eq!(p.preview.as_deref(), Some("帮我找个 skill"));
         assert_eq!(p.messages[1].text, "找到了，是这个。");
+    }
+
+    #[test]
+    fn codex_rollout_parses() {
+        let jsonl = r#"{"type":"session_meta","payload":{"cwd":"C:\\work"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello codex"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi there"}]}}"#;
+        let p = parse_codex(jsonl);
+        assert_eq!(p.message_count, 2);
+        assert_eq!(p.preview.as_deref(), Some("hello codex"));
+        assert_eq!(p.project.as_deref(), Some("C:\\work"));
     }
 
     #[test]
