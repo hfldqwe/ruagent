@@ -8,13 +8,13 @@ import { api, type SessionRecord } from "../api";
 import { useI18n } from "../i18n";
 import { Empty, Markdown, RelTime, Spinner, useToast } from "../ui";
 
-const SOURCE_LABEL: Record<string, string> = {
+export const SOURCE_LABEL: Record<string, string> = {
   "claude-code": "Claude Code",
   dsh: "dsh",
   ruagent: "ruagent",
 };
 
-function sourceHue(s: string): string {
+export function sourceHue(s: string): string {
   // Theme-aware source dot: brand hue families, one per CLI.
   switch (s) {
     case "claude-code":
@@ -213,6 +213,6 @@ function shortProject(p: string): string {
   return parts.slice(-2).join("/");
 }
 
-function msToIso(ms: number): string {
+export function msToIso(ms: number): string {
   return ms > 0 ? new Date(ms).toISOString() : "";
 }
