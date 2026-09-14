@@ -1165,15 +1165,52 @@ async fn recall(
                 serde_json::json!({ "relation": relation, "with": other, "fact": fact })
             })
             .collect::<Vec<_>>();
+        // Graph-guided navigation: what references this entity in the
+        // knowledge base and the memories (ids + one-line excerpts only
+        // — the agent pulls full content on demand).
+        let related_chunks = state
+            .knowledge
+            .search(&e.name, 4)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            // Precision first: either the chunk names the entity, or the
+            // semantic score is strongly above the noise floor.
+            .filter(|h| h.content.contains(&e.name) || h.score >= 0.45)
+            .take(2)
+            .map(|h| {
+                serde_json::json!({
+                    "chunk_id": h.chunk_id, "document": h.document,
+                    "excerpt": truncate_chars(&h.content, 80),
+                })
+            })
+            .collect::<Vec<_>>();
+        let related_memories: Vec<serde_json::Value> = semantic
+            .iter()
+            .chain(fts_related(&state, &e.name).await.iter())
+            .filter(|(_, _, _, c, _)| c.contains(&e.name))
+            .take(2)
+            .map(|(id, store, ns, content, _)| {
+                serde_json::json!({
+                    "id": id, "store": store, "namespace": ns,
+                    "title": truncate_chars(content, 60),
+                })
+            })
+            .collect();
+        let related = if related_chunks.is_empty() && related_memories.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({ "chunks": related_chunks, "memories": related_memories })
+        };
         out_entities.push(if conservative {
             serde_json::json!({
                 "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
-                "facts": facts,
+                "facts": facts, "related": related,
             })
         } else {
             serde_json::json!({
                 "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
-                "summary": e.summary, "facts": facts,
+                "summary": e.summary, "facts": facts, "related": related,
             })
         });
     }
@@ -1184,6 +1221,44 @@ async fn recall(
         "knowledge": out_chunks,
         "entities": out_entities,
     })))
+}
+
+/// FTS memories matching `term` (the keyword leg for entity navigation).
+#[allow(clippy::type_complexity)]
+async fn fts_related(state: &AppState, term: &str) -> Vec<(i64, String, String, String, f32)> {
+    let term = term.to_string();
+    state
+        .mgr
+        .db()
+        .call(move |conn| -> Result<_, ruagent_store::DbError> {
+            let pattern = format!("\"{}\"", term.replace('"', "\"\""));
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.id, m.store, m.namespace, m.content
+                       FROM memories_fts f JOIN memories m ON m.id = f.rowid
+                      WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL
+                      ORDER BY rank LIMIT 3",
+                )
+                .map_err(ruagent_store::DbError::from)?;
+            let rows = stmt
+                .query_map([&pattern], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(ruagent_store::DbError::from)?;
+            Ok(rows
+                .filter_map(|r| r.ok())
+                .map(|(id, s, n, c)| (id, s, n, c, 0.0))
+                .collect())
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default()
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {

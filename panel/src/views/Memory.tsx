@@ -435,6 +435,16 @@ function RecallPlayground() {
                   —{f.relation}→ {f.with}: {f.fact}
                 </p>
               ))}
+              {(e.related?.chunks ?? []).map((c, i) => (
+                <p key={`c${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
+                  📄 [{c.document}] {c.excerpt}
+                </p>
+              ))}
+              {(e.related?.memories ?? []).map((m, i) => (
+                <p key={`m${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
+                  #️⃣ #{m.id} {m.title}
+                </p>
+              ))}
             </div>
           ))}
         </div>

@@ -122,6 +122,10 @@ export interface RecallResult {
     summary?: string;
     hint?: string;
     facts?: { relation: string; with: string; fact: string }[];
+    related?: {
+      chunks: { chunk_id: number; document: string; excerpt: string }[];
+      memories: { id: number; store: string; namespace: string; title: string }[];
+    } | null;
   }[];
 }
 
