@@ -983,6 +983,7 @@ async fn session_distill(
         db: state.mgr.db().clone(),
         root: state.config.root.clone(),
         embedder: Some(state.knowledge.embedder()),
+        registry: state.mgr.registry_view(),
     };
     let out = distiller
         .distill(&key, card)

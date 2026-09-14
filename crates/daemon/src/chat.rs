@@ -124,6 +124,12 @@ pub struct ChatManager {
     chats: Arc<Mutex<HashMap<RunId, Chat>>>,
     park_ask: AskParker,
     mcp: crate::config::McpConfig,
+    /// Session → memory distillation policy (auto on close).
+    pub distill_policy: crate::distill::AutoDistill,
+    /// Agent registry view for the distiller.
+    pub registry: crate::distill::AgentRegistry,
+    /// Shared embedder for distillation writes (set at boot).
+    pub embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
     /// Advertised session options (model, reasoning effort, permission
     /// mode, …) per agent name, refreshed whenever any chat or probe
     /// reports them. What the panel pickers show.
@@ -140,6 +146,9 @@ impl ChatManager {
         root: PathBuf,
         park_ask: AskParker,
         mcp: crate::config::McpConfig,
+        distill_policy: crate::distill::AutoDistill,
+        embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
+        registry: crate::distill::AgentRegistry,
     ) -> Arc<Self> {
         let this = Arc::new(Self {
             db,
@@ -147,6 +156,9 @@ impl ChatManager {
             chats: Arc::new(Mutex::new(HashMap::new())),
             park_ask,
             mcp,
+            distill_policy,
+            registry,
+            embedder,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         this.spawn_idle_reaper();
@@ -343,16 +355,38 @@ impl ChatManager {
         Ok(chat)
     }
 
-    /// Close and remove a chat.
+    /// Close and remove a chat. When auto-distill is on, the session
+    /// becomes memories + graph entries in the background.
     pub fn close(&self, id: RunId) -> bool {
         let chat = self.chats.lock().expect("chats lock").remove(&id);
         match chat {
             Some(c) => {
                 let _ = c.send(ChatCommand::Shutdown);
+                self.maybe_auto_distill(id);
                 true
             }
             None => false,
         }
+    }
+
+    /// Spawn a background distillation for a closed chat (policy-gated).
+    fn maybe_auto_distill(&self, id: RunId) {
+        let Some(distiller) = self.auto_distiller() else {
+            return;
+        };
+        let key = crate::sessions::session_key_of(&self.transcript_path(id));
+        let agent = self.distill_policy.agent.clone();
+        tokio::spawn(async move {
+            match crate::distill::distill_with_agent(&distiller, &key, agent.as_deref()).await {
+                Ok(o) => tracing::info!(
+                    session = %key,
+                    memories = o.memories_written,
+                    entities = o.entities_written,
+                    "auto-distilled"
+                ),
+                Err(e) => tracing::warn!(session = %key, error = %e, "auto-distill failed"),
+            }
+        });
     }
 
     /// Switch model. Prefers a live switch (`session/set_config_option`
@@ -477,6 +511,18 @@ impl ChatManager {
         Ok(state)
     }
 
+    fn auto_distiller(&self) -> Option<crate::distill::Distiller> {
+        if !self.distill_policy.auto {
+            return None;
+        }
+        Some(crate::distill::Distiller {
+            db: self.db.clone(),
+            root: self.root.clone(),
+            embedder: self.embedder.clone(),
+            registry: self.registry.clone(),
+        })
+    }
+
     /// Chat transcripts live next to run transcripts.
     pub fn transcript_path(&self, id: RunId) -> PathBuf {
         transcript_path(self.root.join("data").join("transcripts"), &id)
@@ -488,6 +534,7 @@ impl ChatManager {
 
     fn spawn_idle_reaper(self: &Arc<Self>) {
         let chats = self.chats.clone();
+        let mgr = Arc::clone(self);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -509,6 +556,8 @@ impl ChatManager {
                     };
                     if let Some(c) = chat {
                         let _ = c.send(ChatCommand::Shutdown);
+                        // Auto-distill (policy): same path as explicit close.
+                        mgr.maybe_auto_distill(id);
                     }
                 }
             }

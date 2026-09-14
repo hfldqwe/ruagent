@@ -76,6 +76,9 @@ async fn start_test_daemon() -> String {
         root.clone(),
         Arc::new(|_, _| {}),
         cfg.mcp.clone(),
+        ruagent_daemon::distill::AutoDistill::default(),
+        None,
+        ruagent_daemon::distill::AgentRegistry::default(),
     );
     let mgr = Arc::new(RunManager::new(
         db.clone(),

@@ -93,6 +93,7 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         tracing::warn!(count = recovered, "runs marked interrupted by restart");
     }
 
+    let agents_cards = agents.clone();
     let mgr = Arc::new(runs::RunManager::new(
         db.clone(),
         root.clone(),
@@ -173,6 +174,15 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         root.clone(),
         Arc::new(move |ask, context_id| mgr_for_chats.park_external_ask(ask, context_id)),
         config.mcp.clone(),
+        // Session-distillation policy + shared embedder + registry view.
+        distill::AutoDistill {
+            auto: config.policy.distill.auto,
+            agent: config.policy.distill.agent.clone(),
+        },
+        Some(knowledge.embedder()),
+        distill::AgentRegistry {
+            enabled: agents_cards.iter().filter(|c| c.enabled).cloned().collect(),
+        },
     );
 
     let state = api::AppState {

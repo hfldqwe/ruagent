@@ -511,6 +511,11 @@ fn parse_ruagent(text: &str) -> Parsed {
 
 /// Parse a session file by source name — shared by the API viewer and
 /// the distiller.
+/// The session index key for one of OUR chats (its transcript file).
+pub fn session_key_of(transcript: &std::path::Path) -> String {
+    make_key("ruagent", transcript)
+}
+
 pub fn parse_file_messages(source: &str, path: &Path) -> Vec<SessionMessage> {
     let bytes = std::fs::read(path).unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes).into_owned();

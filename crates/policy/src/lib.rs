@@ -115,6 +115,21 @@ impl PermissionPolicy {
 pub struct PolicyConfig {
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    #[serde(default)]
+    pub distill: DistillConfig,
+}
+
+/// `[distill]` — session → memory distillation policy.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DistillConfig {
+    /// Distill sessions automatically when they close (idle timeout or
+    /// explicit). Off by default: extraction quality is judged per
+    /// deployment before enabling unattended runs.
+    #[serde(default)]
+    pub auto: bool,
+    /// Agent used for extraction; default = dsh if enabled, else the
+    /// first enabled agent.
+    pub agent: Option<String>,
 }
 
 /// `[permissions]` section.

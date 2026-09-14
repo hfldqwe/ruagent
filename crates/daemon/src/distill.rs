@@ -84,12 +84,50 @@ pub struct DistillOutcome {
     pub agent: String,
 }
 
+/// The [distill] policy from policy.toml.
+#[derive(Debug, Clone, Default)]
+pub struct AutoDistill {
+    pub auto: bool,
+    pub agent: Option<String>,
+}
+
+/// Distill `session_key` choosing the extraction agent from the
+/// registry: the policy's agent, else dsh, else the first enabled.
+pub async fn distill_with_agent(
+    distiller: &Distiller,
+    session_key: &str,
+    preferred: Option<&str>,
+) -> Result<DistillOutcome> {
+    let agents = distiller.registry.list_enabled();
+    let card = agents
+        .iter()
+        .find(|a| Some(a.name.as_str()) == preferred)
+        .or_else(|| agents.iter().find(|a| a.name == "dsh"))
+        .or_else(|| agents.first())
+        .ok_or_else(|| anyhow::anyhow!("no enabled agent to distill with"))?;
+    distiller.distill(session_key, card).await
+}
+
 pub struct Distiller {
     pub db: Db,
     pub root: PathBuf, // ruagent home (~/.ruagent)
     /// The shared embedder (knowledge base's) for memory vectors; None
     /// when only the hash fallback is active.
     pub embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
+    /// Agent registry for extraction-agent choice (auto-distill path).
+    pub registry: AgentRegistry,
+}
+
+/// Minimal registry view the distiller needs (no RunManager cycle).
+#[derive(Clone, Default)]
+pub struct AgentRegistry {
+    pub enabled: Vec<ruagent_core::AgentCard>,
+}
+
+impl AgentRegistry {
+    pub fn list_enabled(&self) -> Vec<ruagent_core::AgentCard> {
+        self.enabled.clone()
+    }
 }
 
 impl Distiller {

@@ -477,6 +477,10 @@ servers = ["ruagent"]
 "#;
 
 const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: deterministic rules, design §9.2).
+# Session distillation policy:
+# [distill]
+# auto = true            # distill sessions automatically when they close
+# agent = "dsh"          # extraction agent (default: dsh, else first enabled)
 # First matching rule wins; `default` applies otherwise. Actions:
 #   allow  — auto-select the first allow option
 #   reject — auto-select the first reject option

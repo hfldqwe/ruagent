@@ -61,6 +61,9 @@ async fn start_daemon_with_routing(
         root.clone(),
         Arc::new(|_, _| {}),
         cfg.mcp.clone(),
+        ruagent_daemon::distill::AutoDistill::default(),
+        None,
+        ruagent_daemon::distill::AgentRegistry::default(),
     );
     let mgr = Arc::new(RunManager::new(
         db.clone(),

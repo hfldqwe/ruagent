@@ -257,6 +257,17 @@ impl RunManager {
         self.agents.get(name)
     }
 
+    pub fn registry_view(&self) -> crate::distill::AgentRegistry {
+        crate::distill::AgentRegistry {
+            enabled: self
+                .agents
+                .values()
+                .filter(|a| a.enabled)
+                .cloned()
+                .collect(),
+        }
+    }
+
     pub fn agents(&self) -> Vec<&AgentCard> {
         let mut v: Vec<_> = self.agents.values().collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
