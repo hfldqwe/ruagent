@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Button, Input } from "antd";
-import { FileTextOutlined } from "@ant-design/icons";
+import { Icon } from "../icons";
 import { api, type KnowledgeDocument, type SearchHit } from "../api";
 import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
 import { useI18n } from "../i18n";
@@ -134,7 +134,7 @@ export function Knowledge() {
                   }
                 }}
               >
-                <span className="doc-icon"><FileTextOutlined /></span>
+                <span className="doc-icon"><Icon name="doc" size={15} /></span>
                 <strong>{d.name}</strong>
                 <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
                 <span className="grow" />

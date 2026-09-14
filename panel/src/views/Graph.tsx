@@ -2,34 +2,25 @@
 
 import { useEffect, useState } from "react";
 import { Button, Input, Table } from "antd";
-import {
-  UserOutlined,
-  BankOutlined,
-  AppstoreOutlined,
-  CodeSandboxOutlined,
-  ToolOutlined,
-  TagOutlined,
-} from "@ant-design/icons";
+import { Icon, type IconName } from "../icons";
 import { api, type GraphEdge, type GraphEntity } from "../api";
 import { Empty, Markdown, Modal, Spinner, useToast } from "../ui";
 import { dateOf, useI18n } from "../i18n";
 
 function kindIcon(kind: string | null) {
-  switch (kind) {
-    case "person":
-      return <UserOutlined />;
-    case "org":
-    case "organization":
-      return <BankOutlined />;
-    case "project":
-      return <AppstoreOutlined />;
-    case "repo":
-      return <CodeSandboxOutlined />;
-    case "tool":
-      return <ToolOutlined />;
-    default:
-      return <TagOutlined />;
-  }
+  const name: IconName =
+    kind === "person"
+      ? "user"
+      : kind === "org" || kind === "organization"
+        ? "landmark"
+        : kind === "project"
+          ? "grid"
+          : kind === "repo"
+            ? "repo"
+            : kind === "tool"
+              ? "tool"
+              : "tag";
+  return <Icon name={name} size={15} />;
 }
 
 export function Graph() {
@@ -68,28 +59,30 @@ export function Graph() {
 
   return (
     <div>
-      <div className="view-bar">
-        <h2>{t("graph.title")}</h2>
-        <span className="muted">{t("graph.subtitle")}</span>
-        <span className="grow" />
-        <Button type="primary" onClick={() => setCreating(true)}>
-          + {t("graph.newEntity")}
-        </Button>
-      </div>
-
-      <div className="search-bar">
-        <Input
-          className="grow"
-          placeholder={t("graph.searchPh")}
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onPressEnter={search}
-        />
-      </div>
-
       {selected ? (
         <EntityDetail entity={selected} onBack={() => setSelected(null)} />
-      ) : entities === null ? (
+      ) : (
+        <>
+          <div className="view-bar">
+            <h2>{t("graph.title")}</h2>
+            <span className="muted">{t("graph.subtitle")}</span>
+            <span className="grow" />
+            <Button type="primary" onClick={() => setCreating(true)}>
+              + {t("graph.newEntity")}
+            </Button>
+          </div>
+
+          <div className="search-bar">
+            <Input
+              className="grow"
+              placeholder={t("graph.searchPh")}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onPressEnter={search}
+            />
+          </div>
+
+          {entities === null ? (
         <Spinner label={`${t("graph.title")}…`} />
       ) : entities.length === 0 ? (
         <Empty
@@ -98,18 +91,20 @@ export function Graph() {
           hint={t("graph.empty.hint")}
         />
       ) : (
-        <div className="card">
-          {entities.map(([e, factCount]) => (
-            <button key={e.id} className="row-btn" onClick={() => setSelected(e)}>
-              <span className="doc-icon">{kindIcon(e.kind)}</span>
-              <strong>{e.name}</strong>
-              {e.kind ? <span className="tag">{e.kind}</span> : null}
-              <span className="muted">{t("graph.factCount", { n: factCount })}</span>
-              <span className="grow" />
-              {e.summary ? <span className="muted truncated">{e.summary}</span> : null}
-            </button>
-          ))}
-        </div>
+          <div className="card">
+            {entities.map(([e, factCount]) => (
+              <button key={e.id} className="row-btn" onClick={() => setSelected(e)}>
+                <span className="doc-icon">{kindIcon(e.kind)}</span>
+                <strong>{e.name}</strong>
+                {e.kind ? <span className="tag">{e.kind}</span> : null}
+                <span className="muted">{t("graph.factCount", { n: factCount })}</span>
+                <span className="grow" />
+                {e.summary ? <span className="muted truncated">{e.summary}</span> : null}
+              </button>
+            ))}
+          </div>
+          )}
+        </>
       )}
 
       {creating && (
