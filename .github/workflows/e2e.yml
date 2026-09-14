@@ -1,0 +1,47 @@
+name: E2E
+
+# End-to-end smoke against a real daemon: boot, doctor (7 checks),
+# panel serving. Runs on main pushes after CI, cheap addition.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUAGENT_EMBEDDER: hash
+
+jobs:
+  smoke:
+    name: Daemon + doctor + panel smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build
+        run: cargo build -p ruagent
+      - name: Build panel
+        run: |
+          npm ci
+          npm run build
+        working-directory: panel
+      - name: Boot daemon
+        run: |
+          cargo run -p ruagent -- serve --addr 127.0.0.1:8787 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8787/api/v1/health && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8787/api/v1/health
+      - name: Doctor (7 end-to-end checks)
+        run: cargo run -p ruagent -- doctor
+      - name: Panel serves
+        run: |
+          html=$(curl -sf http://127.0.0.1:8787/)
+          echo "$html" | grep -q 'id="root"'
+          curl -sf http://127.0.0.1:8787/ | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1 | grep -q .

@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: ruagent-${{ github.ref_name }}-x86_64-windows.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: ruagent-${{ github.ref_name }}-x86_64-linux.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y protoc
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p ruagent
+        env:
+          CARGO_BUILD_JOBS: "4"
+      - name: Build panel
+        run: |
+          npm ci
+          npm run build
+        working-directory: panel
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "staging"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ruagent.exe" $staging
+          Copy-Item -Recurse "panel/dist" "$staging/panel-dist"
+          Copy-Item "README.md" $staging
+          Compress-Archive -Path $staging -DestinationPath "${{ matrix.archive }}" -Force
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/ruagent staging/
+          cp -r panel/dist staging/panel-dist
+          cp README.md staging/
+          tar czf ${{ matrix.archive }} -C staging .
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
