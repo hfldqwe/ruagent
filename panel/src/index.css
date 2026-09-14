@@ -49,6 +49,19 @@ html[data-mode="dark"] {
   --status-warn: #cb9400;
   --status-idle: #85858c;
   --noise-opacity: 0.04;
+  /* Categorical kind palette for the graph canvas (3:1+ on surface). */
+  --graph-person: #eb827b;
+  --graph-org: #a495f0;
+  --graph-project: #00bcc5;
+  --graph-repo: #31be98;
+  --graph-tool: #6dba70;
+  --graph-concept: #c889d7;
+  --graph-product: #60aaf3;
+  --graph-protocol: #ca9d33;
+  --graph-default: #85858c;
+  --graph-edge: rgba(255, 255, 255, 0.14);
+  --graph-edge-hi: rgba(255, 255, 255, 0.5);
+  --graph-label: #a6a6b0;
 }
 html[data-mode="light"] {
   --app-shell: #f3f3f4;
@@ -60,6 +73,18 @@ html[data-mode="light"] {
   --status-warn: #9d6400;
   --status-idle: #81818b;
   --noise-opacity: 0.022;
+  --graph-person: #a74541;
+  --graph-org: #6959ae;
+  --graph-project: #007d86;
+  --graph-repo: #00805d;
+  --graph-tool: #2e7c35;
+  --graph-concept: #894d97;
+  --graph-product: #1f6cb0;
+  --graph-protocol: #8b6100;
+  --graph-default: #81818b;
+  --graph-edge: rgba(15, 23, 42, 0.15);
+  --graph-edge-hi: rgba(15, 23, 42, 0.5);
+  --graph-label: #5b5b64;
 }
 
 /* antd's dark algorithm remaps the seed colors to palette step 5, which
@@ -526,6 +551,36 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
   transition: border-color 100ms;
 }
 .neighbor:hover { border-color: var(--ant-color-primary); }
+
+/* Graph explorer — canvas + inspector ---------------------------------- */
+
+.graph-layout { display: flex; gap: 14px; align-items: flex-start; }
+.graph-main { flex: 1 1 auto; min-width: 0; }
+.graph-canvas {
+  display: block; width: 100%; height: 520px;
+  background: var(--ant-color-bg-container);
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  box-shadow: var(--surface-shadow);
+  touch-action: none;
+}
+.graph-hint {
+  margin-top: 6px; text-align: center;
+  font-size: 11px; line-height: 15px;
+  color: var(--ant-color-text-quaternary);
+}
+.graph-detail { flex: 0 0 400px; min-width: 320px; max-width: 460px; }
+@media (max-width: 1100px) {
+  .graph-layout { flex-direction: column; }
+  .graph-detail { flex: 1 1 auto; width: 100%; max-width: none; }
+}
+.graph-detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.graph-detail-head h3 {
+  margin: 0; display: flex; align-items: center; gap: 6px;
+  font-size: 16px; line-height: 24px; font-weight: 650;
+  color: var(--ant-color-text);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* Agents / Inbox ------------------------------------------------------ */
 

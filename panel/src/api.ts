@@ -370,6 +370,11 @@ export const api = {
   // graph
   graphEntities: () =>
     get<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities").then((r) => r.entities),
+  /** The whole entity list (graphEntities caps at the daemon default of 50). */
+  graphEntitiesAll: (limit = 500) =>
+    get<{ entities: [GraphEntity, number][] }>(`/api/v1/graph/entities?limit=${limit}`).then(
+      (r) => r.entities,
+    ),
   graphSearch: (q: string) =>
     get<{ entities: GraphEntity[] }>(`/api/v1/graph/search?q=${encodeURIComponent(q)}`).then(
       (r) => r.entities,
