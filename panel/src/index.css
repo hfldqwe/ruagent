@@ -534,6 +534,56 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
 .rev-old { color: var(--ant-color-text-quaternary); background: transparent; }
 .search-bar .grow { min-width: 0; }
 .search-hit { padding: 9px 4px; border-bottom: 1px solid var(--ant-color-border-secondary); }
+
+/* Recall playground — progressive-disclosure stubs -------------------- */
+
+.recall-hit { padding: 2px 0; }
+.recall-stub-head {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; padding: 8px 10px;
+  background: none; border: none; border-radius: 6px;
+  cursor: pointer; font: inherit; text-align: left;
+  color: var(--ant-color-text);
+  transition: background 100ms;
+}
+.recall-stub-head:hover { background: var(--surface-hover); }
+.recall-stub-head strong { font-size: 13px; line-height: 18px; white-space: nowrap; }
+.recall-stub-head .stub-text {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 13px; line-height: 18px; color: var(--ant-color-text-secondary);
+}
+.recall-stub-head .stub-afford {
+  flex: none; font-size: 11px; line-height: 15px;
+  color: var(--ant-color-text-quaternary);
+}
+.recall-stub-head .chev { flex: none; color: var(--ant-color-text-quaternary); }
+.recall-expand {
+  display: grid; grid-template-rows: 0fr;
+  transition: grid-template-rows 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.recall-expand.open { grid-template-rows: 1fr; }
+.recall-expand .recall-inner { overflow: hidden; min-height: 0; }
+.recall-loading { padding: 10px 12px; }
+.recall-body {
+  padding: 8px 12px 10px;
+  border-left: 2px solid var(--ant-color-border-secondary);
+  margin: 2px 0 8px 6px;
+  font-size: 13px; line-height: 18px;
+}
+.recall-chunk-hl {
+  background: var(--ant-color-fill-quaternary);
+  border-left: 2px solid var(--ant-color-primary);
+  border-radius: 0 6px 6px 0;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+.recall-fact {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 3px 0;
+  font-size: 13px; line-height: 18px;
+}
+.recall-fact.old { opacity: 0.55; }
 .search-hit:last-child { border-bottom: none; }
 .hit-content { margin: 6px 0 0; font-size: 13px; line-height: 18px; color: var(--ant-color-text-secondary); }
 .doc-icon { flex: none; display: inline-flex; color: var(--ant-color-text-tertiary); }

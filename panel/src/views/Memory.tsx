@@ -1,10 +1,17 @@
 // Memory browser: stores × namespaces, supersession chains, write dialog,
 // audit trail (OpenViking parity).
 
-import { Button, Input, Segmented, Select, Tag } from "antd";
+import { Button, Input, Segmented, Select, Spin } from "antd";
 import { useEffect, useState } from "react";
-import { api, type MemoryDiff, type MemoryRow, type RecallResult } from "../api";
-import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
+import {
+  api,
+  type GraphEdge,
+  type KnowledgeExpansion,
+  type MemoryDiff,
+  type MemoryRow,
+  type RecallResult,
+} from "../api";
+import { Empty, Markdown, Modal, RelTime, Spinner, useToast } from "../ui";
 import { dateOf, useI18n } from "../i18n";
 
 const STORES = ["profile", "observation", "procedure", "lesson"] as const;
@@ -375,6 +382,10 @@ function RecallPlayground() {
     }
   };
 
+  const empty =
+    result != null &&
+    result.memories.length + result.knowledge.length + result.entities.length === 0;
+
   return (
     <div>
       <div className="search-bar">
@@ -398,57 +409,243 @@ function RecallPlayground() {
           {t("memory.recallGo")}
         </Button>
       </div>
-      {result && (
-        <div className="card">
-          <div className="row tight">
-            <Tag color={result.strategy === "conservative" ? "blue" : "green"}>
-              {result.strategy}
-            </Tag>
-            <span className="muted">
-              {result.memories.length} mem · {result.knowledge.length} know ·{" "}
-              {result.entities.length} ent
-            </span>
+      {result &&
+        (empty ? (
+          <Empty icon="search" title={t("memory.recallEmpty")} />
+        ) : (
+          <div className="card">
+            <div className="row tight">
+              <span className="tag">{result.strategy}</span>
+              <span className="muted">
+                {result.memories.length} mem · {result.knowledge.length} know ·{" "}
+                {result.entities.length} ent
+              </span>
+            </div>
+            {result.memories.map((m) =>
+              m.hint ? (
+                <MemoryStub key={`m${m.id}`} stub={m} />
+              ) : (
+                <div key={`m${m.id}`} className="search-hit">
+                  <div className="row tight">
+                    <span className="tag">{m.store}</span>
+                    <span className="tag">{m.namespace}</span>
+                    {m.score != null && <span className="muted mono">{m.score.toFixed(2)}</span>}
+                  </div>
+                  <p className="hit-content">{m.content ?? m.title}</p>
+                </div>
+              ),
+            )}
+            {result.knowledge.map((k) =>
+              k.hint ? (
+                <KnowledgeStub key={`k${k.chunk_id}`} stub={k} />
+              ) : (
+                <div key={`k${k.chunk_id}`} className="search-hit">
+                  <span className="tag">{k.document}</span>
+                  <p className="hit-content">{k.content ?? k.excerpt}</p>
+                </div>
+              ),
+            )}
+            {result.entities.map((e) =>
+              e.hint ? (
+                <EntityStub key={`e${e.id}`} stub={e} />
+              ) : (
+                <div key={`e${e.id}`} className="search-hit">
+                  <span className="tag">{e.name}</span>
+                  {e.entity_kind && <span className="tag">{e.entity_kind}</span>}
+                  {e.summary && <p className="hit-content">{e.summary}</p>}
+                  {(e.facts ?? []).map((f, i) => (
+                    <p key={i} className="hit-content mono" style={{ fontSize: 12 }}>
+                      —{f.relation}→ {f.with}: {f.fact}
+                    </p>
+                  ))}
+                  {(e.related?.chunks ?? []).map((c, i) => (
+                    <p key={`c${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
+                      [doc] {c.document} · {c.excerpt}
+                    </p>
+                  ))}
+                  {(e.related?.memories ?? []).map((m, i) => (
+                    <p key={`m${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
+                      [mem] #{m.id} {m.title}
+                    </p>
+                  ))}
+                </div>
+              ),
+            )}
           </div>
-          {result.memories.map((m) => (
-            <div key={`m${m.id}`} className="search-hit">
-              <div className="row tight">
-                <span className="tag">{m.store}</span>
-                <span className="tag">{m.namespace}</span>
-                {m.score != null && <span className="muted mono">{m.score.toFixed(2)}</span>}
-              </div>
-              <p className="hit-content">{m.content ?? m.title}</p>
+        ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Conservative recall returns stubs — the panel mirrors the agent's
+// progressive disclosure: each stub expands inline with an on-demand
+// fetch (memory_get / knowledge_expand / graph facts), instead of a dead
+// truncated line.
+// ---------------------------------------------------------------------------
+
+function useStubFetch<T>(fetcher: () => Promise<T>) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(false);
+  const toast = useToast();
+  const toggle = async () => {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (data) return;
+    setLoading(true);
+    try {
+      setData(await fetcher());
+    } catch (e) {
+      toast("err", String(e));
+      setOpen(false);
+    } finally {
+      setLoading(false);
+    }
+  };
+  return { open, data, loading, toggle };
+}
+
+function StubChevron({ open }: { open: boolean }) {
+  return <span className="chev">{open ? "▾" : "▸"}</span>;
+}
+
+function RecallLoading() {
+  return (
+    <div className="recall-loading">
+      <Spin size="small" />
+    </div>
+  );
+}
+
+function MemoryStub({ stub }: { stub: RecallResult["memories"][number] }) {
+  const { t } = useI18n();
+  const { open, data, loading, toggle } = useStubFetch(() => api.memoryGet(stub.id));
+  return (
+    <div className="recall-hit">
+      <button className="recall-stub-head" onClick={toggle}>
+        <span className="tag">#{stub.id}</span>
+        <span className="tag">{stub.store}</span>
+        {stub.score != null && <span className="muted mono">{stub.score.toFixed(2)}</span>}
+        <span className="stub-text">{stub.title}</span>
+        {!open && <span className="stub-afford">{t("memory.recallExpand")}</span>}
+        <StubChevron open={open} />
+      </button>
+      <div className={open ? "recall-expand open" : "recall-expand"}>
+        <div className="recall-inner">
+          {loading ? (
+            <RecallLoading />
+          ) : data ? (
+            <div className="recall-body md">
+              <Markdown>{data.content}</Markdown>
             </div>
-          ))}
-          {result.knowledge.map((k) => (
-            <div key={`k${k.chunk_id}`} className="search-hit">
-              <span className="tag">{k.document}</span>
-              <p className="hit-content">{k.content ?? k.excerpt}</p>
-            </div>
-          ))}
-          {result.entities.map((e) => (
-            <div key={`e${e.id}`} className="search-hit">
-              <span className="tag">{e.name}</span>
-              {e.entity_kind && <span className="tag">{e.entity_kind}</span>}
-              {e.summary && <p className="hit-content">{e.summary}</p>}
-              {(e.facts ?? []).map((f, i) => (
-                <p key={i} className="hit-content mono" style={{ fontSize: 12 }}>
-                  —{f.relation}→ {f.with}: {f.fact}
-                </p>
-              ))}
-              {(e.related?.chunks ?? []).map((c, i) => (
-                <p key={`c${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
-                  [doc] {c.document} · {c.excerpt}
-                </p>
-              ))}
-              {(e.related?.memories ?? []).map((m, i) => (
-                <p key={`m${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
-                  [mem] #{m.id} {m.title}
-                </p>
-              ))}
-            </div>
-          ))}
+          ) : null}
         </div>
-      )}
+      </div>
+    </div>
+  );
+}
+
+function KnowledgeStub({ stub }: { stub: RecallResult["knowledge"][number] }) {
+  const { t } = useI18n();
+  const { open, data, loading, toggle } = useStubFetch(() =>
+    api.knowledgeExpand(stub.chunk_id),
+  );
+  const x = data as KnowledgeExpansion | null;
+  const i = x ? x.section.indexOf(x.chunk) : -1;
+  return (
+    <div className="recall-hit">
+      <button className="recall-stub-head" onClick={toggle}>
+        <span className="tag">{stub.document}</span>
+        {stub.score != null && <span className="muted mono">{stub.score.toFixed(2)}</span>}
+        <span className="stub-text">{stub.excerpt}</span>
+        {!open && <span className="stub-afford">{t("memory.recallExpand")}</span>}
+        <StubChevron open={open} />
+      </button>
+      <div className={open ? "recall-expand open" : "recall-expand"}>
+        <div className="recall-inner">
+          {loading ? (
+            <RecallLoading />
+          ) : x ? (
+            <div className="recall-body">
+              {x.file ? (
+                <div className="row tight" style={{ marginBottom: 6 }}>
+                  <span className="tag">{x.file}</span>
+                </div>
+              ) : null}
+              {i >= 0 ? (
+                <>
+                  {x.section.slice(0, i).trim() ? (
+                    <Markdown>{x.section.slice(0, i)}</Markdown>
+                  ) : null}
+                  <div className="recall-chunk-hl md">
+                    <span className="rev-label">{t("memory.recallHitChunk")}</span>
+                    <Markdown>{x.chunk}</Markdown>
+                  </div>
+                  {x.section.slice(i + x.chunk.length).trim() ? (
+                    <Markdown>{x.section.slice(i + x.chunk.length)}</Markdown>
+                  ) : null}
+                </>
+              ) : (
+                <Markdown>{x.section}</Markdown>
+              )}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EntityStub({ stub }: { stub: RecallResult["entities"][number] }) {
+  const { t } = useI18n();
+  const { open, data, loading, toggle } = useStubFetch(async () => {
+    const [facts, neighbors] = await Promise.all([
+      api.graphFacts(stub.id),
+      api.graphNeighbors(stub.id, 1),
+    ]);
+    return {
+      facts,
+      names: new Map(neighbors.map(([e]) => [e.id, e.name] as const)),
+    };
+  });
+  return (
+    <div className="recall-hit">
+      <button className="recall-stub-head" onClick={toggle}>
+        <span className="tag">&{stub.id}</span>
+        <strong>{stub.name}</strong>
+        {stub.entity_kind && <span className="tag">{stub.entity_kind}</span>}
+        {stub.summary && <span className="stub-text">{stub.summary}</span>}
+        {!open && <span className="stub-afford">{t("memory.recallExpand")}</span>}
+        <StubChevron open={open} />
+      </button>
+      <div className={open ? "recall-expand open" : "recall-expand"}>
+        <div className="recall-inner">
+          {loading ? (
+            <RecallLoading />
+          ) : data ? (
+            <div className="recall-body">
+              {data.facts.length === 0 ? (
+                <p className="muted">{t("memory.recallNoFacts")}</p>
+              ) : (
+                data.facts.map((f: GraphEdge) => {
+                  const other = f.src === stub.id ? f.dst : f.src;
+                  return (
+                    <div key={f.id} className={f.invalid_at ? "recall-fact old" : "recall-fact"}>
+                      <span className="tag">{f.relation}</span>
+                      <strong>{data.names.get(other) ?? "#" + other}</strong>
+                      <span className="muted">{f.fact_text}</span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 }

@@ -114,6 +114,7 @@ export interface RecallResult {
     content?: string;
     excerpt?: string;
     score?: number;
+    hint?: string;
   }[];
   entities: {
     id: number;
