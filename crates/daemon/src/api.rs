@@ -589,6 +589,9 @@ async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "description": a.description,
                 "model": a.model,
                 "enabled": a.enabled,
+                "runtime": a.runtime,
+                "runtimes": a.runtimes,
+                "prompt": a.prompt.as_deref().map(|p| p.chars().take(160).collect::<String>()),
             })
         })
         .collect();
@@ -1368,6 +1371,9 @@ async fn chat_events(
 #[derive(Deserialize)]
 struct ChatModelRequest {
     model: Option<String>,
+    /// Switch the chat to another runtime (a [runtime.X] name). The
+    /// agent (and its role prompt) stays; the engine restarts.
+    runtime: Option<String>,
 }
 
 async fn chat_model(
@@ -1386,11 +1392,33 @@ async fn chat_model(
         .mgr
         .agent(&chat.agent)
         .ok_or_else(|| ApiError::bad_request("agent vanished"))?;
-    let (new_chat, restarted) = state
-        .chats
-        .switch_model(id, req.model, card)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // Runtime switch: spawn the same agent (same role prompt) on a
+    // different engine. The engine card is the registry entry named by
+    // the runtime; the role prompt travels along.
+    let (new_chat, restarted) = if let Some(runtime) = &req.runtime {
+        let engine = state
+            .mgr
+            .agents()
+            .into_iter()
+            .find(|a| &a.name == runtime)
+            .ok_or_else(|| ApiError::bad_request(format!("unknown runtime `{runtime}`")))?;
+        let mut role = engine.clone();
+        // carry the role prompt + agent identity
+        if let Some(p) = &card.prompt {
+            role.prompt = Some(p.clone());
+        }
+        state
+            .chats
+            .switch_model(id, req.model.clone(), &role)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+    } else {
+        state
+            .chats
+            .switch_model(id, req.model, card)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+    };
     Ok(Json(serde_json::json!({
         "id": new_chat.id.to_string(),
         "agent": new_chat.agent,

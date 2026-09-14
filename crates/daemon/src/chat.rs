@@ -28,6 +28,9 @@ pub struct Chat {
     /// Whether the memory context already went out with a prompt (once
     /// per chat — the first message is the natural recall query).
     memory_injected: Arc<std::sync::atomic::AtomicBool>,
+    /// The agent's portable role prompt (two-layer model): injected
+    /// ahead of the first prompt on every runtime.
+    agent_prompt: Option<String>,
 }
 
 impl Chat {
@@ -50,6 +53,21 @@ impl Chat {
             None
         } else {
             let mut ctx = ChatManager::memory_context_for(db, &text).await;
+            // The role prompt rides first — what this agent IS.
+            if let Some(role) = &self.agent_prompt {
+                let role_block = format!(
+                    "[role — you are]
+{role}"
+                );
+                ctx = Some(match ctx {
+                    Some(c) => format!(
+                        "{role_block}
+
+{c}"
+                    ),
+                    None => role_block,
+                });
+            }
             // semantic leg: the first message is the query
             let hits = crate::memembed::semantic_search(db, embedder, &text, 4, 0.34).await;
             if !hits.is_empty() {
@@ -316,6 +334,7 @@ impl ChatManager {
             session,
             last_active: Arc::new(Mutex::new(Instant::now())),
             memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_prompt: card.prompt.clone(),
         };
         self.chats
             .lock()

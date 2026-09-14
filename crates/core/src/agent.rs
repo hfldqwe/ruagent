@@ -63,6 +63,19 @@ pub struct AgentCard {
     pub mcp_profile: Option<String>,
     /// Selectable model ids for the chat picker (config-defined).
     pub models: Vec<String>,
+    /// The portable role prompt: what this agent IS, independent of any
+    /// runtime. Injected ahead of the first prompt on every runtime —
+    /// the two-layer model (design §4.1 refactor, 2026-09-14).
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Which runtime this agent runs on by default (a `[runtime.X]`
+    /// name; `None` = the card IS the runtime, legacy single-layer).
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// Every runtime this agent can run on (subset of the registry's
+    /// runtimes). Empty for legacy cards.
+    #[serde(default)]
+    pub runtimes: Vec<String>,
     /// Lightweight tags consumed by routing rules.
     pub tags: Vec<String>,
     pub enabled: bool,

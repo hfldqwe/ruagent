@@ -287,6 +287,7 @@ const zh: Record<string, string> = {
   "memory.recallConservative": "保守",
   "memory.recallGo": "召回",
   "sessions.distillHint": "蒸馏这条会话 → 记忆 + 图谱",
+  "chat.runtime": "运行时",
   "chat.opt.effort": "思考力度",
   "chat.opt.fast": "快速模式",
   "chat.empty": "开始对话——消息会保持同一个会话，智能体记得上文。Enter 发送，Shift+Enter 换行。",
@@ -571,6 +572,7 @@ const en: Record<string, string> = {
   "memory.recallConservative": "Conservative",
   "memory.recallGo": "Recall",
   "sessions.distillHint": "Distill this session → memories + graph",
+  "chat.runtime": "Runtime",
   "chat.opt.effort": "Thinking effort",
   "chat.opt.fast": "Fast mode",
   "chat.empty":

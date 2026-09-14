@@ -369,6 +369,31 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     options?.find((o) => o.category === "model" || o.id === "model")?.choices ??
     [];
 
+  const switchRuntime = async (r: string) => {
+    if (!chatId) return;
+    // Runtime switch restarts the engine; the role prompt travels.
+    if (streamRef.current) streamRef.current();
+    try {
+      const chat = await api.chatModel(chatId, null, r);
+      setChatId(chat.id);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          text: `⚙️ 运行时切换 → ${r}（角色不变，会话已重启）`,
+          done: true,
+          notice: true,
+        },
+      ]);
+      attachStream(chat.id);
+    } catch (e) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: String(e), done: true, notice: true },
+      ]);
+    }
+  };
+
   const switchModel = async (m: string) => {
     setModel(m);
     if (!chatId) return;
@@ -488,6 +513,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           onFreeText={(v) => setModel(v)}
           disabled={streaming}
         />
+        {(() => {
+          const a = agents?.find((x) => x.name === agent);
+          const rt = a?.runtimes ?? [];
+          if (rt.length <= 1) return null;
+          return (
+            <OptionPicker
+              label={t("chat.runtime")}
+              loading={false}
+              choices={rt.map((r) => ({ value: r, name: r }))}
+              current={a?.runtime ?? rt[0]}
+              onPick={switchRuntime}
+              disabled={streaming}
+            />
+          );
+        })()}
         {(options ?? [])
           .filter((o) => o.category !== "model" && o.id !== "model")
           .map((opt) => (

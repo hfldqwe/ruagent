@@ -13,6 +13,9 @@ export interface AgentInfo {
   model: string | null;
   enabled: boolean;
   models?: string[];
+  runtime?: string | null;
+  runtimes?: string[];
+  prompt?: string | null;
 }
 
 export interface OptionChoice {
@@ -332,8 +335,8 @@ export const api = {
     ).then((r) => r.chats),
   chatMessage: (id: string, text: string) =>
     post(`/api/v1/chat/${id}/messages`, { text }),
-  chatModel: (id: string, model: string | null) =>
-    send("PATCH", `/api/v1/chat/${id}`, { model }).then(
+  chatModel: (id: string, model: string | null, runtime?: string) =>
+    send("PATCH", `/api/v1/chat/${id}`, { model, runtime }).then(
       (r) =>
         r.json() as Promise<{
           id: string;

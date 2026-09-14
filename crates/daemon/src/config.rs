@@ -88,15 +88,32 @@ impl DaemonConfig {
 // agents.toml
 // ---------------------------------------------------------------------------
 
+/// The parsed `agents.toml` file. Two layers (design §4.1 refactor):
+/// `[runtime.X]` = how an engine is spawned; `[agent.Y]` = a portable
+/// role (prompt + preferred runtimes). Legacy single-layer files (an
+/// agent entry with `harness = …`) keep working — each synthesizes its
+/// own runtime.
 #[derive(Debug, serde::Deserialize)]
 struct AgentsFile {
+    #[serde(default)]
+    runtime: BTreeMap<String, RuntimeEntry>,
     #[serde(default)]
     agent: BTreeMap<String, AgentEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct RuntimeEntry {
+    /// claude-code | opencode | dsh | mock. Defaults to the entry name.
+    harness: Option<String>,
+    command: Option<String>,
+    description: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct AgentEntry {
-    harness: String,
+    /// Legacy single-layer form: the agent IS a runtime instance.
+    harness: Option<String>,
     command: Option<String>,
     description: Option<String>,
     model: Option<String>,
@@ -104,29 +121,157 @@ struct AgentEntry {
     reasoning_effort: Option<String>,
     context_window: Option<u32>,
     mcp_profile: Option<String>,
+    /// The portable role prompt (two-layer form).
+    prompt: Option<String>,
+    /// Default runtime (a `[runtime.X]` name).
+    runtime: Option<String>,
+    /// Every runtime this role can run on.
+    #[serde(default)]
+    runtimes: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
     enabled: Option<bool>,
 }
 
+fn harness_of(name: &str, spec: Option<&str>) -> Result<HarnessKind> {
+    match spec.unwrap_or(name).trim() {
+        "claude-code" | "claude" => Ok(HarnessKind::ClaudeCode),
+        "opencode" => Ok(HarnessKind::OpenCode),
+        "dsh" | "deepseek" => Ok(HarnessKind::Dsh),
+        "mock" => Ok(HarnessKind::Mock),
+        other => anyhow::bail!("unknown harness `{other}` (runtime `{name}`)"),
+    }
+}
+
+fn parse_effort(s: Option<&str>) -> Option<ReasoningEffort> {
+    s.and_then(|s| match s {
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
+    })
+}
+
 fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
     let file: AgentsFile = toml::from_str(text)?;
     let mut out = Vec::new();
+
+    // Two-layer: roles first (what users pick), then raw runtimes.
+    if !file.runtime.is_empty() {
+        let mut runtime_cards: BTreeMap<String, AgentCard> = BTreeMap::new();
+        for (name, entry) in &file.runtime {
+            let harness = harness_of(name, entry.harness.as_deref())?;
+            runtime_cards.insert(
+                name.clone(),
+                AgentCard {
+                    id: ruagent_core::AgentId::generate(),
+                    name: name.clone(),
+                    harness,
+                    command: entry.command.clone(),
+                    description: entry.description.clone().unwrap_or_else(|| name.clone()),
+                    model: None,
+                    models: Vec::new(),
+                    reasoning_effort: None,
+                    context_window: None,
+                    mcp_profile: None,
+                    prompt: None,
+                    runtime: None,
+                    runtimes: Vec::new(),
+                    tags: Vec::new(),
+                    enabled: entry.enabled.unwrap_or(true),
+                },
+            );
+        }
+        for (name, entry) in &file.agent {
+            // Mixed file: a legacy entry (harness set, no runtime) is a
+            // self-contained card even when [runtime.*] sections exist.
+            if entry.runtime.is_none() && entry.runtimes.is_empty() && entry.harness.is_some() {
+                let harness = harness_of(name, entry.harness.as_deref())?;
+                out.push(AgentCard {
+                    id: ruagent_core::AgentId::generate(),
+                    name: name.clone(),
+                    harness,
+                    command: entry.command.clone(),
+                    description: entry.description.clone().unwrap_or_default(),
+                    model: entry.model.clone(),
+                    models: entry.models.clone().unwrap_or_default(),
+                    reasoning_effort: parse_effort(entry.reasoning_effort.as_deref()),
+                    context_window: entry.context_window,
+                    mcp_profile: entry.mcp_profile.clone(),
+                    prompt: entry.prompt.clone(),
+                    runtime: None,
+                    runtimes: Vec::new(),
+                    tags: entry.tags.clone(),
+                    enabled: entry.enabled.unwrap_or(true),
+                });
+                continue;
+            }
+            let Some(default_runtime) = entry
+                .runtime
+                .clone()
+                .or_else(|| entry.runtimes.first().cloned())
+            else {
+                anyhow::bail!(
+                    "agent `{name}` has no runtime: set `runtime = \"…\"` (or `runtimes = […])`)"
+                );
+            };
+            let Some(rc) = runtime_cards.get(&default_runtime) else {
+                anyhow::bail!(
+                    "agent `{name}`: runtime `{default_runtime}` is not defined in [runtime.*]"
+                );
+            };
+            let allowed: Vec<String> = entry
+                .runtimes
+                .iter()
+                .filter(|r| runtime_cards.contains_key(*r))
+                .cloned()
+                .collect();
+            out.push(AgentCard {
+                id: ruagent_core::AgentId::generate(),
+                name: name.clone(),
+                harness: rc.harness,
+                command: rc.command.clone(),
+                description: entry
+                    .description
+                    .clone()
+                    .or_else(|| {
+                        entry
+                            .prompt
+                            .as_deref()
+                            .map(|p| p.chars().take(80).collect())
+                    })
+                    .unwrap_or_else(|| name.clone()),
+                model: entry.model.clone(),
+                models: entry.models.clone().unwrap_or_default(),
+                reasoning_effort: parse_effort(entry.reasoning_effort.as_deref()),
+                context_window: entry.context_window,
+                mcp_profile: entry.mcp_profile.clone(),
+                prompt: entry.prompt.clone(),
+                runtime: Some(default_runtime),
+                runtimes: allowed,
+                tags: entry.tags.clone(),
+                enabled: entry.enabled.unwrap_or(true),
+            });
+        }
+        for (name, mut card) in runtime_cards {
+            if out.iter().any(|a| a.name == name) {
+                continue;
+            }
+            card.description = format!("[runtime] {}", card.description);
+            out.push(card);
+        }
+        return Ok(out);
+    }
+
+    // Legacy single-layer: every entry is a runtime-instance agent.
     for (name, entry) in file.agent {
-        let harness = match entry.harness.as_str() {
-            "claude-code" | "claude" => HarnessKind::ClaudeCode,
-            "opencode" => HarnessKind::OpenCode,
-            "dsh" | "deepseek" => HarnessKind::Dsh,
-            "mock" => HarnessKind::Mock,
-            other => anyhow::bail!("unknown harness `{other}` for agent `{name}`"),
+        let Some(harness_spec) = entry.harness.clone() else {
+            anyhow::bail!(
+                "agent `{name}`: two-layer files need [runtime.*] sections; single-layer entries need `harness = …`"
+            );
         };
-        let reasoning_effort = entry.reasoning_effort.as_deref().and_then(|s| match s {
-            "minimal" => Some(ReasoningEffort::Minimal),
-            "low" => Some(ReasoningEffort::Low),
-            "medium" => Some(ReasoningEffort::Medium),
-            "high" => Some(ReasoningEffort::High),
-            _ => None,
-        });
+        let harness = harness_of(&name, Some(&harness_spec))?;
         out.push(AgentCard {
             id: ruagent_core::AgentId::generate(), // replaced by the stable DB id
             name: name.clone(),
@@ -135,9 +280,12 @@ fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
             description: entry.description.unwrap_or_default(),
             model: entry.model,
             models: entry.models.unwrap_or_default(),
-            reasoning_effort,
+            reasoning_effort: parse_effort(entry.reasoning_effort.as_deref()),
             context_window: entry.context_window,
             mcp_profile: entry.mcp_profile,
+            prompt: entry.prompt,
+            runtime: None,
+            runtimes: Vec::new(),
             tags: entry.tags,
             enabled: entry.enabled.unwrap_or(true),
         });
@@ -286,6 +434,18 @@ harness = "dsh"
 command = "dsh --profile acp"
 description = "DeepSeek Harness (native ACP)"
 mcp_profile = "default"
+
+# Two-layer model (2026-09-14): [runtime.X] = spawnable engines,
+# [agent.Y] = portable roles. A role's prompt runs on ANY of its
+# runtimes. Example:
+#
+# [runtime.dsh]
+# command = "dsh --profile acp"
+#
+# [agent.architect]
+# prompt = "You are the architecture reviewer. Challenge assumptions, propose alternatives, keep reviews constructive and concrete."
+# runtimes = ["dsh", "claude-code"]
+# runtime = "dsh"
 
 [agent.mock]
 harness = "mock"
@@ -443,5 +603,49 @@ agent = "opencode"
     #[test]
     fn default_routing_toml_parses() {
         assert!(parse_routing(DEFAULT_ROUTING_TOML).is_ok());
+    }
+
+    #[test]
+    fn two_layer_agents_parse() {
+        let toml = r#"
+[runtime.dsh]
+command = "dsh --profile acp"
+
+[runtime.claude-code]
+command = "npx @agentclientprotocol/claude-agent-acp"
+
+[agent.architect]
+prompt = "You are the architecture reviewer."
+runtimes = ["dsh", "claude-code"]
+runtime = "dsh"
+description = "架构评审"
+
+[agent.plugin-dev]
+prompt = "You write dsh plugins."
+runtime = "dsh"
+"#;
+        let cards = parse_agents(toml).unwrap();
+        let arch = cards.iter().find(|c| c.name == "architect").unwrap();
+        assert_eq!(arch.runtime.as_deref(), Some("dsh"));
+        assert_eq!(arch.runtimes, vec!["dsh", "claude-code"]);
+        assert!(arch.prompt.as_deref().unwrap().contains("architecture"));
+        // runtimes also present as spawnable cards
+        assert!(cards.iter().any(|c| c.name == "claude-code"));
+        // plugin-dev defaults to its only runtime
+        let plug = cards.iter().find(|c| c.name == "plugin-dev").unwrap();
+        assert_eq!(plug.runtime.as_deref(), Some("dsh"));
+    }
+
+    #[test]
+    fn legacy_agents_still_parse() {
+        let toml = r#"
+[agent.dsh]
+harness = "dsh"
+description = "legacy"
+"#;
+        let cards = parse_agents(toml).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].name, "dsh");
+        assert!(cards[0].runtime.is_none());
     }
 }

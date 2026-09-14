@@ -56,6 +56,8 @@ export function Agents() {
                     <div className="muted">{a.harness}</div>
                   </div>
                   <span className="grow" />
+                  {a.runtime ? <span className="tag">{a.runtime}</span> : null}
+                  {a.prompt ? <span className="tag warn">role</span> : null}
                   {a.enabled ? (
                     <span className="tag ok">{t("agents.enabled")}</span>
                   ) : (
