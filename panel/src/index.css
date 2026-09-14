@@ -479,6 +479,34 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
 .diff-detail code { color: var(--ant-color-text-quaternary); }
 
 .search-bar { display: flex; gap: 8px; margin-bottom: 14px; }
+
+/* Knowledge editor — markdown is the truth source -------------------- */
+
+.legacy-hint {
+  font-size: 12px; line-height: 16px;
+  color: var(--ant-color-text-quaternary);
+  white-space: nowrap;
+}
+.md-editor {
+  font-family: var(--ant-font-family-code, "IBM Plex Mono", ui-monospace, Consolas, monospace);
+  font-size: 13px; line-height: 18px;
+}
+.chunk-item { margin-bottom: 4px; }
+.chunk-item > .raw { margin-bottom: 0; }
+.chunk-actions { padding: 0 2px 6px; }
+.chunk-actions .ant-btn { padding-inline: 6px; height: 22px; }
+.chunk-revisions {
+  border-left: 2px solid var(--ant-color-border-secondary);
+  padding-left: 10px;
+  margin: 2px 0 10px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.revision .raw { max-height: 140px; margin: 2px 0 6px; }
+.rev-label {
+  display: block; font-size: 11px; line-height: 15px;
+  color: var(--ant-color-text-quaternary); margin-top: 4px;
+}
+.rev-old { color: var(--ant-color-text-quaternary); background: transparent; }
 .search-bar .grow { min-width: 0; }
 .search-hit { padding: 9px 4px; border-bottom: 1px solid var(--ant-color-border-secondary); }
 .search-hit:last-child { border-bottom: none; }

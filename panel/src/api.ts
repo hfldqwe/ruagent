@@ -172,6 +172,40 @@ export interface SearchHit {
   score: number;
 }
 
+/** One recorded chunk edit (old/new pair, newest first). */
+export interface KnowledgeRevision {
+  id: number;
+  chunk_id: number;
+  document_name: string;
+  old_content: string;
+  new_content: string;
+  edited_at: string;
+}
+
+/** Result of a chunk edit or a revision rollback. */
+export interface KnowledgeEditOutcome {
+  revision: number;
+  document: string;
+  chunks: number;
+}
+
+/** A hit expanded into its parent section. */
+export interface KnowledgeExpansion {
+  chunk_id: number;
+  document: string;
+  section: string;
+  chunk: string;
+  file: string | null;
+}
+
+/** One pass of the file → index rebuild. */
+export interface KnowledgeRebuildReport {
+  indexed: number;
+  unchanged: number;
+  removed: number;
+  errors: number;
+}
+
 export interface GraphEntity {
   id: number;
   name: string;
@@ -213,6 +247,15 @@ async function send(method: string, path: string, body?: unknown): Promise<Respo
 }
 
 const post = (path: string, body?: unknown) => send("POST", path, body);
+const put = (path: string, body?: unknown) => send("PUT", path, body);
+const patch = (path: string, body?: unknown) => send("PATCH", path, body);
+
+/** GET a non-JSON body (the raw markdown endpoint). */
+async function getText(path: string): Promise<string> {
+  const resp = await fetch(`${BASE}${path}`);
+  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status}`);
+  return resp.text();
+}
 
 // ---------------------------------------------------------------------------
 // API
@@ -297,6 +340,31 @@ export const api = {
   knowledgeSearch: (q: string) =>
     get<{ hits: SearchHit[] }>(`/api/v1/knowledge/search?q=${encodeURIComponent(q)}`).then(
       (r) => r.hits,
+    ),
+  // knowledge — markdown truth-source editing
+  knowledgeRaw: (name: string) =>
+    getText(`/api/v1/knowledge/raw/${encodeURIComponent(name)}`),
+  knowledgeSave: (name: string, content: string) =>
+    put(`/api/v1/knowledge/raw/${encodeURIComponent(name)}`, { content }).then(
+      (r) => r.json() as Promise<{ chunks: number; file: string }>,
+    ),
+  knowledgeEditChunk: (id: number, content: string) =>
+    patch(`/api/v1/knowledge/chunks/${id}`, { content }).then(
+      (r) => r.json() as Promise<KnowledgeEditOutcome>,
+    ),
+  knowledgeChunkRevisions: (id: number) =>
+    get<{ revisions: KnowledgeRevision[] }>(`/api/v1/knowledge/chunks/${id}/revisions`).then(
+      (r) => r.revisions,
+    ),
+  knowledgeRollback: (revisionId: number) =>
+    post(`/api/v1/knowledge/revisions/${revisionId}/rollback`).then(
+      (r) => r.json() as Promise<KnowledgeEditOutcome>,
+    ),
+  knowledgeExpand: (chunkId: number) =>
+    get<KnowledgeExpansion>(`/api/v1/knowledge/expand/${chunkId}`),
+  knowledgeRebuild: () =>
+    post("/api/v1/knowledge/rebuild").then(
+      (r) => r.json() as Promise<{ rebuild: KnowledgeRebuildReport }>,
     ),
 
   // graph
