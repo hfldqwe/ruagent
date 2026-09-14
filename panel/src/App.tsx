@@ -11,6 +11,7 @@ import { api } from "./api";
 import { Icon } from "./icons";
 import { useI18n } from "./i18n";
 import { ThemeProvider, useThemeMode } from "./theme";
+import { CommandPalette } from "./CommandPalette";
 import { ToastBridge } from "./ui";
 import { Board } from "./views/Board";
 import { Home } from "./views/Home";
@@ -21,6 +22,7 @@ import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
 import { Chat } from "./views/Chat";
 import { Sessions } from "./views/Sessions";
+import { CreateTaskModal } from "./views/Board";
 
 const { Sider, Content } = Layout;
 
@@ -78,6 +80,8 @@ function Shell() {
   const [view, setView] = useState<View>(() => parseHash());
   const [inboxCount, setInboxCount] = useState(0);
   const [daemonUp, setDaemonUp] = useState(true);
+  const [cmdk, setCmdk] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   useEffect(() => {
     const apply = () => setView(parseHash());
@@ -152,6 +156,7 @@ function Shell() {
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <ToastBridge />
+      <CommandPalette open={cmdk} onOpenChange={setCmdk} nav={nav} onNewTask={() => setCreating(true)} />
       <Sider width={228} className="app-sider">
         <div className="sider-inner">
         <div
@@ -179,6 +184,9 @@ function Shell() {
           </span>
           <span className="build-id" title="panel build">b {__BUILD_ID__}</span>
           <span className="grow" />
+          <button className="kbd-hint" onClick={() => setCmdk(true)} title={t("cmd.placeholder")}>
+            Ctrl K ⌘K
+          </button>
           <Tooltip title={mode === "dark" ? t("theme.light") : t("theme.dark")}>
             <Button
               size="small"
@@ -195,6 +203,15 @@ function Shell() {
         </div>
         </div>
       </Sider>
+      {creating && (
+        <CreateTaskModal
+          onClose={() => setCreating(false)}
+          onCreated={(id) => {
+            setCreating(false);
+            nav(`task/${id}`);
+          }}
+        />
+      )}
       <Layout>
         <Content className="content">
           {view.kind === "home" && (
