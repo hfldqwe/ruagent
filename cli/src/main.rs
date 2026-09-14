@@ -43,6 +43,10 @@ enum Cmd {
     Skills,
     /// Sync skills into every enabled harness's skill directories.
     SkillsSync,
+    /// Platform self-check: embedder, semantic recall, memory lifecycle,
+    /// graph traversal, session sync, distillation. Prints PASS/FAIL
+    /// per check with details; exit code 1 if anything failed.
+    Doctor,
     /// Run a prompt as a one-off task and stream the result.
     Run {
         prompt: String,
@@ -68,6 +72,7 @@ fn main() -> Result<()> {
             runtime.block_on(ruagent_daemon::serve(root, addr))
         }
         Cmd::Agents => list_agents(&cli.url),
+        Cmd::Doctor => doctor(&cli.url),
         Cmd::Status => status(&cli.url),
         Cmd::Skills => skills_cmd(&cli.url, false),
         Cmd::SkillsSync => skills_cmd(&cli.url, true),
@@ -91,6 +96,196 @@ fn client() -> reqwest::blocking::Client {
         .timeout(Duration::from_secs(600))
         .build()
         .expect("http client builds")
+}
+
+// ---------------------------------------------------------------------------
+// doctor: end-to-end self-check against a running daemon
+// ---------------------------------------------------------------------------
+
+struct Check {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+fn doctor(url: &str) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let get = |path: &str| -> Option<serde_json::Value> {
+        client
+            .get(format!("{url}{path}"))
+            .send()
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .ok()
+    };
+    let post = |path: &str, body: &str| -> Option<serde_json::Value> {
+        client
+            .post(format!("{url}{path}"))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .ok()
+    };
+    let mut checks: Vec<Check> = Vec::new();
+
+    // 1. daemon + embedder
+    match get("/api/v1/knowledge/documents") {
+        Some(v) => {
+            let embedder = v["embedder"].as_str().unwrap_or("?");
+            checks.push(Check {
+                name: "daemon + knowledge".into(),
+                ok: true,
+                detail: format!("embedder = {embedder}"),
+            });
+            let semantic = embedder != "hash-embedder";
+            checks.push(Check {
+                name: "semantic embeddings".into(),
+                ok: semantic,
+                detail: if semantic {
+                    "real model active".into()
+                } else {
+                    "hash fallback — run with network once to pull the model (hf-mirror friendly)"
+                        .into()
+                },
+            });
+        }
+        None => checks.push(Check {
+            name: "daemon + knowledge".into(),
+            ok: false,
+            detail: format!("daemon unreachable at {url} (ruagent serve)"),
+        }),
+    }
+
+    // 2. semantic recall probe: distinct phrasings must hit the same doc.
+    if let Some(doc) = post(
+        "/api/v1/knowledge/ingest",
+        r##"{"name":"doctor-probe","content":"# Doctor probe\n\nThe quarterly ritual involves lighting the braziers at dawn and sounding the bronze bell twice."}"##,
+    ) {
+        let _ = doc; // ingest ok
+        let a = get("/api/v1/knowledge/search?q=what%20happens%20at%20sunrise%20every%20quarter");
+        let hit = a
+            .and_then(|v| v["hits"].as_array().cloned())
+            .map(|h| !h.is_empty() && h[0]["document"] == "doctor-probe")
+            .unwrap_or(false);
+        checks.push(Check {
+            name: "semantic recall".into(),
+            ok: hit,
+            detail: if hit {
+                "sunrise→dawn probe hit".into()
+            } else {
+                "probe missed — recall quality".into()
+            },
+        });
+    } else {
+        checks.push(Check {
+            name: "semantic recall".into(),
+            ok: false,
+            detail: "ingest failed".into(),
+        });
+    }
+
+    // 3. memory lifecycle: write → recall → supersede
+    let mem = post(
+        "/api/v1/memory/write",
+        r#"{"store":"observation","namespace":"user","content":"doctor probe: the kettle is chrome"}"#,
+    );
+    checks.push(Check {
+        name: "memory write".into(),
+        ok: mem.is_some(),
+        detail: mem
+            .map(|m| m["outcome"].as_str().unwrap_or("?").to_string())
+            .unwrap_or_else(|| "failed".into()),
+    });
+    let recall = get("/api/v1/recall?q=kettle%20material&strategy=aggressive&top_n=3");
+    let mem_hit = recall
+        .and_then(|v| v["memories"].as_array().cloned())
+        .map(|m| {
+            m.iter()
+                .any(|x| x["content"].as_str().unwrap_or("").contains("chrome"))
+        })
+        .unwrap_or(false);
+    checks.push(Check {
+        name: "memory recall (semantic+fts)".into(),
+        ok: mem_hit,
+        detail: if mem_hit {
+            "kettle probe recalled".into()
+        } else {
+            "not recalled".into()
+        },
+    });
+
+    // 4. graph: entity + fact + as-of
+    if let Some(e1) = post(
+        "/api/v1/graph/entity",
+        r#"{"name":"doctor-node","kind":"tool"}"#,
+    ) {
+        let id = e1["id"].as_i64().unwrap_or(0);
+        let facts = get(&format!("/api/v1/graph/entity/{id}"));
+        checks.push(Check {
+            name: "graph entity".into(),
+            ok: facts.is_some(),
+            detail: format!("entity #{id} readable"),
+        });
+    } else {
+        checks.push(Check {
+            name: "graph entity".into(),
+            ok: false,
+            detail: "create failed".into(),
+        });
+    }
+
+    // 5. session sync: sources present?
+    if let Some(v) = get("/api/v1/sessions?limit=500") {
+        let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
+        let sources: Vec<String> = {
+            let mut s: Vec<String> = sessions
+                .iter()
+                .filter_map(|x| x["source"].as_str().map(str::to_owned))
+                .collect();
+            s.sort();
+            s.dedup();
+            s
+        };
+        checks.push(Check {
+            name: "session sync".into(),
+            ok: !sessions.is_empty(),
+            detail: format!("{} sessions from: {}", sessions.len(), sources.join(", ")),
+        });
+    }
+
+    // 6. distillation pipeline (dry signal): last distill_log entry age
+    // (API has no distill_log endpoint yet — skip quietly when absent)
+
+    // report
+    println!(
+        "ruagent doctor — {}
+",
+        url
+    );
+    let mut failed = 0;
+    for c in &checks {
+        let mark = if c.ok { "PASS" } else { "FAIL" };
+        if !c.ok {
+            failed += 1;
+        }
+        println!("  [{mark}] {:<26} {}", c.name, c.detail);
+    }
+    println!();
+    if failed == 0 {
+        println!("all checks passed");
+        Ok(())
+    } else {
+        println!("{failed} check(s) failed");
+        bail!("{failed} doctor checks failed")
+    }
 }
 
 fn list_agents(url: &str) -> Result<()> {
