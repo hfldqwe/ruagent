@@ -108,6 +108,22 @@ struct Check {
     detail: String,
 }
 
+/// Any CLI session store present on this machine?
+fn self_has_cli_histories() -> bool {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    [
+        home.join(".claude").join("projects"),
+        home.join(".dsh").join("sessions"),
+        home.join(".local/share/opencode"),
+        home.join(".ruagent").join("data").join("transcripts"),
+    ]
+    .iter()
+    .any(|p| p.is_dir())
+}
+
 fn doctor(url: &str) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -146,11 +162,16 @@ fn doctor(url: &str) -> Result<()> {
                 detail: format!("embedder = {embedder}"),
             });
             let semantic = embedder != "hash-embedder";
+            // Advisory when the operator explicitly pinned the offline
+            // fallback (CI does: RUAGENT_EMBEDDER=hash).
+            let pinned = std::env::var("RUAGENT_EMBEDDER").as_deref() == Ok("hash");
             checks.push(Check {
                 name: "semantic embeddings".into(),
-                ok: semantic,
+                ok: semantic || pinned,
                 detail: if semantic {
                     "real model active".into()
+                } else if pinned {
+                    "hash fallback (pinned via RUAGENT_EMBEDDER=hash) — advisory".into()
                 } else {
                     "hash fallback — run with network once to pull the model (hf-mirror friendly)"
                         .into()
@@ -242,9 +263,19 @@ fn doctor(url: &str) -> Result<()> {
         });
     }
 
-    // 5. session sync: sources present?
-    if let Some(v) = get("/api/v1/sessions?limit=500") {
-        let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
+    // 5. session sync: sources present? The indexer's first pass races
+    // daemon boot — poll briefly before declaring failure.
+    {
+        let mut sessions: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..12 {
+            if let Some(v) = get("/api/v1/sessions?limit=500") {
+                sessions = v["sessions"].as_array().cloned().unwrap_or_default();
+                if !sessions.is_empty() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
         let sources: Vec<String> = {
             let mut s: Vec<String> = sessions
                 .iter()
@@ -254,10 +285,17 @@ fn doctor(url: &str) -> Result<()> {
             s.dedup();
             s
         };
+        // On a machine with no CLI histories (fresh CI runner) there is
+        // legitimately nothing to sync — advisory then.
+        let no_histories = !self_has_cli_histories();
         checks.push(Check {
             name: "session sync".into(),
-            ok: !sessions.is_empty(),
-            detail: format!("{} sessions from: {}", sessions.len(), sources.join(", ")),
+            ok: !sessions.is_empty() || no_histories,
+            detail: if sessions.is_empty() && no_histories {
+                "no CLI histories on this machine (advisory)".into()
+            } else {
+                format!("{} sessions from: {}", sessions.len(), sources.join(", "))
+            },
         });
     }
 
