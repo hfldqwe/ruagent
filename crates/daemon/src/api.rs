@@ -57,7 +57,9 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(knowledge_document_chunks).delete(knowledge_document_delete),
         )
         .route(
-            "/api/v1/knowledge/raw/{name}",
+            // Wildcard: document names are `/`-separated paths into the
+            // knowledge tree (wiki mode M0) — `raw/wiki/deploy-guide`.
+            "/api/v1/knowledge/raw/{*name}",
             get(knowledge_raw).put(knowledge_raw_put),
         )
         .route("/api/v1/knowledge/rebuild", post(knowledge_rebuild))

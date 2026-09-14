@@ -71,10 +71,14 @@ pub struct EditOutcome {
 
 fn invalid_name(name: &str) -> KnowledgeError {
     KnowledgeError::Other(format!(
-        "invalid document name `{name}` (no path separators, `..`, leading dot, \
-         or Windows-reserved characters; 1..=128 chars)"
+        "invalid document name `{name}` (1..=4 `/`-separated segments, each 1..=64 chars; \
+         no `..`, empty or dot-prefixed segments, `\\`, or Windows-reserved characters)"
     ))
 }
+
+/// How deep the knowledge tree goes: `wiki/<a>/<b>/<c>.md` is the
+/// deepest legal document (wiki mode design §8, M0).
+const MAX_PATH_DEPTH: usize = 4;
 
 /// One chunk joined with its document, as `edit_chunk` needs it.
 struct ChunkRow {
@@ -86,24 +90,90 @@ struct ChunkRow {
     source: Option<String>,
 }
 
-/// `<name>` → a safe `<name>.md` file name (accepts an optional `.md`
-/// suffix on input).
+/// `<a/b>` → a safe relative file path `<a/b>.md` (accepts an optional
+/// `.md` suffix on input). Every `/`-separated segment goes through the
+/// single-segment rules; the result always stays inside the knowledge
+/// directory — `..`, empty segments (`a//b`, leading/trailing `/`) and
+/// `\` (Windows separator ambiguity) are rejected outright.
 fn doc_file_name(name: &str) -> Result<String, KnowledgeError> {
     let name = name.trim();
     let stem = name.strip_suffix(".md").unwrap_or(name);
-    if stem.is_empty() || stem.chars().count() > 128 {
+    let segments: Vec<&str> = stem.split('/').collect();
+    if segments.len() > MAX_PATH_DEPTH {
         return Err(invalid_name(name));
     }
-    if stem.contains(['/', '\\']) || stem.contains("..") || stem.starts_with('.') {
+    let mut out = String::new();
+    for seg in segments {
+        if seg.is_empty() || seg.chars().count() > 64 || seg.starts_with('.') {
+            return Err(invalid_name(name));
+        }
+        if seg
+            .chars()
+            .any(|c| matches!(c, '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control())
+        {
+            return Err(invalid_name(name));
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    if out.is_empty() || out.chars().count() > 200 {
         return Err(invalid_name(name));
     }
-    if stem
-        .chars()
-        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control())
-    {
-        return Err(invalid_name(name));
+    Ok(format!("{out}.md"))
+}
+
+/// Recursive `.md` walk of the knowledge tree: dot-directories are
+/// skipped (temp files, `.obsidian` and friends), symlinks are not
+/// followed, depth is capped at [`MAX_PATH_DEPTH`].
+fn walk_md_files(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > MAX_PATH_DEPTH {
+        return;
     }
-    Ok(format!("{stem}.md"))
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            walk_md_files(&entry.path(), depth + 1, out);
+        } else if entry.path().extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(entry.path());
+        }
+    }
+}
+
+/// Write via temp file + rename so the 60s scanner never indexes a
+/// half-written document (wiki mode design §10.8). The temp name is
+/// dot-prefixed and not `.md`, so both the walk and the extension
+/// check skip it.
+fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "doc".into());
+    let tmp = dir.join(format!(
+        ".{base}.tmp-{}",
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// The canonical document name for a file name (`foo.md` → `foo`).
@@ -145,13 +215,17 @@ impl Knowledge {
         Ok(count)
     }
 
-    /// Save a document: write `<root>/knowledge/<name>.md` and index
+    /// Save a document: write `<root>/knowledge/<name>.md` (nested
+    /// names create their directories; the write is atomic) and index
     /// it. This is the ingest path going forward — the file is the
     /// source of truth, the index is derived.
     pub async fn save(&self, name: &str, content: &str) -> Result<u32, KnowledgeError> {
         let file_name = doc_file_name(name)?;
         let path = self.docs_dir.join(&file_name);
-        std::fs::write(&path, content)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write(&path, content)?;
         match self
             .index_doc(&canonical_name(&file_name), content, Some(&file_name))
             .await?
@@ -171,33 +245,39 @@ impl Knowledge {
         }
     }
 
-    /// Incremental sync of the index with the knowledge directory:
-    /// new/changed files are (re)indexed (SHA-256 content hash skips
-    /// unchanged documents), files that vanished take their rows with
-    /// them. Non-file rows (legacy ingests) are never touched.
+    /// The `.md` files of the knowledge tree, as (relative file name,
+    /// absolute path) pairs. Names use `/` separators on every
+    /// platform — `strip_prefix` alone would leak the OS-native `\` on
+    /// Windows and split one document into two identities.
+    fn tree_files(&self) -> Vec<(String, PathBuf)> {
+        let mut paths = Vec::new();
+        walk_md_files(self.docs_dir(), 0, &mut paths);
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let rel = path.strip_prefix(self.docs_dir()).ok()?;
+                let file_name = rel.to_string_lossy().replace('\\', "/");
+                Some((file_name, path))
+            })
+            .collect()
+    }
+
+    /// Incremental sync of the index with the knowledge tree
+    /// (recursive): new/changed files are (re)indexed (SHA-256 content
+    /// hash skips unchanged documents), files that vanished take their
+    /// rows with them. Non-file rows (legacy ingests) are never touched.
     pub async fn scan(&self) -> Result<ScanReport, KnowledgeError> {
         let mut report = ScanReport::default();
         let mut present: Vec<String> = Vec::new();
 
-        let entries = match std::fs::read_dir(self.docs_dir()) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(report), // no dir yet: nothing to sync
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let name = canonical_name(file_name);
+        for (file_name, path) in self.tree_files() {
+            let name = canonical_name(&file_name);
             let Ok(content) = std::fs::read_to_string(&path) else {
                 report.errors += 1;
                 continue;
             };
             present.push(name.clone());
-            match self.index_doc(&name, &content, Some(file_name)).await {
+            match self.index_doc(&name, &content, Some(&file_name)).await {
                 Ok(IndexOutcome::Indexed(_)) => report.indexed += 1,
                 Ok(_) => report.unchanged += 1,
                 Err(e) => {
@@ -230,24 +310,13 @@ impl Knowledge {
         Ok(report)
     }
 
-    /// Rebuild the shadow index from the markdown files: force
-    /// reindex of every document (hashes ignored). The proof that the
-    /// index is disposable.
+    /// Rebuild the shadow index from the markdown files (recursive):
+    /// force reindex of every document (hashes ignored). The proof
+    /// that the index is disposable.
     pub async fn rebuild(&self) -> Result<ScanReport, KnowledgeError> {
         let mut report = ScanReport::default();
-        let entries = match std::fs::read_dir(self.docs_dir()) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(report),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let name = canonical_name(file_name);
+        for (file_name, path) in self.tree_files() {
+            let name = canonical_name(&file_name);
             let Ok(content) = std::fs::read_to_string(&path) else {
                 report.errors += 1;
                 continue;
@@ -269,7 +338,7 @@ impl Knowledge {
             for id in ids {
                 self.delete_document(id).await?;
             }
-            match self.index_doc(&name, &content, Some(file_name)).await {
+            match self.index_doc(&name, &content, Some(&file_name)).await {
                 Ok(IndexOutcome::Indexed(_)) => report.indexed += 1,
                 Ok(_) => report.unchanged += 1,
                 Err(_) => report.errors += 1,
@@ -720,9 +789,151 @@ mod tests {
     #[tokio::test]
     async fn invalid_names_are_rejected() {
         let (kb, root) = test_kb("names").await;
-        for bad in ["", "..", "a/b", "a\\b", ".hidden", "a<b", "con:"] {
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../evil",
+            "a/../b",
+            "a/..",
+            "..a/..b",
+            "/leading",
+            "trailing/",
+            "a//b", // empty segments
+            "a\\b", // windows separator
+            ".hidden",
+            "a/.hidden", // dot-prefixed segments
+            "a<b",
+            "con:x",     // reserved chars
+            "a/b/c/d/e", // too deep
+            "a/b/c/d/e/f/g",
+        ] {
             assert!(kb.save(bad, "x").await.is_err(), "name {bad:?} must fail");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn nested_documents_save_scan_and_delete() {
+        let (kb, root) = test_kb("nested").await;
+        let wiki_dir = root.join("knowledge").join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+
+        // Save a nested document (the wiki-mode layout).
+        let n = kb
+            .save(
+                "wiki/deploy-guide",
+                "# Deploy\n\nThe deploy script lives in scripts/release.sh.",
+            )
+            .await
+            .unwrap();
+        assert!(n >= 1);
+        assert!(
+            wiki_dir.join("deploy-guide.md").is_file(),
+            "nested file written"
+        );
+        // No temp-file residue from the atomic write.
+        let residue: Vec<_> = std::fs::read_dir(&wiki_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(residue.is_empty(), "atomic write left temp files");
+        let raw = kb.read_raw("wiki/deploy-guide").unwrap().unwrap();
+        assert!(raw.contains("release.sh"));
+        let raw2 = kb.read_raw("wiki/deploy-guide.md").unwrap().unwrap();
+        assert_eq!(raw, raw2, "optional .md suffix maps to the same doc");
+
+        // Out-of-band nested file (hand-dropped, like a wiki page will
+        // be) is picked up by the recursive scan.
+        std::fs::write(
+            wiki_dir.join("out-of-band.md"),
+            "# Tea\n\nEarl grey tastes best with a slice of lemon.",
+        )
+        .unwrap();
+        // A dot-directory must be ignored even with .md inside.
+        std::fs::create_dir_all(wiki_dir.join(".obsidian")).unwrap();
+        std::fs::write(wiki_dir.join(".obsidian").join("config.md"), "# hidden").unwrap();
+        // Non-markdown files are ignored too.
+        std::fs::write(wiki_dir.join("notes.txt"), "ignore me").unwrap();
+
+        let report = kb.scan().await.unwrap();
+        // deploy-guide was indexed by `save` already; the hand-dropped
+        // file is the scan's only new find.
+        assert_eq!(
+            report,
+            ScanReport {
+                indexed: 1,
+                unchanged: 1,
+                removed: 0,
+                errors: 0
+            },
+            "{report:?}"
+        );
+        let docs = kb.list_documents().await.unwrap();
+        assert!(docs.iter().any(|d| d.name == "wiki/deploy-guide"));
+        assert!(docs.iter().any(|d| d.name == "wiki/out-of-band"));
+        assert!(!docs.iter().any(|d| d.name.contains("obsidian")));
+        let hits = kb.search("earl grey lemon", 5).await.unwrap();
+        assert!(hits.iter().any(|h| h.document == "wiki/out-of-band"));
+
+        // Deeper nesting (4 segments is the legal max).
+        kb.save("a/b/c/d", "# Deep\n\nfour segments deep")
+            .await
+            .unwrap();
+        assert!(kb.save("a/b/c/d/e", "# Too deep").await.is_err());
+        let docs = kb.list_documents().await.unwrap();
+        assert!(docs.iter().any(|d| d.name == "a/b/c/d"));
+        // Everything already indexed: the scan is a no-op.
+        assert_eq!(
+            kb.scan().await.unwrap(),
+            ScanReport {
+                indexed: 0,
+                unchanged: 3,
+                removed: 0,
+                errors: 0
+            }
+        );
+
+        // Deleting the nested doc takes its file (and only its file).
+        let docs = kb.list_documents().await.unwrap();
+        let target = docs.iter().find(|d| d.name == "wiki/out-of-band").unwrap();
+        kb.delete_document_with_file(target.id).await.unwrap();
+        assert!(!wiki_dir.join("out-of-band.md").exists());
+        assert!(
+            wiki_dir.join("deploy-guide.md").is_file(),
+            "sibling untouched"
+        );
+
+        // Out-of-band deletion: file gone → scan removes the row.
+        std::fs::remove_file(wiki_dir.join("deploy-guide.md")).unwrap();
+        let report = kb.scan().await.unwrap();
+        assert_eq!(report.removed, 1, "{report:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn rebuild_walks_the_tree_recursively() {
+        let (kb, root) = test_kb("nested-rebuild").await;
+        kb.save("top-doc", "# Top\n\nTop level content.")
+            .await
+            .unwrap();
+        kb.save("wiki/nested", "# Nested\n\nNested content.")
+            .await
+            .unwrap();
+        // Simulate index loss for the nested doc.
+        let docs = kb.list_documents().await.unwrap();
+        let nested = docs.iter().find(|d| d.name == "wiki/nested").unwrap();
+        kb.delete_document(nested.id).await.unwrap();
+        let (docs, _) = kb.stats().await.unwrap();
+        assert_eq!(docs, 1);
+
+        let report = kb.rebuild().await.unwrap();
+        assert_eq!(report.indexed, 2, "both levels rebuilt: {report:?}");
+        let docs = kb.list_documents().await.unwrap();
+        assert!(docs.iter().any(|d| d.name == "wiki/nested"));
+        let hits = kb.search("nested content", 5).await.unwrap();
+        assert!(hits.iter().any(|h| h.document == "wiki/nested"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -305,14 +305,81 @@ async fn markdown_truth_chunk_edits_and_parent_recall() {
         "delete removes the file too"
     );
 
-    // Invalid names are rejected.
+    // Invalid names are rejected — `..` never escapes the knowledge
+    // tree (`/` itself is now a legal path separator).
+    for bad in ["..%2Fevil", "a%2F..%2Fb", "%2Fleading"] {
+        let resp = http
+            .put(format!("{daemon_url}/api/v1/knowledge/raw/{bad}"))
+            .json(&serde_json::json!({ "content": "x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "traversal rejected: {bad}");
+        assert!(!root.join("evil.md").exists(), "nothing written outside");
+    }
+
+    // Nested documents (the wiki-mode layout): write, read, search,
+    // out-of-band pickup via the recursive rebuild.
+    let resp: serde_json::Value = http
+        .put(format!("{daemon_url}/api/v1/knowledge/raw/wiki/deploy"))
+        .json(&serde_json::json!({ "content": DOC }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp["chunks"].as_i64().unwrap_or(0) >= 2, "{resp:?}");
+    assert!(
+        root.join("knowledge")
+            .join("wiki")
+            .join("deploy.md")
+            .is_file()
+    );
     let resp = http
-        .put(format!("{daemon_url}/api/v1/knowledge/raw/a%2Fb")) // "a/b"
-        .json(&serde_json::json!({ "content": "x" }))
+        .get(format!("{daemon_url}/api/v1/knowledge/raw/wiki/deploy"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "path separators rejected");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), DOC);
+
+    // A hand-dropped nested file (how wiki pages will land) is picked
+    // up by the recursive walk — rebuild proves it end to end.
+    std::fs::write(
+        root.join("knowledge").join("wiki").join("tea.md"),
+        "# Tea\n\nEarl grey with lemon and honey.",
+    )
+    .unwrap();
+    let rebuild: serde_json::Value = http
+        .post(format!("{daemon_url}/api/v1/knowledge/rebuild"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        rebuild["rebuild"]["indexed"].as_i64().unwrap_or(0) >= 2,
+        "{rebuild:?}"
+    );
+    let hits: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/search"))
+        .query(&[("q", "lemon honey")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["document"].as_str() == Some("wiki/tea")),
+        "{hits:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
