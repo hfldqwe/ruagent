@@ -4,6 +4,7 @@ use std::convert::Infallible;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -55,6 +56,24 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/knowledge/documents/{id}",
             axum::routing::get(knowledge_document_chunks).delete(knowledge_document_delete),
         )
+        .route(
+            "/api/v1/knowledge/raw/{name}",
+            get(knowledge_raw).put(knowledge_raw_put),
+        )
+        .route("/api/v1/knowledge/rebuild", post(knowledge_rebuild))
+        .route(
+            "/api/v1/knowledge/chunks/{id}",
+            axum::routing::patch(knowledge_chunk_edit),
+        )
+        .route(
+            "/api/v1/knowledge/chunks/{id}/revisions",
+            get(knowledge_chunk_revisions),
+        )
+        .route(
+            "/api/v1/knowledge/revisions/{id}/rollback",
+            post(knowledge_revision_rollback),
+        )
+        .route("/api/v1/knowledge/expand/{chunk_id}", get(knowledge_expand))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route(
@@ -383,12 +402,150 @@ async fn knowledge_document_delete(
     let id: i64 = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid document id"))?;
+    // File-backed documents take their `.md` with them — the file is
+    // the source of truth, a row-only delete would be resurrected by
+    // the next scan.
     state
         .knowledge
-        .delete_document(id)
+        .delete_document_with_file(id)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge markdown files (source of truth) + chunk curation
+// (design-study memsearch/EverOS/WeKnora)
+// ---------------------------------------------------------------------------
+
+/// The raw markdown of one document — the source of truth itself.
+async fn knowledge_raw(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    match state.knowledge.read_raw(&name) {
+        Ok(Some(content)) => Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8",
+            )],
+            content,
+        )
+            .into_response()),
+        Ok(None) => Err(ApiError::not_found("no such knowledge document")),
+        Err(e) => Err(ApiError::bad_request(format!("{e}"))),
+    }
+}
+
+#[derive(Deserialize)]
+struct KnowledgeRawPut {
+    content: String,
+}
+
+/// Write a document's markdown: the file lands under
+/// `<root>/knowledge/<name>.md` (human-editable, git-friendly) and the
+/// index follows immediately.
+async fn knowledge_raw_put(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<KnowledgeRawPut>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let chunks = state
+        .knowledge
+        .save(&name, &req.content)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({
+        "chunks": chunks,
+        "file": format!("{name}.md"),
+    })))
+}
+
+/// Rebuild the shadow index from the markdown files (proof the index
+/// is disposable).
+async fn knowledge_rebuild(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let report = state
+        .knowledge
+        .rebuild()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "rebuild": report })))
+}
+
+#[derive(Deserialize)]
+struct ChunkEditRequest {
+    content: String,
+}
+
+/// Edit one chunk (WeKnora chunk editing): the revision is recorded,
+/// the source `.md` is rewritten through the chunk's span, and the
+/// document is reindexed.
+async fn knowledge_chunk_edit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChunkEditRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chunk id"))?;
+    let out = state
+        .knowledge
+        .edit_chunk(id, &req.content)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::to_value(out).unwrap_or_default()))
+}
+
+/// Revision history of one chunk.
+async fn knowledge_chunk_revisions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chunk id"))?;
+    let revisions = state
+        .knowledge
+        .chunk_revisions(id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "revisions": revisions })))
+}
+
+/// Roll one revision back (the rollback itself is recorded as a new
+/// revision).
+async fn knowledge_revision_rollback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid revision id"))?;
+    let out = state
+        .knowledge
+        .rollback_revision(id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::to_value(out).unwrap_or_default()))
+}
+
+/// Expand one hit into its parent section: complete context around the
+/// chunk (the `expand` layer of progressive recall).
+async fn knowledge_expand(
+    State(state): State<AppState>,
+    Path(chunk_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = chunk_id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chunk id"))?;
+    let expansion = state
+        .knowledge
+        .expand(id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    Ok(Json(serde_json::to_value(expansion).unwrap_or_default()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,12 +1209,18 @@ async fn recall(
         .map_err(|e| ApiError::bad_request(format!("{e}")))?
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
 
-    // Knowledge chunks (hybrid semantic + keyword).
+    // Knowledge chunks (hybrid semantic + keyword). Parent-child
+    // retrieval (WeKnora): the hit is the precise unit, the aggressive
+    // strategy returns the parent SECTION for complete context.
     let hits = state
         .knowledge
         .search(&q.q, top_n)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    let parents = state
+        .knowledge
+        .parents_for(&hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>())
+        .await;
 
     // Graph entities (name/summary match) + their currently-valid facts
     // (the relations half of the conservative strategy's stubs).
@@ -1147,11 +1310,18 @@ async fn recall(
             serde_json::json!({
                 "kind": "knowledge", "chunk_id": h.chunk_id, "document": h.document,
                 "excerpt": truncate_chars(&h.content, 80),
+                "hint": "call knowledge_expand(chunk_id) for the full section",
             })
         } else {
             serde_json::json!({
                 "kind": "knowledge", "chunk_id": h.chunk_id, "document": h.document,
-                "content": h.content, "score": h.score,
+                // The parent section (capped): the hit's full context.
+                "content": parents
+                    .get(&h.chunk_id)
+                    .map(|p| truncate_chars(p, PARENT_CONTEXT_CAP))
+                    .unwrap_or_else(|| h.content.clone()),
+                "excerpt": truncate_chars(&h.content, 160),
+                "score": h.score,
             })
         });
     }
@@ -1207,6 +1377,7 @@ async fn recall(
             serde_json::json!({
                 "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,
                 "facts": facts, "related": related,
+                "hint": "call graph_entity(id) for facts and neighbors",
             })
         } else {
             serde_json::json!({
@@ -1269,6 +1440,10 @@ fn truncate_chars(s: &str, n: usize) -> String {
         s.chars().take(n).collect::<String>() + "…"
     }
 }
+
+/// Cap on the parent section returned by aggressive recall: sections
+/// can be long; context budgets cannot.
+const PARENT_CONTEXT_CAP: usize = 2000;
 
 async fn list_permissions(State(state): State<AppState>) -> Json<serde_json::Value> {
     let pending: Vec<PendingPermission> = state.mgr.pending_permissions();
@@ -1689,12 +1864,16 @@ async fn knowledge_ingest(
     State(state): State<AppState>,
     Json(req): Json<KnowledgeIngestRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Markdown is the source of truth: ingest writes the document file
+    // and indexes it (the index is a rebuildable shadow).
     let chunks = state
         .knowledge
-        .ingest(&req.name, &req.content)
+        .save(&req.name, &req.content)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    Ok(Json(serde_json::json!({ "chunks": chunks })))
+    Ok(Json(
+        serde_json::json!({ "chunks": chunks, "file": format!("{}.md", req.name.trim().trim_end_matches(".md")) }),
+    ))
 }
 
 async fn knowledge_search(

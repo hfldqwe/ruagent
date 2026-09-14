@@ -18,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
+sha2 = "0.10"
 fastembed = "6"
 
 [dev-dependencies]

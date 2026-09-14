@@ -165,6 +165,31 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         "knowledge base embedder"
     );
 
+    // Knowledge markdown sync (design-study memsearch/EverOS): the
+    // `.md` files under <root>/knowledge are the source of truth, the
+    // SQLite+LanceDB index a derived shadow. This scan — boot + every
+    // 60s, SHA-256-incremental — picks up out-of-band edits (editor,
+    // git checkout) and deletions, and reindexes what changed.
+    {
+        let kb_scanner = knowledge.clone();
+        tokio::spawn(async move {
+            loop {
+                match kb_scanner.scan().await {
+                    Ok(report) if report.changed() > 0 => tracing::info!(
+                        indexed = report.indexed,
+                        unchanged = report.unchanged,
+                        removed = report.removed,
+                        errors = report.errors,
+                        "knowledge scan"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "knowledge scan failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
     // Chats (terminal-like sessions) share the permission inbox with runs:
     // every chat ask parks in the same inbox (rules → human), keyed by the
     // chat id.

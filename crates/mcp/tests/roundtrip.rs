@@ -128,8 +128,12 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
     for expected in [
         "memory_search",
         "memory_write",
+        "memory_recall",
+        "memory_get",
         "knowledge_search",
         "knowledge_ingest",
+        "knowledge_expand",
+        "graph_entity",
         "list_tasks",
     ] {
         assert!(
@@ -190,6 +194,50 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
     assert!(
         text_of(&out).contains("scripts/release.sh"),
         "{}",
+        text_of(&out)
+    );
+
+    // Expand a hit into its parent section via MCP: the chunk id comes
+    // off the daemon's HTTP surface.
+    let http = reqwest::Client::new();
+    let docs: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/documents"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let doc_id = docs["documents"]
+        .as_array()
+        .and_then(|d| d.first())
+        .and_then(|d| d["id"].as_i64())
+        .expect("ingested document listed");
+    let chunks: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/documents/{doc_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let chunk_id = chunks["chunks"]
+        .as_array()
+        .and_then(|c| c.first())
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|id| id.as_i64())
+        .expect("document has chunks");
+    let out = client
+        .call_tool(call(
+            "knowledge_expand",
+            serde_json::json!({ "chunk_id": chunk_id }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&out).contains("release.sh"),
+        "expansion carries the section: {}",
         text_of(&out)
     );
 

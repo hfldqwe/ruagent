@@ -222,9 +222,18 @@ pub async fn list_entities(db: &Db, limit: u32) -> Result<Vec<(Entity, i64)>, Db
 }
 
 /// FTS over entity names/summaries (the keyword candidate leg of
-/// resolution and retrieval).
+/// resolution and retrieval). Punctuated tokens (scripts/release.sh,
+/// node.js) are FTS5 syntax errors as raw input — quote each token
+/// into a literal phrase.
 pub async fn search_entities(db: &Db, query: &str, limit: u32) -> Result<Vec<Entity>, DbError> {
-    let query = query.to_string();
+    let fts_query = query
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if fts_query.is_empty() {
+        return Ok(Vec::new());
+    }
     db.call(move |conn| -> Result<Vec<Entity>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT e.id, e.name, e.kind, e.summary
@@ -232,7 +241,7 @@ pub async fn search_entities(db: &Db, query: &str, limit: u32) -> Result<Vec<Ent
              WHERE entities_fts MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![query, limit], |row| {
+            .query_map(rusqlite::params![fts_query, limit], |row| {
                 Ok(Entity {
                     id: row.get(0)?,
                     name: row.get(1)?,

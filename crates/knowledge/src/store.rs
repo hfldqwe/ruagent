@@ -12,12 +12,11 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 
 use ruagent_store::Db;
 
-use crate::chunk::chunk_text;
+use crate::chunk::chunk_sections;
 use crate::embed::{EmbedError, Embedder, HashEmbedder};
-use crate::fnv1a;
 use crate::rrf::rrf;
 
-const TABLE: &str = "knowledge_chunks";
+pub(crate) const TABLE: &str = "knowledge_chunks";
 
 #[derive(Debug, thiserror::Error)]
 pub enum KnowledgeError {
@@ -63,9 +62,15 @@ pub struct KnowledgeDocument {
 /// The knowledge base handle. Cheap to clone.
 #[derive(Clone)]
 pub struct Knowledge {
-    db: Db,
-    lance: Connection,
-    embedder: Arc<dyn Embedder>,
+    pub(crate) db: Db,
+    pub(crate) lance: Connection,
+    pub(crate) embedder: Arc<dyn Embedder>,
+    /// `<root>/knowledge` — the markdown documents (source of truth).
+    pub(crate) docs_dir: std::path::PathBuf,
+    /// Serializes index mutations (scan / save / edit / rebuild): they
+    /// are multi-step read-modify-write sequences over SQLite +
+    /// LanceDB, and a scan racing a save must not interleave.
+    pub(crate) index_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Knowledge {
@@ -86,10 +91,14 @@ impl Knowledge {
         let lance = lancedb::connect(dir.to_string_lossy().as_ref())
             .execute()
             .await?;
+        let docs_dir = root.join("knowledge");
+        std::fs::create_dir_all(&docs_dir)?;
         let this = Self {
             db,
             lance,
             embedder,
+            docs_dir,
+            index_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         this.ensure_table().await?;
         this.check_model_meta().await?;
@@ -167,82 +176,131 @@ impl Knowledge {
         }
     }
 
-    /// Ingest a document: chunk → embed → SQLite + LanceDB.
-    /// Idempotent per (name, content-hash).
+    /// Ingest a document into the index WITHOUT writing a file (the
+    /// legacy path; tests and pre-file rows). Idempotent per
+    /// (name, content-hash); a changed document replaces the old rows.
     pub async fn ingest(&self, name: &str, content: &str) -> Result<u32, KnowledgeError> {
-        let hash = format!("{:016x}", fnv1a(content.as_bytes()));
-        let name = name.to_string();
-        let name_for_check = name.clone();
-        let hash_for_check = hash.clone();
-
-        // Idempotency: same name+hash already ingested.
-        let exists: Option<i64> = self
-            .db
-            .call(move |conn| -> Result<Option<i64>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT id FROM documents WHERE name = ?1 AND content_hash = ?2",
-                    rusqlite::params![name_for_check, hash_for_check],
-                    |r| r.get(0),
-                )
-                .map(Some)
-                .or_else(|e| match e {
-                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                    e => Err(e),
-                })
-            })
-            .await?
-            .map_err(ruagent_store::DbError::from)?;
-        if exists.is_some() {
-            return Ok(0);
+        match self.index_doc(name, content, None).await? {
+            crate::files::IndexOutcome::Indexed(n) => Ok(n),
+            _ => Ok(0),
         }
-
-        let chunks = chunk_text(content);
-        if chunks.is_empty() {
-            return Ok(0);
-        }
-        let vectors = self
-            .embedder
-            .embed(&chunks.iter().map(String::as_str).collect::<Vec<_>>())?;
-
-        let chunk_count = chunks.len() as i64;
-        let doc_id: i64 = self
-            .db
-            .call(move |conn| -> Result<i64, rusqlite::Error> {
-                conn.execute(
-                    "INSERT INTO documents (name, source, content_hash, chunk_count, created_at)
-                     VALUES (?1, NULL, ?2, ?3, ?4)",
-                    rusqlite::params![name, hash, chunk_count, chrono::Utc::now().to_rfc3339()],
-                )?;
-                Ok(conn.last_insert_rowid())
-            })
-            .await?
-            .map_err(ruagent_store::DbError::from)?;
-
-        // Insert chunks, collecting ids.
-        let mut ids = Vec::with_capacity(chunks.len());
-        for (idx, chunk) in chunks.iter().enumerate() {
-            let chunk = chunk.clone();
-            let idx = idx as i64;
-            let id: i64 = self
-                .db
-                .call(move |conn| -> Result<i64, rusqlite::Error> {
-                    conn.execute(
-                        "INSERT INTO chunks (document_id, idx, content) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![doc_id, idx, chunk],
-                    )?;
-                    Ok(conn.last_insert_rowid())
-                })
-                .await?
-                .map_err(ruagent_store::DbError::from)?;
-            ids.push(id);
-        }
-
-        // Vectors into LanceDB.
-        self.add_vectors(&ids, &vectors).await?;
-        Ok(ids.len() as u32)
     }
 
-    async fn add_vectors(&self, ids: &[i64], vectors: &[Vec<f32>]) -> Result<(), KnowledgeError> {
+    /// Index a document: chunk (with sections + spans) → embed →
+    /// SQLite + LanceDB. Upsert by name; same name + hash is a no-op.
+    /// `source` = the backing file name for markdown-file documents.
+    pub(crate) async fn index_doc(
+        &self,
+        name: &str,
+        content: &str,
+        source: Option<&str>,
+    ) -> Result<crate::files::IndexOutcome, KnowledgeError> {
+        use crate::files::IndexOutcome;
+
+        // Serialize index mutations (see field docs).
+        let _guard = self.index_lock.lock().await;
+
+        let hash = crate::sha256_hex(content.as_bytes());
+        let name = name.to_string();
+        let source = source.map(str::to_string);
+
+        // Upsert by name: same name + hash already indexed → no-op.
+        // Newest row wins the hash comparison; older duplicates (e.g. a
+        // pre-upgrade row) are replaced.
+        let existing: Vec<(i64, String)> = self
+            .db
+            .call({
+                let name = name.clone();
+                move |conn| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+                    let mut stmt =
+                        conn.prepare("SELECT id, content_hash FROM documents WHERE name = ?1")?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![name], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                }
+            })
+            .await?
+            .map_err(ruagent_store::DbError::from)?;
+        if let Some((_, latest_hash)) = existing.last()
+            && *latest_hash == hash
+        {
+            return Ok(IndexOutcome::Unchanged);
+        }
+        for (id, _) in &existing {
+            self.delete_document(*id).await?;
+        }
+
+        let sections = chunk_sections(content);
+        let texts: Vec<String> = sections
+            .iter()
+            .flat_map(|s| s.chunks.iter().map(|c| c.content.clone()))
+            .collect();
+        if texts.is_empty() {
+            return Ok(IndexOutcome::Empty);
+        }
+
+        // One writer-thread pass: document → sections → chunks.
+        let chunk_count = texts.len();
+        let name_for_insert = name.clone();
+        let source_for_insert = source.clone();
+        let ids: Vec<i64> = self
+            .db
+            .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+                conn.execute(
+                    "INSERT INTO documents (name, source, content_hash, chunk_count, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        name_for_insert,
+                        source_for_insert,
+                        hash,
+                        chunk_count as i64,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+                let doc_id = conn.last_insert_rowid();
+                let mut ids = Vec::with_capacity(chunk_count);
+                for (s_idx, section) in sections.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO chunk_sections (document_id, idx, content)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![doc_id, s_idx as i64, section.content],
+                    )?;
+                    let section_id = conn.last_insert_rowid();
+                    for chunk in &section.chunks {
+                        conn.execute(
+                            "INSERT INTO chunks
+                                (document_id, idx, content, span_start, span_end, section_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            rusqlite::params![
+                                doc_id,
+                                ids.len() as i64,
+                                chunk.content,
+                                chunk.start as i64,
+                                chunk.end as i64,
+                                section_id
+                            ],
+                        )?;
+                        ids.push(conn.last_insert_rowid());
+                    }
+                }
+                Ok(ids)
+            })
+            .await?
+            .map_err(ruagent_store::DbError::from)?;
+
+        // Vectors into LanceDB.
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let vectors = self.embedder.embed(&refs)?;
+        self.add_vectors(&ids, &vectors).await?;
+        Ok(IndexOutcome::Indexed(ids.len() as u32))
+    }
+
+    pub(crate) async fn add_vectors(
+        &self,
+        ids: &[i64],
+        vectors: &[Vec<f32>],
+    ) -> Result<(), KnowledgeError> {
         let dim = self.embedder.dim() as i32;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -294,22 +352,31 @@ impl Knowledge {
             }
         }
 
-        // Leg 2: keyword FTS.
-        let q = query.to_string();
-        let fts_ids: Vec<i64> = self
-            .db
-            .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
-                let mut stmt = conn.prepare(
-                    "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1
-                     ORDER BY rank LIMIT ?2",
-                )?;
-                let ids = stmt
-                    .query_map(rusqlite::params![q, leg_k as i64], |r| r.get(0))?
-                    .collect::<Result<Vec<i64>, _>>()?;
-                Ok(ids)
-            })
-            .await?
-            .map_err(ruagent_store::DbError::from)?;
+        // Leg 2: keyword FTS. Punctuated tokens (deploy.sh, scripts/*)
+        // are FTS5 syntax errors as raw input — quote each token into a
+        // literal phrase (the same treatment memory recall uses).
+        let fts_query = query
+            .split_whitespace()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fts_ids: Vec<i64> = if fts_query.is_empty() {
+            Vec::new()
+        } else {
+            self.db
+                .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1
+                         ORDER BY rank LIMIT ?2",
+                    )?;
+                    let ids = stmt
+                        .query_map(rusqlite::params![fts_query, leg_k as i64], |r| r.get(0))?
+                        .collect::<Result<Vec<i64>, _>>()?;
+                    Ok(ids)
+                })
+                .await?
+                .map_err(ruagent_store::DbError::from)?
+        };
 
         // Fuse.
         let fused = rrf(&[ann_ids, fts_ids], 60);
@@ -404,8 +471,9 @@ impl Knowledge {
             .await??)
     }
 
-    /// Delete a document: chunks (+FTS via trigger) from SQLite, vectors
-    /// from LanceDB by chunk-id filter.
+    /// Delete a document: chunks (+FTS via trigger) and sections from
+    /// SQLite, vectors from LanceDB by chunk-id filter. Ordered for the
+    /// FK constraints (chunks → sections → document).
     pub async fn delete_document(&self, document_id: i64) -> Result<u32, KnowledgeError> {
         let chunk_ids: Vec<i64> = self
             .db
@@ -417,30 +485,31 @@ impl Knowledge {
                 Ok(ids)
             })
             .await??;
-        if chunk_ids.is_empty() {
-            return Ok(0);
-        }
         let count = chunk_ids.len() as u32;
-        let ids_for_db = chunk_ids.clone();
         self.db
             .call(move |conn| -> Result<(), rusqlite::Error> {
                 conn.execute("DELETE FROM chunks WHERE document_id = ?1", [document_id])?;
+                conn.execute(
+                    "DELETE FROM chunk_sections WHERE document_id = ?1",
+                    [document_id],
+                )?;
                 conn.execute("DELETE FROM documents WHERE id = ?1", [document_id])?;
-                let _ = ids_for_db;
                 Ok(())
             })
             .await??;
         // Vectors out of LanceDB.
-        let table = self.lance.open_table(TABLE).execute().await?;
-        let filter = format!(
-            "id IN ({})",
-            chunk_ids
-                .iter()
-                .map(|i| i.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        table.delete(&filter).await?;
+        if !chunk_ids.is_empty() {
+            let table = self.lance.open_table(TABLE).execute().await?;
+            let filter = format!(
+                "id IN ({})",
+                chunk_ids
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            table.delete(&filter).await?;
+        }
         Ok(count)
     }
 

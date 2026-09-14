@@ -215,6 +215,75 @@ impl PlatformTools {
         ))
     }
 
+    #[tool(
+        description = "Expand a knowledge-base hit into its full parent section: the complete context (heading + surrounding paragraphs) around the chunk. Pass the chunk_id from memory_recall or knowledge_search results."
+    )]
+    async fn knowledge_expand(
+        &self,
+        Parameters(params): Parameters<ChunkParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!(
+            "{}/api/v1/knowledge/expand/{}",
+            self.config.daemon_url, params.chunk_id
+        );
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(format!(
+            "[{}] {}\n\n--- hit chunk ---\n{}",
+            resp["document"].as_str().unwrap_or("?"),
+            resp["section"].as_str().unwrap_or("?"),
+            resp["chunk"].as_str().unwrap_or("?"),
+        ))
+    }
+
+    #[tool(
+        description = "Fetch one knowledge-graph entity by id: its currently-valid facts (relations to other entities). The follow-up call for memory_recall's entity stubs."
+    )]
+    async fn graph_entity(
+        &self,
+        Parameters(params): Parameters<EntityParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!(
+            "{}/api/v1/graph/entity/{}",
+            self.config.daemon_url, params.id
+        );
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        let facts = resp["facts"].as_array().cloned().unwrap_or_default();
+        if facts.is_empty() {
+            return Ok(format!("entity #{} has no current facts", params.id));
+        }
+        let mut out = String::new();
+        for f in facts {
+            out.push_str(&format!(
+                "{} {} {}: {}\n",
+                f["src"].as_i64().unwrap_or(0),
+                f["relation"].as_str().unwrap_or("?"),
+                f["dst"].as_i64().unwrap_or(0),
+                f["fact_text"].as_str().unwrap_or("?"),
+            ));
+        }
+        Ok(out)
+    }
+
     // -- platform ops (the symmetric design, §7.2) -----------------------
 
     #[tool(
@@ -260,8 +329,10 @@ impl ServerHandler for PlatformTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "ruagent platform tools: search/write the user's long-term memory, \
-             search/ingest the knowledge base, and list platform tasks. \
-             Prefer memory_search before asking the user for known facts.",
+             search/ingest the knowledge base (expand hits into their full parent \
+             sections with knowledge_expand), fetch knowledge-graph entities, and \
+             list platform tasks. Prefer memory_search before asking the user for \
+             known facts.",
         )
     }
 }
@@ -313,13 +384,26 @@ pub struct IngestParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ChunkParams {
+    #[schemars(description = "Chunk id from recall/search results")]
+    pub chunk_id: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct EntityParams {
+    #[schemars(description = "Entity id from recall results")]
+    pub id: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TaskFilterParams {
     #[schemars(description = "Optional status filter")]
     pub status: Option<String>,
 }
 
 /// Render a /recall response for an agent: sectioned, ids preserved
-/// (conservative stubs point at memory_get / graph_entity).
+/// (conservative stubs point at memory_get / knowledge_expand /
+/// graph_entity).
 fn recall_to_text(resp: &serde_json::Value) -> String {
     let mut out = Vec::new();
     for section in ["memories", "knowledge", "entities"] {
@@ -348,14 +432,15 @@ fn recall_to_text(resp: &serde_json::Value) -> String {
                         .as_str()
                         .or_else(|| it["excerpt"].as_str())
                         .unwrap_or("?");
-                    format!("  [{doc}] {body}")
+                    let cid = it["chunk_id"].clone();
+                    format!("  [{doc}] {body} (expand: {cid})")
                 }
                 "entity" => {
                     let id = it["id"].clone();
                     let name = it["name"].as_str().unwrap_or("?");
                     match it["summary"].as_str() {
                         Some(s) => format!("  &{id} {name} — {s}"),
-                        None => format!("  &{id} {name} (call graph tools for facts)"),
+                        None => format!("  &{id} {name} (call graph_entity for facts)"),
                     }
                 }
                 _ => continue,
@@ -367,7 +452,7 @@ fn recall_to_text(resp: &serde_json::Value) -> String {
         "no results".into()
     } else {
         format!(
-            "{}\n(ids: #n = memory_get(n), &n = graph entity)",
+            "{}\n(ids: #n = memory_get(n), &n = graph_entity(n), expand: n = knowledge_expand(n))",
             out.join("\n")
         )
     }

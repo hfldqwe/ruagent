@@ -9,12 +9,14 @@
 pub mod chunk;
 pub mod embed;
 pub mod fast;
+pub mod files;
 pub mod rrf;
 pub mod store;
 
-pub use chunk::chunk_text;
+pub use chunk::{chunk_sections, chunk_text};
 pub use embed::{Embedder, HashEmbedder};
 pub use fast::FastEmbedder;
+pub use files::{ChunkRevision, EditOutcome, Expansion, ScanReport};
 pub use rrf::rrf;
 pub use store::{Knowledge, KnowledgeError, SearchHit};
 
@@ -26,4 +28,13 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// Content hash for the markdown documents (change detection across
+/// scans; same scheme the memory crate uses for episodes).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
