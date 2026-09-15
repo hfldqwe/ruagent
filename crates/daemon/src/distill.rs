@@ -99,15 +99,25 @@ pub async fn distill_with_agent(
     preferred: Option<&str>,
 ) -> Result<DistillOutcome> {
     let agents = distiller.registry.list_enabled();
-    let card = agents
+    let card = select_agent(&agents, preferred)?;
+    distiller.distill(session_key, card).await
+}
+
+/// Pick the agent for an unattended platform job: the preferred name
+/// if enabled, else dsh, else the first enabled.
+pub fn select_agent<'a>(
+    agents: &'a [ruagent_core::AgentCard],
+    preferred: Option<&str>,
+) -> Result<&'a ruagent_core::AgentCard> {
+    agents
         .iter()
         .find(|a| Some(a.name.as_str()) == preferred)
         .or_else(|| agents.iter().find(|a| a.name == "dsh"))
         .or_else(|| agents.first())
-        .ok_or_else(|| anyhow::anyhow!("no enabled agent to distill with"))?;
-    distiller.distill(session_key, card).await
+        .ok_or_else(|| anyhow::anyhow!("no enabled agent available"))
 }
 
+#[derive(Clone)]
 pub struct Distiller {
     pub db: Db,
     pub root: PathBuf, // ruagent home (~/.ruagent)
@@ -215,7 +225,13 @@ impl Distiller {
     }
 
     /// One-shot ACP run: spawn the agent, ask, collect the reply.
-    async fn ask_agent(&self, card: &ruagent_core::AgentCard, prompt: &str) -> Result<String> {
+    /// Shared with the wiki builder (design §6.1: same single-call
+    /// discipline, no tool loops for unattended jobs).
+    pub(crate) async fn ask_agent(
+        &self,
+        card: &ruagent_core::AgentCard,
+        prompt: &str,
+    ) -> Result<String> {
         let spec = ruagent_acp::adapter_for(card.harness)
             .spawn_spec(card)
             .with_context(|| format!("resolving spawn command for `{}`", card.name))?;

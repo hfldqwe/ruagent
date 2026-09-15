@@ -11,6 +11,7 @@ pub mod memembed;
 pub mod runs;
 pub mod sessions;
 pub mod skills;
+pub mod wiki;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

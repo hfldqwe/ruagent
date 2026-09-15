@@ -404,6 +404,7 @@ impl Knowledge {
             .record_revision(chunk_id, doc_id, &doc_name, &old_content, new_content)
             .await?;
 
+        let source_is_some = source.is_some();
         let chunk_count = if let Some(source) = source {
             // File-backed: the .md file is the truth — rewrite the span.
             let path: PathBuf = self.docs_dir.join(&source);
@@ -442,6 +443,13 @@ impl Knowledge {
             self.replace_chunk_in_place(chunk_id, doc_id, new_content)
                 .await? as i64
         };
+        // The reindex replaced the chunk ids this revision was recorded
+        // against — re-point it at the surviving chunk so the history
+        // stays queryable through a LIVE chunk id.
+        if source_is_some {
+            self.repoint_revision(revision, &doc_name, new_content)
+                .await;
+        }
 
         Ok(EditOutcome {
             revision,
@@ -450,7 +458,12 @@ impl Knowledge {
         })
     }
 
-    /// Revision history of one chunk (newest first).
+    /// Revision history of one chunk (newest first). Chunk AND document
+    /// ids are rowid aliases and get REUSED after deletes, so ids alone
+    /// cannot scope the history — the revision must belong to a live
+    /// chunk of a document with the SAME NAME (names are the stable
+    /// identity; a recycled id must not drag another document's
+    /// revisions into the list).
     pub async fn chunk_revisions(
         &self,
         chunk_id: i64,
@@ -459,8 +472,15 @@ impl Knowledge {
             .db
             .call(move |conn| -> Result<Vec<ChunkRevision>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, chunk_id, document_name, old_content, new_content, edited_at
-                       FROM chunk_revisions WHERE chunk_id = ?1 ORDER BY id DESC",
+                    "SELECT r.id, r.chunk_id, r.document_name, r.old_content, r.new_content, r.edited_at
+                       FROM chunk_revisions r
+                      WHERE r.chunk_id = ?1
+                        AND EXISTS (
+                            SELECT 1 FROM chunks c
+                              JOIN documents d ON d.id = c.document_id
+                             WHERE c.id = r.chunk_id AND d.name = r.document_name
+                        )
+                      ORDER BY r.id DESC",
                 )?;
                 let rows = stmt
                     .query_map([chunk_id], |r| {
@@ -563,13 +583,16 @@ impl Knowledge {
             };
             text.replace_range(pos..pos + rev.new_content.len(), &rev.old_content);
             std::fs::write(&path, &text)?;
-            match self
+            let outcome = match self
                 .index_doc(&rev.document_name, &text, Some(&source))
                 .await?
             {
                 IndexOutcome::Indexed(n) => n as i64,
                 _ => 0,
-            }
+            };
+            self.repoint_revision(revision, &rev.document_name, &rev.old_content)
+                .await;
+            outcome
         } else {
             // Legacy in-place document: find the chunk carrying the
             // edited text and swap it back.
@@ -745,6 +768,41 @@ impl Knowledge {
                 Ok(conn.last_insert_rowid())
             })
             .await??)
+    }
+
+    /// After a file-backed edit reindexed the document, the recorded
+    /// revision points at a dead chunk id. Re-point it at the surviving
+    /// chunk (exact content match first, then first containing) so the
+    /// history stays queryable through a LIVE chunk id.
+    async fn repoint_revision(&self, revision_id: i64, document_name: &str, needle: &str) {
+        let (name, needle) = (document_name.to_string(), needle.to_string());
+        let _ = self
+            .db
+            .call(move |conn| -> Result<(), rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT c.id, c.content FROM chunks c
+                       JOIN documents d ON d.id = c.document_id
+                      WHERE d.name = ?1 ORDER BY c.idx",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![name], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let target = rows
+                    .iter()
+                    .find(|(_, c)| c == &needle)
+                    .or_else(|| rows.iter().find(|(_, c)| c.contains(&needle)))
+                    .map(|(id, _)| *id);
+                if let Some(chunk_id) = target {
+                    conn.execute(
+                        "UPDATE chunk_revisions SET chunk_id = ?1 WHERE id = ?2",
+                        rusqlite::params![chunk_id, revision_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
     }
 }
 
@@ -1050,6 +1108,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunk_revisions_stay_scoped_and_repointed() {
+        let (kb, root) = test_kb("revscope").await;
+        kb.save("doc-a", &doc()).await.unwrap();
+        let docs = kb.list_documents().await.unwrap();
+        let chunks = kb.document_chunks(docs[0].id).await.unwrap();
+        let target = chunks
+            .iter()
+            .find(|(_, c)| c.contains("release.sh"))
+            .expect("deploy chunk");
+
+        // Edit: the revision is recorded against the (soon dead) chunk
+        // id, then re-pointed at the surviving chunk.
+        kb.edit_chunk(
+            target.0,
+            "The deploy script lives in scripts/deploy.sh now.",
+        )
+        .await
+        .unwrap();
+        let docs = kb.list_documents().await.unwrap();
+        let chunks = kb.document_chunks(docs[0].id).await.unwrap();
+        let survivor = chunks
+            .iter()
+            .find(|(_, c)| c.contains("deploy.sh now"))
+            .expect("the re-pointed, surviving chunk");
+        let revs = kb.chunk_revisions(survivor.0).await.unwrap();
+        assert_eq!(revs.len(), 1, "history follows the surviving chunk");
+        assert!(revs[0].new_content.contains("deploy.sh now"));
+
+        // The dead id (recycled later by ANOTHER document) must not
+        // drag this revision into that document's history.
+        kb.delete_document_with_file(docs[0].id).await.unwrap();
+        kb.save(
+            "doc-b",
+            "# Other\n\nSomething entirely different about tea.",
+        )
+        .await
+        .unwrap();
+        let docs = kb.list_documents().await.unwrap();
+        let _chunks = kb.document_chunks(docs[0].id).await.unwrap();
+        // With rowid reuse the new document's chunks may land on the old
+        // ids — whichever id `survivor.0` now belongs to, the revision
+        // history of THAT chunk must not contain doc-a's edit unless the
+        // chunk really is doc-a's (it is not: doc-a is deleted).
+        let revs = kb.chunk_revisions(survivor.0).await.unwrap();
+        assert!(
+            revs.is_empty(),
+            "rowid reuse must not leak revisions across documents: {revs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn chunk_edit_revisions_and_rollback() {
         let (kb, root) = test_kb("edit").await;
         kb.save("guide", &doc()).await.unwrap();
@@ -1080,8 +1190,15 @@ mod tests {
         let hits = kb.search("deploy.sh now", 5).await.unwrap();
         assert!(!hits.is_empty());
 
-        // Revision history.
-        let revs = kb.chunk_revisions(target.0).await.unwrap();
+        // Revision history: after the reindex the revision follows the
+        // surviving chunk (the re-point), not the dead original id.
+        let docs = kb.list_documents().await.unwrap();
+        let chunks = kb.document_chunks(docs[0].id).await.unwrap();
+        let survivor = chunks
+            .iter()
+            .find(|(_, c)| c.contains("deploy.sh now"))
+            .expect("re-pointed chunk");
+        let revs = kb.chunk_revisions(survivor.0).await.unwrap();
         assert_eq!(revs.len(), 1);
         assert!(revs[0].old_content.contains("release.sh"));
 

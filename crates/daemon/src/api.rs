@@ -76,6 +76,9 @@ pub fn router(state: AppState) -> Router {
             post(knowledge_revision_rollback),
         )
         .route("/api/v1/knowledge/expand/{chunk_id}", get(knowledge_expand))
+        .route("/api/v1/knowledge/wiki/build", post(wiki_build))
+        .route("/api/v1/knowledge/wiki/builds", get(wiki_builds))
+        .route("/api/v1/knowledge/wiki/builds/{id}", get(wiki_build_get))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route(
@@ -203,6 +206,15 @@ impl ApiError {
 
 impl From<ruagent_store::DbError> for ApiError {
     fn from(e: ruagent_store::DbError) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("{e}"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for ApiError {
+    fn from(e: rusqlite::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("{e}"),
@@ -577,6 +589,199 @@ struct CreateEntityRequest {
     kind: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Wiki mode (design docs/plans/2026-09-15-wiki-mode-design.md)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WikiBuildRequest {
+    /// "all" | "changed" | an array of document names. Default: changed.
+    #[serde(default)]
+    scope: Option<serde_json::Value>,
+    #[serde(default)]
+    dry_run: Option<bool>,
+    #[serde(default)]
+    agent: Option<String>,
+    /// Reuse the stored plan of a dry-run build (the confirm step).
+    #[serde(default)]
+    confirm_plan: Option<i64>,
+}
+
+fn parse_wiki_scope(v: Option<serde_json::Value>) -> Result<crate::wiki::Scope, ApiError> {
+    match v {
+        None => Ok(crate::wiki::Scope::Changed),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "all" => Ok(crate::wiki::Scope::All),
+            "changed" => Ok(crate::wiki::Scope::Changed),
+            other => Err(ApiError::bad_request(format!(
+                "unknown scope `{other}` (all | changed | [names])"
+            ))),
+        },
+        Some(serde_json::Value::Array(items)) => {
+            let mut names = Vec::new();
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(ApiError::bad_request(
+                        "scope array must contain document names",
+                    ));
+                };
+                names.push(name.to_string());
+            }
+            if names.is_empty() {
+                return Err(ApiError::bad_request("scope array is empty"));
+            }
+            Ok(crate::wiki::Scope::Names(names))
+        }
+        Some(_) => Err(ApiError::bad_request(
+            "scope must be \"all\" | \"changed\" | [names]",
+        )),
+    }
+}
+
+/// Compile source documents into wiki pages. `dry_run` plans and
+/// returns the page set for review (the plan-level human gate);
+/// `confirm_plan` executes a reviewed plan.
+async fn wiki_build(
+    State(state): State<AppState>,
+    Json(req): Json<WikiBuildRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let scope = parse_wiki_scope(req.scope)?;
+    let distiller = crate::distill::Distiller {
+        db: state.mgr.db().clone(),
+        root: state.config.root.clone(),
+        embedder: None,
+        registry: state.mgr.registry_view(),
+    };
+    let builder = crate::wiki::WikiBuilder::new(distiller, state.knowledge.as_ref().clone());
+    let out = builder
+        .start_build(crate::wiki::BuildRequest {
+            scope,
+            dry_run: req.dry_run.unwrap_or(false),
+            agent: req.agent,
+            confirm_plan: req.confirm_plan,
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let status = if out.status == "running" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(serde_json::to_value(&out).unwrap_or_default())))
+}
+
+async fn wiki_builds(
+    State(state): State<AppState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let builds = state
+        .mgr
+        .db()
+        .call(
+            move |conn| -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, scope, status, dry_run, agent, pages_planned, pages_written,
+                        pages_failed, error, started_at, finished_at
+                   FROM wiki_builds ORDER BY id DESC LIMIT ?1",
+                )?;
+                let rows = stmt
+                    .query_map([limit], |r| {
+                        Ok(serde_json::json!({
+                            "id": r.get::<_, i64>(0)?,
+                            "scope": r.get::<_, String>(1)?,
+                            "status": r.get::<_, String>(2)?,
+                            "dry_run": r.get::<_, i64>(3)? != 0,
+                            "agent": r.get::<_, String>(4)?,
+                            "pages_planned": r.get::<_, i64>(5)?,
+                            "pages_written": r.get::<_, i64>(6)?,
+                            "pages_failed": r.get::<_, i64>(7)?,
+                            "error": r.get::<_, Option<String>>(8)?,
+                            "started_at": r.get::<_, String>(9)?,
+                            "finished_at": r.get::<_, Option<String>>(10)?,
+                        }))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await??;
+    Ok(Json(serde_json::json!({ "builds": builds })))
+}
+
+async fn wiki_build_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid build id"))?;
+    let build = state
+        .mgr
+        .db()
+        .call(
+            move |conn| -> Result<Option<serde_json::Value>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT id, scope, status, dry_run, agent, pages_planned, pages_written,
+                        pages_failed, plan_json, error, started_at, finished_at
+                   FROM wiki_builds WHERE id = ?1",
+                    [id],
+                    |r| {
+                        Ok(serde_json::json!({
+                            "id": r.get::<_, i64>(0)?,
+                            "scope": r.get::<_, String>(1)?,
+                            "status": r.get::<_, String>(2)?,
+                            "dry_run": r.get::<_, i64>(3)? != 0,
+                            "agent": r.get::<_, String>(4)?,
+                            "pages_planned": r.get::<_, i64>(5)?,
+                            "pages_written": r.get::<_, i64>(6)?,
+                            "pages_failed": r.get::<_, i64>(7)?,
+                            "plan": serde_json::from_str::<serde_json::Value>(
+                                &r.get::<_, Option<String>>(8)?.unwrap_or_default()
+                            ).ok(),
+                            "error": r.get::<_, Option<String>>(9)?,
+                            "started_at": r.get::<_, String>(10)?,
+                            "finished_at": r.get::<_, Option<String>>(11)?,
+                        }))
+                    },
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })
+            },
+        )
+        .await??;
+    let Some(build) = build else {
+        return Err(ApiError::not_found("no such wiki build"));
+    };
+    let pages = state
+        .mgr
+        .db()
+        .call(
+            move |conn| -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT slug, action, status, error FROM wiki_build_pages
+                  WHERE build_id = ?1 ORDER BY slug",
+                )?;
+                let rows = stmt
+                    .query_map([id], |r| {
+                        Ok(serde_json::json!({
+                            "slug": r.get::<_, String>(0)?,
+                            "action": r.get::<_, String>(1)?,
+                            "status": r.get::<_, String>(2)?,
+                            "error": r.get::<_, Option<String>>(3)?,
+                        }))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await??;
+    Ok(Json(serde_json::json!({ "build": build, "pages": pages })))
 }
 
 async fn graph_create_entity(

@@ -13,11 +13,13 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Result, Stdio};
 
-use ruagent_mock_agent::{Behavior, prompt_text};
+use ruagent_mock_agent::{Behavior, MockArgs, prompt_text};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let behavior = Behavior::from_args();
+    let args = MockArgs::from_args();
+    let behavior = args.behavior;
+    let scripted_replies = Arc::new(args.replies);
     eprintln!("mock-agent starting, behavior: {behavior:?}");
     let session_counter = Arc::new(AtomicU64::new(0));
 
@@ -48,6 +50,7 @@ async fn main() -> Result<()> {
         )
         .on_receive_request(
             {
+                let scripted_replies = scripted_replies.clone();
                 async move |req: PromptRequest, responder, conn| {
                     let sid = req.session_id.clone();
                     let text = prompt_text(&req.prompt);
@@ -56,6 +59,26 @@ async fn main() -> Result<()> {
                     };
 
                     match behavior {
+                        Behavior::Scripted => {
+                            // First marker contained in the prompt wins;
+                            // the script is keyed by content because every
+                            // ruagent one-shot call spawns a fresh process.
+                            let reply = scripted_replies
+                                .iter()
+                                .find(|r| text.contains(&r.marker))
+                                .map(|r| r.reply.clone())
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "no scripted reply for this prompt: {}",
+                                        &text[..text.len().min(80)]
+                                    )
+                                });
+                            notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(reply)),
+                            )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
                         Behavior::Echo => {
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new(format!("echo: {text}"))),

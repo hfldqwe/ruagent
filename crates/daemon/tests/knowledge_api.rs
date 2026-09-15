@@ -199,10 +199,48 @@ async fn markdown_truth_chunk_edits_and_parent_recall() {
     assert!(raw.contains("scripts/deploy.sh now."), "write-through");
     assert!(!raw.contains("scripts/release.sh"));
 
-    // Revision history.
+    // Revision history: after the reindex the revision follows the
+    // SURVIVING chunk (re-pointed), so re-fetch the document's chunks.
+    let docs: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/documents"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let doc_id = docs["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"].as_str() == Some("deploy-guide"))
+        .and_then(|d| d["id"].as_i64())
+        .expect("deploy-guide listed");
+    let chunks: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/documents/{doc_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let survivor = chunks["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|c| {
+            let pair = c.as_array()?;
+            let text = pair.get(1)?.as_str()?;
+            if text.contains("deploy.sh now") {
+                pair.first()?.as_i64()
+            } else {
+                None
+            }
+        })
+        .expect("re-pointed surviving chunk");
     let revs: serde_json::Value = http
         .get(format!(
-            "{daemon_url}/api/v1/knowledge/chunks/{chunk_id}/revisions"
+            "{daemon_url}/api/v1/knowledge/chunks/{survivor}/revisions"
         ))
         .send()
         .await
