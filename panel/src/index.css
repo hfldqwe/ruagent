@@ -249,7 +249,7 @@ h3.sec { margin: 26px 0 12px; font-size: 13px; line-height: 18px; font-weight: 6
 .row.wrap { flex-wrap: wrap; }
 .row.end { justify-content: flex-end; }
 
-button.row-btn {
+.row-btn {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -265,11 +265,12 @@ button.row-btn {
   cursor: pointer;
   transition: background 100ms;
 }
-button.row-btn:hover { background: var(--surface-hover); }
-button.row-btn.selected { background: var(--surface-selected); }
+.row-btn:hover { background: var(--surface-hover); }
+.row-btn.selected { background: var(--surface-selected); }
 /* Hairline between stacked rows — a shadow, not a border, so it never
    shifts layout. */
-.card > button.row-btn + button.row-btn { box-shadow: 0 -1px 0 0 var(--ant-color-border-secondary); }
+.card > .row-btn + .row-btn,
+.card > div + div > .row-btn { box-shadow: 0 -1px 0 0 var(--ant-color-border-secondary); }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
 html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
