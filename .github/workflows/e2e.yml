@@ -45,3 +45,8 @@ jobs:
           html=$(curl -sf http://127.0.0.1:8787/)
           echo "$html" | grep -q 'id="root"'
           curl -sf http://127.0.0.1:8787/ | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1 | grep -q .
+      - name: Panel E2E (Playwright)
+        run: |
+          npx playwright install chromium --with-deps
+          npm run test:e2e
+        working-directory: panel
