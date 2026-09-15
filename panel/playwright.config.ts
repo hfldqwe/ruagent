@@ -16,7 +16,9 @@ export default defineConfig({
   // Every test gets a fresh browser context (own localStorage): theme
   // and language toggles in one test cannot leak into another.
   use: {
-    baseURL: "http://127.0.0.1:8787",
+    // E2E_BASE_URL: point the suite at a throwaway daemon (e.g. a
+    // fresh --root home + doctor seed) to reproduce CI conditions.
+    baseURL: process.env.E2E_BASE_URL ?? "http://127.0.0.1:8787",
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
     locale: "zh-CN",

@@ -130,7 +130,16 @@ export function Stats() {
     return () => clearInterval(t);
   }, []);
   if (!stats) return <Spinner label={`${t("stats.title")}…`} />;
-  if (stats.length === 0) return <Empty icon="stats" title={t("stats.empty")} />;
+  if (stats.length === 0)
+    return (
+      <div>
+        <div className="view-bar">
+          <h2>{t("stats.title")}</h2>
+          <span className="muted">{t("stats.subtitle")}</span>
+        </div>
+        <Empty icon="stats" title={t("stats.empty")} />
+      </div>
+    );
   const maxCost = Math.max(...stats.map((s) => s.total_cost_usd), 0.0001);
   return (
     <div>

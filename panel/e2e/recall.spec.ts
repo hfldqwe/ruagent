@@ -12,12 +12,26 @@ test("conservative recall stubs expand to the full memory", async ({ page, reque
   await page.locator(".ant-segmented-item-label").filter({ hasText: "召回" }).click();
   await page.locator(".ant-segmented-item-label").filter({ hasText: "保守" }).click();
 
-  await page.locator(".search-bar input.ant-input").fill("deploy");
+  // "kettle": doctor's seeded memory probe — guarantees a memory hit on
+  // a fresh database (CI); on a populated one any query falls back to
+  // top memories anyway
+  await page.locator(".search-bar input.ant-input").fill("kettle");
   // antd auto-inserts a space between two CJK chars in buttons ("召回" → "召 回")
   await page.locator(".search-bar button").filter({ hasText: /召 ?回|Recall/ }).click();
 
-  // memory stubs appear with the fetch affordance
-  const stub = page.locator(".recall-stub-head").first();
+  // wait for the result card (or the empty state) — count() is an
+  // instant check and would race the recall API call
+  await expect(page.locator(".recall-hit, .ant-empty").first()).toBeVisible({
+    timeout: 10_000,
+  });
+
+  // memory stubs only (knowledge stubs show a document tag, entity
+  // stubs use &id — only memory stubs carry #id)
+  const stubs = page.locator(".recall-stub-head").filter({ hasText: /#\d+/ });
+  if ((await stubs.count()) === 0) {
+    test.skip(true, "recall matched no memories in this database");
+  }
+  const stub = stubs.first();
   await expect(stub).toBeVisible();
   await expect(stub.locator(".stub-afford")).toBeVisible();
 

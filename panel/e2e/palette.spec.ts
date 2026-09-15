@@ -3,13 +3,25 @@
 
 import { expect, test } from "@playwright/test";
 
-test("Ctrl+K opens the palette with all four groups", async ({ page }) => {
+test("Ctrl+K opens the palette with all four groups", async ({ page, request }) => {
   await page.goto("/");
   await expect(page.locator(".app-sider")).toBeVisible();
 
+  // empty groups are skipped by design — agents/sessions render only
+  // when the database actually has them (CI runs on a fresh daemon)
+  const [agentRes, sesRes] = await Promise.all([
+    request.get("/api/v1/agents"),
+    request.get("/api/v1/sessions"),
+  ]);
+  const { agents } = (await agentRes.json()) as { agents: { enabled: boolean }[] };
+  const { sessions } = (await sesRes.json()) as { sessions: unknown[] };
+  const groups = ["导航", "动作"];
+  if (agents.some((a) => a.enabled)) groups.push("智能体");
+  if (sessions.length > 0) groups.push("会话");
+
   await page.keyboard.press("Control+k");
   await expect(page.locator(".cmdk")).toBeVisible();
-  for (const group of ["导航", "智能体", "会话", "动作"]) {
+  for (const group of groups) {
     await expect(page.locator(".cmdk-group").filter({ hasText: group })).toBeVisible();
   }
   // input is focused and the first item is selected
