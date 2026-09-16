@@ -3,11 +3,12 @@
 // curation with revision history + rollback, and an index rebuild.
 
 import { useEffect, useState } from "react";
-import { Button, Input, Popconfirm } from "antd";
+import { Button, Input, Popconfirm, Segmented } from "antd";
 import { Icon } from "../icons";
 import { api, type KnowledgeDocument, type KnowledgeRevision, type SearchHit } from "../api";
 import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
 import { dateOf, useI18n } from "../i18n";
+import { WikiTab } from "./Wiki";
 
 export function Knowledge() {
   const { t } = useI18n();
@@ -24,6 +25,8 @@ export function Knowledge() {
   const [revChunk, setRevChunk] = useState<number | null>(null);
   const [revisions, setRevisions] = useState<KnowledgeRevision[] | null>(null);
   const [rebuilding, setRebuilding] = useState(false);
+  /** docs list vs the wiki tab (M2 panel surface). */
+  const [tab, setTab] = useState<"docs" | "wiki">("docs");
   const toast = useToast();
 
   const refresh = () =>
@@ -53,6 +56,14 @@ export function Knowledge() {
       toast("err", String(e));
       setHits([]);
     }
+  };
+
+  /** Open the raw editor for a wiki page (name = "wiki/<slug>"). */
+  const openWikiEditor = (name: string) => {
+    const doc = docs?.find((d) => d.name === name);
+    setEditingDoc(
+      doc ?? { id: -1, name, source: `${name}.md`, chunk_count: 0, created_at: "" },
+    );
   };
 
   const reloadChunks = async (id: number) => {
@@ -148,8 +159,16 @@ export function Knowledge() {
       <div className="view-bar">
         <h2>{t("knowledge.title")}</h2>
         <span className="muted">{t("knowledge.subtitle")} ({embedder || "…"})</span>
+        <Segmented
+          value={tab}
+          onChange={(v) => setTab(v as "docs" | "wiki")}
+          options={[
+            { value: "docs", label: t("knowledge.tab.docs") },
+            { value: "wiki", label: t("knowledge.tab.wiki") },
+          ]}
+        />
         <span className="grow" />
-        <Popconfirm
+        {tab === "docs" && <Popconfirm
           title={t("knowledge.rebuild.title")}
           description={t("knowledge.rebuild.body")}
           okText={t("knowledge.rebuild")}
@@ -158,12 +177,18 @@ export function Knowledge() {
           onConfirm={rebuild}
         >
           <Button loading={rebuilding}>{t("knowledge.rebuild")}</Button>
-        </Popconfirm>
-        <Button type="primary" onClick={() => setIngesting(true)}>
-          + {t("knowledge.ingest")}
-        </Button>
+        </Popconfirm>}
+        {tab === "docs" && (
+          <Button type="primary" onClick={() => setIngesting(true)}>
+            + {t("knowledge.ingest")}
+          </Button>
+        )}
       </div>
 
+      {tab === "wiki" ? (
+        <WikiTab openEditor={openWikiEditor} />
+      ) : (
+      <>
       <div className="search-bar">
         <Input
           autoFocus
@@ -313,6 +338,8 @@ export function Knowledge() {
             </div>
           ))}
         </div>
+      )}
+      </>
       )}
 
       {ingesting && (

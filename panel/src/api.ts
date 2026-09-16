@@ -116,6 +116,19 @@ export interface RecallResult {
     score?: number;
     hint?: string;
   }[];
+  /** §13-2: generated wiki pages — a separate section, never mixed
+   * into knowledge, always conservative stubs. */
+  wiki: {
+    kind: string;
+    slug: string;
+    chunk_id: number;
+    document: string;
+    title: string;
+    summary: string;
+    excerpt?: string;
+    stale: boolean;
+    hint?: string;
+  }[];
   entities: {
     id: number;
     name: string;
@@ -205,6 +218,73 @@ export interface KnowledgeRebuildReport {
   unchanged: number;
   removed: number;
   errors: number;
+}
+
+// ---------------------------------------------------------------------------
+// Wiki (M2 read APIs + the build surface)
+// ---------------------------------------------------------------------------
+
+/** One wiki page in the inventory: stale = a cited source's hash
+ * drifted; edited = hand-edited since its last build (§13-3). */
+export interface WikiPageInfo {
+  slug: string;
+  title: string;
+  summary: string;
+  aliases: string[];
+  entities: string[];
+  sources: string[];
+  stale: boolean;
+  edited: boolean;
+  links_out: number;
+  links_in: number;
+}
+
+/** The link graph: broken = linked but missing (wanted pages). */
+export interface WikiLinks {
+  nodes: string[];
+  edges: { src: string; dst: string }[];
+  broken: string[];
+  orphans: string[];
+}
+
+export interface WikiBuild {
+  id: number;
+  scope: string;
+  status: string; // planned|running|done|failed
+  dry_run: boolean;
+  agent: string;
+  pages_planned: number;
+  pages_written: number;
+  pages_failed: number;
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+/** One page of a build plan (create|update|delete|keep). */
+export interface WikiPagePlan {
+  slug: string;
+  title: string;
+  summary?: string;
+  aliases?: string[];
+  entities?: string[];
+  sources?: string[];
+  action: string;
+}
+
+/** POST /wiki/build result — dry runs carry the plan for review. */
+export interface WikiBuildStarted {
+  build_id: number;
+  status: string;
+  agent: string;
+  pages_planned: number;
+  plan?: WikiPagePlan[];
+  notes?: string;
+}
+
+export interface WikiBuildDetail {
+  build: WikiBuild & { plan: WikiPagePlan[] | null };
+  pages: { slug: string; action: string; status: string; error: string | null }[];
 }
 
 export interface GraphEntity {
@@ -366,6 +446,22 @@ export const api = {
   knowledgeRebuild: () =>
     post("/api/v1/knowledge/rebuild").then(
       (r) => r.json() as Promise<{ rebuild: KnowledgeRebuildReport }>,
+    ),
+
+  // wiki — M2 read APIs + builds
+  wikiPages: () =>
+    get<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages").then((r) => r.pages),
+  wikiLinks: () => get<WikiLinks>("/api/v1/knowledge/wiki/links"),
+  wikiBuilds: (limit = 20) =>
+    get<{ builds: WikiBuild[] }>(`/api/v1/knowledge/wiki/builds?limit=${limit}`).then(
+      (r) => r.builds,
+    ),
+  wikiBuild: (id: number) => get<WikiBuildDetail>(`/api/v1/knowledge/wiki/builds/${id}`),
+  wikiBuildStart: (req: { scope?: string; dry_run?: boolean; agent?: string }) =>
+    post("/api/v1/knowledge/wiki/build", req).then((r) => r.json() as Promise<WikiBuildStarted>),
+  wikiBuildConfirm: (buildId: number, agent?: string) =>
+    post("/api/v1/knowledge/wiki/build", { confirm_plan: buildId, agent }).then(
+      (r) => r.json() as Promise<WikiBuildStarted>,
     ),
 
   // graph

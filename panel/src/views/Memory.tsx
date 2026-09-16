@@ -418,7 +418,7 @@ function RecallPlayground() {
               <span className="tag">{result.strategy}</span>
               <span className="muted">
                 {result.memories.length} mem · {result.knowledge.length} know ·{" "}
-                {result.entities.length} ent
+                {(result.wiki ?? []).length} wiki · {result.entities.length} ent
               </span>
             </div>
             {result.memories.map((m) =>
@@ -445,6 +445,9 @@ function RecallPlayground() {
                 </div>
               ),
             )}
+            {(result.wiki ?? []).map((w) => (
+              <WikiStub key={`w${w.chunk_id}`} stub={w} />
+            ))}
             {result.entities.map((e) =>
               e.hint ? (
                 <EntityStub key={`e${e.id}`} stub={e} />
@@ -541,6 +544,43 @@ function MemoryStub({ stub }: { stub: RecallResult["memories"][number] }) {
           ) : data ? (
             <div className="recall-body md">
               <Markdown>{data.content}</Markdown>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** §13-2: a generated wiki page hit — always a stub, labeled so the
+ * reader can tell compiled content from sources. */
+function WikiStub({ stub }: { stub: NonNullable<RecallResult["wiki"]>[number] }) {
+  const { t } = useI18n();
+  const { open, data, loading, toggle } = useStubFetch(() =>
+    api.knowledgeExpand(stub.chunk_id),
+  );
+  const x = data as KnowledgeExpansion | null;
+  return (
+    <div className="recall-hit">
+      <button className="recall-stub-head" onClick={toggle}>
+        <span className="tag">wiki</span>
+        <strong>{stub.title}</strong>
+        {stub.stale && <span className="tag warn">{t("wiki.staleTag")}</span>}
+        {!open && <span className="stub-text">{stub.summary || stub.excerpt}</span>}
+        {!open && <span className="stub-afford">{t("memory.recallExpand")}</span>}
+        <StubChevron open={open} />
+      </button>
+      <div className={open ? "recall-expand open" : "recall-expand"}>
+        <div className="recall-inner">
+          {loading ? (
+            <RecallLoading />
+          ) : x ? (
+            <div className="recall-body">
+              <div className="row tight" style={{ marginBottom: 6 }}>
+                <span className="tag">{stub.document}</span>
+                <span className="tag warn">{t("memory.recallWikiGenerated")}</span>
+              </div>
+              <Markdown>{x.section}</Markdown>
             </div>
           ) : null}
         </div>
