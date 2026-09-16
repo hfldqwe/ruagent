@@ -1285,7 +1285,10 @@ async fn judge_task(
             "judging needs at least two completed runs with results",
         ));
     }
-    let run = state.mgr.start_judge(&task, &req.agent, &candidates).await?;
+    let run = state
+        .mgr
+        .start_judge(&task, &req.agent, &candidates)
+        .await?;
     Ok(Json(serde_json::json!({ "judge_run": run })))
 }
 

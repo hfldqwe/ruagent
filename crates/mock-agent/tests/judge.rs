@@ -30,9 +30,7 @@ async fn start_judge_daemon() -> (String, std::path::PathBuf) {
         let replies_path = root.join(format!("{name}-replies.json"));
         std::fs::write(
             &replies_path,
-            format!(
-                "[{{\"marker\":\"FANOUT MARKER\",\"reply\":\"answer from {name}\"}}]"
-            ),
+            format!("[{{\"marker\":\"FANOUT MARKER\",\"reply\":\"answer from {name}\"}}]"),
         )
         .unwrap();
         let replies = replies_path.to_string_lossy().replace('\\', "/");
@@ -112,9 +110,8 @@ where
             .unwrap();
         let status = resp.status();
         let body = resp.text().await.unwrap();
-        let t: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
-            panic!("task detail GET returned {status}: {e}\nbody: {body}")
-        });
+        let t: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("task detail GET returned {status}: {e}\nbody: {body}"));
         if ok(&t) {
             return t;
         }
@@ -193,7 +190,10 @@ async fn fanout_judge_picks_winner_and_records_provenance() {
     .await;
     assert_eq!(detail["selected_run_id"], expected_winner.as_str());
     assert_eq!(detail["selected_by"], "agent:judge");
-    assert_eq!(detail["judgement"]["winner_run_id"], expected_winner.as_str());
+    assert_eq!(
+        detail["judgement"]["winner_run_id"],
+        expected_winner.as_str()
+    );
     assert_eq!(
         detail["judgement"]["rationale"],
         "mock judge prefers the first candidate"

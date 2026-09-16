@@ -205,11 +205,11 @@ async fn main() -> Result<()> {
                             // Pick the first [RUN <id>] candidate: the
                             // daemon's judge prompt lists them in run order,
                             // so tests get a deterministic winner.
-                            let reply = match ruagent_mock_agent::judge_candidates(&text)
-                                .first()
-                            {
+                            let reply = match ruagent_mock_agent::judge_candidates(&text).first() {
                                 Some(id) => {
-                                    format!("RUN: {id}\nWHY: mock judge prefers the first candidate")
+                                    format!(
+                                        "RUN: {id}\nWHY: mock judge prefers the first candidate"
+                                    )
                                 }
                                 None => "no candidates in prompt".to_string(),
                             };

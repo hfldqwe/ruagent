@@ -165,23 +165,21 @@ impl Db {
     ) -> Result<Option<(ruagent_core::RunId, String)>, DbError> {
         type SelectionRow = Option<(Option<String>, Option<String>)>;
         let row: SelectionRow = self
-            .call(
-                move |conn| -> Result<SelectionRow, rusqlite::Error> {
-                    let mut stmt = conn
-                        .prepare("SELECT selected_run_id, selected_by FROM tasks WHERE id = ?1")?;
-                    let mut rows = stmt.query([task_id.to_string()])?;
-                    match rows.next()? {
-                        // get::<Option<String>>: the columns are NULL-able, and
-                        // a bare `String` get rejects NULL rows.
-                        Some(row) => {
-                            let run: Option<String> = row.get(0)?;
-                            let by: Option<String> = row.get(1)?;
-                            Ok(Some((run, by)))
-                        }
-                        None => Ok(None),
+            .call(move |conn| -> Result<SelectionRow, rusqlite::Error> {
+                let mut stmt =
+                    conn.prepare("SELECT selected_run_id, selected_by FROM tasks WHERE id = ?1")?;
+                let mut rows = stmt.query([task_id.to_string()])?;
+                match rows.next()? {
+                    // get::<Option<String>>: the columns are NULL-able, and
+                    // a bare `String` get rejects NULL rows.
+                    Some(row) => {
+                        let run: Option<String> = row.get(0)?;
+                        let by: Option<String> = row.get(1)?;
+                        Ok(Some((run, by)))
                     }
-                },
-            )
+                    None => Ok(None),
+                }
+            })
             .await??;
         match row {
             // NULL selected_by = a selection made before migration 0012.

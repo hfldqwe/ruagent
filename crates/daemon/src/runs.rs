@@ -11,7 +11,7 @@ use ruagent_acp::permission::{PermissionAnswer, PermissionAsk};
 use ruagent_acp::{RunOptions, adapter_for, run_once};
 use ruagent_core::{
     AgentCard, EdgeKind, PermissionKind, PermissionResolution, RouteSource, RoutingDecision, Run,
-    RunEvent, RunId, RunParams, RunStatus, StopReason, Task, TaskCreator, TaskStatus, TaskEdge,
+    RunEvent, RunId, RunParams, RunStatus, StopReason, Task, TaskCreator, TaskEdge, TaskStatus,
 };
 use ruagent_orchestrator::{self, PipelineStep, Topology};
 use ruagent_policy::PermissionPolicy;
@@ -1035,7 +1035,11 @@ pub(crate) fn parse_judge_verdict(
         })
     };
     let chosen = line_value("run:")?;
-    let winner = match candidates.iter().copied().find(|id| id.to_string() == chosen) {
+    let winner = match candidates
+        .iter()
+        .copied()
+        .find(|id| id.to_string() == chosen)
+    {
         Some(id) => Some(id),
         // Tolerate shortened ids — but only when unambiguous.
         // (`then_some` would index eagerly — len 0 must not panic.)
@@ -1060,7 +1064,10 @@ pub(crate) fn parse_judge_verdict(
 /// not leave them dangling in Pending forever (design §5.1 task states).
 async fn cancel_unstarted(db: &Db, planned: &[ruagent_orchestrator::PlannedRun]) {
     for p in planned {
-        if let Err(e) = db.update_task_status(p.task.id, TaskStatus::Cancelled).await {
+        if let Err(e) = db
+            .update_task_status(p.task.id, TaskStatus::Cancelled)
+            .await
+        {
             tracing::warn!(error = %e, "cancelling downstream pipeline task failed");
         }
     }
@@ -1179,9 +1186,11 @@ mod tests {
         .collect();
 
         // Exact id + rationale.
-        let (w, why) =
-            parse_judge_verdict("RUN: 22222222-2222-2222-2222-222222222222\nWHY: cheaper", &ids)
-                .unwrap();
+        let (w, why) = parse_judge_verdict(
+            "RUN: 22222222-2222-2222-2222-222222222222\nWHY: cheaper",
+            &ids,
+        )
+        .unwrap();
         assert_eq!(w, ids[1]);
         assert_eq!(why.as_deref(), Some("cheaper"));
 
