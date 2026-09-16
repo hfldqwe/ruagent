@@ -166,6 +166,23 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         "knowledge base embedder"
     );
 
+    // An embedder switch migrates the knowledge table at open (see
+    // store.rs migrate_embedder); memory rows get the same treatment
+    // here — in the background, so a large library never blocks boot.
+    {
+        let db_m = db.clone();
+        let embedder_m = knowledge.embedder();
+        tokio::spawn(async move {
+            let n = memembed::reembed_stale(&db_m, embedder_m).await;
+            if n > 0 {
+                tracing::info!(
+                    reembedded = n,
+                    "memory embeddings migrated to the active model"
+                );
+            }
+        });
+    }
+
     // Knowledge markdown sync (design-study memsearch/EverOS): the
     // `.md` files under <root>/knowledge are the source of truth, the
     // SQLite+LanceDB index a derived shadow. This scan — boot + every

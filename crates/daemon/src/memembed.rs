@@ -47,10 +47,7 @@ pub async fn semantic_search(
     top_n: u32,
     min_score: f32,
 ) -> Vec<(i64, String, String, String, f32)> {
-    let Ok(vectors) = embedder.embed(&[query]) else {
-        return Vec::new();
-    };
-    let Some(qv) = vectors.first() else {
+    let Ok(qv) = embedder.embed_query(query) else {
         return Vec::new();
     };
     let qnorm: f32 = qv.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -95,7 +92,7 @@ pub async fn semantic_search(
             if norm == 0.0 {
                 return None;
             }
-            let dot: f32 = v.iter().zip(qv).map(|(a, b)| a * b).sum();
+            let dot: f32 = v.iter().zip(qv.iter()).map(|(a, b)| a * b).sum();
             Some((id, store, ns, content, dot / (norm * qnorm)))
         })
         .filter(|(_, _, _, _, score)| *score >= min_score)
@@ -103,6 +100,40 @@ pub async fn semantic_search(
     scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(top_n as usize);
     scored
+}
+
+/// Re-embed memory rows whose embeddings are missing or were written
+/// by a different model — the memory-side half of an embedder switch
+/// (the knowledge crate migrates its own table at open). Skipped when
+/// the active embedder is the offline fallback: an offline boot must
+/// never downgrade real vectors to hash vectors. Returns the number
+/// of rows re-embedded.
+pub async fn reembed_stale(db: &Db, embedder: Arc<dyn Embedder>) -> usize {
+    if embedder.is_fallback() {
+        return 0;
+    }
+    let active = embedder.name().to_string();
+    let rows: Vec<(i64, String)> = match db
+        .call(move |conn| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM memories
+                  WHERE embedding IS NULL OR embedder IS NULL OR embedder != ?1",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![active], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    {
+        Ok(Ok(rows)) => rows,
+        _ => return 0,
+    };
+    let n = rows.len();
+    for (id, content) in rows {
+        embed_row(db, embedder.clone(), id, &content).await;
+    }
+    n
 }
 
 #[cfg(test)]

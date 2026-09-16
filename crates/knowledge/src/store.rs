@@ -172,8 +172,76 @@ impl Knowledge {
                 Ok(())
             }
             Some(stored) if stored == active => Ok(()),
-            Some(stored) => Err(KnowledgeError::ModelMismatch { stored, active }),
+            Some(stored) if self.embedder.is_fallback() => {
+                // Offline fallback boot against a table built with a
+                // real model: never migrate TO the fallback (that would
+                // destroy real vectors on a temporary outage). Searches
+                // are degraded but the platform boots. Previously this
+                // errored — and could prevent boot entirely.
+                tracing::warn!(
+                    stored,
+                    active,
+                    "embedder mismatch on fallback boot — semantic search degraded until the model is available"
+                );
+                Ok(())
+            }
+            Some(stored) => self.migrate_embedder(&stored, &active).await,
         }
+    }
+
+    /// One-time model switch: adopt the active model, rebuild the
+    /// vector table from the chunk texts (the sqlite rows are the
+    /// truth; the old vectors are noise in the new space). Runs inside
+    /// `with_embedder`, i.e. at open — before any scanner or API can
+    /// race it.
+    async fn migrate_embedder(&self, stored: &str, active: &str) -> Result<(), KnowledgeError> {
+        tracing::warn!(
+            stored,
+            active,
+            "embedder model changed — re-embedding the knowledge base (one-time migration)"
+        );
+        let a = active.to_string();
+        self.db
+            .call(move |conn| -> Result<(), rusqlite::Error> {
+                conn.execute(
+                    "INSERT OR REPLACE INTO knowledge_meta (key, value) VALUES ('embedder', ?1)",
+                    [&a],
+                )?;
+                Ok(())
+            })
+            .await?
+            .map_err(ruagent_store::DbError::from)?;
+        // Drop and recreate the vector table: old vectors are noise and
+        // the dimensions may differ entirely.
+        if let Err(e) = self.lance.drop_table(TABLE, &[]).await {
+            // a missing table is fine (nothing built yet)
+            tracing::debug!(error = %e, "dropping vector table");
+        }
+        self.ensure_table().await?;
+        // Re-embed every chunk from its text, in batches.
+        let rows: Vec<(i64, String)> = self
+            .db
+            .call(|conn| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+                let mut stmt = conn.prepare("SELECT id, content FROM chunks ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await?
+            .map_err(ruagent_store::DbError::from)?;
+        for batch in rows.chunks(32) {
+            let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
+            let vectors = self.embedder.embed(&texts)?;
+            let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
+            self.add_vectors(&ids, &vectors).await?;
+        }
+        tracing::info!(
+            chunks = rows.len(),
+            active,
+            "knowledge base re-embedded under the new model"
+        );
+        Ok(())
     }
 
     /// Ingest a document into the index WITHOUT writing a file (the
@@ -335,7 +403,7 @@ impl Knowledge {
         let leg_k = limit.max(10) as usize;
 
         // Leg 1: semantic ANN.
-        let qvec = self.embedder.embed(&[query])?.remove(0);
+        let qvec = self.embedder.embed_query(query)?;
         let mut ann_ids: Vec<i64> = Vec::new();
         let table = self.lance.open_table(TABLE).execute().await?;
         let batches = table
@@ -600,32 +668,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Constant vectors; a distinct identity per instance — stands in
+    /// for two real models in the migration tests.
+    struct Tagged(&'static str, usize);
+    impl Embedder for Tagged {
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0; self.1]).collect())
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn dim(&self) -> usize {
+            self.1
+        }
+    }
+
+    async fn stored_embedder(db: &Db) -> String {
+        db.call(|conn| -> Result<String, rusqlite::Error> {
+            conn.query_row(
+                "SELECT value FROM knowledge_meta WHERE key = 'embedder'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn model_mismatch_is_a_hard_error() {
-        let root = test_root("mismatch");
+    async fn model_switch_migrates_the_table() {
+        let root = test_root("migrate");
         let db = Db::open_in_memory().unwrap();
-        // Open with hash embedder (records meta).
-        let kb = Knowledge::open(&root, db.clone()).await.unwrap();
-        kb.ingest("x", "some content to anchor the meta")
+        {
+            let kb = Knowledge::with_embedder(&root, db.clone(), Arc::new(Tagged("model-a", 8)))
+                .await
+                .unwrap();
+            kb.ingest(
+                "deploy-guide",
+                "The deploy script lives in scripts/release.sh. Run it from the root.",
+            )
             .await
             .unwrap();
-        drop(kb);
-
-        // Reopen with a DIFFERENT embedder identity -> hard error.
-        struct Other;
-        impl Embedder for Other {
-            fn embed(&self, _t: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-                Ok(vec![])
-            }
-            fn name(&self) -> &'static str {
-                "other-embedder"
-            }
-            fn dim(&self) -> usize {
-                8
-            }
         }
-        let err = Knowledge::with_embedder(&root, db, Arc::new(Other)).await;
-        assert!(matches!(err, Err(KnowledgeError::ModelMismatch { .. })));
+        assert_eq!(stored_embedder(&db).await, "model-a");
+
+        // Reopen with a DIFFERENT model (and even a different dim): the
+        // migration adopts it, rebuilds the vector table from the chunk
+        // texts, and search still works.
+        let kb = Knowledge::with_embedder(&root, db.clone(), Arc::new(Tagged("model-b", 16)))
+            .await
+            .unwrap();
+        assert_eq!(kb.embedder_name(), "model-b");
+        assert_eq!(stored_embedder(&db).await, "model-b");
+        let hits = kb.search("release.sh", 5).await.unwrap();
+        assert!(!hits.is_empty(), "re-embedded table still finds the doc");
+        // reopening with the same model is a no-op (no second migration
+        // path to assert beyond: it simply opens)
+        drop(kb);
+        Knowledge::with_embedder(&root, db, Arc::new(Tagged("model-b", 16)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn fallback_boot_does_not_migrate_the_table() {
+        let root = test_root("fallback");
+        let db = Db::open_in_memory().unwrap();
+        {
+            let kb = Knowledge::with_embedder(&root, db.clone(), Arc::new(Tagged("model-a", 8)))
+                .await
+                .unwrap();
+            kb.ingest("x", "content to anchor the meta").await.unwrap();
+        }
+
+        // Offline fallback boot against a real-model table: opens (it
+        // used to hard-error and could prevent boot entirely), and
+        // NEVER adopts the fallback — the meta still says model-a, so
+        // the next boot with a real model migrates cleanly.
+        let kb = Knowledge::open(&root, db.clone()).await.unwrap();
+        assert_eq!(kb.embedder_name(), "hash-embedder");
+        assert_eq!(
+            stored_embedder(&db).await,
+            "model-a",
+            "the fallback must not overwrite the real model's identity"
+        );
+        drop(kb);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

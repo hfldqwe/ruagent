@@ -1322,25 +1322,9 @@ async fn sessions_messages(
 async fn memory_backfill_embeddings(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.mgr.db().clone();
-    let rows: Vec<(i64, String)> = db
-        .call(|conn| -> Result<_, ruagent_store::DbError> {
-            let mut stmt = conn
-                .prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
-                .map_err(ruagent_store::DbError::from)?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(ruagent_store::DbError::from)?;
-            Ok(rows.filter_map(|r| r.ok()).collect())
-        })
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e}")))?
-        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    let total = rows.len();
-    let embedder = state.knowledge.embedder();
-    for (id, content) in rows {
-        crate::memembed::embed_row(&db, embedder.clone(), id, &content).await;
-    }
+    // NULL embeddings AND rows written by a different model (the
+    // memory-side half of an embedder switch)
+    let total = crate::memembed::reembed_stale(state.mgr.db(), state.knowledge.embedder()).await;
     Ok(Json(serde_json::json!({ "embedded": total })))
 }
 

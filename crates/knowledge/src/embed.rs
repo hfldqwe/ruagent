@@ -5,7 +5,20 @@
 
 /// Anything that can turn texts into fixed-dim vectors.
 pub trait Embedder: Send + Sync {
+    /// Documents/passages.
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// Queries. E5-style models need distinct prefixes for queries and
+    /// passages; the default shares the document path (prefix-free
+    /// models).
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        Ok(self.embed(&[text])?.remove(0))
+    }
+    /// The offline fallback embedder. A model mismatch at open must
+    /// never migrate the vector table TO the fallback (an offline boot
+    /// would destroy real vectors); only a real model switch migrates.
+    fn is_fallback(&self) -> bool {
+        false
+    }
     /// Stable model identifier — stored with the vector table; changing
     /// it requires re-embedding everything (LightRAG's lesson).
     fn name(&self) -> &'static str;
@@ -41,6 +54,10 @@ impl Default for HashEmbedder {
 }
 
 impl Embedder for HashEmbedder {
+    fn is_fallback(&self) -> bool {
+        true
+    }
+
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
         Ok(texts
             .iter()
