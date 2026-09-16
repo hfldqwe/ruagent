@@ -54,6 +54,37 @@ enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Wiki mode: compile source documents into interlinked pages.
+    Wiki {
+        #[command(subcommand)]
+        cmd: WikiCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WikiCmd {
+    /// Compile source documents into wiki pages. Default is a dry run:
+    /// prints the plan, writes nothing -- confirm with --confirm <id>.
+    Build {
+        /// Scope: "all", "changed", or comma-separated source names.
+        #[arg(long, default_value = "changed")]
+        scope: String,
+        /// Plan only -- print the page plan, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Execute a reviewed dry-run plan by build id.
+        #[arg(long)]
+        confirm: Option<i64>,
+        /// Agent name (default: dsh, else first enabled).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// List wiki pages with stale/edited markers and link counts.
+    List,
+    /// Print the link graph: edges, broken (wanted) pages, orphans.
+    Links,
+    /// Print one page's raw markdown.
+    Show { slug: String },
 }
 
 fn main() -> Result<()> {
@@ -88,7 +119,213 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Cmd::Run { prompt, agent } => run(&cli.url, &prompt, agent.as_deref()),
+        Cmd::Wiki { cmd } => wiki_cmd(&cli.url, cmd),
     }
+}
+
+// ---------------------------------------------------------------------------
+// wiki: compile sources into interlinked pages (thin client over the API)
+// ---------------------------------------------------------------------------
+
+/// Response -> JSON with the daemon's {message} error body surfaced.
+fn api_json(resp: reqwest::blocking::Response) -> Result<serde_json::Value> {
+    let status = resp.status();
+    let text = resp.text().context("reading response")?;
+    if !status.is_success() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(m) = v["message"].as_str()
+        {
+            bail!("{m}");
+        }
+        bail!("HTTP {status}: {text}");
+    }
+    serde_json::from_str(&text).context("parsing response")
+}
+
+fn wiki_cmd(url: &str, cmd: WikiCmd) -> Result<()> {
+    match cmd {
+        WikiCmd::Build {
+            scope,
+            dry_run,
+            confirm,
+            agent,
+        } => {
+            let _ = dry_run; // plain builds always plan first (the gate)
+            wiki_build(url, &scope, confirm, agent.as_deref())
+        }
+        WikiCmd::List => wiki_list(url),
+        WikiCmd::Links => wiki_links(url),
+        WikiCmd::Show { slug } => wiki_show(url, &slug),
+    }
+}
+
+fn wiki_build(url: &str, scope: &str, confirm: Option<i64>, agent: Option<&str>) -> Result<()> {
+    let body = if let Some(id) = confirm {
+        serde_json::json!({ "confirm_plan": id, "agent": agent })
+    } else {
+        // "all"/"changed" pass through; anything else is a name list.
+        // Always dry_run: the plan-level human gate -- confirm explicitly.
+        let scope_json = if scope == "all" || scope == "changed" {
+            serde_json::json!(scope)
+        } else {
+            serde_json::json!(
+                scope
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            )
+        };
+        serde_json::json!({ "scope": scope_json, "dry_run": true, "agent": agent })
+    };
+    let is_plan = confirm.is_none();
+    let resp = api_json(
+        client()
+            .post(format!("{url}/api/v1/knowledge/wiki/build"))
+            .json(&body)
+            .send()
+            .context("daemon unreachable (is `ruagent serve` running?)")?,
+    )?;
+    let build_id = resp["build_id"].as_i64().unwrap_or(0);
+    let planned = resp["pages_planned"].as_i64().unwrap_or(0);
+    let agent_name = resp["agent"].as_str().unwrap_or("?");
+    if is_plan {
+        println!("plan #{build_id} by {agent_name} -- {planned} pages (dry run, nothing written)");
+        if let Some(notes) = resp["notes"].as_str() {
+            println!("notes: {notes}");
+        }
+        for p in resp["plan"].as_array().unwrap_or(&Vec::new()) {
+            let sources = p["sources"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "  [{:<6}] {:<24} {} (sources: {})",
+                p["action"].as_str().unwrap_or("?"),
+                p["slug"].as_str().unwrap_or("?"),
+                p["title"].as_str().unwrap_or(""),
+                sources,
+            );
+        }
+        println!();
+        println!("confirm to execute: ruagent wiki build --confirm {build_id}");
+    } else {
+        println!("build #{build_id} running via {agent_name} -- {planned} pages planned");
+        println!("watch progress in the panel (知识库 -> Wiki) or `ruagent wiki list`");
+    }
+    Ok(())
+}
+
+fn wiki_list(url: &str) -> Result<()> {
+    let resp = api_json(
+        client()
+            .get(format!("{url}/api/v1/knowledge/wiki/pages"))
+            .send()
+            .context("daemon unreachable")?,
+    )?;
+    let pages = resp["pages"].as_array().context("bad response")?;
+    if pages.is_empty() {
+        println!("no wiki pages -- `ruagent wiki build` to compile some");
+        return Ok(());
+    }
+    println!(
+        "{:<5} {:<26} {:<30} {:<7} {:<6} SOURCES",
+        "MARK", "SLUG", "TITLE", "OUT/IN", "STALE"
+    );
+    for p in pages {
+        let mut mark = String::new();
+        if p["stale"].as_bool().unwrap_or(false) {
+            mark.push('S');
+        }
+        if p["edited"].as_bool().unwrap_or(false) {
+            mark.push('E');
+        }
+        let title: String = p["title"].as_str().unwrap_or("").chars().take(28).collect();
+        let sources = p["sources"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        println!(
+            "{:<5} {:<26} {:<30} {:<3}/{:<3}  {:<6} {}",
+            mark,
+            p["slug"].as_str().unwrap_or("?"),
+            title,
+            p["links_out"].as_i64().unwrap_or(0),
+            p["links_in"].as_i64().unwrap_or(0),
+            if p["stale"].as_bool().unwrap_or(false) {
+                "stale"
+            } else {
+                ""
+            },
+            sources,
+        );
+    }
+    println!();
+    println!("S = sources updated since generation, E = hand-edited (builds skip it)");
+    Ok(())
+}
+
+fn wiki_links(url: &str) -> Result<()> {
+    let resp = api_json(
+        client()
+            .get(format!("{url}/api/v1/knowledge/wiki/links"))
+            .send()
+            .context("daemon unreachable")?,
+    )?;
+    let edges = resp["edges"].as_array().context("bad response")?;
+    let broken = resp["broken"].as_array().context("bad response")?;
+    let orphans = resp["orphans"].as_array().context("bad response")?;
+    println!("edges ({}):", edges.len());
+    for e in edges {
+        println!(
+            "  {} -> {}",
+            e["src"].as_str().unwrap_or("?"),
+            e["dst"].as_str().unwrap_or("?")
+        );
+    }
+    let wanted: Vec<&str> = broken.iter().filter_map(|b| b.as_str()).collect();
+    println!();
+    println!(
+        "wanted (linked but missing, {}): {}",
+        wanted.len(),
+        wanted.join(", ")
+    );
+    let orph: Vec<&str> = orphans.iter().filter_map(|o| o.as_str()).collect();
+    println!("orphans ({}): {}", orph.len(), orph.join(", "));
+    Ok(())
+}
+
+fn wiki_show(url: &str, slug: &str) -> Result<()> {
+    let name = format!("wiki/{slug}");
+    let resp = client()
+        .get(format!(
+            "{url}/api/v1/knowledge/raw/{}",
+            urlencoding::encode(&name)
+        ))
+        .send()
+        .context("daemon unreachable")?;
+    let status = resp.status();
+    let text = resp.text().context("reading response")?;
+    if !status.is_success() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(m) = v["message"].as_str()
+        {
+            bail!("{m}");
+        }
+        bail!("HTTP {status}: {text}");
+    }
+    print!("{text}");
+    Ok(())
 }
 
 fn client() -> reqwest::blocking::Client {
