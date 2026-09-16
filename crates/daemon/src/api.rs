@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/{key}", get(sessions_messages))
         .route("/api/v1/sessions/{key}/distill", post(session_distill))
         .route("/api/v1/recall", get(recall))
+        .route("/api/v1/recall/log", get(recall_log))
         .route(
             "/api/v1/memory/backfill-embeddings",
             post(memory_backfill_embeddings),
@@ -1435,16 +1436,25 @@ async fn recall(
     // Knowledge chunks (hybrid semantic + keyword). Parent-child
     // retrieval (WeKnora): the hit is the precise unit, the aggressive
     // strategy returns the parent SECTION for complete context.
-    // §13-2: wiki pages split off into their own section before the
-    // knowledge array is built — they must never appear as knowledge.
+    // Search WIDER than top_n: wiki pages are compilations of their
+    // sources — more keyword density, more chunks — and crowd the
+    // sources out of a shared budget (live finding 2026-09-16:
+    // "autohotkey 改键" returned 5 wiki chunks, 0 source docs). Each
+    // section gets its own top_n instead.
+    let search_n = (top_n.saturating_mul(3)).min(30);
     let all_hits = state
         .knowledge
-        .search(&q.q, top_n)
+        .search(&q.q, search_n)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    // raw best score BEFORE any filtering — logged for threshold
+    // tuning (what the filters dropped)
+    let top_knowledge_score = all_hits.first().map(|h| h.score as f64);
     let (wiki_hits, hits): (Vec<_>, Vec<_>) = all_hits
         .into_iter()
         .partition(|h| h.document.starts_with("wiki/"));
+    let wiki_hits: Vec<_> = wiki_hits.into_iter().take(top_n as usize).collect();
+    let hits: Vec<_> = hits.into_iter().take(top_n as usize).collect();
     let out_wiki = crate::wiki::recall_stubs(state.knowledge.as_ref(), &wiki_hits);
     let parents = state
         .knowledge
@@ -1631,6 +1641,49 @@ async fn recall(
         });
     }
 
+    // M6: usage log for threshold tuning — one row per call with the
+    // per-section counts and raw top scores (what the filters kept vs
+    // dropped). Fire-and-forget; local sqlite, sub-millisecond.
+    {
+        let db = state.mgr.db().clone();
+        let query: String = q.q.chars().take(200).collect();
+        let strategy = if conservative {
+            "conservative"
+        } else {
+            "aggressive"
+        };
+        let (nm, nk, nw, ne) = (
+            out_memories.len() as i64,
+            out_chunks.len() as i64,
+            out_wiki.len() as i64,
+            out_entities.len() as i64,
+        );
+        let tm = semantic.first().map(|m| m.4 as f64);
+        let _ = db
+            .call(move |conn| -> Result<(), rusqlite::Error> {
+                conn.execute(
+                    "INSERT INTO recall_log
+                        (ts, query, strategy, top_n, memories, knowledge, wiki, entities,
+                         top_memory_score, top_knowledge_score)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    rusqlite::params![
+                        chrono::Utc::now().to_rfc3339(),
+                        query,
+                        strategy,
+                        top_n as i64,
+                        nm,
+                        nk,
+                        nw,
+                        ne,
+                        tm,
+                        top_knowledge_score,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await;
+    }
+
     Ok(Json(serde_json::json!({
         "strategy": if conservative { "conservative" } else { "aggressive" },
         "memories": out_memories,
@@ -1641,6 +1694,47 @@ async fn recall(
         "wiki": out_wiki,
         "entities": out_entities,
     })))
+}
+
+/// Recent recall calls with per-section counts and raw top scores —
+/// the M6 tuning dataset (which sections came back empty, what the
+/// filters dropped).
+async fn recall_log(
+    State(state): State<AppState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let rows = state
+        .mgr
+        .db()
+        .call(
+            move |conn| -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT ts, query, strategy, top_n, memories, knowledge, wiki, entities,
+                            top_memory_score, top_knowledge_score
+                       FROM recall_log ORDER BY id DESC LIMIT ?1",
+                )?;
+                let rows = stmt
+                    .query_map([limit], |r| {
+                        Ok(serde_json::json!({
+                            "ts": r.get::<_, String>(0)?,
+                            "query": r.get::<_, String>(1)?,
+                            "strategy": r.get::<_, String>(2)?,
+                            "top_n": r.get::<_, i64>(3)?,
+                            "memories": r.get::<_, i64>(4)?,
+                            "knowledge": r.get::<_, i64>(5)?,
+                            "wiki": r.get::<_, i64>(6)?,
+                            "entities": r.get::<_, i64>(7)?,
+                            "top_memory_score": r.get::<_, Option<f64>>(8)?,
+                            "top_knowledge_score": r.get::<_, Option<f64>>(9)?,
+                        }))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await??;
+    Ok(Json(serde_json::json!({ "log": rows })))
 }
 
 /// FTS memories matching `term` (the keyword leg for entity navigation).

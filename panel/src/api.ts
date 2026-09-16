@@ -205,6 +205,21 @@ export interface KnowledgeEditOutcome {
   chunks: number;
 }
 
+/** One recall call in the usage log (M6 tuning dataset): per-section
+ * counts plus RAW top scores before the relevance filters. */
+export interface RecallLogRow {
+  ts: string;
+  query: string;
+  strategy: string;
+  top_n: number;
+  memories: number;
+  knowledge: number;
+  wiki: number;
+  entities: number;
+  top_memory_score: number | null;
+  top_knowledge_score: number | null;
+}
+
 /** A hit expanded into its parent section. */
 export interface KnowledgeExpansion {
   chunk_id: number;
@@ -552,6 +567,10 @@ export const api = {
   recall: (q: string, conservative: boolean, topN = 5) =>
     get<RecallResult>(
       `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,
+    ),
+  recallLog: (limit = 50) =>
+    get<{ log: RecallLogRow[] }>(`/api/v1/recall/log?limit=${limit}`).then(
+      (r) => r.log,
     ),
 
   // skills

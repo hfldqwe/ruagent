@@ -8,6 +8,7 @@ import {
   type AgentStats,
   type McpRegistry,
   type PendingPermission,
+  type RecallLogRow,
 } from "../api";
 import { Empty, Modal, RelTime, Spinner, fmtUsd, useToast } from "../ui";
 import { useI18n } from "../i18n";
@@ -124,8 +125,10 @@ export function Agents() {
 export function Stats() {
   const { t } = useI18n();
   const [stats, setStats] = useState<AgentStats[] | null>(null);
+  const [recallLog, setRecallLog] = useState<RecallLogRow[] | null>(null);
   useEffect(() => {
     api.stats().then(setStats).catch(() => setStats([]));
+    api.recallLog(20).then(setRecallLog).catch(() => setRecallLog([]));
     const t = setInterval(() => api.stats().then(setStats).catch(() => {}), 5000);
     return () => clearInterval(t);
   }, []);
@@ -184,6 +187,37 @@ export function Stats() {
           ]}
         />
       </Card>
+
+      {/* M6: the recall tuning dataset — what each call returned and
+          the raw top scores the filters kept/dropped */}
+      {recallLog && recallLog.length > 0 && (
+        <>
+          <div className="dash-head" style={{ marginTop: 18 }}>{t("stats.recallLog")}</div>
+          <div className="card">
+            {recallLog.map((r, i) => (
+              <div key={i} className="row-btn" style={{ cursor: "default" }}>
+                <span className="mono" style={{ fontSize: 12 }}>{r.query}</span>
+                <span className="tag">{r.strategy === "conservative" ? "保守" : "激进"}</span>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  mem {r.memories} · know {r.knowledge} · wiki {r.wiki} · ent {r.entities}
+                </span>
+                <span className="grow" />
+                {r.top_memory_score != null && (
+                  <span className="muted mono" style={{ fontSize: 11 }}>
+                    m {r.top_memory_score.toFixed(2)}
+                  </span>
+                )}
+                {r.top_knowledge_score != null && (
+                  <span className="muted mono" style={{ fontSize: 11 }}>
+                    k {r.top_knowledge_score.toFixed(2)}
+                  </span>
+                )}
+                <span className="time"><RelTime iso={r.ts} /></span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

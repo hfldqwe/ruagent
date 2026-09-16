@@ -602,3 +602,48 @@ async fn recall_entity_carries_related_wiki() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M6: every recall call lands in the usage log with per-section
+/// counts and raw top scores — the threshold-tuning dataset.
+#[tokio::test]
+async fn recall_calls_are_logged() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    http.put(format!("{daemon_url}/api/v1/knowledge/raw/deploy-guide"))
+        .json(&serde_json::json!({ "content": DOC }))
+        .send()
+        .await
+        .unwrap();
+    for (q, strategy) in [("release.sh", "aggressive"), ("kettle tea", "conservative")] {
+        http.get(format!("{daemon_url}/api/v1/recall"))
+            .query(&[("q", q), ("strategy", strategy), ("top_n", "5")])
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let log: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/recall/log"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = log["log"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{log:?}");
+    // newest first
+    assert_eq!(rows[0]["query"].as_str().unwrap(), "kettle tea");
+    assert_eq!(rows[0]["strategy"].as_str().unwrap(), "conservative");
+    assert_eq!(rows[0]["top_n"], serde_json::json!(5));
+    // the deploy-guide query returned a knowledge hit and logged a
+    // raw top score
+    assert_eq!(rows[1]["query"].as_str().unwrap(), "release.sh");
+    assert!(rows[1]["knowledge"].as_i64().unwrap_or(0) >= 1, "{log:?}");
+    assert!(
+        rows[1]["top_knowledge_score"].as_f64().unwrap_or(0.0) > 0.0,
+        "{log:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
