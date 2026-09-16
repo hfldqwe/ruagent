@@ -18,6 +18,7 @@ pub const BEHAVIORS: &[&str] = &[
     "plan",
     "crash",
     "approve",
+    "judge",
     "scripted",
 ];
 
@@ -36,6 +37,10 @@ pub enum Behavior {
     Crash,
     /// Reply with exactly "ALLOW" — plays the approver agent in tests.
     Approve,
+    /// Reply with the first `[RUN <id>]` candidate in the prompt — plays
+    /// the fan-out judge in tests (the run ids only exist at runtime, so
+    /// a marker-keyed script cannot reference them).
+    Judge,
     /// Reply from a marker-keyed script file — see [`MockArgs`].
     Scripted,
 }
@@ -132,10 +137,28 @@ impl Behavior {
             "plan" => Some(Behavior::Plan),
             "crash" => Some(Behavior::Crash),
             "approve" => Some(Behavior::Approve),
+            "judge" => Some(Behavior::Judge),
             "scripted" => Some(Behavior::Scripted),
             _ => None,
         }
     }
+}
+
+/// Extract every `[RUN <id>]` candidate marker from a judge prompt.
+/// Empty when the prompt carries no candidates.
+pub fn judge_candidates(prompt: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = prompt;
+    while let Some(open) = rest.find("[RUN ") {
+        rest = &rest[open + "[RUN ".len()..];
+        let Some(close) = rest.find(']') else { break };
+        let id = rest[..close].trim();
+        if !id.is_empty() && !ids.iter().any(|i| i == id) {
+            ids.push(id.to_string());
+        }
+        rest = &rest[close + 1..];
+    }
+    ids
 }
 
 /// Concatenate the text of a prompt's content blocks.
@@ -161,6 +184,7 @@ mod tests {
     fn parses_behaviors() {
         assert_eq!(Behavior::parse("echo"), Some(Behavior::Echo));
         assert_eq!(Behavior::parse("crash"), Some(Behavior::Crash));
+        assert_eq!(Behavior::parse("judge"), Some(Behavior::Judge));
         assert_eq!(Behavior::parse("scripted"), Some(Behavior::Scripted));
         assert_eq!(Behavior::parse("nope"), None);
     }
@@ -181,5 +205,23 @@ mod tests {
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[0].marker, "WIKI PLANNER");
         assert_eq!(replies[1].reply, "# X");
+    }
+
+    #[test]
+    fn judge_candidates_extracted_in_order_deduped() {
+        let prompt = "Candidates:\n[RUN run-aaaa-bbbb-1111] agent=claude\nresult 1\n[RUN run-aaaa-bbbb-2222] agent=dsh\nresult 2\nReply with RUN: and WHY:";
+        assert_eq!(
+            judge_candidates(prompt),
+            ["run-aaaa-bbbb-1111", "run-aaaa-bbbb-2222"]
+        );
+        // No markers, unclosed marker, duplicates, blank id.
+        assert!(judge_candidates("no markers here").is_empty());
+        assert!(judge_candidates("[RUN never-closed").is_empty());
+        assert!(judge_candidates("[RUN ] nothing").is_empty());
+        assert_eq!(
+            judge_candidates("[RUN x] [RUN x] [RUN y]"),
+            ["x", "y"],
+            "duplicates collapse"
+        );
     }
 }

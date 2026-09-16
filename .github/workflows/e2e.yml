@@ -24,12 +24,39 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build
-        run: cargo build -p ruagent
+        run: cargo build -p ruagent -p ruagent-mock-agent
       - name: Build panel
         run: |
           npm ci
           npm run build
         working-directory: panel
+      - name: Register e2e mock agents
+        # Two scripted fan-out members + the judge behavior: lets the
+        # Playwright suite exercise the full fan-out judge loop (design
+        # §5.2/§5.3) against real runs, without spending real agents.
+        run: |
+          mkdir -p ~/.ruagent/config
+          root="$HOME/.ruagent"
+          bin="$PWD/target/debug/ruagent-mock-agent"
+          printf '[{"marker":"FANOUT MARKER","reply":"answer from alpha"}]' > "$root/config/e2e-alpha.json"
+          printf '[{"marker":"FANOUT MARKER","reply":"answer from beta"}]' > "$root/config/e2e-beta.json"
+          cat > "$root/config/agents.toml" <<EOF
+          [agent.alpha]
+          harness = "mock"
+          command = "$bin --behavior scripted --replies $root/config/e2e-alpha.json"
+          description = "e2e fan-out member"
+
+          [agent.beta]
+          harness = "mock"
+          command = "$bin --behavior scripted --replies $root/config/e2e-beta.json"
+          description = "e2e fan-out member"
+
+          [agent.judge]
+          harness = "mock"
+          command = "$bin --behavior judge"
+          description = "e2e fan-out judge"
+          EOF
+          cat "$root/config/agents.toml"
       - name: Boot daemon
         run: |
           cargo run -p ruagent -- serve --addr 127.0.0.1:8787 &

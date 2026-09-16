@@ -90,6 +90,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/tasks/{id}/runs", post(start_run))
         .route("/api/v1/tasks/{id}/fanout", post(start_fanout))
         .route("/api/v1/tasks/{id}/pipeline", post(start_pipeline))
+        .route("/api/v1/tasks/{id}/judge", post(judge_task))
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/select", post(select_run))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
@@ -1032,10 +1033,21 @@ async fn get_task(
         .await?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
     let runs = state.mgr.db().list_runs_for_task(id).await?;
-    let selected_run_id = state.mgr.db().selected_run(id).await?;
-    Ok(Json(
-        serde_json::json!({ "task": task, "runs": runs, "selected_run_id": selected_run_id }),
-    ))
+    let (selected_run_id, selected_by) = state
+        .mgr
+        .db()
+        .selected_run(id)
+        .await?
+        .map(|(run_id, by)| (Some(run_id), Some(by)))
+        .unwrap_or((None, None));
+    let judgement = judge_view(state.mgr.db(), id, &runs).await?;
+    Ok(Json(serde_json::json!({
+        "task": task,
+        "runs": runs,
+        "selected_run_id": selected_run_id,
+        "selected_by": selected_by,
+        "judgement": judgement,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1196,6 +1208,131 @@ async fn start_pipeline(
     Ok(Json(serde_json::json!({ "tasks": task_ids })))
 }
 
+#[derive(Deserialize)]
+struct JudgeRequest {
+    agent: String,
+    /// Restrict judging to these runs; default = every completed run
+    /// with a result.
+    run_ids: Option<Vec<String>>,
+}
+
+/// Fan-out judge (design §5.2/§5.3): a NORMAL run that reviews the
+/// completed runs of a task and picks the winner. Returns the live
+/// judge run; the verdict lands on the task in the background.
+async fn judge_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(req): Json<JudgeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let task_id: ruagent_core::TaskId = task_id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    let task = state
+        .mgr
+        .db()
+        .get_task(task_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    let runs = state.mgr.db().list_runs_for_task(task_id).await?;
+
+    let wanted: Option<Vec<RunId>> = match req.run_ids {
+        Some(ids) => {
+            let mut out = Vec::new();
+            for raw in ids {
+                let id: RunId = raw
+                    .parse()
+                    .map_err(|_| ApiError::bad_request(format!("invalid run id `{raw}`")))?;
+                if !runs.iter().any(|r| r.id == id) {
+                    return Err(ApiError::bad_request(format!(
+                        "run `{raw}` does not belong to this task"
+                    )));
+                }
+                out.push(id);
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
+    let agent_cards = state.mgr.agents();
+    let mut candidates: Vec<crate::runs::JudgeCandidate> = Vec::new();
+    for r in &runs {
+        if let Some(ids) = &wanted
+            && !ids.contains(&r.id)
+        {
+            continue;
+        }
+        if r.status != RunStatus::Completed {
+            continue;
+        }
+        let Some(result) = r.result.as_deref().filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let agent_name = agent_cards
+            .iter()
+            .find(|c| c.id == r.params.agent)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| r.params.agent.to_string());
+        candidates.push(crate::runs::JudgeCandidate {
+            run_id: r.id,
+            agent_name,
+            cost_usd: r.cost_usd,
+            result: result.to_string(),
+        });
+    }
+    if candidates.len() < 2 {
+        return Err(ApiError::bad_request(
+            "judging needs at least two completed runs with results",
+        ));
+    }
+    let run = state.mgr.start_judge(&task, &req.agent, &candidates).await?;
+    Ok(Json(serde_json::json!({ "judge_run": run })))
+}
+
+/// The newest judge run for a task and its parsed verdict, for display.
+/// The authoritative selection lives on the task (`selected_run_id` /
+/// `selected_by`); this re-derives the judge's own pick + rationale from
+/// its reply, so it survives a later human override.
+async fn judge_view(
+    db: &ruagent_store::Db,
+    task_id: ruagent_core::TaskId,
+    parent_runs: &[Run],
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let edges = db.edges_from(task_id).await?;
+    let mut judge_tasks = Vec::new();
+    for e in edges
+        .iter()
+        .filter(|e| e.kind == ruagent_core::EdgeKind::Reviews)
+    {
+        if let Some(t) = db.get_task(e.to).await? {
+            judge_tasks.push(t);
+        }
+    }
+    let Some(judge_task) = judge_tasks
+        .into_iter()
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+    else {
+        return Ok(None);
+    };
+    let mut runs = db.list_runs_for_task(judge_task.id).await?;
+    let Some(run) = runs.pop() else {
+        return Ok(None);
+    };
+    let candidate_ids: Vec<RunId> = parent_runs.iter().map(|r| r.id).collect();
+    let (winner, rationale) = run
+        .result
+        .as_deref()
+        .and_then(|reply| crate::runs::parse_judge_verdict(reply, &candidate_ids))
+        .map(|(w, r)| (Some(w), r))
+        .unwrap_or((None, None));
+    Ok(Some(serde_json::json!({
+        "judge_run_id": run.id,
+        "judge_run_status": run.status,
+        "winner_run_id": winner,
+        "rationale": rationale,
+    })))
+}
+
 /// Select the winning run of a task (fan-out comparison outcome).
 async fn select_run(
     State(state): State<AppState>,
@@ -1213,7 +1350,11 @@ async fn select_run(
     if run.status != RunStatus::Completed {
         return Err(ApiError::bad_request("only completed runs can be selected"));
     }
-    state.mgr.db().set_selected_run(run.task_id, run_id).await?;
+    state
+        .mgr
+        .db()
+        .set_selected_run(run.task_id, run_id, "human")
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

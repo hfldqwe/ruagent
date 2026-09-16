@@ -59,6 +59,25 @@ export interface Task {
   updated_at: string;
 }
 
+/** The judge view over a task's fan-out (design §5.2/§5.3): the newest
+ *  judge run, its verdict re-parsed from the reply, and its rationale.
+ *  The authoritative selection lives on the task itself. */
+export interface Judgement {
+  judge_run_id: string;
+  judge_run_status: string;
+  winner_run_id: string | null;
+  rationale: string | null;
+}
+
+export interface TaskDetail {
+  task: Task;
+  runs: Run[];
+  selected_run_id: string | null;
+  /** "human" | "agent:<name>" | null (no selection yet). */
+  selected_by: string | null;
+  judgement: Judgement | null;
+}
+
 export interface Run {
   id: string;
   task_id: string;
@@ -372,8 +391,7 @@ export const api = {
     get<{ tasks: Task[] }>(`/api/v1/tasks${status ? `?status=${status}` : ""}`).then(
       (r) => r.tasks,
     ),
-  task: (id: string) =>
-    get<{ task: Task; runs: Run[]; selected_run_id: string | null }>(`/api/v1/tasks/${id}`),
+  task: (id: string) => get<TaskDetail>(`/api/v1/tasks/${id}`),
   createTask: (title: string, intent: string, project?: string) =>
     post("/api/v1/tasks", { title, intent, project }).then((r) => r.json() as Promise<Task>),
   updateTaskStatus: (id: string, status: string) => send("PATCH", `/api/v1/tasks/${id}`, { status }),
@@ -391,6 +409,10 @@ export const api = {
   pipeline: (taskId: string, steps: { agent: string; prompt?: string }[]) =>
     post(`/api/v1/tasks/${taskId}/pipeline`, { steps }).then(
       (r) => r.json() as Promise<{ tasks: string[] }>,
+    ),
+  judgeTask: (taskId: string, agent: string) =>
+    post(`/api/v1/tasks/${taskId}/judge`, { agent }).then(
+      (r) => r.json() as Promise<{ judge_run: Run }>,
     ),
   selectRun: (runId: string) => post(`/api/v1/runs/${runId}/select`),
   cancelRun: (runId: string) => post(`/api/v1/runs/${runId}/cancel`),

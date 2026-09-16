@@ -10,8 +10,8 @@ use ruagent_acp::adapter::HarnessAdapter as _;
 use ruagent_acp::permission::{PermissionAnswer, PermissionAsk};
 use ruagent_acp::{RunOptions, adapter_for, run_once};
 use ruagent_core::{
-    AgentCard, PermissionKind, PermissionResolution, RouteSource, RoutingDecision, Run, RunEvent,
-    RunId, RunParams, RunStatus, StopReason, Task, TaskCreator, TaskStatus,
+    AgentCard, EdgeKind, PermissionKind, PermissionResolution, RouteSource, RoutingDecision, Run,
+    RunEvent, RunId, RunParams, RunStatus, StopReason, Task, TaskCreator, TaskStatus, TaskEdge,
 };
 use ruagent_orchestrator::{self, PipelineStep, Topology};
 use ruagent_policy::PermissionPolicy;
@@ -516,7 +516,7 @@ impl RunManager {
         let base = task.clone();
         tokio::spawn(async move {
             let mut handoff: Option<String> = None;
-            for planned in &plan.runs {
+            for (i, planned) in plan.runs.iter().enumerate() {
                 let prompt = match (&planned.prompt, &handoff) {
                     (Some(p), _) => p.clone(),
                     (None, Some(up)) => compose_handoff(&base.intent, up),
@@ -526,6 +526,7 @@ impl RunManager {
                     Some(c) => c,
                     None => {
                         tracing::error!(agent = %planned.agent, "pipeline step agent missing");
+                        cancel_unstarted(&mgr.db, &plan.runs[i..]).await;
                         break;
                     }
                 };
@@ -549,6 +550,9 @@ impl RunManager {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!(error = %e, "pipeline step failed to start");
+                        // start_run failed before insert_run: step i's task
+                        // is still Pending, so cancel from it (inclusive).
+                        cancel_unstarted(&mgr.db, &plan.runs[i..]).await;
                         break;
                     }
                 };
@@ -556,17 +560,105 @@ impl RunManager {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!(error = %e, "pipeline wait failed");
+                        cancel_unstarted(&mgr.db, &plan.runs[i + 1..]).await;
                         break;
                     }
                 };
                 if final_run.status != RunStatus::Completed {
                     tracing::warn!(run_id = %run.id, status = ?final_run.status, "pipeline step did not complete; stopping chain");
+                    cancel_unstarted(&mgr.db, &plan.runs[i + 1..]).await;
                     break;
                 }
                 handoff = final_run.result;
             }
         });
         Ok(task_ids)
+    }
+
+    /// Fan-out judge (design §5.2 winner selection, §5.3 everything-is-a-run):
+    /// a NORMAL run on a judge sub-task that reviews the completed
+    /// candidate runs and picks one. Its verdict — a `RUN:` line naming a
+    /// candidate — becomes `task.selected_run_id` with `agent:<name>`
+    /// provenance; the Reviews edge links the judge task to the parent.
+    /// The judge completes in the background; the returned run is live.
+    pub async fn start_judge(
+        self: &Arc<Self>,
+        task: &Task,
+        judge_agent: &str,
+        candidates: &[JudgeCandidate],
+    ) -> Result<Run> {
+        let card = self
+            .agent(judge_agent)
+            .with_context(|| format!("unknown agent `{judge_agent}`"))?;
+        if candidates.len() < 2 {
+            anyhow::bail!("judging needs at least two completed runs with results");
+        }
+        let prompt = compose_judge_prompt(task, candidates);
+
+        let mut judge_task = Task::new(
+            format!("judge: {}", task.title),
+            prompt.clone(),
+            TaskCreator::Rule {
+                name: "judge".into(),
+            },
+        );
+        judge_task.project = Some("ruagent-internal".into());
+        self.db.insert_task(&judge_task).await?;
+        self.db
+            .insert_edge(TaskEdge {
+                from: task.id,
+                to: judge_task.id,
+                kind: EdgeKind::Reviews,
+            })
+            .await?;
+
+        let decision = RoutingDecision {
+            agents: vec![card.id],
+            source: RouteSource::Explicit,
+            rationale: Some("fan-out judge".into()),
+        };
+        let mcp = self.mcp_for(card);
+        let run = self
+            .start_run(
+                &judge_task,
+                judge_agent,
+                prompt,
+                mcp,
+                WorkspaceSpec::Fresh,
+                Some(decision),
+            )
+            .await?;
+
+        let mgr = Arc::clone(self);
+        let task_id = task.id;
+        let by = format!("agent:{judge_agent}");
+        let candidate_ids: Vec<RunId> = candidates.iter().map(|c| c.run_id).collect();
+        tokio::spawn(async move {
+            let final_run = match wait_terminal(&mgr.db, run.id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "judge run wait failed");
+                    return;
+                }
+            };
+            let Some(reply) = final_run.result.as_deref() else {
+                tracing::warn!(status = ?final_run.status, "judge run produced no result");
+                return;
+            };
+            match parse_judge_verdict(reply, &candidate_ids) {
+                Some((winner, why)) => {
+                    tracing::info!(winner = %winner, rationale = why.as_deref().unwrap_or("-"), "judge verdict recorded");
+                    if let Err(e) = mgr.db.set_selected_run(task_id, winner, &by).await {
+                        tracing::warn!(error = %e, "recording judge selection failed");
+                    }
+                }
+                None => tracing::warn!(
+                    reply = &reply[..reply.len().min(200)],
+                    "judge reply carried no valid RUN: verdict; selection unchanged"
+                ),
+            }
+        });
+        Ok(run)
     }
 
     /// MCP servers for an agent's configured profile (design §7.1).
@@ -881,6 +973,99 @@ Continue from the upstream result."
     )
 }
 
+/// One candidate shown to a fan-out judge: the run, the agent's display
+/// name, and its (bounded) result.
+#[derive(Debug, Clone)]
+pub struct JudgeCandidate {
+    pub run_id: RunId,
+    pub agent_name: String,
+    pub cost_usd: Option<f64>,
+    pub result: String,
+}
+
+/// Build the judge prompt. The `[RUN <id>]` markers are part of the
+/// contract — the judge reply references them, and the mock agent's judge
+/// behavior keys on them.
+fn compose_judge_prompt(task: &Task, candidates: &[JudgeCandidate]) -> String {
+    const MAX_RESULT_CHARS: usize = 3000;
+    let mut out = format!(
+        "You are judging fan-out results for a task. Compare the candidate runs and pick the single best one.\n\nTask: {}\nIntent: {}\n\nCandidates (in run order):\n",
+        task.title, task.intent
+    );
+    for (i, c) in candidates.iter().enumerate() {
+        let bounded: String = if c.result.chars().count() > MAX_RESULT_CHARS {
+            let cut: String = c.result.chars().take(MAX_RESULT_CHARS).collect();
+            format!("{cut}\n…[truncated at {MAX_RESULT_CHARS} chars]")
+        } else {
+            c.result.clone()
+        };
+        let cost = c
+            .cost_usd
+            .map(|v| format!("${v:.4}"))
+            .unwrap_or_else(|| "-".into());
+        out.push_str(&format!(
+            "\n[{}] [RUN {}] agent: {} · cost: {}\n{}\n",
+            i + 1,
+            c.run_id,
+            c.agent_name,
+            cost,
+            bounded
+        ));
+    }
+    out.push_str(
+        "\nReply with exactly two lines:\nRUN: <the run id of the best candidate>\nWHY: <one short paragraph justifying the choice>\n",
+    );
+    out
+}
+
+/// Parse a judge reply. The first `RUN:` line must name a candidate (full
+/// id, or an unambiguous prefix of at least 8 chars); the first `WHY:`
+/// line is the rationale (optional). `None` = no usable verdict.
+pub(crate) fn parse_judge_verdict(
+    reply: &str,
+    candidates: &[RunId],
+) -> Option<(RunId, Option<String>)> {
+    let line_value = |key: &str| -> Option<String> {
+        reply.lines().find_map(|l| {
+            let t = l.trim();
+            t.to_lowercase()
+                .strip_prefix(key)
+                .map(|rest| rest.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    };
+    let chosen = line_value("run:")?;
+    let winner = match candidates.iter().copied().find(|id| id.to_string() == chosen) {
+        Some(id) => Some(id),
+        // Tolerate shortened ids — but only when unambiguous.
+        // (`then_some` would index eagerly — len 0 must not panic.)
+        None if chosen.len() >= 8 => {
+            let matches: Vec<RunId> = candidates
+                .iter()
+                .copied()
+                .filter(|id| id.to_string().starts_with(&chosen))
+                .collect();
+            if matches.len() == 1 {
+                Some(matches[0])
+            } else {
+                None
+            }
+        }
+        None => None,
+    }?;
+    Some((winner, line_value("why:")))
+}
+
+/// Mark never-started pipeline sub-tasks cancelled so a broken chain does
+/// not leave them dangling in Pending forever (design §5.1 task states).
+async fn cancel_unstarted(db: &Db, planned: &[ruagent_orchestrator::PlannedRun]) {
+    for p in planned {
+        if let Err(e) = db.update_task_status(p.task.id, TaskStatus::Cancelled).await {
+            tracing::warn!(error = %e, "cancelling downstream pipeline task failed");
+        }
+    }
+}
+
 /// Wait for a run to reach a terminal state (poll; 30-minute ceiling).
 async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1800);
@@ -892,10 +1077,11 @@ async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
         if run.status.is_terminal() {
             return Ok(run);
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "pipeline step timed out (30 min)"
-        );
+        // bail, not assert: this runs in background drivers where a panic
+        // would kill the driver silently.
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("run did not reach a terminal state within 30 minutes");
+        }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
@@ -954,5 +1140,67 @@ mod tests {
         let p = compose_handoff("intent", "short");
         assert!(p.contains("short"));
         assert!(p.contains("Upstream result"));
+    }
+
+    fn candidate(id: &str, result: &str) -> JudgeCandidate {
+        JudgeCandidate {
+            run_id: id.parse().unwrap(),
+            agent_name: format!("agent-{}", &id[..8]),
+            cost_usd: Some(0.01),
+            result: result.into(),
+        }
+    }
+
+    #[test]
+    fn judge_prompt_lists_candidates_with_run_markers() {
+        let task = Task::new("Pick", "pick the best", TaskCreator::Human);
+        let prompt = compose_judge_prompt(
+            &task,
+            &[
+                candidate("11111111-1111-1111-1111-111111111111", "first result"),
+                candidate("22222222-2222-2222-2222-222222222222", &"x".repeat(4_000)),
+            ],
+        );
+        assert!(prompt.contains("[RUN 11111111-1111-1111-1111-111111111111]"));
+        assert!(prompt.contains("agent-11111111"));
+        assert!(prompt.contains("$0.0100"));
+        assert!(prompt.contains("truncated at 3000 chars"));
+        assert!(prompt.contains("RUN: <the run id"));
+    }
+
+    #[test]
+    fn judge_verdict_parses_exact_prefix_and_why() {
+        let ids: Vec<RunId> = [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+        // Exact id + rationale.
+        let (w, why) =
+            parse_judge_verdict("RUN: 22222222-2222-2222-2222-222222222222\nWHY: cheaper", &ids)
+                .unwrap();
+        assert_eq!(w, ids[1]);
+        assert_eq!(why.as_deref(), Some("cheaper"));
+
+        // Unambiguous 8-char prefix, no WHY, noisy casing/spacing.
+        let (w, why) = parse_judge_verdict("  run:   11111111  \nother lines", &ids).unwrap();
+        assert_eq!(w, ids[0]);
+        assert!(why.is_none());
+
+        // Unknown id, and an ambiguous prefix: both reject.
+        assert!(parse_judge_verdict("RUN: 33333333-3333", &ids).is_none());
+        let same_prefix: Vec<RunId> = [
+            "11111111-1111-1111-1111-111111111111",
+            "11111111-2222-2222-2222-222222222222",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        assert!(parse_judge_verdict("RUN: 11111111", &same_prefix).is_none());
+        // No RUN: line at all.
+        assert!(parse_judge_verdict("I liked the second one", &ids).is_none());
     }
 }

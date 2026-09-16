@@ -4,7 +4,7 @@
 import { useEffect, useState } from "react";
 import { Button, Checkbox, Input, Popconfirm, Segmented, Select } from "antd";
 import { Icon } from "../icons";
-import { api, type AgentInfo, type Run, type Task } from "../api";
+import { api, type AgentInfo, type Judgement, type Run, type Task } from "../api";
 import { useI18n } from "../i18n";
 import {
   Markdown,
@@ -24,6 +24,10 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [task, setTask] = useState<Task | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [winner, setWinner] = useState<string | null>(null);
+  const [selectionBy, setSelectionBy] = useState<string | null>(null);
+  const [judgement, setJudgement] = useState<Judgement | null>(null);
+  const [judgeAgent, setJudgeAgent] = useState("");
+  const [judging, setJudging] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [launching, setLaunching] = useState(false);
@@ -36,6 +40,8 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
         setTask(r.task);
         setRuns(r.runs);
         setWinner(r.selected_run_id);
+        setSelectionBy(r.selected_by);
+        setJudgement(r.judgement);
         setSelectedRun((prev) => prev ?? (r.runs[0]?.id ?? null));
         return r;
       })
@@ -93,7 +99,12 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                   <StatusDot status={r.status} />
                   <strong>{agentName(r)}</strong>
                   {r.cost_usd != null ? <span className="muted">{fmtUsd(r.cost_usd)}</span> : null}
-                  {winner === r.id ? <span className="tag ok">{t("task.winner")}</span> : null}
+                  {winner === r.id ? (
+                    <span className="tag ok">
+                      {t("task.winner")}
+                      {selectionBy?.startsWith("agent:") ? ` · ${selectionBy.slice(6)}` : ""}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="compare-result">
                   {r.result ? (
@@ -127,6 +138,18 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
               </div>
             ))}
           </div>
+          <JudgeBar
+            task={task}
+            agents={agents.filter((a) => a.enabled)}
+            runs={runs}
+            judgement={judgement}
+            judgeAgent={judgeAgent}
+            setJudgeAgent={setJudgeAgent}
+            judging={judging}
+            setJudging={setJudging}
+            onStarted={refresh}
+            agentName={agentName}
+          />
         </>
       )}
 
@@ -378,6 +401,109 @@ function Launcher({
           <Markdown>{t("launcher.hint.body")}</Markdown>
         </div>
       </details>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Judge bar (design §5.2/§5.3): launch an AI judge over the fan-out
+// results, then show its verdict. The human pick always overrides.
+// ---------------------------------------------------------------------------
+
+const ACTIVE_STATUSES = ["queued", "spawning", "running", "waiting_permission"];
+
+function JudgeBar({
+  task,
+  agents,
+  runs,
+  judgement,
+  judgeAgent,
+  setJudgeAgent,
+  judging,
+  setJudging,
+  onStarted,
+  agentName,
+}: {
+  task: Task;
+  agents: AgentInfo[];
+  runs: Run[];
+  judgement: Judgement | null;
+  judgeAgent: string;
+  setJudgeAgent: (a: string) => void;
+  judging: boolean;
+  setJudging: (b: boolean) => void;
+  onStarted: () => void;
+  agentName: (r: Run) => string;
+}) {
+  const { t } = useI18n();
+  const toast = useToast();
+
+  useEffect(() => {
+    if (agents.length && !agents.some((a) => a.name === judgeAgent)) setJudgeAgent(agents[0].name);
+  }, [agents, judgeAgent]);
+
+  const completedWithResult = runs.filter(
+    (r) => r.status === "completed" && (r.result ?? "").trim().length > 0,
+  );
+  const live = !!judgement && ACTIVE_STATUSES.includes(judgement.judge_run_status);
+  const canJudge = completedWithResult.length >= 2 && !live && !judging;
+
+  const go = async () => {
+    if (!judgeAgent) return;
+    setJudging(true);
+    try {
+      await api.judgeTask(task.id, judgeAgent);
+      toast("ok", t("toast.judgeStarted"));
+      onStarted();
+    } catch (e) {
+      toast("err", String(e));
+    } finally {
+      setJudging(false);
+    }
+  };
+
+  const verdictTag = () => {
+    if (!judgement) return null;
+    if (live) return <span className="tag">{t("task.judging")}</span>;
+    if (judgement.judge_run_status === "completed") {
+      if (judgement.winner_run_id) {
+        const run = runs.find((r) => r.id === judgement.winner_run_id);
+        return (
+          <span className="tag ok">
+            {t("task.judgePicked")}
+            {run ? `: ${agentName(run)}` : ""}
+          </span>
+        );
+      }
+      return <span className="tag warn">{t("task.judgeNoVerdict")}</span>;
+    }
+    return <span className="tag err">{t("task.judgeFailed")}</span>;
+  };
+
+  return (
+    <div className="card judge-bar" style={{ marginTop: 10 }}>
+      <div className="row">
+        <span className="doc-icon">
+          <Icon name="thought" size={15} />
+        </span>
+        <strong>{t("task.judge")}</strong>
+        <Select
+          size="small"
+          value={judgeAgent || undefined}
+          onChange={setJudgeAgent}
+          placeholder={t("task.judgeAgent")}
+          style={{ minWidth: 150 }}
+          options={agents.map((a) => ({ value: a.name, label: a.name }))}
+        />
+        <Button size="small" type="primary" disabled={!canJudge} loading={judging} onClick={go}>
+          {t("task.judgeGo")}
+        </Button>
+        <span className="grow" />
+        {verdictTag()}
+      </div>
+      {judgement?.rationale && (
+        <p className="muted" style={{ margin: "8px 0 0" }}>{judgement.rationale}</p>
+      )}
     </div>
   );
 }

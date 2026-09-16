@@ -201,6 +201,24 @@ async fn main() -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
+                        Behavior::Judge => {
+                            // Pick the first [RUN <id>] candidate: the
+                            // daemon's judge prompt lists them in run order,
+                            // so tests get a deterministic winner.
+                            let reply = match ruagent_mock_agent::judge_candidates(&text)
+                                .first()
+                            {
+                                Some(id) => {
+                                    format!("RUN: {id}\nWHY: mock judge prefers the first candidate")
+                                }
+                                None => "no candidates in prompt".to_string(),
+                            };
+                            notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(reply)),
+                            )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
                         Behavior::Crash => {
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new("about to crash")),

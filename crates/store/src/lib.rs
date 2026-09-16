@@ -133,17 +133,22 @@ impl Db {
     }
 
     /// Mark the winning run of a task (fan-out selection, design §5.2).
+    /// `by` records the selection provenance: `"human"` or `"agent:<name>"`
+    /// (a judge run, design §5.3).
     pub async fn set_selected_run(
         &self,
         task_id: ruagent_core::TaskId,
         run_id: ruagent_core::RunId,
+        by: &str,
     ) -> Result<(), DbError> {
+        let by = by.to_string();
         self.call(move |conn| {
             conn.execute(
-                "UPDATE tasks SET selected_run_id = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE tasks SET selected_run_id = ?2, selected_by = ?3, updated_at = ?4 WHERE id = ?1",
                 rusqlite::params![
                     task_id.to_string(),
                     run_id.to_string(),
+                    by,
                     Utc::now().to_rfc3339(),
                 ],
             )
@@ -152,24 +157,39 @@ impl Db {
         Ok(())
     }
 
-    /// The selected winning run of a task, if any.
+    /// The selected winning run of a task and who selected it, if any.
+    /// Returns `(run_id, by)`; `by` is `"human"` or `"agent:<name>"`.
     pub async fn selected_run(
         &self,
         task_id: ruagent_core::TaskId,
-    ) -> Result<Option<ruagent_core::RunId>, DbError> {
-        let row: Option<String> = self
-            .call(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                let mut stmt = conn.prepare("SELECT selected_run_id FROM tasks WHERE id = ?1")?;
-                let mut rows = stmt.query([task_id.to_string()])?;
-                match rows.next()? {
-                    Some(row) => Ok(row.get(0)?),
-                    None => Ok(None),
-                }
-            })
+    ) -> Result<Option<(ruagent_core::RunId, String)>, DbError> {
+        type SelectionRow = Option<(Option<String>, Option<String>)>;
+        let row: SelectionRow = self
+            .call(
+                move |conn| -> Result<SelectionRow, rusqlite::Error> {
+                    let mut stmt = conn
+                        .prepare("SELECT selected_run_id, selected_by FROM tasks WHERE id = ?1")?;
+                    let mut rows = stmt.query([task_id.to_string()])?;
+                    match rows.next()? {
+                        // get::<Option<String>>: the columns are NULL-able, and
+                        // a bare `String` get rejects NULL rows.
+                        Some(row) => {
+                            let run: Option<String> = row.get(0)?;
+                            let by: Option<String> = row.get(1)?;
+                            Ok(Some((run, by)))
+                        }
+                        None => Ok(None),
+                    }
+                },
+            )
             .await??;
         match row {
-            Some(s) => Ok(Some(s.parse().map_err(conv)?)),
-            None => Ok(None),
+            // NULL selected_by = a selection made before migration 0012.
+            Some((Some(run), by)) => Ok(Some((
+                run.parse().map_err(conv)?,
+                by.unwrap_or_else(|| "human".into()),
+            ))),
+            Some((None, _)) | None => Ok(None),
         }
     }
 
