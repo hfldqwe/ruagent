@@ -298,7 +298,8 @@ const zh: Record<string, string> = {
 
   // agents
   "agents.title": "智能体",
-  "agents.subtitle": "已注册的执行器与实时表现",
+  "agents.subtitle": "已注册的角色及其实时表现（运行时可切换）",
+  "agents.runtime": "运行时",
   "agents.empty.title": "没有已注册的智能体",
   "agents.empty.hint": "在 ~/.ruagent/config/agents.toml 添加后重启 daemon。",
   "agents.enabled": "已启用",
@@ -709,7 +710,8 @@ const en: Record<string, string> = {
   "graph.fact": "fact",
 
   "agents.title": "Agents",
-  "agents.subtitle": "Registered harnesses with live performance",
+  "agents.subtitle": "Registered roles with live performance (runtimes are swappable)",
+  "agents.runtime": "Runtime",
   "agents.empty.title": "No agents registered",
   "agents.empty.hint": "Add them to ~/.ruagent/config/agents.toml and restart the daemon.",
   "agents.enabled": "enabled",

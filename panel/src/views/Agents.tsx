@@ -54,7 +54,7 @@ export function Agents() {
                   <span className="agent-avatar">{a.name.slice(0, 2).toUpperCase()}</span>
                   <div>
                     <strong>{a.name}</strong>
-                    <div className="muted">{a.harness}</div>
+                    <div className="muted">{t("agents.runtime")} · {a.harness}</div>
                   </div>
                   <span className="grow" />
                   {a.runtime ? <span className="tag">{a.runtime}</span> : null}
