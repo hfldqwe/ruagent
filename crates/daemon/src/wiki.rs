@@ -1212,24 +1212,7 @@ async fn wiki_page_titles(kb: &Knowledge) -> Vec<(String, String)> {
 async fn regenerate_index(kb: &Knowledge, build_id: i64) -> Result<()> {
     let dir = kb.docs_dir().join("wiki");
     let mut entries: Vec<(String, frontmatter::PageMeta, bool)> = Vec::new();
-    let source_hashes: HashMap<String, String> = std::fs::read_dir(kb.docs_dir())
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    if name.starts_with('.') || !name.ends_with(".md") {
-                        return None;
-                    }
-                    std::fs::read_to_string(e.path()).ok().map(|c| {
-                        (
-                            name.trim_end_matches(".md").to_string(),
-                            ruagent_knowledge::sha256_hex(c.as_bytes()),
-                        )
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let hashes = source_hashes(kb);
     for entry in std::fs::read_dir(&dir)?.flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
         if file.starts_with('.') || !file.ends_with(".md") {
@@ -1248,7 +1231,7 @@ async fn regenerate_index(kb: &Knowledge, build_id: i64) -> Result<()> {
         let stale = meta
             .source_hashes
             .iter()
-            .any(|(n, h)| source_hashes.get(n).map(|cur| cur != h).unwrap_or(true));
+            .any(|(n, h)| hashes.get(n).map(|cur| cur != h).unwrap_or(true));
         entries.push((slug, meta, stale));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1276,6 +1259,266 @@ async fn regenerate_index(kb: &Knowledge, build_id: i64) -> Result<()> {
     }
     kb.save("wiki/index", &out).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M2: read APIs (page inventory + link graph, design §9.1) and the
+// §13-2 recall stubs
+// ---------------------------------------------------------------------------
+
+/// One wiki page in the panel's page inventory.
+#[derive(Debug, serde::Serialize)]
+pub struct WikiPageInfo {
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    pub aliases: Vec<String>,
+    pub entities: Vec<String>,
+    pub sources: Vec<String>,
+    pub stale: bool,
+    pub edited: bool,
+    pub links_out: usize,
+    pub links_in: usize,
+}
+
+/// The link graph (design §9.1 GET /wiki/links): what the panel graph
+/// view and the lint/wanted-pages loop consume.
+#[derive(Debug, serde::Serialize)]
+pub struct WikiLinks {
+    pub nodes: Vec<String>,
+    pub edges: Vec<WikiEdge>,
+    /// Linked but missing — the wanted pages (growth loop, §5.3).
+    pub broken: Vec<String>,
+    /// No links in, no links out.
+    pub orphans: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct WikiEdge {
+    pub src: String,
+    pub dst: String,
+}
+
+/// name → hash of the top-level source documents (stale detection).
+fn source_hashes(kb: &Knowledge) -> HashMap<String, String> {
+    std::fs::read_dir(kb.docs_dir())
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with('.') || !name.ends_with(".md") {
+                        return None;
+                    }
+                    std::fs::read_to_string(e.path()).ok().map(|c| {
+                        (
+                            name.trim_end_matches(".md").to_string(),
+                            ruagent_knowledge::sha256_hex(c.as_bytes()),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// slug → normalized outbound targets, from disk. `index` is excluded:
+/// it links to everything and would flatten the graph.
+fn page_links(kb: &Knowledge) -> Vec<(String, Vec<String>)> {
+    let dir = kb.docs_dir().join("wiki");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with('.') || !file.ends_with(".md") {
+            continue;
+        }
+        let slug = file.trim_end_matches(".md").to_string();
+        if slug == "index" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let targets = wiki_links(frontmatter::body(&text))
+            .iter()
+            .map(|t| normalize_target(t))
+            .collect();
+        out.push((slug, targets));
+    }
+    out.sort();
+    out
+}
+
+/// Pure graph math over (slug → outbound targets). Edges and inbound
+/// counts are deduped — a page linking the same target twice is one
+/// edge (graph-view semantics, not raw link counts).
+fn link_graph(pages: &[(String, Vec<String>)]) -> WikiLinks {
+    let nodes: Vec<String> = pages.iter().map(|(s, _)| s.clone()).collect();
+    let known: std::collections::HashSet<&str> = nodes.iter().map(String::as_str).collect();
+    let mut edges = Vec::new();
+    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    let mut broken: Vec<String> = Vec::new();
+    let mut inbound: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (src, targets) in pages {
+        for dst in targets {
+            if !known.contains(dst.as_str()) {
+                if !broken.contains(dst) {
+                    broken.push(dst.clone());
+                }
+                continue;
+            }
+            if dst == src {
+                continue; // self-links are noise in the graph
+            }
+            if seen.insert((src.as_str(), dst.as_str())) {
+                edges.push(WikiEdge {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                });
+                *inbound.entry(dst.as_str()).or_default() += 1;
+            }
+        }
+    }
+    broken.sort();
+    let orphans = pages
+        .iter()
+        .filter(|(slug, targets)| targets.is_empty() && !inbound.contains_key(slug.as_str()))
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    WikiLinks {
+        nodes,
+        edges,
+        broken,
+        orphans,
+    }
+}
+
+/// The page inventory: stale (source hashes drifted), edited
+/// (§13-3 hand-edit detection) and link counts, frontmatter-parsed.
+pub async fn pages(db: &ruagent_store::Db, kb: &Knowledge) -> Vec<WikiPageInfo> {
+    let hashes = source_hashes(kb);
+    let dir = kb.docs_dir().join("wiki");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    struct Raw {
+        slug: String,
+        meta: frontmatter::PageMeta,
+        text: String,
+        targets: Vec<String>,
+    }
+    let mut inbound: HashMap<String, usize> = HashMap::new();
+    let mut raws: Vec<Raw> = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with('.') || !file.ends_with(".md") {
+            continue;
+        }
+        let slug = file.trim_end_matches(".md").to_string();
+        if slug == "index" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(meta) = frontmatter::parse(&text) else {
+            continue;
+        };
+        let mut targets: Vec<String> = wiki_links(frontmatter::body(&text))
+            .iter()
+            .map(|t| normalize_target(t))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        for t in &targets {
+            if t != &slug {
+                *inbound.entry(t.clone()).or_default() += 1;
+            }
+        }
+        raws.push(Raw {
+            slug,
+            meta,
+            text,
+            targets,
+        });
+    }
+    raws.sort_by(|a, b| a.slug.cmp(&b.slug));
+    let mut out = Vec::new();
+    for raw in raws {
+        let stale = raw
+            .meta
+            .source_hashes
+            .iter()
+            .any(|(n, h)| hashes.get(n).map(|cur| cur != h).unwrap_or(true));
+        let edited = match page_hash(db, &raw.slug).await {
+            Some(recorded) => recorded != ruagent_knowledge::sha256_hex(raw.text.as_bytes()),
+            None => false,
+        };
+        out.push(WikiPageInfo {
+            slug: raw.slug.clone(),
+            title: raw.meta.title,
+            summary: raw.meta.summary,
+            aliases: raw.meta.aliases,
+            entities: raw.meta.entities,
+            sources: raw.meta.sources,
+            stale,
+            edited,
+            links_out: raw.targets.len(),
+            links_in: inbound.get(&raw.slug).copied().unwrap_or(0),
+        });
+    }
+    out
+}
+
+/// The link graph, straight from disk.
+pub fn links(kb: &Knowledge) -> WikiLinks {
+    link_graph(&page_links(kb))
+}
+
+/// §13-2 recall stubs for wiki hits — ALWAYS conservative (title +
+/// slug + stale marker), both strategies. The page is an ordinary
+/// knowledge document: consumers pull it through knowledge_expand /
+/// raw like any other hit.
+pub fn recall_stubs(
+    kb: &Knowledge,
+    hits: &[ruagent_knowledge::SearchHit],
+) -> Vec<serde_json::Value> {
+    let hashes = source_hashes(kb);
+    let mut out = Vec::new();
+    for h in hits {
+        let Some(slug) = h.document.strip_prefix("wiki/") else {
+            continue;
+        };
+        let meta = std::fs::read_to_string(kb.docs_dir().join("wiki").join(format!("{slug}.md")))
+            .ok()
+            .and_then(|t| frontmatter::parse(&t));
+        let stale = meta
+            .as_ref()
+            .map(|m| {
+                m.source_hashes
+                    .iter()
+                    .any(|(n, h)| hashes.get(n).map(|cur| cur != h).unwrap_or(true))
+            })
+            .unwrap_or(false);
+        out.push(serde_json::json!({
+            "kind": "wiki",
+            "slug": slug,
+            "chunk_id": h.chunk_id,
+            "document": h.document,
+            "title": meta
+                .as_ref()
+                .map(|m| m.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| slug.to_string()),
+            "summary": meta.as_ref().map(|m| m.summary.clone()).unwrap_or_default(),
+            "excerpt": h.content.chars().take(80).collect::<String>(),
+            "stale": stale,
+            "hint": "generated wiki page — verify against its sources before trusting",
+        }));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,6 +1775,36 @@ mod tests {
             "# Title\n\nbody"
         );
         assert_eq!(strip_page_fences("# Plain"), "# Plain");
+    }
+
+    #[test]
+    fn link_graph_math() {
+        let pages = vec![
+            (
+                "deploy-pipeline".into(),
+                vec!["k8s".into(), "rollback".into(), "k8s".into()],
+            ),
+            ("k8s".into(), vec!["deploy-pipeline".into()]),
+            ("pasta".into(), vec![]),
+        ];
+        let g = link_graph(&pages);
+        assert_eq!(g.nodes, ["deploy-pipeline", "k8s", "pasta"]);
+        // deploy→k8s twice is ONE edge (deduped); k8s→deploy is the other
+        assert_eq!(g.edges.len(), 2);
+        assert_eq!(g.edges.iter().filter(|e| e.dst == "k8s").count(), 1);
+        // rollback linked but missing → wanted page
+        assert_eq!(g.broken, ["rollback"]);
+        // pasta: no out, no in → orphan
+        assert_eq!(g.orphans, ["pasta"]);
+        // self-links are noise
+        let selfy = vec![("x".into(), vec!["x".into()])];
+        assert!(link_graph(&selfy).edges.is_empty());
+        // broken targets dedup
+        let dup = vec![
+            ("a".into(), vec!["missing".into()]),
+            ("b".into(), vec!["missing".into()]),
+        ];
+        assert_eq!(link_graph(&dup).broken, ["missing"]);
     }
 
     #[test]

@@ -101,7 +101,7 @@ impl PlatformTools {
     }
 
     #[tool(
-        description = "Unified recall across long-term memories, knowledge base and the knowledge graph. Two strategies: aggressive (default) returns full content above a relevance threshold — use when you need ready-to-use context; conservative returns only stubs (titles, entity names, relation one-liners) — cheap to scan, then fetch what you actually need via memory_get / graph_entity. Prefer conservative when context budget matters."
+        description = "Unified recall across long-term memories, knowledge base, generated wiki pages and the knowledge graph. Two strategies: aggressive (default) returns full content above a relevance threshold — use when you need ready-to-use context; conservative returns only stubs (titles, entity names, relation one-liners) — cheap to scan, then fetch what you actually need via memory_get / graph_entity. Prefer conservative when context budget matters. The `wiki` section holds AGENT-GENERATED pages (stale flag marks outdated ones) — treat as leads to verify against sources, not ground truth."
     )]
     async fn memory_recall(
         &self,
@@ -406,7 +406,7 @@ pub struct TaskFilterParams {
 /// graph_entity).
 fn recall_to_text(resp: &serde_json::Value) -> String {
     let mut out = Vec::new();
-    for section in ["memories", "knowledge", "entities"] {
+    for section in ["memories", "knowledge", "wiki", "entities"] {
         let items = resp[section].as_array().cloned().unwrap_or_default();
         if items.is_empty() {
             continue;
@@ -434,6 +434,21 @@ fn recall_to_text(resp: &serde_json::Value) -> String {
                         .unwrap_or("?");
                     let cid = it["chunk_id"].clone();
                     format!("  [{doc}] {body} (expand: {cid})")
+                }
+                "wiki" => {
+                    // §13-2: generated pages — labeled and marked so the
+                    // agent can verify against sources before trusting.
+                    let slug = it["slug"].as_str().unwrap_or("?");
+                    let title = it["title"].as_str().unwrap_or("?");
+                    let stale = if it["stale"].as_bool().unwrap_or(false) {
+                        " [sources updated since generation]"
+                    } else {
+                        ""
+                    };
+                    let cid = it["chunk_id"].clone();
+                    format!(
+                        "  [wiki/{slug}] {title}{stale} (expand: {cid}; GENERATED — verify against sources)"
+                    )
                 }
                 "entity" => {
                     let id = it["id"].clone();

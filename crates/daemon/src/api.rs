@@ -79,6 +79,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/knowledge/wiki/build", post(wiki_build))
         .route("/api/v1/knowledge/wiki/builds", get(wiki_builds))
         .route("/api/v1/knowledge/wiki/builds/{id}", get(wiki_build_get))
+        .route("/api/v1/knowledge/wiki/pages", get(wiki_pages))
+        .route("/api/v1/knowledge/wiki/links", get(wiki_links))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
         .route(
@@ -784,6 +786,20 @@ async fn wiki_build_get(
     Ok(Json(serde_json::json!({ "build": build, "pages": pages })))
 }
 
+/// The wiki page inventory (design §9.1): slug/title/aliases/entities/
+/// sources with stale + edited markers and link counts.
+async fn wiki_pages(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let pages = crate::wiki::pages(state.mgr.db(), state.knowledge.as_ref()).await;
+    Ok(Json(serde_json::json!({ "pages": pages })))
+}
+
+/// The wiki link graph: nodes, edges, broken (wanted pages) and orphans.
+async fn wiki_links(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(crate::wiki::links(state.knowledge.as_ref())).unwrap_or_default(),
+    ))
+}
+
 async fn graph_create_entity(
     State(state): State<AppState>,
     Json(req): Json<CreateEntityRequest>,
@@ -1419,11 +1435,17 @@ async fn recall(
     // Knowledge chunks (hybrid semantic + keyword). Parent-child
     // retrieval (WeKnora): the hit is the precise unit, the aggressive
     // strategy returns the parent SECTION for complete context.
-    let hits = state
+    // §13-2: wiki pages split off into their own section before the
+    // knowledge array is built — they must never appear as knowledge.
+    let all_hits = state
         .knowledge
         .search(&q.q, top_n)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    let (wiki_hits, hits): (Vec<_>, Vec<_>) = all_hits
+        .into_iter()
+        .partition(|h| h.document.starts_with("wiki/"));
+    let out_wiki = crate::wiki::recall_stubs(state.knowledge.as_ref(), &wiki_hits);
     let parents = state
         .knowledge
         .parents_for(&hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>())
@@ -1598,6 +1620,10 @@ async fn recall(
         "strategy": if conservative { "conservative" } else { "aggressive" },
         "memories": out_memories,
         "knowledge": out_chunks,
+        // §13-2: wiki hits are a separate section — never merged into
+        // knowledge — so consumers can distinguish generated pages and
+        // downweight or verify them.
+        "wiki": out_wiki,
         "entities": out_entities,
     })))
 }

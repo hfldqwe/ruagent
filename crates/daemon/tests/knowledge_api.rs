@@ -421,3 +421,137 @@ async fn markdown_truth_chunk_edits_and_parent_recall() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+const WIKI_PAGE_A: &str = "---\ntitle: Deploy pipeline\nsummary: \"一条命令走完全部发布\"\naliases: [deploy]\nentities: [Kubernetes]\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Deploy pipeline\n\nThe deploy script lives in scripts/release.sh. See [[tea-notes]] and [[k8s]].\n";
+const WIKI_PAGE_B: &str = "---\ntitle: Tea notes\nsummary: \"伯爵茶加柠檬\"\naliases: []\nentities: []\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Tea notes\n\nEarl grey tastes best with a slice of lemon.\n";
+const WIKI_ORPHAN: &str = "---\ntitle: Orphan\nsummary: \"\"\naliases: []\nentities: []\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Orphan\n\nNobody links here, I link nowhere.\n";
+
+/// M2 read APIs: the page inventory (stale/edited markers, link counts)
+/// and the link graph (edges, broken/wanted, orphans).
+#[tokio::test]
+async fn wiki_pages_and_links_inventory() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    for (name, content) in [
+        ("deploy-guide", DOC),
+        ("wiki/deploy-pipeline", WIKI_PAGE_A),
+        ("wiki/tea-notes", WIKI_PAGE_B),
+        ("wiki/orphan-page", WIKI_ORPHAN),
+    ] {
+        let resp: serde_json::Value = http
+            .put(format!("{daemon_url}/api/v1/knowledge/raw/{name}"))
+            .json(&serde_json::json!({ "content": content }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            resp["chunks"].as_i64().unwrap_or(0) >= 1,
+            "{name}: {resp:?}"
+        );
+    }
+
+    let pages: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/wiki/pages"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let list = pages["pages"].as_array().unwrap();
+    assert_eq!(list.len(), 3, "index.md excluded: {pages:?}");
+    let find = |slug: &str| {
+        list.iter()
+            .find(|p| p["slug"].as_str() == Some(slug))
+            .unwrap_or_else(|| panic!("no {slug} in {pages:?}"))
+            .clone()
+    };
+    let a = find("deploy-pipeline");
+    assert_eq!(a["title"].as_str().unwrap(), "Deploy pipeline");
+    // deadbeef is not the real source hash → stale
+    assert_eq!(a["stale"], serde_json::json!(true), "{a:?}");
+    // no build wrote it → not edited
+    assert_eq!(a["edited"], serde_json::json!(false));
+    assert_eq!(a["links_out"], serde_json::json!(2)); // tea-notes + k8s
+    assert_eq!(a["links_in"], serde_json::json!(0));
+    let b = find("tea-notes");
+    assert_eq!(b["stale"], serde_json::json!(true));
+    assert_eq!(b["links_in"], serde_json::json!(1));
+    assert_eq!(find("orphan-page")["links_out"], serde_json::json!(0));
+
+    let links: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/knowledge/wiki/links"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nodes: Vec<&str> = links["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect();
+    assert_eq!(nodes, ["deploy-pipeline", "orphan-page", "tea-notes"]);
+    let edges = links["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{links:?}");
+    assert_eq!(edges[0]["src"].as_str().unwrap(), "deploy-pipeline");
+    assert_eq!(edges[0]["dst"].as_str().unwrap(), "tea-notes");
+    // k8s is linked but missing — the wanted-pages loop
+    assert_eq!(links["broken"], serde_json::json!(["k8s"]), "{links:?}");
+    assert_eq!(links["orphans"], serde_json::json!(["orphan-page"]));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// §13-2: wiki hits come back as their own section, never inside
+/// `knowledge`, and are ALWAYS stubs (even on the aggressive strategy).
+#[tokio::test]
+async fn recall_returns_wiki_section_separate_from_knowledge() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    for (name, content) in [("deploy-guide", DOC), ("wiki/deploy-pipeline", WIKI_PAGE_A)] {
+        http.put(format!("{daemon_url}/api/v1/knowledge/raw/{name}"))
+            .json(&serde_json::json!({ "content": content }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let resp: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/recall"))
+        .query(&[("q", "release.sh deploy"), ("strategy", "aggressive")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wiki = resp["wiki"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !wiki.is_empty(),
+        "wiki hit must land in the wiki section: {resp:?}"
+    );
+    let stub = &wiki[0];
+    assert_eq!(stub["kind"].as_str().unwrap(), "wiki");
+    assert_eq!(stub["slug"].as_str().unwrap(), "deploy-pipeline");
+    assert_eq!(stub["title"].as_str().unwrap(), "Deploy pipeline");
+    assert_eq!(stub["stale"], serde_json::json!(true));
+    assert!(stub["chunk_id"].as_i64().is_some());
+    // ALWAYS conservative stubs — no full content even on aggressive
+    assert!(stub.get("content").is_none(), "{stub:?}");
+    // and never inside the knowledge section
+    let knowledge = resp["knowledge"].as_array().cloned().unwrap_or_default();
+    assert!(
+        knowledge
+            .iter()
+            .all(|h| !h["document"].as_str().unwrap_or("").starts_with("wiki/")),
+        "wiki documents must not appear as knowledge hits: {resp:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
