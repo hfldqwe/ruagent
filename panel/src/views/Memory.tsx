@@ -471,6 +471,12 @@ function RecallPlayground() {
                       [mem] #{m.id} {m.title}
                     </p>
                   ))}
+                  {(e.related?.wiki ?? []).map((w, i) => (
+                    <p key={`w${i}`} className="hit-content mono" style={{ fontSize: 12 }}>
+                      [wiki] {w.slug} — {w.title}
+                      {w.stale ? " ⚠" : ""} ({t("memory.recallWikiGenerated")})
+                    </p>
+                  ))}
                 </div>
               ),
             )}
@@ -681,6 +687,17 @@ function EntityStub({ stub }: { stub: RecallResult["entities"][number] }) {
                     </div>
                   );
                 })
+              )}
+              {(stub.related?.wiki ?? []).length > 0 && (
+                <div className="row tight" style={{ marginTop: 8, flexWrap: "wrap" }}>
+                  <span className="tag">wiki</span>
+                  {(stub.related?.wiki ?? []).map((w) => (
+                    <span key={w.slug} className="tag" title={w.hint}>
+                      {w.title}
+                      {w.stale ? " ⚠" : ""} · {t("memory.recallWikiGenerated")}
+                    </span>
+                  ))}
+                </div>
               )}
             </div>
           ) : null}

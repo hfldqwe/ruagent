@@ -453,9 +453,21 @@ fn recall_to_text(resp: &serde_json::Value) -> String {
                 "entity" => {
                     let id = it["id"].clone();
                     let name = it["name"].as_str().unwrap_or("?");
+                    // §12-2: related wiki pages on the stub — labeled
+                    // generated so the agent verifies before trusting
+                    let wiki = it["related"]["wiki"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|w| w["slug"].as_str())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|v| !v.is_empty())
+                        .map(|v| format!(" [wiki: {} (generated)]", v.join(", ")))
+                        .unwrap_or_default();
                     match it["summary"].as_str() {
-                        Some(s) => format!("  &{id} {name} — {s}"),
-                        None => format!("  &{id} {name} (call graph_entity for facts)"),
+                        Some(s) => format!("  &{id} {name} — {s}{wiki}"),
+                        None => format!("  &{id} {name} (call graph_entity for facts){wiki}"),
                     }
                 }
                 _ => continue,
@@ -503,4 +515,49 @@ pub async fn serve_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let reason = server.waiting().await?;
     tracing::info!(?reason, "mcp server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recall_to_text;
+
+    #[test]
+    fn recall_to_text_renders_sections_and_entity_wiki() {
+        let resp = serde_json::json!({
+            "memories": [{ "kind": "memory", "id": 7, "title": "use sqlx", "hint": "call memory_get" }],
+            "knowledge": [{ "kind": "knowledge", "chunk_id": 3, "document": "ops-handbook", "excerpt": "release.sh" }],
+            "wiki": [{ "kind": "wiki", "slug": "deploy-pipeline", "title": "Deploy pipeline",
+                        "stale": true, "chunk_id": 9, "hint": "verify" }],
+            "entities": [{ "kind": "entity", "id": 1, "name": "Kubernetes",
+                           "related": { "wiki": [{ "slug": "deploy-pipeline" }] } }],
+        });
+        let text = recall_to_text(&resp);
+        assert!(text.contains("## memories"), "{text}");
+        assert!(text.contains("#7 use sqlx"), "{text}");
+        assert!(text.contains("## knowledge"), "{text}");
+        assert!(
+            text.contains("[ops-handbook] release.sh (expand: 3)"),
+            "{text}"
+        );
+        // wiki section: labeled generated, stale flag present
+        assert!(text.contains("## wiki"), "{text}");
+        assert!(
+            text.contains("[wiki/deploy-pipeline] Deploy pipeline [sources updated since generation] (expand: 9; GENERATED"),
+            "{text}"
+        );
+        // entity line carries the soft-linked wiki pages
+        assert!(
+            text.contains(
+                "&1 Kubernetes (call graph_entity for facts) [wiki: deploy-pipeline (generated)]"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn recall_to_text_skips_empty_sections() {
+        let resp =
+            serde_json::json!({ "memories": [], "knowledge": [], "wiki": [], "entities": [] });
+        assert_eq!(recall_to_text(&resp), "no results");
+    }
 }

@@ -1487,10 +1487,18 @@ pub fn recall_stubs(
 ) -> Vec<serde_json::Value> {
     let hashes = source_hashes(kb);
     let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for h in hits {
         let Some(slug) = h.document.strip_prefix("wiki/") else {
             continue;
         };
+        // index is the build-generated catalog, not content — noise in
+        // recall (§4.4); one stub per page, hits are ranked so the
+        // first chunk wins
+        if slug == "index" || seen.iter().any(|s| s == slug) {
+            continue;
+        }
+        seen.push(slug.to_string());
         let meta = std::fs::read_to_string(kb.docs_dir().join("wiki").join(format!("{slug}.md")))
             .ok()
             .and_then(|t| frontmatter::parse(&t));
@@ -1517,6 +1525,100 @@ pub fn recall_stubs(
             "stale": stale,
             "hint": "generated wiki page — verify against its sources before trusting",
         }));
+    }
+    out
+}
+
+/// Word-boundary containment: "autohotkey" ⊂ "autohotkey v2" matches,
+/// "f6" ⊄ "shell:startup". Graph names are distilled ("AutoHotkey"),
+/// page entities are agent-written and often more specific
+/// ("AutoHotkey v2") — exact matching connects nothing in practice.
+fn word_contains(hay: &str, needle: &str) -> bool {
+    if hay == needle {
+        return true;
+    }
+    let Some(pos) = hay.find(needle) else {
+        return false;
+    };
+    let before_ok = pos == 0
+        || !hay[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+    let after = &hay[pos + needle.len()..];
+    let after_ok = after.chars().next().is_none_or(|c| !c.is_alphanumeric());
+    before_ok && after_ok
+}
+
+/// §12-2: the entity→wiki soft link — for each entity name, the wiki
+/// pages whose `entities` frontmatter cites it. One pass over the
+/// wiki dir; the match is case-insensitive word-boundary containment
+/// in BOTH directions (see [`word_contains`]). §13-2 discipline:
+/// conservative stubs only (slug + title + stale), capped at 3 pages
+/// per entity.
+pub fn entity_related_pages(
+    kb: &Knowledge,
+    names: &[String],
+) -> HashMap<String, Vec<serde_json::Value>> {
+    if names.is_empty() {
+        return HashMap::new();
+    }
+    let wanted: Vec<String> = names
+        .iter()
+        .map(|n| n.trim().to_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    let hashes = source_hashes(kb);
+    let dir = kb.docs_dir().join("wiki");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return HashMap::new();
+    };
+    let mut out: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with('.') || !file.ends_with(".md") {
+            continue;
+        }
+        let slug = file.trim_end_matches(".md").to_string();
+        if slug == "index" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(meta) = frontmatter::parse(&text) else {
+            continue;
+        };
+        // which of the queried entities does this page cite?
+        let matched: Vec<String> = wanted
+            .iter()
+            .filter(|w| {
+                meta.entities.iter().any(|e| {
+                    let el = e.trim().to_lowercase();
+                    word_contains(&el, w) || word_contains(w, &el)
+                })
+            })
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        let stale = meta
+            .source_hashes
+            .iter()
+            .any(|(n, h)| hashes.get(n).map(|cur| cur != h).unwrap_or(true));
+        let card = serde_json::json!({
+            "slug": slug,
+            "title": if meta.title.is_empty() { slug.clone() } else { meta.title },
+            "stale": stale,
+            "hint": "generated wiki page — verify against its sources",
+        });
+        for key in matched {
+            let list = out.entry(key).or_default();
+            if list.len() < 3 && !list.iter().any(|c| c["slug"] == card["slug"]) {
+                list.push(card.clone());
+            }
+        }
     }
     out
 }
@@ -1775,6 +1877,24 @@ mod tests {
             "# Title\n\nbody"
         );
         assert_eq!(strip_page_fences("# Plain"), "# Plain");
+    }
+
+    #[test]
+    fn word_boundary_containment() {
+        // one-directional: needle as a WHOLE WORD inside hay. The
+        // bidirectionality lives at the entity_related_pages call site.
+        assert!(word_contains("autohotkey", "autohotkey"));
+        // graph name shorter, page entity more specific — the real-data case
+        assert!(word_contains("autohotkey v2", "autohotkey"));
+        // a longer needle can never be found in a shorter hay
+        assert!(!word_contains("autohotkey", "autohotkey v2"));
+        // word boundaries: substring alone is not enough
+        assert!(!word_contains("shell:startup", "f6"));
+        assert!(!word_contains("deploy-pipeline", "pipe"));
+        assert!(!word_contains("kubernetes", "k8s"));
+        // boundaries at both ends, separators are fine
+        assert!(word_contains("xbutton2, f6", "f6"));
+        assert!(word_contains("f6 (key)", "f6"));
     }
 
     #[test]

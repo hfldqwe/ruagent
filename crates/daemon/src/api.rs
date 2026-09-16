@@ -1554,6 +1554,12 @@ async fn recall(
             })
         });
     }
+    // §12-2: the entity→wiki soft link, computed once for all hits
+    // (one pass over the wiki dir, not one per entity).
+    let related_wiki = crate::wiki::entity_related_pages(
+        state.knowledge.as_ref(),
+        &entities.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+    );
     let mut out_entities: Vec<serde_json::Value> = Vec::new();
     for e in entities {
         let facts = entity_facts
@@ -1597,11 +1603,20 @@ async fn recall(
                 })
             })
             .collect();
-        let related = if related_chunks.is_empty() && related_memories.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!({ "chunks": related_chunks, "memories": related_memories })
-        };
+        // map keys are lowercased entity names (the match is too)
+        let wiki_pages = related_wiki
+            .get(&e.name.trim().to_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        let related =
+            if related_chunks.is_empty() && related_memories.is_empty() && wiki_pages.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({
+                    "chunks": related_chunks, "memories": related_memories,
+                    "wiki": wiki_pages,
+                })
+            };
         out_entities.push(if conservative {
             serde_json::json!({
                 "kind": "entity", "id": e.id, "name": e.name, "entity_kind": e.kind,

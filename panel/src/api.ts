@@ -139,6 +139,8 @@ export interface RecallResult {
     related?: {
       chunks: { chunk_id: number; document: string; excerpt: string }[];
       memories: { id: number; store: string; namespace: string; title: string }[];
+      /** §12-2: wiki pages citing this entity (generated — labeled). */
+      wiki?: { slug: string; title: string; stale: boolean; hint?: string }[];
     } | null;
   }[];
 }

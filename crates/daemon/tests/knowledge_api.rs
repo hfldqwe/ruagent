@@ -555,3 +555,50 @@ async fn recall_returns_wiki_section_separate_from_knowledge() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// §12-2: entity recall stubs carry the wiki pages that cite them
+/// (case-insensitive match between graph names and page entities).
+#[tokio::test]
+async fn recall_entity_carries_related_wiki() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    // a wiki page whose entities frontmatter cites "Kubernetes"
+    http.put(format!(
+        "{daemon_url}/api/v1/knowledge/raw/wiki/deploy-pipeline"
+    ))
+    .json(&serde_json::json!({ "content": WIKI_PAGE_A }))
+    .send()
+    .await
+    .unwrap();
+    // a graph entity in DIFFERENT casing — the match must be case-insensitive
+    http.post(format!("{daemon_url}/api/v1/graph/entity"))
+        .json(&serde_json::json!({ "name": "kubernetes" }))
+        .send()
+        .await
+        .unwrap();
+
+    let resp: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/recall"))
+        .query(&[("q", "kubernetes"), ("strategy", "conservative")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entities = resp["entities"].as_array().cloned().unwrap_or_default();
+    assert!(!entities.is_empty(), "entity must match: {resp:?}");
+    let wiki = entities[0]["related"]["wiki"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !wiki.is_empty(),
+        "entity stub must carry the citing wiki page: {resp:?}"
+    );
+    assert_eq!(wiki[0]["slug"].as_str().unwrap(), "deploy-pipeline");
+    assert_eq!(wiki[0]["title"].as_str().unwrap(), "Deploy pipeline");
+    assert_eq!(wiki[0]["stale"], serde_json::json!(true));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
