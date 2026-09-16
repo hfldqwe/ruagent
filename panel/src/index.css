@@ -974,3 +974,11 @@ html[data-mode="dark"] .home-hero::before {
 ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.18); }
 html[data-mode="light"] ::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.10); }
 html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.18); }
+
+/* ---------------------------------------------------------------------------
+   Wiki page viewer — navigable [[wikilinks]]; broken = wanted pages
+   --------------------------------------------------------------------------- */
+.wiki-view { max-height: 60vh; overflow: auto; padding-right: 8px; }
+.wiki-view h1 { margin-top: 0; }
+.wiki-broken { color: var(--ant-color-error); }
+.wiki-broken .wiki-q { font-weight: 600; margin-left: 1px; }

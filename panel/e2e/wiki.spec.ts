@@ -47,3 +47,23 @@ test("recall returns wiki hits as their own labeled section", async ({ page, req
   await expect(stub).toBeVisible();
   await expect(stub.locator(".recall-stub-head")).toContainText(pages[0].title || pages[0].slug);
 });
+
+test("the page viewer renders pages without leaking frontmatter", async ({ page, request }) => {
+  const res = await request.get("/api/v1/knowledge/wiki/pages");
+  test.skip(!res.ok(), "wiki pages API unavailable");
+  const { pages } = (await res.json()) as { pages: { slug: string; title: string }[] };
+  test.skip(pages.length === 0, "no wiki pages in this database");
+
+  await page.goto("/#knowledge");
+  await page.locator(".ant-segmented-item-label").filter({ hasText: /^Wiki$/ }).click();
+  await page.locator(".card .row-btn").first().click();
+
+  // the page renders as markdown (H1 present) — a raw dump would show
+  // the frontmatter block instead
+  await expect(page.locator(".wiki-view h1")).toBeVisible({ timeout: 8_000 });
+  await expect(page.locator(".wiki-view")).not.toContainText("source_hashes");
+  // and the raw editor is one click away
+  await expect(
+    page.locator("button").filter({ hasText: /编辑此页|Edit page/ }),
+  ).toBeVisible();
+});

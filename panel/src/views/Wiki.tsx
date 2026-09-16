@@ -6,6 +6,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button, Segmented, Select } from "antd";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, type AgentInfo, type WikiBuild, type WikiBuildStarted, type WikiPageInfo } from "../api";
 import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
 import { Icon } from "../icons";
@@ -27,6 +29,8 @@ export function WikiTab({ openEditor }: { openEditor: (name: string) => void }) 
   const [broken, setBroken] = useState<string[]>([]);
   const [orphans, setOrphans] = useState<string[]>([]);
   const [compiling, setCompiling] = useState(false);
+  /** slug being viewed in the page viewer (null = closed). */
+  const [viewing, setViewing] = useState<string | null>(null);
   /** build id whose per-page detail is unfolded. */
   const [openBuild, setOpenBuild] = useState<number | null>(null);
   const [buildDetail, setBuildDetail] = useState<
@@ -118,8 +122,8 @@ export function WikiTab({ openEditor }: { openEditor: (name: string) => void }) 
                 tabIndex={0}
                 aria-label={p.slug}
                 className="row-btn"
-                onClick={() => openEditor(`wiki/${p.slug}`)}
-                onKeyDown={(e) => e.key === "Enter" && openEditor(`wiki/${p.slug}`)}
+                onClick={() => setViewing(p.slug)}
+                onKeyDown={(e) => e.key === "Enter" && setViewing(p.slug)}
               >
                 <span className="doc-icon"><Icon name="doc" size={15} /></span>
                 <strong>{p.title || p.slug}</strong>
@@ -199,6 +203,18 @@ export function WikiTab({ openEditor }: { openEditor: (name: string) => void }) 
             ))}
           </div>
         </>
+      )}
+
+      {viewing && (
+        <WikiPageModal
+          slug={viewing}
+          pages={pages}
+          onEdit={(slug) => {
+            setViewing(null);
+            openEditor(`wiki/${slug}`);
+          }}
+          onClose={() => setViewing(null)}
+        />
       )}
 
       {compiling && (
@@ -336,6 +352,151 @@ function CompileModal({
           <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
             {t("wiki.compile.gate")}
           </p>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Page viewer: rendered markdown with navigable [[wikilinks]] — the
+// Karpathy-wiki core interaction. Broken links render red with "?" —
+// they are the wanted pages (MediaWiki convention).
+// ---------------------------------------------------------------------------
+
+/** Strip the daemon-serialized frontmatter block (everything between
+ * the leading `---` and the closing `---`). */
+function stripFrontmatter(text: string): string {
+  if (!text.startsWith("---\n")) return text;
+  const end = text.indexOf("\n---\n", 3);
+  return end < 0 ? text : text.slice(end + 5);
+}
+
+/** Mirror of the server's normalize_target (wiki.rs §5.2). */
+function normalizeWikiTarget(target: string): string {
+  return target
+    .trim()
+    .replace(/\.md$/, "")
+    .trim()
+    .toLowerCase()
+    .replace(/ /g, "-");
+}
+
+/** [[target|display]] / [[target]] → markdown links pointing at the
+ * viewer's internal scheme (#wiki-<slug>). Code fences are left
+ * alone — same discipline as the server's wiki_links parser. */
+function linkifyWikilinks(body: string): string {
+  const link = (t: string, disp?: string) => {
+    const slug = normalizeWikiTarget(t);
+    return `[${(disp ?? t).trim()}](#wiki-${slug})`;
+  };
+  return body
+    .split(/(```[\s\S]*?```)/g)
+    .map((part, i) =>
+      i % 2 === 1
+        ? part
+        : part.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, t: string, d?: string) =>
+            link(t, d),
+          ),
+    )
+    .join("");
+}
+
+function WikiPageModal({
+  slug,
+  pages,
+  onEdit,
+  onClose,
+}: {
+  slug: string;
+  pages: WikiPageInfo[];
+  onEdit: (slug: string) => void;
+  onClose: () => void;
+}) {
+  const { t } = useI18n();
+  const toast = useToast();
+  const [current, setCurrent] = useState(slug);
+  const [raw, setRaw] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setRaw(null);
+    api
+      .knowledgeRaw(`wiki/${current}`)
+      .then((r) => {
+        if (alive) setRaw(r);
+      })
+      .catch((e) => {
+        toast("err", String(e));
+        if (alive) onClose();
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current]);
+
+  const title =
+    pages.find((p) => p.slug === current)?.title || current;
+  const exists = (s: string) => pages.some((p) => p.slug === s);
+  const body = raw === null ? "" : linkifyWikilinks(stripFrontmatter(raw));
+
+  return (
+    <Modal
+      wide
+      title={title}
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>{t("common.close")}</Button>
+          <Button type="primary" onClick={() => onEdit(current)}>
+            {t("wiki.view.edit")}
+          </Button>
+        </>
+      }
+    >
+      {raw === null ? (
+        <Spinner />
+      ) : (
+        <div className="md wiki-view">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              a: ({ href, children }) => {
+                if (typeof href === "string" && href.startsWith("#wiki-")) {
+                  const target = href.slice("#wiki-".length);
+                  if (!exists(target)) {
+                    // wanted page — red ? marks what a future build
+                    // should create
+                    return (
+                      <span className="wiki-broken">
+                        {children}
+                        <span className="wiki-q">?</span>
+                      </span>
+                    );
+                  }
+                  return (
+                    <a
+                      href={`#wiki-${target}`}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setCurrent(target);
+                      }}
+                    >
+                      {children}
+                    </a>
+                  );
+                }
+                return (
+                  <a href={href} target="_blank" rel="noreferrer">
+                    {children}
+                  </a>
+                );
+              },
+            }}
+          >
+            {body}
+          </ReactMarkdown>
         </div>
       )}
     </Modal>
