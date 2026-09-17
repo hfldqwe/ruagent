@@ -32,3 +32,10 @@ desktop.ini
 .idea/
 .vscode/
 *.swp
+
+# Local-only: vendored study materials (third-party content) and scratch
+# logs — kept out of the public repo.
+.agents/skills/
+docs/design-study/
+/*_stderr.log
+/*_stdout.log
