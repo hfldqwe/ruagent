@@ -60,7 +60,9 @@ pub enum StreamMsg {
 pub struct RunManager {
     db: Db,
     root: PathBuf,
-    agents: HashMap<String, AgentCard>,
+    /// Live registry, swappable without a daemon restart (registry
+    /// edits hot-reload it; see api.rs and registry.rs).
+    agents: std::sync::RwLock<HashMap<String, AgentCard>>,
     policy: PermissionPolicy,
     mcp: crate::config::McpConfig,
     broadcast: broadcast::Sender<StreamMsg>,
@@ -72,6 +74,8 @@ pub struct RunManager {
     approver_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<PendingPermission>>>,
     /// Live cancellation tokens per run (POST /runs/{id}/cancel).
     cancellations: Arc<Mutex<HashMap<RunId, tokio_util::sync::CancellationToken>>>,
+    /// Round-trip editor over config/agents.toml (registry API).
+    registry: crate::registry::Editor,
 }
 
 impl RunManager {
@@ -82,6 +86,7 @@ impl RunManager {
         policy: PermissionPolicy,
         mcp: crate::config::McpConfig,
     ) -> Self {
+        let registry_path = root.join("config").join("agents.toml");
         let (broadcast, _) = broadcast::channel(1024);
         let (approver_tx, approver_rx) = mpsc::unbounded_channel();
         // Resolve the approver name into its stable id (if registered).
@@ -100,7 +105,9 @@ impl RunManager {
         Self {
             db,
             root,
-            agents: agents.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            agents: std::sync::RwLock::new(
+                agents.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            ),
             policy,
             mcp,
             broadcast,
@@ -109,7 +116,13 @@ impl RunManager {
             approver_tx,
             approver_rx: std::sync::Mutex::new(Some(approver_rx)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            registry: crate::registry::Editor::new(registry_path),
         }
+    }
+
+    /// The agents.toml editor (registry write API).
+    pub fn registry(&self) -> &crate::registry::Editor {
+        &self.registry
     }
 
     /// Start the approver loop (call once after wrapping in Arc).
@@ -169,7 +182,7 @@ impl RunManager {
         task.project = Some("ruagent-internal".into());
         self.db.insert_task(&task).await?;
 
-        let mcp = self.mcp_for(card);
+        let mcp = self.mcp_for(&card);
         let run = self
             .start_run(
                 &task,
@@ -253,14 +266,25 @@ impl RunManager {
         self.root.join("data").join("transcripts")
     }
 
-    pub fn agent(&self, name: &str) -> Option<&AgentCard> {
-        self.agents.get(name)
+    pub fn agent(&self, name: &str) -> Option<AgentCard> {
+        self.agents.read().expect("agents lock").get(name).cloned()
+    }
+
+    /// Swap the live registry (registry edits call this after writing
+    /// agents.toml). Cards keep their stable DB ids; new ones are
+    /// resolved by the caller.
+    pub fn reload_agents(&self, agents: Vec<AgentCard>) {
+        let mut guard = self.agents.write().expect("agents lock");
+        *guard = agents.into_iter().map(|a| (a.name.clone(), a)).collect();
+        tracing::info!(count = guard.len(), "agent registry reloaded");
     }
 
     pub fn registry_view(&self) -> crate::distill::AgentRegistry {
         crate::distill::AgentRegistry {
             enabled: self
                 .agents
+                .read()
+                .expect("agents lock")
                 .values()
                 .filter(|a| a.enabled)
                 .cloned()
@@ -268,8 +292,14 @@ impl RunManager {
         }
     }
 
-    pub fn agents(&self) -> Vec<&AgentCard> {
-        let mut v: Vec<_> = self.agents.values().collect();
+    pub fn agents(&self) -> Vec<AgentCard> {
+        let mut v: Vec<_> = self
+            .agents
+            .read()
+            .expect("agents lock")
+            .values()
+            .cloned()
+            .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -338,7 +368,7 @@ impl RunManager {
             .agent(agent_name)
             .with_context(|| format!("unknown agent `{agent_name}`"))?;
         let spec = adapter_for(card.harness)
-            .spawn_spec(card)
+            .spawn_spec(&card)
             .with_context(|| format!("resolving spawn command for `{agent_name}`"))?;
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
@@ -472,7 +502,7 @@ impl RunManager {
                 source: RouteSource::Explicit,
                 rationale: Some("fan-out member".into()),
             };
-            let mcp = self.mcp_for(card);
+            let mcp = self.mcp_for(&card);
             let spec = match &repo {
                 Some(r) => WorkspaceSpec::Worktree { repo: r.clone() },
                 None => WorkspaceSpec::Fresh,
@@ -535,7 +565,7 @@ impl RunManager {
                     source: RouteSource::Explicit,
                     rationale: Some(format!("pipeline step (upstream: {})", handoff.is_some())),
                 };
-                let mcp = mgr.mcp_for(card);
+                let mcp = mgr.mcp_for(&card);
                 let run = match mgr
                     .start_run(
                         &planned.task,
@@ -617,7 +647,7 @@ impl RunManager {
             source: RouteSource::Explicit,
             rationale: Some("fan-out judge".into()),
         };
-        let mcp = self.mcp_for(card);
+        let mcp = self.mcp_for(&card);
         let run = self
             .start_run(
                 &judge_task,

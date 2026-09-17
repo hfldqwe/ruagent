@@ -423,6 +423,30 @@ export const api = {
     post(`/api/v1/tasks/${taskId}/pipeline`, { steps }).then(
       (r) => r.json() as Promise<{ tasks: string[] }>,
     ),
+  // registry editing (runtimes + roles write straight to agents.toml
+  // through the daemon, then hot-reload)
+  createRuntime: (body: {
+    name: string;
+    harness?: string;
+    command?: string;
+    description?: string;
+    mcp_profile?: string;
+    models?: string[];
+  }) => post("/api/v1/runtimes", body).then((r) => r.json() as Promise<AgentInfo>),
+  updateRuntime: (name: string, body: Partial<AgentInfo>) =>
+    send("PATCH", `/api/v1/runtimes/${encodeURIComponent(name)}`, body),
+  deleteRuntime: (name: string) => send("DELETE", `/api/v1/runtimes/${encodeURIComponent(name)}`),
+  createAgent: (body: {
+    name: string;
+    prompt: string;
+    description?: string;
+    model?: string;
+    runtimes?: string[];
+    runtime?: string;
+  }) => post("/api/v1/agents", body).then((r) => r.json() as Promise<AgentInfo>),
+  updateAgent: (name: string, body: Record<string, unknown>) =>
+    send("PATCH", `/api/v1/agents/${encodeURIComponent(name)}`, body),
+  deleteAgent: (name: string) => send("DELETE", `/api/v1/agents/${encodeURIComponent(name)}`),
   judgeTask: (taskId: string, agent: string) =>
     post(`/api/v1/tasks/${taskId}/judge`, { agent }).then(
       (r) => r.json() as Promise<{ judge_run: Run }>,

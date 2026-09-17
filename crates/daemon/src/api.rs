@@ -29,8 +29,17 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/agents", get(list_agents).post(create_agent_card))
+        .route(
+            "/api/v1/agents/{name}",
+            axum::routing::patch(update_agent_card).delete(delete_agent_card),
+        )
         .route("/api/v1/agents/{name}/options", get(agent_options))
+        .route("/api/v1/runtimes", post(create_runtime_card))
+        .route(
+            "/api/v1/runtimes/{name}",
+            axum::routing::patch(update_runtime_card).delete(delete_runtime_card),
+        )
         .route("/api/v1/chat/{id}/options", post(chat_option))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/mcp", get(mcp_registry))
@@ -203,6 +212,20 @@ impl ApiError {
     fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
+    }
+
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.into(),
+        }
+    }
+
+    fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
         }
     }
@@ -956,38 +979,301 @@ async fn mcp_registry(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(serde_json::json!({ "servers": servers, "profiles": profiles }))
 }
 
-async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let agents: Vec<serde_json::Value> = state
+// ---------------------------------------------------------------------------
+// Registry editing (runtimes + roles): agents.toml via toml_edit, then a
+// hot reload — the daemon never needs a restart for a registry change.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RuntimeCardRequest {
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    mcp_profile: Option<String>,
+    #[serde(default)]
+    models: Option<Vec<String>>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CreateRuntimeRequest {
+    name: String,
+    #[serde(flatten)]
+    fields: RuntimeCardRequest,
+}
+
+impl RuntimeCardRequest {
+    fn patch(&self) -> crate::registry::RuntimePatch {
+        crate::registry::RuntimePatch {
+            harness: self.harness.clone(),
+            command: self.command.clone(),
+            description: self.description.clone(),
+            mcp_profile: self.mcp_profile.clone(),
+            models: self.models.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+/// Re-parse agents.toml, re-resolve stable DB ids, swap the live
+/// registry. Every successful edit runs through this.
+async fn reload_registry(state: &AppState) -> Result<Vec<ruagent_core::AgentCard>, ApiError> {
+    let text = std::fs::read_to_string(state.mgr.registry().path())
+        .map_err(|e| ApiError::internal(format!("re-reading agents.toml: {e}")))?;
+    let mut cards = crate::config::parse_agents(&text)
+        .map_err(|e| ApiError::internal(format!("re-parsing agents.toml: {e}")))?;
+    for card in &mut cards {
+        if let Some(id) = state.mgr.db().agent_id_by_name(&card.name).await? {
+            card.id = id;
+        }
+        state.mgr.db().upsert_agent(card).await?;
+    }
+    state.mgr.reload_agents(cards.clone());
+    Ok(cards)
+}
+
+/// Validate that every runtime the patch references exists.
+fn check_runtime_refs(state: &AppState, runtimes: &[String]) -> Result<(), ApiError> {
+    let known = state
         .mgr
-        .agents()
-        .into_iter()
-        .map(|a| {
-            serde_json::json!({
-                "id": a.id.to_string(),
-                "name": a.name,
-                "harness": format!("{:?}", a.harness),
-                "models": a.models,
-                "reasoning_effort": a.reasoning_effort,
-                "description": a.description,
-                "model": a.model,
-                "enabled": a.enabled,
-                "runtime": a.runtime,
-                "runtimes": a.runtimes,
-                "prompt": a.prompt.as_deref().map(|p| p.chars().take(160).collect::<String>()),
-                // Two-layer model (design §4.1, user ruling 2026-09-17):
-                // a card with a role prompt or runtime references is a
-                // ROLE; a bare harness instance (legacy single-layer
-                // entry, or a [runtime.*] card) IS a runtime.
-                "kind": if a.prompt.is_some() || a.runtime.is_some() || !a.runtimes.is_empty() {
-                    "role"
-                } else {
-                    "runtime"
-                },
-                "command": a.command,
-            })
-        })
-        .collect();
+        .registry()
+        .runtime_names()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    for r in runtimes {
+        if !known.contains(r) {
+            return Err(ApiError::bad_request(format!(
+                "runtime `{r}` is not defined — create it first"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn create_runtime_card(
+    State(state): State<AppState>,
+    Json(req): Json<CreateRuntimeRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let command = req
+        .fields
+        .command
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("a runtime needs a spawn command"))?;
+    // Validate the harness BEFORE writing anything to the file.
+    crate::config::harness_of(&req.name, req.fields.harness.as_deref())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    state
+        .mgr
+        .registry()
+        .create_runtime(&req.name, &req.fields.patch())
+        .map_err(registry_error)?;
+    let _ = command;
+    let cards = reload_registry(&state).await?;
+    let card = cards
+        .iter()
+        .find(|c| c.name == req.name)
+        .ok_or_else(|| ApiError::internal("runtime vanished after create"))?;
+    Ok((StatusCode::CREATED, Json(card_json(card))))
+}
+
+async fn update_runtime_card(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<RuntimeCardRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(h) = req.harness.as_deref() {
+        crate::config::harness_of(&name, Some(h))
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
+    state
+        .mgr
+        .registry()
+        .update_runtime(&name, &req.patch())
+        .map_err(registry_error)?;
+    let cards = reload_registry(&state).await?;
+    let card = cards
+        .iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| ApiError::internal("runtime vanished after update"))?;
+    Ok(Json(card_json(card)))
+}
+
+async fn delete_runtime_card(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    // A runtime in use by any role is a conflict, not a bad request.
+    state
+        .mgr
+        .registry()
+        .delete_runtime(&name)
+        .map_err(registry_error)?;
+    reload_registry(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AgentCardRequest {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    mcp_profile: Option<String>,
+    #[serde(default)]
+    runtimes: Option<Vec<String>>,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CreateAgentRequest {
+    name: String,
+    #[serde(flatten)]
+    fields: AgentCardRequest,
+}
+
+impl AgentCardRequest {
+    fn patch(&self) -> crate::registry::AgentPatch {
+        crate::registry::AgentPatch {
+            prompt: self.prompt.clone(),
+            description: self.description.clone(),
+            model: self.model.clone(),
+            mcp_profile: self.mcp_profile.clone(),
+            runtimes: self.runtimes.clone(),
+            runtime: self.runtime.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+async fn create_agent_card(
+    State(state): State<AppState>,
+    Json(req): Json<CreateAgentRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if req
+        .fields
+        .prompt
+        .as_deref()
+        .is_none_or(|p| p.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "a role needs a prompt — that is what makes it a role",
+        ));
+    }
+    // runtimes = the full list when given; else the single default.
+    let mut runtimes = req.fields.runtimes.clone().unwrap_or_default();
+    if let Some(default) = req.fields.runtime.as_deref() {
+        let owned = default.to_string();
+        if !runtimes.contains(&owned) {
+            runtimes.push(owned);
+        }
+    }
+    if runtimes.is_empty() {
+        return Err(ApiError::bad_request(
+            "a role needs at least one runtime — create one on the runtimes page first",
+        ));
+    }
+    check_runtime_refs(&state, &runtimes)?;
+    state
+        .mgr
+        .registry()
+        .create_agent(&req.name, &req.fields.patch())
+        .map_err(registry_error)?;
+    let cards = reload_registry(&state).await?;
+    let card = cards
+        .iter()
+        .find(|c| c.name == req.name)
+        .ok_or_else(|| ApiError::internal("agent vanished after create"))?;
+    Ok((StatusCode::CREATED, Json(card_json(card))))
+}
+
+async fn update_agent_card(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<AgentCardRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(rts) = req.runtimes.as_deref() {
+        check_runtime_refs(&state, rts)?;
+    }
+    state
+        .mgr
+        .registry()
+        .update_agent(&name, &req.patch())
+        .map_err(registry_error)?;
+    let cards = reload_registry(&state).await?;
+    let card = cards
+        .iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| ApiError::internal("agent vanished after update"))?;
+    Ok(Json(card_json(card)))
+}
+
+async fn delete_agent_card(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .mgr
+        .registry()
+        .delete_agent(&name)
+        .map_err(registry_error)?;
+    reload_registry(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Registry edits fail as `anyhow` errors — "not found" and "is used by"
+/// read as 404/409, everything else as 400.
+fn registry_error(e: anyhow::Error) -> ApiError {
+    let msg = format!("{e:#}");
+    if msg.contains("not found") {
+        ApiError::not_found(msg)
+    } else if msg.contains("is used by") {
+        ApiError::conflict(msg)
+    } else {
+        ApiError::bad_request(msg)
+    }
+}
+
+async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let agents: Vec<serde_json::Value> = state.mgr.agents().iter().map(card_json).collect();
     Json(serde_json::json!({ "agents": agents }))
+}
+
+/// The agent-card JSON shape (list + registry create/update replies).
+fn card_json(a: &ruagent_core::AgentCard) -> serde_json::Value {
+    serde_json::json!({
+        "id": a.id.to_string(),
+        "name": a.name,
+        "harness": format!("{:?}", a.harness),
+        "models": a.models,
+        "reasoning_effort": a.reasoning_effort,
+        "description": a.description,
+        "model": a.model,
+        "enabled": a.enabled,
+        "runtime": a.runtime,
+        "runtimes": a.runtimes,
+        "prompt": a.prompt.as_deref().map(|p| p.chars().take(160).collect::<String>()),
+        // Two-layer model (design §4.1, user ruling 2026-09-17):
+        // a card with a role prompt or runtime references is a
+        // ROLE; a bare harness instance (legacy single-layer
+        // entry, or a [runtime.*] card) IS a runtime.
+        "kind": if a.prompt.is_some() || a.runtime.is_some() || !a.runtimes.is_empty() {
+            "role"
+        } else {
+            "runtime"
+        },
+        "command": a.command,
+    })
 }
 
 #[derive(Deserialize)]
@@ -2012,7 +2298,7 @@ async fn chat_start(
         .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{}`", req.agent)))?;
     let chat = state
         .chats
-        .start(card, req.model)
+        .start(&card, req.model)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
@@ -2146,7 +2432,7 @@ async fn chat_model(
     } else {
         state
             .chats
-            .switch_model(id, req.model, card)
+            .switch_model(id, req.model, &card)
             .await
             .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
     };
@@ -2173,7 +2459,7 @@ async fn agent_options(
         .ok_or_else(|| ApiError::not_found("agent not found"))?;
     let options = state
         .chats
-        .agent_options(card)
+        .agent_options(&card)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(
@@ -2370,7 +2656,7 @@ async fn knowledge_search(
 
 /// Resolve the routing file's agent NAMES into ids and run the cascade.
 fn routing_decision(state: &AppState, task: &Task) -> Option<ruagent_core::RoutingDecision> {
-    let by_name: std::collections::HashMap<String, &ruagent_core::AgentCard> = state
+    let by_name: std::collections::HashMap<String, ruagent_core::AgentCard> = state
         .mgr
         .agents()
         .into_iter()

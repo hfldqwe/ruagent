@@ -138,7 +138,7 @@ struct AgentEntry {
     enabled: Option<bool>,
 }
 
-fn harness_of(name: &str, spec: Option<&str>) -> Result<HarnessKind> {
+pub(crate) fn harness_of(name: &str, spec: Option<&str>) -> Result<HarnessKind> {
     match spec.unwrap_or(name).trim() {
         "claude-code" | "claude" => Ok(HarnessKind::ClaudeCode),
         "opencode" => Ok(HarnessKind::OpenCode),
@@ -158,7 +158,7 @@ fn parse_effort(s: Option<&str>) -> Option<ReasoningEffort> {
     })
 }
 
-fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
+pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
     let file: AgentsFile = toml::from_str(text)?;
     let mut out = Vec::new();
 

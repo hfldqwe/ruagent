@@ -2,7 +2,7 @@
 // view, design §4.1 two-layer ruling 2026-09-17), Stats, Inbox.
 
 import { useEffect, useState } from "react";
-import { Button, Card, Progress, Table, Tooltip } from "antd";
+import { Button, Card, Input, Popconfirm, Progress, Select, Table, Tooltip } from "antd";
 import {
   api,
   type AgentInfo,
@@ -25,11 +25,14 @@ export function Agents() {
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [stats, setStats] = useState<AgentStats[]>([]);
   const [mcp, setMcp] = useState<McpRegistry | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<AgentInfo | null>(null);
+  const toast = useToast();
+  const load = () => {
+    api.agents().then(setAgents).catch(() => setAgents([]));
+    api.stats().then(setStats).catch(() => {});
+  };
   useEffect(() => {
-    const load = () => {
-      api.agents().then(setAgents).catch(() => setAgents([]));
-      api.stats().then(setStats).catch(() => {});
-    };
     load();
     api.mcp().then(setMcp).catch(() => {});
     const t = setInterval(load, 5000);
@@ -38,12 +41,27 @@ export function Agents() {
 
   if (!agents) return <Spinner label={`${t("agents.title")}…`} />;
   const roles = agents.filter(isRoleAgent);
+  const runtimeList = agents.filter((a) => !isRoleAgent(a));
+
+  const removeRole = async (name: string) => {
+    try {
+      await api.deleteAgent(name);
+      toast("ok", t("agents.roleDeleted", { name }));
+      load();
+    } catch (e) {
+      toast("err", String(e));
+    }
+  };
 
   return (
     <div>
       <div className="view-bar">
         <h2>{t("agents.title")}</h2>
         <span className="muted">{t("agents.subtitle")}</span>
+        <span className="grow" />
+        <Button type="primary" onClick={() => setCreating(true)}>
+          + {t("agents.create")}
+        </Button>
       </div>
 
       {roles.length === 0 ? (
@@ -105,6 +123,22 @@ export function Agents() {
                     ) : (
                       <p className="muted" style={{ margin: "10px 0 0" }}>{t("agents.noRuns")}</p>
                     )}
+                    <div className="row end" style={{ marginTop: 8 }}>
+                      <Button size="small" onClick={() => setEditing(a)}>
+                        {t("common.edit")}
+                      </Button>
+                      <Popconfirm
+                        title={t("agents.roleDeleteConfirm.title")}
+                        okText={t("common.delete")}
+                        cancelText={t("common.keep")}
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => removeRole(a.name)}
+                      >
+                        <Button size="small" danger>
+                          {t("common.delete")}
+                        </Button>
+                      </Popconfirm>
+                    </div>
                   </Card>
                 );
               })}
@@ -130,7 +164,153 @@ export function Agents() {
         ) : (
           <Empty icon="plug" title={t("mcp.empty.title")} hint={t("mcp.empty.hint")} />
         )}
+      {(creating || editing) && (
+        <RoleModal
+          runtimes={runtimeList}
+          editing={editing}
+          onClose={() => {
+            setCreating(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setCreating(false);
+            setEditing(null);
+            load();
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Role create/edit modal (two-layer form: prompt + runtime refs)
+// ---------------------------------------------------------------------------
+
+function RoleModal({
+  runtimes,
+  editing,
+  onClose,
+  onSaved,
+}: {
+  runtimes: AgentInfo[];
+  editing: AgentInfo | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { t } = useI18n();
+  const toast = useToast();
+  const [form, setForm] = useState(
+    () =>
+      editing
+        ? {
+            name: editing.name,
+            prompt: editing.prompt ?? "",
+            description: editing.description ?? "",
+            model: editing.model ?? "",
+            runtimes: editing.runtimes ?? [],
+            runtime: editing.runtime ?? editing.runtimes?.[0] ?? "",
+          }
+        : {
+            name: "",
+            prompt: "",
+            description: "",
+            model: "",
+            runtimes: [] as string[],
+            runtime: "",
+          },
+  );
+  const [busy, setBusy] = useState(false);
+  const options = runtimes.map((r) => ({ value: r.name, label: r.name }));
+
+  const go = async () => {
+    setBusy(true);
+    try {
+      const body = {
+        prompt: form.prompt,
+        description: form.description.trim() || undefined,
+        model: form.model.trim() || undefined,
+        runtimes: form.runtimes.length ? form.runtimes : undefined,
+        runtime: form.runtime || form.runtimes[0] || undefined,
+      };
+      if (editing) {
+        await api.updateAgent(editing.name, body);
+        toast("ok", t("agents.roleUpdated", { name: editing.name }));
+      } else {
+        await api.createAgent({ name: form.name.trim(), ...body });
+        toast("ok", t("agents.roleCreated", { name: form.name.trim() }));
+      }
+      onSaved();
+    } catch (e) {
+      toast("err", String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const hasRuntimeRef = form.runtimes.length > 0 || !!form.runtime || !!editing?.runtimes?.length;
+  const ok = (editing || form.name.trim()) && form.prompt.trim() && hasRuntimeRef;
+
+  return (
+    <Modal
+      title={editing ? t("agents.editTitle", { name: editing.name }) : t("agents.create")}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <Button onClick={onClose}>{t("common.cancel")}</Button>
+          <Button type="primary" loading={busy} disabled={!ok} onClick={go}>
+            {editing ? t("common.save") : t("agents.create")}
+          </Button>
+        </>
+      }
+    >
+      <label className="muted">{t("agents.f.name")}</label>
+      <Input
+        value={form.name}
+        onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+        disabled={!!editing}
+        placeholder="architect"
+        style={{ marginBottom: 10 }}
+      />
+      <label className="muted">{t("agents.f.runtimes")}</label>
+      <Select
+        mode="multiple"
+        value={form.runtimes}
+        onChange={(v: string[]) => setForm((f) => ({ ...f, runtimes: v }))}
+        options={options}
+        placeholder={t("agents.f.runtimesPh")}
+        style={{ width: "100%", marginBottom: 10 }}
+      />
+      <label className="muted">{t("agents.f.runtime")}</label>
+      <Select
+        value={form.runtime || undefined}
+        onChange={(v: string) => setForm((f) => ({ ...f, runtime: v }))}
+        options={options}
+        placeholder={t("agents.f.runtimePh")}
+        style={{ width: "100%", marginBottom: 10 }}
+      />
+      <label className="muted">{t("agents.f.prompt")}</label>
+      <Input.TextArea
+        value={form.prompt}
+        onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
+        rows={6}
+        placeholder="You are the architecture reviewer. …"
+        style={{ marginBottom: 10 }}
+      />
+      <label className="muted">{t("agents.f.description")}</label>
+      <Input
+        value={form.description}
+        onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+        style={{ marginBottom: 10 }}
+      />
+      <label className="muted">{t("agents.f.model")}</label>
+      <Input
+        value={form.model}
+        onChange={(e) => setForm((f) => ({ ...f, model: e.target.value }))}
+        placeholder="deepseek-chat"
+      />
+    </Modal>
   );
 }
 
