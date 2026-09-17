@@ -2,6 +2,8 @@
 
 **English** · [中文](README.zh-CN.md)
 
+[![CI](https://github.com/hfldqwe/ruagent/actions/workflows/ci.yml/badge.svg)](https://github.com/hfldqwe/ruagent/actions/workflows/ci.yml) [![E2E](https://github.com/hfldqwe/ruagent/actions/workflows/e2e.yml/badge.svg)](https://github.com/hfldqwe/ruagent/actions/workflows/e2e.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Local-first, single-user **agent engineering platform**: orchestrate multiple coding-agent CLIs (Claude Code, OpenCode, DeepSeek Harness, Codex, …) over the [Agent Client Protocol](https://agentclientprotocol.com), with a unified memory layer, knowledge base + wiki compilation, session distillation, and full observability.
 
 ```

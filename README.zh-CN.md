@@ -2,6 +2,8 @@
 
 [English](README.md) · **中文**
 
+[![CI](https://github.com/hfldqwe/ruagent/actions/workflows/ci.yml/badge.svg)](https://github.com/hfldqwe/ruagent/actions/workflows/ci.yml) [![E2E](https://github.com/hfldqwe/ruagent/actions/workflows/e2e.yml/badge.svg)](https://github.com/hfldqwe/ruagent/actions/workflows/e2e.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 本地优先、单用户的**智能体工程平台**：通过 [Agent Client Protocol](https://agentclientprotocol.com) 编排多个编码智能体 CLI（Claude Code、OpenCode、DeepSeek Harness、Codex、…），配套统一记忆层、知识库 + Wiki 编译、会话蒸馏和全程可观测。
 
 ```
