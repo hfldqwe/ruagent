@@ -254,11 +254,13 @@ fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                 enabled: entry.enabled.unwrap_or(true),
             });
         }
-        for (name, mut card) in runtime_cards {
-            if out.iter().any(|a| a.name == name) {
+        // Runtime cards that no role claimed: still listed (direct-run
+        // instances). The kind classification lives in the API layer
+        // (`kind: "runtime"`), not in a description prefix.
+        for (_name, card) in runtime_cards {
+            if out.iter().any(|a| a.name == card.name) {
                 continue;
             }
-            card.description = format!("[runtime] {}", card.description);
             out.push(card);
         }
         return Ok(out);

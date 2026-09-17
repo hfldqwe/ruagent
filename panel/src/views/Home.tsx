@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from "react";
 import { Button, Card, Statistic } from "antd";
-import { api, type MemoryRow, type SessionRecord } from "../api";
+import { api, isRoleAgent, type MemoryRow, type SessionRecord } from "../api";
 import { useI18n } from "../i18n";
 import { RelTime, Spinner } from "../ui";
 import { Icon, type IconName } from "../icons";
@@ -65,7 +65,9 @@ export function Home({ onOpenTask, onNav }: { onOpenTask: (id: string) => void; 
         }
         setDown(false);
         setDash({
-          agents: agents.filter((a) => a.enabled).length,
+          // Roles only (user ruling 2026-09-17): runtimes are execution
+          // backends, not 智能体.
+          agents: agents.filter((a) => a.enabled && isRoleAgent(a)).length,
           tasks: tasks.length,
           runs: stats.reduce((s, x) => s + x.runs, 0),
           docs: docs.documents.length,

@@ -571,15 +571,26 @@ fn list_agents(url: &str) -> Result<()> {
         .error_for_status()?
         .json()
         .context("parsing response")?;
-    for a in resp["agents"].as_array().context("bad response")? {
+    // Roles first, then runtimes — the two layers of design §4.1
+    // (user ruling 2026-09-17: agents are roles; claude-code/dsh/opencode
+    // are runtimes).
+    let mut cards: Vec<&serde_json::Value> = resp["agents"]
+        .as_array()
+        .context("bad response")?
+        .iter()
+        .collect();
+    cards.sort_by_key(|a| a["kind"].as_str().unwrap_or("role") != "role");
+    for a in cards {
         let enabled = if a["enabled"].as_bool().unwrap_or(false) {
             "*"
         } else {
             " "
         };
+        let kind = a["kind"].as_str().unwrap_or("role");
         println!(
-            "{enabled} {:<10} {:<12} {}",
+            "{enabled} {:<10} {:<8} {:<12} {}",
             a["name"].as_str().unwrap_or("?"),
+            kind,
             a["harness"].as_str().unwrap_or("?"),
             a["description"].as_str().unwrap_or("")
         );

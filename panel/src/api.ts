@@ -16,7 +16,20 @@ export interface AgentInfo {
   runtime?: string | null;
   runtimes?: string[];
   prompt?: string | null;
+  /** Two-layer model: a card with a prompt or runtime refs is a "role";
+   *  a bare harness instance (legacy entry or [runtime.*] card) is a
+   *  "runtime" — claude-code/dsh/opencode, the execution backends. */
+  kind?: "role" | "runtime";
+  command?: string | null;
 }
+
+/** Two-layer model (user ruling 2026-09-17): a card with a role prompt or
+ *  runtime references is a ROLE; a bare harness instance (legacy entry or
+ *  [runtime.*] card) IS a runtime. `kind` comes from the API; the shape
+ *  fallback covers older daemons. */
+export const isRoleAgent = (a: AgentInfo) =>
+  a.kind === "role" ||
+  (a.kind == null && (!!a.prompt || !!a.runtime || (a.runtimes?.length ?? 0) > 0));
 
 export interface OptionChoice {
   value: string;

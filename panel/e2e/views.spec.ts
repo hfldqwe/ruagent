@@ -80,9 +80,20 @@ test("graph renders the canvas or its empty state, with the mode toggle", async 
   await expectOneVisible(page, ["canvas.graph-canvas", ".ant-empty"]);
 });
 
-test("agents renders cards or its empty state", async ({ page }) => {
+test("agents view separates roles and runtimes into tabs", async ({ page }) => {
   await page.goto("/#agents");
   await expect(page.locator(".view-bar h2")).toBeVisible();
+  // The two-layer model (user ruling 2026-09-17): roles and runtimes are
+  // separate tabs; the runtime tab shows execution backends.
+  for (const label of [/^角色$|^Roles$/, /^运行时$|^Runtimes$/]) {
+    await expect(page.locator(".ant-segmented-item-label").filter({ hasText: label })).toBeVisible();
+  }
+  await expectOneVisible(page, [".agent-card", ".ant-empty"]);
+
+  await page.locator(".ant-segmented-item-label").filter({ hasText: /^运行时$|^Runtimes$/ }).click();
+  await expect(
+    page.locator(".ant-segmented-item-selected").filter({ hasText: /^运行时$|^Runtimes$/ }),
+  ).toBeVisible();
   await expectOneVisible(page, [".agent-card", ".ant-empty"]);
 });
 

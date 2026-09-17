@@ -974,6 +974,16 @@ async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "runtime": a.runtime,
                 "runtimes": a.runtimes,
                 "prompt": a.prompt.as_deref().map(|p| p.chars().take(160).collect::<String>()),
+                // Two-layer model (design §4.1, user ruling 2026-09-17):
+                // a card with a role prompt or runtime references is a
+                // ROLE; a bare harness instance (legacy single-layer
+                // entry, or a [runtime.*] card) IS a runtime.
+                "kind": if a.prompt.is_some() || a.runtime.is_some() || !a.runtimes.is_empty() {
+                    "role"
+                } else {
+                    "runtime"
+                },
+                "command": a.command,
             })
         })
         .collect();
