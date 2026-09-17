@@ -1,8 +1,8 @@
-// Agents (two layers on separate tabs, design §4.1: roles with live
-// stats + MCP registry / runtimes — the execution backends), Stats, Inbox.
+// Agents (roles with live stats + MCP registry — runtimes have their own
+// view, design §4.1 two-layer ruling 2026-09-17), Stats, Inbox.
 
 import { useEffect, useState } from "react";
-import { Button, Card, Progress, Segmented, Table, Tooltip } from "antd";
+import { Button, Card, Progress, Table, Tooltip } from "antd";
 import {
   api,
   type AgentInfo,
@@ -22,7 +22,6 @@ import { Icon } from "../icons";
 
 export function Agents() {
   const { t } = useI18n();
-  const [tab, setTab] = useState<"agents" | "runtimes">("agents");
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [stats, setStats] = useState<AgentStats[]>([]);
   const [mcp, setMcp] = useState<McpRegistry | null>(null);
@@ -39,26 +38,15 @@ export function Agents() {
 
   if (!agents) return <Spinner label={`${t("agents.title")}…`} />;
   const roles = agents.filter(isRoleAgent);
-  const runtimes = agents.filter((a) => !isRoleAgent(a));
 
   return (
     <div>
       <div className="view-bar">
         <h2>{t("agents.title")}</h2>
         <span className="muted">{t("agents.subtitle")}</span>
-        <Segmented
-          value={tab}
-          onChange={(v) => setTab(v as "agents" | "runtimes")}
-          options={[
-            { value: "agents", label: t("agents.tab.agents") },
-            { value: "runtimes", label: t("agents.tab.runtimes") },
-          ]}
-        />
       </div>
 
-      {tab === "agents" ? (
-        <>
-          {roles.length === 0 ? (
+      {roles.length === 0 ? (
             <Empty icon="bot" title={t("agents.empty.title")} hint={t("agents.empty.hint")} />
           ) : (
             <div className="agent-grid">
@@ -139,82 +127,9 @@ export function Agents() {
               ))}
               <p className="muted pad">{t("mcp.overlay")}</p>
             </Card>
-          ) : (
-            <Empty icon="plug" title={t("mcp.empty.title")} hint={t("mcp.empty.hint")} />
-          )}
-        </>
-      ) : (
-        <RuntimeGrid runtimes={runtimes} roles={roles} />
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Runtimes tab — the execution backends (claude-code / dsh / opencode / …)
-// ---------------------------------------------------------------------------
-
-function RuntimeGrid({ runtimes, roles }: { runtimes: AgentInfo[]; roles: AgentInfo[] }) {
-  const { t } = useI18n();
-  if (runtimes.length === 0)
-    return (
-      <Empty icon="tool" title={t("agents.runtimes.empty")} hint={t("agents.runtimes.hint")} />
-    );
-  return (
-    <div className="agent-grid">
-      {runtimes.map((r) => {
-        const usedBy = roles.filter((a) => a.runtimes?.includes(r.name));
-        return (
-          <Card
-            key={r.name}
-            className={r.enabled ? "agent-card" : "agent-card disabled"}
-            size="small"
-          >
-            <div className="row">
-              <span className="agent-avatar">{r.name.slice(0, 2).toUpperCase()}</span>
-              <div>
-                <strong>{r.name}</strong>
-                <div className="muted">{r.harness}</div>
-              </div>
-              <span className="grow" />
-              {r.enabled ? (
-                <span className="tag ok">{t("agents.enabled")}</span>
-              ) : (
-                <span className="tag">{t("agents.disabled")}</span>
-              )}
-            </div>
-            <p className="muted" style={{ margin: "10px 0 6px" }}>{r.description}</p>
-            {r.command ? (
-              <div className="row">
-                <span className="doc-icon">
-                  <Icon name="zap" size={13} />
-                </span>
-                <span className="muted mono truncated" style={{ fontSize: 12 }}>{r.command}</span>
-              </div>
-            ) : null}
-            <div className="row" style={{ marginTop: 10 }}>
-              {usedBy.length > 0 ? (
-                usedBy.map((a) => <span key={a.name} className="tag">{a.name}</span>)
-              ) : (
-                <span className="muted" style={{ fontSize: 12 }}>
-                  {t("agents.runtimes.noRoles")}
-                </span>
-              )}
-              <span className="grow" />
-              {r.enabled ? (
-                <Button
-                  size="small"
-                  onClick={() => {
-                    window.location.hash = `chat?agent=${encodeURIComponent(r.name)}`;
-                  }}
-                >
-                  {t("agents.runtimes.direct")}
-                </Button>
-              ) : null}
-            </div>
-          </Card>
-        );
-      })}
+        ) : (
+          <Empty icon="plug" title={t("mcp.empty.title")} hint={t("mcp.empty.hint")} />
+        )}
     </div>
   );
 }

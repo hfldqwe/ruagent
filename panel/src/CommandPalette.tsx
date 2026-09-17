@@ -30,7 +30,8 @@ const NAV: { hash: string; labelKey: string; kw: string }[] = [
   { hash: "memory", labelKey: "nav.memory", kw: "memory" },
   { hash: "knowledge", labelKey: "nav.knowledge", kw: "knowledge docs" },
   { hash: "graph", labelKey: "nav.graph", kw: "graph entities" },
-  { hash: "agents", labelKey: "nav.agents", kw: "agents" },
+  { hash: "agents", labelKey: "nav.agents", kw: "agents roles" },
+  { hash: "runtimes", labelKey: "nav.runtimes", kw: "runtimes backends claude-code dsh opencode" },
   { hash: "stats", labelKey: "nav.stats", kw: "stats" },
   { hash: "inbox", labelKey: "nav.inbox", kw: "inbox permissions" },
 ];

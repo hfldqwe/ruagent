@@ -108,6 +108,11 @@ struct RuntimeEntry {
     command: Option<String>,
     description: Option<String>,
     enabled: Option<bool>,
+    /// Machine params for DIRECT runtime runs (the role layer overrides
+    /// these when a role runs on the runtime).
+    model: Option<String>,
+    models: Option<Vec<String>>,
+    mcp_profile: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -170,11 +175,11 @@ fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                     harness,
                     command: entry.command.clone(),
                     description: entry.description.clone().unwrap_or_else(|| name.clone()),
-                    model: None,
-                    models: Vec::new(),
+                    model: entry.model.clone(),
+                    models: entry.models.clone().unwrap_or_default(),
                     reasoning_effort: None,
                     context_window: None,
-                    mcp_profile: None,
+                    mcp_profile: entry.mcp_profile.clone(),
                     prompt: None,
                     runtime: None,
                     runtimes: Vec::new(),

@@ -20,6 +20,7 @@ import { Memory } from "./views/Memory";
 import { Knowledge } from "./views/Knowledge";
 import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
+import { Runtimes } from "./views/Runtimes";
 import { Chat } from "./views/Chat";
 import { Sessions } from "./views/Sessions";
 import { CreateTaskModal } from "./views/Board";
@@ -36,6 +37,7 @@ type View =
   | { kind: "knowledge" }
   | { kind: "graph" }
   | { kind: "agents" }
+  | { kind: "runtimes" }
   | { kind: "stats" }
   | { kind: "inbox" };
 
@@ -57,6 +59,8 @@ function parseHash(): View {
       return { kind: "graph" };
     case "agents":
       return { kind: "agents" };
+    case "runtimes":
+      return { kind: "runtimes" };
     case "stats":
       return { kind: "stats" };
     case "inbox":
@@ -136,6 +140,7 @@ function Shell() {
       label: t("nav.group.system"),
       children: [
         { key: "agents", icon: <Icon name="bot" size={16} />, label: t("nav.agents") },
+        { key: "runtimes", icon: <Icon name="layers" size={16} />, label: t("nav.runtimes") },
         { key: "stats", icon: <Icon name="stats" size={16} />, label: t("nav.stats") },
         {
           key: "inbox",
@@ -230,6 +235,7 @@ function Shell() {
           {view.kind === "knowledge" && <Knowledge />}
           {view.kind === "graph" && <Graph />}
           {view.kind === "agents" && <Agents />}
+          {view.kind === "runtimes" && <Runtimes />}
           {view.kind === "stats" && <Stats />}
           {view.kind === "inbox" && <Inbox />}
         </Content>
