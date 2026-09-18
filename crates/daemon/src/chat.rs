@@ -154,6 +154,7 @@ impl Chat {
 
 /// The chat registry + idle reaper.
 type AskParker = Arc<dyn Fn(ruagent_acp::permission::PermissionAsk, RunId) + Send + Sync>;
+type AskDropper = Arc<dyn Fn(RunId) + Send + Sync>;
 
 /// One cached option catalog (what a runtime advertises) plus when the
 /// persisted copy was written — the panel shows the sync time.
@@ -206,6 +207,10 @@ pub struct ChatManager {
     root: PathBuf,
     chats: Arc<Mutex<HashMap<RunId, Chat>>>,
     park_ask: AskParker,
+    /// Drops parked asks when a chat closes — wired to
+    /// `RunManager::drop_pending_for` once both exist (chats are built
+    /// before the RunManager). Optional so tests can omit it.
+    drop_asks: Mutex<Option<AskDropper>>,
     mcp: crate::config::McpConfig,
     /// Session → memory distillation policy (auto on close).
     pub distill_policy: crate::distill::AutoDistill,
@@ -241,6 +246,7 @@ impl ChatManager {
             root,
             chats: Arc::new(Mutex::new(HashMap::new())),
             park_ask,
+            drop_asks: Mutex::new(None),
             mcp,
             distill_policy,
             registry,
@@ -515,11 +521,23 @@ impl ChatManager {
 
     /// Close and remove a chat. When auto-distill is on, the session
     /// becomes memories + graph entries in the background.
+    /// Wire the ask-dropper (RunManager::drop_pending_for). Called once
+    /// at boot, after both managers exist.
+    pub fn set_ask_dropper(&self, f: AskDropper) {
+        *self.drop_asks.lock().expect("drop_asks lock") = Some(f);
+    }
+
+    /// Close one chat: shut the session down, drop its parked asks
+    /// (fail-closed on the agent side, out of the inbox — issue #40),
+    /// then maybe auto-distill.
     pub fn close(&self, id: RunId) -> bool {
         let chat = self.chats.lock().expect("chats lock").remove(&id);
         match chat {
             Some(c) => {
                 let _ = c.send(ChatCommand::Shutdown);
+                if let Some(drop) = self.drop_asks.lock().expect("drop_asks lock").as_ref() {
+                    drop(id);
+                }
                 self.maybe_auto_distill(id);
                 true
             }
@@ -916,15 +934,9 @@ impl ChatManager {
                     }
                 }
                 for id in to_close {
-                    let chat = {
-                        let mut map = chats.lock().expect("chats lock");
-                        map.remove(&id)
-                    };
-                    if let Some(c) = chat {
-                        let _ = c.send(ChatCommand::Shutdown);
-                        // Auto-distill (policy): same path as explicit close.
-                        mgr.maybe_auto_distill(id);
-                    }
+                    // Same path as explicit close: shutdown, drop parked
+                    // asks, maybe distill.
+                    mgr.close(id);
                 }
             }
         });

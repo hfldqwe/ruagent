@@ -335,6 +335,18 @@ impl RunManager {
             .insert(key, (info, dead_tx, answer));
     }
 
+    /// Drop every ask parked for one chat. Called when a chat closes
+    /// (explicit close, idle reaper, engine-restart): the dropped
+    /// oneshot senders make the acp side fail closed (Cancel) and the
+    /// inbox stops listing dead entries (issue #40).
+    pub fn drop_pending_for(&self, context_id: RunId) {
+        let prefix = format!("{context_id}:");
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .retain(|k, _| !k.starts_with(&prefix));
+    }
+
     pub fn root(&self) -> PathBuf {
         self.root.clone()
     }
@@ -1045,9 +1057,14 @@ async fn supervise(
                 // grace tick: re-check the drain condition above
             }
             _ = cancel_token.cancelled(), if !done => {
-                // Cancellation: dropping the driver future tears down the
-                // child process (the SDK's ChildGuard). Finalize like any
-                // other terminal state.
+                // Cancellation: abort the driver task — the abort drops
+                // the run_once future at its await point, dropping the
+                // connection and tearing down the child process group
+                // (the SDK's ChildGuard). Merely detaching it would let
+                // the agent run on, burning tokens under a row already
+                // marked Cancelled (issue #39). Parked asks fail closed:
+                // their oneshot senders drop, the acp side reads Cancel.
+                driver.abort();
                 done = true;
                 run.status = RunStatus::Cancelled;
                 run.stop_reason = Some(StopReason::Cancelled);

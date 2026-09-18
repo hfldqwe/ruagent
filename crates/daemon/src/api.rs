@@ -1041,23 +1041,6 @@ async fn reload_registry(state: &AppState) -> Result<Vec<ruagent_core::AgentCard
     Ok(cards)
 }
 
-/// Validate that every runtime the patch references exists.
-fn check_runtime_refs(state: &AppState, runtimes: &[String]) -> Result<(), ApiError> {
-    let known = state
-        .mgr
-        .registry()
-        .runtime_names()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    for r in runtimes {
-        if !known.contains(r) {
-            return Err(ApiError::bad_request(format!(
-                "runtime `{r}` is not defined — create it first"
-            )));
-        }
-    }
-    Ok(())
-}
-
 async fn create_runtime_card(
     State(state): State<AppState>,
     Json(req): Json<CreateRuntimeRequest>,
@@ -1192,7 +1175,6 @@ async fn create_agent_card(
             "a role needs at least one runtime — create one on the runtimes page first",
         ));
     }
-    check_runtime_refs(&state, &runtimes)?;
     state
         .mgr
         .registry()
@@ -1211,9 +1193,6 @@ async fn update_agent_card(
     Path(name): Path<String>,
     Json(req): Json<AgentCardRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(rts) = req.runtimes.as_deref() {
-        check_runtime_refs(&state, rts)?;
-    }
     state
         .mgr
         .registry()
@@ -2432,8 +2411,8 @@ async fn chat_message(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// Chat SSE: replay the chat transcript, then tail live events (single
-/// event per line, no seq). `StateChanged{completed}` = end of chat.
+/// Chat SSE: replay the chat transcript, then tail live events. `StateChanged{completed}`
+/// = end of chat.
 async fn chat_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2446,24 +2425,55 @@ async fn chat_events(
         .chat(id)
         .ok_or_else(|| ApiError::not_found("chat not found"))?;
     let path = state.chats.transcript_path(id);
-    let replay = ruagent_store::read_transcript(&path).unwrap_or_default();
 
+    // Subscribe BEFORE reading the transcript (issue #42, the run_events
+    // lesson): events broadcast in the read window sit in the receiver
+    // instead of being lost. Both this receiver and the transcript
+    // forwarder see the same ordered stream, so the buffered events are
+    // a suffix of it and the replay a prefix — whatever prefix of the
+    // buffer the file already contains gets skipped below.
     let mut live = chat.subscribe();
+    let mut buffered = Vec::new();
+    let mut lagged = false;
+    loop {
+        match live.try_recv() {
+            Ok(event) => buffered.push(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => lagged = true,
+            Err(_) => break,
+        }
+    }
+    let replay = ruagent_store::read_transcript(&path).unwrap_or_default();
     let (tx, rx_stream) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for line in replay {
-            let _ = tx.send(sse_data(&line));
+        for line in &replay {
+            let _ = tx.send(sse_data(line));
+        }
+        // The overlap: the largest k where the transcript's last k
+        // events equal the buffer's first k. On receiver lag the buffer
+        // is incomplete and matching could skip real events — accept
+        // duplicates instead (degrade, never lose).
+        let mut skip = 0;
+        if !lagged {
+            let max_k = buffered.len().min(replay.len());
+            'k: for k in (1..=max_k).rev() {
+                for i in 0..k {
+                    if replay[replay.len() - k + i].event != buffered[i] {
+                        continue 'k;
+                    }
+                }
+                skip = k;
+                break;
+            }
+        }
+        for event in buffered.into_iter().skip(skip) {
+            if chat_sse_event(&tx, &event) {
+                return;
+            }
         }
         loop {
             match live.recv().await {
                 Ok(event) => {
-                    let json = serde_json::to_string(&event).unwrap_or_default();
-                    let _ = tx.send(Ok(Event::default().data(json)));
-                    if let ruagent_core::RunEvent::StateChanged {
-                        status: ruagent_core::RunStatus::Completed,
-                    } = &event
-                    {
-                        let _ = tx.send(sse_end(ruagent_core::RunStatus::Completed));
+                    if chat_sse_event(&tx, &event) {
                         return;
                     }
                 }
@@ -2477,6 +2487,21 @@ async fn chat_events(
     });
 
     Ok(Sse::new(UnboundedReceiverStream::new(rx_stream)).keep_alive(KeepAlive::default()))
+}
+
+/// Send one live chat event over SSE; true when it terminates the stream.
+fn chat_sse_event(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    event: &ruagent_core::RunEvent,
+) -> bool {
+    let json = serde_json::to_string(event).unwrap_or_default();
+    let _ = tx.send(Ok(Event::default().data(json)));
+    matches!(
+        event,
+        ruagent_core::RunEvent::StateChanged {
+            status: ruagent_core::RunStatus::Completed
+        }
+    )
 }
 
 #[derive(Deserialize)]

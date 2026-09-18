@@ -40,15 +40,6 @@ async fn start_daemon() -> (String, std::path::PathBuf) {
     let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
         .await
         .unwrap();
-    let chats = ruagent_daemon::chat::ChatManager::new(
-        db.clone(),
-        root.clone(),
-        Arc::new(|_, _| {}),
-        cfg.mcp.clone(),
-        ruagent_daemon::distill::AutoDistill::default(),
-        None,
-        ruagent_daemon::distill::AgentRegistry::default(),
-    );
     let mgr = Arc::new(RunManager::new(
         db.clone(),
         root.clone(),
@@ -56,6 +47,22 @@ async fn start_daemon() -> (String, std::path::PathBuf) {
         cfg.policy.to_policy(),
         cfg.mcp.clone(),
     ));
+    // Chat asks park in the shared inbox and die with the chat — the
+    // same wiring the real daemon does (lib.rs).
+    let mgr_for_chats = Arc::clone(&mgr);
+    let chats = ruagent_daemon::chat::ChatManager::new(
+        db.clone(),
+        root.clone(),
+        Arc::new(move |ask, context_id| mgr_for_chats.park_external_ask(ask, context_id)),
+        cfg.mcp.clone(),
+        ruagent_daemon::distill::AutoDistill::default(),
+        None,
+        ruagent_daemon::distill::AgentRegistry::default(),
+    );
+    chats.set_ask_dropper({
+        let mgr = Arc::clone(&mgr);
+        Arc::new(move |id| mgr.drop_pending_for(id))
+    });
     let app = ruagent_daemon::api::router(AppState {
         mgr,
         config: Arc::new(cfg),
@@ -449,5 +456,75 @@ async fn run_options_apply() {
     assert_eq!(
         done["params"]["options"]["mode"], "auto",
         "options must be recorded on the run"
+    );
+}
+
+/// Issue #40: a chat closed while an ask is unanswered drops its
+/// parked ask — no zombie entry left in the shared inbox, and the
+/// agent side fails closed (the dropped oneshot reads Cancel).
+#[tokio::test]
+async fn chat_close_drops_parked_asks() {
+    let (url, _root) = start_daemon().await;
+    let http = reqwest::Client::new();
+    create_runtime(
+        &http,
+        &url,
+        "rt",
+        &format!("{MOCK_BIN} --behavior permission"),
+    )
+    .await;
+
+    let chat: serde_json::Value = http
+        .post(format!("{url}/api/v1/chat"))
+        .json(&serde_json::json!({ "agent": "rt" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = chat["id"].as_str().unwrap().to_string();
+
+    // Prompt → the mock parks on a permission ask (the #38 fix keeps
+    // the dispatch loop alive while it waits).
+    http.post(format!("{url}/api/v1/chat/{id}/messages"))
+        .json(&serde_json::json!({ "text": "write something" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let pending = poll_json(
+        &http,
+        &format!("{url}/api/v1/permissions"),
+        |v| v["pending"].as_array().is_some_and(|a| !a.is_empty()),
+        "chat ask parked",
+    )
+    .await;
+    assert_eq!(
+        pending["pending"][0]["run_id"], id,
+        "chat asks key by the chat id"
+    );
+
+    // Close the chat: the parked ask must die with it.
+    let resp = http
+        .delete(format!("{url}/api/v1/chat/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "chat close failed");
+
+    let pending: serde_json::Value = http
+        .get(format!("{url}/api/v1/permissions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        pending["pending"].as_array().unwrap().is_empty(),
+        "chat close must drop parked asks: {pending}"
     );
 }

@@ -230,6 +230,13 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         },
     );
 
+    // Chat asks die with the chat (issue #40): closing a chat drops its
+    // parked asks — the agent side fails closed and the inbox stays clean.
+    {
+        let mgr = Arc::clone(&mgr);
+        chats.set_ask_dropper(Arc::new(move |id| mgr.drop_pending_for(id)));
+    }
+
     let state = api::AppState {
         mgr,
         config: Arc::new(config),

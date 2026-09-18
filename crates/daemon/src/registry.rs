@@ -220,6 +220,10 @@ impl Editor {
         }
         let t = Self::entry_table(&mut doc, "agent", name);
         Self::apply_agent(t, patch);
+        // Reference check INSIDE the lock, on the merged entry: a
+        // concurrent delete_runtime cannot slip a dangling reference
+        // between check and write (issue #41).
+        Self::check_agent_refs(&doc, name)?;
         self.save(&doc)
     }
 
@@ -234,7 +238,39 @@ impl Editor {
             bail!("agent `{name}` not found");
         };
         Self::apply_agent(t, patch);
+        // Same in-lock reference check as create (issue #41) — on the
+        // merged entry, so a partial patch is validated as it lands.
+        Self::check_agent_refs(&doc, name)?;
         self.save(&doc)
+    }
+
+    /// Every runtime the (merged) `[agent.<name>]` entry references must
+    /// exist in the same document — checked under the edit lock so the
+    /// validation sees exactly what is about to be written (issue #41).
+    fn check_agent_refs(doc: &DocumentMut, name: &str) -> Result<()> {
+        let table = doc.as_table();
+        let Some(t) = table
+            .get("agent")
+            .and_then(|a| a.as_table_like())
+            .and_then(|a| a.get(name))
+            .and_then(|i| i.as_table_like())
+        else {
+            return Ok(());
+        };
+        let mut refs: Vec<String> = Vec::new();
+        if let Some(list) = t.get("runtimes").and_then(|v| v.as_array()) {
+            refs.extend(list.iter().filter_map(|v| v.as_str().map(String::from)));
+        }
+        if let Some(s) = t.get("runtime").and_then(|v| v.as_str()) {
+            refs.push(s.to_string());
+        }
+        let runtimes = table.get("runtime").and_then(|r| r.as_table_like());
+        for r in &refs {
+            if !runtimes.is_some_and(|rt| rt.contains_key(r)) {
+                bail!("runtime `{r}` is not defined — create it first");
+            }
+        }
+        Ok(())
     }
 
     fn apply_agent(t: &mut dyn TableLike, patch: &AgentPatch) {
@@ -552,5 +588,80 @@ runtimes = [\"dsh\"]
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn agent_refs_missing_runtime_rejected_in_lock() {
+        // Issue #41: reference validation runs inside the edit lock, on
+        // the entry about to be written — so create and update can never
+        // write a dangling runtime reference (a delete that interleaves
+        // between an outside check and the write is no longer possible).
+        let (ed, _g) = editor();
+        ed.create_runtime(
+            "dsh",
+            &RuntimePatch {
+                command: Some("dsh --profile acp".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Create referencing an unknown runtime: rejected, file unchanged.
+        let err = ed
+            .create_agent(
+                "writer",
+                &AgentPatch {
+                    prompt: Some("write".into()),
+                    runtime: Some("ghost".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
+        let text = std::fs::read_to_string(ed.path()).unwrap();
+        assert!(
+            !text.contains("[agent.writer]"),
+            "rejected write must not land"
+        );
+
+        // Create a valid one, then update it onto an unknown runtime:
+        // rejected, the entry keeps its valid reference.
+        ed.create_agent(
+            "writer",
+            &AgentPatch {
+                prompt: Some("write".into()),
+                runtime: Some("dsh".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = ed
+            .update_agent(
+                "writer",
+                &AgentPatch {
+                    runtime: Some("ghost".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
+        let cards = parse(ed.path());
+        let writer = cards.iter().find(|c| c.name == "writer").unwrap();
+        assert_eq!(
+            writer.runtime.as_deref(),
+            Some("dsh"),
+            "update must not land"
+        );
+
+        // A partial patch that touches no runtimes leaves the (valid)
+        // references untouched — the merged entry still checks clean.
+        ed.update_agent(
+            "writer",
+            &AgentPatch {
+                prompt: Some("write more".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 }

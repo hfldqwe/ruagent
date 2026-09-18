@@ -280,7 +280,7 @@ async fn supervise_chat(
             {
                 let ask = ask.clone();
                 let ev = ev_permission.clone();
-                async move |req: RequestPermissionRequest, responder, _cx| {
+                async move |req: RequestPermissionRequest, responder, cx| {
                     let tool = &req.tool_call;
                     let title = tool
                         .fields
@@ -316,20 +316,30 @@ async fn supervise_chat(
                         choices,
                         answer: tx,
                     };
-                    let answer = match ask.send(ask_msg) {
-                        Ok(()) => rx.await.unwrap_or(PermissionAnswer::Cancel),
-                        Err(_) => PermissionAnswer::Cancel,
-                    };
-                    match answer {
-                        PermissionAnswer::Select(id) => responder.respond(
-                            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-                                SelectedPermissionOutcome::new(id),
-                            )),
-                        ),
-                        PermissionAnswer::Cancel => responder.respond(
-                            RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
-                        ),
+                    // Never hold the dispatch loop while waiting for the
+                    // human (a chat ask may sit for minutes): forward the
+                    // ask, then answer from a spawned task so the loop
+                    // keeps processing messages (SDK ordering docs — the
+                    // same fix run.rs already carries; issue #38).
+                    if ask.send(ask_msg).is_err() {
+                        // Daemon is gone: fail closed.
+                        return responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
                     }
+                    cx.spawn(async move {
+                        let answer = rx.await.unwrap_or(PermissionAnswer::Cancel);
+                        match answer {
+                            PermissionAnswer::Select(id) => responder.respond(
+                                RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                                    SelectedPermissionOutcome::new(id),
+                                )),
+                            ),
+                            PermissionAnswer::Cancel => responder.respond(
+                                RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+                            ),
+                        }
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
