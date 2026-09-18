@@ -22,6 +22,7 @@ ruagent-orchestrator.workspace = true
 ruagent-memory.workspace = true
 ruagent-knowledge.workspace = true
 ruagent-graph.workspace = true
+ruagent-mcp.workspace = true
 agent-client-protocol = "2.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }

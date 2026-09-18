@@ -155,6 +155,21 @@ export function Agents() {
                     <Icon name="plug" size={15} />
                   </span>
                   <strong>{s.name}</strong>
+                  {s.health ? (
+                    s.health.state === "ok" ? (
+                      <Tooltip
+                        title={`${s.health.tools ?? 0} ${t("mcp.tools")} · ${s.health.latency_ms}ms`}
+                      >
+                        <span className="tag ok">
+                          {t("mcp.up")} · {s.health.tools ?? 0}
+                        </span>
+                      </Tooltip>
+                    ) : (
+                      <Tooltip title={s.health.error ?? t("mcp.down")}>
+                        <span className="tag warn">{t("mcp.down")}</span>
+                      </Tooltip>
+                    )
+                  ) : null}
                   {s.inject_for ? <span className="tag">{s.inject_for.join(", ")}</span> : null}
                   <span className="grow" />
                   <span className="muted mono truncated">{s.url ?? s.command}</span>

@@ -10,6 +10,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 
+pub mod health;
+
 /// Configuration for the bridge.
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {

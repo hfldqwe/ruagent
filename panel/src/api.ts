@@ -207,7 +207,20 @@ export interface RecallResult {
 }
 
 export interface McpRegistry {
-  servers: { name: string; command: string | null; url: string | null; inject_for: string[] | null }[];
+  servers: {
+    name: string;
+    command: string | null;
+    url: string | null;
+    inject_for: string[] | null;
+    /** Live health (issue #24); null = never checked. */
+    health?: {
+      state: "ok" | "down";
+      tools: number | null;
+      latency_ms: number;
+      error: string | null;
+      checked_at: number;
+    } | null;
+  }[];
   profiles: { name: string; servers: string[] }[];
 }
 

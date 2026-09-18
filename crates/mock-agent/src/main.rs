@@ -25,6 +25,9 @@ async fn main() -> Result<()> {
     let session_counter = Arc::new(AtomicU64::new(0));
     // Current session-option values (model / mode / reasoning effort).
     let current = Arc::new(std::sync::Mutex::new(default_current()));
+    // Names of the MCP servers injected at session/new — the configdump
+    // behavior reports them (health-gate tests, issue #24).
+    let session_mcp = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
     Agent
         .builder()
@@ -42,9 +45,22 @@ async fn main() -> Result<()> {
             {
                 let counter = session_counter.clone();
                 let current = current.clone();
+                let session_mcp = session_mcp.clone();
                 async move |req: NewSessionRequest, responder, _conn| {
                     let _ = &req.cwd;
                     let n = counter.fetch_add(1, Ordering::SeqCst);
+                    *session_mcp.lock().expect("session mcp lock") = req
+                        .mcp_servers
+                        .iter()
+                        .map(|s| match s {
+                            agent_client_protocol::schema::v1::McpServer::Http(h) => h.name.clone(),
+                            agent_client_protocol::schema::v1::McpServer::Sse(s) => s.name.clone(),
+                            agent_client_protocol::schema::v1::McpServer::Stdio(s) => {
+                                s.name.clone()
+                            }
+                            _ => "?".to_string(),
+                        })
+                        .collect();
                     let options = advertise(&current.lock().expect("options lock"));
                     responder.respond(
                         NewSessionResponse::new(SessionId::new(format!("mock-session-{n}")))
@@ -82,6 +98,7 @@ async fn main() -> Result<()> {
             {
                 let scripted_replies = scripted_replies.clone();
                 let current = current.clone();
+                let session_mcp = session_mcp.clone();
                 async move |req: PromptRequest, responder, conn| {
                     let sid = req.session_id.clone();
                     let text = prompt_text(&req.prompt);
@@ -253,11 +270,15 @@ async fn main() -> Result<()> {
                         Behavior::ConfigDump => {
                             // Report the current option values as k=v
                             // pairs — proves whether the client's
-                            // set_config_option calls took effect.
+                            // set_config_option calls took effect —
+                            // plus the names of the injected MCP
+                            // servers (health-gate tests, issue #24).
                             let report = {
                                 let cur = current.lock().expect("options lock");
+                                let mcp = session_mcp.lock().expect("session mcp lock").join(",");
                                 cur.iter()
                                     .map(|(k, v)| format!("{k}={v}"))
+                                    .chain(std::iter::once(format!("mcp={mcp}")))
                                     .collect::<Vec<_>>()
                                     .join(" ")
                             };

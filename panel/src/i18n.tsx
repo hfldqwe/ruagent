@@ -356,6 +356,9 @@ const zh: Record<string, string> = {
   "mcp.empty.title": "没有注册 MCP 服务器",
   "mcp.empty.hint": "在 ~/.ruagent/config/mcp.toml 添加。",
   "mcp.overlay": "注入是叠加层——各 CLI 自己的 MCP 配置不会被改动。",
+  "mcp.up": "在线",
+  "mcp.down": "已下线",
+  "mcp.tools": "个工具",
 
   // stats
   "stats.title": "统计",
@@ -816,6 +819,9 @@ const en: Record<string, string> = {
   "mcp.empty.title": "No MCP servers registered",
   "mcp.empty.hint": "Add them to ~/.ruagent/config/mcp.toml.",
   "mcp.overlay": "Injection is an overlay — each CLI's own MCP config is never touched.",
+  "mcp.up": "up",
+  "mcp.down": "down",
+  "mcp.tools": "tools",
 
   "stats.title": "Stats",
   "stats.subtitle": "Per-agent performance and cost",

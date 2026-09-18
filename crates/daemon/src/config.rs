@@ -316,6 +316,11 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
 pub struct McpConfig {
     pub servers: BTreeMap<String, McpEntry>,
     pub profiles: BTreeMap<String, Vec<String>>,
+    /// Live health registry (issue #24): the last check result per
+    /// server, shared by every clone of this config. Populated by the
+    /// daemon's background loop; `expand_profile` excludes servers
+    /// whose last check failed.
+    pub health: std::sync::Arc<crate::mcphealth::McpHealth>,
 }
 
 /// One registered MCP server.
@@ -375,6 +380,7 @@ fn parse_mcp(text: &str) -> Result<McpConfig> {
             .into_iter()
             .map(|(name, p)| (name, p.servers))
             .collect(),
+        health: Default::default(),
     })
 }
 
@@ -394,27 +400,40 @@ impl McpConfig {
         };
         server_names
             .iter()
-            .filter_map(|n| self.servers.get(n))
-            .filter(|e| {
+            .filter_map(|n| self.servers.get(n).map(|e| (n, e)))
+            .filter(|(_, e)| {
                 e.inject_for
                     .as_ref()
                     .map(|names| names.iter().any(|n| n == agent_name))
                     .unwrap_or(true)
             })
-            .map(mcp_entry_to_acp)
+            .filter(|(n, _)| {
+                // Health gate (issue #24): a server whose last check
+                // failed stays out of injection — spawning it would
+                // break session startup. Re-checked every few minutes.
+                if self.health.is_down(n) {
+                    tracing::warn!(server = %n, "mcp server is down — excluded from injection");
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|(n, e)| mcp_entry_to_acp(n, e))
             .collect()
     }
 }
 
-fn mcp_entry_to_acp(e: &McpEntry) -> agent_client_protocol::schema::v1::McpServer {
+fn mcp_entry_to_acp(name: &str, e: &McpEntry) -> agent_client_protocol::schema::v1::McpServer {
     use agent_client_protocol::schema::v1::{McpServer, McpServerHttp, McpServerStdio};
     if let Some(url) = &e.url {
         // http vs sse is indistinguishable from config alone; http is the
         // modern default and agents that only support sse will say so.
-        return McpServer::Http(McpServerHttp::new("mcp", url.clone()));
+        return McpServer::Http(McpServerHttp::new(name, url.clone()));
     }
     let command = e.command.clone().unwrap_or_default();
-    let mut stdio = McpServerStdio::new("mcp", command);
+    // The registry name travels: agents label servers by it (a
+    // hardcoded "mcp" made every injection indistinguishable).
+    let mut stdio = McpServerStdio::new(name, command);
     stdio = stdio.args(e.args.clone());
     McpServer::Stdio(stdio)
 }

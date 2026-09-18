@@ -7,6 +7,7 @@ pub mod api;
 pub mod chat;
 pub mod config;
 pub mod distill;
+pub mod mcphealth;
 pub mod memembed;
 pub mod registry;
 pub mod runs;
@@ -252,6 +253,12 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
             }
         });
     }
+
+    // MCP health (issue #24): a live initialize + tools/list roundtrip
+    // per registered server, boot + every few minutes. Down servers are
+    // excluded from injection (they would break session startup) and
+    // the panel shows the state.
+    state.config.mcp.health.spawn_loop(state.config.mcp.clone());
 
     let app = api::router(state);
 

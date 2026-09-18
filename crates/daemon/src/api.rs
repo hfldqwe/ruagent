@@ -956,6 +956,8 @@ async fn sync_skills(State(state): State<AppState>) -> Result<Json<serde_json::V
 /// The MCP registry as configured (design SS7.1). Live health pinging
 /// arrives with the M3 platform MCP server.
 async fn mcp_registry(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // Live health per server (issue #24); null = never checked.
+    let health = state.config.mcp.health.snapshot();
     let servers: Vec<serde_json::Value> = state
         .config
         .mcp
@@ -967,6 +969,7 @@ async fn mcp_registry(State(state): State<AppState>) -> Json<serde_json::Value> 
                 "command": e.command,
                 "url": e.url,
                 "inject_for": e.inject_for,
+                "health": health.get(name),
             })
         })
         .collect();
