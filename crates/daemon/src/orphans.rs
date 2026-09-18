@@ -122,8 +122,8 @@ pub fn kill_tree(pid: u32) -> bool {
     // Agents run as their own process-group leaders (the SDK spawns
     // them that way): kill the group to reach the grandchildren.
     // Fallback to the pid itself for non-leaders.
-    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) == 0 }
-    || unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 }
+    (unsafe { libc::kill(-(pid as i32), libc::SIGKILL) == 0 })
+        || (unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 })
 }
 
 #[cfg(windows)]
