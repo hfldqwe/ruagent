@@ -395,7 +395,10 @@ impl ChatManager {
 
         // Transcript forwarder: every chat event lands in the chat's JSONL
         // (SSE replays from it) — matches the run transcript pattern.
-        {
+        // Probes (record=false) write nothing: an empty transcript file
+        // would make doctor's "has CLI histories" probe think this
+        // machine has session history to sync.
+        if record {
             let mut sub = session.subscribe();
             let path = self.transcript_path(id);
             tokio::spawn(async move {
