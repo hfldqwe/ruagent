@@ -9,6 +9,7 @@ pub mod config;
 pub mod distill;
 pub mod mcphealth;
 pub mod memembed;
+pub mod orphans;
 pub mod registry;
 pub mod runs;
 pub mod sessions;
@@ -44,6 +45,10 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
                 .unwrap_or_else(|_| "ruagent=info".into()),
         )
         .init();
+
+    // Orphan sweep (issue #44): a daemon that died leaves its agent
+    // children running — kill them before anything new spawns.
+    orphans::boot(&root);
 
     let config = config::DaemonConfig::load(&root)?;
     let db = Db::open(root.join("data").join("ruagent.db")).with_context(|| "opening database")?;

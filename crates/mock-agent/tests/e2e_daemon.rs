@@ -1242,3 +1242,76 @@ async fn harness_concurrency_gates_and_queues() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Boot-time orphan sweep (#44)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn orphan_sweep_finds_and_kills_children() {
+    // A parked mock agent is a real child of this test process: the
+    // sweep must identify it as a child of its parent and the kill
+    // primitive must take down the process tree.
+    // Piped stdin: an inherited one hits EOF (no test stdin) and the
+    // mock exits instead of parking — the whole point of the test.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ruagent-mock-agent"))
+        .args(["--behavior", "permission"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    // A freshly created Windows process reports exit code 0 until it
+    // initializes (then STILL_ACTIVE) — poll for true liveness.
+    let mut alive = false;
+    for _ in 0..50 {
+        if ruagent_daemon::orphans::process_started_at_ms(pid).is_some() {
+            alive = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(alive, "spawned mock never showed up as alive");
+
+    // Identification: it shows up as a child of this process.
+    let children = ruagent_daemon::orphans::child_pids_of(std::process::id());
+    assert!(children.contains(&pid), "child not found in {children:?}");
+
+    // The recorded start time matches a fresh read (alive check basis).
+    let start = ruagent_daemon::orphans::process_started_at_ms(pid).unwrap();
+    assert!(start > 0);
+
+    // Kill: the parked process must actually die.
+    assert!(ruagent_daemon::orphans::kill_tree(pid));
+    let status = child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "a killed process cannot exit cleanly: {status:?}"
+    );
+    assert!(ruagent_daemon::orphans::process_started_at_ms(pid).is_none());
+}
+
+#[test]
+fn prior_daemon_record_roundtrips() {
+    let root = std::env::temp_dir().join(format!(
+        "ruagent-orphan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    // First boot: no record.
+    assert!(
+        ruagent_daemon::orphans::read_prior(&root)
+            .unwrap()
+            .is_none()
+    );
+    ruagent_daemon::orphans::write_current(&root).unwrap();
+    // Our own pid round-trips with its start time.
+    let prior = ruagent_daemon::orphans::read_prior(&root).unwrap().unwrap();
+    assert_eq!(prior.pid, std::process::id());
+    let _ = std::fs::remove_dir_all(&root);
+}
