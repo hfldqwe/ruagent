@@ -2,6 +2,20 @@
 //! spawned agent process per chat, multi-turn prompts on one session,
 //! model switching (live via `set_config_option` when the agent supports
 //! it, session restart otherwise).
+//!
+//! Three cross-cutting records:
+//! - **Chat history** (`chats` table): every chat ever started, with its
+//!   agent identity (survives runtime switches), engine, model and title
+//!   (first prompt) — the panel's history drawer reads it and joins the
+//!   sessions index for message counts.
+//! - **Option catalog cache** (`agent_options` table): the model list /
+//!   permission modes / thinking levels each runtime advertises over ACP,
+//!   persisted per RUNTIME name. Loaded at boot so the pickers are
+//!   instant; refreshed by every live chat, by a background loop
+//!   (boot + every few hours) and by the manual sync button.
+//! - **Role defaults** (`[agent.X.options]`): canonical option values a
+//!   role pins (mode / effort), applied on the runtime's advertised
+//!   option ids at chat start.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +34,11 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct Chat {
     pub id: RunId,
+    /// The card the user picked (role or runtime name) — survives
+    /// runtime switches, so history stays attributed to the role.
     pub agent: String,
+    /// The `[runtime.X]` engine this chat currently runs on.
+    pub runtime: String,
     pub model: Option<String>,
     pub created_at: String,
     session: ChatSession,
@@ -39,7 +57,8 @@ impl Chat {
         self.session.send(cmd).context("sending chat command")
     }
 
-    /// Send a user prompt; the first one carries the memory context.
+    /// Send a user prompt; the first one carries the memory context and
+    /// becomes the chat's history title.
     pub async fn send_prompt(
         &self,
         db: &ruagent_store::Db,
@@ -99,6 +118,22 @@ impl Chat {
             }
             ctx
         };
+        // History: the first prompt becomes the title, every prompt
+        // refreshes updated_at (chat ordering in the history drawer).
+        {
+            let id = self.id.to_string();
+            let title = truncate_chars(&text, 80);
+            let now = Utc::now().timestamp_millis();
+            let _ = db
+                .call(move |conn| {
+                    conn.execute(
+                        "UPDATE chats SET title = COALESCE(title, ?1), updated_at = ?2
+                          WHERE id = ?3",
+                        rusqlite::params![title, now, id],
+                    )
+                })
+                .await;
+        }
         self.send(ChatCommand::Prompt { text, context })
     }
 
@@ -118,6 +153,52 @@ impl Chat {
 /// The chat registry + idle reaper.
 type AskParker = Arc<dyn Fn(ruagent_acp::permission::PermissionAsk, RunId) + Send + Sync>;
 
+/// One cached option catalog (what a runtime advertises) plus when the
+/// persisted copy was written — the panel shows the sync time.
+#[derive(Debug, Clone)]
+pub struct CachedOptions {
+    pub options: Vec<SessionOptionState>,
+    pub updated_at: i64,
+}
+
+/// Result of one `Db::call` round-trip (the channel result wrapping the
+/// closure's own Result).
+type DbCall<T> = Result<Result<T, ruagent_store::DbError>, ruagent_store::DbError>;
+
+/// One raw `chats`-table row, column order.
+type ChatRow = (
+    String,         // id
+    String,         // agent
+    Option<String>, // runtime
+    Option<String>, // model
+    Option<String>, // title
+    i64,            // created_at
+    i64,            // updated_at
+);
+
+/// One sessions-index join row: (key, message_count, preview).
+type SessionIndexRow = (String, u32, Option<String>);
+
+/// A chats-table row joined with the sessions index (viewer route).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatHistoryEntry {
+    pub id: String,
+    pub agent: String,
+    pub runtime: Option<String>,
+    pub model: Option<String>,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// A live chat the daemon is still holding (history can reopen the
+    /// transcript; a live one also streams).
+    pub active: bool,
+    pub message_count: Option<u32>,
+    pub preview: Option<String>,
+    /// Sessions-index key of the transcript (the shared viewer route).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
+}
+
 pub struct ChatManager {
     db: ruagent_store::Db,
     root: PathBuf,
@@ -131,14 +212,17 @@ pub struct ChatManager {
     /// Shared embedder for distillation writes (set at boot).
     pub embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
     /// Advertised session options (model, reasoning effort, permission
-    /// mode, …) per agent name, refreshed whenever any chat or probe
-    /// reports them. What the panel pickers show.
-    model_cache: Arc<Mutex<HashMap<String, Vec<SessionOptionState>>>>,
+    /// mode, …) per RUNTIME name, refreshed whenever any chat or probe
+    /// reports them. Seeded from the `agent_options` table at boot —
+    /// what the panel pickers show, with no probe spawn on cold start.
+    model_cache: Arc<Mutex<HashMap<String, CachedOptions>>>,
 }
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How long to wait for a spawned agent to report its model catalog.
 const MODELS_WAIT: Duration = Duration::from_secs(20);
+/// Background option-catalog refresh cadence.
+pub const OPTIONS_REFRESH: Duration = Duration::from_secs(6 * 3600);
 
 impl ChatManager {
     pub fn new(
@@ -165,6 +249,15 @@ impl ChatManager {
         this
     }
 
+    /// The runtime a card runs on: roles name theirs, runtime cards are
+    /// their own engine.
+    pub fn runtime_of(card: &AgentCard) -> String {
+        card.runtime
+            .clone()
+            .or_else(|| card.runtimes.first().cloned())
+            .unwrap_or_else(|| card.name.clone())
+    }
+
     pub fn chat(&self, id: RunId) -> Option<Chat> {
         self.chats.lock().expect("chats lock").get(&id).cloned()
     }
@@ -178,6 +271,7 @@ impl ChatManager {
                 serde_json::json!({
                     "id": c.id.to_string(),
                     "agent": c.agent,
+                    "runtime": c.runtime,
                     "model": c.model,
                     "created_at": c.created_at,
                 })
@@ -245,8 +339,22 @@ impl ChatManager {
     }
 
     /// Start a new chat on the given agent (optionally with a model).
-    /// Workspace = a fresh dir under workspaces/chat-<id>.
+    /// Workspace = a fresh dir under workspaces/chat-<id>. Records a
+    /// chats-table history row.
     pub async fn start(&self, card: &AgentCard, model: Option<String>) -> Result<Chat> {
+        self.start_inner(card, model, &card.name, true).await
+    }
+
+    /// The spawn path shared by chats and probes. `label` is the history
+    /// identity (the role the user picked); `record` decides whether a
+    /// chats row is written (probes must not pollute history).
+    async fn start_inner(
+        &self,
+        card: &AgentCard,
+        model: Option<String>,
+        label: &str,
+        record: bool,
+    ) -> Result<Chat> {
         let spec = ruagent_acp::adapter_for(card.harness)
             .spawn_spec(card)
             .with_context(|| format!("resolving spawn command for `{}`", card.name))?;
@@ -316,20 +424,32 @@ impl ChatManager {
             });
         }
 
+        let runtime = Self::runtime_of(card);
+
         // Option-state tracker: whenever this session's advertised options
-        // or current selections change, refresh the per-agent cache the
-        // panel pickers read.
+        // or current selections change, refresh the per-runtime catalog
+        // (memory + `agent_options` table) the panel pickers read.
         {
             let mut watch = session.options_watch();
             let cache = self.model_cache.clone();
-            let agent_name = card.name.clone();
+            let db = self.db.clone();
+            let runtime_key = runtime.clone();
+            let mut last: Option<Vec<SessionOptionState>> = None;
             tokio::spawn(async move {
                 loop {
-                    if let Some(state) = watch.borrow_and_update().clone() {
-                        cache
-                            .lock()
-                            .expect("model cache lock")
-                            .insert(agent_name.clone(), state);
+                    if let Some(state) = watch.borrow_and_update().clone()
+                        && last.as_ref() != Some(&state)
+                    {
+                        last = Some(state.clone());
+                        let updated_at = Utc::now().timestamp_millis();
+                        cache.lock().expect("model cache lock").insert(
+                            runtime_key.clone(),
+                            CachedOptions {
+                                options: state.clone(),
+                                updated_at,
+                            },
+                        );
+                        persist_options(&db, &runtime_key, &state, updated_at);
                     }
                     if watch.changed().await.is_err() {
                         return; // chat closed
@@ -340,7 +460,8 @@ impl ChatManager {
 
         let chat = Chat {
             id,
-            agent: card.name.clone(),
+            agent: label.to_string(),
+            runtime,
             model,
             created_at: Utc::now().to_rfc3339(),
             session,
@@ -348,6 +469,38 @@ impl ChatManager {
             memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_prompt: card.prompt.clone(),
         };
+
+        // History row: who (agent identity) on which engine.
+        if record {
+            let id_s = id.to_string();
+            let agent_s = chat.agent.clone();
+            let runtime_s = chat.runtime.clone();
+            let model_s = chat.model.clone();
+            let now = Utc::now().timestamp_millis();
+            let db = self.db.clone();
+            let _ = db
+                .call(move |conn| {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO chats
+                             (id, agent, runtime, model, title, created_at, updated_at)
+                         VALUES (?1,?2,?3,?4,NULL,?5,?5)",
+                        rusqlite::params![id_s, agent_s, runtime_s, model_s, now],
+                    )
+                })
+                .await;
+        }
+
+        // Role defaults (`[agent.X.options]`): applied when the runtime
+        // reports its options — canonical keys are mapped onto whatever
+        // option ids this engine advertises.
+        if !card.options.is_empty() {
+            let chat = chat.clone();
+            let defaults = card.options.clone();
+            tokio::spawn(async move {
+                apply_role_defaults(&chat, &defaults).await;
+            });
+        }
+
         self.chats
             .lock()
             .expect("chats lock")
@@ -391,13 +544,15 @@ impl ChatManager {
 
     /// Switch model. Prefers a live switch (`session/set_config_option`
     /// — context preserved); falls back to restarting the session on the
-    /// same agent when the agent rejects the value or the option.
-    /// Returns the chat plus whether a restart happened.
+    /// given engine card, keeping `label` as the history identity (the
+    /// role the user picked). Returns the chat plus whether a restart
+    /// happened.
     pub async fn switch_model(
         &self,
         id: RunId,
         model: Option<String>,
         card: &AgentCard,
+        label: &str,
     ) -> Result<(Chat, bool)> {
         let chat = self
             .chat(id)
@@ -437,7 +592,7 @@ impl ChatManager {
             }
         }
         self.close(id);
-        let chat = self.start(card, model).await?;
+        let chat = self.start_inner(card, model, label, true).await?;
         Ok((chat, true))
     }
 
@@ -465,50 +620,256 @@ impl ChatManager {
         }
     }
 
-    /// The advertised session options for an agent: cache, a live chat, or
-    /// a throwaway probe session (spawned, queried, closed). Empty means
-    /// the agent advertises no options (free-text model input).
-    pub async fn agent_options(&self, card: &AgentCard) -> Result<Vec<SessionOptionState>> {
-        // Cache first — refreshed by every chat/probe since daemon start.
-        if let Some(state) = self
+    /// The advertised session options for a card's runtime: memory cache
+    /// (seeded from the DB at boot), a live chat, or a throwaway probe
+    /// session (spawned, queried, closed — never recorded in history).
+    /// Empty options mean the runtime advertises none (free-text model
+    /// input). Returns whether the answer came from cache.
+    pub async fn agent_options(&self, card: &AgentCard) -> Result<(CachedOptions, bool)> {
+        let runtime = Self::runtime_of(card);
+        // Cache first — seeded from `agent_options` at daemon boot and
+        // refreshed by every chat/probe since.
+        if let Some(entry) = self
             .model_cache
             .lock()
             .expect("model cache lock")
-            .get(&card.name)
+            .get(&runtime)
         {
-            return Ok(state.clone());
+            return Ok((entry.clone(), true));
         }
-        // A live chat is already asking the agent: wait for its report.
+        // Nothing cached: probe (a live chat on this runtime is already
+        // asking the agent — wait for its report instead of spawning).
+        let entry = self.probe_options(card, &runtime).await?;
+        Ok((entry, false))
+    }
+
+    /// Force a fresh read bypassing every cache (the manual sync
+    /// button): live chat when one exists, else a throwaway probe.
+    /// Persists the result.
+    pub async fn refresh_agent_options(&self, card: &AgentCard) -> Result<CachedOptions> {
+        let runtime = Self::runtime_of(card);
+        let entry = self.probe_options(card, &runtime).await?;
+        Ok(entry)
+    }
+
+    /// Read a runtime's advertised options from a live chat when one
+    /// exists, else spawn a throwaway probe session. Updates the cache
+    /// and the `agent_options` table.
+    async fn probe_options(&self, card: &AgentCard, runtime: &str) -> Result<CachedOptions> {
         let live = {
             let chats = self.chats.lock().expect("chats lock");
-            chats.values().find(|c| c.agent == card.name).cloned()
+            chats.values().find(|c| c.runtime == runtime).cloned()
         };
-        let (watch, probe_id) = match live {
-            Some(c) => (Some(c.options_watch()), None),
+        let state = match live {
+            Some(c) => wait_options(&c).await,
             None => {
-                // Probe: start a chat, read the options, close it.
-                let chat = self.start(card, None).await?;
-                (Some(chat.options_watch()), Some(chat.id))
+                // Probe: start (unrecorded), read the options, close.
+                let chat = self.start_inner(card, None, &card.name, false).await?;
+                let state = wait_options(&chat).await;
+                self.close(chat.id);
+                state
             }
         };
-        let state = match watch {
-            Some(mut w) => {
-                if w.borrow().is_none() {
-                    let _ = tokio::time::timeout(MODELS_WAIT, w.changed()).await;
-                }
-                w.borrow_and_update().clone()
-            }
-            None => None,
+        let updated_at = Utc::now().timestamp_millis();
+        let entry = CachedOptions {
+            options: state.clone(),
+            updated_at,
         };
-        if let Some(id) = probe_id {
-            self.close(id);
-        }
-        let state = state.unwrap_or_default();
         self.model_cache
             .lock()
             .expect("model cache lock")
-            .insert(card.name.clone(), state.clone());
-        Ok(state)
+            .insert(runtime.to_string(), entry.clone());
+        persist_options(&self.db, runtime, &state, updated_at);
+        Ok(entry)
+    }
+
+    /// Seed the option cache from the `agent_options` table at boot —
+    /// after a daemon restart the pickers are instant (no probe spawn).
+    pub async fn load_option_cache(&self) {
+        let rows: DbCall<Vec<(String, String, i64)>> = self
+            .db
+            .call(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT runtime, options, updated_at FROM agent_options")
+                    .map_err(ruagent_store::DbError::from)?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map_err(ruagent_store::DbError::from)?;
+                Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            })
+            .await;
+        let Ok(Ok(rows)) = rows else {
+            return;
+        };
+        let mut n = 0usize;
+        let mut cache = self.model_cache.lock().expect("model cache lock");
+        for (runtime, json, updated_at) in rows {
+            if let Ok(options) = serde_json::from_str::<Vec<SessionOptionState>>(&json) {
+                // Don't overwrite entries a live chat already refreshed.
+                cache.entry(runtime).or_insert(CachedOptions {
+                    options,
+                    updated_at,
+                });
+                n += 1;
+            }
+        }
+        if n > 0 {
+            tracing::info!(runtimes = n, "option catalogs loaded from db");
+        }
+    }
+
+    /// Re-probe every enabled runtime sequentially (boot + periodic
+    /// loop). Roles are skipped — they share their runtime's catalog.
+    pub async fn refresh_all_options(&self, cards: &[AgentCard]) {
+        for card in cards
+            .iter()
+            .filter(|c| c.enabled && c.prompt.is_none() && c.runtime.is_none())
+        {
+            match self.refresh_agent_options(card).await {
+                Ok(entry) => tracing::info!(
+                    runtime = %card.name,
+                    options = entry.options.len(),
+                    "option catalog refreshed"
+                ),
+                Err(e) => {
+                    tracing::warn!(runtime = %card.name, error = %e, "option catalog refresh failed")
+                }
+            }
+        }
+    }
+
+    /// Chat history from the `chats` table, newest first, joined with
+    /// the sessions index (message count / preview) and live state.
+    pub async fn history(&self, agent: Option<&str>, limit: u32) -> Vec<ChatHistoryEntry> {
+        let filter = agent.map(|a| a.to_string());
+        let rows: DbCall<Vec<ChatRow>> = self
+            .db
+            .call(move |conn| {
+                let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &filter {
+                    Some(a) => (
+                        "SELECT id, agent, runtime, model, title, created_at, updated_at
+                           FROM chats WHERE agent = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                        vec![a, &limit],
+                    ),
+                    None => (
+                        "SELECT id, agent, runtime, model, title, created_at, updated_at
+                           FROM chats ORDER BY updated_at DESC LIMIT ?1",
+                        vec![&limit],
+                    ),
+                };
+                let mut stmt = conn.prepare(sql).map_err(ruagent_store::DbError::from)?;
+                let rows = stmt
+                    .query_map(params.as_slice(), |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                        ))
+                    })
+                    .map_err(ruagent_store::DbError::from)?;
+                Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            })
+            .await;
+        let Ok(Ok(rows)) = rows else {
+            return Vec::new();
+        };
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        // Session keys (viewer route) + sessions-index enrichment.
+        let mut entries: Vec<ChatHistoryEntry> = rows
+            .into_iter()
+            .map(
+                |(id, agent, runtime, model, title, created_at, updated_at)| {
+                    let session_key = id
+                        .parse::<RunId>()
+                        .ok()
+                        .map(|rid| crate::sessions::session_key_of(&self.transcript_path(rid)));
+                    ChatHistoryEntry {
+                        id,
+                        agent,
+                        runtime,
+                        model,
+                        title,
+                        created_at,
+                        updated_at,
+                        active: false,
+                        message_count: None,
+                        preview: None,
+                        session_key,
+                    }
+                },
+            )
+            .collect();
+
+        let keys: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.session_key.clone())
+            .collect();
+        let index: HashMap<String, (u32, Option<String>)> = if keys.is_empty() {
+            HashMap::new()
+        } else {
+            let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT key, message_count, preview FROM sessions WHERE key IN ({placeholders})"
+            );
+            let res: DbCall<Vec<SessionIndexRow>> = self
+                .db
+                .call(move |conn| {
+                    let mut stmt = conn.prepare(&sql).map_err(ruagent_store::DbError::from)?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, u32>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        })
+                        .map_err(ruagent_store::DbError::from)?;
+                    Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+                })
+                .await;
+            res.ok()
+                .and_then(|r| r.ok())
+                .map(|rows| rows.into_iter().map(|(k, n, p)| (k, (n, p))).collect())
+                .unwrap_or_default()
+        };
+
+        let live: Vec<String> = {
+            let chats = self.chats.lock().expect("chats lock");
+            chats.keys().map(|id| id.to_string()).collect()
+        };
+        for e in &mut entries {
+            if let Some(key) = &e.session_key
+                && let Some((count, preview)) = index.get(key)
+            {
+                e.message_count = Some(*count);
+                e.preview.clone_from(preview);
+            }
+            e.active = live.contains(&e.id);
+        }
+        entries
+    }
+
+    /// Chat transcript paths keyed by agent identity (sessions-view
+    /// enrichment: "which role was this ruagent conversation with?").
+    pub async fn session_keys_by_agent(&self, limit: u32) -> HashMap<String, String> {
+        self.history(None, limit)
+            .await
+            .into_iter()
+            .filter_map(|e| e.session_key.map(|k| (k, e.agent)))
+            .collect()
     }
 
     fn auto_distiller(&self) -> Option<crate::distill::Distiller> {
@@ -563,6 +924,115 @@ impl ChatManager {
             }
         });
     }
+}
+
+/// Wait for a session to report its advertised options (bounded).
+async fn wait_options(chat: &Chat) -> Vec<SessionOptionState> {
+    let mut watch = chat.options_watch();
+    if watch.borrow().is_none() {
+        let _ = tokio::time::timeout(MODELS_WAIT, watch.changed()).await;
+    }
+    watch.borrow_and_update().clone().unwrap_or_default()
+}
+
+/// Apply a role's canonical option defaults onto a live chat: wait for
+/// the runtime's advertised options, map canonical keys (`mode`,
+/// `effort`) onto the option ids this engine uses, set each.
+async fn apply_role_defaults(chat: &Chat, defaults: &std::collections::BTreeMap<String, String>) {
+    let mut watch = chat.options_watch();
+    if watch.borrow().is_none()
+        && tokio::time::timeout(MODELS_WAIT, watch.changed())
+            .await
+            .is_err()
+    {
+        tracing::warn!(chat = %chat.id, "role defaults: runtime reported no options");
+        return;
+    }
+    let Some(options) = watch.borrow_and_update().clone() else {
+        return;
+    };
+    for (canonical, value) in defaults {
+        let Some(opt) = find_canonical(&options, canonical) else {
+            tracing::debug!(
+                chat = %chat.id,
+                canonical,
+                "runtime has no option for this role default; skipped"
+            );
+            continue;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if chat
+            .send(ChatCommand::SetConfig {
+                id: opt.id.clone(),
+                value: value.clone(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return; // chat closed
+        }
+        match tokio::time::timeout(MODELS_WAIT, rx).await {
+            Ok(Ok(Ok(_))) => tracing::info!(
+                chat = %chat.id,
+                option = %opt.id,
+                value,
+                "role default applied"
+            ),
+            Ok(Ok(Err(reason))) => {
+                tracing::warn!(chat = %chat.id, option = %opt.id, value, reason,
+                    "role default rejected by runtime")
+            }
+            _ => tracing::warn!(chat = %chat.id, option = %opt.id,
+                "role default: runtime did not answer"),
+        }
+    }
+}
+
+/// Map a canonical option key to the runtime's advertised option:
+/// `mode` → permission mode (category `mode`), `effort` → thinking
+/// level (category `thought_level`); anything else matches an exact id.
+fn find_canonical<'a>(
+    options: &'a [SessionOptionState],
+    canonical: &str,
+) -> Option<&'a SessionOptionState> {
+    match canonical {
+        "mode" => options
+            .iter()
+            .find(|o| o.category.as_deref() == Some("mode") || o.id == "mode"),
+        "effort" => options.iter().find(|o| {
+            o.category.as_deref() == Some("thought_level")
+                || o.id == "effort"
+                || o.id == "reasoning_effort"
+        }),
+        other => options.iter().find(|o| o.id == other),
+    }
+}
+
+/// Persist one runtime's option catalog (fire-and-forget upsert).
+fn persist_options(
+    db: &ruagent_store::Db,
+    runtime: &str,
+    options: &[SessionOptionState],
+    updated_at: i64,
+) {
+    let Ok(json) = serde_json::to_string(options) else {
+        return;
+    };
+    let runtime = runtime.to_string();
+    let db = db.clone();
+    tokio::spawn(async move {
+        let _ = db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_options (runtime, options, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(runtime) DO UPDATE
+                       SET options = excluded.options, updated_at = excluded.updated_at",
+                    rusqlite::params![runtime, json, updated_at],
+                )
+            })
+            .await;
+    });
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {

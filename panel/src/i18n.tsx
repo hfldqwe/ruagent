@@ -59,7 +59,9 @@ const zh: Record<string, string> = {
   "agents.f.runtimePh": "默认运行时…",
   "agents.f.prompt": "角色提示词（会跟随角色跨运行时）",
   "agents.f.description": "描述",
-  "agents.f.model": "模型（可选）",
+  "agents.f.model": "默认模型（可选）",
+  "agents.f.mode": "权限模式（可选）",
+  "agents.f.effort": "思考强度（可选）",
   "runtimes.create": "新建运行时",
   "runtimes.editTitle": "编辑运行时 {name}",
   "runtimes.created": "运行时 {name} 已创建",
@@ -73,6 +75,7 @@ const zh: Record<string, string> = {
   "runtimes.f.description": "描述",
   "runtimes.f.mcp": "MCP profile",
   "runtimes.f.models": "模型列表（逗号分隔，可选）",
+  "runtimes.models": "{n} 个模型",
 
   // home
   "home.greeting": "欢迎回来",
@@ -430,6 +433,10 @@ const zh: Record<string, string> = {
   "chat.empty": "开始对话——消息会保持同一个会话，智能体记得上文。Enter 发送，Shift+Enter 换行。",
   "chat.inputPh": "输入消息…",
   "chat.send": "发送",
+  "chat.history": "历史",
+  "chat.historyEmpty": "还没有和它聊过——开始第一段对话吧。在线的会话点开即恢复，已结束的只读查看。",
+  "chat.sync": "同步模型目录",
+  "chat.syncedAt": "目录同步于",
 
   // statuses
   "status.pending": "待处理",
@@ -509,7 +516,9 @@ const en: Record<string, string> = {
   "agents.f.runtimePh": "Default runtime…",
   "agents.f.prompt": "Role prompt (travels with the role across runtimes)",
   "agents.f.description": "Description",
-  "agents.f.model": "Model (optional)",
+  "agents.f.model": "Default model (optional)",
+  "agents.f.mode": "Permission mode (optional)",
+  "agents.f.effort": "Thinking effort (optional)",
   "runtimes.create": "New Runtime",
   "runtimes.editTitle": "Edit runtime {name}",
   "runtimes.created": "runtime {name} created",
@@ -523,6 +532,7 @@ const en: Record<string, string> = {
   "runtimes.f.description": "Description",
   "runtimes.f.mcp": "MCP profile",
   "runtimes.f.models": "Models (comma-separated, optional)",
+  "runtimes.models": "{n} models",
 
   "home.greeting": "Welcome back",
   "home.subtitle":
@@ -854,6 +864,10 @@ const en: Record<string, string> = {
     "Start talking — messages share one session, the agent remembers. Enter to send, Shift+Enter for a new line.",
   "chat.inputPh": "Type a message…",
   "chat.send": "Send",
+  "chat.history": "History",
+  "chat.historyEmpty": "Nothing yet — start the first conversation. Live chats reattach and stream; closed ones open read-only.",
+  "chat.sync": "Sync model catalog",
+  "chat.syncedAt": "Catalog synced",
 
   "inbox.title": "Inbox",
   "inbox.subtitle": "Permission requests waiting on you",

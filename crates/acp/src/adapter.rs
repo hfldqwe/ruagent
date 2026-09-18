@@ -178,6 +178,7 @@ mod tests {
             prompt: None,
             runtime: None,
             runtimes: Vec::new(),
+            options: Default::default(),
             tags: vec![],
             models: vec![],
             enabled: true,

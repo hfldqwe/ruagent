@@ -8,7 +8,10 @@
 //! ruagent-mock-agent --behavior scripted --replies replies.json
 //! ```
 
-use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::schema::v1::{
+    ContentBlock, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+};
+use std::collections::HashMap;
 
 /// All selectable behaviors.
 pub const BEHAVIORS: &[&str] = &[
@@ -21,6 +24,87 @@ pub const BEHAVIORS: &[&str] = &[
     "judge",
     "scripted",
 ];
+
+// ---------------------------------------------------------------------------
+// Advertised session options (model / mode / reasoning effort): mirrors
+// what real runtimes advertise, so the daemon's option-catalog caching
+// and role-default application are testable end to end.
+// ---------------------------------------------------------------------------
+
+/// (option id, choices) — the first choice is the default.
+pub const OPTIONS: &[(&str, &[&str])] = &[
+    ("model", &["mock-pro", "mock-max"]),
+    ("mode", &["ask", "auto"]),
+    ("reasoning_effort", &["off", "high", "max"]),
+];
+
+/// The startup current values (first choice of each option).
+pub fn default_current() -> HashMap<String, String> {
+    OPTIONS
+        .iter()
+        .map(|(id, choices)| ((*id).to_string(), choices[0].to_string()))
+        .collect()
+}
+
+/// The choices of one option id.
+fn choices_of(id: &str) -> Option<&'static [&'static str]> {
+    OPTIONS.iter().find(|(i, _)| *i == id).map(|(_, c)| *c)
+}
+
+fn option_name(id: &str) -> String {
+    match id {
+        "model" => "Model".into(),
+        "mode" => "Mode".into(),
+        "reasoning_effort" => "Reasoning effort".into(),
+        other => other.to_string(),
+    }
+}
+
+fn option_category(id: &str) -> SessionConfigOptionCategory {
+    match id {
+        "model" => SessionConfigOptionCategory::Model,
+        "mode" => SessionConfigOptionCategory::Mode,
+        "reasoning_effort" => SessionConfigOptionCategory::ThoughtLevel,
+        other => SessionConfigOptionCategory::Other(other.to_string()),
+    }
+}
+
+/// Build the full advertisement for the current selections.
+pub fn advertise(current: &HashMap<String, String>) -> Vec<SessionConfigOption> {
+    OPTIONS
+        .iter()
+        .map(|(id, choices)| {
+            let value = current
+                .get(*id)
+                .cloned()
+                .unwrap_or_else(|| choices[0].to_string());
+            SessionConfigOption::select(
+                *id,
+                option_name(id),
+                value,
+                choices
+                    .iter()
+                    .map(|c| SessionConfigSelectOption::new((*c).to_string(), (*c).to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .category(option_category(id))
+        })
+        .collect()
+}
+
+/// Set one option's current value; validates the id and the choice.
+pub fn set_option(
+    current: &mut HashMap<String, String>,
+    id: &str,
+    value: &str,
+) -> Result<(), String> {
+    let choices = choices_of(id).ok_or_else(|| format!("unknown option `{id}`"))?;
+    if !choices.contains(&value) {
+        return Err(format!("unknown value `{value}` for option `{id}`"));
+    }
+    current.insert(id.to_string(), value.to_string());
+    Ok(())
+}
 
 /// What the mock agent does when prompted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -116,6 +116,7 @@ export function Sessions() {
                   </span>
                 ) : null}
               </span>
+              {s.agent ? <span className="tag">{s.agent}</span> : null}
               <span className="muted mono" style={{ fontSize: 11 }}>
                 {s.message_count} {t("sessions.messages")}
               </span>
@@ -147,7 +148,7 @@ export function Sessions() {
   );
 }
 
-function SessionDetail({
+export function SessionDetail({
   session,
   onClose,
 }: {

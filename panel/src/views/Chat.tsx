@@ -1,17 +1,23 @@
 // Chat: terminal-like conversations — pick agent, pick model, talk
-// multi-turn on one persistent session.
+// multi-turn on one persistent session. Models / permission modes /
+// thinking levels come from the daemon's cached catalog (instant, with
+// a manual sync); the model defaults to the agent's configured one so
+// nobody is asked to choose every time. The history drawer reopens
+// past conversations (live ones reattach and stream).
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Select } from "antd";
+import { Button, Drawer, Select, Tooltip } from "antd";
 import {
   api,
   type AgentInfo,
+  type ChatHistoryEntry,
   type OptionChoice,
   type SessionOptionInfo,
 } from "../api";
 import { Icon, type IconName } from "../icons";
 import { useI18n } from "../i18n";
-import { Markdown, Spinner } from "../ui";
+import { Markdown, RelTime, Spinner } from "../ui";
+import { msToIso, SessionDetail } from "./Sessions";
 
 /** Known option ids get translated labels; others show the agent's name. */
 function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
@@ -22,6 +28,14 @@ function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
   if (opt.category === "mode") return t("chat.opt.mode");
   if (opt.category === "thought_level") return t("chat.opt.thought");
   return opt.name;
+}
+
+/** Canonical picker order: model → permission mode → thinking → extras. */
+function categoryRank(o: SessionOptionInfo): number {
+  if (o.category === "model" || o.id === "model") return 0;
+  if (o.category === "mode" || o.id === "mode") return 1;
+  if (o.category === "thought_level") return 2;
+  return 3;
 }
 
 type PickerOption =
@@ -146,9 +160,14 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [agent, setAgent] = useState(initialAgent ?? "");
   const [model, setModel] = useState("");
+  /** The engine the chat currently runs on (roles can switch). */
+  const [runtime, setRuntime] = useState("");
   /** Live session options advertised by the agent (model, reasoning
-   * effort, permission mode, …; ACP session config). Null = probing. */
+   * effort, permission mode, …; ACP session config). Null = loading. */
   const [options, setOptions] = useState<SessionOptionInfo[] | null>(null);
+  /** When the daemon's cached catalog was last refreshed. */
+  const [optionsAt, setOptionsAt] = useState<number | null>(null);
+  const [syncing, setSyncing] = useState(false);
   /** Fallback model list from config (agents.toml `models`). */
   const [configModels, setConfigModels] = useState<string[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
@@ -156,8 +175,15 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
+  const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<(() => void) | null>(null);
+  /** Which chat id the SSE is attached to — reattaching replays the
+   * whole transcript, so the same chat must only attach once (the
+   * duplicate-append bug on multi-turn conversations). */
+  const attachedRef = useRef<string | null>(null);
 
   useEffect(() => {
     api.agents().then((a) => {
@@ -169,24 +195,29 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }).catch(() => setAgents([]));
   }, []);
 
-  // Live session options for the selected agent: what the agent itself
-  // advertises over ACP (may probe-spawn it once, then cached server-side).
-  // The model option falls back to the config list, then to free text.
+  // Session options for the selected agent: the daemon's cached catalog
+  // (instant after restart) — the model defaults to the card's
+  // configured model, then the agent's advertised current.
   useEffect(() => {
     if (!agent) return;
     const a = agents?.find((x) => x.name === agent);
     setConfigModels(a?.models ?? []);
     setOptions(null);
+    setOptionsAt(null);
+    setModel(a?.model ?? "");
+    setRuntime(a?.runtime ?? "");
     let alive = true;
     api
       .agentOptions(agent)
       .then((r) => {
         if (!alive) return;
         setOptions(r.options);
+        setOptionsAt(r.updated_at ?? null);
         const m = r.options.find(
           (o) => o.category === "model" || o.id === "model",
         );
-        if (m?.current) setModel(m.current);
+        // Configured default wins; otherwise the advertised current.
+        setModel((cur) => cur || m?.current || "");
       })
       .catch(() => {
         if (alive) setOptions([]);
@@ -195,6 +226,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       alive = false;
     };
   }, [agent, agents]);
+
+  /** Manual catalog sync (the sync button). */
+  const syncOptions = async () => {
+    if (!agent || syncing) return;
+    setSyncing(true);
+    try {
+      const r = await api.agentOptions(agent, true);
+      setOptions(r.options);
+      setOptionsAt(r.updated_at ?? null);
+    } catch {
+      /* the pickers keep the cached list */
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   /** Apply the refreshed option list (after a live set). */
   const applyOptions = (list: SessionOptionInfo[]) => {
@@ -238,21 +284,26 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       const chat = await api.chatStart(agent, model.trim() || null);
       setChatId(chat.id);
       setModel(chat.model ?? "");
+      setRuntime(chat.runtime ?? "");
       return chat.id;
     } finally {
       setStarting(false);
     }
   };
 
-  const attachStream = (id: string) => {
+  const attachStream = (id: string, force = false) => {
+    if (!force && attachedRef.current === id && streamRef.current) return;
+    attachedRef.current = id;
     if (streamRef.current) streamRef.current();
     const es = new EventSource(`/api/v1/chat/${id}/events`);
     const close = () => es.close();
     streamRef.current = close;
     es.onmessage = (e) => {
       try {
-        const ev = JSON.parse(e.data) as ChatEvent;
-        handleEvent(ev);
+        const parsed = JSON.parse(e.data) as { event?: ChatEvent } & ChatEvent;
+        // Transcript replay lines wrap the event ({ts, seq, event});
+        // live events arrive flat. Handle both.
+        handleEvent(parsed.event ?? parsed);
       } catch {
         /* skip */
       }
@@ -269,6 +320,18 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
 
   const handleEvent = (ev: ChatEvent) => {
     switch (ev.type) {
+      case "user_message": {
+        // Transcript replay (history reattach) re-adds user turns; the
+        // tail dedupe keeps the optimistic copy from doubling live.
+        const text = String(ev.text ?? "");
+        if (!text) return;
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.role === "user" && last.text === text) return prev;
+          return [...prev, { role: "user", text, done: true }];
+        });
+        break;
+      }
       case "agent_message_chunk": {
         const content = ev.content as { text?: string }[];
         const text = content.map((c) => c.text ?? "").join("");
@@ -360,6 +423,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const newChat = () => {
     if (streamRef.current) streamRef.current();
     streamRef.current = null;
+    attachedRef.current = null;
     setChatId(null);
     setMessages([]);
     setStreaming(false);
@@ -369,6 +433,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     options?.find((o) => o.category === "model" || o.id === "model")?.choices ??
     [];
 
+  /** Non-model pickers in canonical order: permission mode → thinking. */
+  const extraPickers = (options ?? [])
+    .filter((o) => o.category !== "model" && o.id !== "model")
+    .sort((a, b) => categoryRank(a) - categoryRank(b));
+
   const switchRuntime = async (r: string) => {
     if (!chatId) return;
     // Runtime switch restarts the engine; the role prompt travels.
@@ -376,6 +445,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     try {
       const chat = await api.chatModel(chatId, null, r);
       setChatId(chat.id);
+      setRuntime(chat.runtime ?? r);
       setMessages((prev) => [
         ...prev,
         {
@@ -417,6 +487,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         if (streamRef.current) streamRef.current();
         setChatId(chat.id);
         setModel(chat.model ?? m);
+        setRuntime(chat.runtime ?? runtime);
         setMessages((prev) => [
           ...prev,
           {
@@ -437,7 +508,36 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
+  // ------------------------------------------------------------------
+  // History: past conversations with the current agent. Live ones
+  // reattach (the SSE replays the transcript, then streams); closed
+  // ones open the shared read-only viewer.
+  // ------------------------------------------------------------------
+  const openHistory = () => {
+    setHistoryOpen(true);
+    setHistory(null);
+    api.chatsHistory(agent).then(setHistory).catch(() => setHistory([]));
+  };
+
+  const openPast = (h: ChatHistoryEntry) => {
+    if (h.active) {
+      setHistoryOpen(false);
+      if (streamRef.current) streamRef.current();
+      setAgent(h.agent);
+      setChatId(h.id);
+      setModel(h.model ?? "");
+      setRuntime(h.runtime ?? "");
+      setMessages([]);
+      setStreaming(false);
+      attachStream(h.id, true);
+    } else {
+      setViewing(h);
+    }
+  };
+
   if (!agents) return <Spinner label={`${t("chat.title")}…`} />;
+
+  const currentAgent = agents.find((a) => a.name === agent);
 
   return (
     <div className="chat-wrap">
@@ -445,6 +545,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         <h2>{t("chat.title")}</h2>
         <span className="muted">{t("chat.subtitle")}</span>
         <span className="grow" />
+        {optionsAt ? (
+          <Tooltip title={`${t("chat.syncedAt")} ${relTimeText(optionsAt)}`}>
+            <Button size="small" loading={syncing} onClick={syncOptions} title={t("chat.sync")}>
+              <Icon name="sync" size={13} />
+            </Button>
+          </Tooltip>
+        ) : null}
+        <Button size="small" onClick={openHistory}>
+          <Icon name="history" size={13} /> {t("chat.history")}
+        </Button>
         {chatId ? (
           <Button size="small" onClick={newChat}>
             + {t("chat.new")}
@@ -514,33 +624,30 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           disabled={streaming}
         />
         {(() => {
-          const a = agents?.find((x) => x.name === agent);
-          const rt = a?.runtimes ?? [];
+          const rt = currentAgent?.runtimes ?? [];
           if (rt.length <= 1) return null;
           return (
             <OptionPicker
               label={t("chat.runtime")}
               loading={false}
               choices={rt.map((r) => ({ value: r, name: r }))}
-              current={a?.runtime ?? rt[0]}
+              current={runtime || currentAgent?.runtime || rt[0]}
               onPick={switchRuntime}
               disabled={streaming}
             />
           );
         })()}
-        {(options ?? [])
-          .filter((o) => o.category !== "model" && o.id !== "model")
-          .map((opt) => (
-            <OptionPicker
-              key={opt.id}
-              label={optionLabel(opt, t)}
-              loading={false}
-              choices={opt.choices}
-              current={opt.current ?? ""}
-              onPick={(v) => setOption(opt, v)}
-              disabled={streaming}
-            />
-          ))}
+        {extraPickers.map((opt) => (
+          <OptionPicker
+            key={opt.id}
+            label={optionLabel(opt, t)}
+            loading={false}
+            choices={opt.choices}
+            current={opt.current ?? ""}
+            onPick={(v) => setOption(opt, v)}
+            disabled={streaming}
+          />
+        ))}
       </div>
       <div className="chat-input-bar">
         <div className="composer">
@@ -568,6 +675,75 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         </div>
       </div>
       </div>
+
+      <Drawer
+        title={`${t("chat.history")} · ${agent}`}
+        placement="right"
+        width={420}
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+      >
+        {history === null ? (
+          <Spinner />
+        ) : history.length === 0 ? (
+          <p className="muted">{t("chat.historyEmpty")}</p>
+        ) : (
+          <div className="card">
+            {history.map((h) => (
+              <button key={h.id} className="row-btn" onClick={() => openPast(h)}>
+                <span className="dot" style={{ width: 6, height: 6,
+                  background: h.active ? "var(--ant-color-success)" : "var(--ant-color-text-quaternary)" }} />
+                <span className="title">
+                  <strong>{h.title || h.preview || t("sessions.untitled")}</strong>
+                  {h.runtime ? (
+                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                      {h.runtime}
+                    </span>
+                  ) : null}
+                </span>
+                {h.message_count != null ? (
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    {h.message_count} {t("sessions.messages")}
+                  </span>
+                ) : null}
+                <span className="time">
+                  <RelTime iso={msToIso(h.updated_at)} />
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </Drawer>
+
+      {viewing && (
+        <SessionDetail
+          session={{
+            key: viewing.session_key ?? "",
+            source: "ruagent",
+            title: viewing.title,
+            project: null,
+            ref_path: "",
+            started_at: viewing.created_at,
+            updated_at: viewing.updated_at,
+            message_count: viewing.message_count ?? 0,
+            preview: viewing.preview,
+            agent: viewing.agent,
+          }}
+          onClose={() => setViewing(null)}
+        />
+      )}
     </div>
   );
+}
+
+/** Compact relative time for tooltips ("3 小时前" style, no dependency
+ * on the i18n plumbing — Intl handles the locale). */
+function relTimeText(epochMs: number): string {
+  const diff = Date.now() - epochMs;
+  const mins = Math.round(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
 }

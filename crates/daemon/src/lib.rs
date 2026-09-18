@@ -236,6 +236,23 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         chats,
         sessions: indexer,
     };
+
+    // Option catalogs (model lists, permission modes, thinking levels)
+    // per runtime: load the persisted copies first (the panel pickers
+    // are instant after a daemon restart), then refresh them in the
+    // background at boot and every few hours.
+    {
+        let chats = std::sync::Arc::clone(&state.chats);
+        let mgr = std::sync::Arc::clone(&state.mgr);
+        tokio::spawn(async move {
+            chats.load_option_cache().await;
+            loop {
+                chats.refresh_all_options(&mgr.agents()).await;
+                tokio::time::sleep(chat::OPTIONS_REFRESH).await;
+            }
+        });
+    }
+
     let app = api::router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)

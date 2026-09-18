@@ -10,6 +10,7 @@ import {
   type McpRegistry,
   type PendingPermission,
   type RecallLogRow,
+  type SessionOptionInfo,
   isRoleAgent,
 } from "../api";
 import { Empty, Modal, RelTime, Spinner, fmtUsd, useToast } from "../ui";
@@ -210,6 +211,8 @@ function RoleModal({
             model: editing.model ?? "",
             runtimes: editing.runtimes ?? [],
             runtime: editing.runtime ?? editing.runtimes?.[0] ?? "",
+            mode: editing.options?.mode ?? "",
+            effort: editing.options?.effort ?? "",
           }
         : {
             name: "",
@@ -218,20 +221,59 @@ function RoleModal({
             model: "",
             runtimes: [] as string[],
             runtime: "",
+            mode: "",
+            effort: "",
           },
   );
   const [busy, setBusy] = useState(false);
   const options = runtimes.map((r) => ({ value: r.name, label: r.name }));
 
+  // The default runtime's option catalog (models / permission modes /
+  // thinking levels) — cached daemon-side, so this is instant.
+  const catalogRuntime = form.runtime || form.runtimes[0] || "";
+  const [catalog, setCatalog] = useState<SessionOptionInfo[] | null>(null);
+  useEffect(() => {
+    if (!catalogRuntime) {
+      setCatalog(null);
+      return;
+    }
+    let alive = true;
+    setCatalog(null);
+    api
+      .agentOptions(catalogRuntime)
+      .then((r) => alive && setCatalog(r.options))
+      .catch(() => alive && setCatalog([]));
+    return () => {
+      alive = false;
+    };
+  }, [catalogRuntime]);
+
+  const find = (pred: (o: SessionOptionInfo) => boolean) =>
+    (catalog ?? []).find(pred)?.choices ?? [];
+  const isModel = (o: SessionOptionInfo) => o.category === "model" || o.id === "model";
+  const isMode = (o: SessionOptionInfo) => o.category === "mode" || o.id === "mode";
+  const isEffort = (o: SessionOptionInfo) =>
+    o.category === "thought_level" || o.id === "effort" || o.id === "reasoning_effort";
+  const modelChoices = find(isModel);
+  const modeChoices = find(isMode);
+  const effortChoices = find(isEffort);
+  // Runtime without an advertisement: the config models list, else free text.
+  const fallbackModels = runtimes.find((r) => r.name === catalogRuntime)?.models ?? [];
+
   const go = async () => {
     setBusy(true);
     try {
+      const opts: Record<string, string> = {};
+      if (form.mode) opts.mode = form.mode;
+      if (form.effort) opts.effort = form.effort;
       const body = {
         prompt: form.prompt,
         description: form.description.trim() || undefined,
         model: form.model.trim() || undefined,
         runtimes: form.runtimes.length ? form.runtimes : undefined,
         runtime: form.runtime || form.runtimes[0] || undefined,
+        // canonical defaults applied at chat start; `{}` clears on edit
+        options: Object.keys(opts).length ? opts : editing ? {} : undefined,
       };
       if (editing) {
         await api.updateAgent(editing.name, body);
@@ -305,11 +347,44 @@ function RoleModal({
         style={{ marginBottom: 10 }}
       />
       <label className="muted">{t("agents.f.model")}</label>
-      <Input
-        value={form.model}
-        onChange={(e) => setForm((f) => ({ ...f, model: e.target.value }))}
-        placeholder="deepseek-chat"
+      <Select
+        mode="tags"
+        maxCount={1}
+        value={form.model ? [form.model] : []}
+        onChange={(v: string[]) => setForm((f) => ({ ...f, model: v[v.length - 1] ?? "" }))}
+        loading={catalog === null}
+        placeholder={t("chat.modelPh")}
+        style={{ width: "100%", marginBottom: 10 }}
+        options={modelChoices.length
+          ? modelChoices.map((c) => ({ value: c.value, label: c.name }))
+          : fallbackModels.map((m) => ({ value: m, label: m }))}
       />
+      {modeChoices.length > 0 ? (
+        <>
+          <label className="muted">{t("agents.f.mode")}</label>
+          <Select
+            allowClear
+            value={form.mode || undefined}
+            onChange={(v: string) => setForm((f) => ({ ...f, mode: v ?? "" }))}
+            options={modeChoices.map((c) => ({ value: c.value, label: c.name }))}
+            placeholder="—"
+            style={{ width: "100%", marginBottom: 10 }}
+          />
+        </>
+      ) : null}
+      {effortChoices.length > 0 ? (
+        <>
+          <label className="muted">{t("agents.f.effort")}</label>
+          <Select
+            allowClear
+            value={form.effort || undefined}
+            onChange={(v: string) => setForm((f) => ({ ...f, effort: v ?? "" }))}
+            options={effortChoices.map((c) => ({ value: c.value, label: c.name }))}
+            placeholder="—"
+            style={{ width: "100%" }}
+          />
+        </>
+      ) : null}
     </Modal>
   );
 }

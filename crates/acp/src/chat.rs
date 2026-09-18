@@ -22,7 +22,7 @@ use crate::permission::{PermissionAnswer, PermissionAsk};
 /// One selectable value of a session config option, as advertised by the
 /// agent. `value` is what `session/set_config_option` expects — agents
 /// use their own schemes (dsh models: `["provider","model"]`).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OptionChoice {
     pub value: String,
     pub name: String,
@@ -34,7 +34,7 @@ pub struct OptionChoice {
 
 /// One advertised select option (model, reasoning effort, permission
 /// mode, …) with its choices and current selection.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionOptionState {
     pub id: String,
     pub name: String,

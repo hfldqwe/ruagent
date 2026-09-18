@@ -16,6 +16,9 @@ export interface AgentInfo {
   runtime?: string | null;
   runtimes?: string[];
   prompt?: string | null;
+  /** Canonical session-option defaults ([agent.X.options]): `mode`
+   *  (permission) and `effort` (thinking), applied at chat start. */
+  options?: Record<string, string>;
   /** Two-layer model: a card with a prompt or runtime refs is a "role";
    *  a bare harness instance (legacy entry or [runtime.*] card) is a
    *  "runtime" — claude-code/dsh/opencode, the execution backends. */
@@ -51,6 +54,28 @@ export interface SessionOptionInfo {
 export interface AgentOptions {
   agent: string;
   options: SessionOptionInfo[];
+  /** true = served from the persisted catalog (no probe); false = a
+   *  fresh probe just ran. */
+  cached?: boolean;
+  /** Epoch ms of the persisted catalog copy. */
+  updated_at?: number;
+}
+
+/** One recorded conversation (chats table) — the history drawer. */
+export interface ChatHistoryEntry {
+  id: string;
+  agent: string;
+  runtime: string | null;
+  model: string | null;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  /** The daemon is still holding this chat (streams live). */
+  active: boolean;
+  message_count: number | null;
+  preview: string | null;
+  /** Sessions-index key of the transcript (the shared viewer). */
+  session_key?: string;
 }
 
 export interface AgentStats {
@@ -117,7 +142,7 @@ export interface PendingPermission {
 
 export interface SessionRecord {
   key: string;
-  source: string; // claude-code | dsh | ruagent
+  source: string; // claude-code | dsh | ruagent | opencode | codex
   title: string | null;
   project: string | null;
   ref_path: string;
@@ -125,6 +150,8 @@ export interface SessionRecord {
   updated_at: number;
   message_count: number;
   preview: string | null;
+  /** ruagent chats: the agent (role/runtime) the conversation was with. */
+  agent?: string;
 }
 
 export interface RecallResult {
@@ -394,8 +421,8 @@ async function getText(path: string): Promise<string> {
 export const api = {
   // agents + stats
   agents: () => get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents),
-  agentOptions: (name: string) =>
-    get<AgentOptions>(`/api/v1/agents/${name}/options`),
+  agentOptions: (name: string, refresh?: boolean) =>
+    get<AgentOptions>(`/api/v1/agents/${name}/options${refresh ? "?refresh=1" : ""}`),
   stats: () => get<{ agents: AgentStats[] }>("/api/v1/stats").then((r) => r.agents),
   mcp: () => get<McpRegistry>("/api/v1/mcp"),
 
@@ -443,6 +470,7 @@ export const api = {
     model?: string;
     runtimes?: string[];
     runtime?: string;
+    options?: Record<string, string>;
   }) => post("/api/v1/agents", body).then((r) => r.json() as Promise<AgentInfo>),
   updateAgent: (name: string, body: Record<string, unknown>) =>
     send("PATCH", `/api/v1/agents/${encodeURIComponent(name)}`, body),
@@ -577,11 +605,21 @@ export const api = {
   // chat
   chatStart: (agent: string, model: string | null) =>
     post("/api/v1/chat", { agent, model }).then(
-      (r) => r.json() as Promise<{ id: string; agent: string; model: string | null }>,
+      (r) =>
+        r.json() as Promise<{
+          id: string;
+          agent: string;
+          runtime: string;
+          model: string | null;
+        }>,
     ),
   chatList: () =>
     get<{ chats: { id: string; agent: string; model: string | null; created_at: string }[] }>(
       "/api/v1/chat",
+    ).then((r) => r.chats),
+  chatsHistory: (agent?: string, limit = 50) =>
+    get<{ chats: ChatHistoryEntry[] }>(
+      `/api/v1/chats?${agent ? `agent=${encodeURIComponent(agent)}&` : ""}limit=${limit}`,
     ).then((r) => r.chats),
   chatMessage: (id: string, text: string) =>
     post(`/api/v1/chat/${id}/messages`, { text }),
@@ -591,6 +629,7 @@ export const api = {
         r.json() as Promise<{
           id: string;
           agent: string;
+          runtime: string;
           model: string | null;
           switched: "live" | "restarted";
         }>,

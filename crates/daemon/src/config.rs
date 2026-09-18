@@ -133,6 +133,9 @@ struct AgentEntry {
     /// Every runtime this role can run on.
     #[serde(default)]
     runtimes: Vec<String>,
+    /// Canonical session-option defaults (`options = { mode = "plan" }`).
+    #[serde(default)]
+    options: BTreeMap<String, String>,
     #[serde(default)]
     tags: Vec<String>,
     enabled: Option<bool>,
@@ -183,6 +186,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                     prompt: None,
                     runtime: None,
                     runtimes: Vec::new(),
+                    options: BTreeMap::new(),
                     tags: Vec::new(),
                     enabled: entry.enabled.unwrap_or(true),
                 },
@@ -207,6 +211,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                     prompt: entry.prompt.clone(),
                     runtime: None,
                     runtimes: Vec::new(),
+                    options: entry.options.clone(),
                     tags: entry.tags.clone(),
                     enabled: entry.enabled.unwrap_or(true),
                 });
@@ -255,6 +260,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                 prompt: entry.prompt.clone(),
                 runtime: Some(default_runtime),
                 runtimes: allowed,
+                options: entry.options.clone(),
                 tags: entry.tags.clone(),
                 enabled: entry.enabled.unwrap_or(true),
             });
@@ -293,6 +299,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
             prompt: entry.prompt,
             runtime: None,
             runtimes: Vec::new(),
+            options: entry.options,
             tags: entry.tags,
             enabled: entry.enabled.unwrap_or(true),
         });

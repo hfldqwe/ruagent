@@ -76,6 +76,13 @@ pub struct AgentCard {
     /// runtimes). Empty for legacy cards.
     #[serde(default)]
     pub runtimes: Vec<String>,
+    /// Canonical session-option defaults for this role, applied when a
+    /// chat starts (`[agent.X.options]` in agents.toml). Keys are
+    /// runtime-portable, not option ids: `mode` (permission mode) and
+    /// `effort` (thinking level); mapped onto whatever the runtime
+    /// advertises by category.
+    #[serde(default)]
+    pub options: std::collections::BTreeMap<String, String>,
     /// Lightweight tags consumed by routing rules.
     pub tags: Vec<String>,
     pub enabled: bool,

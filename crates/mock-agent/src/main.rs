@@ -8,12 +8,13 @@ use agent_client_protocol::schema::v1::{
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionId,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
     PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallUpdate,
+    ToolCallUpdateFields, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Result, Stdio};
 
-use ruagent_mock_agent::{Behavior, MockArgs, prompt_text};
+use ruagent_mock_agent::{Behavior, MockArgs, advertise, default_current, prompt_text, set_option};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,6 +23,8 @@ async fn main() -> Result<()> {
     let scripted_replies = Arc::new(args.replies);
     eprintln!("mock-agent starting, behavior: {behavior:?}");
     let session_counter = Arc::new(AtomicU64::new(0));
+    // Current session-option values (model / mode / reasoning effort).
+    let current = Arc::new(std::sync::Mutex::new(default_current()));
 
     Agent
         .builder()
@@ -38,12 +41,39 @@ async fn main() -> Result<()> {
         .on_receive_request(
             {
                 let counter = session_counter.clone();
+                let current = current.clone();
                 async move |req: NewSessionRequest, responder, _conn| {
                     let _ = &req.cwd;
                     let n = counter.fetch_add(1, Ordering::SeqCst);
-                    responder.respond(NewSessionResponse::new(SessionId::new(format!(
-                        "mock-session-{n}"
-                    ))))
+                    let options = advertise(&current.lock().expect("options lock"));
+                    responder.respond(
+                        NewSessionResponse::new(SessionId::new(format!("mock-session-{n}")))
+                            .config_options(options),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let current = current.clone();
+                async move |req: SetSessionConfigOptionRequest, responder, _conn| {
+                    let Some(value) = req.value.as_value_id() else {
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("mock options are select-style"),
+                        )?;
+                        return Ok(());
+                    };
+                    let mut cur = current.lock().expect("options lock");
+                    match set_option(&mut cur, &req.config_id.to_string(), &value.to_string()) {
+                        Ok(()) => {
+                            responder.respond(SetSessionConfigOptionResponse::new(advertise(&cur)))
+                        }
+                        Err(e) => responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(e),
+                        ),
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),

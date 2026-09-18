@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/events", get(run_events))
         .route("/api/v1/chat", post(chat_start).get(chat_list))
+        .route("/api/v1/chats", get(chats_history))
         .route("/api/v1/chat/{id}/messages", post(chat_message))
         .route("/api/v1/chat/{id}/events", get(chat_events))
         .route(
@@ -1131,6 +1132,10 @@ struct AgentCardRequest {
     runtimes: Option<Vec<String>>,
     #[serde(default)]
     runtime: Option<String>,
+    /// Canonical session-option defaults (`options = { mode = "plan" }`).
+    /// `Some(empty)` clears them.
+    #[serde(default)]
+    options: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     enabled: Option<bool>,
 }
@@ -1151,6 +1156,7 @@ impl AgentCardRequest {
             mcp_profile: self.mcp_profile.clone(),
             runtimes: self.runtimes.clone(),
             runtime: self.runtime.clone(),
+            options: self.options.clone(),
             enabled: self.enabled,
         }
     }
@@ -1262,6 +1268,7 @@ fn card_json(a: &ruagent_core::AgentCard) -> serde_json::Value {
         "enabled": a.enabled,
         "runtime": a.runtime,
         "runtimes": a.runtimes,
+        "options": a.options,
         "prompt": a.prompt.as_deref().map(|p| p.chars().take(160).collect::<String>()),
         // Two-layer model (design §4.1, user ruling 2026-09-17):
         // a card with a role prompt or runtime references is a
@@ -1737,11 +1744,24 @@ async fn sessions_list(
     State(state): State<AppState>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sessions = state
+    let limit = q.limit.unwrap_or(200);
+    let mut sessions = state
         .sessions
-        .list(q.limit.unwrap_or(200))
+        .list(limit)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    // ruagent conversations carry the agent identity from the chats
+    // table (which role/runtime the user was talking to).
+    if sessions.iter().any(|s| s.source == "ruagent") {
+        let by_key = state.chats.session_keys_by_agent(limit).await;
+        for s in &mut sessions {
+            if s.source == "ruagent"
+                && let Some(agent) = by_key.get(s.key.as_str())
+            {
+                s.agent = Some(agent.clone());
+            }
+        }
+    }
     Ok(Json(serde_json::json!({ "sessions": sessions })))
 }
 
@@ -2296,14 +2316,22 @@ async fn chat_start(
         .mgr
         .agent(&req.agent)
         .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{}`", req.agent)))?;
+    // The user's pick wins; otherwise the card's configured default
+    // model ([agent.X].model / [runtime.X].model) — nobody should be
+    // asked to choose a model on every chat.
+    let model = req
+        .model
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| card.model.clone());
     let chat = state
         .chats
-        .start(&card, req.model)
+        .start(&card, model)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
         "id": chat.id.to_string(),
         "agent": chat.agent,
+        "runtime": chat.runtime,
         "model": chat.model,
     })))
 }
@@ -2405,66 +2433,112 @@ async fn chat_model(
         .chats
         .chat(id)
         .ok_or_else(|| ApiError::not_found("chat not found"))?;
-    let card = state
+    // The original card (role identity + prompt + role option defaults).
+    // A runtime chat names its own engine; a role chat keeps its prompt
+    // regardless of which engine it currently runs on.
+    let original = state
         .mgr
         .agent(&chat.agent)
         .ok_or_else(|| ApiError::bad_request("agent vanished"))?;
-    // Runtime switch: spawn the same agent (same role prompt) on a
-    // different engine. The engine card is the registry entry named by
-    // the runtime; the role prompt travels along.
-    let (new_chat, restarted) = if let Some(runtime) = &req.runtime {
-        let engine = state
+    // Engine switch: spawn the same agent (same role prompt) on a
+    // different runtime. No runtime given: stay on the CURRENT engine
+    // (a chat switched to another runtime must not fall back to the
+    // role's default).
+    let engine = match &req.runtime {
+        Some(runtime) => state
             .mgr
             .agents()
             .into_iter()
             .find(|a| &a.name == runtime)
-            .ok_or_else(|| ApiError::bad_request(format!("unknown runtime `{runtime}`")))?;
-        let mut role = engine.clone();
-        // carry the role prompt + agent identity
-        if let Some(p) = &card.prompt {
-            role.prompt = Some(p.clone());
-        }
-        state
-            .chats
-            .switch_model(id, req.model.clone(), &role)
-            .await
-            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
-    } else {
-        state
-            .chats
-            .switch_model(id, req.model, &card)
-            .await
-            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+            .ok_or_else(|| ApiError::bad_request(format!("unknown runtime `{runtime}`")))?,
+        None => state
+            .mgr
+            .agent(&chat.runtime)
+            .unwrap_or_else(|| original.clone()),
     };
+    // carry the role prompt, defaults and identity onto the engine card
+    let mut target = engine.clone();
+    if let Some(p) = &original.prompt {
+        target.prompt = Some(p.clone());
+    }
+    target.options = original.options.clone();
+    let (new_chat, restarted) = state
+        .chats
+        .switch_model(id, req.model, &target, &chat.agent)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({
         "id": new_chat.id.to_string(),
         "agent": new_chat.agent,
+        "runtime": new_chat.runtime,
         "model": new_chat.model,
         // "live" = same session, context preserved; "restarted" = new one.
         "switched": if restarted { "restarted" } else { "live" },
     })))
 }
 
-/// The session options an agent advertises (model, reasoning effort,
-/// permission mode, …): cached, read from a live chat, or probed with a
-/// throwaway session.
+#[derive(Deserialize)]
+struct AgentOptionsQuery {
+    /// Force a fresh probe (the manual sync button) instead of serving
+    /// the cached catalog. "1" and "true" both count.
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+/// The session options a runtime advertises (model, reasoning effort,
+/// permission mode, …): served from the persisted catalog (instant),
+/// unless `?refresh=1` forces a fresh probe.
 async fn agent_options(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<AgentOptionsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card = state
         .mgr
         .agent(&name)
         .filter(|a| a.enabled)
         .ok_or_else(|| ApiError::not_found("agent not found"))?;
-    let options = state
-        .chats
-        .agent_options(&card)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    Ok(Json(
-        serde_json::json!({ "agent": name, "options": options }),
-    ))
+    let (entry, cached) = if matches!(q.refresh.as_deref(), Some("1") | Some("true")) {
+        let entry = state
+            .chats
+            .refresh_agent_options(&card)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        (entry, false)
+    } else {
+        state
+            .chats
+            .agent_options(&card)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+    };
+    Ok(Json(serde_json::json!({
+        "agent": name,
+        "options": entry.options,
+        "cached": cached,
+        "updated_at": entry.updated_at,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ChatsHistoryQuery {
+    /// Only conversations with this agent (role or runtime name).
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Chat history: every conversation the daemon ever hosted (the chats
+/// table), newest first, joined with the sessions index for previews
+/// and counts — the panel's history drawer.
+async fn chats_history(
+    State(state): State<AppState>,
+    Query(q): Query<ChatsHistoryQuery>,
+) -> Json<serde_json::Value> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let chats = state.chats.history(q.agent.as_deref(), limit).await;
+    Json(serde_json::json!({ "chats": chats }))
 }
 
 #[derive(Deserialize)]

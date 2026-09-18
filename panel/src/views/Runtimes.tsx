@@ -6,13 +6,51 @@
 // agents.toml (comments preserved) and hot-reloads the registry.
 
 import { useEffect, useState } from "react";
-import { Button, Card, Input, Popconfirm, Select } from "antd";
-import { api, isRoleAgent, type AgentInfo } from "../api";
+import { Button, Card, Input, Popconfirm, Select, Tooltip } from "antd";
+import { api, isRoleAgent, type AgentInfo, type SessionOptionInfo } from "../api";
 import { Empty, Modal, Spinner, useToast } from "../ui";
 import { useI18n } from "../i18n";
 import { Icon } from "../icons";
 
 const HARNESSES = ["claude-code", "opencode", "dsh", "mock"];
+
+const modelOption = (options: SessionOptionInfo[]) =>
+  options.find((o) => o.category === "model" || o.id === "model");
+
+/** Model-count chip state for the card grid. */
+function useModelCounts(names: string[]) {
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [syncing, setSyncing] = useState<string | null>(null);
+  const key = names.join(",");
+  useEffect(() => {
+    if (!key) return;
+    let alive = true;
+    for (const n of key.split(",")) {
+      api
+        .agentOptions(n)
+        .then((o) => {
+          if (!alive) return;
+          setCounts((c) => ({ ...c, [n]: modelOption(o.options)?.choices.length ?? 0 }));
+        })
+        .catch(() => {});
+    }
+    return () => {
+      alive = false;
+    };
+  }, [key]);
+  const sync = async (name: string) => {
+    setSyncing(name);
+    try {
+      const o = await api.agentOptions(name, true);
+      setCounts((c) => ({ ...c, [name]: modelOption(o.options)?.choices.length ?? 0 }));
+    } catch {
+      /* keep the cached count */
+    } finally {
+      setSyncing(null);
+    }
+  };
+  return { counts, syncing, sync };
+}
 
 /** The create/edit form state; `editing` names the runtime being edited. */
 type FormState = {
@@ -46,6 +84,12 @@ export function Runtimes() {
     const t = setInterval(load, 5000);
     return () => clearInterval(t);
   }, []);
+
+  // Model-count chips per runtime, from the daemon's cached catalog.
+  // Runs before the early return (hook order), names derived from state.
+  const { counts, syncing, sync } = useModelCounts(
+    (agents ?? []).filter((a) => !isRoleAgent(a) && a.enabled).map((a) => a.name),
+  );
 
   if (!agents) return <Spinner label={`${t("runtimes.title")}…`} />;
   const roles = agents.filter(isRoleAgent);
@@ -100,6 +144,13 @@ export function Runtimes() {
                   </div>
                 ) : null}
                 <div className="row" style={{ marginTop: 10 }}>
+                  {counts[r.name] ? (
+                    <Tooltip title={t("chat.sync")}>
+                      <span className="tag">
+                        {t("runtimes.models", { n: counts[r.name] })}
+                      </span>
+                    </Tooltip>
+                  ) : null}
                   {usedBy.length > 0 ? (
                     usedBy.map((a) => <span key={a.name} className="tag">{a.name}</span>)
                   ) : (
@@ -110,6 +161,16 @@ export function Runtimes() {
                   <span className="grow" />
                 </div>
                 <div className="row end" style={{ marginTop: 8 }}>
+                  <Tooltip title={t("chat.sync")}>
+                    <Button
+                      size="small"
+                      loading={syncing === r.name}
+                      onClick={() => sync(r.name)}
+                      aria-label={t("chat.sync")}
+                    >
+                      <Icon name="sync" size={13} />
+                    </Button>
+                  </Tooltip>
                   <Button
                     size="small"
                     onClick={() => {

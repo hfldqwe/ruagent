@@ -35,6 +35,9 @@ pub struct AgentPatch {
     pub mcp_profile: Option<String>,
     pub runtimes: Option<Vec<String>>,
     pub runtime: Option<String>,
+    /// Canonical session-option defaults (`options = { mode = "plan" }`).
+    /// `Some(empty)` removes the key; `None` leaves it alone.
+    pub options: Option<std::collections::BTreeMap<String, String>>,
     pub enabled: Option<bool>,
 }
 
@@ -241,6 +244,17 @@ impl Editor {
         Self::set_str(t, "mcp_profile", &patch.mcp_profile);
         Self::set_string_list(t, "runtimes", &patch.runtimes);
         Self::set_str(t, "runtime", &patch.runtime);
+        if let Some(opts) = &patch.options {
+            if opts.is_empty() {
+                t.remove("options");
+            } else {
+                let mut tbl = toml_edit::InlineTable::new();
+                for (k, v) in opts {
+                    tbl.insert(k.as_str(), v.clone().into());
+                }
+                t.insert("options", value(tbl));
+            }
+        }
         if let Some(e) = patch.enabled {
             t.insert("enabled", value(e));
         }
@@ -454,6 +468,52 @@ runtimes = [\"dsh\"]
             cards
                 .iter()
                 .any(|c| c.name == "writer" && c.prompt.as_deref() == Some("write better things"))
+        );
+
+        // session-option defaults round-trip as an inline table
+        let mut opts = std::collections::BTreeMap::new();
+        opts.insert("mode".to_string(), "plan".to_string());
+        opts.insert("effort".to_string(), "high".to_string());
+        ed.update_agent(
+            "writer",
+            &AgentPatch {
+                options: Some(opts),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(ed.path()).unwrap();
+        assert!(
+            text.contains("options = {"),
+            "options inline table missing: {text}"
+        );
+        let cards = parse(ed.path());
+        let writer = cards.iter().find(|c| c.name == "writer").unwrap();
+        assert_eq!(writer.options.get("mode").map(String::as_str), Some("plan"));
+        assert_eq!(
+            writer.options.get("effort").map(String::as_str),
+            Some("high")
+        );
+
+        // Some(empty) clears them
+        ed.update_agent(
+            "writer",
+            &AgentPatch {
+                options: Some(Default::default()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(ed.path()).unwrap();
+        assert!(!text.contains("options"));
+        let cards = parse(ed.path());
+        assert!(
+            cards
+                .iter()
+                .find(|c| c.name == "writer")
+                .unwrap()
+                .options
+                .is_empty()
         );
 
         // delete

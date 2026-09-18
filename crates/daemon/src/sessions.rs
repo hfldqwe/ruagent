@@ -26,6 +26,10 @@ pub struct SessionRecord {
     pub updated_at: i64,
     pub message_count: u32,
     pub preview: Option<String>,
+    /// ruagent chats: which agent (role/runtime) the conversation was
+    /// with — joined from the chats table in the API layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,6 +242,7 @@ impl SessionIndexer {
                         updated_at: r.get(6)?,
                         message_count: r.get(7)?,
                         preview: r.get(8)?,
+                        agent: None,
                     })
                 })?;
                 let mut out = Vec::new();
