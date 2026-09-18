@@ -104,7 +104,7 @@ fn chrono_tag() -> u64 {
 fn mock_agent_toml(behavior: &str) -> String {
     // Windows paths must use forward slashes here: TOML basic strings
     // treat backslashes as escapes (a lesson for users too).
-    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let bin = mock_bin();
     format!(
         "[agent.mock]
 harness = \"mock\"
@@ -112,6 +112,11 @@ command = \"{bin} --behavior {behavior}\"
 description = \"mock\"
 "
     )
+}
+
+/// Forward-slash mock binary path, TOML-safe on Windows.
+fn mock_bin() -> String {
+    env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/")
 }
 
 /// Run a prompt on the mock agent and return (final text, sse dump).
@@ -1314,4 +1319,138 @@ fn prior_daemon_record_roundtrips() {
     let prior = ruagent_daemon::orphans::read_prior(&root).unwrap().unwrap();
     assert_eq!(prior.pid, std::process::id());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Failed-run one-click retry (§8.3 crash row)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn failed_run_one_click_retry() {
+    // The crash mock dies mid-prompt. The retry is a NEW run on the
+    // same task with the same agent + options, reusing the dead
+    // attempt's workspace, with its last output injected as context.
+    let bin = mock_bin();
+    let d = start_daemon(
+        &format!(
+            "[agent.crasher]\nharness = \"mock\"\ncommand = \"{bin} --behavior crash\"\n\n\
+             [agent.echoer]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\n"
+        ),
+        "default = \"ask\"\n",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "retryable", "intent": "do the thing" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let run: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/runs", d.url))
+        .json(&serde_json::json!({
+            "agent": "crasher",
+            "prompt": "custom launch prompt",
+            "options": { "mode": "auto" },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    let failed = poll_until(&http, &format!("{}/api/v1/runs/{run_id}", d.url), |v| {
+        v["status"] == "failed"
+    })
+    .await;
+    assert_eq!(failed["params"]["prompt"], "custom launch prompt");
+    let old_ws = failed["workspace"].as_str().unwrap().to_string();
+    assert!(old_ws.contains("run-"), "fresh workspace: {old_ws}");
+
+    // Retry: a new run row on the same task, params preserved.
+    let resp = http
+        .post(format!("{}/api/v1/runs/{run_id}/retry", d.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+    let retry: serde_json::Value = resp.json().await.unwrap();
+    let retry_id = retry["id"].as_str().unwrap().to_string();
+    assert_ne!(retry_id, run_id);
+    assert_eq!(retry["task_id"], task_id);
+
+    // The crash mock dies again (faithful retry) — but on the SAME
+    // workspace, with the dead attempt's last words as context.
+    let retried = poll_until(&http, &format!("{}/api/v1/runs/{retry_id}", d.url), |v| {
+        v["status"] == "failed"
+    })
+    .await;
+    assert_eq!(
+        retried["workspace"], old_ws,
+        "the retry continues in the dead attempt's workspace"
+    );
+    assert_eq!(retried["params"]["options"]["mode"], "auto");
+    let root = std::path::Path::new(&old_ws)
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_path_buf();
+    let transcript = std::fs::read_to_string(
+        root.join("data")
+            .join("transcripts")
+            .join(format!("run-{retry_id}.jsonl")),
+    )
+    .unwrap_or_else(|e| panic!("retry transcript unreadable: {e} (root {})", root.display()));
+    assert!(
+        transcript.contains("retry context") && transcript.contains("about to crash"),
+        "the crash snapshot rides the retry prompt: {}",
+        &transcript[..transcript.len().min(400)]
+    );
+
+    // A completed run is not retryable — "run again" is a different
+    // gesture.
+    let task2: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "done", "intent": "say hi" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run2: serde_json::Value = http
+        .post(format!(
+            "{}/api/v1/tasks/{}/runs",
+            d.url,
+            task2["id"].as_str().unwrap()
+        ))
+        .json(&serde_json::json!({ "agent": "echoer", "prompt": "say hi" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let _ = poll_until(
+        &http,
+        &format!("{}/api/v1/runs/{}", d.url, run2["id"].as_str().unwrap()),
+        |v| v["status"] == "completed",
+    )
+    .await;
+    let resp = http
+        .post(format!(
+            "{}/api/v1/runs/{}/retry",
+            d.url,
+            run2["id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
 }

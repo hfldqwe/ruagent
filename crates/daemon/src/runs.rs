@@ -516,6 +516,9 @@ impl RunManager {
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
         // Canonical session-option defaults (issue #36): mode / effort.
         run.params.options = launch.options;
+        // The original prompt (pre-injection): a retry replays it
+        // faithfully (design §8.3 crash row).
+        run.params.prompt = Some(prompt.clone());
 
         // Concurrency gate (design §8.3): a free slot spawns now; a
         // busy one queues the run — the row lands as Queued so the
@@ -676,6 +679,71 @@ impl RunManager {
         });
 
         Ok(returned)
+    }
+
+    /// One-click retry of a dead run (design §8.3 crash row): a new
+    /// run on the same task with the same agent and options, reusing
+    /// the crashed attempt's workspace (half-written work survives),
+    /// and a context snapshot from its transcript so the agent knows
+    /// where it died instead of starting from zero.
+    pub async fn retry_run(&self, run_id: RunId) -> Result<Run> {
+        let old = self
+            .db
+            .get_run(run_id)
+            .await?
+            .with_context(|| format!("run {run_id} not found"))?;
+        anyhow::ensure!(
+            matches!(
+                old.status,
+                RunStatus::Failed | RunStatus::Interrupted | RunStatus::Cancelled
+            ),
+            "only failed, interrupted or cancelled runs can be retried (this one is {:?})",
+            old.status
+        );
+        let task = self
+            .db
+            .get_task(old.task_id)
+            .await?
+            .with_context(|| format!("task {} for retry not found", old.task_id))?;
+        let card = self
+            .agents()
+            .into_iter()
+            .find(|c| c.id == old.params.agent)
+            .with_context(|| "the retried run's agent is no longer registered")?;
+
+        let prompt = old
+            .params
+            .prompt
+            .clone()
+            .unwrap_or_else(|| task.intent.clone());
+        let prompt = match retry_context(&self.root, &old) {
+            Some(ctx) => format!("{ctx}\n---\n{prompt}"),
+            None => prompt,
+        };
+        // The workspace carries the crashed attempt's half-written
+        // work: the retry continues in place.
+        let workspace = old
+            .workspace
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .map(WorkspaceSpec::Cwd)
+            .unwrap_or(WorkspaceSpec::Fresh);
+        self.start_run(
+            &task,
+            &card.name,
+            prompt,
+            self.mcp_for(&card),
+            workspace,
+            RunLaunch {
+                routed: Some(RoutingDecision {
+                    agents: vec![card.id],
+                    source: RouteSource::Explicit,
+                    rationale: Some(format!("retry of run {run_id}")),
+                }),
+                options: old.params.options.clone(),
+            },
+        )
+        .await
     }
 
     /// Fan out: same prompt to N agents in parallel on one task
@@ -978,7 +1046,7 @@ async fn supervise(
         args: spec.args.clone(),
         cwd,
         mcp_servers,
-        prompt,
+        prompt: prompt.clone(),
         options: run
             .params
             .options
@@ -986,6 +1054,15 @@ async fn supervise(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     };
+    // The transcript records what the agent was actually asked — the
+    // full prompt including injection and retry context — so a run
+    // trace is self-contained (chats already did this).
+    emit(
+        &mut transcript,
+        &broadcast,
+        &run,
+        RunEvent::UserMessage { text: prompt },
+    );
     let mut driver = tokio::spawn(run_once(opts, ev_tx.clone(), ask_tx));
 
     let mut ev_open = true;
@@ -1356,6 +1433,46 @@ async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+}
+
+/// The crash snapshot for a retry (design §8.3): what the dead attempt
+/// last said, so the replacement run continues instead of restarting
+/// from zero. Bounded — the tail, not the whole transcript.
+fn retry_context(root: &std::path::Path, old: &Run) -> Option<String> {
+    let path = transcript_path(root.join("data").join("transcripts"), &old.id);
+    let lines = ruagent_store::read_transcript(&path).ok()?;
+    let mut text = String::new();
+    for line in &lines {
+        if let ruagent_core::RunEvent::AgentMessageChunk { content } = &line.event {
+            for block in content {
+                if let Some(t) = block.as_text() {
+                    text.push_str(t);
+                }
+            }
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    // Keep the tail (the last thing the agent was doing), bounded —
+    // snapped to a char boundary (a byte cut would split a multi-byte
+    // character and panic).
+    let start = text.len().saturating_sub(1500);
+    let start = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|i| *i >= start)
+        .unwrap_or(start);
+    let tail = &text[start..];
+    let why = old
+        .error
+        .as_deref()
+        .map(|e| format!(" — {e}"))
+        .unwrap_or_default();
+    Some(format!(
+        "[retry context — the previous attempt (run {}) died{why}. Its last output before dying:] {tail}",
+        old.id
+    ))
 }
 
 /// Per-run isolated workspace (design §8.2): a fresh dir under the

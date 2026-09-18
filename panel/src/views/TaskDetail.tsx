@@ -247,6 +247,23 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                   {t("task.cancelRun")}
                 </Button>
               ) : null}
+              {["failed", "interrupted", "cancelled"].includes(r.status) ? (
+                <Button
+                  size="small"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    try {
+                      await api.retryRun(r.id);
+                      toast("ok", t("toast.retrying"));
+                    } catch (err) {
+                      toast("err", String(err));
+                    }
+                    refresh();
+                  }}
+                >
+                  {t("task.retryRun")}
+                </Button>
+              ) : null}
             </div>
           ))}
         </div>

@@ -100,6 +100,11 @@ pub struct RunParams {
     /// vocabulary chats and roles use.
     #[serde(default)]
     pub options: std::collections::BTreeMap<String, String>,
+    /// The prompt this run was launched with (`None` = the task's
+    /// intent). Recorded so a retry replays the original attempt
+    /// faithfully (design §8.3 crash row).
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 impl RunParams {
@@ -111,6 +116,7 @@ impl RunParams {
             mcp_profile: None,
             max_tokens: None,
             options: Default::default(),
+            prompt: None,
         }
     }
 }

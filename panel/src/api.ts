@@ -512,6 +512,8 @@ export const api = {
     ),
   selectRun: (runId: string) => post(`/api/v1/runs/${runId}/select`),
   cancelRun: (runId: string) => post(`/api/v1/runs/${runId}/cancel`),
+  retryRun: (runId: string) =>
+    post(`/api/v1/runs/${runId}/retry`).then((r) => r.json() as Promise<Run>),
 
   // permissions
   pendingPermissions: () =>

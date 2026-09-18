@@ -103,6 +103,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/select", post(select_run))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
+        .route("/api/v1/runs/{id}/retry", post(retry_run))
         .route("/api/v1/runs/{id}/events", get(run_events))
         .route("/api/v1/chat", post(chat_start).get(chat_list))
         .route("/api/v1/chats", get(chats_history))
@@ -308,6 +309,23 @@ async fn cancel_run(
             Err(ApiError::not_found("run not live"))
         }
     }
+}
+
+/// One-click retry of a dead run (design §8.3 crash row): new run,
+/// same task/agent/options, workspace reused, crash context injected.
+async fn retry_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Run>), ApiError> {
+    let run_id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid run id"))?;
+    let run = state
+        .mgr
+        .retry_run(run_id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok((StatusCode::CREATED, Json(run)))
 }
 
 #[derive(Deserialize)]
