@@ -444,12 +444,24 @@ export const api = {
   deleteTask: (id: string) => send("DELETE", `/api/v1/tasks/${id}`),
 
   // runs
-  startRun: (taskId: string, agent: string | null, prompt: string, repo?: string) =>
-    post(`/api/v1/tasks/${taskId}/runs`, { agent, prompt, repo }).then(
+  startRun: (
+    taskId: string,
+    agent: string | null,
+    prompt: string,
+    repo?: string,
+    options?: Record<string, string>,
+  ) =>
+    post(`/api/v1/tasks/${taskId}/runs`, { agent, prompt, repo, options }).then(
       (r) => r.json() as Promise<Run>,
     ),
-  fanout: (taskId: string, agents: string[], prompt: string, repo?: string) =>
-    post(`/api/v1/tasks/${taskId}/fanout`, { agents, prompt, repo }).then(
+  fanout: (
+    taskId: string,
+    agents: string[],
+    prompt: string,
+    repo?: string,
+    options?: Record<string, string>,
+  ) =>
+    post(`/api/v1/tasks/${taskId}/fanout`, { agents, prompt, repo, options }).then(
       (r) => r.json() as Promise<{ runs: Run[] }>,
     ),
   pipeline: (taskId: string, steps: { agent: string; prompt?: string }[]) =>

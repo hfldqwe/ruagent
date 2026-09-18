@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
         .on_receive_request(
             {
                 let scripted_replies = scripted_replies.clone();
+                let current = current.clone();
                 async move |req: PromptRequest, responder, conn| {
                     let sid = req.session_id.clone();
                     let text = prompt_text(&req.prompt);
@@ -245,6 +246,23 @@ async fn main() -> Result<()> {
                             };
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new(reply)),
+                            )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
+                        Behavior::ConfigDump => {
+                            // Report the current option values as k=v
+                            // pairs — proves whether the client's
+                            // set_config_option calls took effect.
+                            let report = {
+                                let cur = current.lock().expect("options lock");
+                                cur.iter()
+                                    .map(|(k, v)| format!("{k}={v}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            };
+                            notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(report)),
                             )))?;
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))

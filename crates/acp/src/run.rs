@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, McpServer, NewSessionRequest, PromptRequest,
     ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, TextContent,
-    WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOptionValue,
+    SessionNotification, SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, LineDirection};
 use ruagent_core::RunEvent;
@@ -29,6 +30,10 @@ pub struct RunOptions {
     pub mcp_servers: Vec<McpServer>,
     /// The prompt text.
     pub prompt: String,
+    /// Canonical session-option defaults applied after `session/new`
+    /// (issue #36): `mode` (permission mode) / `effort` (thinking),
+    /// mapped onto the agent's advertised options.
+    pub options: Vec<(String, String)>,
 }
 
 /// Split a command line into program + args on whitespace.
@@ -236,6 +241,37 @@ pub async fn run_once(
             let _ = ev_lifecycle.send(ruagent_core::RunEvent::StateChanged {
                 status: ruagent_core::RunStatus::Running,
             });
+
+            // Canonical option defaults (issue #36): map onto the ids
+            // this agent advertised and set each, best-effort — an
+            // unsupported value must not kill the run.
+            if !opts.options.is_empty() {
+                let advertised =
+                    crate::chat::extract_options(session.config_options.as_deref().unwrap_or(&[]));
+                for (canonical, value) in &opts.options {
+                    let Some(opt) = crate::chat::find_canonical(&advertised, canonical) else {
+                        tracing::debug!(
+                            canonical,
+                            "agent advertises no option for this run default; skipped"
+                        );
+                        continue;
+                    };
+                    let set = SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        opt.id.clone(),
+                        SessionConfigOptionValue::value_id(value.clone()),
+                    );
+                    match connection.send_request(set).block_task().await {
+                        Ok(_) => {
+                            tracing::info!(option = %opt.id, value, "run option applied")
+                        }
+                        Err(e) => tracing::warn!(
+                            option = %opt.id, value, error = %e,
+                            "run option rejected; continuing with the agent default"
+                        ),
+                    }
+                }
+            }
 
             // 3. Prompt to completion.
             let prompt = PromptRequest::new(

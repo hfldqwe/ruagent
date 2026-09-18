@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use ruagent_acp::adapter::HarnessAdapter as _;
-use ruagent_acp::chat::{ChatCommand, ChatOptions, ChatSession, SessionOptionState, start_chat};
+use ruagent_acp::chat::{
+    ChatCommand, ChatOptions, ChatSession, SessionOptionState, find_canonical, start_chat,
+};
 use ruagent_core::{AgentCard, RunEvent, RunId};
 use ruagent_store::{TranscriptWriter, transcript_path};
 use tokio::sync::mpsc;
@@ -988,26 +990,6 @@ async fn apply_role_defaults(chat: &Chat, defaults: &std::collections::BTreeMap<
             _ => tracing::warn!(chat = %chat.id, option = %opt.id,
                 "role default: runtime did not answer"),
         }
-    }
-}
-
-/// Map a canonical option key to the runtime's advertised option:
-/// `mode` → permission mode (category `mode`), `effort` → thinking
-/// level (category `thought_level`); anything else matches an exact id.
-fn find_canonical<'a>(
-    options: &'a [SessionOptionState],
-    canonical: &str,
-) -> Option<&'a SessionOptionState> {
-    match canonical {
-        "mode" => options
-            .iter()
-            .find(|o| o.category.as_deref() == Some("mode") || o.id == "mode"),
-        "effort" => options.iter().find(|o| {
-            o.category.as_deref() == Some("thought_level")
-                || o.id == "effort"
-                || o.id == "reasoning_effort"
-        }),
-        other => options.iter().find(|o| o.id == other),
     }
 }
 

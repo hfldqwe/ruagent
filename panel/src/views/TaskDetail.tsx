@@ -4,7 +4,14 @@
 import { useEffect, useState } from "react";
 import { Button, Checkbox, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
 import { Icon } from "../icons";
-import { api, type AgentInfo, type Judgement, type Run, type Task } from "../api";
+import {
+  api,
+  type AgentInfo,
+  type Judgement,
+  type Run,
+  type SessionOptionInfo,
+  type Task,
+} from "../api";
 import { useI18n } from "../i18n";
 import {
   Markdown,
@@ -284,6 +291,41 @@ function Launcher({
   const [steps, setSteps] = useState<string[]>([]);
   const [repo, setRepo] = useState("");
   const toast = useToast();
+  // Canonical run options (issue #36): permission mode / thinking
+  // effort, applied after session/new. The choices come from the
+  // selected agent's runtime catalog (cached daemon-side).
+  const [optMode, setOptMode] = useState("");
+  const [optEffort, setOptEffort] = useState("");
+  const [catalog, setCatalog] = useState<SessionOptionInfo[] | null>(null);
+  const optAgent = mode === "fanout" ? (picked[0] ?? "") : agent;
+  useEffect(() => {
+    if (!optAgent) {
+      setCatalog(null);
+      setOptMode("");
+      setOptEffort("");
+      return;
+    }
+    let alive = true;
+    setCatalog(null);
+    setOptMode("");
+    setOptEffort("");
+    api
+      .agentOptions(optAgent)
+      .then((r) => alive && setCatalog(r.options))
+      .catch(() => alive && setCatalog([]));
+    return () => {
+      alive = false;
+    };
+  }, [optAgent]);
+  const modeChoices =
+    (catalog ?? []).find((o) => o.category === "mode" || o.id === "mode")?.choices ?? [];
+  const effortChoices =
+    (catalog ?? []).find(
+      (o) =>
+        o.category === "thought_level" ||
+        o.id === "effort" ||
+        o.id === "reasoning_effort",
+    )?.choices ?? [];
 
   useEffect(() => {
     if (agents.length && !agents.some((a) => a.name === agent)) setAgent(agents[0].name);
@@ -293,12 +335,21 @@ function Launcher({
     setBusy(true);
     try {
       const p = prompt.trim() || task.intent;
+      const runOptions: Record<string, string> = {};
+      if (optMode) runOptions.mode = optMode;
+      if (optEffort) runOptions.effort = optEffort;
       if (mode === "single") {
-        const run = await api.startRun(task.id, agent, p, repo.trim() || undefined);
+        const run = await api.startRun(task.id, agent, p, repo.trim() || undefined, runOptions);
         onLaunched(run.id);
       } else if (mode === "fanout") {
         if (picked.length < 2) throw new Error(t("launcher.needs2"));
-        const { runs } = await api.fanout(task.id, picked, p, repo.trim() || undefined);
+        const { runs } = await api.fanout(
+          task.id,
+          picked,
+          p,
+          repo.trim() || undefined,
+          runOptions,
+        );
         onLaunched(runs[0]?.id ?? null);
       } else {
         if (steps.length < 2 || steps.some((s) => !s)) throw new Error(t("launcher.needs2"));
@@ -360,6 +411,33 @@ function Launcher({
           <span className="muted">{t("launcher.selected", { n: picked.length })}</span>
         </div>
       )}
+      {mode !== "pipeline" && (modeChoices.length > 0 || effortChoices.length > 0) ? (
+        // Canonical run options (issue #36) — the displayed choices are
+        // the selected agent's catalog; on mixed fan-out members the
+        // daemon applies each value best-effort.
+        <div className="row" style={{ marginBottom: 10 }}>
+          {modeChoices.length > 0 ? (
+            <Select
+              allowClear
+              value={optMode || undefined}
+              onChange={(v: string) => setOptMode(v ?? "")}
+              placeholder={t("agents.f.mode")}
+              style={{ minWidth: 170 }}
+              options={modeChoices.map((c) => ({ value: c.value, label: c.name }))}
+            />
+          ) : null}
+          {effortChoices.length > 0 ? (
+            <Select
+              allowClear
+              value={optEffort || undefined}
+              onChange={(v: string) => setOptEffort(v ?? "")}
+              placeholder={t("agents.f.effort")}
+              style={{ minWidth: 150 }}
+              options={effortChoices.map((c) => ({ value: c.value, label: c.name }))}
+            />
+          ) : null}
+        </div>
+      ) : null}
       {mode === "pipeline" && (
         <div className="pipeline-builder">
           {steps.map((s, i) => (

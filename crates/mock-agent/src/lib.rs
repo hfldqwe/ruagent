@@ -23,6 +23,7 @@ pub const BEHAVIORS: &[&str] = &[
     "approve",
     "judge",
     "scripted",
+    "configdump",
 ];
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,9 @@ pub enum Behavior {
     Judge,
     /// Reply from a marker-keyed script file — see [`MockArgs`].
     Scripted,
+    /// Reply with the current session-option values (`k=v` pairs) —
+    /// proves whether `session/set_config_option` took effect.
+    ConfigDump,
 }
 
 /// One scripted reply: sent when the prompt contains `marker`.
@@ -223,6 +227,7 @@ impl Behavior {
             "approve" => Some(Behavior::Approve),
             "judge" => Some(Behavior::Judge),
             "scripted" => Some(Behavior::Scripted),
+            "configdump" => Some(Behavior::ConfigDump),
             _ => None,
         }
     }

@@ -16,6 +16,7 @@ fn mock_opts(behavior: &str) -> RunOptions {
         cwd: std::env::temp_dir(),
         mcp_servers: vec![],
         prompt: "hello mock".into(),
+        options: vec![],
     }
 }
 

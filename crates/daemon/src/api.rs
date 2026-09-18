@@ -1378,6 +1378,10 @@ struct StartRunRequest {
     cwd: Option<String>,
     /// Git repo to isolate this run in (worktree on a per-run branch).
     repo: Option<String>,
+    /// Canonical session-option defaults (issue #36): `mode` (permission
+    /// mode) / `effort` (thinking level), applied after session/new.
+    #[serde(default)]
+    options: std::collections::BTreeMap<String, String>,
 }
 
 async fn start_run(
@@ -1448,7 +1452,17 @@ async fn start_run(
     };
     let run = state
         .mgr
-        .start_run(&task, &agent, prompt, mcp, workspace_spec, Some(decision))
+        .start_run(
+            &task,
+            &agent,
+            prompt,
+            mcp,
+            workspace_spec,
+            crate::runs::RunLaunch {
+                routed: Some(decision),
+                options: req.options,
+            },
+        )
         .await?;
     Ok(Json(run))
 }
@@ -1459,6 +1473,10 @@ struct FanOutRequest {
     prompt: Option<String>,
     /// Git repo: every fan-out member gets its own worktree (design SS8.2).
     repo: Option<String>,
+    /// Canonical session-option defaults applied to every member
+    /// (issue #36): mode / effort.
+    #[serde(default)]
+    options: std::collections::BTreeMap<String, String>,
 }
 
 /// Fan-out compare (design §5.2): same prompt to N agents in parallel.
@@ -1484,6 +1502,7 @@ async fn start_fanout(
             &req.agents,
             prompt,
             req.repo.map(std::path::PathBuf::from),
+            req.options,
         )
         .await?;
     Ok(Json(serde_json::json!({ "runs": runs })))

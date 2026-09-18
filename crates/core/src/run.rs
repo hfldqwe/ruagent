@@ -94,6 +94,12 @@ pub struct RunParams {
     pub mcp_profile: Option<String>,
     /// Hard cap on total tokens for this run (None = no cap).
     pub max_tokens: Option<u64>,
+    /// Canonical session-option defaults applied after `session/new`
+    /// (issue #36): `mode` (permission mode) and `effort` (thinking
+    /// level), mapped onto whatever the runtime advertises — the same
+    /// vocabulary chats and roles use.
+    #[serde(default)]
+    pub options: std::collections::BTreeMap<String, String>,
 }
 
 impl RunParams {
@@ -104,6 +110,7 @@ impl RunParams {
             reasoning_effort: None,
             mcp_profile: None,
             max_tokens: None,
+            options: Default::default(),
         }
     }
 }

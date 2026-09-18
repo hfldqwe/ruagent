@@ -50,6 +50,16 @@ pub enum WorkspaceSpec {
     Worktree { repo: PathBuf },
 }
 
+/// How to launch one run beyond task/agent/prompt/workspace: routing
+/// provenance and canonical session-option defaults (issue #36).
+#[derive(Default)]
+pub struct RunLaunch {
+    pub routed: Option<RoutingDecision>,
+    /// Canonical option defaults applied after `session/new`:
+    /// `mode` (permission mode) / `effort` (thinking level).
+    pub options: std::collections::BTreeMap<String, String>,
+}
+
 /// Messages broadcast to live subscribers (SSE/WS).
 #[derive(Debug, Clone)]
 pub enum StreamMsg {
@@ -190,7 +200,10 @@ impl RunManager {
                 prompt,
                 mcp,
                 WorkspaceSpec::Fresh,
-                Some(RoutingDecision::explicit(card.id)),
+                RunLaunch {
+                    routed: Some(RoutingDecision::explicit(card.id)),
+                    ..Default::default()
+                },
             )
             .await?;
         let final_run = wait_terminal(&self.db, run.id).await?;
@@ -362,7 +375,7 @@ impl RunManager {
         prompt: String,
         mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
         workspace_spec: WorkspaceSpec,
-        routed: Option<RoutingDecision>,
+        launch: RunLaunch,
     ) -> Result<Run> {
         let card = self
             .agent(agent_name)
@@ -372,6 +385,8 @@ impl RunManager {
             .with_context(|| format!("resolving spawn command for `{agent_name}`"))?;
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
+        // Canonical session-option defaults (issue #36): mode / effort.
+        run.params.options = launch.options;
 
         // Per-run isolated workspace (design §8.2).
         let workspace = match workspace_spec {
@@ -456,7 +471,7 @@ impl RunManager {
                 prompt,
                 mcp_servers,
                 cwd,
-                routed,
+                launch.routed,
                 injection,
                 cancel_token,
             )
@@ -487,6 +502,7 @@ impl RunManager {
         agents: &[String],
         prompt: String,
         repo: Option<PathBuf>,
+        options: std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<Run>> {
         let topology = Topology::FanOut {
             agents: agents.to_vec(),
@@ -514,7 +530,10 @@ impl RunManager {
                     prompt.clone(),
                     mcp,
                     spec,
-                    Some(decision),
+                    RunLaunch {
+                        routed: Some(decision),
+                        options: options.clone(),
+                    },
                 )
                 .await?;
             runs.push(run);
@@ -573,7 +592,10 @@ impl RunManager {
                         prompt,
                         mcp,
                         WorkspaceSpec::Fresh,
-                        Some(decision),
+                        RunLaunch {
+                            routed: Some(decision),
+                            ..Default::default()
+                        },
                     )
                     .await
                 {
@@ -655,7 +677,10 @@ impl RunManager {
                 prompt,
                 mcp,
                 WorkspaceSpec::Fresh,
-                Some(decision),
+                RunLaunch {
+                    routed: Some(decision),
+                    ..Default::default()
+                },
             )
             .await?;
 
@@ -770,6 +795,12 @@ async fn supervise(
         cwd,
         mcp_servers,
         prompt,
+        options: run
+            .params
+            .options
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     };
     let mut driver = tokio::spawn(run_once(opts, ev_tx.clone(), ask_tx));
 

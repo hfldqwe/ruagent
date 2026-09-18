@@ -382,3 +382,72 @@ async fn role_option_defaults_apply() {
 
     let _ = http.delete(format!("{url}/api/v1/chat/{id}")).send().await;
 }
+
+/// Runs accept canonical session-option defaults (issue #36): mode /
+/// effort are applied after session/new onto the runtime's advertised
+/// option ids. The configdump mock reports its applied values back.
+#[tokio::test]
+async fn run_options_apply() {
+    let (url, _root) = start_daemon().await;
+    let http = reqwest::Client::new();
+    create_runtime(
+        &http,
+        &url,
+        "rt",
+        &format!("{MOCK_BIN} --behavior configdump"),
+    )
+    .await;
+
+    let task: serde_json::Value = http
+        .post(format!("{url}/api/v1/tasks"))
+        .json(&serde_json::json!({ "title": "opts", "intent": "report your config" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let run: serde_json::Value = http
+        .post(format!("{url}/api/v1/tasks/{task_id}/runs"))
+        .json(&serde_json::json!({
+            "agent": "rt",
+            "prompt": "report your config",
+            "options": { "mode": "auto", "effort": "high" },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+
+    let done = poll_json(
+        &http,
+        &format!("{url}/api/v1/runs/{run_id}"),
+        |v| v["status"] == "completed",
+        "run completion",
+    )
+    .await;
+    let result = done["result"].as_str().unwrap_or_default();
+    assert!(
+        result.contains("mode=auto"),
+        "mode default not applied, result: {result}"
+    );
+    assert!(
+        result.contains("reasoning_effort=high"),
+        "effort default not applied, result: {result}"
+    );
+    assert!(
+        result.contains("model=mock-pro"),
+        "untouched option must keep its default, result: {result}"
+    );
+
+    // The options ride into the run's persisted params too.
+    assert_eq!(
+        done["params"]["options"]["mode"], "auto",
+        "options must be recorded on the run"
+    );
+}

@@ -49,7 +49,7 @@ pub struct SessionOptionState {
 
 /// Extract every select-kind option the agent advertises (dsh: model +
 /// reasoning_effort; claude: mode + model + effort; others: none).
-fn extract_options(options: &[SessionConfigOption]) -> Vec<SessionOptionState> {
+pub(crate) fn extract_options(options: &[SessionConfigOption]) -> Vec<SessionOptionState> {
     options
         .iter()
         .filter_map(|opt| {
@@ -101,6 +101,27 @@ fn extract_options(options: &[SessionConfigOption]) -> Vec<SessionOptionState> {
             })
         })
         .collect()
+}
+
+/// Map a canonical option key to a runtime's advertised option:
+/// `mode` → permission mode (category `mode`), `effort` → thinking
+/// level (category `thought_level`); anything else matches an exact id.
+/// Runs, chats and roles all speak this vocabulary (issue #36).
+pub fn find_canonical<'a>(
+    options: &'a [SessionOptionState],
+    canonical: &str,
+) -> Option<&'a SessionOptionState> {
+    match canonical {
+        "mode" => options
+            .iter()
+            .find(|o| o.category.as_deref() == Some("mode") || o.id == "mode"),
+        "effort" => options.iter().find(|o| {
+            o.category.as_deref() == Some("thought_level")
+                || o.id == "effort"
+                || o.id == "reasoning_effort"
+        }),
+        other => options.iter().find(|o| o.id == other),
+    }
 }
 
 /// Options for a chat session.
