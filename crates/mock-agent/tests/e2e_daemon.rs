@@ -1041,3 +1041,171 @@ async fn graph_endpoints_roundtrip() {
     assert!(list["entities"].as_array().unwrap().len() >= 2);
     let _ = fact;
 }
+
+#[tokio::test]
+async fn harness_concurrency_gates_and_queues() {
+    // per_harness = 1 (design §8.3): the second run on the same harness
+    // must queue (the permission mock parks the first indefinitely),
+    // and beyond the queue cap launches are rejected with a clear
+    // error instead of queueing forever.
+    let d = start_daemon(
+        &mock_agent_toml("permission"),
+        "[permissions]\ndefault = \"ask\"\n\n[concurrency]\nper_harness = 1\nqueue_per_harness = 1\n",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let mk_task = |n: &str| {
+        let http = http.clone();
+        let url = d.url.clone();
+        let title = format!("gate {n}");
+        async move {
+            let t: serde_json::Value = http
+                .post(format!("{url}/api/v1/tasks"))
+                .json(&serde_json::json!({ "title": title, "intent": "write something" }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            t["id"].as_str().unwrap().to_string()
+        }
+    };
+    // POST a run; the caller decides how to read the response because
+    // a saturated launch is an error status, not a run row.
+    let start = |task: String| {
+        let http = http.clone();
+        let url = d.url.clone();
+        async move {
+            http.post(format!("{url}/api/v1/tasks/{task}/runs"))
+                .json(&serde_json::json!({ "agent": "mock", "prompt": "write something" }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    // Wait for a pending permission belonging to one specific run.
+    let wait_parked = |run_id: String| {
+        let http = http.clone();
+        let url = d.url.clone();
+        async move {
+            poll_until(&http, &format!("{url}/api/v1/permissions"), |v| {
+                v["pending"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|p| p["run_id"].as_str() == Some(&run_id)))
+            })
+            .await
+        }
+    };
+    let get_run = |run_id: String| {
+        let http = http.clone();
+        let url = d.url.clone();
+        async move {
+            http.get(format!("{url}/api/v1/runs/{run_id}"))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let resolve_all = || {
+        let http = http.clone();
+        let url = d.url.clone();
+        async move {
+            let pending: serde_json::Value = http
+                .get(format!("{url}/api/v1/permissions"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            for p in pending["pending"]
+                .as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
+                let key = format!(
+                    "{}:{}",
+                    p["run_id"].as_str().unwrap(),
+                    p["tool_call_id"].as_str().unwrap()
+                );
+                let _ = http
+                    .post(format!("{url}/api/v1/permissions/{key}"))
+                    .json(&serde_json::json!({ "action": "allow" }))
+                    .send()
+                    .await;
+            }
+        }
+    };
+
+    // A acquires the only slot and parks on its permission.
+    let a: serde_json::Value = start(mk_task("a").await).await.json().await.unwrap();
+    let a_id = a["id"].as_str().unwrap().to_string();
+    assert_eq!(a["status"], "spawning", "free slot spawns immediately");
+    wait_parked(a_id.clone()).await;
+    let a_run = get_run(a_id.clone()).await;
+    assert_eq!(a_run["status"], "running");
+
+    // B queues behind A: row present, no spawn, no workspace yet.
+    let b: serde_json::Value = start(mk_task("b").await).await.json().await.unwrap();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    assert_eq!(b["status"], "queued", "second run queues: {b}");
+    let b_run = get_run(b_id.clone()).await;
+    assert_eq!(b_run["status"], "queued");
+    assert!(
+        b_run["workspace"].is_null(),
+        "a queued run must not consume resources: {b_run}"
+    );
+
+    // C: the queue cap (1 waiting) rejects the launch; the run row
+    // records why, so the failure is observable, not just a 500.
+    let c_task = mk_task("c").await;
+    let c_resp = start(c_task.clone()).await;
+    assert!(
+        !c_resp.status().is_success(),
+        "saturated launch must be rejected, got {}",
+        c_resp.status()
+    );
+    let c_detail: serde_json::Value = http
+        .get(format!("{}/api/v1/tasks/{c_task}", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c_run = &c_detail["runs"][0];
+    assert_eq!(c_run["status"], "failed", "rejected run row: {c_run}");
+    assert!(
+        c_run["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("saturated"),
+        "queue-full must say so: {c_run}"
+    );
+
+    // Resolve A's permission → A completes → B takes the freed slot
+    // and parks on its own permission.
+    resolve_all().await;
+    let _ = poll_until(&http, &format!("{}/api/v1/runs/{a_id}", d.url), |v| {
+        v["status"] == "completed"
+    })
+    .await;
+    wait_parked(b_id.clone()).await;
+    let b_run = poll_until(&http, &format!("{}/api/v1/runs/{b_id}", d.url), |v| {
+        v["status"] == "running"
+    })
+    .await;
+    assert!(b_run["workspace"].is_string(), "B spawned after the gate");
+
+    // Release B so the mock process exits cleanly.
+    resolve_all().await;
+    let _ = poll_until(&http, &format!("{}/api/v1/runs/{b_id}", d.url), |v| {
+        v["status"] == "completed"
+    })
+    .await;
+}

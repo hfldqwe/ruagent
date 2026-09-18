@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -60,6 +61,41 @@ pub struct RunLaunch {
     pub options: std::collections::BTreeMap<String, String>,
 }
 
+/// One harness's concurrency gate (design §8.3): a counting semaphore
+/// plus a waiting counter so an overloaded harness can reject new
+/// launches with a clear error instead of queueing forever.
+struct HarnessGate {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+/// A run's hold on its harness gate: either a permit taken on the spot
+/// (fast path), or a reserved waiting slot the supervisor task settles.
+enum GateHold {
+    Free(tokio::sync::OwnedSemaphorePermit),
+    Waiting(std::sync::Arc<HarnessGate>),
+}
+
+/// Reserve a waiting slot on a busy gate (design §8.3). Increments the
+/// waiting count — the caller MUST decrement it once it acquires. A
+/// full queue rejects with a clear error.
+fn reserve_slot(
+    gate: &HarnessGate,
+    kind: ruagent_core::HarnessKind,
+    queue_cap: usize,
+    running: usize,
+) -> Result<()> {
+    let waiting = gate.waiting.fetch_add(1, Ordering::SeqCst) + 1;
+    if waiting > queue_cap {
+        gate.waiting.fetch_sub(1, Ordering::SeqCst);
+        anyhow::bail!(
+            "harness {kind:?} is saturated: {queue_cap} runs already waiting \
+             ({running} running) — retry when the current runs finish"
+        );
+    }
+    Ok(())
+}
+
 /// Messages broadcast to live subscribers (SSE/WS).
 #[derive(Debug, Clone)]
 pub enum StreamMsg {
@@ -86,6 +122,10 @@ pub struct RunManager {
     cancellations: Arc<Mutex<HashMap<RunId, tokio_util::sync::CancellationToken>>>,
     /// Round-trip editor over config/agents.toml (registry API).
     registry: crate::registry::Editor,
+    /// Per-harness concurrency gates (design §8.3): fanning out N
+    /// agents on one runtime queues them instead of spawning N
+    /// children at once.
+    gates: HashMap<ruagent_core::HarnessKind, std::sync::Arc<HarnessGate>>,
 }
 
 impl RunManager {
@@ -112,6 +152,7 @@ impl RunManager {
                 "approver agent configured but not registered; tier 2 disabled"
             );
         }
+        let limits = policy.concurrency;
         Self {
             db,
             root,
@@ -127,7 +168,30 @@ impl RunManager {
             approver_rx: std::sync::Mutex::new(Some(approver_rx)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             registry: crate::registry::Editor::new(registry_path),
+            gates: ruagent_core::HarnessKind::ALL
+                .into_iter()
+                .map(|k| {
+                    (
+                        k,
+                        std::sync::Arc::new(HarnessGate {
+                            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                                limits.per_harness,
+                            )),
+                            waiting: std::sync::atomic::AtomicUsize::new(0),
+                        }),
+                    )
+                })
+                .collect(),
         }
+    }
+
+    /// The gate for one harness (design §8.3). Every harness kind has
+    /// one (see `HarnessKind::ALL`).
+    fn gate(&self, kind: ruagent_core::HarnessKind) -> std::sync::Arc<HarnessGate> {
+        self.gates
+            .get(&kind)
+            .expect("every harness kind has a gate")
+            .clone()
     }
 
     /// The agents.toml editor (registry write API).
@@ -388,54 +452,37 @@ impl RunManager {
         // Canonical session-option defaults (issue #36): mode / effort.
         run.params.options = launch.options;
 
-        // Per-run isolated workspace (design §8.2).
-        let workspace = match workspace_spec {
-            WorkspaceSpec::Fresh => {
-                let dir = self.root.join("workspaces").join(format!("run-{}", run.id));
-                std::fs::create_dir_all(&dir)
-                    .with_context(|| format!("creating workspace {}", dir.display()))?;
-                dir
-            }
-            WorkspaceSpec::Cwd(dir) => dir,
-            WorkspaceSpec::Worktree { repo } => {
-                let dir = self.root.join("worktrees").join(format!("run-{}", run.id));
-                let branch = format!("ruagent/run-{}", run.id);
-                let out = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&repo)
-                    .args(["worktree", "add", "-b", &branch])
-                    .arg(&dir)
-                    .output()
-                    .with_context(|| "spawning git for worktree add")?;
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "git worktree add failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
+        // Concurrency gate (design §8.3): a free slot spawns now; a
+        // busy one queues the run — the row lands as Queued so the
+        // fan-out reply lists every member — and a full queue rejects
+        // the launch with a clear error.
+        let gate = self.gate(card.harness);
+        let hold = match gate.sem.clone().try_acquire_owned() {
+            Ok(permit) => GateHold::Free(permit),
+            Err(_) => {
+                if let Err(e) = reserve_slot(
+                    &gate,
+                    card.harness,
+                    self.policy.concurrency.queue_per_harness,
+                    self.policy.concurrency.per_harness,
+                ) {
+                    run.status = RunStatus::Failed;
+                    run.error = Some(e.to_string());
+                    run.stop_reason = Some(StopReason::Error);
+                    run.updated_at = chrono::Utc::now();
+                    self.db.insert_run(&run).await?;
+                    return Err(e);
                 }
-                tracing::info!(branch = %branch, worktree = %dir.display(), "worktree created");
-                dir
+                run.status = RunStatus::Queued;
+                run.updated_at = chrono::Utc::now();
+                self.db.insert_run(&run).await?;
+                GateHold::Waiting(gate)
             }
         };
-        run.workspace = Some(workspace.to_string_lossy().into_owned());
-
-        // Push path of the injection contract (design SS6.4): bounded
-        // tagged memory blocks prepended to the prompt; the render is
-        // also emitted as a ContextInjected event for observability.
-        let injection = render_run_injection(&self.db, task).await;
-        let prompt = if injection.is_empty() {
-            prompt
-        } else {
-            format!("{injection}\n---\n{prompt}")
-        };
-
-        run.status = RunStatus::Spawning;
-        run.updated_at = chrono::Utc::now();
-        self.db.insert_run(&run).await?;
-        if task.status == TaskStatus::Pending {
-            self.db
-                .update_task_status(task.id, TaskStatus::InProgress)
-                .await?;
+        if let GateHold::Free(_) = &hold {
+            run.status = RunStatus::Spawning;
+            run.updated_at = chrono::Utc::now();
+            self.db.insert_run(&run).await?;
         }
 
         let db = self.db.clone();
@@ -453,10 +500,82 @@ impl RunManager {
         let cancellations = self.cancellations.clone();
         let task_id = task.id;
         let run_id = run.id;
-        let cwd = workspace.clone();
+        let task = task.clone();
 
         let returned = run.clone();
+        // The gate permit rides the supervisor: it releases when the
+        // run reaches any terminal state (design §8.3). A queued run
+        // waits for the gate here — cancellable — before it consumes
+        // any resources.
         tokio::spawn(async move {
+            let _permit = match hold {
+                GateHold::Free(permit) => permit,
+                GateHold::Waiting(g) => {
+                    let permit = tokio::select! {
+                        p = g.sem.clone().acquire_owned() => p.ok(),
+                        _ = cancel_token.cancelled() => None,
+                    };
+                    g.waiting.fetch_sub(1, Ordering::SeqCst);
+                    let Some(permit) = permit else {
+                        if cancel_token.is_cancelled() {
+                            run.status = RunStatus::Cancelled;
+                            run.stop_reason = Some(StopReason::Cancelled);
+                        } else {
+                            run.status = RunStatus::Failed;
+                            run.stop_reason = Some(StopReason::Error);
+                            run.error = Some("harness gate closed".into());
+                        }
+                        run.updated_at = chrono::Utc::now();
+                        let _ = db.update_run(&run).await;
+                        cancellations
+                            .lock()
+                            .expect("cancellations lock")
+                            .remove(&run_id);
+                        return;
+                    };
+                    permit
+                }
+            };
+
+            // Per-run isolated workspace (design §8.2) and the push path
+            // of the injection contract (design SS6.4): bounded tagged
+            // memory blocks prepended to the prompt; the render is also
+            // emitted as a ContextInjected event for observability.
+            // Prepared after the gate so a queued run touches nothing
+            // while it waits.
+            let cwd = match create_workspace(&root, workspace_spec, run_id) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    tracing::error!(run_id = %run_id, error = %err, "workspace prep failed");
+                    run.status = RunStatus::Failed;
+                    run.error = Some(err.to_string());
+                    run.stop_reason = Some(StopReason::Error);
+                    run.updated_at = chrono::Utc::now();
+                    let _ = db.update_run(&run).await;
+                    cancellations
+                        .lock()
+                        .expect("cancellations lock")
+                        .remove(&run_id);
+                    return;
+                }
+            };
+            run.workspace = Some(cwd.to_string_lossy().into_owned());
+
+            let injection = render_run_injection(&db, &task).await;
+            let mut prompt = prompt;
+            if !injection.is_empty() {
+                prompt = format!("{injection}\n---\n{prompt}");
+            }
+
+            if run.status == RunStatus::Queued {
+                run.status = RunStatus::Spawning;
+            }
+            run.updated_at = chrono::Utc::now();
+            let _ = db.update_run(&run).await;
+            if task.status == TaskStatus::Pending {
+                let _ = db.update_task_status(task.id, TaskStatus::InProgress).await;
+            }
+
             let result = supervise(
                 db.clone(),
                 root,
@@ -1167,6 +1286,39 @@ async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+}
+
+/// Per-run isolated workspace (design §8.2): a fresh dir under the
+/// data root, an explicit cwd, or a git worktree branched for this run.
+fn create_workspace(root: &std::path::Path, spec: WorkspaceSpec, run_id: RunId) -> Result<PathBuf> {
+    Ok(match spec {
+        WorkspaceSpec::Fresh => {
+            let dir = root.join("workspaces").join(format!("run-{}", run_id));
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating workspace {}", dir.display()))?;
+            dir
+        }
+        WorkspaceSpec::Cwd(dir) => dir,
+        WorkspaceSpec::Worktree { repo } => {
+            let dir = root.join("worktrees").join(format!("run-{}", run_id));
+            let branch = format!("ruagent/run-{}", run_id);
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "-b", &branch])
+                .arg(&dir)
+                .output()
+                .with_context(|| "spawning git for worktree add")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            tracing::info!(branch = %branch, worktree = %dir.display(), "worktree created");
+            dir
+        }
+    })
 }
 
 /// Assemble the push-path injection for a run (design SS6.4): user

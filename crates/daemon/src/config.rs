@@ -522,6 +522,13 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 [permissions]
 default = "ask"
 
+# Per-harness concurrency (design §8.3): fanning out N agents on one
+# runtime queues them instead of spawning N children at once; beyond
+# the queue cap new launches are rejected with a clear error.
+# [concurrency]
+# per_harness = 2        # simultaneous runs per harness kind
+# queue_per_harness = 8  # waiting runs before rejection
+
 # [[permissions.rules]]
 # title_contains = "read"
 # action = "allow"

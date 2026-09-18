@@ -38,6 +38,28 @@ pub struct PermissionPolicy {
     pub rules: Vec<PermissionRule>,
     /// Approver agent name (tier 2). None disables delegation.
     pub approver: Option<ApproverConfig>,
+    /// Per-harness concurrency gates (design §8.3).
+    pub concurrency: ConcurrencyLimits,
+}
+
+/// Resolved `[concurrency]` limits: a fan-out to N agents on one
+/// runtime queues instead of spawning N children at once; beyond the
+/// queue cap launches are rejected with a clear error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConcurrencyLimits {
+    /// Max simultaneous runs per harness kind.
+    pub per_harness: usize,
+    /// Max runs WAITING per harness before new launches are rejected.
+    pub queue_per_harness: usize,
+}
+
+impl Default for ConcurrencyLimits {
+    fn default() -> Self {
+        Self {
+            per_harness: 2,
+            queue_per_harness: 8,
+        }
+    }
 }
 
 /// Tier-2 configuration.
@@ -117,6 +139,28 @@ pub struct PolicyConfig {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub distill: DistillConfig,
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
+}
+
+/// `[concurrency]` — per-harness run gates (design §8.3).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ConcurrencyConfig {
+    /// Max simultaneous runs per harness kind (default 2).
+    pub per_harness: Option<usize>,
+    /// Max waiting runs per harness before new launches are rejected
+    /// with a clear error (default 8).
+    pub queue_per_harness: Option<usize>,
+}
+
+impl ConcurrencyConfig {
+    fn limits(&self) -> ConcurrencyLimits {
+        let d = ConcurrencyLimits::default();
+        ConcurrencyLimits {
+            per_harness: self.per_harness.unwrap_or(d.per_harness),
+            queue_per_harness: self.queue_per_harness.unwrap_or(d.queue_per_harness),
+        }
+    }
 }
 
 /// `[distill]` — session → memory distillation policy.
@@ -168,6 +212,7 @@ impl PolicyConfig {
     /// Compile to the executable policy.
     pub fn to_policy(&self) -> PermissionPolicy {
         PermissionPolicy {
+            concurrency: self.concurrency.limits(),
             default: self
                 .permissions
                 .default
@@ -221,10 +266,36 @@ mod tests {
                 },
             ],
             approver: None,
+            concurrency: ConcurrencyLimits::default(),
         };
         assert_eq!(policy.decide("Read file"), PermissionAction::Allow);
         assert_eq!(policy.decide("WRITE FILE now"), PermissionAction::Reject);
         assert_eq!(policy.decide("Run command"), PermissionAction::Ask);
+    }
+
+    #[test]
+    fn concurrency_limits_parse() {
+        let config =
+            PolicyConfig::parse("[concurrency]\nper_harness = 4\nqueue_per_harness = 2\n").unwrap();
+        assert_eq!(
+            config.concurrency.limits(),
+            ConcurrencyLimits {
+                per_harness: 4,
+                queue_per_harness: 2
+            }
+        );
+        // Omitted keys fall back to the defaults, not zero.
+        let partial = PolicyConfig::parse("[concurrency]\nper_harness = 3\n").unwrap();
+        assert_eq!(
+            partial.concurrency.limits(),
+            ConcurrencyLimits {
+                per_harness: 3,
+                queue_per_harness: 8
+            }
+        );
+        // And an absent section entirely.
+        let bare = PolicyConfig::parse("").unwrap();
+        assert_eq!(bare.concurrency.limits(), ConcurrencyLimits::default());
     }
 
     #[test]
@@ -253,6 +324,7 @@ action = "allow"
                 agent: "claude".into(),
                 high_risk: vec!["delete".into()],
             }),
+            concurrency: ConcurrencyLimits::default(),
         };
         let approver_id = "approver-uuid";
         // Normal ask from another agent -> delegate.
@@ -275,6 +347,7 @@ action = "allow"
             default: PermissionAction::Ask,
             rules: vec![],
             approver: None,
+            concurrency: ConcurrencyLimits::default(),
         };
         assert_eq!(
             no_approver.path("Write file", Some("other-uuid"), None),
@@ -291,6 +364,7 @@ action = "allow"
                 agent: "claude".into(),
                 high_risk: vec![],
             }),
+            concurrency: ConcurrencyLimits::default(),
         };
         assert_eq!(
             ruled.path("Read file", Some("x"), Some("y")),

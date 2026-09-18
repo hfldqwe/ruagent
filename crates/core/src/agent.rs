@@ -19,6 +19,15 @@ pub enum HarnessKind {
 }
 
 impl HarnessKind {
+    /// Every variant — for registries that key on the full kind set.
+    /// Keep in sync when adding a variant.
+    pub const ALL: [HarnessKind; 4] = [
+        HarnessKind::ClaudeCode,
+        HarnessKind::OpenCode,
+        HarnessKind::Dsh,
+        HarnessKind::Mock,
+    ];
+
     /// The default spawn command for each harness (overridable in config).
     pub fn default_command(self) -> &'static str {
         match self {
