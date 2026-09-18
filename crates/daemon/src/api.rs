@@ -337,6 +337,9 @@ async fn delete_task(
     let id: ruagent_core::TaskId = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    // Deleting a task discards its outputs: the run workspaces and
+    // worktrees go with the rows (issue #43).
+    state.mgr.cleanup_task_workspaces(id).await;
     state.mgr.db().delete_task(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

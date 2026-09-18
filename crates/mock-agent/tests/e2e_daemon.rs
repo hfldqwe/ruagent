@@ -719,6 +719,39 @@ async fn fanout_with_repo_gives_each_run_its_own_worktree() {
         "runs must not share a worktree"
     );
 
+    // Issue #43: deleting the task discards its outputs — the
+    // worktrees and their branches go with the rows.
+    let resp = http
+        .delete(format!("{}/api/v1/tasks/{task_id}", d.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+    for ws in &workspaces {
+        assert!(!std::path::Path::new(ws).exists(), "worktree must go: {ws}");
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !listed.contains("run-"),
+        "admin entries must be pruned: {listed}"
+    );
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list", "ruagent/run-*"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "branches must be deleted"
+    );
+
     let _ = std::fs::remove_dir_all(&repo);
 }
 

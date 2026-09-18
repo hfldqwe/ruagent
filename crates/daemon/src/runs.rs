@@ -347,6 +347,59 @@ impl RunManager {
             .retain(|k, _| !k.starts_with(&prefix));
     }
 
+    /// Remove the per-run isolated workspaces of one task. Task
+    /// deletion discards the task and its outputs, so the run
+    /// worktrees (and their branches) must not accumulate (issue #43);
+    /// runs that merely finished keep theirs — a worktree can hold the
+    /// deliverable of a code-writing run.
+    pub async fn cleanup_task_workspaces(&self, task_id: ruagent_core::TaskId) {
+        let runs = match self.db.list_runs_for_task(task_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "listing runs for workspace cleanup");
+                return;
+            }
+        };
+        let worktrees = self.root.join("worktrees");
+        let workspaces = self.root.join("workspaces");
+        for run in runs {
+            let Some(ws) = run.workspace else { continue };
+            let dir = std::path::PathBuf::from(&ws);
+            if dir.starts_with(&worktrees) {
+                // A registered worktree: remove it through git (which
+                // also prunes the admin entry), then the branch. A
+                // vanished parent repo degrades to deleting the dir.
+                let parent = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(["rev-parse", "--git-common-dir"])
+                    .output();
+                let repo = parent
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+                if let Some(repo) = repo.filter(|r| r.is_dir()) {
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(["worktree", "remove", "--force"])
+                        .arg(&dir)
+                        .output();
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(["branch", "-D", &format!("ruagent/run-{}", run.id)])
+                        .output();
+                    tracing::info!(run_id = %run.id, "worktree removed with task");
+                } else {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            } else if dir.starts_with(&workspaces) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
     pub fn root(&self) -> PathBuf {
         self.root.clone()
     }
