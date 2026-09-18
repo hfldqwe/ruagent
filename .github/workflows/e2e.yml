@@ -38,7 +38,7 @@ jobs:
           mkdir -p ~/.ruagent/config
           root="$HOME/.ruagent"
           bin="$PWD/target/debug/ruagent-mock-agent"
-          printf '[{"marker":"FANOUT MARKER","reply":"answer from alpha"}]' > "$root/config/e2e-alpha.json"
+          printf '[{"marker":"FANOUT MARKER","reply":"answer from alpha"},{"marker":"CHAT MARKER","reply":"answer from alpha chat"}]' > "$root/config/e2e-alpha.json"
           printf '[{"marker":"FANOUT MARKER","reply":"answer from beta"}]' > "$root/config/e2e-beta.json"
           cat > "$root/config/agents.toml" <<EOF
           [agent.alpha]

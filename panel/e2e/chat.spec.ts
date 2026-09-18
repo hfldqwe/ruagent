@@ -33,11 +33,12 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
     timeout: 15_000,
   });
 
-  // One round-trip: the echo reply streams back.
-  await page.locator(".composer textarea").fill("e2e history probe");
+  // One round-trip. alpha is a SCRIPTED mock (same file the judge spec
+  // uses) — the CHAT MARKER keys its reply.
+  await page.locator(".composer textarea").fill("CHAT MARKER: e2e history probe");
   await page.locator(".send-btn").click();
-  await expect(page.locator(".chat-msg.user").last()).toContainText("e2e history probe");
-  await expect(page.locator(".chat-msg.agent").last()).toContainText("e2e history probe", {
+  await expect(page.locator(".chat-msg.user").last()).toContainText("CHAT MARKER");
+  await expect(page.locator(".chat-msg.agent").last()).toContainText("answer from alpha chat", {
     timeout: 15_000,
   });
 
@@ -49,17 +50,17 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
     .first()
     .click();
   const row = page.locator(".ant-drawer .row-btn").first();
-  await expect(row).toContainText("e2e history probe", { timeout: 10_000 });
+  await expect(row).toContainText("CHAT MARKER", { timeout: 10_000 });
 
   // Live entry: click reattaches, the transcript replay restores both
   // turns in the log. (antd 6 keeps `.ant-drawer` mounted when closed —
   // the open class is the reliable signal.)
   await row.click();
   await expect(page.locator(".ant-drawer.ant-drawer-open")).toHaveCount(0);
-  await expect(page.locator(".chat-msg.user").last()).toContainText("e2e history probe", {
+  await expect(page.locator(".chat-msg.user").last()).toContainText("CHAT MARKER", {
     timeout: 8_000,
   });
-  await expect(page.locator(".chat-msg.agent").last()).toContainText("e2e history probe", {
+  await expect(page.locator(".chat-msg.agent").last()).toContainText("answer from alpha chat", {
     timeout: 8_000,
   });
 

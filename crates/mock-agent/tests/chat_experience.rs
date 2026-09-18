@@ -4,6 +4,11 @@
 
 use std::sync::Arc;
 
+/// Absolute path to the built mock binary (the CARGO_BIN_EXE pattern —
+/// a bare name would only resolve where ~/.cargo/bin happens to have
+/// it installed, which is exactly nowhere in CI).
+const MOCK_BIN: &str = env!("CARGO_BIN_EXE_ruagent-mock-agent");
+
 use ruagent_daemon::api::AppState;
 use ruagent_daemon::config::DaemonConfig;
 use ruagent_daemon::runs::RunManager;
@@ -113,7 +118,7 @@ where
 async fn option_catalog_probes_once_then_persists() {
     let (url, root) = start_daemon().await;
     let http = reqwest::Client::new();
-    create_runtime(&http, &url, "rt", "ruagent-mock-agent --behavior echo").await;
+    create_runtime(&http, &url, "rt", &format!("{MOCK_BIN} --behavior echo")).await;
 
     // First read probes (a real mock-agent process spawns).
     let v = poll_json(
@@ -187,8 +192,8 @@ async fn option_catalog_probes_once_then_persists() {
 async fn chat_history_and_runtime_switch_identity() {
     let (url, _root) = start_daemon().await;
     let http = reqwest::Client::new();
-    create_runtime(&http, &url, "rt-a", "ruagent-mock-agent --behavior echo").await;
-    create_runtime(&http, &url, "rt-b", "ruagent-mock-agent --behavior echo").await;
+    create_runtime(&http, &url, "rt-a", &format!("{MOCK_BIN} --behavior echo")).await;
+    create_runtime(&http, &url, "rt-b", &format!("{MOCK_BIN} --behavior echo")).await;
     create_role(
         &http,
         &url,
@@ -296,7 +301,7 @@ async fn chat_history_and_runtime_switch_identity() {
 async fn role_option_defaults_apply() {
     let (url, _root) = start_daemon().await;
     let http = reqwest::Client::new();
-    create_runtime(&http, &url, "rt", "ruagent-mock-agent --behavior echo").await;
+    create_runtime(&http, &url, "rt", &format!("{MOCK_BIN} --behavior echo")).await;
     create_role(
         &http,
         &url,
