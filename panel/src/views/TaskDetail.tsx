@@ -2,7 +2,7 @@
 // execution log, task status controls. Fully bilingual.
 
 import { useEffect, useState } from "react";
-import { Button, Checkbox, Input, Popconfirm, Segmented, Select } from "antd";
+import { Button, Checkbox, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
 import { Icon } from "../icons";
 import { api, type AgentInfo, type Judgement, type Run, type Task } from "../api";
 import { useI18n } from "../i18n";
@@ -183,6 +183,13 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
               <span className="mono muted">{r.id.slice(0, 8)}</span>
               <span className="tag">{agentName(r)}</span>
               <StatusPill status={r.status} />
+              {r.waiting_permission ? (
+                <Tooltip title={r.waiting_permission.title}>
+                  <span className="tag warn">
+                    <Icon name="lock" size={11} /> {t("task.waitingPerm")}
+                  </span>
+                </Tooltip>
+              ) : null}
               {r.context_usage ? (
                 <span className="muted">
                   {Math.round((r.context_usage.used / r.context_usage.size) * 100)}%
@@ -193,6 +200,28 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
               <span className="time">
                 <RelTime iso={r.created_at} />
               </span>
+              {r.waiting_permission ? (
+                <Button
+                  type="primary"
+                  size="small"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    try {
+                      await api.resolvePermission(
+                        r.id,
+                        r.waiting_permission!.tool_call_id,
+                        { action: "allow" },
+                      );
+                      toast("ok", t("inbox.allowed"));
+                    } catch (err) {
+                      toast("err", String(err));
+                    }
+                    refresh();
+                  }}
+                >
+                  {t("inbox.allow")}
+                </Button>
+              ) : null}
               {activeStatuses.includes(r.status) ? (
                 <Button
                   danger

@@ -257,10 +257,37 @@ async fn permission_parks_for_human_then_resolves() {
         p["tool_call_id"].as_str().unwrap()
     );
 
-    // Answer: allow.
+    // While parked: the task view says so (issue #34) and the run is
+    // `running` (the session went live), not stuck in `spawning`.
+    let detail = poll_until(&http, &format!("{}/api/v1/tasks/{task_id}", d.url), |v| {
+        v["runs"]
+            .as_array()
+            .is_some_and(|rs| rs.iter().any(|r| r["waiting_permission"].is_object()))
+    })
+    .await;
+    let parked = detail["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["waiting_permission"].is_object())
+        .unwrap();
+    assert_eq!(parked["status"], "running");
+    assert_eq!(parked["waiting_permission"]["title"], "Write file");
+
+    // An unknown option_id is rejected without consuming the ask.
+    let bad = http
+        .post(format!("{}/api/v1/permissions/{key}", d.url))
+        .json(&serde_json::json!({ "option_id": "allow-everything-forever" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // Answer with the agent's exact option id (issue #35) — the only
+    // path that can express allow-always style options.
     let status = http
         .post(format!("{}/api/v1/permissions/{key}", d.url))
-        .json(&serde_json::json!({ "action": "allow" }))
+        .json(&serde_json::json!({ "option_id": "allow-once" }))
         .send()
         .await
         .unwrap()

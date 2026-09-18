@@ -379,6 +379,7 @@ const zh: Record<string, string> = {
   "inbox.reject": "拒绝",
   "inbox.allowed": "已允许",
   "inbox.rejected": "已拒绝",
+  "task.waitingPerm": "等待权限",
 
   // timeline
   "timeline.live": "实时",
@@ -879,6 +880,7 @@ const en: Record<string, string> = {
   "inbox.reject": "Reject",
   "inbox.allowed": "allowed",
   "inbox.rejected": "rejected",
+  "task.waitingPerm": "waiting for permission",
 
   "timeline.live": "live",
   "timeline.latest": "↓ latest",

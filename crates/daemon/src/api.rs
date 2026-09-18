@@ -1344,9 +1344,27 @@ async fn get_task(
         .map(|(run_id, by)| (Some(run_id), Some(by)))
         .unwrap_or((None, None));
     let judgement = judge_view(state.mgr.db(), id, &runs).await?;
+    // A run parked on the inbox shows it here: the task view must say
+    // "waiting for permission", not look hung (issue #34).
+    let pending = state.mgr.pending_permissions();
+    let runs_json: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or_default();
+            if let Some(p) = pending.iter().find(|p| p.run_id == r.id) {
+                v["waiting_permission"] = serde_json::json!({
+                    "tool_call_id": p.tool_call_id,
+                    "title": p.title,
+                });
+            } else {
+                v["waiting_permission"] = serde_json::Value::Null;
+            }
+            v
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "task": task,
-        "runs": runs,
+        "runs": runs_json,
         "selected_run_id": selected_run_id,
         "selected_by": selected_by,
         "judgement": judgement,
@@ -2238,8 +2256,15 @@ async fn list_permissions(State(state): State<AppState>) -> Json<serde_json::Val
 
 #[derive(Deserialize)]
 struct ResolvePermissionRequest {
-    /// "allow" | "reject" | "cancel"
-    action: String,
+    /// "allow" | "reject" | "cancel" — semantic actions; `allow` picks
+    /// the first allow-kind option the agent offered.
+    #[serde(default)]
+    action: Option<String>,
+    /// The exact option id from the inbox listing (e.g.
+    /// `allow-with-updates`) — the only way to grant an allow-always
+    /// style option (issue #35).
+    #[serde(default)]
+    option_id: Option<String>,
 }
 
 async fn resolve_permission(
@@ -2254,39 +2279,58 @@ async fn resolve_permission(
         .find(|p| format!("{}:{}", p.run_id, p.tool_call_id) == key)
         .ok_or_else(|| ApiError::not_found("no such pending permission"))?;
 
-    let answer = match req.action.as_str() {
-        "allow" => {
-            let id = pending
-                .choices
-                .iter()
-                .find(|c| {
-                    matches!(
-                        c.kind,
-                        ruagent_core::PermissionKind::AllowOnce
-                            | ruagent_core::PermissionKind::AllowAlways
-                    )
-                })
-                .map(|c| c.option_id.clone())
-                .ok_or_else(|| ApiError::bad_request("no allow option offered"))?;
-            ruagent_acp::permission::PermissionAnswer::Select(id)
+    let answer = if let Some(id) = &req.option_id {
+        if !pending.choices.iter().any(|c| &c.option_id == id) {
+            return Err(ApiError::bad_request(format!(
+                "option `{id}` was not offered (choices: {})",
+                pending
+                    .choices
+                    .iter()
+                    .map(|c| c.option_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
-        "reject" => {
-            let id = pending
-                .choices
-                .iter()
-                .find(|c| {
-                    matches!(
-                        c.kind,
-                        ruagent_core::PermissionKind::RejectOnce
-                            | ruagent_core::PermissionKind::RejectAlways
-                    )
-                })
-                .map(|c| c.option_id.clone())
-                .ok_or_else(|| ApiError::bad_request("no reject option offered"))?;
-            ruagent_acp::permission::PermissionAnswer::Select(id)
+        ruagent_acp::permission::PermissionAnswer::Select(id.clone())
+    } else {
+        match req.action.as_deref() {
+            Some("allow") => {
+                let id = pending
+                    .choices
+                    .iter()
+                    .find(|c| {
+                        matches!(
+                            c.kind,
+                            ruagent_core::PermissionKind::AllowOnce
+                                | ruagent_core::PermissionKind::AllowAlways
+                        )
+                    })
+                    .map(|c| c.option_id.clone())
+                    .ok_or_else(|| ApiError::bad_request("no allow option offered"))?;
+                ruagent_acp::permission::PermissionAnswer::Select(id)
+            }
+            Some("reject") => {
+                let id = pending
+                    .choices
+                    .iter()
+                    .find(|c| {
+                        matches!(
+                            c.kind,
+                            ruagent_core::PermissionKind::RejectOnce
+                                | ruagent_core::PermissionKind::RejectAlways
+                        )
+                    })
+                    .map(|c| c.option_id.clone())
+                    .ok_or_else(|| ApiError::bad_request("no reject option offered"))?;
+                ruagent_acp::permission::PermissionAnswer::Select(id)
+            }
+            Some("cancel") => ruagent_acp::permission::PermissionAnswer::Cancel,
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "pass `option_id` (the inbox listing's exact id) or `action` (allow|reject|cancel), got {other:?}"
+                )));
+            }
         }
-        "cancel" => ruagent_acp::permission::PermissionAnswer::Cancel,
-        other => return Err(ApiError::bad_request(format!("unknown action `{other}`"))),
     };
 
     state.mgr.resolve_permission(&key, answer)?;
@@ -2483,11 +2527,17 @@ struct AgentOptionsQuery {
     /// the cached catalog. "1" and "true" both count.
     #[serde(default)]
     refresh: Option<String>,
+    /// Read the catalog of a DIFFERENT runtime than the card's default
+    /// (issue #37): a role chat switched to another engine needs that
+    /// engine's models, not the default's.
+    #[serde(default)]
+    runtime: Option<String>,
 }
 
 /// The session options a runtime advertises (model, reasoning effort,
 /// permission mode, …): served from the persisted catalog (instant),
-/// unless `?refresh=1` forces a fresh probe.
+/// unless `?refresh=1` forces a fresh probe. `?runtime=` overrides the
+/// engine whose catalog is read.
 async fn agent_options(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -2498,6 +2548,23 @@ async fn agent_options(
         .agent(&name)
         .filter(|a| a.enabled)
         .ok_or_else(|| ApiError::not_found("agent not found"))?;
+    // Runtime override: read (and probe) the named engine instead of
+    // the card's default one. Model catalogs are engine-specific.
+    let card = match &q.runtime {
+        Some(rt) if *rt != crate::chat::ChatManager::runtime_of(&card) => {
+            let engine = state
+                .mgr
+                .agent(rt)
+                .ok_or_else(|| ApiError::bad_request(format!("unknown runtime `{rt}`")))?;
+            if engine.prompt.is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "`{rt}` is a role, not a runtime"
+                )));
+            }
+            engine
+        }
+        _ => card,
+    };
     let (entry, cached) = if matches!(q.refresh.as_deref(), Some("1") | Some("true")) {
         let entry = state
             .chats

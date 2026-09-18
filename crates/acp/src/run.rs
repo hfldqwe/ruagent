@@ -73,6 +73,7 @@ pub async fn run_once(
 
     let ev_notification = event_tx.clone();
     let ev_permission = event_tx.clone();
+    let ev_lifecycle = event_tx.clone();
     let ask = ask_tx.clone();
     let read_root = opts.cwd.clone();
     let write_root = opts.cwd.clone();
@@ -227,6 +228,14 @@ pub async fn run_once(
             new_session.mcp_servers = opts.mcp_servers.clone();
             let session = connection.send_request(new_session).block_task().await?;
             let session_id = session.session_id;
+
+            // The session is live: the run leaves "spawning" here (the
+            // daemon's driver watches for this event to flip the run
+            // status — otherwise a long research run sits in "spawning"
+            // while the context is already filling).
+            let _ = ev_lifecycle.send(ruagent_core::RunEvent::StateChanged {
+                status: ruagent_core::RunStatus::Running,
+            });
 
             // 3. Prompt to completion.
             let prompt = PromptRequest::new(

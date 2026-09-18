@@ -803,6 +803,21 @@ async fn supervise(
                             }
                         }
                     }
+                    // The ACP session went live: leave "spawning" (a
+                    // run waiting on a permission mid-research must not
+                    // read as still-spawning — issue #34).
+                    if let RunEvent::StateChanged {
+                        status: ruagent_core::RunStatus::Running,
+                    } = &event
+                    {
+                        run.status = ruagent_core::RunStatus::Running;
+                        run.updated_at = chrono::Utc::now();
+                        let r = run.clone();
+                        let db = db.clone();
+                        tokio::spawn(async move {
+                            let _ = db.update_run(&r).await;
+                        });
+                    }
                     if let RunEvent::UsageUpdate { usage } = &event {
                         run.context_usage = Some(*usage);
                         if usage.cost_usd.is_some() {

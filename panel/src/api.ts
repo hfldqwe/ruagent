@@ -130,6 +130,9 @@ export interface Run {
   stop_reason: string | null;
   created_at: string;
   updated_at: string;
+  /** Parked on the permission inbox — the run is waiting on a human
+   *  (issue #34). Null when not waiting. */
+  waiting_permission?: { tool_call_id: string; title: string } | null;
 }
 
 export interface PendingPermission {
@@ -139,7 +142,6 @@ export interface PendingPermission {
   raw_input: unknown;
   choices: { option_id: string; name: string; kind: string }[];
 }
-
 export interface SessionRecord {
   key: string;
   source: string; // claude-code | dsh | ruagent | opencode | codex
@@ -421,8 +423,12 @@ async function getText(path: string): Promise<string> {
 export const api = {
   // agents + stats
   agents: () => get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents),
-  agentOptions: (name: string, refresh?: boolean) =>
-    get<AgentOptions>(`/api/v1/agents/${name}/options${refresh ? "?refresh=1" : ""}`),
+  agentOptions: (name: string, refresh?: boolean, runtime?: string) =>
+    get<AgentOptions>(
+      `/api/v1/agents/${name}/options` +
+        `${refresh || runtime ? "?" : ""}${refresh ? "refresh=1" : ""}` +
+        `${refresh && runtime ? "&" : ""}${runtime ? `runtime=${encodeURIComponent(runtime)}` : ""}`,
+    ),
   stats: () => get<{ agents: AgentStats[] }>("/api/v1/stats").then((r) => r.agents),
   mcp: () => get<McpRegistry>("/api/v1/mcp"),
 
@@ -485,8 +491,11 @@ export const api = {
   // permissions
   pendingPermissions: () =>
     get<{ pending: PendingPermission[] }>("/api/v1/permissions").then((r) => r.pending),
-  resolvePermission: (runId: string, toolCallId: string, action: string) =>
-    post(`/api/v1/permissions/${runId}:${toolCallId}`, { action }),
+  resolvePermission: (
+    runId: string,
+    toolCallId: string,
+    answer: { action: "allow" | "reject" | "cancel" } | { option_id: string },
+  ) => post(`/api/v1/permissions/${runId}:${toolCallId}`, answer),
 
   // memory
   memoryList: (store: string, namespace: string) =>

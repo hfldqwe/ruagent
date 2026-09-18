@@ -276,6 +276,32 @@ async fn chat_history_and_runtime_switch_identity() {
     );
     assert_eq!(switched2["agent"], "tester");
 
+    // Options can be read for a DIFFERENT engine than the role's
+    // default (issue #37): the runtime override addresses a runtime
+    // card; roles and unknown names are rejected.
+    let resp = http
+        .get(format!("{url}/api/v1/agents/tester/options?runtime=rt-b"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        v["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == "model")
+    );
+    for bad in ["nope", "tester"] {
+        let resp = http
+            .get(format!("{url}/api/v1/agents/tester/options?runtime={bad}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "runtime={bad} must be rejected");
+    }
+
     // History: both rows attributed to the role.
     let history = poll_json(
         &http,

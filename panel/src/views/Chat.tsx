@@ -196,19 +196,33 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   }, []);
 
   // Session options for the selected agent: the daemon's cached catalog
-  // (instant after restart) — the model defaults to the card's
+  // (instant after restart), read for the CURRENT engine — model
+  // catalogs are engine-specific, so a runtime switch refetches and
+  // resets the pick (issue #37). The model defaults to the card's
   // configured model, then the agent's advertised current.
+  const lastAgentRef = useRef("");
+  const lastEngineRef = useRef("");
   useEffect(() => {
     if (!agent) return;
     const a = agents?.find((x) => x.name === agent);
+    const engine = runtime || a?.runtime || "";
+    const agentChanged = lastAgentRef.current !== agent;
+    const engineChanged = lastEngineRef.current !== engine;
+    lastAgentRef.current = agent;
+    lastEngineRef.current = engine;
     setConfigModels(a?.models ?? []);
     setOptions(null);
     setOptionsAt(null);
-    setModel(a?.model ?? "");
-    setRuntime(a?.runtime ?? "");
+    if (agentChanged) {
+      setModel(a?.model ?? "");
+      setRuntime(a?.runtime ?? "");
+    } else if (engineChanged) {
+      // Same role, other engine: the old model id is not portable.
+      setModel("");
+    }
     let alive = true;
     api
-      .agentOptions(agent)
+      .agentOptions(agent, false, engine || undefined)
       .then((r) => {
         if (!alive) return;
         setOptions(r.options);
@@ -225,14 +239,15 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     return () => {
       alive = false;
     };
-  }, [agent, agents]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent, agents, runtime]);
 
-  /** Manual catalog sync (the sync button). */
+  /** Manual catalog sync (the sync button) — for the current engine. */
   const syncOptions = async () => {
     if (!agent || syncing) return;
     setSyncing(true);
     try {
-      const r = await api.agentOptions(agent, true);
+      const r = await api.agentOptions(agent, true, runtime || undefined);
       setOptions(r.options);
       setOptionsAt(r.updated_at ?? null);
     } catch {

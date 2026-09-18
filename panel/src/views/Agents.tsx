@@ -515,10 +515,14 @@ export function Inbox() {
     return () => clearInterval(t);
   }, []);
 
-  const resolve = async (p: PendingPermission, action: string) => {
+  const resolve = async (
+    p: PendingPermission,
+    answer: { action: "allow" | "reject" | "cancel" } | { option_id: string },
+    okLabel: string,
+  ) => {
     try {
-      await api.resolvePermission(p.run_id, p.tool_call_id, action);
-      toast("ok", action === "allow" ? t("inbox.allowed") : t("inbox.rejected"));
+      await api.resolvePermission(p.run_id, p.tool_call_id, answer);
+      toast("ok", okLabel);
       refresh();
     } catch (e) {
       toast("err", String(e));
@@ -552,12 +556,33 @@ export function Inbox() {
                 {t("inbox.viewRaw")}
               </Button>
               <div className="row">
-                <Button type="primary" onClick={() => resolve(p, "allow")}>
-                  {t("inbox.allow")}
-                </Button>
-                <Button danger onClick={() => resolve(p, "reject")}>
-                  {t("inbox.reject")}
-                </Button>
+                {p.choices.length > 0 ? (
+                  // The agent's own options (e.g. "Yes, allow reading
+                  // during this session") — the exact option ids go to
+                  // the API, so allow-always style grants are reachable
+                  // (issue #35).
+                  p.choices.map((c) => (
+                    <Button
+                      key={c.option_id}
+                      type={c.kind.startsWith("allow") ? "primary" : undefined}
+                      danger={c.kind.startsWith("reject")}
+                      onClick={() =>
+                        resolve(p, { option_id: c.option_id }, c.name)
+                      }
+                    >
+                      {c.name}
+                    </Button>
+                  ))
+                ) : (
+                  <>
+                    <Button type="primary" onClick={() => resolve(p, { action: "allow" }, t("inbox.allowed"))}>
+                      {t("inbox.allow")}
+                    </Button>
+                    <Button danger onClick={() => resolve(p, { action: "reject" }, t("inbox.rejected"))}>
+                      {t("inbox.reject")}
+                    </Button>
+                  </>
+                )}
               </div>
             </Card>
           ))}
@@ -570,7 +595,7 @@ export function Inbox() {
             <Button
               type="primary"
               onClick={async () => {
-                await resolve(detail, "allow");
+                await resolve(detail, { action: "allow" }, t("inbox.allowed"));
                 setDetail(null);
               }}
             >
@@ -579,7 +604,7 @@ export function Inbox() {
             <Button
               danger
               onClick={async () => {
-                await resolve(detail, "reject");
+                await resolve(detail, { action: "reject" }, t("inbox.rejected"));
                 setDetail(null);
               }}
             >
