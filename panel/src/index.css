@@ -835,7 +835,8 @@ html[data-mode="dark"] .home-hero::before {
 }
 .chat-layout.rail-collapsed .chat-side { display: none; }
 /* History rail: sticky beside the conversation (the drawer it
-   replaced needed a button press to see). */
+   replaced needed a button press to see). A hairline closes the rail
+   zone so history and conversation read as two intentional panels. */
 .chat-side {
   position: sticky;
   top: 12px;
@@ -844,6 +845,8 @@ html[data-mode="dark"] .home-hero::before {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+  padding-inline-end: 10px;
+  border-inline-end: 1px solid var(--ant-color-border-secondary);
 }
 .chat-side-list {
   overflow-y: auto;
@@ -893,8 +896,12 @@ html[data-mode="dark"] .home-hero::before {
   }
 }
 .chat-wrap {
-  max-width: 880px;
-  margin: 0 auto;
+  /* Left-aligned after the rail, not centered in the leftover column:
+     centering put a wide dead band between history and conversation on
+     large screens (user report 2026-09-19). Free space belongs to the
+     right edge, reading order stays natural. */
+  max-width: 920px;
+  margin: 0;
   display: flex;
   flex-direction: column;
   min-height: calc(100vh - 140px);
