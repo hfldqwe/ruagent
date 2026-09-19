@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import {
+  Alert,
+  Badge,
   Layout,
   Menu,
   Button,
@@ -86,12 +88,24 @@ function Shell() {
   const [daemonUp, setDaemonUp] = useState(true);
   const [cmdk, setCmdk] = useState(false);
   const [creating, setCreating] = useState(false);
+  // Auto-collapse below lg; the footer toggle keeps manual control on
+  // desktop too. MatchMedia drives it so resizing the window adapts live.
+  const [collapsed, setCollapsed] = useState(
+    () => window.matchMedia("(max-width: 992px)").matches,
+  );
 
   useEffect(() => {
     const apply = () => setView(parseHash());
     apply();
     window.addEventListener("hashchange", apply);
     return () => window.removeEventListener("hashchange", apply);
+  }, []);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 992px)");
+    const onChange = () => setCollapsed(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
   }, []);
 
   useEffect(() => {
@@ -115,54 +129,68 @@ function Shell() {
   const selected =
     view.kind === "task" ? "board" : view.kind === "home" ? "home" : view.kind;
 
-  const items = [
+  const navItems = [
+    { key: "home", icon: <Icon name="home" size={16} />, label: t("nav.home") },
+    { key: "chat", icon: <Icon name="chat" size={16} />, label: t("chat.title") },
+    { key: "sessions", icon: <Icon name="history" size={16} />, label: t("sessions.title") },
+    { key: "board", icon: <Icon name="grid" size={16} />, label: t("nav.board") },
+    { key: "memory", icon: <Icon name="cloud" size={16} />, label: t("nav.memory") },
+    { key: "knowledge", icon: <Icon name="book" size={16} />, label: t("nav.knowledge") },
+    { key: "graph", icon: <Icon name="graph" size={16} />, label: t("nav.graph") },
+    { key: "agents", icon: <Icon name="bot" size={16} />, label: t("nav.agents") },
+    { key: "runtimes", icon: <Icon name="layers" size={16} />, label: t("nav.runtimes") },
+    { key: "stats", icon: <Icon name="stats" size={16} />, label: t("nav.stats") },
     {
-      type: "group" as const,
-      label: t("nav.group.work"),
-      children: [
-        { key: "home", icon: <Icon name="home" size={16} />, label: t("nav.home") },
-        { key: "chat", icon: <Icon name="chat" size={16} />, label: t("chat.title") },
-        { key: "sessions", icon: <Icon name="history" size={16} />, label: t("sessions.title") },
-        { key: "board", icon: <Icon name="grid" size={16} />, label: t("nav.board") },
-      ],
-    },
-    {
-      type: "group" as const,
-      label: t("nav.group.knowledge"),
-      children: [
-        { key: "memory", icon: <Icon name="cloud" size={16} />, label: t("nav.memory") },
-        { key: "knowledge", icon: <Icon name="book" size={16} />, label: t("nav.knowledge") },
-        { key: "graph", icon: <Icon name="graph" size={16} />, label: t("nav.graph") },
-      ],
-    },
-    {
-      type: "group" as const,
-      label: t("nav.group.system"),
-      children: [
-        { key: "agents", icon: <Icon name="bot" size={16} />, label: t("nav.agents") },
-        { key: "runtimes", icon: <Icon name="layers" size={16} />, label: t("nav.runtimes") },
-        { key: "stats", icon: <Icon name="stats" size={16} />, label: t("nav.stats") },
-        {
-          key: "inbox",
-          icon: <Icon name="inbox" size={16} />,
-          label: (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              {t("nav.inbox")}
-              {inboxCount > 0 && (
-                <span className="nav-badge">{inboxCount}</span>
-              )}
-            </span>
-          ),
-        },
-      ],
+      key: "inbox",
+      icon: collapsed ? (
+        <Badge count={inboxCount} size="small" offset={[4, -4]}>
+          <Icon name="inbox" size={16} />
+        </Badge>
+      ) : (
+        <Icon name="inbox" size={16} />
+      ),
+      label: (
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          {t("nav.inbox")}
+          {inboxCount > 0 && <span className="nav-badge">{inboxCount}</span>}
+        </span>
+      ),
     },
   ];
+
+  // Collapsed rail: flat list (group titles have nowhere to live at 72px),
+  // antd shows the label as a hover tooltip automatically.
+  const items = collapsed
+    ? navItems
+    : [
+        {
+          type: "group" as const,
+          label: t("nav.group.work"),
+          children: navItems.slice(0, 4),
+        },
+        {
+          type: "group" as const,
+          label: t("nav.group.knowledge"),
+          children: navItems.slice(4, 7),
+        },
+        {
+          type: "group" as const,
+          label: t("nav.group.system"),
+          children: navItems.slice(7),
+        },
+      ];
 
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <ToastBridge />
       <CommandPalette open={cmdk} onOpenChange={setCmdk} nav={nav} onNewTask={() => setCreating(true)} />
-      <Sider width={228} className="app-sider">
+      <Sider
+        width={228}
+        collapsedWidth={72}
+        collapsed={collapsed}
+        trigger={null}
+        className="app-sider"
+      >
         <div className="sider-inner">
         <div
           className="brand"
@@ -170,9 +198,10 @@ function Shell() {
           role="button"
           tabIndex={0}
           onKeyDown={(e) => e.key === "Enter" && nav("")}
+          title="ruagent"
         >
           <span className="brand-mark">ru</span>
-          <span className="brand-name">ruagent</span>
+          {!collapsed && <span className="brand-name">ruagent</span>}
         </div>
         <div className="sider-nav">
           <Menu
@@ -184,14 +213,28 @@ function Shell() {
           />
         </div>
         <div className="sidebar-foot">
-          <span className={`conn ${daemonUp ? "ok" : "err"}`}>
-            ● {daemonUp ? t("common.online") : t("common.offline")}
-          </span>
-          <span className="build-id" title="panel build">b {__BUILD_ID__}</span>
-          <span className="grow" />
-          <button className="kbd-hint" onClick={() => setCmdk(true)} title={t("cmd.placeholder")}>
-            Ctrl K ⌘K
-          </button>
+          <Tooltip title={`${daemonUp ? t("common.online") : t("common.offline")} · b ${__BUILD_ID__}`}>
+            <span className={`conn ${daemonUp ? "ok" : "err"}`}>
+              {collapsed ? "●" : `● ${daemonUp ? t("common.online") : t("common.offline")}`}
+            </span>
+          </Tooltip>
+          {!collapsed && <span className="build-id" title="panel build">b {__BUILD_ID__}</span>}
+          {!collapsed && <span className="grow" />}
+          {!collapsed && (
+            <button className="kbd-hint" onClick={() => setCmdk(true)} title={t("cmd.placeholder")}>
+              Ctrl K ⌘K
+            </button>
+          )}
+          <Tooltip title={t("common.toggleSidebar")}>
+            <Button
+              size="small"
+              type="text"
+              onClick={() => setCollapsed((c) => !c)}
+              aria-label={t("common.toggleSidebar")}
+            >
+              <Icon name={collapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
+            </Button>
+          </Tooltip>
           <Tooltip title={mode === "dark" ? t("theme.light") : t("theme.dark")}>
             <Button
               size="small"
@@ -219,6 +262,15 @@ function Shell() {
       )}
       <Layout>
         <Content className="content">
+          {!daemonUp && (
+            <Alert
+              type="error"
+              showIcon
+              banner
+              className="offline-banner"
+              message={t("common.offlineBanner")}
+            />
+          )}
           {view.kind === "home" && (
             <Home
               onOpenTask={(id) => nav(`task/${id}`)}

@@ -250,7 +250,7 @@ export function Knowledge() {
                 }}
               >
                 <span className="doc-icon"><Icon name="doc" size={15} /></span>
-                <strong>{d.name}</strong>
+                <strong className="title">{d.name}</strong>
                 {d.source ? <span className="tag">{d.source}</span> : null}
                 <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
                 <span className="grow" />

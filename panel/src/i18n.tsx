@@ -24,6 +24,9 @@ const zh: Record<string, string> = {
 
   // common
   "common.online": "daemon 在线",
+  "common.loading": "加载中…",
+  "common.offlineBanner": "daemon 不可达 — 无法加载数据，正在自动重试",
+  "common.toggleSidebar": "收起 / 展开侧栏",
   "cmd.placeholder": "搜索命令…",
   "cmd.foot": "↑↓ 选择 · Enter 执行 · Esc 关闭",
   "cmd.empty": "没有匹配的命令",
@@ -407,6 +410,7 @@ const zh: Record<string, string> = {
   // chat
   "chat.title": "对话",
   "chat.subtitle": "像终端一样和智能体连续对话",
+  "chat.connectionLost": "连接已断开（daemon 可能已重启）。此会话已结束，可从历史中查看记录或开启新对话。",
   "chat.new": "新对话",
   "chat.agent": "智能体",
   "chat.model": "模型",
@@ -490,6 +494,9 @@ const en: Record<string, string> = {
   "nav.inbox": "Inbox",
 
   "common.online": "daemon online",
+  "common.loading": "Loading…",
+  "common.offlineBanner": "daemon unreachable — data may be stale, retrying automatically",
+  "common.toggleSidebar": "Collapse / expand sidebar",
   "cmd.placeholder": "Search commands…",
   "cmd.foot": "↑↓ select · Enter run · Esc close",
   "cmd.empty": "No matching commands",
@@ -844,6 +851,7 @@ const en: Record<string, string> = {
 
   "chat.title": "Chat",
   "chat.subtitle": "Talk to an agent continuously, terminal-style",
+  "chat.connectionLost": "Connection lost (the daemon may have restarted). This conversation has ended — open it read-only from history, or start a new one.",
   "chat.new": "New chat",
   "chat.agent": "Agent",
   "chat.model": "Model",

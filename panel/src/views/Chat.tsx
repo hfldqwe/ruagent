@@ -184,6 +184,29 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
    * whole transcript, so the same chat must only attach once (the
    * duplicate-append bug on multi-turn conversations). */
   const attachedRef = useRef<string | null>(null);
+  /** SSE reconnection: a drop mid-reply reattaches with backoff — the
+   * transcript replay rebuilds state including any Stopped we missed —
+   * capped at five tries. A chat killed by a daemon restart 404s, which
+   * burns the tries and ends in an honest "connection lost" notice
+   * instead of a half-finished reply silently marked done. */
+  const streamingRef = useRef(false);
+  const reconnectRef = useRef<{ tries: number; timer: number | null }>({
+    tries: 0,
+    timer: null,
+  });
+
+  useEffect(() => {
+    streamingRef.current = streaming;
+  }, [streaming]);
+
+  // Never leak a pending reconnect timer past the component.
+  useEffect(
+    () => () => {
+      const st = reconnectRef.current;
+      if (st.timer !== null) clearTimeout(st.timer);
+    },
+    [],
+  );
 
   useEffect(() => {
     api.agents().then((a) => {
@@ -306,6 +329,32 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
+  const scheduleReconnect = (id: string) => {
+    const st = reconnectRef.current;
+    if (st.timer !== null) return;
+    if (st.tries >= 5) {
+      setStreaming(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          text: t("chat.connectionLost"),
+          done: true,
+          notice: true,
+          icon: "warn",
+        },
+      ]);
+      return;
+    }
+    const delay = 1000 * 2 ** st.tries; // 1s → 16s
+    st.tries += 1;
+    st.timer = window.setTimeout(() => {
+      st.timer = null;
+      setMessages([]); // the replay rebuilds the transcript
+      attachStream(id, true);
+    }, delay);
+  };
+
   const attachStream = (id: string, force = false) => {
     if (!force && attachedRef.current === id && streamRef.current) return;
     attachedRef.current = id;
@@ -314,6 +363,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     const close = () => es.close();
     streamRef.current = close;
     es.onmessage = (e) => {
+      reconnectRef.current.tries = 0; // liveness
       try {
         const parsed = JSON.parse(e.data) as { event?: ChatEvent } & ChatEvent;
         // Transcript replay lines wrap the event ({ts, seq, event});
@@ -324,12 +374,23 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       }
     };
     es.addEventListener("end", () => {
+      const st = reconnectRef.current;
+      if (st.timer !== null) {
+        clearTimeout(st.timer);
+        st.timer = null;
+      }
+      st.tries = 0;
       es.close();
       setStreaming(false);
     });
     es.onerror = () => {
       es.close();
-      setStreaming(false);
+      // The server closes the stream after each prompt's `end` — an
+      // error with no reply in flight is that close racing us (or a
+      // dead daemon nobody is talking to). Only a drop mid-reply is
+      // worth reconnecting.
+      if (!streamingRef.current) return;
+      scheduleReconnect(id);
     };
   };
 
