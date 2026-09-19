@@ -739,15 +739,29 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             }}
             placeholder={t("chat.inputPh")}
           />
-          <Button
-            type="primary"
-            className="send-btn"
-            disabled={streaming || starting || !input.trim()}
-            onClick={send}
-            title={t("chat.send")}
-          >
-            {starting ? "…" : <Icon name="arrowUp" size={16} />}
-          </Button>
+          {streaming && chatId ? (
+            <Button
+              className="send-btn stop-btn"
+              onClick={() => {
+                api.chatStop(chatId).catch(() => {
+                  /* the Stopped event still lands via the stream */
+                });
+              }}
+              title={t("chat.stop")}
+            >
+              <Icon name="stop" size={14} />
+            </Button>
+          ) : (
+            <Button
+              type="primary"
+              className="send-btn"
+              disabled={streaming || starting || !input.trim()}
+              onClick={send}
+              title={t("chat.send")}
+            >
+              {starting ? "…" : <Icon name="arrowUp" size={16} />}
+            </Button>
+          )}
         </div>
       </div>
       </div>

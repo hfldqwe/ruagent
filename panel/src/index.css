@@ -898,6 +898,9 @@ html[data-mode="dark"] .home-hero::before {
   max-height: 180px;
 }
 .composer .send-btn { flex: none; width: 34px; height: 34px; padding: 0; }
+/* The send button's streaming-state swap: a quiet stop, not an alarm. */
+.composer .send-btn.stop-btn { color: var(--ant-color-error); border-color: var(--ant-color-error-border); }
+.composer .send-btn.stop-btn:hover { color: #fff; background: var(--ant-color-error); border-color: var(--ant-color-error); }
 
 /* Session viewer (raw modal classes — kept hand-rolled) --------------- */
 

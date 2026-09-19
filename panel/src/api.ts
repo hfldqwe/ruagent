@@ -673,6 +673,7 @@ export const api = {
     ).then((r) => r.chats),
   chatMessage: (id: string, text: string) =>
     post(`/api/v1/chat/${id}/messages`, { text }),
+  chatStop: (id: string) => post(`/api/v1/chat/${id}/stop`),
   chatModel: (id: string, model: string | null, runtime?: string) =>
     send("PATCH", `/api/v1/chat/${id}`, { model, runtime }).then(
       (r) =>
