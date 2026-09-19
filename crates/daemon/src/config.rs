@@ -242,16 +242,10 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                 name: name.clone(),
                 harness: rc.harness,
                 command: rc.command.clone(),
-                description: entry
-                    .description
-                    .clone()
-                    .or_else(|| {
-                        entry
-                            .prompt
-                            .as_deref()
-                            .map(|p| p.chars().take(80).collect())
-                    })
-                    .unwrap_or_else(|| name.clone()),
+                // No prompt-snippet fallback: a mid-sentence cut reads
+                // as corruption, not a preview (the panel renders a
+                // labeled prompt preview of its own).
+                description: entry.description.clone().unwrap_or_default(),
                 model: entry.model.clone(),
                 models: entry.models.clone().unwrap_or_default(),
                 reasoning_effort: parse_effort(entry.reasoning_effort.as_deref()),

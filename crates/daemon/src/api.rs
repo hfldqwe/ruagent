@@ -1286,7 +1286,11 @@ fn card_json(a: &ruagent_core::AgentCard) -> serde_json::Value {
         "runtime": a.runtime,
         "runtimes": a.runtimes,
         "options": a.options,
-        "prompt": a.prompt.as_deref().map(|p| p.chars().take(160).collect::<String>()),
+        // Full prompt, no truncation: the edit modal round-trips this
+        // value — a truncated copy would destroy the real prompt on
+        // save (found via the user's "description and prompt incomplete"
+        // report: every role showed exactly 160 chars).
+        "prompt": a.prompt,
         // Two-layer model (design §4.1, user ruling 2026-09-17):
         // a card with a role prompt or runtime references is a
         // ROLE; a bare harness instance (legacy single-layer
