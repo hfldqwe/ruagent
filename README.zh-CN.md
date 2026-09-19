@@ -108,7 +108,8 @@ queue_per_harness = 8  # 排队上限，超过即拒绝
 
 来自 **claude-code、dsh、opencode、ruagent** 的会话自动汇入同一段
 历史（60 秒增量扫描）。`policy.toml` 里 `[distill] auto = true` 时，
-会话关闭即在后台蒸馏成记忆 + 图谱。
+会话关闭即在后台蒸馏成记忆 + 图谱。`[distill] language = "简体中文"`
+指定蒸馏产出的书写语言；`[distill] prompt` 可整体替换内置提取提示词。
 
 **召回双策略**（`GET /api/v1/recall` / `memory_recall` MCP 工具），
 各自返回四个独立预算的分区——记忆、知识、Wiki、实体：

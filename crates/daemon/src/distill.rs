@@ -33,8 +33,6 @@ Respond with ONLY a JSON object, no markdown fences, no commentary:
   "relations": [{"src": "...", "dst": "...", "relation": "snake_case", "fact": "one sentence"}]
 }
 Empty arrays are valid. Quality over quantity.
-
-TRANSCRIPT:
 "#;
 
 #[derive(Debug, Default, Deserialize)]
@@ -89,6 +87,8 @@ pub struct DistillOutcome {
 pub struct AutoDistill {
     pub auto: bool,
     pub agent: Option<String>,
+    pub language: Option<String>,
+    pub prompt: Option<String>,
 }
 
 /// Distill `session_key` choosing the extraction agent from the
@@ -126,6 +126,10 @@ pub struct Distiller {
     pub embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
     /// Agent registry for extraction-agent choice (auto-distill path).
     pub registry: AgentRegistry,
+    /// Output language for distilled content, from `[distill] language`.
+    pub language: Option<String>,
+    /// Full prompt override, from `[distill] prompt`.
+    pub prompt_override: Option<String>,
 }
 
 /// Minimal registry view the distiller needs (no RunManager cycle).
@@ -141,6 +145,11 @@ impl AgentRegistry {
 }
 
 impl Distiller {
+    /// The full extraction prompt: base (built-in or `[distill] prompt`
+    /// override) + the optional language clause + the transcript tail.
+    fn compose_prompt(&self) -> String {
+        extraction_prompt(self.language.as_deref(), self.prompt_override.as_deref())
+    }
     /// Distill one session: render the transcript, run the extraction
     /// prompt through the given agent (one ACP chat turn), write the
     /// results into memory + graph.
@@ -154,8 +163,9 @@ impl Distiller {
             anyhow::bail!("session has no messages to distill");
         }
 
+        let full_prompt = self.compose_prompt();
         let raw = self
-            .ask_agent(card, &format!("{EXTRACTION_PROMPT}{transcript}"))
+            .ask_agent(card, &format!("{full_prompt}{transcript}"))
             .await
             .context("distillation agent run failed")?;
         let extraction = parse_extraction(&raw)?;
@@ -481,6 +491,23 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
 /// Cheap near-duplicate check: high token overlap on normalized text.
 /// (The full embedder-based check lands with memory embeddings; this
 /// ships the dedup contract now.)
+/// The full extraction prompt: base (built-in or `[distill] prompt`
+/// override), optional language clause, transcript tail. Free function
+/// so the composition is testable without a Distiller.
+fn extraction_prompt(language: Option<&str>, prompt_override: Option<&str>) -> String {
+    let base = prompt_override.unwrap_or(EXTRACTION_PROMPT);
+    let mut out = base.to_string();
+    if let Some(lang) = language {
+        out.push_str(&format!(
+            "\n\nWrite every `content` value, entity `summary`, and \
+             relation `fact` in {lang}. JSON keys and the \
+             `store`/`namespace` values stay exactly as specified above."
+        ));
+    }
+    out.push_str("\n\nTRANSCRIPT:\n");
+    out
+}
+
 fn is_near_duplicate(content: &str, existing: &[String]) -> bool {
     let norm = |s: &str| -> Vec<String> {
         s.split_whitespace()
@@ -513,6 +540,26 @@ fn is_near_duplicate(content: &str, existing: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_composition_language_and_override() {
+        // Bare: builtin prompt + transcript tail, no language clause.
+        let bare = extraction_prompt(None, None);
+        assert!(bare.starts_with("You are a memory distillation engine."));
+        assert!(bare.ends_with("TRANSCRIPT:\n"));
+        assert!(!bare.contains("Write every"));
+
+        // Language clause rides between the base and the tail.
+        let zh = extraction_prompt(Some("简体中文"), None);
+        assert!(zh.contains("in 简体中文"));
+        assert!(zh.ends_with("TRANSCRIPT:\n"));
+
+        // Full override replaces the base entirely.
+        let over = extraction_prompt(Some("简体中文"), Some("CUSTOM REGIME\n"));
+        assert!(over.starts_with("CUSTOM REGIME"));
+        assert!(!over.contains("memory distillation engine"));
+        assert!(over.ends_with("TRANSCRIPT:\n"));
+    }
 
     #[test]
     fn extraction_json_parses_with_fences() {

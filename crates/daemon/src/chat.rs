@@ -904,6 +904,8 @@ impl ChatManager {
             root: self.root.clone(),
             embedder: self.embedder.clone(),
             registry: self.registry.clone(),
+            language: self.distill_policy.language.clone(),
+            prompt_override: self.distill_policy.prompt.clone(),
         })
     }
 

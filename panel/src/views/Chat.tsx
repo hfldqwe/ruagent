@@ -6,7 +6,7 @@
 // past conversations (live ones reattach and stream).
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Drawer, Select, Tooltip } from "antd";
+import { Button, Select, Tooltip } from "antd";
 import {
   api,
   type AgentInfo,
@@ -175,7 +175,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [sideOpen, setSideOpen] = useState(false);
   const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -448,6 +448,8 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           return next;
         });
         setStreaming(false);
+        // The reply bumped this chat up the history rail — resync it.
+        refreshHistory();
         break;
       }
       case "error": {
@@ -585,19 +587,23 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   };
 
   // ------------------------------------------------------------------
-  // History: past conversations with the current agent. Live ones
-  // reattach (the SSE replays the transcript, then streams); closed
-  // ones open the shared read-only viewer.
+  // History: past conversations with the current agent, always visible
+  // in the left rail. Live ones reattach (the SSE replays the
+  // transcript, then streams); closed ones open the shared read-only
+  // viewer. Refreshed when the agent changes and after each reply.
   // ------------------------------------------------------------------
-  const openHistory = () => {
-    setHistoryOpen(true);
-    setHistory(null);
+  const refreshHistory = () => {
+    if (!agent) return;
     api.chatsHistory(agent).then(setHistory).catch(() => setHistory([]));
   };
+  useEffect(() => {
+    refreshHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent]);
 
   const openPast = (h: ChatHistoryEntry) => {
+    setSideOpen(false);
     if (h.active) {
-      setHistoryOpen(false);
       if (streamRef.current) streamRef.current();
       setAgent(h.agent);
       setChatId(h.id);
@@ -616,7 +622,59 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const currentAgent = agents.find((a) => a.name === agent);
 
   return (
-    <div className="chat-wrap">
+    <div className="chat-layout">
+      <aside className={`chat-side${sideOpen ? " open" : ""}`}>
+        <Button
+          block
+          size="small"
+          type="primary"
+          ghost
+          onClick={() => {
+            newChat();
+            setSideOpen(false);
+          }}
+        >
+          + {t("chat.new")}
+        </Button>
+        <div className="chat-side-list">
+          {history === null ? (
+            <Spinner />
+          ) : history.length === 0 ? (
+            <p className="muted">{t("chat.historyEmpty")}</p>
+          ) : (
+            history.map((h) => (
+              <button
+                key={h.id}
+                className={`row-btn${h.id === chatId ? " selected" : ""}`}
+                onClick={() => openPast(h)}
+                title={h.title || h.preview || t("sessions.untitled")}
+              >
+                <span className="dot" style={{ width: 6, height: 6,
+                  background: h.active ? "var(--ant-color-success)" : "var(--ant-color-text-quaternary)" }} />
+                <span className="title">
+                  <strong>{h.title || h.preview || t("sessions.untitled")}</strong>
+                  {h.runtime ? (
+                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                      {h.runtime}
+                    </span>
+                  ) : null}
+                </span>
+                {h.message_count != null ? (
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    {h.message_count} {t("sessions.messages")}
+                  </span>
+                ) : null}
+                <span className="time">
+                  <RelTime iso={msToIso(h.updated_at)} />
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </aside>
+      {sideOpen && <div className="chat-side-backdrop" onClick={() => setSideOpen(false)} />}
+
+      <div className="chat-wrap">
       <div className="view-bar">
         <h2>{t("chat.title")}</h2>
         <span className="muted">{t("chat.subtitle")}</span>
@@ -628,8 +686,13 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             </Button>
           </Tooltip>
         ) : null}
-        <Button size="small" onClick={openHistory}>
-          <Icon name="history" size={13} /> {t("chat.history")}
+        <Button
+          size="small"
+          className="chat-side-toggle"
+          onClick={() => setSideOpen(true)}
+          title={t("chat.history")}
+        >
+          <Icon name="history" size={13} />
         </Button>
         {chatId ? (
           <Button size="small" onClick={newChat}>
@@ -765,45 +828,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         </div>
       </div>
       </div>
-
-      <Drawer
-        title={`${t("chat.history")} · ${agent}`}
-        placement="right"
-        width={420}
-        open={historyOpen}
-        onClose={() => setHistoryOpen(false)}
-      >
-        {history === null ? (
-          <Spinner />
-        ) : history.length === 0 ? (
-          <p className="muted">{t("chat.historyEmpty")}</p>
-        ) : (
-          <div className="card">
-            {history.map((h) => (
-              <button key={h.id} className="row-btn" onClick={() => openPast(h)}>
-                <span className="dot" style={{ width: 6, height: 6,
-                  background: h.active ? "var(--ant-color-success)" : "var(--ant-color-text-quaternary)" }} />
-                <span className="title">
-                  <strong>{h.title || h.preview || t("sessions.untitled")}</strong>
-                  {h.runtime ? (
-                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
-                      {h.runtime}
-                    </span>
-                  ) : null}
-                </span>
-                {h.message_count != null ? (
-                  <span className="muted" style={{ fontSize: 11 }}>
-                    {h.message_count} {t("sessions.messages")}
-                  </span>
-                ) : null}
-                <span className="time">
-                  <RelTime iso={msToIso(h.updated_at)} />
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-      </Drawer>
+      </div>
 
       {viewing && (
         <SessionDetail

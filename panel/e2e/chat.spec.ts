@@ -43,20 +43,16 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
   });
 
   // History: the conversation is recorded with the first prompt as the
-  // title, marked live.
-  await page
-    .locator("button")
-    .filter({ hasText: /历\s*史|History/ })
-    .first()
-    .click();
-  const row = page.locator(".ant-drawer .row-btn").first();
+  // title, marked live — in the persistent left rail (2026-09-19: the
+  // history drawer became a rail; the mobile toggle is the only other
+  // entry point).
+  const row = page.locator(".chat-side .row-btn").first();
   await expect(row).toContainText("CHAT MARKER", { timeout: 10_000 });
 
   // Live entry: click reattaches, the transcript replay restores both
-  // turns in the log. (antd 6 keeps `.ant-drawer` mounted when closed —
-  // the open class is the reliable signal.)
+  // turns in the log, and the row is the selected one.
   await row.click();
-  await expect(page.locator(".ant-drawer.ant-drawer-open")).toHaveCount(0);
+  await expect(page.locator(".chat-side .row-btn.selected")).toHaveCount(1);
   await expect(page.locator(".chat-msg.user").last()).toContainText("CHAT MARKER", {
     timeout: 8_000,
   });

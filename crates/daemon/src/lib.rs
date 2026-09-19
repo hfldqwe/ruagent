@@ -228,6 +228,8 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         distill::AutoDistill {
             auto: config.policy.distill.auto,
             agent: config.policy.distill.agent.clone(),
+            language: config.policy.distill.language.clone(),
+            prompt: config.policy.distill.prompt.clone(),
         },
         Some(knowledge.embedder()),
         distill::AgentRegistry {

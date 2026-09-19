@@ -117,7 +117,9 @@ queue_per_harness = 8  # waiting runs before rejection
 Sessions from **claude-code, dsh, opencode and ruagent** auto-sync into
 one history (60s incremental scan). With `[distill] auto = true` in
 `policy.toml`, closing a session distills it into memories + graph in
-the background.
+the background. `[distill] language = "简体中文"` sets the output
+language of distilled memories/entities; `[distill] prompt` replaces the
+built-in extraction prompt entirely.
 
 **Recall, two strategies** (`GET /api/v1/recall` / the `memory_recall`
 MCP tool), each returning four separately-budgeted sections — memories,

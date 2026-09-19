@@ -811,6 +811,62 @@ html[data-mode="dark"] .home-hero::before {
 
 /* Chat — the conversation is the canvas, the composer is raised -------- */
 
+.chat-layout {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  gap: 0 20px;
+  align-items: start;
+  min-height: calc(100vh - 140px);
+}
+/* History rail: sticky beside the conversation (the drawer it
+   replaced needed a button press to see). */
+.chat-side {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 96px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.chat-side-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 8px;
+}
+.chat-side-list .row-btn { padding-block: 7px; }
+.chat-side-toggle { display: none; }
+.chat-side-backdrop { display: none; }
+@media (max-width: 940px) {
+  .chat-layout { grid-template-columns: 200px minmax(0, 1fr); gap: 0 14px; }
+}
+@media (max-width: 700px) {
+  .chat-layout { grid-template-columns: minmax(0, 1fr); }
+  .chat-side-toggle { display: inline-flex; }
+  /* The rail becomes a slide-over; the view-bar button summons it. */
+  .chat-side {
+    position: fixed;
+    top: 0; bottom: 0; left: 0;
+    width: min(300px, 84vw);
+    z-index: 1001;
+    max-height: none;
+    padding: 14px 12px;
+    background: var(--app-shell);
+    border-inline-end: 1px solid var(--ant-color-border-secondary);
+    box-shadow: var(--ant-box-shadow);
+    transform: translateX(-102%);
+    transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .chat-side.open { transform: none; }
+  .chat-side-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: color-mix(in srgb, var(--app-shell) 45%, transparent);
+  }
+}
 .chat-wrap {
   max-width: 780px;
   margin: 0 auto;

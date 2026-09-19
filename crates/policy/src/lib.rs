@@ -174,6 +174,13 @@ pub struct DistillConfig {
     /// Agent used for extraction; default = dsh if enabled, else the
     /// first enabled agent.
     pub agent: Option<String>,
+    /// Output language for distilled content (e.g. "简体中文", "English").
+    /// Appended to the extraction prompt — JSON keys and `store`/
+    /// `namespace` values stay canonical either way.
+    pub language: Option<String>,
+    /// Full override of the extraction prompt (escape hatch for custom
+    /// extraction regimes; the transcript is still appended by the code).
+    pub prompt: Option<String>,
 }
 
 /// `[permissions]` section.

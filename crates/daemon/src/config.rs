@@ -514,6 +514,10 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 # [distill]
 # auto = true            # distill sessions automatically when they close
 # agent = "dsh"          # extraction agent (default: dsh, else first enabled)
+# language = "简体中文"   # output language for distilled memories/entities
+#                        # (JSON keys and store/namespace stay canonical)
+# prompt = """..."""     # full override of the extraction prompt (advanced;
+#                        # the transcript is still appended by the daemon)
 # First matching rule wins; `default` applies otherwise. Actions:
 #   allow  — auto-select the first allow option
 #   reject — auto-select the first reject option

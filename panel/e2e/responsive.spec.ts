@@ -41,6 +41,20 @@ test.describe("phone (390px)", () => {
       await noOverflow(page);
     });
   }
+
+  // The chat history rail is a slide-over here: the view-bar toggle
+  // opens it, tapping beside it closes.
+  test("chat history rail opens and closes as a slide-over", async ({
+    page,
+  }) => {
+    await page.goto("/#chat");
+    await page.waitForTimeout(600);
+    await page.locator(".chat-side-toggle").click();
+    await expect(page.locator(".chat-side")).toHaveClass(/open/);
+    await expect(page.locator(".chat-side-backdrop")).toBeVisible();
+    await page.mouse.click(360, 400); // right of the 300px rail
+    await expect(page.locator(".chat-side")).not.toHaveClass(/open/);
+  });
 });
 
 test.describe("tablet (768px)", () => {

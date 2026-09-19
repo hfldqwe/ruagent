@@ -708,6 +708,10 @@ async fn wiki_build(
         root: state.config.root.clone(),
         embedder: None,
         registry: state.mgr.registry_view(),
+        // The wiki pipeline has its own prompts; the distill language
+        // override is about memories, not wiki pages.
+        language: None,
+        prompt_override: None,
     };
     let builder = crate::wiki::WikiBuilder::new(distiller, state.knowledge.as_ref().clone());
     let out = builder
@@ -1894,6 +1898,8 @@ async fn session_distill(
         root: state.config.root.clone(),
         embedder: Some(state.knowledge.embedder()),
         registry: state.mgr.registry_view(),
+        language: state.config.policy.distill.language.clone(),
+        prompt_override: state.config.policy.distill.prompt.clone(),
     };
     let out = distiller
         .distill(&key, card)
