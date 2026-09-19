@@ -512,6 +512,10 @@ impl RunManager {
         let spec = adapter_for(card.harness)
             .spawn_spec(&card)
             .with_context(|| format!("resolving spawn command for `{agent_name}`"))?;
+        // The role's identity rides every run (the same contract chats
+        // use): a run against a ROLE must carry the role prompt, not
+        // just the runtime behind it.
+        let role = card.prompt.clone();
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
         // Canonical session-option defaults (issue #36): mode / effort.
@@ -629,7 +633,16 @@ impl RunManager {
             };
             run.workspace = Some(cwd.to_string_lossy().into_owned());
 
-            let injection = render_run_injection(&db, &task).await;
+            let mut injection = render_run_injection(&db, &task).await;
+            // Role identity first, then memory context (the chat
+            // contract, mirrored for runs).
+            if let Some(role) = role.as_deref().filter(|r| !r.trim().is_empty()) {
+                injection = if injection.is_empty() {
+                    format!("[role — you are]\n{role}")
+                } else {
+                    format!("[role — you are]\n{role}\n---\n{injection}")
+                };
+            }
             let mut prompt = prompt;
             if !injection.is_empty() {
                 prompt = format!("{injection}\n---\n{prompt}");

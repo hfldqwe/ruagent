@@ -1454,3 +1454,61 @@ async fn failed_run_one_click_retry() {
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// Role identity in runs (the specialist model)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn role_prompt_rides_runs() {
+    // A run against a ROLE carries the role's identity ahead of the
+    // prompt — the same contract chats use. The specialist team model
+    // depends on it: without the role block, a run is just a runtime.
+    let bin = mock_bin();
+    let d = start_daemon(
+        &format!(
+            "[runtime.mockrt]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\n\n\
+             [agent.specialist]\nprompt = \"you are the gatekeeper of truth\"\nruntimes = [\"mockrt\"]\nruntime = \"mockrt\"\n"
+        ),
+        "default = \"ask\"\n",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "role", "intent": "hello" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run: serde_json::Value = http
+        .post(format!(
+            "{}/api/v1/tasks/{}/runs",
+            d.url,
+            task["id"].as_str().unwrap()
+        ))
+        .json(&serde_json::json!({ "agent": "specialist", "prompt": "hello role" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    let final_run = poll_until(&http, &format!("{}/api/v1/runs/{run_id}", d.url), |v| {
+        v["status"] == "completed"
+    })
+    .await;
+    let result = final_run["result"].as_str().unwrap_or_default();
+    assert!(
+        result.contains("[role — you are]") && result.contains("you are the gatekeeper of truth"),
+        "the role block must ride the run prompt: {result}"
+    );
+    assert!(
+        result.contains("hello role"),
+        "the prompt itself survives: {result}"
+    );
+}
