@@ -19,6 +19,7 @@ pub const BEHAVIORS: &[&str] = &[
     "toolcall",
     "permission",
     "plan",
+    "write",
     "crash",
     "approve",
     "judge",
@@ -118,6 +119,9 @@ pub enum Behavior {
     Permission,
     /// Publish a plan, then a message, then end turn.
     Plan,
+    /// Write `out.txt` into the session's cwd, reply "wrote out.txt" —
+    /// a run with a real file deliverable (the land tests' winner).
+    Write,
     /// Stream one chunk, then exit(1) — simulates a crashed harness.
     Crash,
     /// Reply with exactly "ALLOW" — plays the approver agent in tests.
@@ -223,6 +227,7 @@ impl Behavior {
             "toolcall" => Some(Behavior::ToolCall),
             "permission" => Some(Behavior::Permission),
             "plan" => Some(Behavior::Plan),
+            "write" => Some(Behavior::Write),
             "crash" => Some(Behavior::Crash),
             "approve" => Some(Behavior::Approve),
             "judge" => Some(Behavior::Judge),
@@ -273,6 +278,7 @@ mod tests {
     fn parses_behaviors() {
         assert_eq!(Behavior::parse("echo"), Some(Behavior::Echo));
         assert_eq!(Behavior::parse("crash"), Some(Behavior::Crash));
+        assert_eq!(Behavior::parse("write"), Some(Behavior::Write));
         assert_eq!(Behavior::parse("judge"), Some(Behavior::Judge));
         assert_eq!(Behavior::parse("scripted"), Some(Behavior::Scripted));
         assert_eq!(Behavior::parse("nope"), None);

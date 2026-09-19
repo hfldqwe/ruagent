@@ -981,6 +981,83 @@ impl RunManager {
         Ok(run)
     }
 
+    /// Land the fan-out winner (design §5.2): commit any uncommitted
+    /// work in the selected run's worktree, merge its branch into the
+    /// main repo, then sweep the task's worktrees and branches (issue
+    /// #43's rule — the deliverable is safe in the main checkout now).
+    /// Returns the post-merge HEAD short hash. A failed merge returns
+    /// git's own message and cleans nothing: a conflict is a human
+    /// decision, not ours to discard.
+    pub async fn land_selected(&self, task_id: ruagent_core::TaskId) -> Result<String> {
+        let task = self
+            .db
+            .get_task(task_id)
+            .await?
+            .with_context(|| format!("task {task_id} not found"))?;
+        let (run_id, _by) = self
+            .db
+            .selected_run(task_id)
+            .await?
+            .context("no winner selected")?;
+        let run = self
+            .db
+            .get_run(run_id)
+            .await?
+            .with_context(|| format!("selected run {run_id} not found"))?;
+        // Only a run's own worktree can land — a fresh or explicit-cwd
+        // workspace has no branch to merge.
+        let worktrees = self.root.join("worktrees");
+        let ws = run
+            .workspace
+            .as_deref()
+            .map(std::path::Path::new)
+            .filter(|d| d.starts_with(&worktrees) && d.is_dir())
+            .context("winner has no worktree to land")?;
+        let branch = format!("ruagent/run-{run_id}");
+
+        // The main checkout the worktree was cut from.
+        let common = git(
+            ws,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let main = std::path::Path::new(&common)
+            .parent()
+            .context("git common dir has no parent")?
+            .to_path_buf();
+
+        // Uncommitted work in the worktree is part of the deliverable:
+        // land it on the run branch so the merge carries it.
+        if !git(ws, &["status", "--porcelain"])?.is_empty() {
+            git(ws, &["add", "-A"])?;
+            let msg = format!("ruagent: land run {run_id} ({})", task.title);
+            git(
+                ws,
+                &[
+                    "-c",
+                    "user.name=ruagent",
+                    "-c",
+                    "user.email=ruagent@localhost",
+                    "commit",
+                    "-m",
+                    &msg,
+                ],
+            )?;
+        } else {
+            // Clean worktree: nothing beyond main's HEAD on the branch
+            // means the merge would be a no-op.
+            let range = format!("HEAD..{branch}");
+            if git(&main, &["rev-list", "--count", &range])? == "0" {
+                anyhow::bail!("winner produced nothing to land");
+            }
+        }
+
+        git(&main, &["merge", "--no-edit", &branch])?;
+        self.cleanup_task_workspaces(task_id).await;
+        let head = git(&main, &["rev-parse", "--short", "HEAD"])?;
+        tracing::info!(run_id = %run_id, hash = %head, "winner landed");
+        Ok(head)
+    }
+
     /// MCP servers for an agent's configured profile (design §7.1).
     fn mcp_for(&self, card: &AgentCard) -> Vec<agent_client_protocol::schema::v1::McpServer> {
         self.mcp
@@ -1486,6 +1563,31 @@ fn retry_context(root: &std::path::Path, old: &Run) -> Option<String> {
         "[retry context — the previous attempt (run {}) died{why}. Its last output before dying:] {tail}",
         old.id
     ))
+}
+
+/// Run git in `dir`, returning trimmed stdout. A non-zero exit carries
+/// git's own output verbatim — stdout first, then stderr: a merge
+/// conflict reports on stdout while most errors use stderr, and the
+/// caller (the land API) must relay what git actually said.
+fn git(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawning git in {}", dir.display()))?;
+    if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut msg = String::new();
+        if !stdout.trim().is_empty() {
+            msg.push_str(stdout.trim());
+            msg.push('\n');
+        }
+        msg.push_str(stderr.trim());
+        anyhow::bail!("{msg}");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Per-run isolated workspace (design §8.2): a fresh dir under the

@@ -100,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/tasks/{id}/fanout", post(start_fanout))
         .route("/api/v1/tasks/{id}/pipeline", post(start_pipeline))
         .route("/api/v1/tasks/{id}/judge", post(judge_task))
+        .route("/api/v1/tasks/{id}/land", post(land_task))
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/select", post(select_run))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
@@ -1347,6 +1348,19 @@ async fn get_task(
         .map(|(run_id, by)| (Some(run_id), Some(by)))
         .unwrap_or((None, None));
     let judgement = judge_view(state.mgr.db(), id, &runs).await?;
+    // Landable (design §5.2): the winner still has its worktree — the
+    // branch can be merged back into the main repo. A fresh/cwd
+    // workspace or an already-landed (swept) worktree is not.
+    let worktrees = state.mgr.root().join("worktrees");
+    let landable = selected_run_id.is_some_and(|rid| {
+        runs.iter().any(|r| {
+            r.id == rid
+                && r.workspace.as_deref().is_some_and(|ws| {
+                    let p = std::path::Path::new(ws);
+                    p.starts_with(&worktrees) && p.is_dir()
+                })
+        })
+    });
     // A run parked on the inbox shows it here: the task view must say
     // "waiting for permission", not look hung (issue #34).
     let pending = state.mgr.pending_permissions();
@@ -1370,6 +1384,7 @@ async fn get_task(
         "runs": runs_json,
         "selected_run_id": selected_run_id,
         "selected_by": selected_by,
+        "landable": landable,
         "judgement": judgement,
     })))
 }
@@ -1702,6 +1717,30 @@ async fn select_run(
         .set_selected_run(run.task_id, run_id, "human")
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Land the fan-out winner (design §5.2): merge the selected run's
+/// worktree branch into the main repo, then sweep the task's
+/// worktrees. A failed merge reports git's own message.
+async fn land_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: ruagent_core::TaskId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid task id"))?;
+    state
+        .mgr
+        .db()
+        .get_task(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    let hash = state
+        .mgr
+        .land_selected(id)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "landed": hash })))
 }
 
 async fn get_run(
