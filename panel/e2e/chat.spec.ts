@@ -35,7 +35,10 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
   // The model picker fills from the runtime's advertised catalog —
   // first probe (a real mock process) then the cached copy. antd 6
   // shows the value in `.ant-select-content`.
-  const modelField = page.locator(".chat-bar .chat-field").nth(1);
+  const modelField = page
+    .locator(".chat-bar .chat-field")
+    .filter({ hasText: /模型|Model/ })
+    .first();
   await expect(modelField.locator(".ant-select-content")).toHaveText("mock-pro", {
     timeout: 15_000,
   });
