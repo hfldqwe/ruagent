@@ -1536,3 +1536,90 @@ async fn role_prompt_rides_runs() {
         "the prompt itself survives: {result}"
     );
 }
+
+#[tokio::test]
+async fn role_option_defaults_apply_to_runs() {
+    // [agent.X.options] defaults ride RUNS too, not just chats — a
+    // specialist registered with mode=auto must not ask for every
+    // edit in run mode. The mock reports applied options back.
+    let bin = mock_bin();
+    let d = start_daemon(
+        &format!(
+            "[runtime.mockrt]\nharness = \"mock\"\ncommand = \"{bin} --behavior configdump\"\n\n\
+             [agent.specialist]\nprompt = \"you are the tester\"\nruntimes = [\"mockrt\"]\nruntime = \"mockrt\"\n\n\
+             [agent.plainer]\nprompt = \"no defaults\"\nruntimes = [\"mockrt\"]\nruntime = \"mockrt\"\n\n\
+             [agent.specialist.options]\nmode = \"auto\"\n"
+        ),
+        "default = \"ask\"\n",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let drive = |agent: &str, extra: serde_json::Value| {
+        let http = http.clone();
+        let url = d.url.clone();
+        let agent = agent.to_string();
+        async move {
+            let task: serde_json::Value = http
+                .post(format!("{url}/api/v1/tasks"))
+                .json(&serde_json::json!({ "title": "opts", "intent": "dump" }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut body = serde_json::json!({ "agent": agent, "prompt": "dump" });
+            if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            let run: serde_json::Value = http
+                .post(format!(
+                    "{}/api/v1/tasks/{}/runs",
+                    url,
+                    task["id"].as_str().unwrap()
+                ))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let run_id = run["id"].as_str().unwrap().to_string();
+            poll_until(&http, &format!("{url}/api/v1/runs/{run_id}"), |v| {
+                v["status"] == "completed"
+            })
+            .await
+        }
+    };
+
+    // Role default applies.
+    let r = drive("specialist", serde_json::json!({})).await;
+    assert!(
+        (r["result"].as_str().unwrap_or_default()).contains("mode=auto"),
+        "role default options must ride runs: {}",
+        r["result"]
+    );
+    assert_eq!(r["params"]["options"]["mode"], "auto");
+
+    // A role WITHOUT defaults stays clean.
+    let r = drive("plainer", serde_json::json!({})).await;
+    assert_eq!(r["params"]["options"].as_object().map(|m| m.len()), Some(0));
+
+    // The request's explicit option overrides the role default per key
+    // (the mock's mode choices are ask/auto).
+    let r = drive(
+        "specialist",
+        serde_json::json!({ "options": { "mode": "ask" } }),
+    )
+    .await;
+    assert!(
+        (r["result"].as_str().unwrap_or_default()).contains("mode=ask"),
+        "request options win: {}",
+        r["result"]
+    );
+    assert_eq!(r["params"]["options"]["mode"], "ask");
+}

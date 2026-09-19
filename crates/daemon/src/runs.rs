@@ -529,7 +529,15 @@ impl RunManager {
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
         // Canonical session-option defaults (issue #36): mode / effort.
-        run.params.options = launch.options;
+        // The ROLE's defaults apply to runs too — the same contract
+        // chats have. Without this, a specialist registered with
+        // `options = { mode = "auto" }` still asked for every edit in
+        // run mode (request options win per key).
+        let mut options = card.options.clone();
+        for (k, v) in &launch.options {
+            options.insert(k.clone(), v.clone());
+        }
+        run.params.options = options;
         // The original prompt (pre-injection): a retry replays it
         // faithfully (design §8.3 crash row).
         run.params.prompt = Some(
