@@ -914,6 +914,7 @@ impl ChatManager {
             registry: self.registry.clone(),
             language: policy.language,
             prompt_override: policy.prompt,
+            mode: policy.mode,
         })
     }
 

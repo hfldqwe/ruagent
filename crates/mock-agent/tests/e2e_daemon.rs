@@ -14,6 +14,9 @@ use ruagent_store::Db;
 struct TestDaemon {
     url: String,
     _root: PathBuf,
+    /// Direct store handle for seeding/querying behind the API's back
+    /// (sessions rows, distill_log).
+    db: Db,
 }
 
 async fn start_daemon(agents_toml: &str, policy_toml: &str) -> TestDaemon {
@@ -90,6 +93,7 @@ async fn start_daemon_with_routing(
     TestDaemon {
         url: format!("http://{addr}"),
         _root: root,
+        db,
     }
 }
 
@@ -2008,4 +2012,177 @@ async fn role_option_defaults_apply_to_runs() {
         r["result"]
     );
     assert_eq!(r["params"]["options"]["mode"], "ask");
+}
+
+// ---------------------------------------------------------------------------
+// Distill rules mode: zero-token harvest of explicit directives
+// ---------------------------------------------------------------------------
+
+/// Write a ruagent-format transcript file and index it as a session row,
+/// bypassing the indexer's home-directory scan. Returns the session key.
+async fn index_transcript(d: &TestDaemon, file: &std::path::Path, jsonl: &str) -> String {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(file, jsonl).unwrap();
+    let key = ruagent_daemon::sessions::session_key_of(file);
+    let (k, ref_path) = (key.clone(), file.to_string_lossy().into_owned());
+    d.db.call(move |conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions
+                 (key, source, ref_path, started_at, updated_at, mtime_ms,
+                  size_bytes, message_count)
+             VALUES (?1, 'ruagent', ?2, 0, 0, 0, 0, 1)",
+            [&k, &ref_path],
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    key
+}
+
+#[tokio::test]
+async fn distill_rules_mode_harvests_directives_without_an_agent() {
+    let d = start_daemon(&mock_agent_toml("echo"), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    // PUT mode="rules" hot-swaps the live policy and GET reflects it.
+    let put: serde_json::Value = http
+        .put(format!("{}/api/v1/distill", d.url))
+        .json(&serde_json::json!({ "mode": "rules" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(put["ok"], true);
+    let policy: serde_json::Value = http
+        .get(format!("{}/api/v1/distill", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(policy["mode"], "rules");
+    // A typo 400s instead of silently distilling with the default.
+    let bogus = http
+        .put(format!("{}/api/v1/distill", d.url))
+        .json(&serde_json::json!({ "mode": "bogus" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bogus.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    // One session whose user message opens with an explicit directive.
+    let transcripts = d._root.join("data").join("transcripts");
+    let key = index_transcript(
+        &d,
+        &transcripts.join("run-rules.jsonl"),
+        concat!(
+            "{\"ts\":\"2026-09-20T10:00:00Z\",\"seq\":1,",
+            "\"event\":{\"type\":\"user_message\",\"text\":\"记住：用户喜欢深色主题\"}}\n",
+            "{\"ts\":\"2026-09-20T10:00:01Z\",\"seq\":2,",
+            "\"event\":{\"type\":\"agent_message_chunk\",",
+            "\"content\":[{\"type\":\"text\",\"text\":\"已记住\"}]}}\n",
+            "{\"ts\":\"2026-09-20T10:00:02Z\",\"seq\":3,",
+            "\"event\":{\"type\":\"stopped\"}}\n",
+        ),
+    )
+    .await;
+
+    // Zero tokens: the directive becomes a memory with no agent run.
+    // (The mock only echoes — an accidental agent run would 400 on the
+    // unparseable echo, so success itself proves the rules path.)
+    let out: serde_json::Value = http
+        .post(format!("{}/api/v1/sessions/{key}/distill", d.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(out["distilled"]["memories_written"], 1);
+    assert_eq!(out["distilled"]["agent"], "rules");
+    assert_eq!(out["distilled"]["entities_written"], 0);
+    assert_eq!(out["distilled"]["relations_written"], 0);
+
+    // The memory: [distilled]-prefixed, observation/user, confidence 0.9.
+    let memories: serde_json::Value = http
+        .get(format!(
+            "{}/api/v1/memory/list?store=observation&namespace=user",
+            d.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hit = memories["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["content"] == "[distilled] 用户喜欢深色主题")
+        .unwrap_or_else(|| panic!("distilled memory missing: {memories}"));
+    assert_eq!(hit["confidence"], 0.9);
+
+    // distill_log records the rules extractor.
+    let logged =
+        d.db.call({
+            let key = key.clone();
+            move |conn| {
+                conn.query_row(
+                    "SELECT agent FROM distill_log WHERE session_key = ?1",
+                    [&key],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(logged.as_deref(), Some("rules"));
+
+    // Re-distilling the same transcript skips as near-duplicate.
+    let out2: serde_json::Value = http
+        .post(format!("{}/api/v1/sessions/{key}/distill", d.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(out2["distilled"]["memories_written"], 0);
+    assert_eq!(out2["distilled"]["memories_skipped"], 1);
+
+    // A transcript without directives distills to zero, not an error.
+    let plain_key = index_transcript(
+        &d,
+        &transcripts.join("run-plain.jsonl"),
+        "{\"ts\":\"2026-09-20T11:00:00Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"今天天气怎么样\"}}\n",
+    )
+    .await;
+    let out3: serde_json::Value = http
+        .post(format!("{}/api/v1/sessions/{plain_key}/distill", d.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(out3["distilled"]["memories_written"], 0);
+    assert_eq!(out3["distilled"]["memories_skipped"], 0);
+    assert_eq!(out3["distilled"]["agent"], "rules");
 }

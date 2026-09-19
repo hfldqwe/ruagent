@@ -181,6 +181,10 @@ pub struct DistillConfig {
     /// Full override of the extraction prompt (escape hatch for custom
     /// extraction regimes; the transcript is still appended by the code).
     pub prompt: Option<String>,
+    /// Extraction mode: "agent" (extraction prompt through an agent
+    /// run) or "rules" (zero-token harvest of explicit directives in
+    /// the user's own messages). Default "agent".
+    pub mode: Option<String>,
 }
 
 /// `[permissions]` section.

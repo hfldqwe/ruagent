@@ -512,6 +512,9 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 #                        # (JSON keys and store/namespace stay canonical)
 # prompt = """..."""     # full override of the extraction prompt (advanced;
 #                        # the transcript is still appended by the daemon)
+# mode = "agent"         # extraction mode: "agent" (LLM run, default) or
+#                        # "rules" (zero-token: harvest explicit "记住:"/
+#                        # "remember:" directives from user messages)
 # First matching rule wins; `default` applies otherwise. Actions:
 #   allow  — auto-select the first allow option
 #   reject — auto-select the first reject option
@@ -566,6 +569,7 @@ agent = \"dsh\"
                 agent: None,
                 language: Some("简体中文".into()),
                 prompt: None,
+                mode: Some("rules".into()),
             })
             .unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
@@ -577,11 +581,13 @@ agent = \"dsh\"
         // A None key is removed, not emptied.
         assert!(!out.contains("agent ="));
         assert!(out.contains("简体中文"));
+        assert!(out.contains("mode = \"rules\""));
         // The result reparses as the same policy.
         let policy = ruagent_policy::PolicyConfig::parse(&out).unwrap();
         assert!(!policy.distill.auto);
         assert_eq!(policy.distill.language.as_deref(), Some("简体中文"));
         assert!(policy.distill.agent.is_none());
+        assert_eq!(policy.distill.mode.as_deref(), Some("rules"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -691,6 +697,7 @@ impl DistillEditor {
         set_or_remove(tbl, "agent", &cfg.agent);
         set_or_remove(tbl, "language", &cfg.language);
         set_or_remove(tbl, "prompt", &cfg.prompt);
+        set_or_remove(tbl, "mode", &cfg.mode);
         let tmp = self.path.with_extension("toml.tmp");
         std::fs::write(&tmp, doc.to_string())
             .with_context(|| format!("writing {}", tmp.display()))?;

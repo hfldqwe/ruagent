@@ -716,6 +716,7 @@ async fn wiki_build(
         // override is about memories, not wiki pages.
         language: None,
         prompt_override: None,
+        mode: crate::distill::DistillMode::Agent,
     };
     let builder = crate::wiki::WikiBuilder::new(distiller, state.knowledge.as_ref().clone());
     let out = builder
@@ -1898,6 +1899,7 @@ async fn distill_policy_get(State(state): State<AppState>) -> Json<serde_json::V
         "agent": p.agent,
         "language": p.language,
         "prompt": p.prompt,
+        "mode": p.mode.as_str(),
         "builtin_prompt": crate::distill::builtin_extraction_prompt(),
     }))
 }
@@ -1912,6 +1914,8 @@ struct DistillPutRequest {
     language: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// Update the distillation policy: write `[distill]` in policy.toml
@@ -1931,6 +1935,11 @@ async fn distill_policy_put(
     let agent = clean(&req.agent);
     let language = clean(&req.language);
     let prompt = clean(&req.prompt);
+    // mode: "agent" | "rules". Parsed (and rejected) here so a typo
+    // 400s instead of silently distilling with the default.
+    let mode_val = clean(&req.mode);
+    let mode = crate::distill::DistillMode::parse_opt(mode_val.as_deref())
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
     // A named extractor must exist — a typo would silently fall back to
     // dsh otherwise.
     if let Some(name) = agent.as_deref() {
@@ -1946,6 +1955,8 @@ async fn distill_policy_put(
         agent,
         language,
         prompt,
+        // canonical spelling, so policy.toml always round-trips
+        mode: mode_val.map(|_| mode.as_str().to_string()),
     };
     crate::config::DistillEditor::new(state.config.root.join("config").join("policy.toml"))
         .update(&cfg)
@@ -1955,6 +1966,7 @@ async fn distill_policy_put(
         agent: cfg.agent.clone(),
         language: cfg.language.clone(),
         prompt: cfg.prompt.clone(),
+        mode,
     });
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1966,10 +1978,6 @@ async fn session_distill(
     // The live policy decides: its agent, else dsh, else the first
     // enabled; its language/prompt ride the extraction prompt.
     let policy = state.chats.distill_policy_now();
-    let agents = state.mgr.agents();
-    let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
-    let card = crate::distill::select_agent(&enabled, policy.agent.as_deref())
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let distiller = crate::distill::Distiller {
         db: state.mgr.db().clone(),
         root: state.config.root.clone(),
@@ -1977,11 +1985,24 @@ async fn session_distill(
         registry: state.mgr.registry_view(),
         language: policy.language,
         prompt_override: policy.prompt,
+        mode: policy.mode,
     };
-    let out = distiller
-        .distill(&key, card)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // Rules mode spends no tokens: there is no agent to select or run.
+    let out = if policy.mode == crate::distill::DistillMode::Rules {
+        distiller
+            .distill_by_rules(&key)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+    } else {
+        let agents = state.mgr.agents();
+        let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
+        let card = crate::distill::select_agent(&enabled, policy.agent.as_deref())
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        distiller
+            .distill(&key, card)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+    };
     Ok(Json(serde_json::json!({ "distilled": out })))
 }
 
