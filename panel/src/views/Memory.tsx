@@ -1,11 +1,10 @@
 // Memory browser: stores × namespaces, supersession chains, write dialog,
 // audit trail (OpenViking parity).
 
-import { Button, Input, Segmented, Select, Spin, Switch } from "antd";
+import { Button, Input, Segmented, Select, Spin } from "antd";
 import { useEffect, useState } from "react";
 import {
   api,
-  type DistillPolicy,
   type GraphEdge,
   type KnowledgeExpansion,
   type MemoryDiff,
@@ -33,9 +32,7 @@ export function Memory() {
   const [namespace, setNamespace] = useState("user");
   const [memories, setMemories] = useState<MemoryRow[] | null>(null);
   const [writing, setWriting] = useState(false);
-  const [tab, setTab] = useState<"browse" | "recall" | "audit" | "distill">(
-    "browse",
-  );
+  const [tab, setTab] = useState<"browse" | "recall" | "audit">("browse");
   const toast = useToast();
 
   const refresh = () =>
@@ -77,7 +74,6 @@ export function Memory() {
             { value: "browse", label: t("memory.browse") },
             { value: "recall", label: t("memory.recall") },
             { value: "audit", label: t("memory.audit") },
-            { value: "distill", label: t("distill.title") },
           ]}
         />
         {tab === "browse" && (
@@ -85,16 +81,11 @@ export function Memory() {
             + {t("memory.write")}
           </Button>
         )}
-        {tab === "distill" && (
-          <span className="muted">{t("distill.subtitle")}</span>
-        )}
         {tab === "recall" && <RecallPlayground />}
       </div>
 
       {tab === "audit" ? (
         <AuditView />
-      ) : tab === "distill" ? (
-        <DistillSettings />
       ) : tab === "recall" ? (
         <div />
       ) : (
@@ -716,100 +707,3 @@ function EntityStub({ stub }: { stub: RecallResult["entities"][number] }) {
   );
 }
 
-// Distillation policy (the [distill] table of policy.toml): auto, the
-// extraction agent, the output language, a full prompt override. Live —
-// saving swaps the running daemon's policy, no restart.
-function DistillSettings() {
-  const { t } = useI18n();
-  const toast = useToast();
-  const [policy, setPolicy] = useState<DistillPolicy | null>(null);
-  const [agents, setAgents] = useState<{ name: string }[]>([]);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    api.distillPolicy().then(setPolicy).catch(() => setPolicy(null));
-    api
-      .agents()
-      .then((a) => setAgents(a.filter((x) => x.enabled).map((x) => ({ name: x.name }))))
-      .catch(() => setAgents([]));
-  }, []);
-
-  if (!policy) return <Spinner label={t("common.loading")} />;
-  const set = (patch: Partial<DistillPolicy>) =>
-    setPolicy({ ...policy, ...patch });
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await api.setDistillPolicy({
-        auto: policy.auto,
-        agent: policy.agent ?? "",
-        language: policy.language ?? "",
-        prompt: policy.prompt ?? "",
-      });
-      toast("ok", t("distill.saved"));
-    } catch (e) {
-      toast("err", String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="card distill-settings">
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <div style={{ minWidth: 0 }}>
-          <strong>{t("distill.auto")}</strong>
-          <p className="muted" style={{ margin: 0 }}>
-            {t("distill.autoHint")}
-          </p>
-        </div>
-        <Switch checked={policy.auto} onChange={(v) => set({ auto: v })} />
-      </div>
-
-      <div className="row wrap">
-        <label className="chat-field" style={{ flex: "1 1 220px" }}>
-          <span>{t("distill.agent")}</span>
-          <Select
-            value={policy.agent ?? ""}
-            onChange={(v) => set({ agent: v || null })}
-            style={{ width: "100%" }}
-            options={[
-              { value: "", label: t("distill.agentDefault") },
-              ...agents.map((a) => ({ value: a.name, label: a.name })),
-            ]}
-          />
-        </label>
-        <label className="chat-field" style={{ flex: "1 1 220px" }}>
-          <span>{t("distill.language")}</span>
-          <Input
-            value={policy.language ?? ""}
-            placeholder={t("distill.languagePh")}
-            onChange={(e) => set({ language: e.target.value })}
-          />
-        </label>
-      </div>
-
-      <label className="chat-field">
-        <span>{t("distill.prompt")}</span>
-        <Input.TextArea
-          rows={7}
-          value={policy.prompt ?? ""}
-          placeholder={t("distill.promptPh")}
-          onChange={(e) => set({ prompt: e.target.value })}
-        />
-      </label>
-
-      <details className="distill-builtin">
-        <summary>{t("distill.builtin")}</summary>
-        <pre>{policy.builtin_prompt}</pre>
-      </details>
-
-      <div className="row end">
-        <Button type="primary" loading={saving} onClick={save}>
-          {t("distill.save")}
-        </Button>
-      </div>
-    </div>
-  );
-}

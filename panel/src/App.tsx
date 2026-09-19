@@ -23,6 +23,7 @@ import { Knowledge } from "./views/Knowledge";
 import { Graph } from "./views/Graph";
 import { Agents, Inbox, Stats } from "./views/Agents";
 import { Runtimes } from "./views/Runtimes";
+import { Settings } from "./views/Settings";
 import { Chat } from "./views/Chat";
 import { Sessions } from "./views/Sessions";
 import { CreateTaskModal } from "./views/Board";
@@ -41,6 +42,7 @@ type View =
   | { kind: "agents" }
   | { kind: "runtimes" }
   | { kind: "stats" }
+  | { kind: "settings" }
   | { kind: "inbox" };
 
 function parseHash(): View {
@@ -67,6 +69,8 @@ function parseHash(): View {
       return { kind: "stats" };
     case "inbox":
       return { kind: "inbox" };
+    case "settings":
+      return { kind: "settings" };
     default:
       return { kind: "home" };
   }
@@ -140,6 +144,7 @@ function Shell() {
     { key: "agents", icon: <Icon name="bot" size={16} />, label: t("nav.agents") },
     { key: "runtimes", icon: <Icon name="layers" size={16} />, label: t("nav.runtimes") },
     { key: "stats", icon: <Icon name="stats" size={16} />, label: t("nav.stats") },
+    { key: "settings", icon: <Icon name="settings" size={16} />, label: t("nav.settings") },
     {
       key: "inbox",
       icon: collapsed ? (
@@ -289,6 +294,7 @@ function Shell() {
           {view.kind === "agents" && <Agents />}
           {view.kind === "runtimes" && <Runtimes />}
           {view.kind === "stats" && <Stats />}
+          {view.kind === "settings" && <Settings />}
           {view.kind === "inbox" && <Inbox />}
         </Content>
       </Layout>

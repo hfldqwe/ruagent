@@ -101,6 +101,15 @@ export function Agents() {
                       )}
                     </div>
                     <p className="muted" style={{ margin: "10px 0 6px" }}>{a.description}</p>
+                    {a.prompt ? (
+                      <details className="prompt-view">
+                        <summary>
+                          {t("agents.promptView")} ·{" "}
+                          {a.prompt.length} {t("chat.chars", { n: a.prompt.length }).split(" ")[1] ?? ""}
+                        </summary>
+                        <pre>{a.prompt}</pre>
+                      </details>
+                    ) : null}
                     {a.model ? <span className="tag mono">{a.model}</span> : null}
                     {s && s.runs > 0 ? (
                       <div className="agent-stats">

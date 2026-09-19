@@ -115,6 +115,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/chats", get(chats_history))
         .route("/api/v1/chat/{id}/messages", post(chat_message))
         .route("/api/v1/chat/{id}/stop", post(chat_stop))
+        .route("/api/v1/chat/{id}/handoff", post(chat_handoff))
+        .route("/api/v1/chat/{id}/resume", post(chat_resume))
         .route("/api/v1/chat/{id}/events", get(chat_events))
         .route(
             "/api/v1/chat/{id}",
@@ -2599,6 +2601,82 @@ async fn chat_stop(
     chat.send(ChatCommand::Stop)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(StatusCode::OK)
+}
+
+/// Hand the conversation to another agent: the session restarts on the
+/// target card with the prior conversation (bounded tail) as handoff
+/// context on the next prompt. Returns the NEW chat's identity.
+async fn chat_handoff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: ruagent_core::RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    let name = req
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("missing `agent`"))?;
+    let card = state
+        .mgr
+        .agent(name)
+        .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{name}`")))?
+        .clone();
+    let chat = state
+        .chats
+        .switch_agent(id, &card)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "id": chat.id.to_string(),
+        "agent": chat.agent,
+        "runtime": chat.runtime,
+        "model": chat.model,
+    })))
+}
+
+/// Resume a closed conversation: same RunId (transcript appends,
+/// history row survives), session restarted on the chat's agent with
+/// the prior conversation as handoff context.
+async fn chat_resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: ruagent_core::RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    // The chats row names the agent; resolve it to a live card.
+    let label: String = state
+        .mgr
+        .db()
+        .call({
+            let key = id.to_string();
+            move |conn| {
+                conn.query_row("SELECT agent FROM chats WHERE id = ?1", [&key], |r| {
+                    r.get(0)
+                })
+            }
+        })
+        .await
+        .map_err(|_| ApiError::not_found("chat not found in history"))?
+        .map_err(|_| ApiError::not_found("chat not found in history"))?;
+    let card = state
+        .mgr
+        .agent(&label)
+        .ok_or_else(|| ApiError::bad_request(format!("agent `{label}` no longer exists")))?
+        .clone();
+    let chat = state
+        .chats
+        .resume_chat(id, &card)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "id": chat.id.to_string(),
+        "agent": chat.agent,
+        "runtime": chat.runtime,
+        "model": chat.model,
+    })))
 }
 
 /// Chat SSE: replay the chat transcript, then tail live events. `StateChanged{completed}`

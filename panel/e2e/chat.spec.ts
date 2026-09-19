@@ -22,7 +22,14 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
   await expect(page.locator(".view-bar h2")).toBeVisible();
 
   // The agent picker defaults to the first enabled agent; pick the mock.
-  await page.locator(".chat-bar .chat-field").first().locator(".ant-select-input").click();
+  // (The chat-bar's first field is the project directory now — target
+  // the agent field by its label.)
+  await page
+    .locator(".chat-bar .chat-field")
+    .filter({ hasText: /智能体|Agent/ })
+    .first()
+    .locator(".ant-select-input")
+    .click();
   await page.locator(".ant-select-item-option").filter({ hasText: mock.name }).click();
 
   // The model picker fills from the runtime's advertised catalog —

@@ -236,6 +236,7 @@ export interface McpRegistry {
 
 export interface DistillPolicy {
   auto: boolean;
+  mode?: string | null;
   agent: string | null;
   language: string | null;
   prompt: string | null;
@@ -550,6 +551,7 @@ export const api = {
   distillPolicy: () => get<DistillPolicy>("/api/v1/distill"),
   setDistillPolicy: (body: {
     auto: boolean;
+    mode?: string;
     agent: string;
     language: string;
     prompt: string;
@@ -668,8 +670,8 @@ export const api = {
   }) => post("/api/v1/graph/fact", fact).then((r) => r.json() as Promise<{ id: number }>),
 
   // chat
-  chatStart: (agent: string, model: string | null) =>
-    post("/api/v1/chat", { agent, model }).then(
+  chatStart: (agent: string, model: string | null, cwd?: string) =>
+    post("/api/v1/chat", { agent, model, cwd: cwd || undefined }).then(
       (r) =>
         r.json() as Promise<{
           id: string;
@@ -689,6 +691,26 @@ export const api = {
   chatMessage: (id: string, text: string) =>
     post(`/api/v1/chat/${id}/messages`, { text }),
   chatStop: (id: string) => post(`/api/v1/chat/${id}/stop`),
+  chatResume: (id: string) =>
+    post(`/api/v1/chat/${id}/resume`).then(
+      (r) =>
+        r.json() as Promise<{
+          id: string;
+          agent: string;
+          runtime: string;
+          model: string | null;
+        }>,
+    ),
+  chatHandoff: (id: string, agent: string) =>
+    post(`/api/v1/chat/${id}/handoff`, { agent }).then(
+      (r) =>
+        r.json() as Promise<{
+          id: string;
+          agent: string;
+          runtime: string;
+          model: string | null;
+        }>,
+    ),
   chatModel: (id: string, model: string | null, runtime?: string) =>
     send("PATCH", `/api/v1/chat/${id}`, { model, runtime }).then(
       (r) =>

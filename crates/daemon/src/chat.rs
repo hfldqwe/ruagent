@@ -51,6 +51,10 @@ pub struct Chat {
     /// The agent's portable role prompt (two-layer model): injected
     /// ahead of the first prompt on every runtime.
     agent_prompt: Option<String>,
+    /// Prior-conversation tail for an agent handoff (switch_agent):
+    /// rides the first prompt's context, ahead of the memory context —
+    /// the new agent takes over mid-conversation.
+    handoff: Option<String>,
 }
 
 impl Chat {
@@ -74,7 +78,19 @@ impl Chat {
             None
         } else {
             let mut ctx = ChatManager::memory_context_for(db, &text).await;
-            // The role prompt rides first — what this agent IS.
+            // A handoff tail rides first: the conversation the new
+            // agent is taking over.
+            if let Some(h) = &self.handoff {
+                ctx = Some(match ctx {
+                    Some(c) => format!(
+                        "{h}
+
+{c}"
+                    ),
+                    None => h.clone(),
+                });
+            }
+            // The role prompt rides next — what this agent IS.
             if let Some(role) = &self.agent_prompt {
                 let role_block = format!(
                     "[role — you are]
@@ -352,7 +368,86 @@ impl ChatManager {
     /// Workspace = a fresh dir under workspaces/chat-<id>. Records a
     /// chats-table history row.
     pub async fn start(&self, card: &AgentCard, model: Option<String>) -> Result<Chat> {
-        self.start_inner(card, model, &card.name, true).await
+        self.start_inner(card, model, &card.name, true, None, None)
+            .await
+    }
+
+    /// Hand the conversation over to another agent (role or runtime):
+    /// the old session closes (and auto-distills — its segment is done),
+    /// a new one starts on the target card, and a bounded tail of the
+    /// prior conversation rides the new session's first prompt as
+    /// handoff context. The conversation continues; the engine changes.
+    pub async fn switch_agent(&self, id: RunId, card: &AgentCard) -> Result<Chat> {
+        let old = self
+            .chat(id)
+            .ok_or_else(|| anyhow::anyhow!("chat not found"))?;
+        let old_label = old.agent.clone();
+        let msgs = crate::sessions::parse_file_messages("ruagent", &self.transcript_path(id));
+        // Bounded tail: the last 8 turns, ≤ 3000 chars, char-boundary safe.
+        let mut tail = String::new();
+        for m in msgs.iter().rev().take(8).collect::<Vec<_>>().iter().rev() {
+            let line = format!("[{}] {}", m.role, m.text);
+            if tail.len() + line.len() + 1 > 3000 {
+                break;
+            }
+            tail.push_str(&line);
+            tail.push('\n');
+        }
+        let handoff = if tail.trim().is_empty() {
+            None
+        } else {
+            Some(format!(
+                "[conversation handoff — you are taking over a conversation previously held with `{old_label}`; treat the tail below as established context and continue naturally]
+{tail}"
+            ))
+        };
+        self.close(id);
+        self.start_inner(card, None, &card.name, true, handoff, None)
+            .await
+    }
+
+    /// Resume a closed conversation: restart the session on the same
+    /// agent, under the SAME RunId — the transcript appends, the
+    /// history row survives (one thread, not fragments) — with the
+    /// prior conversation handed over as context on the next prompt.
+    /// Session switching, ChatGPT-style: click a past conversation and
+    /// keep talking.
+    pub async fn resume_chat(&self, id: RunId, card: &AgentCard) -> Result<Chat> {
+        if self.chat(id).is_some() {
+            anyhow::bail!("chat is live — attach instead of resuming");
+        }
+        let label: String = {
+            let key = id.to_string();
+            self.db
+                .call(move |conn| {
+                    conn.query_row("SELECT agent FROM chats WHERE id = ?1", [&key], |r| {
+                        r.get(0)
+                    })
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("chat not found in history"))??
+        };
+        let msgs = crate::sessions::parse_file_messages("ruagent", &self.transcript_path(id));
+        // A resume needs more context than a mid-chat handoff: the last
+        // 16 turns, <= 8000 chars.
+        let mut tail = String::new();
+        for m in msgs.iter().rev().take(16).collect::<Vec<_>>().iter().rev() {
+            let line = format!("[{}] {}", m.role, m.text);
+            if tail.len() + line.len() + 1 > 8000 {
+                break;
+            }
+            tail.push_str(&line);
+            tail.push('\n');
+        }
+        let handoff = if tail.trim().is_empty() {
+            None
+        } else {
+            Some(format!(
+                "[conversation resume — you are continuing your earlier conversation with the user; the transcript below is where it left off]\n{tail}"
+            ))
+        };
+        self.start_inner(card, None, &label, true, handoff, Some(id))
+            .await
     }
 
     /// The spawn path shared by chats and probes. `label` is the history
@@ -364,11 +459,15 @@ impl ChatManager {
         model: Option<String>,
         label: &str,
         record: bool,
+        handoff: Option<String>,
+        reuse: Option<RunId>,
     ) -> Result<Chat> {
         let spec = ruagent_acp::adapter_for(card.harness)
             .spawn_spec(card)
             .with_context(|| format!("resolving spawn command for `{}`", card.name))?;
-        let id = RunId::generate();
+        // A resumed conversation keeps its RunId: the transcript
+        // appends, the history row survives, the rail shows one thread.
+        let id = reuse.unwrap_or_else(RunId::generate);
         let workspace = self.root.join("workspaces").join(format!("chat-{id}"));
         std::fs::create_dir_all(&workspace)
             .with_context(|| format!("creating workspace {}", workspace.display()))?;
@@ -481,6 +580,7 @@ impl ChatManager {
             last_active: Arc::new(Mutex::new(Instant::now())),
             memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_prompt: card.prompt.clone(),
+            handoff,
         };
 
         // History row: who (agent identity) on which engine.
@@ -493,10 +593,18 @@ impl ChatManager {
             let db = self.db.clone();
             let _ = db
                 .call(move |conn| {
+                    // Resume (same id): refresh the engine identity but
+                    // keep the row's title and created_at — it is the
+                    // same conversation continuing.
                     conn.execute(
-                        "INSERT OR REPLACE INTO chats
+                        "INSERT INTO chats
                              (id, agent, runtime, model, title, created_at, updated_at)
-                         VALUES (?1,?2,?3,?4,NULL,?5,?5)",
+                         VALUES (?1,?2,?3,?4,NULL,?5,?5)
+                         ON CONFLICT(id) DO UPDATE SET
+                             agent = excluded.agent,
+                             runtime = excluded.runtime,
+                             model = excluded.model,
+                             updated_at = excluded.updated_at",
                         rusqlite::params![id_s, agent_s, runtime_s, model_s, now],
                     )
                 })
@@ -622,7 +730,9 @@ impl ChatManager {
             }
         }
         self.close(id);
-        let chat = self.start_inner(card, model, label, true).await?;
+        let chat = self
+            .start_inner(card, model, label, true, None, None)
+            .await?;
         Ok((chat, true))
     }
 
@@ -694,7 +804,9 @@ impl ChatManager {
             Some(c) => wait_options(&c).await,
             None => {
                 // Probe: start (unrecorded), read the options, close.
-                let chat = self.start_inner(card, None, &card.name, false).await?;
+                let chat = self
+                    .start_inner(card, None, &card.name, false, None, None)
+                    .await?;
                 let state = wait_options(&chat).await;
                 self.close(chat.id);
                 state

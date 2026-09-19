@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import { Button, Select } from "antd";
 import {
   api,
+  isRoleAgent,
   type AgentInfo,
   type ChatHistoryEntry,
   type OptionChoice,
@@ -16,8 +17,8 @@ import {
 } from "../api";
 import { Icon, type IconName } from "../icons";
 import { useI18n } from "../i18n";
-import { Markdown, RelTime, Spinner } from "../ui";
-import { msToIso, SessionDetail } from "./Sessions";
+import { Markdown, RelTime, Spinner, useToast } from "../ui";
+import { msToIso } from "./Sessions";
 
 /** Known option ids get translated labels; others show the agent's name. */
 function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
@@ -161,6 +162,7 @@ interface ChatEvent {
 
 export function Chat({ initialAgent }: { initialAgent?: string }) {
   const { t } = useI18n();
+  const toast = useToast();
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [agent, setAgent] = useState(initialAgent ?? "");
   const [model, setModel] = useState("");
@@ -186,6 +188,28 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     localStorage.setItem("chat.railCollapsed", railCollapsed ? "1" : "0");
   }, [railCollapsed]);
   const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
+  /** Working directory for new chats — which project the agent works
+   * in (persisted; the daemon spawns the session there). */
+  const [project, setProject] = useState(
+    () => localStorage.getItem("chat.cwd") ?? "",
+  );
+  const [projects, setProjects] = useState<string[]>([]);
+  useEffect(() => {
+    localStorage.setItem("chat.cwd", project);
+  }, [project]);
+  // Known projects: distinct values from the sessions index.
+  useEffect(() => {
+    api
+      .sessions()
+      .then((all) => {
+        const seen = new Set<string>();
+        for (const sess of all) {
+          if (sess.project) seen.add(sess.project);
+        }
+        setProjects([...seen].sort());
+      })
+      .catch(() => setProjects([]));
+  }, []);
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<(() => void) | null>(null);
@@ -311,7 +335,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     if (chatId) return chatId;
     setStarting(true);
     try {
-      const chat = await api.chatStart(agent, model.trim() || null);
+      const chat = await api.chatStart(
+        agent,
+        model.trim() || null,
+        project.trim() || undefined,
+      );
       setChatId(chat.id);
       setModel(chat.model ?? "");
       setRuntime(chat.runtime ?? "");
@@ -562,9 +590,44 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     if (streamRef.current) streamRef.current();
     streamRef.current = null;
     attachedRef.current = null;
+    setViewing(null);
     setChatId(null);
     setMessages([]);
     setStreaming(false);
+  };
+
+  /** Switch agents mid-conversation: the session restarts on the
+   * target with the prior turns handed over as context — the
+   * conversation continues across engines (claude-code ↔ dsh ↔ …).
+   * Without a live chat it is just a different default pick. */
+  const switchAgent = async (name: string) => {
+    if (chatId && !streaming) {
+      try {
+        const r = await api.chatHandoff(chatId, name);
+        if (streamRef.current) streamRef.current();
+        setAgent(name);
+        setChatId(r.id);
+        setModel(r.model ?? "");
+        setRuntime(r.runtime ?? "");
+        attachStream(r.id, true);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: t("chat.handoffNotice", { name }),
+            done: true,
+            notice: true,
+            icon: "settings",
+          },
+        ]);
+        refreshHistory();
+        return;
+      } catch (e) {
+        toast("err", String(e));
+        return;
+      }
+    }
+    setAgent(name);
   };
 
   const modelChoices =
@@ -661,9 +724,14 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent]);
 
-  const openPast = (h: ChatHistoryEntry) => {
+  /** Session switching: clicking a past conversation RESUMES it — the
+   * session restarts under the same id (transcript appends, one
+   * history thread) with the prior turns handed over. Only when the
+   * agent no longer exists does it fall back to the read-only view. */
+  const openPast = async (h: ChatHistoryEntry) => {
     setSideOpen(false);
     if (h.active) {
+      setViewing(null);
       if (streamRef.current) streamRef.current();
       setAgent(h.agent);
       setChatId(h.id);
@@ -672,8 +740,22 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       setMessages([]);
       setStreaming(false);
       attachStream(h.id, true);
-    } else {
-      setViewing(h);
+      return;
+    }
+    try {
+      const r = await api.chatResume(h.id);
+      setViewing(null);
+      if (streamRef.current) streamRef.current();
+      setAgent(r.agent);
+      setChatId(r.id);
+      setModel(r.model ?? "");
+      setRuntime(r.runtime ?? "");
+      setMessages([]);
+      setStreaming(false);
+      attachStream(r.id, true); // replay rebuilds the whole thread
+      refreshHistory();
+    } catch {
+      setViewing(h); // agent deleted / daemon refuses: read-only
     }
   };
 
@@ -759,6 +841,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         </Button>
       </div>
 
+      {viewing ? (
+        <PastConversation entry={viewing} onNew={newChat} />
+      ) : (
       <div className="chat-log grow">
         {messages.length === 0 ? (
           <div className="state empty">
@@ -824,20 +909,45 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         )}
         <div ref={bottomRef} />
       </div>
+      )}
 
+      {!viewing && (
       <div className="chat-bottom">
       <div className="chat-bar">
+        <label className="chat-field">
+          <span>{t("chat.project")}</span>
+          <Select
+            mode="tags"
+            maxCount={1}
+            value={project ? [project] : []}
+            onChange={(v) => setProject(v[v.length - 1] ?? "")}
+            disabled={streaming || !!chatId}
+            style={{ minWidth: 210 }}
+            placeholder={t("chat.projectPh")}
+            options={projects.map((x) => ({ value: x, label: x }))}
+            tokenSeparators={[","]}
+          />
+        </label>
         <label className="chat-field">
           <span>{t("chat.agent")}</span>
           <Select
             value={agent || undefined}
             onChange={(v) => {
-              if (chatId) newChat();
-              setAgent(v);
+              void switchAgent(v);
             }}
             disabled={streaming}
             style={{ minWidth: 150 }}
-            options={agents.map((a) => ({ value: a.name, label: a.name }))}
+            options={[
+              ...agents
+                .filter((a) => isRoleAgent(a))
+                .map((a) => ({ value: a.name, label: a.name })),
+              {
+                label: t("chat.runtimeGroup"),
+                options: agents
+                  .filter((a) => !isRoleAgent(a))
+                  .map((a) => ({ value: a.name, label: a.name })),
+              },
+            ]}
           />
         </label>
         <OptionPicker
@@ -919,26 +1029,73 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         </div>
       </div>
       </div>
+      )}
       </div>
 
-      {viewing && (
-        <SessionDetail
-          session={{
-            key: viewing.session_key ?? "",
-            source: "ruagent",
-            title: viewing.title,
-            project: null,
-            ref_path: "",
-            started_at: viewing.created_at,
-            updated_at: viewing.updated_at,
-            message_count: viewing.message_count ?? 0,
-            preview: viewing.preview,
-            agent: viewing.agent,
-          }}
-          onClose={() => setViewing(null)}
-        />
-      )}
     </div>
   );
 }
 
+
+/** A closed conversation, rendered inline in the chat main area —
+ * clicking history enters the conversation (ChatGPT-style), it does
+ * not pop a modal over the page. Read-only: the agent process is gone;
+ * a new conversation is one click away. */
+function PastConversation({
+  entry,
+  onNew,
+}: {
+  entry: ChatHistoryEntry;
+  onNew: () => void;
+}) {
+  const { t } = useI18n();
+  const [messages, setMessages] = useState<
+    { role: string; text: string }[] | null
+  >(null);
+
+  useEffect(() => {
+    if (entry.session_key) {
+      api
+        .sessionMessages(entry.session_key)
+        .then(setMessages)
+        .catch(() => setMessages([]));
+    } else {
+      setMessages([]);
+    }
+  }, [entry.session_key]);
+
+  return (
+    <div className="chat-log grow">
+      <div className="row wrap" style={{ gap: 8, marginBottom: 10 }}>
+        <span className="tag warn">{t("chat.readonlyHistory")}</span>
+        <span className="muted">
+          {entry.title || entry.agent}
+          {entry.runtime ? ` · ${entry.runtime}` : ""}
+        </span>
+        <span className="grow" />
+        <Button size="small" onClick={onNew}>
+          + {t("chat.new")}
+        </Button>
+      </div>
+      {messages === null ? (
+        <Spinner />
+      ) : messages.length === 0 ? (
+        <div className="state empty">
+          <p>{t("chat.empty")}</p>
+        </div>
+      ) : (
+        messages.map((m, i) => (
+          <div
+            key={i}
+            className={
+              m.role === "user" ? "chat-msg user" : "chat-msg agent"
+            }
+          >
+            {m.role === "user" ? m.text : <Markdown>{m.text}</Markdown>}
+          </div>
+        ))
+      )}
+      <div style={{ height: 40 }} />
+    </div>
+  );
+}

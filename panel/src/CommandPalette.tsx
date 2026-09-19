@@ -33,6 +33,7 @@ const NAV: { hash: string; labelKey: string; kw: string }[] = [
   { hash: "agents", labelKey: "nav.agents", kw: "agents roles" },
   { hash: "runtimes", labelKey: "nav.runtimes", kw: "runtimes backends claude-code dsh opencode" },
   { hash: "stats", labelKey: "nav.stats", kw: "stats" },
+  { hash: "settings", labelKey: "nav.settings", kw: "settings preferences distill" },
   { hash: "inbox", labelKey: "nav.inbox", kw: "inbox permissions" },
 ];
 
