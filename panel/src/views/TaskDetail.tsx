@@ -36,6 +36,8 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [judgeAgent, setJudgeAgent] = useState("");
   const [judging, setJudging] = useState(false);
   const [retrying, setRetrying] = useState<string | null>(null);
+  const [landable, setLandable] = useState(false);
+  const [landing, setLanding] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [launching, setLaunching] = useState(false);
@@ -50,6 +52,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
         setWinner(r.selected_run_id);
         setSelectionBy(r.selected_by);
         setJudgement(r.judgement);
+        setLandable(r.landable);
         setSelectedRun((prev) => prev ?? (r.runs[0]?.id ?? null));
         return r;
       })
@@ -108,10 +111,32 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
                   <strong>{agentName(r)}</strong>
                   {r.cost_usd != null ? <span className="muted">{fmtUsd(r.cost_usd)}</span> : null}
                   {winner === r.id ? (
-                    <span className="tag ok">
-                      {t("task.winner")}
-                      {selectionBy?.startsWith("agent:") ? ` · ${selectionBy.slice(6)}` : ""}
-                    </span>
+                    <>
+                      <span className="tag ok">
+                        {t("task.winner")}
+                        {selectionBy?.startsWith("agent:") ? ` · ${selectionBy.slice(6)}` : ""}
+                      </span>
+                      {landable ? (
+                        <Button
+                          size="small"
+                          loading={landing}
+                          onClick={async () => {
+                            setLanding(true);
+                            try {
+                              const { landed } = await api.landTask(task.id);
+                              toast("ok", t("toast.landed", { hash: landed }));
+                            } catch (e) {
+                              toast("err", String(e));
+                            } finally {
+                              setLanding(false);
+                            }
+                            refresh();
+                          }}
+                        >
+                          {t("task.land")}
+                        </Button>
+                      ) : null}
+                    </>
                   ) : null}
                 </div>
                 <div className="compare-result">

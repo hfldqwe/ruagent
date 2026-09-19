@@ -617,34 +617,19 @@ async fn routing_rule_picks_agent_without_explicit_pin() {
 // M2 worktree isolation (design SS8.2)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fanout_with_repo_gives_each_run_its_own_worktree() {
-    // A real git repo to isolate in.
+/// A temp git repo with one commit on `main` — the isolation target for
+/// worktree fan-outs, and the merge target when a winner lands.
+fn temp_git_repo(tag: &str) -> PathBuf {
+    // Windows SystemTime granularity makes timestamp tags collide
+    // between parallel tests — hence a counter (see DIR_SEQ).
     static REPO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = REPO_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let repo = std::env::temp_dir().join(format!("ruagent-repo-{}-{}", std::process::id(), seq));
+    let repo =
+        std::env::temp_dir().join(format!("ruagent-repo-{tag}-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("hello.txt"), "base").unwrap();
-    assert!(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["init", "-q", "-b", "main"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["add", "."])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
+    let git = |args: &[&str]| {
         std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -652,11 +637,21 @@ async fn fanout_with_repo_gives_each_run_its_own_worktree() {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .args(["commit", "-q", "-m", "base"])
+            .args(args)
             .status()
             .unwrap()
             .success()
-    );
+    };
+    assert!(git(&["init", "-q", "-b", "main"]));
+    assert!(git(&["add", "."]));
+    assert!(git(&["commit", "-q", "-m", "base"]));
+    repo
+}
+
+#[tokio::test]
+async fn fanout_with_repo_gives_each_run_its_own_worktree() {
+    // A real git repo to isolate in.
+    let repo = temp_git_repo("wt");
 
     let d = start_daemon(
         &two_mock_agents_toml(),
@@ -756,6 +751,166 @@ async fn fanout_with_repo_gives_each_run_its_own_worktree() {
         String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         "branches must be deleted"
     );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out winner landing (design §5.2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn land_selected_worktree() {
+    // The winner's work must reach the main repo, not die on a branch:
+    // land commits the selected run's uncommitted work, merges its
+    // branch, and sweeps the task's worktrees (design §5.2).
+    let repo = temp_git_repo("land");
+    // Two write mocks in the two-layer form: every run leaves out.txt
+    // in its own worktree.
+    let bin = mock_bin();
+    let d = start_daemon(
+        &format!(
+            "[runtime.wr1]\nharness = \"mock\"\ncommand = \"{bin} --behavior write\"\n\n\
+             [runtime.wr2]\nharness = \"mock\"\ncommand = \"{bin} --behavior write\"\n\n\
+             [agent.writer1]\nruntimes = [\"wr1\"]\nruntime = \"wr1\"\n\n\
+             [agent.writer2]\nruntimes = [\"wr2\"]\nruntime = \"wr2\"\n"
+        ),
+        "default = \"ask\"\n",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "land me", "intent": "write the file" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let fan: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/fanout", d.url))
+        .json(&serde_json::json!({
+            "agents": ["writer1", "writer2"],
+            "repo": repo.to_string_lossy().replace('\\', "/")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let runs = fan["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    let run1 = runs[0]["id"].as_str().unwrap().to_string();
+
+    // Both runs complete, each with out.txt in its own worktree.
+    for r in runs {
+        let rid = r["id"].as_str().unwrap();
+        let final_run = poll_until(&http, &format!("{}/api/v1/runs/{rid}", d.url), |v| {
+            v["status"] == "completed"
+        })
+        .await;
+        assert_eq!(final_run["result"], "wrote out.txt");
+        let ws = final_run["workspace"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(ws).join("out.txt").is_file(),
+            "the mock wrote into its worktree: {ws}"
+        );
+    }
+
+    // Human pick, then land.
+    let status = http
+        .post(format!("{}/api/v1/runs/{run1}/select", d.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(status.is_success());
+    let detail: serde_json::Value = http
+        .get(format!("{}/api/v1/tasks/{task_id}", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["landable"], true,
+        "a selected winner with its worktree is landable: {detail}"
+    );
+
+    let resp = http
+        .post(format!("{}/api/v1/tasks/{task_id}/land", d.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let landed: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        !landed["landed"].as_str().unwrap_or("").is_empty(),
+        "the land reply carries the new HEAD: {landed}"
+    );
+
+    // The main repo carries the winner's file, committed by the land.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("out.txt")).unwrap(),
+        "written by mock"
+    );
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("ruagent: land run {run1} (land me)"),
+        "HEAD is the land commit"
+    );
+
+    // The task's worktrees and branches are swept...
+    let worktrees = d._root.join("worktrees");
+    let swept = std::fs::read_dir(&worktrees)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(true); // a removed dir is swept too
+    assert!(
+        swept,
+        "the task's worktrees must be gone: {}",
+        worktrees.display()
+    );
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list", "ruagent/run-*"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "run branches must be deleted"
+    );
+
+    // ...so the task is no longer landable and a second land is a 400.
+    let detail: serde_json::Value = http
+        .get(format!("{}/api/v1/tasks/{task_id}", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["landable"], false);
+    let resp = http
+        .post(format!("{}/api/v1/tasks/{task_id}/land", d.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
 
     let _ = std::fs::remove_dir_all(&repo);
 }

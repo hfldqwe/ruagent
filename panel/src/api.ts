@@ -114,6 +114,9 @@ export interface TaskDetail {
   /** "human" | "agent:<name>" | null (no selection yet). */
   selected_by: string | null;
   judgement: Judgement | null;
+  /** The winner's worktree still exists — its branch can be landed
+   *  (merged back into the main repo). */
+  landable: boolean;
 }
 
 export interface Run {
@@ -518,6 +521,10 @@ export const api = {
       (r) => r.json() as Promise<{ judge_run: Run }>,
     ),
   selectRun: (runId: string) => post(`/api/v1/runs/${runId}/select`),
+  /** Land the task's selected winner: merge its worktree branch into
+   *  the main repo. Resolves with the post-merge HEAD short hash. */
+  landTask: (taskId: string) =>
+    post(`/api/v1/tasks/${taskId}/land`).then((r) => r.json() as Promise<{ landed: string }>),
   cancelRun: (runId: string) => post(`/api/v1/runs/${runId}/cancel`),
   retryRun: (runId: string) =>
     post(`/api/v1/runs/${runId}/retry`).then((r) => r.json() as Promise<Run>),

@@ -28,6 +28,10 @@ async fn main() -> Result<()> {
     // Names of the MCP servers injected at session/new — the configdump
     // behavior reports them (health-gate tests, issue #24).
     let session_mcp = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // The session's cwd (session/new). The Write behavior drops its
+    // file there — the ACP workspace contract — because the process
+    // cwd belongs to whoever spawned us, not to the session.
+    let session_cwd = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
 
     Agent
         .builder()
@@ -46,8 +50,9 @@ async fn main() -> Result<()> {
                 let counter = session_counter.clone();
                 let current = current.clone();
                 let session_mcp = session_mcp.clone();
+                let session_cwd = session_cwd.clone();
                 async move |req: NewSessionRequest, responder, _conn| {
-                    let _ = &req.cwd;
+                    *session_cwd.lock().expect("session cwd lock") = req.cwd.clone();
                     let n = counter.fetch_add(1, Ordering::SeqCst);
                     *session_mcp.lock().expect("session mcp lock") = req
                         .mcp_servers
@@ -99,6 +104,7 @@ async fn main() -> Result<()> {
                 let scripted_replies = scripted_replies.clone();
                 let current = current.clone();
                 let session_mcp = session_mcp.clone();
+                let session_cwd = session_cwd.clone();
                 async move |req: PromptRequest, responder, conn| {
                     let sid = req.session_id.clone();
                     let text = prompt_text(&req.prompt);
@@ -238,6 +244,19 @@ async fn main() -> Result<()> {
                             ])))?;
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new("planned work")),
+                            )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
+                        Behavior::Write => {
+                            // A real file deliverable in the session's
+                            // workspace — what the daemon commits and
+                            // merges when this run's task lands.
+                            let cwd = session_cwd.lock().expect("session cwd lock").clone();
+                            std::fs::write(cwd.join("out.txt"), "written by mock")
+                                .map_err(agent_client_protocol::Error::into_internal_error)?;
+                            notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("wrote out.txt")),
                             )))?;
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
