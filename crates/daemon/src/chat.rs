@@ -212,8 +212,10 @@ pub struct ChatManager {
     /// before the RunManager). Optional so tests can omit it.
     drop_asks: Mutex<Option<AskDropper>>,
     mcp: crate::config::McpConfig,
-    /// Session → memory distillation policy (auto on close).
-    pub distill_policy: crate::distill::AutoDistill,
+    /// Session → memory distillation policy (auto on close). Behind a
+    /// RwLock: the panel's settings card swaps it at runtime (the file
+    /// edit and this value update together).
+    pub distill_policy: std::sync::RwLock<crate::distill::AutoDistill>,
     /// Agent registry view for the distiller.
     pub registry: crate::distill::AgentRegistry,
     /// Shared embedder for distillation writes (set at boot).
@@ -248,7 +250,7 @@ impl ChatManager {
             park_ask,
             drop_asks: Mutex::new(None),
             mcp,
-            distill_policy,
+            distill_policy: std::sync::RwLock::new(distill_policy),
             registry,
             embedder,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -551,7 +553,12 @@ impl ChatManager {
             return;
         };
         let key = crate::sessions::session_key_of(&self.transcript_path(id));
-        let agent = self.distill_policy.agent.clone();
+        let agent = self
+            .distill_policy
+            .read()
+            .expect("distill policy")
+            .agent
+            .clone();
         tokio::spawn(async move {
             match crate::distill::distill_with_agent(&distiller, &key, agent.as_deref()).await {
                 Ok(o) => tracing::info!(
@@ -896,7 +903,8 @@ impl ChatManager {
     }
 
     fn auto_distiller(&self) -> Option<crate::distill::Distiller> {
-        if !self.distill_policy.auto {
+        let policy = self.distill_policy.read().expect("distill policy").clone();
+        if !policy.auto {
             return None;
         }
         Some(crate::distill::Distiller {
@@ -904,9 +912,20 @@ impl ChatManager {
             root: self.root.clone(),
             embedder: self.embedder.clone(),
             registry: self.registry.clone(),
-            language: self.distill_policy.language.clone(),
-            prompt_override: self.distill_policy.prompt.clone(),
+            language: policy.language,
+            prompt_override: policy.prompt,
         })
+    }
+
+    /// Swap the live distillation policy (the settings card; the
+    /// policy.toml file edit happens before this call).
+    pub fn set_distill_policy(&self, policy: crate::distill::AutoDistill) {
+        *self.distill_policy.write().expect("distill policy") = policy;
+    }
+
+    /// The current live distillation policy (manual distill shares it).
+    pub fn distill_policy_now(&self) -> crate::distill::AutoDistill {
+        self.distill_policy.read().expect("distill policy").clone()
     }
 
     /// Chat transcripts live next to run transcripts.

@@ -540,6 +540,57 @@ default = "ask"
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn distill_editor_round_trips_preserving_comments() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruagent-distill-edit-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(
+            &path,
+            "# top comment
+[permissions]
+default = \"ask\"
+
+# distillation
+[distill]
+auto = true
+agent = \"dsh\"
+",
+        )
+        .unwrap();
+        let editor = DistillEditor::new(&path);
+        editor
+            .update(&ruagent_policy::DistillConfig {
+                auto: false,
+                agent: None,
+                language: Some("简体中文".into()),
+                prompt: None,
+            })
+            .unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        // Comments, ordering and other sections survive.
+        assert!(out.contains("# top comment"));
+        assert!(out.contains("[permissions]"));
+        assert!(out.contains("# distillation"));
+        assert!(out.contains("auto = false"));
+        // A None key is removed, not emptied.
+        assert!(!out.contains("agent ="));
+        assert!(out.contains("简体中文"));
+        // The result reparses as the same policy.
+        let policy = ruagent_policy::PolicyConfig::parse(&out).unwrap();
+        assert!(!policy.distill.auto);
+        assert_eq!(policy.distill.language.as_deref(), Some("简体中文"));
+        assert!(policy.distill.agent.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -604,6 +655,66 @@ pub struct RouteEntry {
     pub project: Option<String>,
     pub title_contains: Option<String>,
     pub agent: String,
+}
+
+// ---------------------------------------------------------------------------
+// policy.toml [distill] editing (the panel's settings card)
+// ---------------------------------------------------------------------------
+
+/// Round-trip editor for the `[distill]` table of `policy.toml` — the
+/// registry::Editor discipline (toml_edit keeps comments/ordering/other
+/// sections, temp+rename is atomic, a mutex stops interleaved writes)
+/// applied to the distillation policy.
+pub struct DistillEditor {
+    path: PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+impl DistillEditor {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Write the whole `[distill]` table: `auto` always, the optional
+    /// keys only when present (None removes the key from the file).
+    pub fn update(&self, cfg: &ruagent_policy::DistillConfig) -> Result<()> {
+        let _guard = self.lock.lock().expect("distill editor lock");
+        let text = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parsing {}", self.path.display()))?;
+        if !doc.contains_key("distill") {
+            doc["distill"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let tbl = doc["distill"]
+            .as_table_mut()
+            .context("[distill] is not a table")?;
+        tbl["auto"] = toml_edit::value(cfg.auto);
+        set_or_remove(tbl, "agent", &cfg.agent);
+        set_or_remove(tbl, "language", &cfg.language);
+        set_or_remove(tbl, "prompt", &cfg.prompt);
+        let tmp = self.path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("renaming into {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+fn set_or_remove(tbl: &mut toml_edit::Table, key: &str, v: &Option<String>) {
+    match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            tbl[key] = toml_edit::value(s);
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
 }
 
 fn parse_routing(text: &str) -> Result<RoutingFile> {

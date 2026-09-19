@@ -1189,3 +1189,35 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
 .wiki-view h1 { margin-top: 0; }
 .wiki-broken { color: var(--ant-color-error); }
 .wiki-broken .wiki-q { font-weight: 600; margin-left: 1px; }
+
+/* Distillation settings card (Memory → 蒸馏 tab) ----------------------- */
+.distill-settings { max-width: 760px; display: flex; flex-direction: column; gap: 16px; }
+.distill-settings .chat-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.distill-builtin {
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 8px;
+  background: var(--ant-color-fill-quaternary);
+  overflow: hidden;
+}
+.distill-builtin > summary {
+  padding: 5px 12px;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--ant-color-text-tertiary);
+  cursor: pointer;
+  user-select: none;
+}
+.distill-builtin > summary::marker { content: ""; }
+.distill-builtin > summary::after { content: "▾"; float: right; }
+.distill-builtin[open] > summary { border-bottom: 1px solid var(--ant-color-border-secondary); }
+.distill-builtin > pre {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 300px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 17px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ant-color-text-secondary);
+}

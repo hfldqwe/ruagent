@@ -491,6 +491,12 @@ fn parse_extraction(raw: &str) -> Result<Extraction> {
 /// Cheap near-duplicate check: high token overlap on normalized text.
 /// (The full embedder-based check lands with memory embeddings; this
 /// ships the dedup contract now.)
+/// The built-in extraction prompt — read-only reference for the panel's
+/// settings card, so users can see what `[distill] prompt` would replace.
+pub fn builtin_extraction_prompt() -> &'static str {
+    EXTRACTION_PROMPT
+}
+
 /// The full extraction prompt: base (built-in or `[distill] prompt`
 /// override), optional language clause, transcript tail. Free function
 /// so the composition is testable without a Distiller.

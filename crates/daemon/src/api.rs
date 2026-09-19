@@ -107,6 +107,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/retry", post(retry_run))
         .route("/api/v1/runs/{id}/events", get(run_events))
+        .route(
+            "/api/v1/distill",
+            get(distill_policy_get).put(distill_policy_put),
+        )
         .route("/api/v1/chat", post(chat_start).get(chat_list))
         .route("/api/v1/chats", get(chats_history))
         .route("/api/v1/chat/{id}/messages", post(chat_message))
@@ -1881,25 +1885,94 @@ async fn memory_backfill_embeddings(
 // Distillation: session → memories + graph (agent-run extraction)
 // ---------------------------------------------------------------------------
 
+/// The live distillation policy (the settings card's source) plus the
+/// built-in extraction prompt for reference.
+async fn distill_policy_get(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let p = state.chats.distill_policy_now();
+    Json(serde_json::json!({
+        "auto": p.auto,
+        "agent": p.agent,
+        "language": p.language,
+        "prompt": p.prompt,
+        "builtin_prompt": crate::distill::builtin_extraction_prompt(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct DistillPutRequest {
+    #[serde(default)]
+    auto: bool,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// Update the distillation policy: write `[distill]` in policy.toml
+/// (round-tripped — comments and other sections survive), then swap the
+/// live value. Empty strings clear optional keys.
+async fn distill_policy_put(
+    State(state): State<AppState>,
+    Json(req): Json<DistillPutRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Normalize: blank optional fields mean "not set".
+    let clean = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let agent = clean(&req.agent);
+    let language = clean(&req.language);
+    let prompt = clean(&req.prompt);
+    // A named extractor must exist — a typo would silently fall back to
+    // dsh otherwise.
+    if let Some(name) = agent.as_deref() {
+        let known = state.mgr.agents();
+        if !known.iter().any(|a| a.enabled && a.name == name) {
+            return Err(ApiError::bad_request(format!(
+                "unknown or disabled agent `{name}`"
+            )));
+        }
+    }
+    let cfg = ruagent_policy::DistillConfig {
+        auto: req.auto,
+        agent,
+        language,
+        prompt,
+    };
+    crate::config::DistillEditor::new(state.config.root.join("config").join("policy.toml"))
+        .update(&cfg)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.chats.set_distill_policy(crate::distill::AutoDistill {
+        auto: cfg.auto,
+        agent: cfg.agent.clone(),
+        language: cfg.language.clone(),
+        prompt: cfg.prompt.clone(),
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 async fn session_distill(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Any enabled agent can serve as the distiller; prefer dsh (cheap,
-    // local) then the first enabled.
+    // The live policy decides: its agent, else dsh, else the first
+    // enabled; its language/prompt ride the extraction prompt.
+    let policy = state.chats.distill_policy_now();
     let agents = state.mgr.agents();
-    let card = agents
-        .iter()
-        .find(|a| a.enabled && a.name == "dsh")
-        .or_else(|| agents.iter().find(|a| a.enabled))
-        .ok_or_else(|| ApiError::bad_request("no enabled agent to distill with"))?;
+    let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
+    let card = crate::distill::select_agent(&enabled, policy.agent.as_deref())
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let distiller = crate::distill::Distiller {
         db: state.mgr.db().clone(),
         root: state.config.root.clone(),
         embedder: Some(state.knowledge.embedder()),
         registry: state.mgr.registry_view(),
-        language: state.config.policy.distill.language.clone(),
-        prompt_override: state.config.policy.distill.prompt.clone(),
+        language: policy.language,
+        prompt_override: policy.prompt,
     };
     let out = distiller
         .distill(&key, card)

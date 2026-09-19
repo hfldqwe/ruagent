@@ -234,6 +234,14 @@ export interface McpRegistry {
   profiles: { name: string; servers: string[] }[];
 }
 
+export interface DistillPolicy {
+  auto: boolean;
+  agent: string | null;
+  language: string | null;
+  prompt: string | null;
+  builtin_prompt: string;
+}
+
 export interface MemoryRow {
   id: number;
   store: string;
@@ -539,6 +547,13 @@ export const api = {
   ) => post(`/api/v1/permissions/${runId}:${toolCallId}`, answer),
 
   // memory
+  distillPolicy: () => get<DistillPolicy>("/api/v1/distill"),
+  setDistillPolicy: (body: {
+    auto: boolean;
+    agent: string;
+    language: string;
+    prompt: string;
+  }) => send("PUT", "/api/v1/distill", body),
   memoryList: (store: string, namespace: string) =>
     get<{ memories: MemoryRow[]; counts: [string, string, number][] }>(
       `/api/v1/memory/list?store=${store}&namespace=${encodeURIComponent(namespace)}`,
