@@ -23,6 +23,13 @@ One resident daemon (Rust) serves both the CLI and the web panel — a
 thin local API client. Everything runs on your machine; nothing leaves
 it.
 
+Agent processes die with the daemon. On Windows the daemon joins a
+kill-on-close job object, so the OS terminates every agent, wrapper
+launcher and MCP server it spawned the moment the daemon process dies —
+crash, kill or clean exit. On every platform the next boot sweeps the
+surviving children of a previously recorded daemon that is verifiably
+gone.
+
 ## Quick start
 
 ```bash
@@ -60,9 +67,11 @@ runtime = "dsh"                  # default runtime
 
 The role prompt travels across runtimes: chat with the architect on dsh,
 switch the runtime to claude-code mid-conversation — same role, same
-memory. The panel has separate pages for the two layers: **Agents**
-(#agents, roles with live stats) and **Runtimes** (#runtimes, execution
-backends). Legacy single-layer configs keep working.
+memory. It rides runs too: the role block leads every run's injected
+context, so a delegated run carries the specialist's identity, not just
+the runtime behind it. The panel has separate pages for the two layers:
+**Agents** (#agents, roles with live stats) and **Runtimes** (#runtimes,
+execution backends). Legacy single-layer configs keep working.
 
 ## Orchestration
 
@@ -77,6 +86,24 @@ backends). Legacy single-layer configs keep working.
   recorded with its source.
 - **Permissions** — deterministic rules > approver agent > human inbox,
   fail-closed. High-risk operations always reach a human.
+- **Concurrency gates** — a fan-out past a harness's cap queues instead
+  of spawning N children at once: the run row lands as `queued` and
+  consumes no workspace or child process until a slot frees. Past the
+  queue cap the launch is rejected with a saturation error, recorded on
+  the run row.
+- **Retry a dead run** — a failed, interrupted or cancelled run gets a
+  **Retry** button (`POST /api/v1/runs/<id>/retry`): a new run on the
+  same task, agent and options, reusing the dead attempt's workspace so
+  half-written work survives, with the crash snapshot (its last output,
+  last tool call and why it died) prepended as injected context.
+
+Tuning lives in `policy.toml`:
+
+```toml
+[concurrency]
+per_harness = 2        # simultaneous runs per harness kind
+queue_per_harness = 8  # waiting runs before rejection
+```
 
 ## The memory layer
 
@@ -124,7 +151,9 @@ per-harness glue. Skills (SKILL.md library) sync into every harness.
 
 Replayable JSONL transcripts (SSE live streams), per-agent cost stats,
 context-injection rendered on every timeline, and a recall usage log
-(every call's section counts + raw top scores) that feeds tuning.
+(every call's section counts + raw top scores) that feeds tuning. The
+run timeline shows the original instruction as its own entry, separate
+from the injected context.
 
 ## CLI
 
