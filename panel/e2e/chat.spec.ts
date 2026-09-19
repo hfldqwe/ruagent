@@ -42,6 +42,18 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
     timeout: 15_000,
   });
 
+  // The first prompt appears exactly ONCE — the injection chip riding
+  // between the optimistic copy and the live user_message echo used to
+  // break the tail dedupe and double every first turn (the "你好"
+  // report, 2026-09-19).
+  await expect(page.locator(".chat-msg.user")).toHaveCount(1);
+
+  // The platform injection is inspectable: a collapsed chip that opens
+  // to the full render.
+  await expect(page.locator(".chat-injection summary")).toBeVisible();
+  await page.locator(".chat-injection summary").click();
+  await expect(page.locator(".chat-injection pre")).toBeVisible();
+
   // History: the conversation is recorded with the first prompt as the
   // title, marked live — in the persistent left rail (2026-09-19: the
   // history drawer became a rail; the mobile toggle is the only other

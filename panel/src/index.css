@@ -811,13 +811,29 @@ html[data-mode="dark"] .home-hero::before {
 
 /* Chat — the conversation is the canvas, the composer is raised -------- */
 
+/* Chat: full-bleed so the history rail hugs the sider edge instead of
+   floating inside the content column's padding (user request
+   2026-09-19). The layout carries its own insets. */
+.content:has(> .chat-layout) {
+  padding-inline: 0;
+  max-width: none;
+}
 .chat-layout {
   display: grid;
-  grid-template-columns: 264px minmax(0, 1fr);
-  gap: 0 20px;
+  grid-template-columns: 248px minmax(0, 1fr);
+  gap: 0 24px;
   align-items: start;
   min-height: calc(100vh - 140px);
+  padding-inline-start: 14px;
+  padding-inline-end: clamp(16px, 2.6vw, 48px);
 }
+/* Freed width: the rail collapses to nothing, the conversation keeps
+   the space (toggle in the view-bar, persisted per browser). */
+.chat-layout.rail-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr);
+  gap: 0;
+}
+.chat-layout.rail-collapsed .chat-side { display: none; }
 /* History rail: sticky beside the conversation (the drawer it
    replaced needed a button press to see). */
 .chat-side {
@@ -838,11 +854,20 @@ html[data-mode="dark"] .home-hero::before {
 .chat-side-list .row-btn { padding-block: 7px; }
 .chat-side-toggle { display: none; }
 .chat-side-backdrop { display: none; }
+/* Desktop gets the inline-rail collapse; phones keep the slide-over. */
+.chat-rail-toggle { display: inline-flex; }
+@media (max-width: 700px) {
+  .chat-rail-toggle { display: none; }
+  .chat-side-toggle { display: inline-flex; }
+}
 @media (max-width: 940px) {
   .chat-layout { grid-template-columns: 200px minmax(0, 1fr); gap: 0 14px; }
 }
 @media (max-width: 700px) {
-  .chat-layout { grid-template-columns: minmax(0, 1fr); }
+  .chat-layout, .chat-layout.rail-collapsed { grid-template-columns: minmax(0, 1fr); }
+  /* rail-collapsed is a desktop concept — phones always get the
+     slide-over when summoned. */
+  .chat-layout.rail-collapsed .chat-side { display: flex; }
   .chat-side-toggle { display: inline-flex; }
   /* The rail becomes a slide-over; the view-bar button summons it. */
   .chat-side {
@@ -868,11 +893,77 @@ html[data-mode="dark"] .home-hero::before {
   }
 }
 .chat-wrap {
-  max-width: 780px;
+  max-width: 880px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
   min-height: calc(100vh - 140px);
+
+  /* Collapsible chat blocks: what the platform injected, and what the
+     agent thought — inspectable instead of hidden (user request
+     2026-09-19). */
+  details.chat-injection, details.chat-thought {
+    margin: 4px 0;
+    border: 1px solid var(--ant-color-border-secondary);
+    border-radius: 8px;
+    background: var(--ant-color-fill-quaternary);
+    overflow: hidden;
+  }
+  details.chat-injection > summary, details.chat-thought > summary {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    font-size: 12px;
+    line-height: 17px;
+    color: var(--ant-color-text-tertiary);
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+  }
+  details.chat-injection > summary::marker,
+  details.chat-thought > summary::marker { content: ""; }
+  details.chat-injection[open] > summary,
+  details.chat-thought[open] > summary {
+    border-bottom: 1px solid var(--ant-color-border-secondary);
+    color: var(--ant-color-text-secondary);
+  }
+  details.chat-injection > summary::after,
+  details.chat-thought > summary::after {
+    content: "▾";
+    margin-left: auto;
+    font-size: 10px;
+    transition: transform 150ms;
+  }
+  details.chat-injection[open] > summary::after,
+  details.chat-thought[open] > summary::after { transform: rotate(180deg); }
+  details.chat-injection > pre {
+    margin: 0;
+    padding: 10px 12px;
+    max-height: 320px;
+    overflow: auto;
+    font-family: var(--ant-font-family-code, monospace);
+    font-size: 12px;
+    line-height: 17px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--ant-color-text-secondary);
+  }
+  .thought-body {
+    padding: 10px 12px;
+    max-height: 320px;
+    overflow: auto;
+    font-size: 13px;
+    line-height: 19px;
+    color: var(--ant-color-text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  details.chat-thought[open] .thought-body {
+    border-left: 2px solid var(--ant-color-border);
+    margin-left: 10px;
+    max-height: none;
+  }
 }
 .chat-bottom {
   position: sticky;

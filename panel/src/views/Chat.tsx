@@ -6,7 +6,7 @@
 // past conversations (live ones reattach and stream).
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Select, Tooltip } from "antd";
+import { Button, Select } from "antd";
 import {
   api,
   type AgentInfo,
@@ -148,6 +148,10 @@ interface Message {
   notice?: boolean;
   /** icon shown on notices */
   icon?: IconName;
+  /** collapsible block: platform context injection (inspectable, not
+   * hidden) or the agent's thought stream (open while streaming,
+   * collapses when the turn ends, reopenable). */
+  kind?: "injection" | "thought";
 }
 
 interface ChatEvent {
@@ -165,9 +169,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   /** Live session options advertised by the agent (model, reasoning
    * effort, permission mode, …; ACP session config). Null = loading. */
   const [options, setOptions] = useState<SessionOptionInfo[] | null>(null);
-  /** When the daemon's cached catalog was last refreshed. */
-  const [optionsAt, setOptionsAt] = useState<number | null>(null);
-  const [syncing, setSyncing] = useState(false);
   /** Fallback model list from config (agents.toml `models`). */
   const [configModels, setConfigModels] = useState<string[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
@@ -176,6 +177,14 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [streaming, setStreaming] = useState(false);
   const [starting, setStarting] = useState(false);
   const [sideOpen, setSideOpen] = useState(false);
+  /** History rail collapsed (desktop) — persisted so it survives
+   * reloads; the conversation owns the width it frees. */
+  const [railCollapsed, setRailCollapsed] = useState(
+    () => localStorage.getItem("chat.railCollapsed") === "1",
+  );
+  useEffect(() => {
+    localStorage.setItem("chat.railCollapsed", railCollapsed ? "1" : "0");
+  }, [railCollapsed]);
   const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -235,7 +244,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     lastEngineRef.current = engine;
     setConfigModels(a?.models ?? []);
     setOptions(null);
-    setOptionsAt(null);
     if (agentChanged) {
       setModel(a?.model ?? "");
       setRuntime(a?.runtime ?? "");
@@ -249,7 +257,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       .then((r) => {
         if (!alive) return;
         setOptions(r.options);
-        setOptionsAt(r.updated_at ?? null);
         const m = r.options.find(
           (o) => o.category === "model" || o.id === "model",
         );
@@ -264,21 +271,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent, agents, runtime]);
-
-  /** Manual catalog sync (the sync button) — for the current engine. */
-  const syncOptions = async () => {
-    if (!agent || syncing) return;
-    setSyncing(true);
-    try {
-      const r = await api.agentOptions(agent, true, runtime || undefined);
-      setOptions(r.options);
-      setOptionsAt(r.updated_at ?? null);
-    } catch {
-      /* the pickers keep the cached list */
-    } finally {
-      setSyncing(false);
-    }
-  };
 
   /** Apply the refreshed option list (after a live set). */
   const applyOptions = (list: SessionOptionInfo[]) => {
@@ -399,11 +391,18 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       case "user_message": {
         // Transcript replay (history reattach) re-adds user turns; the
         // tail dedupe keeps the optimistic copy from doubling live.
+        // Injection/notice rows ride BETWEEN the two — scan past them,
+        // or every first prompt doubles (the opencode "你好" bug: the
+        // optimistic copy, the injection chip, then the live echo).
         const text = String(ev.text ?? "");
         if (!text) return;
         setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last && last.role === "user" && last.text === text) return prev;
+          for (let i = prev.length - 1; i >= 0; i--) {
+            const m = prev[i];
+            if (m.notice || m.kind) continue;
+            if (m.role === "user" && m.text === text) return prev;
+            break;
+          }
           return [...prev, { role: "user", text, done: true }];
         });
         break;
@@ -415,7 +414,12 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         setMessages((prev) => {
           const next = [...prev];
           const last = next[next.length - 1];
-          if (last && last.role === "assistant" && !last.done) {
+          if (
+            last &&
+            last.role === "assistant" &&
+            !last.done &&
+            !last.kind
+          ) {
             next[next.length - 1] = { ...last, text: last.text + text };
           } else {
             next.push({ role: "assistant", text, done: false });
@@ -424,26 +428,82 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         });
         break;
       }
+      case "agent_thought_chunk": {
+        const content = ev.content as { text?: string }[];
+        const text = content.map((c) => c.text ?? "").join("");
+        if (!text) return;
+        // Accumulates like a reply, but renders as an open-while-
+        // streaming collapsible: the tail stays visible live (the page
+        // auto-scrolls on every message change), the full history is
+        // one click away after the turn ends.
+        setMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (
+            last &&
+            last.role === "assistant" &&
+            last.kind === "thought" &&
+            !last.done
+          ) {
+            next[next.length - 1] = { ...last, text: last.text + text };
+          } else {
+            next.push({
+              role: "assistant",
+              text,
+              done: false,
+              kind: "thought",
+            });
+          }
+          return next;
+        });
+        break;
+      }
       case "context_injected": {
+        // Show WHAT was injected, not that something was: the full
+        // render behind a collapsed chip, so recall relevance is
+        // checkable by the human instead of hidden.
         const render = String(ev.render ?? "");
+        if (!render) return;
         setMessages((prev) => [
           ...prev,
-          {
-            role: "assistant",
-            text: render.length > 160 ? `${render.slice(0, 160)}…` : render,
-            done: true,
-            notice: true,
-            icon: "brain",
-          },
+          { role: "assistant", text: render, done: true, kind: "injection" },
         ]);
         break;
       }
       case "stopped": {
         setMessages((prev) => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (last && last.role === "assistant") {
-            next[next.length - 1] = { ...last, done: true };
+          // Close every open thought stream first — they may sit
+          // anywhere in the turn (before/between/after the reply).
+          const next = prev.map((m) =>
+            m.kind === "thought" && !m.done ? { ...m, done: true } : m,
+          );
+          // Then: did anything actually reply to the last ask?
+          let sawReply = false;
+          for (let i = next.length - 1; i >= 0; i--) {
+            const m = next[i];
+            if (m.kind) continue; // chips: not replies
+            if (m.notice) {
+              if (m.text === t("chat.emptyReply")) sawReply = true; // replay guard
+              continue;
+            }
+            if (m.role === "assistant") sawReply = true;
+            break;
+          }
+          if (!sawReply) {
+            // The agent ended its turn silently — say so instead of
+            // looking broken (opencode does this on bare greetings).
+            next.push({
+              role: "assistant",
+              text: t("chat.emptyReply"),
+              done: true,
+              notice: true,
+              icon: "warn",
+            });
+          } else {
+            const last = next[next.length - 1];
+            if (last && last.role === "assistant") {
+              next[next.length - 1] = { ...last, done: true };
+            }
           }
           return next;
         });
@@ -622,7 +682,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const currentAgent = agents.find((a) => a.name === agent);
 
   return (
-    <div className="chat-layout">
+    <div className={`chat-layout${railCollapsed ? " rail-collapsed" : ""}`}>
       <aside className={`chat-side${sideOpen ? " open" : ""}`}>
         <Button
           block
@@ -676,16 +736,19 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
 
       <div className="chat-wrap">
       <div className="view-bar">
+        <Button
+          size="small"
+          type="text"
+          className="chat-rail-toggle"
+          onClick={() => setRailCollapsed((c) => !c)}
+          title={t("chat.toggleRail")}
+          aria-label={t("chat.toggleRail")}
+        >
+          <Icon name={railCollapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
+        </Button>
         <h2>{t("chat.title")}</h2>
         <span className="muted">{t("chat.subtitle")}</span>
         <span className="grow" />
-        {optionsAt ? (
-          <Tooltip title={`${t("chat.syncedAt")} ${relTimeText(optionsAt)}`}>
-            <Button size="small" loading={syncing} onClick={syncOptions} title={t("chat.sync")}>
-              <Icon name="sync" size={13} />
-            </Button>
-          </Tooltip>
-        ) : null}
         <Button
           size="small"
           className="chat-side-toggle"
@@ -694,11 +757,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         >
           <Icon name="history" size={13} />
         </Button>
-        {chatId ? (
-          <Button size="small" onClick={newChat}>
-            + {t("chat.new")}
-          </Button>
-        ) : null}
       </div>
 
       <div className="chat-log grow">
@@ -710,21 +768,54 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             <p>{t("chat.empty")}</p>
           </div>
         ) : (
-          messages.map((m, i) => (
-            <div
-              key={i}
-              className={
-                m.notice
-                  ? "chat-msg notice"
-                  : m.role === "user"
-                    ? "chat-msg user"
-                    : "chat-msg agent"
-              }
-            >
-              {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
-              {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
-            </div>
-          ))
+          messages.map((m, i) => {
+            if (m.kind === "injection") {
+              return (
+                <details key={i} className="chat-injection">
+                  <summary>
+                    <Icon name="brain" size={12} />{" "}
+                    {t("chat.injection")} ·{" "}
+                    {t("chat.chars", { n: m.text.length })}
+                  </summary>
+                  <pre>{m.text}</pre>
+                </details>
+              );
+            }
+            if (m.kind === "thought") {
+              // Open while streaming (the tail stays live — the page
+              // auto-scrolls on every message change); collapses when
+              // the turn ends, reopenable in full.
+              return (
+                <details
+                  key={i}
+                  className="chat-thought"
+                  open={!m.done ? true : undefined}
+                >
+                  <summary>
+                    <Icon name="thought" size={12} />{" "}
+                    {t("chat.thought")} ·{" "}
+                    {t("chat.chars", { n: m.text.length })}
+                  </summary>
+                  <div className="thought-body">{m.text}</div>
+                </details>
+              );
+            }
+            return (
+              <div
+                key={i}
+                className={
+                  m.notice
+                    ? "chat-msg notice"
+                    : m.role === "user"
+                      ? "chat-msg user"
+                      : "chat-msg agent"
+                }
+              >
+                {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
+                {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
+              </div>
+            );
+          })
         )}
         {streaming && (
           <div className="chat-typing">
@@ -851,14 +942,3 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   );
 }
 
-/** Compact relative time for tooltips ("3 小时前" style, no dependency
- * on the i18n plumbing — Intl handles the locale). */
-function relTimeText(epochMs: number): string {
-  const diff = Date.now() - epochMs;
-  const mins = Math.round(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.round(hours / 24)}d`;
-}
