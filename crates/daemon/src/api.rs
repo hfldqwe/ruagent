@@ -8,6 +8,7 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ruagent_acp::chat::ChatCommand;
 use ruagent_core::{Run, RunId, RunStatus, Task, TaskCreator, TaskStatus};
 use ruagent_store::{TranscriptLine, transcript_path};
 use serde::Deserialize;
@@ -109,6 +110,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/chat", post(chat_start).get(chat_list))
         .route("/api/v1/chats", get(chats_history))
         .route("/api/v1/chat/{id}/messages", post(chat_message))
+        .route("/api/v1/chat/{id}/stop", post(chat_stop))
         .route("/api/v1/chat/{id}/events", get(chat_events))
         .route(
             "/api/v1/chat/{id}",
@@ -2473,6 +2475,26 @@ async fn chat_message(
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Stop the chat's in-flight reply: the outstanding prompt is cancelled
+/// (`$/cancel_request`) and a `Stopped{cancelled}` event follows on the
+/// stream; the session stays alive for the next prompt. Idempotent —
+/// with no prompt in flight it does nothing.
+async fn chat_stop(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    let chat = state
+        .chats
+        .chat(id)
+        .ok_or_else(|| ApiError::not_found("chat not found"))?;
+    chat.send(ChatCommand::Stop)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(StatusCode::OK)
 }
 
 /// Chat SSE: replay the chat transcript, then tail live events. `StateChanged{completed}`

@@ -25,6 +25,7 @@ pub const BEHAVIORS: &[&str] = &[
     "judge",
     "scripted",
     "configdump",
+    "slowreply",
 ];
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,11 @@ pub enum Behavior {
     /// Reply with the current session-option values (`k=v` pairs) —
     /// proves whether `session/set_config_option` took effect.
     ConfigDump,
+    /// Hold the prompt for 10s before replying EndTurn — the
+    /// interception window for cancellation tests. A `$/cancel_request`
+    /// during the wait is answered immediately with the standard
+    /// cancellation error (-32800).
+    SlowReply,
 }
 
 /// One scripted reply: sent when the prompt contains `marker`.
@@ -233,6 +239,7 @@ impl Behavior {
             "judge" => Some(Behavior::Judge),
             "scripted" => Some(Behavior::Scripted),
             "configdump" => Some(Behavior::ConfigDump),
+            "slowreply" => Some(Behavior::SlowReply),
             _ => None,
         }
     }
@@ -281,6 +288,7 @@ mod tests {
         assert_eq!(Behavior::parse("write"), Some(Behavior::Write));
         assert_eq!(Behavior::parse("judge"), Some(Behavior::Judge));
         assert_eq!(Behavior::parse("scripted"), Some(Behavior::Scripted));
+        assert_eq!(Behavior::parse("slowreply"), Some(Behavior::SlowReply));
         assert_eq!(Behavior::parse("nope"), None);
     }
 

@@ -307,6 +307,30 @@ async fn main() -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
+                        Behavior::SlowReply => {
+                            // The 10s wait must run off the dispatch loop:
+                            // an inline await would block it, and the
+                            // cancellation marker only updates when the
+                            // loop can process `$/cancel_request` (SDK
+                            // ordering docs — same reason the Permission
+                            // arm answers from a callback).
+                            let cancellation = responder.cancellation();
+                            conn.spawn(async move {
+                                match cancellation
+                                    .run_until_cancelled(async {
+                                        tokio::time::sleep(std::time::Duration::from_secs(10))
+                                            .await;
+                                        Ok(())
+                                    })
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                                    }
+                                    Err(e) => responder.respond_with_error(e),
+                                }
+                            })
+                        }
                         Behavior::Crash => {
                             notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new("about to crash")),
