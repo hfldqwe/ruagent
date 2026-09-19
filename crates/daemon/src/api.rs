@@ -320,11 +320,14 @@ async fn retry_run(
     let run_id: RunId = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid run id"))?;
-    let run = state
-        .mgr
-        .retry_run(run_id)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let run = state.mgr.retry_run(run_id).await.map_err(|e| {
+        let msg = format!("{e:#}");
+        if msg.contains("not found") {
+            ApiError::not_found(msg)
+        } else {
+            ApiError::bad_request(msg)
+        }
+    })?;
     Ok((StatusCode::CREATED, Json(run)))
 }
 
@@ -1464,6 +1467,7 @@ async fn start_run(
             crate::runs::RunLaunch {
                 routed: Some(decision),
                 options: req.options,
+                ..Default::default()
             },
         )
         .await?;

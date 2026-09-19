@@ -1396,6 +1396,13 @@ async fn failed_run_one_click_retry() {
         "the retry continues in the dead attempt's workspace"
     );
     assert_eq!(retried["params"]["options"]["mode"], "auto");
+    // The original ask is preserved verbatim — chained retries must
+    // not grow the record.
+    assert_eq!(
+        retried["params"]["prompt"], "custom launch prompt",
+        "params.prompt must stay the original: {}",
+        retried["params"]["prompt"]
+    );
     let root = std::path::Path::new(&old_ws)
         .ancestors()
         .nth(2)
@@ -1407,10 +1414,27 @@ async fn failed_run_one_click_retry() {
             .join(format!("run-{retry_id}.jsonl")),
     )
     .unwrap_or_else(|e| panic!("retry transcript unreadable: {e} (root {})", root.display()));
+    // The crash snapshot rides as CONTEXT (context_injected), the
+    // user_message stays the clean original ask — session previews
+    // and distillation never see injected text as user speech.
+    let lines: Vec<serde_json::Value> = transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let ctx = lines
+        .iter()
+        .find(|l| l["event"]["type"] == "context_injected");
     assert!(
-        transcript.contains("retry context") && transcript.contains("about to crash"),
-        "the crash snapshot rides the retry prompt: {}",
-        &transcript[..transcript.len().min(400)]
+        ctx.is_some_and(|l| {
+            let r = l["event"]["render"].as_str().unwrap_or_default();
+            r.contains("retry context") && r.contains("about to crash")
+        }),
+        "the crash snapshot rides the ContextInjected render"
+    );
+    let user = lines.iter().find(|l| l["event"]["type"] == "user_message");
+    assert!(
+        user.is_some_and(|l| l["event"]["text"] == "custom launch prompt"),
+        "user_message must be the clean original ask, not the composed prompt"
     );
 
     // A completed run is not retryable — "run again" is a different

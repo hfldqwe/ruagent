@@ -201,6 +201,18 @@ function EventRow({ line }: { line: EventLine }) {
         </div>
       );
     }
+    case "user_message": {
+      // The original ask (injection rides separately as context_injected).
+      const text = String(e.text ?? "");
+      return (
+        <details className="ev inject">
+          <summary>
+            <span className="ev-icon"><Icon name="user" size={13} /></span> {t("timeline.asked")}
+          </summary>
+          <pre className="raw">{text}</pre>
+        </details>
+      );
+    }
     case "context_injected": {
       const render = String(e.render);
       const blocks = (render.match(/<(\w+)>/g) ?? []).map((b) => b.slice(1, -1));

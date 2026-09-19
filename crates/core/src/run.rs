@@ -62,6 +62,16 @@ impl RunStatus {
                 | RunStatus::Interrupted
         )
     }
+
+    /// Whether a one-click retry may replay this run (design §8.3
+    /// crash row): dead-but-not-delivered states. Completed is
+    /// "run again", a different gesture.
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Failed | RunStatus::Interrupted | RunStatus::Cancelled
+        )
+    }
 }
 
 /// Why a run stopped. Mirrors ACP stop reasons plus our own causes.

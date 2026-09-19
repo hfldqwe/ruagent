@@ -59,6 +59,15 @@ pub struct RunLaunch {
     /// Canonical option defaults applied after `session/new`:
     /// `mode` (permission mode) / `effort` (thinking level).
     pub options: std::collections::BTreeMap<String, String>,
+    /// The prompt to RECORD as the original ask (defaults to the
+    /// incoming one). A retry composes context onto the original but
+    /// must still record the original — chained retries would grow
+    /// the record monotonically otherwise.
+    pub original_prompt: Option<String>,
+    /// Context prepended to the injection render (visible as
+    /// ContextInjected, not as user speech): a retry's crash snapshot
+    /// rides here, keeping session previews and distillation clean.
+    pub context_prefix: Option<String>,
 }
 
 /// One harness's concurrency gate (design §8.3): a counting semaphore
@@ -516,13 +525,19 @@ impl RunManager {
         // use): a run against a ROLE must carry the role prompt, not
         // just the runtime behind it.
         let role = card.prompt.clone();
+        let context_prefix = launch.context_prefix.clone();
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
         // Canonical session-option defaults (issue #36): mode / effort.
         run.params.options = launch.options;
         // The original prompt (pre-injection): a retry replays it
         // faithfully (design §8.3 crash row).
-        run.params.prompt = Some(prompt.clone());
+        run.params.prompt = Some(
+            launch
+                .original_prompt
+                .clone()
+                .unwrap_or_else(|| prompt.clone()),
+        );
 
         // Concurrency gate (design §8.3): a free slot spawns now; a
         // busy one queues the run — the row lands as Queued so the
@@ -634,6 +649,16 @@ impl RunManager {
             run.workspace = Some(cwd.to_string_lossy().into_owned());
 
             let mut injection = render_run_injection(&db, &task).await;
+            // Attempt-history context (a retry's crash snapshot) rides
+            // as context — visible in the ContextInjected render, never
+            // as user speech.
+            if let Some(prefix) = context_prefix.as_deref().filter(|p| !p.trim().is_empty()) {
+                injection = if injection.is_empty() {
+                    prefix.to_string()
+                } else {
+                    format!("{prefix}\n---\n{injection}")
+                };
+            }
             // Role identity first, then memory context (the chat
             // contract, mirrored for runs).
             if let Some(role) = role.as_deref().filter(|r| !r.trim().is_empty()) {
@@ -653,7 +678,10 @@ impl RunManager {
             }
             run.updated_at = chrono::Utc::now();
             let _ = db.update_run(&run).await;
-            if task.status == TaskStatus::Pending {
+            // A task goes (back) to in_progress whenever a run of it is
+            // live — a retry on an already-Done task must not run under
+            // a Done status.
+            if matches!(task.status, TaskStatus::Pending | TaskStatus::Done) {
                 let _ = db.update_task_status(task.id, TaskStatus::InProgress).await;
             }
 
@@ -706,10 +734,7 @@ impl RunManager {
             .await?
             .with_context(|| format!("run {run_id} not found"))?;
         anyhow::ensure!(
-            matches!(
-                old.status,
-                RunStatus::Failed | RunStatus::Interrupted | RunStatus::Cancelled
-            ),
+            old.status.is_retryable(),
             "only failed, interrupted or cancelled runs can be retried (this one is {:?})",
             old.status
         );
@@ -724,15 +749,16 @@ impl RunManager {
             .find(|c| c.id == old.params.agent)
             .with_context(|| "the retried run's agent is no longer registered")?;
 
-        let prompt = old
+        // The original ask: recorded as-is even though the retry
+        // composes context onto it (chained retries must not grow it).
+        let original = old
             .params
             .prompt
             .clone()
             .unwrap_or_else(|| task.intent.clone());
-        let prompt = match retry_context(&self.root, &old) {
-            Some(ctx) => format!("{ctx}\n---\n{prompt}"),
-            None => prompt,
-        };
+        // The crash snapshot rides as CONTEXT (ContextInjected), not as
+        // user speech — session previews and distillation stay clean.
+        let context_prefix = retry_context(&self.transcripts_dir(), &old);
         // The workspace carries the crashed attempt's half-written
         // work: the retry continues in place.
         let workspace = old
@@ -744,7 +770,7 @@ impl RunManager {
         self.start_run(
             &task,
             &card.name,
-            prompt,
+            original.clone(),
             self.mcp_for(&card),
             workspace,
             RunLaunch {
@@ -754,6 +780,8 @@ impl RunManager {
                     rationale: Some(format!("retry of run {run_id}")),
                 }),
                 options: old.params.options.clone(),
+                original_prompt: Some(original),
+                context_prefix,
             },
         )
         .await
@@ -798,6 +826,7 @@ impl RunManager {
                     RunLaunch {
                         routed: Some(decision),
                         options: options.clone(),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -1067,14 +1096,17 @@ async fn supervise(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     };
-    // The transcript records what the agent was actually asked — the
-    // full prompt including injection and retry context — so a run
-    // trace is self-contained (chats already did this).
+    // The user_message event carries the ORIGINAL ask only — injected
+    // memory and retry context ride separately (ContextInjected / the
+    // dead attempt's transcript), the same contract chats use. Putting
+    // the composed prompt here leaked injection text into session
+    // previews and fed it back into distillation as user speech.
+    let asked = run.params.prompt.clone().unwrap_or_else(|| prompt.clone());
     emit(
         &mut transcript,
         &broadcast,
         &run,
-        RunEvent::UserMessage { text: prompt },
+        RunEvent::UserMessage { text: asked },
     );
     let mut driver = tokio::spawn(run_once(opts, ev_tx.clone(), ask_tx));
 
@@ -1276,6 +1308,12 @@ async fn supervise(
     // Finalize only AFTER the drain: a run that is terminal in the DB or
     // announced as Finished must have every event (including stragglers
     // that raced the prompt response) already appended and flushed.
+    // Straggler chunks appended after the driver arm snapshotted
+    // `result` must land in the persisted result too — the review round
+    // lost its entire final report to this ordering once.
+    if !result_text.is_empty() {
+        run.result = Some(result_text);
+    }
     transcript.flush()?;
     db.update_run(&run).await?;
     if run.status == RunStatus::Completed {
@@ -1451,39 +1489,61 @@ async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
 /// The crash snapshot for a retry (design §8.3): what the dead attempt
 /// last said, so the replacement run continues instead of restarting
 /// from zero. Bounded — the tail, not the whole transcript.
-fn retry_context(root: &std::path::Path, old: &Run) -> Option<String> {
-    let path = transcript_path(root.join("data").join("transcripts"), &old.id);
+fn retry_context(transcripts: &std::path::Path, old: &Run) -> Option<String> {
+    let path = transcript_path(transcripts, &old.id);
     let lines = ruagent_store::read_transcript(&path).ok()?;
     let mut text = String::new();
+    let mut last_tool = None;
     for line in &lines {
-        if let ruagent_core::RunEvent::AgentMessageChunk { content } = &line.event {
-            for block in content {
-                if let Some(t) = block.as_text() {
-                    text.push_str(t);
+        match &line.event {
+            ruagent_core::RunEvent::AgentMessageChunk { content } => {
+                for block in content {
+                    if let Some(t) = block.as_text() {
+                        text.push_str(t);
+                    }
                 }
             }
+            // Where a run died often shows in its last tool call, not
+            // its last words.
+            ruagent_core::RunEvent::ToolCall { title, .. } => last_tool = Some(title.clone()),
+            _ => {}
         }
     }
-    if text.is_empty() {
-        return None;
-    }
-    // Keep the tail (the last thing the agent was doing), bounded —
-    // snapped to a char boundary (a byte cut would split a multi-byte
-    // character and panic).
-    let start = text.len().saturating_sub(1500);
-    let start = text
-        .char_indices()
-        .map(|(i, _)| i)
-        .find(|i| *i >= start)
-        .unwrap_or(start);
-    let tail = &text[start..];
     let why = old
         .error
         .as_deref()
         .map(|e| format!(" — {e}"))
         .unwrap_or_default();
+    if text.is_empty() {
+        // Died before saying anything: the death reason still rides
+        // (an early-death retry must not lose it).
+        return old
+            .error
+            .as_deref()
+            .map(|_| {
+                format!(
+                    "[retry context — the previous attempt (run {}) died{why} before producing any output.]",
+                    old.id
+                )
+            });
+    }
+    // Keep the tail (the last thing the agent was doing), bounded in
+    // CHARACTERS with a visible truncation marker — the repo's
+    // injection convention (memory/inject.rs, compose_handoff, judge).
+    const BOUND: usize = 1500;
+    let total = text.chars().count();
+    let tail = if total > BOUND {
+        let skipped = total - BOUND;
+        let kept: String = text.chars().skip(skipped).collect();
+        format!("…[+{skipped} chars truncated] {kept}")
+    } else {
+        text
+    };
+    let tool = last_tool
+        .map(|t| format!(" Last tool call: {t}."))
+        .unwrap_or_default();
     Some(format!(
-        "[retry context — the previous attempt (run {}) died{why}. Its last output before dying:] {tail}",
+        "[retry context — the previous attempt (run {}) died{why}.{tool} Its last output before dying:] {tail}",
         old.id
     ))
 }

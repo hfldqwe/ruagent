@@ -120,7 +120,14 @@ export interface Run {
   id: string;
   task_id: string;
   status: string;
-  params: { agent: string; model: string | null };
+  params: {
+    agent: string;
+    model: string | null;
+    /** Canonical session-option defaults (mode / effort). */
+    options?: Record<string, string>;
+    /** The original launch prompt (None on pre-field rows). */
+    prompt?: string | null;
+  };
   result: string | null;
   acp_session_id: string | null;
   workspace: string | null;

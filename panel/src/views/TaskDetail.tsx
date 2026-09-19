@@ -35,6 +35,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [judgement, setJudgement] = useState<Judgement | null>(null);
   const [judgeAgent, setJudgeAgent] = useState("");
   const [judging, setJudging] = useState(false);
+  const [retrying, setRetrying] = useState<string | null>(null);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [launching, setLaunching] = useState(false);
@@ -250,14 +251,17 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
               {["failed", "interrupted", "cancelled"].includes(r.status) ? (
                 <Button
                   size="small"
+                  loading={retrying === r.id}
                   onClick={async (e) => {
                     e.stopPropagation();
+                    setRetrying(r.id);
                     try {
                       await api.retryRun(r.id);
                       toast("ok", t("toast.retrying"));
                     } catch (err) {
                       toast("err", String(err));
                     }
+                    setRetrying(null);
                     refresh();
                   }}
                 >
