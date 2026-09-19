@@ -1635,6 +1635,237 @@ async fn failed_run_one_click_retry() {
 }
 
 // ---------------------------------------------------------------------------
+// Chat: stop the in-flight reply (user cancellation, UX audit §4)
+// ---------------------------------------------------------------------------
+
+/// A chat's transcript lines (the same events the SSE route replays),
+/// empty while the file does not exist yet.
+fn chat_transcript(root: &std::path::Path, chat_id: &str) -> Vec<serde_json::Value> {
+    let path = root
+        .join("data")
+        .join("transcripts")
+        .join(format!("run-{chat_id}.jsonl"));
+    std::fs::read_to_string(&path)
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll a chat's transcript until `pred` holds over the parsed lines.
+async fn poll_transcript<F>(
+    root: &std::path::Path,
+    chat_id: &str,
+    ceiling: Duration,
+    what: &str,
+    pred: F,
+) -> Vec<serde_json::Value>
+where
+    F: Fn(&[serde_json::Value]) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + ceiling;
+    loop {
+        let lines = chat_transcript(root, chat_id);
+        if pred(&lines) {
+            return lines;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}, transcript:\n{lines:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Stopping mid-reply lands a `Stopped{cancelled}` within seconds (the
+/// agent answers the cancelled prompt immediately, not after its 10s
+/// wait), and the session survives for the next prompt.
+#[tokio::test]
+async fn chat_stop_cancels_inflight_reply() {
+    // A role card (its prompt guarantees a ContextInjected event on the
+    // first prompt) on the slowreply mock: every reply is 10s away
+    // unless cancelled.
+    let bin = mock_bin();
+    let d = start_daemon(
+        &format!(
+            "[runtime.slow]\nharness = \"mock\"\ncommand = \"{bin} --behavior slowreply\"\n\n\
+             [agent.talker]\nruntimes = [\"slow\"]\nruntime = \"slow\"\nprompt = \"you are the slow one\"\n"
+        ),
+        "default = \"ask\"\n",
+    )
+    .await;
+    let http = reqwest::Client::new();
+
+    let chat: serde_json::Value = http
+        .post(format!("{}/api/v1/chat", d.url))
+        .json(&serde_json::json!({ "agent": "talker" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = chat["id"].as_str().unwrap().to_string();
+
+    // Session up, then a prompt whose reply is 10s away.
+    poll_transcript(
+        &d._root,
+        &id,
+        Duration::from_secs(10),
+        "chat running",
+        |l| {
+            l.iter()
+                .any(|e| e["event"]["type"] == "state_changed" && e["event"]["status"] == "running")
+        },
+    )
+    .await;
+    http.post(format!("{}/api/v1/chat/{id}/messages", d.url))
+        .json(&serde_json::json!({ "text": "hello" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    poll_transcript(
+        &d._root,
+        &id,
+        Duration::from_secs(10),
+        "prompt round started",
+        |l| l.iter().any(|e| e["event"]["type"] == "context_injected"),
+    )
+    .await;
+
+    // Stop mid-flight: the cancelled stop reason must arrive within 3s.
+    let status = http
+        .post(format!("{}/api/v1/chat/{id}/stop", d.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, axum::http::StatusCode::OK);
+    poll_transcript(
+        &d._root,
+        &id,
+        Duration::from_secs(3),
+        "cancelled stop",
+        |l| {
+            l.iter().any(|e| {
+                e["event"]["type"] == "stopped" && e["event"]["stop_reason"] == "cancelled"
+            })
+        },
+    )
+    .await;
+
+    // The session survived: another prompt still gets its (slow) reply.
+    http.post(format!("{}/api/v1/chat/{id}/messages", d.url))
+        .json(&serde_json::json!({ "text": "still there?" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    poll_transcript(
+        &d._root,
+        &id,
+        Duration::from_secs(20),
+        "second reply",
+        |l| {
+            l.iter()
+                .any(|e| e["event"]["type"] == "stopped" && e["event"]["stop_reason"] == "end_turn")
+        },
+    )
+    .await;
+
+    // Cleanup so the mock process exits.
+    let _ = http
+        .delete(format!("{}/api/v1/chat/{id}", d.url))
+        .send()
+        .await;
+}
+
+/// Stop is idempotent: unknown ids are 404, and with no prompt in flight
+/// it is a 200 no-op — no stop event, session still answers afterwards.
+#[tokio::test]
+async fn chat_stop_without_inflight_prompt_is_a_noop() {
+    let d = start_daemon(&mock_agent_toml("echo"), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+
+    // Unknown chat id: 404.
+    let ghost = ruagent_core::RunId::generate().to_string();
+    let status = http
+        .post(format!("{}/api/v1/chat/{ghost}/stop", d.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+    let chat: serde_json::Value = http
+        .post(format!("{}/api/v1/chat", d.url))
+        .json(&serde_json::json!({ "agent": "mock" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = chat["id"].as_str().unwrap().to_string();
+
+    // Session up, nothing in flight.
+    poll_transcript(
+        &d._root,
+        &id,
+        Duration::from_secs(10),
+        "chat running",
+        |l| {
+            l.iter()
+                .any(|e| e["event"]["type"] == "state_changed" && e["event"]["status"] == "running")
+        },
+    )
+    .await;
+    let status = http
+        .post(format!("{}/api/v1/chat/{id}/stop", d.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // No side effects: no stop event appears…
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let lines = chat_transcript(&d._root, &id);
+    assert!(
+        !lines.iter().any(|e| e["event"]["type"] == "stopped"),
+        "stop with no prompt in flight must not emit a stop event:\n{lines:#?}"
+    );
+
+    // …and the session still answers a prompt normally.
+    http.post(format!("{}/api/v1/chat/{id}/messages", d.url))
+        .json(&serde_json::json!({ "text": "hello" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    poll_transcript(&d._root, &id, Duration::from_secs(10), "echo reply", |l| {
+        l.iter()
+            .any(|e| e["event"]["type"] == "stopped" && e["event"]["stop_reason"] == "end_turn")
+    })
+    .await;
+
+    let _ = http
+        .delete(format!("{}/api/v1/chat/{id}", d.url))
+        .send()
+        .await;
+}
+
+// ---------------------------------------------------------------------------
 // Role identity in runs (the specialist model)
 // ---------------------------------------------------------------------------
 

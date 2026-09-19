@@ -3,10 +3,11 @@
 //! via `session/set_config_option` (agents that don't support it keep their
 //! default; the caller surfaces the warning).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, McpServer, NewSessionRequest, PromptRequest,
+    ContentBlock, ErrorCode, InitializeRequest, McpServer, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigSelectOptions, SessionNotification,
@@ -147,6 +148,12 @@ pub enum ChatCommand {
         text: String,
         context: Option<String>,
     },
+    /// Cancel the in-flight prompt: sends `$/cancel_request` for the
+    /// outstanding request; the session reports `Stopped{cancelled}`
+    /// when the agent answers. The session itself stays alive — the
+    /// conversation continues with the next prompt. Idempotent: with no
+    /// prompt in flight this is a no-op.
+    Stop,
     /// Set one advertised session option mid-session (no restart, context
     /// preserved). `id` "model" addresses the agent's model option. Replies
     /// with the refreshed option list, or the agent's rejection message.
@@ -455,8 +462,19 @@ async fn supervise_chat(
             });
 
             // The conversation loop: each Prompt keeps the same session —
-            // that's the whole point (terminal-like multi-turn).
-            while let Some(cmd) = cmd_rx.recv().await {
+            // that's the whole point (terminal-like multi-turn). A prompt's
+            // response is awaited with the command channel still live so
+            // Stop can cancel it mid-flight; commands that arrive while a
+            // prompt runs are buffered and processed in arrival order.
+            let mut pending: VecDeque<ChatCommand> = VecDeque::new();
+            loop {
+                let cmd = match pending.pop_front() {
+                    Some(cmd) => cmd,
+                    None => match cmd_rx.recv().await {
+                        Some(cmd) => cmd,
+                        None => break,
+                    },
+                };
                 match cmd {
                     ChatCommand::Prompt { text, context } => {
                         // First-prompt platform memory: recorded as a
@@ -480,11 +498,55 @@ async fn supervise_chat(
                             session_id.clone(),
                             vec![ContentBlock::Text(TextContent::new(outgoing))],
                         );
-                        let resp = connection.send_request(prompt).block_task().await;
+                        let sent = connection.send_request(prompt);
+                        // `block_task` consumes the handle, so keep the
+                        // request id: Stop arrives while the response
+                        // future is alive, and the only way to cancel then
+                        // is `$/cancel_request` by id (SDK cancellation
+                        // docs — the peer always answers, normally or with
+                        // -32800).
+                        let request_id = sent.id().clone();
+                        let mut response = std::pin::pin!(sent.block_task());
+                        let mut cancelled = false;
+                        let mut cmd_open = true;
+                        let resp = loop {
+                            tokio::select! {
+                                // Once cancelled (or with no senders left),
+                                // only the response matters; fresh commands
+                                // stay queued in the channel.
+                                cmd = cmd_rx.recv(), if cmd_open && !cancelled => {
+                                    match cmd {
+                                        Some(ChatCommand::Stop) => {
+                                            if let Err(e) =
+                                                connection.send_cancel_request(request_id.clone())
+                                            {
+                                                tracing::warn!(
+                                                    target: "ruagent::acp",
+                                                    error = %e,
+                                                    "sending $/cancel_request failed"
+                                                );
+                                            }
+                                            cancelled = true;
+                                        }
+                                        Some(other) => pending.push_back(other),
+                                        None => cmd_open = false,
+                                    }
+                                }
+                                resp = &mut response => break resp,
+                            }
+                        };
                         match resp {
                             Ok(r) => {
                                 let _ = events.send(RunEvent::Stopped {
                                     stop_reason: crate::map::stop_reason(r.stop_reason),
+                                });
+                            }
+                            // The agent honoured our cancellation (or
+                            // cancelled on its own): a stop, not an error —
+                            // the session stays usable for the next prompt.
+                            Err(e) if e.code == ErrorCode::RequestCancelled => {
+                                let _ = events.send(RunEvent::Stopped {
+                                    stop_reason: ruagent_core::StopReason::Cancelled,
                                 });
                             }
                             Err(e) => {
@@ -515,6 +577,11 @@ async fn supervise_chat(
                             Err(e) => Err(format!("{e}")),
                         };
                         let _ = reply.send(answer);
+                    }
+                    ChatCommand::Stop => {
+                        // No prompt in flight: nothing to cancel (idempotent
+                        // no-op — the in-flight case lives in the Prompt
+                        // arm's response wait).
                     }
                     ChatCommand::Shutdown => break,
                 }
