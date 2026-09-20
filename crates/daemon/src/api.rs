@@ -111,6 +111,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/distill",
             get(distill_policy_get).put(distill_policy_put),
         )
+        .route("/api/v1/directory/pick", post(pick_directory))
         .route("/api/v1/chat", post(chat_start).get(chat_list))
         .route("/api/v1/chats", get(chats_history))
         .route("/api/v1/chat/{id}/messages", post(chat_message))
