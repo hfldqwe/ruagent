@@ -1903,11 +1903,18 @@ async fn pick_directory() -> Json<serde_json::Value> {
     // fails silently (RPC_E_CHANGED_MODE → None, no dialog) on a
     // thread whose COM apartment differs. The async variant opens the
     // dialog on a dedicated fresh thread — the documented fix.
-    let handle = rfd::AsyncFileDialog::new()
-        .set_title("选择项目目录")
-        .pick_folder()
-        .await;
-    let path = handle.map(|h| h.path().to_path_buf());
+    #[cfg(windows)]
+    let path = {
+        let handle = rfd::AsyncFileDialog::new()
+            .set_title("选择项目目录")
+            .pick_folder()
+            .await;
+        handle.map(|h| h.path().to_path_buf())
+    };
+    // No native picker off-Windows (rfd's Linux backends all need
+    // compile-time wayland/GTK) — the panel treats null as cancelled.
+    #[cfg(not(windows))]
+    let path: Option<std::path::PathBuf> = None;
     Json(serde_json::json!({ "path": path }))
 }
 
