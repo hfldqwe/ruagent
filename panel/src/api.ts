@@ -693,6 +693,10 @@ export const api = {
   chatMessage: (id: string, text: string) =>
     post(`/api/v1/chat/${id}/messages`, { text }),
   chatStop: (id: string) => post(`/api/v1/chat/${id}/stop`),
+  pickDirectory: () =>
+    post("/api/v1/directory/pick").then(
+      (r) => r.json() as Promise<{ path: string | null }>,
+    ),
   chatResume: (id: string) =>
     post(`/api/v1/chat/${id}/resume`).then(
       (r) =>

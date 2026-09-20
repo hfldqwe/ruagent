@@ -6,7 +6,7 @@
 // past conversations (live ones reattach and stream).
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Input, Select } from "antd";
+import { Button, Input, Select, Tooltip } from "antd";
 import {
   api,
   isRoleAgent,
@@ -193,29 +193,23 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [project, setProject] = useState(
     () => localStorage.getItem("chat.cwd") ?? "",
   );
-  const [projects, setProjects] = useState<string[]>([]);
   const [sessionQuery, setSessionQuery] = useState("");
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  /** Explicitly added workspaces (the folder picker) — persisted; the
+   * rendered groups are these UNION the cwd of recorded chats. */
+  const [workspaces, setWorkspaces] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("chat.workspaces") ?? "[]") as string[];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem("chat.workspaces", JSON.stringify(workspaces));
+  }, [workspaces]);
   useEffect(() => {
     localStorage.setItem("chat.cwd", project);
   }, [project]);
-  // Known projects: distinct values from the sessions index, plus the
-  // cwd of recorded chats (they are the same kind of workspace).
-  useEffect(() => {
-    api
-      .sessions()
-      .then((all) => {
-        const seen = new Set<string>();
-        for (const sess of all) {
-          if (sess.project) seen.add(sess.project);
-        }
-        for (const h of history ?? []) {
-          if (h.cwd) seen.add(h.cwd);
-        }
-        setProjects([...seen].sort());
-      })
-      .catch(() => setProjects([]));
-  }, [history]);
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<(() => void) | null>(null);
@@ -636,6 +630,29 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     setAgent(name);
   };
 
+  /** New session bound to a specific workspace (the group-head +). */
+  const newSessionIn = (ws: string) => {
+    setProject(ws);
+    newChat();
+    setSideOpen(false);
+  };
+
+  /** The folder button: system directory picker via the daemon (the
+   * browser cannot read absolute local paths — a local process can),
+   * the picked directory becomes a workspace and the active project. */
+  const pickWorkspace = async () => {
+    try {
+      const r = await api.pickDirectory();
+      if (r.path) {
+        setWorkspaces((w) => (w.includes(r.path!) ? w : [...w, r.path!]));
+        setProject(r.path);
+        toast("ok", t("chat.workspaceAdded", { name: r.path.replace(/.*[/]/, "") }));
+      }
+    } catch (e) {
+      toast("err", String(e));
+    }
+  };
+
   const modelChoices =
     options?.find((o) => o.category === "model" || o.id === "model")?.choices ??
     [];
@@ -776,6 +793,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       (h.agent ?? "").toLowerCase().includes(q),
     );
     const by = new Map<string, ChatHistoryEntry[]>();
+    // Explicit workspaces exist even with no sessions yet (暂无会话).
+    for (const ws of workspaces) {
+      if (!by.has(ws)) by.set(ws, []);
+    }
     for (const h of filtered) {
       const key = h.cwd?.trim() || "";
       const list = by.get(key) ?? [];
@@ -783,6 +804,8 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       by.set(key, list);
     }
     const cur = project.trim().toLowerCase();
+    // A search filters visible rows; workspaces without hits keep
+
     return [...by.entries()].sort((a, b) => {
       const rank = (k: string) =>
         k.toLowerCase() === cur ? 0 : k === "" ? 2 : 1;
@@ -797,31 +820,26 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   return (
     <div className={`chat-layout${railCollapsed ? " rail-collapsed" : ""}`}>
       <aside className={`chat-side${sideOpen ? " open" : ""}`}>
-        <Button
-          block
-          size="small"
-          type="primary"
-          ghost
-          onClick={() => {
-            newChat();
-            setSideOpen(false);
-          }}
-        >
-          + {t("chat.new")}
-        </Button>
-        <label className="chat-field" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <span>{t("chat.project")}</span>
-          <Select
-            mode="tags"
-            maxCount={1}
-            value={project ? [project] : []}
-            onChange={(v) => setProject(v[v.length - 1] ?? "")}
-            style={{ width: "100%" }}
-            placeholder={t("chat.projectPh")}
-            options={projects.map((x) => ({ value: x, label: x }))}
-            tokenSeparators={[","]}
-          />
-        </label>
+        <div className="row" style={{ gap: 6 }}>
+          <Button
+            block
+            size="small"
+            type="primary"
+            ghost
+            style={{ flex: 1 }}
+            onClick={() => {
+              newChat();
+              setSideOpen(false);
+            }}
+          >
+            + {t("chat.new")}
+          </Button>
+          <Tooltip title={t("chat.addWorkspace")}>
+            <Button size="small" onClick={pickWorkspace} aria-label={t("chat.addWorkspace")}>
+              <Icon name="folder" size={14} />
+            </Button>
+          </Tooltip>
+        </div>
         <Input
           allowClear
           value={sessionQuery}
@@ -830,6 +848,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           size="small"
         />
         <div className="chat-side-list">
+          <div className="chat-ws-title">{t("chat.workspaces")}</div>
           {history === null ? (
             <Spinner />
           ) : historyGroups.length === 0 ? (
@@ -841,11 +860,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
               return (
                 <div key={key || "none"} className="chat-group">
                   <div className="chat-group-head" title={cwd || undefined}>
-                    <Icon name="db" size={12} />
+                    <Icon name="folder" size={12} />
                     <span className="chat-group-name">
                       {cwd ? cwd.replace(/.*[\\/]/, "") : t("chat.noProject")}
                     </span>
                     <span className="muted" style={{ fontSize: 11 }}>{items.length}</span>
+                    <span className="grow" />
+                    <Tooltip title={t("chat.newSessionHere")}>
+                      <button
+                        className="ws-new-btn"
+                        aria-label={t("chat.newSessionHere")}
+                        onClick={() => newSessionIn(cwd)}
+                      >
+                        <Icon name="plus" size={12} />
+                      </button>
+                    </Tooltip>
                   </div>
                   {shown.map((h) => (
                     <button
@@ -874,6 +903,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                       </span>
                     </button>
                   ))}
+                  {shown.length === 0 ? (
+                    <div className="chat-group-empty muted">{t("chat.noSessions")}</div>
+                  ) : null}
                   {items.length > shown.length ? (
                     <button
                       className="chat-group-more"

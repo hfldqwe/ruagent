@@ -1893,6 +1893,24 @@ async fn memory_backfill_embeddings(
 // Distillation: session → memories + graph (agent-run extraction)
 // ---------------------------------------------------------------------------
 
+/// Open the system directory picker and return the chosen path (null
+/// when cancelled). The browser cannot learn absolute local paths, but
+/// the daemon is a local process — the workspace picker goes through
+/// here. Interactive by design: nothing automated should call it.
+async fn pick_directory() -> Json<serde_json::Value> {
+    // AsyncFileDialog, not the sync API: rfd's sync pick_folder runs
+    // CoInitializeEx(APARTMENTTHREADED) on the CALLING thread, which
+    // fails silently (RPC_E_CHANGED_MODE → None, no dialog) on a
+    // thread whose COM apartment differs. The async variant opens the
+    // dialog on a dedicated fresh thread — the documented fix.
+    let handle = rfd::AsyncFileDialog::new()
+        .set_title("选择项目目录")
+        .pick_folder()
+        .await;
+    let path = handle.map(|h| h.path().to_path_buf());
+    Json(serde_json::json!({ "path": path }))
+}
+
 /// The live distillation policy (the settings card's source) plus the
 /// built-in extraction prompt for reference.
 async fn distill_policy_get(State(state): State<AppState>) -> Json<serde_json::Value> {

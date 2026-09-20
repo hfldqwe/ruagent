@@ -13,6 +13,9 @@ smoke = []
 
 [dependencies]
 ruzstd = "0.7"
+# Native folder picker (the workspace dialog — the browser cannot read
+# absolute local paths, but the daemon is a local process and can).
+rfd = "0.15"
 rusqlite = { version = "0.37", features = ["bundled"] }
 ruagent-core.workspace = true
 ruagent-acp.workspace = true
