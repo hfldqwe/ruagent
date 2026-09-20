@@ -8,6 +8,7 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Input, Popconfirm, Select, Tooltip } from "antd";
 import { api, isRoleAgent, type AgentInfo, type SessionOptionInfo } from "../api";
+import { brandClass, BrandMark } from "../brand";
 import { Empty, Modal, Spinner, useToast } from "../ui";
 import { useI18n } from "../i18n";
 import { Icon } from "../icons";
@@ -126,7 +127,11 @@ export function Runtimes() {
             return (
               <Card key={r.name} className="agent-card" size="small">
                 <div className="row">
-                  <span className="agent-avatar">{r.name.slice(0, 2).toUpperCase()}</span>
+                  {/* Brand logo tile — the runtime's own mark on a tint of
+                      its brand color (mock and unknowns stay neutral). */}
+                  <span className={`runtime-logo${brandClass(r.harness) ? " " + brandClass(r.harness) : ""}`}>
+                    <BrandMark harness={r.harness} size={20} mono fallback="bot" />
+                  </span>
                   <div>
                     <strong>{r.name}</strong>
                     <div className="muted">{r.harness}</div>

@@ -93,10 +93,21 @@ export function Sessions() {
       ) : (
         <div className="card">
           {filtered.map((s) => (
-            <button
+            /* role=button, not a real <button>: the row carries a distill
+               action inside it — nested buttons are invalid HTML and give
+               screen readers two activation targets for one row. */
+            <div
               key={s.key}
               className="row-btn"
+              role="button"
+              tabIndex={0}
               onClick={() => setOpen(s)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setOpen(s);
+                }
+              }}
             >
               <span
                 className="tag"
@@ -130,6 +141,7 @@ export function Sessions() {
                 <Button
                   size="small"
                   type="text"
+                  aria-label={t("sessions.distillHint")}
                   icon={<Icon name="zap" size={14} />}
                   loading={distilling === s.key}
                   onClick={(e) => {
@@ -138,7 +150,7 @@ export function Sessions() {
                   }}
                 />
               </Tooltip>
-            </button>
+            </div>
           ))}
         </div>
       )}

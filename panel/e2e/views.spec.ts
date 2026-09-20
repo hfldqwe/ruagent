@@ -36,9 +36,9 @@ test("chat renders pickers and the composer", async ({ page }) => {
   await page.goto("/#chat");
   await expect(page.locator(".composer")).toBeVisible();
   await expect(page.locator(".composer .send-btn")).toBeVisible();
-  // agent + model pickers always render; runtime / reasoning-effort
-  // appear only when the selected agent advertises them.
-  const pickers = page.locator(".chat-field");
+  // agent + model pickers always render (the composer's controls row);
+  // runtime / reasoning-effort appear only when the agent advertises them.
+  const pickers = page.locator(".composer-controls .ctl-select");
   await expect(pickers.first()).toBeVisible();
   expect(await pickers.count()).toBeGreaterThanOrEqual(2);
 });

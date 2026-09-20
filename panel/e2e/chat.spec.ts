@@ -22,23 +22,15 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
   await expect(page.locator(".view-bar h2")).toBeVisible();
 
   // The agent picker defaults to the first enabled agent; pick the mock.
-  // (The chat-bar's first field is the project directory now — target
-  // the agent field by its label.)
-  await page
-    .locator(".chat-bar .chat-field")
-    .filter({ hasText: /智能体|Agent/ })
-    .first()
-    .locator(".ant-select-input")
-    .click();
+  // (The composer's controls row carries the pickers — the agent select
+  // is the first one; target it by its field class, not by label text.)
+  await page.locator(".composer .ctl-agent").click();
   await page.locator(".ant-select-item-option").filter({ hasText: mock.name }).click();
 
   // The model picker fills from the runtime's advertised catalog —
   // first probe (a real mock process) then the cached copy. antd 6
   // shows the value in `.ant-select-content`.
-  const modelField = page
-    .locator(".chat-bar .chat-field")
-    .filter({ hasText: /模型|Model/ })
-    .first();
+  const modelField = page.locator(".composer .ctl-model");
   await expect(modelField.locator(".ant-select-content")).toHaveText("mock-pro", {
     timeout: 15_000,
   });

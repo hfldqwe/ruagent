@@ -1,5 +1,7 @@
-// IBM Plex Mono — the instrument-panel data face (bundled woff2, no
-// network at runtime; CJK falls back to the system face).
+// Faces are bundled (woff2, no network at runtime): Inter Variable is the
+// UI face for Latin; IBM Plex Mono is the data face. CJK falls back to the
+// system face.
+import "@fontsource-variable/inter";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";

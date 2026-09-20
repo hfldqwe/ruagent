@@ -4,7 +4,10 @@
    conversation, kanban, execution log, cards-as-rows) and consumes antd's
    CSS variables (--ant-*) so everything follows the theme toggle.
 
-   Design system: docs/design-study/multica-tokens.css.
+   Design language (2026-09-20 restyle): graphite neutrals with ONE
+   restrained indigo accent — quiet, flat, precise. Surfaces separate by
+   lightness and hairlines; static cards carry no shadows (only ephemeral
+   overlays do); no decorative glows or textures.
    - Surface ladder: app-shell (quiet frame) < page-canvas (lists, boards,
      conversations) < surface (bounded groups) < surface-raised (overlays)
      < hover < selected. antd carries canvas/surface/raised/border/text as
@@ -15,8 +18,6 @@
      sizes. Sizes carry their locked line-heights.
    - Radius ladder from one base (8): md 6 rows/menus, lg 8 controls,
      xl 12 cards/dialogs, 2xl 16 the composer.
-   - Shadows: --surface-shadow (1px whisper) / --ant-box-shadow (menus) /
-     --ant-box-shadow-secondary (dialogs).
    Keep the hexes in sync with theme.tsx.
    ========================================================================== */
 
@@ -40,15 +41,14 @@ body {
 
 :root,
 html[data-mode="dark"] {
-  --app-shell: #0c0c0e;
-  --surface-hover: #27272a;
-  --surface-selected: #2d2d31;
+  --app-shell: #0a0a0c;
+  --surface-hover: #232329;
+  --surface-selected: #2a2a33;
   --surface-shadow: 0 1px 2px rgba(0, 0, 0, 0.20), 0 1px 1px rgba(0, 0, 0, 0.16);
   --status-ok: #4aa651;
   --status-err: #ff6467;
   --status-warn: #cb9400;
   --status-idle: #85858c;
-  --noise-opacity: 0.04;
   /* Categorical kind palette for the graph canvas (3:1+ on surface). */
   --graph-person: #eb827b;
   --graph-org: #a495f0;
@@ -59,20 +59,19 @@ html[data-mode="dark"] {
   --graph-product: #60aaf3;
   --graph-protocol: #ca9d33;
   --graph-default: #85858c;
-  --graph-edge: rgba(255, 255, 255, 0.14);
-  --graph-edge-hi: rgba(255, 255, 255, 0.5);
+  --graph-edge: rgba(255, 255, 255, 0.34);
+  --graph-edge-hi: rgba(255, 255, 255, 0.55);
   --graph-label: #a6a6b0;
 }
 html[data-mode="light"] {
   --app-shell: #f3f3f4;
   --surface-hover: #f4f4f5;
-  --surface-selected: #eeeef0;
+  --surface-selected: #ededef;
   --surface-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 1px rgba(15, 23, 42, 0.03);
   --status-ok: #1c882d;
   --status-err: #e7000b;
   --status-warn: #9d6400;
   --status-idle: #81818b;
-  --noise-opacity: 0.022;
   --graph-person: #a74541;
   --graph-org: #6959ae;
   --graph-project: #007d86;
@@ -82,51 +81,21 @@ html[data-mode="light"] {
   --graph-product: #1f6cb0;
   --graph-protocol: #8b6100;
   --graph-default: #81818b;
-  --graph-edge: rgba(15, 23, 42, 0.15);
-  --graph-edge-hi: rgba(15, 23, 42, 0.5);
+  --graph-edge: rgba(15, 23, 42, 0.34);
+  --graph-edge-hi: rgba(15, 23, 42, 0.55);
   --graph-label: #5b5b64;
 }
 
-/* antd's dark algorithm remaps the seed colors to palette step 5, which
-   mutes them (#e79c27 -> #c78824) and leaves two slightly-different
-   ambers on one screen (component tokens like the menu's selected color
-   bypass the algorithm). Pin the variables back to the calibrated seeds
-   so buttons, links, tags and status marks agree; hover/active/tint
-   families stay on antd's derived ramp. Light mode passes seeds through
-   unchanged, so it needs no pin. */
+/* antd's dark algorithm remaps the seed colors to palette step 5; pin the
+   component-facing variables back to the calibrated seeds so buttons,
+   tags and status marks agree; hover/active/tint families stay on antd's
+   derived ramp. Light mode passes seeds through unchanged, so it needs
+   no pin. */
 html[data-mode="dark"] .ruagent {
-  --ant-color-primary: #e79c27;
+  --ant-color-primary: #5d6be0;
   --ant-color-success: #4aa651;
   --ant-color-warning: #cb9400;
   --ant-color-error: #ff6467;
-}
-
-/* Atmosphere: fine film grain — the panel reads as a physical object,
-   not a whiteboard. Both modes, barely-there opacity. */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  pointer-events: none;
-  opacity: var(--noise-opacity);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-
-/* Instrument title mark — a short amber tick left of every view title,
-   like a labeled channel on a mixing desk. */
-.view-bar h2::before {
-  content: "";
-  display: inline-block;
-  width: 3px;
-  height: 15px;
-  margin-right: 10px;
-  border-radius: 1.5px;
-  background: var(--ant-color-primary);
-  vertical-align: -2px;
-}
-html[data-mode="dark"] .view-bar h2::before {
-  box-shadow: 0 0 6px rgba(231, 156, 39, 0.35);
 }
 
 /* One orchestrated entrance per view (reduced-motion collapses it). */
@@ -146,8 +115,8 @@ html[data-mode="dark"] .view-bar h2::before {
 .time { font-size: 11px; line-height: 15px; color: var(--ant-color-text-quaternary); font-family: var(--ant-font-family-code, monospace); letter-spacing: 0.02em; }
 .nums, .time, .mono, table { font-variant-numeric: tabular-nums; }
 
-::selection { background: rgba(231, 156, 39, 0.28); }
-html[data-mode="light"] ::selection { background: rgba(156, 98, 15, 0.18); }
+::selection { background: rgba(93, 107, 224, 0.32); }
+html[data-mode="light"] ::selection { background: rgba(79, 90, 214, 0.18); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
@@ -167,7 +136,7 @@ html[data-mode="light"] ::selection { background: rgba(156, 98, 15, 0.18); }
 .brand-name { letter-spacing: 0.04em; font-weight: 650; font-size: 15px; line-height: 22px; color: var(--ant-color-text); }
 .brand-mark {
   background: var(--ant-color-primary);
-  color: #17130c;
+  color: #fff;
   font-weight: 700;
   border-radius: 6px;
   padding: 3px 7px;
@@ -175,7 +144,6 @@ html[data-mode="light"] ::selection { background: rgba(156, 98, 15, 0.18); }
   line-height: 16px;
   font-family: var(--ant-font-family-code, monospace);
 }
-html[data-mode="light"] .brand-mark { color: #fff; }
 
 /* Sider: sticky full-height column — nav grows, footer pinned to the
    bottom (antd's Sider children container is not a flex column, so we
@@ -215,7 +183,6 @@ html[data-mode="light"] .brand-mark { color: #fff; }
 .build-id { font-family: var(--ant-font-family-code, monospace); font-size: 11px; line-height: 15px; color: var(--ant-color-text-quaternary); }
 .conn { font-family: var(--ant-font-family-code, monospace); font-size: 11px; line-height: 15px; letter-spacing: 0.03em; }
 .conn.ok { color: var(--ant-color-success); }
-html[data-mode="dark"] .conn.ok { text-shadow: 0 0 6px rgba(74, 166, 81, 0.35); }
 .conn.err { color: var(--ant-color-error); }
 .nav-badge {
   background: var(--ant-color-error);
@@ -259,7 +226,6 @@ h3.sec { margin: 26px 0 12px; font-size: 13px; line-height: 18px; font-weight: 6
   background: var(--ant-color-bg-container);
   border: 1px solid var(--ant-color-border-secondary);
   border-radius: 12px;
-  box-shadow: var(--surface-shadow);
   padding: 14px 16px;
   margin-bottom: 12px;
 }
@@ -293,7 +259,6 @@ h3.sec { margin: 26px 0 12px; font-size: 13px; line-height: 18px; font-weight: 6
 .card > div + div > .row-btn { box-shadow: 0 -1px 0 0 var(--ant-color-border-secondary); }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
-html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
 
 .pill {
   border: 1px solid var(--ant-color-border);
@@ -331,6 +296,9 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
   .row-btn .tag, .row .tag { max-width: 30%; }
 }
 .tag.ok { color: var(--ant-color-success); border-color: var(--ant-color-success-border); background: var(--ant-color-success-bg); }
+/* Light success-on-tint drops under 4.5:1 (audit 2026-09-20) — pin the
+   darker reading green for text usage. */
+html[data-mode="light"] .tag.ok { color: #14691f; }
 .tag.warn { color: var(--ant-color-warning); border-color: var(--ant-color-warning-border); background: var(--ant-color-warning-bg); }
 .tag.err { color: var(--ant-color-error); border-color: var(--ant-color-error-border); background: var(--ant-color-error-bg); }
 
@@ -441,7 +409,6 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
   background: var(--ant-color-bg-container);
   border: 1px solid var(--ant-color-border-secondary);
   border-radius: 12px;
-  box-shadow: var(--surface-shadow);
   display: flex; flex-direction: column;
   overflow: hidden;
 }
@@ -647,7 +614,6 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
   background: var(--ant-color-bg-container);
   border: 1px solid var(--ant-color-border-secondary);
   border-radius: 12px;
-  box-shadow: var(--surface-shadow);
   touch-action: none;
 }
 .graph-hint {
@@ -685,7 +651,10 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
   background: var(--ant-color-primary-bg);
   border: 1px solid var(--ant-color-primary-border);
   border-radius: 8px;
-  font-weight: 700; color: var(--ant-color-primary); font-size: 12px; line-height: 16px;
+  /* The bright indigo (link grade) keeps the monogram 5:1+ on the tint —
+     the fill-grade seed is a background color, not a text color. */
+  color: var(--ant-color-link);
+  font-weight: 700; font-size: 12px; line-height: 16px;
   font-family: var(--ant-font-family-code, monospace);
 }
 .agent-stats { display: flex; gap: 18px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--ant-color-border-secondary); }
@@ -696,19 +665,8 @@ html[data-mode="dark"] .dot { box-shadow: 0 0 4px 1px currentColor; }
 
 /* Home ---------------------------------------------------------------- */
 
-.home-hero { margin-bottom: 24px; position: relative; }
+.home-hero { margin-bottom: 24px; }
 .home-hero .row { flex-wrap: wrap; }
-html[data-mode="dark"] .home-hero::before {
-  content: "";
-  position: absolute;
-  /* No right bleed: the gradient sits at 18% left, and a negative right
-     inset inflates documentElement.scrollWidth — sideways scroll for a
-     decoration. */
-  inset: -60px 0 auto -40px;
-  height: 260px;
-  background: radial-gradient(ellipse 60% 100% at 18% 0%, rgba(231, 156, 39, 0.055), transparent 70%);
-  pointer-events: none;
-}
 .home-hero h1, .home-hero p { position: relative; }
 .home-hero h1 {
   font-size: 24px; line-height: 32px; font-weight: 650; letter-spacing: -0.02em;
@@ -736,18 +694,16 @@ html[data-mode="dark"] .home-hero::before {
   background: var(--ant-color-bg-container);
   border: 1px solid var(--ant-color-border-secondary);
   border-radius: 12px;
-  box-shadow: var(--surface-shadow);
   padding: 14px 16px;
   cursor: pointer;
   font: inherit;
   color: var(--ant-color-text);
   text-align: left;
-  transition: border-color 120ms, transform 120ms, box-shadow 120ms;
+  transition: border-color 120ms, transform 120ms;
 }
 .guide-card:hover {
   border-color: color-mix(in srgb, var(--ant-color-primary) 35%, var(--ant-color-border));
   transform: translateY(-1px);
-  box-shadow: var(--ant-box-shadow);
 }
 .guide-card strong { font-size: 14px; line-height: 20px; }
 .guide-card p { margin: 3px 0 0; font-size: 13px; line-height: 18px; color: var(--ant-color-text-tertiary); }
@@ -806,8 +762,8 @@ html[data-mode="dark"] .home-hero::before {
 }
 .mem-preview .time { display: block; margin-top: 2px; }
 
-/* antd Cards share the surface material: bordered + a 1px whisper. */
-.ant-card { box-shadow: var(--surface-shadow); }
+/* antd Cards share the surface material: hairline border, no shadow. */
+.ant-card { box-shadow: none; }
 
 /* Chat — the conversation is the canvas, the composer is raised -------- */
 
@@ -854,6 +810,9 @@ html[data-mode="dark"] .home-hero::before {
   flex-direction: column;
   padding-bottom: 8px;
 }
+/* Rail header: the primary new-session action + the add-workspace icon. */
+.chat-side-head { display: flex; align-items: center; gap: 4px; }
+.chat-side-head .icon-btn { flex: none; color: var(--ant-color-text-secondary); }
 .chat-side-list .row-btn { padding-block: 7px; }
 .chat-side-toggle { display: none; }
 .chat-side-backdrop { display: none; }
@@ -972,17 +931,47 @@ html[data-mode="dark"] .home-hero::before {
     max-height: none;
   }
 }
+/* Empty conversation: the composer block centers in the conversation
+   column — the canvas is the invitation, not a void. */
+.chat-wrap.is-empty { justify-content: center; }
+.chat-wrap.is-empty .chat-bottom { position: static; padding-top: 0; }
+.chat-hero {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 4px; text-align: center;
+  padding: 12px 16px 18px;
+}
+.chat-hero-mark {
+  width: 52px; height: 52px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 14px;
+  background: var(--ant-color-fill-tertiary);
+  border: 1px solid var(--ant-color-border-secondary);
+  color: var(--ant-color-text-secondary);
+  margin-bottom: 6px;
+}
+.chat-hero h3 { margin: 0; font-size: 17px; line-height: 24px; font-weight: 600; letter-spacing: -0.01em; }
+.chat-hero p { margin: 0; font-size: 13px; line-height: 18px; color: var(--ant-color-text-tertiary); max-width: 420px; }
+.chat-suggest { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
+.suggest-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--ant-color-border-secondary);
+  background: var(--ant-color-bg-container);
+  color: var(--ant-color-text-secondary);
+  border-radius: 999px;
+  padding: 5px 13px;
+  font: inherit; font-size: 12.5px; line-height: 17px;
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms;
+}
+.suggest-chip:hover { border-color: var(--ant-color-primary); color: var(--ant-color-text); }
+
 .chat-bottom {
   position: sticky;
   bottom: 0;
   padding-top: 10px;
   background: linear-gradient(180deg, transparent, var(--ant-color-bg-layout) 18px);
 }
-.chat-bar {
-  display: flex; gap: 8px; align-items: flex-end;
-  padding: 0 4px 10px;
-  flex-wrap: wrap;
-}
+/* Labeled-field layout (settings forms reuse it). */
 .chat-field { display: flex; flex-direction: column; gap: 4px; }
 .chat-field > span { font-size: 11px; line-height: 15px; color: var(--ant-color-text-quaternary); }
 
@@ -997,10 +986,9 @@ html[data-mode="dark"] .home-hero::before {
 .chat-msg.user {
   align-self: flex-end;
   max-width: 78%;
-  background: var(--ant-color-bg-container);
-  border: 1px solid var(--ant-color-border-secondary);
-  border-radius: 12px 12px 4px 12px;
-  padding: 9px 14px;
+  background: var(--ant-color-fill-tertiary);
+  border-radius: 14px 14px 4px 14px;
+  padding: 10px 14px;
   margin: 8px 0;
   white-space: pre-wrap;
   font-size: 14px; line-height: 22px;
@@ -1031,30 +1019,63 @@ html[data-mode="dark"] .home-hero::before {
 .chat-typing i:nth-child(3) { animation-delay: 0.3s; }
 @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.5; } 30% { transform: translateY(-3px); opacity: 1; } }
 
-.chat-input-bar { padding: 0 4px 2px; }
+/* The composer is a self-contained unit: the input row (textarea + send),
+   then a hairline-divided controls row (agent / model / mode / effort /
+   project) — the chat controls live WITH the input, not in a form above
+   the conversation. */
 .composer {
-  display: flex; align-items: flex-end; gap: 8px;
+  display: flex; flex-direction: column; gap: 4px;
   background: var(--ant-color-bg-elevated);
   border: 1px solid var(--ant-color-border);
   border-radius: 16px;
-  box-shadow: var(--surface-shadow);
-  padding: 8px 8px 8px 14px;
+  padding: 10px 10px 6px 14px;
   transition: border-color 120ms, box-shadow 120ms;
 }
 .composer:focus-within {
   border-color: var(--ant-color-primary);
-  box-shadow: var(--surface-shadow), 0 0 0 3px color-mix(in srgb, var(--ant-color-primary) 14%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ant-color-primary) 12%, transparent);
 }
+.composer-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer :where(textarea) {
   flex: 1; background: none; border: none; outline: none; resize: none;
   font-family: inherit; font-size: 15px; line-height: 24px;
   color: var(--ant-color-text);
   max-height: 180px;
+  padding: 2px 0;
 }
-.composer .send-btn { flex: none; width: 34px; height: 34px; padding: 0; }
+.composer .send-btn { flex: none; width: 32px; height: 32px; padding: 0; border-radius: 999px; }
 /* The send button's streaming-state swap: a quiet stop, not an alarm. */
 .composer .send-btn.stop-btn { color: var(--ant-color-error); border-color: var(--ant-color-error-border); }
 .composer .send-btn.stop-btn:hover { color: #fff; background: var(--ant-color-error); border-color: var(--ant-color-error); }
+
+/* Controls row: borderless mini selects — quiet until opened. */
+.composer-controls {
+  display: flex; align-items: center; gap: 0; flex-wrap: wrap;
+  border-top: 1px solid var(--ant-color-border-secondary);
+  padding-top: 2px;
+}
+.composer-controls .ctl-select { color: var(--ant-color-text-secondary); }
+.composer-controls .ctl-select:hover { color: var(--ant-color-text); }
+.composer-controls .ctl-select .ant-select-selector { padding-inline: 6px !important; }
+.composer-controls .ctl-select .ant-select-selection-item,
+.composer-controls .ctl-select .ant-select-selection-placeholder {
+  color: inherit;
+  font-size: 12px;
+  line-height: 18px;
+}
+.ctl-sep { width: 1px; height: 14px; background: var(--ant-color-border-secondary); margin: 0 6px; flex: none; }
+.sel-opt { display: inline-flex; align-items: center; gap: 6px; }
+/* The project chip: which directory the agent works in. */
+.ws-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  max-width: 220px;
+  font-size: 12px; line-height: 16px;
+  color: var(--ant-color-text-tertiary);
+  background: var(--ant-color-fill-tertiary);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+.ws-chip .ws-chip-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
 /* Session viewer (raw modal classes — kept hand-rolled) --------------- */
 
@@ -1173,6 +1194,15 @@ html[data-mode="dark"] .home-hero::before {
   color: var(--ant-color-text-quaternary);
 }
 
+/* Keyboard focus: one visible ring voice for the hand-rolled interactive
+   elements (antd components carry their own). */
+:is(.row-btn, .kanban-card, .guide-card, .suggest-chip, .brand, .kbd-hint,
+    .chat-group-more, .recall-stub-head, .tool-head, .mem-preview, .neighbor,
+    .ws-new-btn):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ant-color-primary) 65%, transparent);
+  outline-offset: 2px;
+}
+
 /* Scrollbars ---------------------------------------------------------- */
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -1229,7 +1259,7 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 10px 4px;
+  padding: 8px 8px 4px;
   font-size: 12px;
   line-height: 16px;
   font-weight: 600;
@@ -1242,6 +1272,17 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+.ws-count {
+  font-size: 11px; line-height: 15px;
+  color: var(--ant-color-text-quaternary);
+  font-variant-numeric: tabular-nums;
+}
+/* The workspace hue set is tuned for dark; on the light canvas several
+   fall under 3:1 as icon strokes (audit 2026-09-20) — darken them a
+   notch so the folders stay readable without a second palette. */
+html[data-mode="light"] .ws-folder { filter: brightness(0.72) saturate(1.12); }
+.chat-session .title { font-weight: 500; }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--status-ok); flex: none; }
 .chat-group-more {
   background: none;
   border: none;
@@ -1269,21 +1310,49 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
   border: none;
-  border-radius: 4px;
+  border-radius: 6px;
   background: none;
   color: var(--ant-color-text-tertiary);
   cursor: pointer;
   flex: none;
+  /* Revealed on the group's hover — quiet until pointed at. */
+  opacity: 0;
+  transition: opacity 120ms, color 120ms, background 120ms;
 }
+.chat-group:hover .ws-new-btn,
+.ws-new-btn:focus-visible { opacity: 1; }
 .ws-new-btn:hover {
   color: var(--ant-color-primary);
   background: var(--surface-hover);
+}
+/* No hover affordance on touch: the button stays visible. */
+@media (hover: none) {
+  .ws-new-btn { opacity: 1; }
 }
 .chat-group-empty {
   padding: 4px 10px 6px 29px;
   font-size: 12px;
   line-height: 16px;
+}
+
+/* Runtime brand marks (brand.tsx) — official colors, applied via class so
+   containers can tint from currentColor. The near-black marks flip light
+   in dark mode. */
+.brand-claude { color: #d97757; }
+.brand-deepseek { color: #5786fe; }
+.brand-opencode { color: #121212; }
+html[data-mode="dark"] .brand-opencode { color: #e8e8ea; }
+
+/* Runtime logo tile (Runtimes view) — the tile carries the brand class,
+   so the tint and the mark derive from the same color. */
+.runtime-logo {
+  width: 38px; height: 38px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 10px;
+  color: var(--ant-color-text-secondary);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
 }

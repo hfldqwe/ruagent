@@ -5,7 +5,7 @@
 // nobody is asked to choose every time. The history drawer reopens
 // past conversations (live ones reattach and stream).
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Button, Input, Select, Tooltip } from "antd";
 import {
   api,
@@ -15,10 +15,22 @@ import {
   type OptionChoice,
   type SessionOptionInfo,
 } from "../api";
+import { BrandMark } from "../brand";
 import { Icon, type IconName } from "../icons";
 import { useI18n } from "../i18n";
 import { Markdown, RelTime, Spinner, useToast } from "../ui";
 import { msToIso } from "./Sessions";
+
+/** Deterministic per-workspace hue from a curated set — the workspace
+ * tree reads at a glance (each project keeps its color across visits). */
+const WS_HUES = [
+  "#7c86f0", "#e0916a", "#56b4a4", "#d97f8e", "#78b874",
+  "#a887e8", "#5fa8dc", "#d8ac5c", "#9aa4b8", "#c8877a",
+];
+const wsColor = (ws: string) =>
+  WS_HUES[
+    [...ws].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % WS_HUES.length
+  ];
 
 /** Known option ids get translated labels; others show the agent's name. */
 function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
@@ -57,10 +69,12 @@ function buildOptions(choices: OptionChoice[]): PickerOption[] {
   );
 }
 
-/** One select over a set of agent-advertised choices (grouped when the
- * agent groups them); config fallback / free text when it doesn't
- * advertise any. */
+/** One compact select over a set of agent-advertised choices (grouped
+ * when the agent groups them); config fallback / free text when it
+ * doesn't advertise any. These are the composer's borderless mini
+ * controls, not form fields — the label carries meaning via aria. */
 function OptionPicker({
+  field,
   label,
   loading,
   choices,
@@ -73,6 +87,7 @@ function OptionPicker({
   onFreeText,
   disabled,
 }: {
+  field: string;
   label: string;
   loading: boolean;
   choices: OptionChoice[];
@@ -85,56 +100,50 @@ function OptionPicker({
   onFreeText?: (value: string) => void;
   disabled?: boolean;
 }) {
+  const common = {
+    className: `ctl-select ctl-${field}`,
+    "aria-label": label,
+    size: "small" as const,
+    variant: "borderless" as const,
+    popupMatchSelectWidth: false,
+    disabled,
+  };
   if (loading) {
-    return (
-      <label className="chat-field">
-        <span>{label}</span>
-        <Select loading disabled style={{ minWidth: 190 }} />
-      </label>
-    );
+    return <Select {...common} loading style={{ minWidth: 56 }} />;
   }
   if (choices.length > 0) {
     return (
-      <label className="chat-field">
-        <span>{label}</span>
-        <Select
-          value={current || choices[0]?.value}
-          onChange={onPick}
-          disabled={disabled}
-          style={{ minWidth: 190 }}
-          options={buildOptions(choices)}
-        />
-      </label>
+      <Select
+        {...common}
+        value={current || choices[0]?.value}
+        onChange={onPick}
+        style={{ minWidth: 56 }}
+        options={buildOptions(choices)}
+      />
     );
   }
   if (fallback && fallback.length > 0 && onFallbackPick) {
     return (
-      <label className="chat-field">
-        <span>{label}</span>
-        <Select
-          value={current}
-          onChange={onFallbackPick}
-          disabled={disabled}
-          style={{ minWidth: 190 }}
-          options={fallback.map((m) => ({ value: m, label: m }))}
-        />
-      </label>
+      <Select
+        {...common}
+        value={current}
+        onChange={onFallbackPick}
+        style={{ minWidth: 56 }}
+        options={fallback.map((m) => ({ value: m, label: m }))}
+      />
     );
   }
   if (freeText && onFreeText) {
     return (
-      <label className="chat-field">
-        <span>{label}</span>
-        <Select
-          mode="tags"
-          maxCount={1}
-          value={current ? [current] : []}
-          onChange={(v) => onFreeText(v[v.length - 1] ?? "")}
-          disabled={disabled}
-          style={{ minWidth: 190 }}
-          placeholder={freeTextPh}
-        />
-      </label>
+      <Select
+        {...common}
+        mode="tags"
+        maxCount={1}
+        value={current ? [current] : []}
+        onChange={(v) => onFreeText(v[v.length - 1] ?? "")}
+        style={{ minWidth: 56 }}
+        placeholder={freeTextPh}
+      />
     );
   }
   return null;
@@ -212,6 +221,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   }, [project]);
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const streamRef = useRef<(() => void) | null>(null);
   /** Which chat id the SSE is attached to — reattaching replays the
    * whole transcript, so the same chat must only attach once (the
@@ -817,35 +827,188 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
 
   const currentAgent = agents.find((a) => a.name === agent);
 
+  /** The composer unit: input row + hairline-divided controls row (agent,
+   * model, mode/effort, project). Rendered centered when the conversation
+   * is empty, sticky at the bottom once it has messages. */
+  const composerBlock = (
+    <div className="chat-bottom">
+      <div className="composer">
+        <div className="composer-row">
+          <textarea
+            ref={inputRef}
+            rows={2}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            placeholder={t("chat.inputPh")}
+          />
+          {streaming && chatId ? (
+            <Button
+              className="send-btn stop-btn"
+              onClick={() => {
+                api.chatStop(chatId).catch(() => {
+                  /* the Stopped event still lands via the stream */
+                });
+              }}
+              title={t("chat.stop")}
+            >
+              <Icon name="stop" size={14} />
+            </Button>
+          ) : (
+            <Button
+              type="primary"
+              className="send-btn"
+              disabled={streaming || starting || !input.trim()}
+              onClick={send}
+              title={t("chat.send")}
+            >
+              {starting ? "…" : <Icon name="arrowUp" size={16} />}
+            </Button>
+          )}
+        </div>
+        <div className="composer-controls">
+          <Select
+            className="ctl-select ctl-agent"
+            aria-label={t("chat.agent")}
+            variant="borderless"
+            size="small"
+            popupMatchSelectWidth={false}
+            value={agent || undefined}
+            onChange={(v) => {
+              void switchAgent(v);
+            }}
+            disabled={streaming}
+            options={[
+              ...agents
+                .filter((a) => isRoleAgent(a))
+                .map((a) => ({
+                  value: a.name,
+                  label: (
+                    <span className="sel-opt">
+                      <BrandMark harness={a.harness} size={13} mono fallback="bot" />
+                      {a.name}
+                    </span>
+                  ),
+                })),
+              {
+                label: t("chat.runtimeGroup"),
+                options: agents
+                  .filter((a) => !isRoleAgent(a))
+                  .map((a) => ({
+                    value: a.name,
+                    label: (
+                      <span className="sel-opt">
+                        <BrandMark harness={a.harness} size={13} mono fallback="bot" />
+                        {a.name}
+                      </span>
+                    ),
+                  })),
+              },
+            ]}
+          />
+          <span className="ctl-sep" />
+          <OptionPicker
+            field="model"
+            label={t("chat.model")}
+            loading={options === null}
+            choices={modelChoices}
+            current={model}
+            onPick={switchModel}
+            fallback={configModels}
+            onFallbackPick={switchModel}
+            freeText
+            freeTextPh={t("chat.modelPh")}
+            onFreeText={(v) => setModel(v)}
+            disabled={streaming}
+          />
+          {(() => {
+            const rt = currentAgent?.runtimes ?? [];
+            if (rt.length <= 1) return null;
+            return (
+              <>
+                <span className="ctl-sep" />
+                <OptionPicker
+                  field="runtime"
+                  label={t("chat.runtime")}
+                  loading={false}
+                  choices={rt.map((r) => ({ value: r, name: r }))}
+                  current={runtime || currentAgent?.runtime || rt[0]}
+                  onPick={switchRuntime}
+                  disabled={streaming}
+                />
+              </>
+            );
+          })()}
+          {extraPickers.map((opt) => (
+            <Fragment key={opt.id}>
+              <span className="ctl-sep" />
+              <OptionPicker
+                field={opt.id}
+                label={optionLabel(opt, t)}
+                loading={false}
+                choices={opt.choices}
+                current={opt.current ?? ""}
+                onPick={(v) => setOption(opt, v)}
+                disabled={streaming}
+              />
+            </Fragment>
+          ))}
+          <span className="grow" />
+          {project.trim() ? (
+            <Tooltip title={project}>
+              <span className="ws-chip">
+                <Icon name="folderOpen" size={12} />
+                <span className="ws-chip-name">
+                  {project.trim().replace(/.*[\\/]/, "")}
+                </span>
+              </span>
+            </Tooltip>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className={`chat-layout${railCollapsed ? " rail-collapsed" : ""}`}>
       <aside className={`chat-side${sideOpen ? " open" : ""}`}>
-        <div className="row" style={{ gap: 6 }}>
+        <div className="chat-side-head">
           <Button
-            block
-            size="small"
             type="primary"
-            ghost
+            size="small"
             style={{ flex: 1 }}
             onClick={() => {
               newChat();
               setSideOpen(false);
             }}
           >
-            + {t("chat.new")}
+            <Icon name="squarePen" size={13} /> {t("chat.new")}
           </Button>
           <Tooltip title={t("chat.addWorkspace")}>
-            <Button size="small" onClick={pickWorkspace} aria-label={t("chat.addWorkspace")}>
-              <Icon name="folder" size={14} />
+            <Button
+              size="small"
+              type="text"
+              className="icon-btn"
+              onClick={pickWorkspace}
+              aria-label={t("chat.addWorkspace")}
+            >
+              <Icon name="folderPlus" size={15} />
             </Button>
           </Tooltip>
         </div>
         <Input
           allowClear
+          variant="filled"
           value={sessionQuery}
           onChange={(e) => setSessionQuery(e.target.value)}
           placeholder={t("chat.searchSessions")}
           size="small"
+          prefix={<Icon name="search" size={12} />}
         />
         <div className="chat-side-list">
           <div className="chat-ws-title">{t("chat.workspaces")}</div>
@@ -860,11 +1023,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
               return (
                 <div key={key || "none"} className="chat-group">
                   <div className="chat-group-head" title={cwd || undefined}>
-                    <Icon name="folder" size={12} />
+                    <Icon
+                      name="folderOpen"
+                      size={14}
+                      className="ws-folder"
+                      style={{ color: key ? wsColor(key) : undefined, flex: "none" }}
+                    />
                     <span className="chat-group-name">
                       {cwd ? cwd.replace(/.*[\\/]/, "") : t("chat.noProject")}
                     </span>
-                    <span className="muted" style={{ fontSize: 11 }}>{items.length}</span>
+                    <span className="ws-count">{items.length}</span>
                     <span className="grow" />
                     <Tooltip title={t("chat.newSessionHere")}>
                       <button
@@ -872,37 +1040,32 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                         aria-label={t("chat.newSessionHere")}
                         onClick={() => newSessionIn(cwd)}
                       >
-                        <Icon name="plus" size={12} />
+                        <Icon name="plus" size={13} />
                       </button>
                     </Tooltip>
                   </div>
-                  {shown.map((h) => (
-                    <button
-                      key={h.id}
-                      className={`row-btn${h.id === chatId ? " selected" : ""}`}
-                      onClick={() => openPast(h)}
-                      title={h.title || h.preview || t("sessions.untitled")}
-                    >
-                      <span className="dot" style={{ width: 6, height: 6,
-                        background: h.active ? "var(--ant-color-success)" : "var(--ant-color-text-quaternary)" }} />
-                      <span className="title">
-                        <strong>{h.title || h.preview || t("sessions.untitled")}</strong>
-                        {h.runtime ? (
-                          <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
-                            {h.runtime}
-                          </span>
-                        ) : null}
-                      </span>
-                      {h.message_count != null ? (
-                        <span className="muted" style={{ fontSize: 11 }}>
-                          {h.message_count} {t("sessions.messages")}
+                  {shown.map((h) => {
+                    const harness = agents?.find((a) => a.name === h.runtime)?.harness;
+                    return (
+                      <button
+                        key={h.id}
+                        className={`row-btn chat-session${h.id === chatId ? " selected" : ""}`}
+                        onClick={() => openPast(h)}
+                        title={h.title || h.preview || t("sessions.untitled")}
+                      >
+                        {h.active ? <span className="live-dot" /> : null}
+                        <span className="title">
+                          {h.title || h.preview || t("sessions.untitled")}
                         </span>
-                      ) : null}
-                      <span className="time">
-                        <RelTime iso={msToIso(h.updated_at)} />
-                      </span>
-                    </button>
-                  ))}
+                        {harness ? (
+                          <BrandMark harness={harness} size={12} mono className="muted" />
+                        ) : null}
+                        <span className="time">
+                          <RelTime iso={msToIso(h.updated_at)} />
+                        </span>
+                      </button>
+                    );
+                  })}
                   {shown.length === 0 ? (
                     <div className="chat-group-empty muted">{t("chat.noSessions")}</div>
                   ) : null}
@@ -924,7 +1087,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       </aside>
       {sideOpen && <div className="chat-side-backdrop" onClick={() => setSideOpen(false)} />}
 
-      <div className="chat-wrap">
+      <div
+        className={`chat-wrap${!viewing && messages.length === 0 ? " is-empty" : ""}`}
+      >
       <div className="view-bar">
         <Button
           size="small"
@@ -937,7 +1102,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           <Icon name={railCollapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
         </Button>
         <h2>{t("chat.title")}</h2>
-        <span className="muted">{t("chat.subtitle")}</span>
         <span className="grow" />
         <Button
           size="small"
@@ -951,17 +1115,38 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
 
       {viewing ? (
         <PastConversation entry={viewing} onNew={newChat} />
-      ) : (
-      <div className="chat-log grow">
-        {messages.length === 0 ? (
-          <div className="state empty">
-            <span className="empty-icon">
-              <Icon name="chat" size={30} />
+      ) : messages.length === 0 ? (
+        <>
+          {/* Empty conversation: the composer centers as the invitation —
+             who you're talking to, the input, and three starters. */}
+          <div className="chat-hero">
+            <span className="chat-hero-mark">
+              <BrandMark harness={currentAgent?.harness} size={24} fallback="bot" />
             </span>
-            <p>{t("chat.empty")}</p>
+            <h3>{agent}</h3>
+            <p>{currentAgent?.description || t("chat.subtitle")}</p>
           </div>
-        ) : (
-          messages.map((m, i) => {
+          {composerBlock}
+          <div className="chat-suggest">
+            {[t("chat.suggest.1"), t("chat.suggest.2"), t("chat.suggest.3")].map((s) => (
+              <button
+                key={s}
+                className="suggest-chip"
+                onClick={() => {
+                  setInput(s);
+                  inputRef.current?.focus();
+                }}
+              >
+                <Icon name="sparkles" size={12} />
+                {s}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="chat-log grow">
+          {messages.map((m, i) => {
             if (m.kind === "injection") {
               return (
                 <details key={i} className="chat-injection">
@@ -1008,122 +1193,18 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                 {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
               </div>
             );
-          })
-        )}
-        {streaming && (
-          <div className="chat-typing">
-            <i /> <i /> <i />
+          })}
+          {streaming && (
+            <div className="chat-typing">
+              <i /> <i /> <i />
+            </div>
+          )}
+          <div ref={bottomRef} />
           </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
+          {composerBlock}
+        </>
       )}
 
-      {!viewing && (
-      <div className="chat-bottom">
-      <div className="chat-bar">
-        <label className="chat-field">
-          <span>{t("chat.agent")}</span>
-          <Select
-            value={agent || undefined}
-            onChange={(v) => {
-              void switchAgent(v);
-            }}
-            disabled={streaming}
-            style={{ minWidth: 150 }}
-            options={[
-              ...agents
-                .filter((a) => isRoleAgent(a))
-                .map((a) => ({ value: a.name, label: a.name })),
-              {
-                label: t("chat.runtimeGroup"),
-                options: agents
-                  .filter((a) => !isRoleAgent(a))
-                  .map((a) => ({ value: a.name, label: a.name })),
-              },
-            ]}
-          />
-        </label>
-        <OptionPicker
-          label={t("chat.model")}
-          loading={options === null}
-          choices={modelChoices}
-          current={model}
-          onPick={switchModel}
-          fallback={configModels}
-          onFallbackPick={switchModel}
-          freeText
-          freeTextPh={t("chat.modelPh")}
-          onFreeText={(v) => setModel(v)}
-          disabled={streaming}
-        />
-        {(() => {
-          const rt = currentAgent?.runtimes ?? [];
-          if (rt.length <= 1) return null;
-          return (
-            <OptionPicker
-              label={t("chat.runtime")}
-              loading={false}
-              choices={rt.map((r) => ({ value: r, name: r }))}
-              current={runtime || currentAgent?.runtime || rt[0]}
-              onPick={switchRuntime}
-              disabled={streaming}
-            />
-          );
-        })()}
-        {extraPickers.map((opt) => (
-          <OptionPicker
-            key={opt.id}
-            label={optionLabel(opt, t)}
-            loading={false}
-            choices={opt.choices}
-            current={opt.current ?? ""}
-            onPick={(v) => setOption(opt, v)}
-            disabled={streaming}
-          />
-        ))}
-      </div>
-      <div className="chat-input-bar">
-        <div className="composer">
-          <textarea
-            rows={2}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
-            placeholder={t("chat.inputPh")}
-          />
-          {streaming && chatId ? (
-            <Button
-              className="send-btn stop-btn"
-              onClick={() => {
-                api.chatStop(chatId).catch(() => {
-                  /* the Stopped event still lands via the stream */
-                });
-              }}
-              title={t("chat.stop")}
-            >
-              <Icon name="stop" size={14} />
-            </Button>
-          ) : (
-            <Button
-              type="primary"
-              className="send-btn"
-              disabled={streaming || starting || !input.trim()}
-              onClick={send}
-              title={t("chat.send")}
-            >
-              {starting ? "…" : <Icon name="arrowUp" size={16} />}
-            </Button>
-          )}
-        </div>
-      </div>
-      </div>
-      )}
       </div>
 
     </div>

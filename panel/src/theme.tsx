@@ -1,14 +1,13 @@
-// Theme: antd ConfigProvider + dark/light mode (persisted) + the surface
-// system from docs/design-study/multica-tokens.css translated onto antd's
-// design tokens.
+// Theme: antd ConfigProvider + dark/light mode (persisted).
 //
-// Surface architecture (Multica): the app shell is the quiet outer frame;
-// the page canvas is where lists, boards and conversations live; surfaces
-// are bounded content groups; raised surfaces are ephemeral overlays. In
-// dark mode higher = lighter; each step is ~0.03 lightness apart:
-//   app-shell .155 < canvas .18 < surface .21 < raised .235 < hover .274 < selected .30
-// Values are Multica's OKLCH tokens converted to sRGB hex; the handful of
-// roles antd has no token for live as CSS vars in index.css — keep in sync.
+// Design language (2026-09-20 restyle): quiet graphite neutrals with ONE
+// restrained indigo accent — premium minimalism, no ornament. Surfaces
+// separate by lightness alone (dark: higher = lighter, steps ~0.03 apart;
+// no shadows on static cards — hairlines and elevation carry the depth).
+// The accent appears only where it means something: primary buttons, the
+// selected nav item, links, focus rings. Brand colors live per-runtime
+// (brand.tsx), never as chrome.
+//   app-shell < canvas < surface < raised < hover < selected
 
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { App as AntApp, ConfigProvider, theme as antdTheme } from "antd";
@@ -24,56 +23,61 @@ const ModeCtx = createContext<{ mode: Mode; toggle: () => void }>({
 });
 export const useThemeMode = () => useContext(ModeCtx);
 
-// Inter leads where installed; Segoe UI Variable is the Windows-native
-// equivalent. CJK falls through PingFang SC -> Microsoft YaHei so zh copy
-// never lands on the browser's default face.
+// Inter Variable is bundled (@fontsource-variable); Segoe UI Variable is
+// the Windows-native fallback. CJK falls through PingFang SC -> Microsoft
+// YaHei so zh copy never lands on the browser's default face.
 const FONT =
-  '"Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+  '"Inter Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
 const MONO = '"IBM Plex Mono", "Cascadia Code", ui-monospace, Consolas, monospace';
 
 const D = {
-  appShell: "#0c0c0e", // oklch(0.155 0.005 285.823)
-  pageCanvas: "#111114", // oklch(0.18 0.005 285.823)
-  surface: "#18181b", // oklch(0.21 0.006 285.885)
-  surfaceRaised: "#1e1e21", // oklch(0.235 0.007 285.885)
-  surfaceHover: "#27272a", // oklch(0.274 0.006 286.033)
-  surfaceSelected: "#2d2d31", // oklch(0.3 0.006 286.033)
-  border: "rgba(255, 255, 255, 0.10)", // oklch(1 0 0 / 10%)
-  borderSecondary: "rgba(255, 255, 255, 0.06)", // oklch(1 0 0 / 6%)
-  text: "#fafafa", // oklch(0.985 0 0)
-  textSecondary: "#9f9fa9", // oklch(0.705 0.015 286.067) — 5.2:1+ on every surface
-  textTertiary: "#8e8e98", // oklch(0.65 0.015 286.067)
-  textQuaternary: "#7f7f89", // oklch(0.60 0.015 286.067) — faint marks, 3:1 floor
-  brand: "#e79c27", // oklch(0.75 0.15 72) — signal amber; ink on it 8.1:1
-  ink: "#17130c", // near-black text on the amber primary
-  success: "#4aa651", // oklch(0.65 0.15 145)
-  warning: "#cb9400", // oklch(0.70 0.16 85)
-  error: "#ff6467", // oklch(0.704 0.191 22.216)
+  appShell: "#0a0a0c",
+  pageCanvas: "#101013",
+  surface: "#161619",
+  surfaceRaised: "#1c1c20",
+  surfaceHover: "#232329",
+  surfaceSelected: "#2a2a33",
+  border: "rgba(255, 255, 255, 0.085)",
+  borderSecondary: "rgba(255, 255, 255, 0.05)",
+  text: "#f5f5f7",
+  textSecondary: "#a3a3ad", // 5.2:1+ on every surface
+  textTertiary: "#8d8d98",
+  textQuaternary: "#7e7e88", // 4.6:1+ — micro text carries real content (timestamps), audit 2026-09-20
+  brand: "#5d6be0", // indigo — fills/borders (white on it 4.5:1)
+  link: "#a7aeff", // brighter indigo for accent TEXT on dark (7:1+)
+  ink: "#ffffff", // text on the indigo primary
+  success: "#4aa651",
+  warning: "#cb9400",
+  error: "#ff6467",
   menuShadow: "0 10px 28px rgba(0, 0, 0, 0.30), 0 2px 8px rgba(0, 0, 0, 0.18)",
   floatingShadow: "0 20px 48px rgba(0, 0, 0, 0.46), 0 4px 12px rgba(0, 0, 0, 0.28)",
-  navSelectedBg: "#352b17", // amber 14% over surface — 6.1:1 for amber text
+  navSelectedBg: "#222640", // indigo ~12% over surface
+  navSelectedColor: "#aab2ff",
 };
 
 const L = {
-  appShell: "#f3f3f4", // oklch(0.964435 0.001327 286.375)
-  pageCanvas: "#fbfbfb", // oklch(0.988087 0 0)
-  surface: "#ffffff", // oklch(1 0 0)
-  surfaceRaised: "#ffffff", // oklch(1 0 0) — menus/modals read as raised via --menu-shadow
-  surfaceHover: "#f4f4f5", // oklch(0.967 0.001 286.375)
-  surfaceSelected: "#eeeef0", // oklch(0.95 0.002 286.375)
-  border: "#e4e4e7", // oklch(0.92 0.004 286.32)
-  borderSecondary: "#ececef", // oklch(0.945 0.003 286.32)
-  text: "#09090b", // oklch(0.141 0.005 285.823)
-  textSecondary: "#64636e", // oklch(0.505 0.016 285.938) — 4.88:1+ on every surface
-  textTertiary: "#70707b", // oklch(0.55 0.016 285.938)
-  textQuaternary: "#81818b", // oklch(0.606 0.016 285.938) — faint marks, 3:1 floor
-  brand: "#9c620f", // oklch(0.547 0.115 68) — 5.0:1 as text and under white text
-  success: "#1c882d", // oklch(0.55 0.16 145)
-  warning: "#9d6400", // oklch(0.55 0.13 75) — darker than Multica's fill-only warning so it holds as text
-  error: "#e7000b", // oklch(0.577 0.245 27.325)
+  appShell: "#f3f3f4",
+  pageCanvas: "#fbfbfb",
+  surface: "#ffffff",
+  surfaceRaised: "#ffffff", // menus/modals read as raised via --menu-shadow
+  surfaceHover: "#f4f4f5",
+  surfaceSelected: "#ededef",
+  border: "#e4e4e7",
+  borderSecondary: "#ececef",
+  text: "#09090b",
+  textSecondary: "#64636e", // 4.88:1+ on every surface
+  textTertiary: "#70707b",
+  textQuaternary: "#6b6b76", // 4.75:1+ on the app shell (audit 2026-09-20)
+  brand: "#4f5ad6",
+  link: "#4f5ad6", // 5.5:1+ as text on white
+  ink: "#ffffff",
+  success: "#1c882d",
+  warning: "#9d6400",
+  error: "#e7000b",
   menuShadow: "0 8px 24px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.05)",
   floatingShadow: "0 16px 40px rgba(15, 23, 42, 0.14), 0 3px 10px rgba(15, 23, 42, 0.08)",
-  navSelectedBg: "#f7f2ec", // amber 8% over white — 4.6:1 for amber text
+  navSelectedBg: "#eef0fc", // indigo ~6% over white
+  navSelectedColor: "#3f49c4",
 };
 
 // Type scale (Multica): micro 11 / caption 12 / label 13 / body 14 /
@@ -100,8 +104,7 @@ const darkTokens = {
   ...base,
   colorPrimary: D.brand,
   colorInfo: D.brand,
-  colorLink: D.brand,
-  // Primary buttons are amber — white on amber is 2.4:1, ink is 8:1.
+  colorLink: D.link, // text-grade indigo — the seed is a fill color
   colorTextLightSolid: D.ink,
   colorBgBase: D.surface,
   colorBgContainer: D.surface,
@@ -124,7 +127,8 @@ const lightTokens = {
   ...base,
   colorPrimary: L.brand,
   colorInfo: L.brand,
-  colorLink: L.brand,
+  colorLink: L.link,
+  colorTextLightSolid: L.ink,
   colorBgBase: L.pageCanvas,
   colorBgContainer: L.surface,
   colorBgElevated: L.surfaceRaised,
@@ -147,7 +151,7 @@ function components(mode: Mode) {
   return {
     Layout: {
       // The sidebar is its own panel one step off the canvas: raised in
-      // dark (Multica --sidebar), the quiet frame grey in light.
+      // dark, the quiet frame grey in light.
       siderBg: mode === "dark" ? D.surface : L.appShell,
       headerBg: "transparent",
       bodyBg: p.pageCanvas,
@@ -167,11 +171,12 @@ function components(mode: Mode) {
       darkItemHoverBg: p.surfaceHover,
       itemHoverColor: p.text,
       darkItemHoverColor: p.text,
-      // Active nav is the one place the amber accent lives in the shell.
+      // Active nav: the one accent in the shell — a quiet indigo wash and
+      // a bright indigo label.
       itemSelectedBg: p.navSelectedBg,
       darkItemSelectedBg: p.navSelectedBg,
-      itemSelectedColor: p.brand,
-      darkItemSelectedColor: p.brand,
+      itemSelectedColor: p.navSelectedColor,
+      darkItemSelectedColor: p.navSelectedColor,
       groupTitleColor: p.textQuaternary,
       activeBarHeight: 0,
       activeBarBorderWidth: 0,
@@ -185,7 +190,7 @@ function components(mode: Mode) {
     },
     Modal: { titleFontSize: 16 },
     // Flat buttons — the material voice comes from surfaces, not glows.
-    Button: { primaryShadow: "none", defaultShadow: "none", dangerShadow: "none" },
+    Button: { primaryShadow: "none", defaultShadow: "none", dangerShadow: "none", fontWeight: 500 },
   };
 }
 
