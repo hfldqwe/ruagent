@@ -52,7 +52,7 @@ function DistillSettings() {
     try {
       await api.setDistillPolicy({
         auto: policy.auto,
-        mode: policy.mode ?? "agent",
+        graph: policy.graph ?? true,
         agent: policy.agent ?? "",
         language: policy.language ?? "",
         prompt: policy.prompt ?? "",
@@ -78,19 +78,20 @@ function DistillSettings() {
         <Switch checked={policy.auto} onChange={(v) => set({ auto: v })} />
       </div>
 
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <div style={{ minWidth: 0 }}>
+          <strong>{t("distill.graph")}</strong>
+          <p className="muted" style={{ margin: 0 }}>
+            {t("distill.graphHint")}
+          </p>
+        </div>
+        <Switch
+          checked={policy.graph ?? true}
+          onChange={(v) => set({ graph: v })}
+        />
+      </div>
+
       <div className="row wrap">
-        <label className="chat-field" style={{ flex: "1 1 220px" }}>
-          <span>{t("distill.mode")}</span>
-          <Select
-            value={policy.mode ?? "agent"}
-            onChange={(v) => set({ mode: v })}
-            style={{ width: "100%" }}
-            options={[
-              { value: "agent", label: t("distill.mode.agent") },
-              { value: "rules", label: t("distill.mode.rules") },
-            ]}
-          />
-        </label>
         <label className="chat-field" style={{ flex: "1 1 220px" }}>
           <span>{t("distill.agent")}</span>
           <Select

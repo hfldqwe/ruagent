@@ -1221,3 +1221,35 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
   word-break: break-word;
   color: var(--ant-color-text-secondary);
 }
+
+/* Session groups by project (the dsh-web workspace tree shape) ------- */
+.chat-side-list { gap: 2px; }
+.chat-group { display: flex; flex-direction: column; margin-bottom: 6px; }
+.chat-group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px 4px;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 600;
+  color: var(--ant-color-text-secondary);
+  overflow: hidden;
+}
+.chat-group-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chat-group-more {
+  background: none;
+  border: none;
+  padding: 3px 10px 3px 29px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--ant-color-text-tertiary);
+  cursor: pointer;
+  text-align: left;
+}
+.chat-group-more:hover { color: var(--ant-color-text); }

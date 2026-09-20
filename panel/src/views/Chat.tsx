@@ -6,7 +6,7 @@
 // past conversations (live ones reattach and stream).
 
 import { useEffect, useRef, useState } from "react";
-import { Button, Select } from "antd";
+import { Button, Input, Select } from "antd";
 import {
   api,
   isRoleAgent,
@@ -194,10 +194,13 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     () => localStorage.getItem("chat.cwd") ?? "",
   );
   const [projects, setProjects] = useState<string[]>([]);
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   useEffect(() => {
     localStorage.setItem("chat.cwd", project);
   }, [project]);
-  // Known projects: distinct values from the sessions index.
+  // Known projects: distinct values from the sessions index, plus the
+  // cwd of recorded chats (they are the same kind of workspace).
   useEffect(() => {
     api
       .sessions()
@@ -206,10 +209,13 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         for (const sess of all) {
           if (sess.project) seen.add(sess.project);
         }
+        for (const h of history ?? []) {
+          if (h.cwd) seen.add(h.cwd);
+        }
         setProjects([...seen].sort());
       })
       .catch(() => setProjects([]));
-  }, []);
+  }, [history]);
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<(() => void) | null>(null);
@@ -759,6 +765,31 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
+  /** Sessions grouped by project (the workspace tree, dsh-web style):
+   * the current project's group first, then others, then ungrouped. */
+  const historyGroups: [string, ChatHistoryEntry[]][] = (() => {
+    const q = sessionQuery.trim().toLowerCase();
+    const filtered = (history ?? []).filter((h) =>
+      !q ||
+      (h.title ?? "").toLowerCase().includes(q) ||
+      (h.preview ?? "").toLowerCase().includes(q) ||
+      (h.agent ?? "").toLowerCase().includes(q),
+    );
+    const by = new Map<string, ChatHistoryEntry[]>();
+    for (const h of filtered) {
+      const key = h.cwd?.trim() || "";
+      const list = by.get(key) ?? [];
+      list.push(h);
+      by.set(key, list);
+    }
+    const cur = project.trim().toLowerCase();
+    return [...by.entries()].sort((a, b) => {
+      const rank = (k: string) =>
+        k.toLowerCase() === cur ? 0 : k === "" ? 2 : 1;
+      return rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]);
+    });
+  })();
+
   if (!agents) return <Spinner label={`${t("chat.title")}…`} />;
 
   const currentAgent = agents.find((a) => a.name === agent);
@@ -778,39 +809,84 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         >
           + {t("chat.new")}
         </Button>
+        <label className="chat-field" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <span>{t("chat.project")}</span>
+          <Select
+            mode="tags"
+            maxCount={1}
+            value={project ? [project] : []}
+            onChange={(v) => setProject(v[v.length - 1] ?? "")}
+            style={{ width: "100%" }}
+            placeholder={t("chat.projectPh")}
+            options={projects.map((x) => ({ value: x, label: x }))}
+            tokenSeparators={[","]}
+          />
+        </label>
+        <Input
+          allowClear
+          value={sessionQuery}
+          onChange={(e) => setSessionQuery(e.target.value)}
+          placeholder={t("chat.searchSessions")}
+          size="small"
+        />
         <div className="chat-side-list">
           {history === null ? (
             <Spinner />
-          ) : history.length === 0 ? (
-            <p className="muted">{t("chat.historyEmpty")}</p>
+          ) : historyGroups.length === 0 ? (
+            <p className="muted">{sessionQuery ? t("chat.noResults") : t("chat.historyEmpty")}</p>
           ) : (
-            history.map((h) => (
-              <button
-                key={h.id}
-                className={`row-btn${h.id === chatId ? " selected" : ""}`}
-                onClick={() => openPast(h)}
-                title={h.title || h.preview || t("sessions.untitled")}
-              >
-                <span className="dot" style={{ width: 6, height: 6,
-                  background: h.active ? "var(--ant-color-success)" : "var(--ant-color-text-quaternary)" }} />
-                <span className="title">
-                  <strong>{h.title || h.preview || t("sessions.untitled")}</strong>
-                  {h.runtime ? (
-                    <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
-                      {h.runtime}
+            historyGroups.map(([cwd, items]) => {
+              const key = cwd || "";
+              const shown = expandedGroups.has(key) ? items : items.slice(0, 5);
+              return (
+                <div key={key || "none"} className="chat-group">
+                  <div className="chat-group-head" title={cwd || undefined}>
+                    <Icon name="db" size={12} />
+                    <span className="chat-group-name">
+                      {cwd ? cwd.replace(/.*[\\/]/, "") : t("chat.noProject")}
                     </span>
+                    <span className="muted" style={{ fontSize: 11 }}>{items.length}</span>
+                  </div>
+                  {shown.map((h) => (
+                    <button
+                      key={h.id}
+                      className={`row-btn${h.id === chatId ? " selected" : ""}`}
+                      onClick={() => openPast(h)}
+                      title={h.title || h.preview || t("sessions.untitled")}
+                    >
+                      <span className="dot" style={{ width: 6, height: 6,
+                        background: h.active ? "var(--ant-color-success)" : "var(--ant-color-text-quaternary)" }} />
+                      <span className="title">
+                        <strong>{h.title || h.preview || t("sessions.untitled")}</strong>
+                        {h.runtime ? (
+                          <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                            {h.runtime}
+                          </span>
+                        ) : null}
+                      </span>
+                      {h.message_count != null ? (
+                        <span className="muted" style={{ fontSize: 11 }}>
+                          {h.message_count} {t("sessions.messages")}
+                        </span>
+                      ) : null}
+                      <span className="time">
+                        <RelTime iso={msToIso(h.updated_at)} />
+                      </span>
+                    </button>
+                  ))}
+                  {items.length > shown.length ? (
+                    <button
+                      className="chat-group-more"
+                      onClick={() =>
+                        setExpandedGroups((g) => new Set(g).add(key))
+                      }
+                    >
+                      {t("chat.showAll", { n: items.length })}
+                    </button>
                   ) : null}
-                </span>
-                {h.message_count != null ? (
-                  <span className="muted" style={{ fontSize: 11 }}>
-                    {h.message_count} {t("sessions.messages")}
-                  </span>
-                ) : null}
-                <span className="time">
-                  <RelTime iso={msToIso(h.updated_at)} />
-                </span>
-              </button>
-            ))
+                </div>
+              );
+            })
           )}
         </div>
       </aside>
@@ -914,20 +990,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       {!viewing && (
       <div className="chat-bottom">
       <div className="chat-bar">
-        <label className="chat-field">
-          <span>{t("chat.project")}</span>
-          <Select
-            mode="tags"
-            maxCount={1}
-            value={project ? [project] : []}
-            onChange={(v) => setProject(v[v.length - 1] ?? "")}
-            disabled={streaming || !!chatId}
-            style={{ minWidth: 210 }}
-            placeholder={t("chat.projectPh")}
-            options={projects.map((x) => ({ value: x, label: x }))}
-            tokenSeparators={[","]}
-          />
-        </label>
         <label className="chat-field">
           <span>{t("chat.agent")}</span>
           <Select

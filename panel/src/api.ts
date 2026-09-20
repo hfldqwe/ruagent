@@ -72,6 +72,8 @@ export interface ChatHistoryEntry {
   updated_at: number;
   /** The daemon is still holding this chat (streams live). */
   active: boolean;
+  /** Project working directory the chat runs in (workspace grouping). */
+  cwd?: string | null;
   message_count: number | null;
   preview: string | null;
   /** Sessions-index key of the transcript (the shared viewer). */
@@ -236,7 +238,7 @@ export interface McpRegistry {
 
 export interface DistillPolicy {
   auto: boolean;
-  mode?: string | null;
+  graph?: boolean | null;
   agent: string | null;
   language: string | null;
   prompt: string | null;
@@ -551,7 +553,7 @@ export const api = {
   distillPolicy: () => get<DistillPolicy>("/api/v1/distill"),
   setDistillPolicy: (body: {
     auto: boolean;
-    mode?: string;
+    graph?: boolean;
     agent: string;
     language: string;
     prompt: string;
