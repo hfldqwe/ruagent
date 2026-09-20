@@ -1116,9 +1116,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       {viewing ? (
         <PastConversation entry={viewing} onNew={newChat} />
       ) : messages.length === 0 ? (
-        <>
-          {/* Empty conversation: the composer centers as the invitation —
-             who you're talking to, the input, and three starters. */}
+        /* Empty conversation: the composer centers in the leftover space
+           below the header — the canvas is the invitation, not a void
+           (the header itself stays pinned top-left of the column). */
+        <div className="chat-empty-zone">
           <div className="chat-hero">
             <span className="chat-hero-mark">
               <BrandMark harness={currentAgent?.harness} size={24} fallback="bot" />
@@ -1142,7 +1143,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
               </button>
             ))}
           </div>
-        </>
+        </div>
       ) : (
         <>
           <div className="chat-log grow">

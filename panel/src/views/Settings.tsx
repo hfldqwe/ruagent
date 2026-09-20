@@ -47,6 +47,15 @@ function DistillSettings() {
   const set = (patch: Partial<DistillPolicy>) =>
     setPolicy({ ...policy, ...patch });
 
+  /** The textarea is pre-filled with the EFFECTIVE prompt (the override
+   * when set, otherwise the built-in) — the user edits from the real
+   * thing instead of writing a replacement blind (user request
+   * 2026-09-20). Saving an unmodified/equal-to-builtin text clears the
+   * override; Reset restores the built-in in one click. */
+  const isCustom =
+    !!policy.prompt && policy.prompt.trim() !== policy.builtin_prompt.trim();
+  const effectivePrompt = policy.prompt || policy.builtin_prompt;
+
   const save = async () => {
     setSaving(true);
     try {
@@ -55,7 +64,7 @@ function DistillSettings() {
         graph: policy.graph ?? true,
         agent: policy.agent ?? "",
         language: policy.language ?? "",
-        prompt: policy.prompt ?? "",
+        prompt: isCustom ? policy.prompt ?? "" : "",
       });
       toast("ok", t("distill.saved"));
     } catch (e) {
@@ -115,21 +124,28 @@ function DistillSettings() {
       </div>
 
       <label className="chat-field">
-        <span>{t("distill.prompt")}</span>
+        <span>
+          {t("distill.prompt")}
+          {isCustom ? (
+            <span className="tag" style={{ marginLeft: 8 }}>
+              {t("distill.customized")}
+            </span>
+          ) : null}
+        </span>
         <Input.TextArea
           rows={7}
-          value={policy.prompt ?? ""}
-          placeholder={t("distill.promptPh")}
+          value={effectivePrompt}
           onChange={(e) => set({ prompt: e.target.value })}
         />
+        <span className="field-hint">{t("distill.promptHint")}</span>
       </label>
 
-      <details className="prompt-view">
-        <summary>{t("distill.builtin")}</summary>
-        <pre>{policy.builtin_prompt}</pre>
-      </details>
-
       <div className="row end">
+        {isCustom ? (
+          <Button onClick={() => set({ prompt: "" })}>
+            {t("distill.promptReset")}
+          </Button>
+        ) : null}
         <Button type="primary" loading={saving} onClick={save}>
           {t("distill.save")}
         </Button>

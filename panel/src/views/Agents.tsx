@@ -131,7 +131,17 @@ export function Agents() {
                         </div>
                       </div>
                     ) : (
-                      <p className="muted" style={{ margin: "10px 0 0" }}>{t("agents.noRuns")}</p>
+                      /* Same block, same shape — a dash over the label keeps
+                         the divider at the same height as run stats (a bare
+                         sentence made it 29px shorter and the card's hairline
+                         visibly lower than its row-mates, user report
+                         2026-09-20). */
+                      <div className="agent-stats">
+                        <div className="stat-cell">
+                          <span className="stat-num">—</span>
+                          <span className="muted">{t("agents.noRuns")}</span>
+                        </div>
+                      </div>
                     )}
                     <div className="row end" style={{ marginTop: 8 }}>
                       <Button size="small" onClick={() => setEditing(a)}>
