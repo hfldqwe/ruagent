@@ -512,9 +512,8 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 #                        # (JSON keys and store/namespace stay canonical)
 # prompt = """..."""     # full override of the extraction prompt (advanced;
 #                        # the transcript is still appended by the daemon)
-# mode = "agent"         # extraction mode: "agent" (LLM run, default) or
-#                        # "rules" (zero-token: harvest explicit "记住:"/
-#                        # "remember:" directives from user messages)
+# graph = false          # memories only — skip entity/relation extraction
+#                        # (default true: memories + graph)
 # First matching rule wins; `default` applies otherwise. Actions:
 #   allow  — auto-select the first allow option
 #   reject — auto-select the first reject option
@@ -569,7 +568,7 @@ agent = \"dsh\"
                 agent: None,
                 language: Some("简体中文".into()),
                 prompt: None,
-                mode: Some("rules".into()),
+                graph: Some(false),
             })
             .unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
@@ -581,13 +580,32 @@ agent = \"dsh\"
         // A None key is removed, not emptied.
         assert!(!out.contains("agent ="));
         assert!(out.contains("简体中文"));
-        assert!(out.contains("mode = \"rules\""));
+        assert!(out.contains("graph = false"));
         // The result reparses as the same policy.
         let policy = ruagent_policy::PolicyConfig::parse(&out).unwrap();
         assert!(!policy.distill.auto);
         assert_eq!(policy.distill.language.as_deref(), Some("简体中文"));
         assert!(policy.distill.agent.is_none());
-        assert_eq!(policy.distill.mode.as_deref(), Some("rules"));
+        assert_eq!(policy.distill.graph, Some(false));
+        // A later None removes the graph key again (back to the default).
+        editor
+            .update(&ruagent_policy::DistillConfig {
+                auto: false,
+                agent: None,
+                language: None,
+                prompt: None,
+                graph: None,
+            })
+            .unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("graph ="));
+        assert_eq!(
+            ruagent_policy::PolicyConfig::parse(&out)
+                .unwrap()
+                .distill
+                .graph,
+            None
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -697,7 +715,7 @@ impl DistillEditor {
         set_or_remove(tbl, "agent", &cfg.agent);
         set_or_remove(tbl, "language", &cfg.language);
         set_or_remove(tbl, "prompt", &cfg.prompt);
-        set_or_remove(tbl, "mode", &cfg.mode);
+        set_or_remove_bool(tbl, "graph", cfg.graph);
         let tmp = self.path.with_extension("toml.tmp");
         std::fs::write(&tmp, doc.to_string())
             .with_context(|| format!("writing {}", tmp.display()))?;
@@ -711,6 +729,19 @@ fn set_or_remove(tbl: &mut toml_edit::Table, key: &str, v: &Option<String>) {
     match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
             tbl[key] = toml_edit::value(s);
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
+}
+
+/// The bool twin of [`set_or_remove`]: None removes the key (back to
+/// the file's absent-key default), Some writes it verbatim.
+fn set_or_remove_bool(tbl: &mut toml_edit::Table, key: &str, v: Option<bool>) {
+    match v {
+        Some(v) => {
+            tbl[key] = toml_edit::value(v);
         }
         None => {
             tbl.remove(key);

@@ -181,10 +181,9 @@ pub struct DistillConfig {
     /// Full override of the extraction prompt (escape hatch for custom
     /// extraction regimes; the transcript is still appended by the code).
     pub prompt: Option<String>,
-    /// Extraction mode: "agent" (extraction prompt through an agent
-    /// run) or "rules" (zero-token harvest of explicit directives in
-    /// the user's own messages). Default "agent".
-    pub mode: Option<String>,
+    /// Also extract entities/relations into the graph. None (absent key)
+    /// means the default, true — memories-only deployments opt out.
+    pub graph: Option<bool>,
 }
 
 /// `[permissions]` section.
@@ -392,5 +391,24 @@ action = "explode"
 "#;
         let config = PolicyConfig::parse(text).unwrap();
         assert!(config.to_policy().rules.is_empty());
+    }
+
+    #[test]
+    fn distill_graph_parses_with_default_absent() {
+        let off = PolicyConfig::parse("[distill]\ngraph = false\n").unwrap();
+        assert_eq!(off.distill.graph, Some(false));
+        // No key = the default (true), decided by the consumer.
+        let bare = PolicyConfig::parse("[distill]\nauto = true\n").unwrap();
+        assert_eq!(bare.distill.graph, None);
+    }
+
+    #[test]
+    fn removed_distill_mode_key_still_parses() {
+        // `mode` was removed with the rules extractor; an existing
+        // policy.toml that still carries the key must parse untouched
+        // (serde ignores unknown fields — no forced hand-editing).
+        let config = PolicyConfig::parse("[distill]\nauto = true\nmode = \"rules\"\n").unwrap();
+        assert!(config.distill.auto);
+        assert_eq!(config.distill.graph, None);
     }
 }

@@ -2015,7 +2015,7 @@ async fn role_option_defaults_apply_to_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// Distill rules mode: zero-token harvest of explicit directives
+// Distillation: the [distill] graph toggle (memories-only mode)
 // ---------------------------------------------------------------------------
 
 /// Write a ruagent-format transcript file and index it as a session row,
@@ -2042,15 +2042,56 @@ async fn index_transcript(d: &TestDaemon, file: &std::path::Path, jsonl: &str) -
     key
 }
 
+/// One extraction reply for the scripted mock: a memory plus an entity,
+/// so the graph toggle's effect is observable end to end.
+fn extraction_reply(memory: &str, entity: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "memories": [{
+            "store": "observation",
+            "namespace": "user",
+            "content": memory,
+            "confidence": 0.9,
+        }],
+        "entities": [{ "name": entity, "kind": "concept", "summary": "提取" }],
+        "relations": [],
+    }))
+    .unwrap()
+}
+
 #[tokio::test]
-async fn distill_rules_mode_harvests_directives_without_an_agent() {
-    let d = start_daemon(&mock_agent_toml("echo"), "default = \"ask\"\n").await;
+async fn distill_graph_toggle_controls_entity_extraction() {
+    // The scripted mock plays the extraction agent: its reply carries a
+    // memory AND an entity; graph=false must keep the memory and keep
+    // the entities table untouched, graph=true must write both.
+    let replies_dir = std::env::temp_dir().join(format!(
+        "ruagent-distill-{}-{}",
+        std::process::id(),
+        chrono_tag()
+    ));
+    std::fs::create_dir_all(&replies_dir).unwrap();
+    let replies_file = replies_dir.join("replies.json");
+    std::fs::write(
+        &replies_file,
+        serde_json::to_string(&serde_json::json!([
+            { "marker": "深色主题", "reply": extraction_reply("用户喜欢深色主题", "深色主题") },
+            { "marker": "GraphHub", "reply": extraction_reply("GraphHub 项目已启动", "GraphHub") },
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let bin = mock_bin();
+    let agents = format!(
+        "[agent.mock]\nharness = \"mock\"\ncommand = \"{bin} --behavior scripted --replies {replies}\"\ndescription = \"mock\"\n",
+        replies = replies_file.to_string_lossy().replace('\\', "/"),
+    );
+    let d = start_daemon(&agents, "default = \"ask\"\n").await;
     let http = reqwest::Client::new();
 
-    // PUT mode="rules" hot-swaps the live policy and GET reflects it.
+    // PUT graph=false hot-swaps the live policy and GET reflects it; a
+    // non-boolean 400s instead of silently distilling with the default.
     let put: serde_json::Value = http
         .put(format!("{}/api/v1/distill", d.url))
-        .json(&serde_json::json!({ "mode": "rules" }))
+        .json(&serde_json::json!({ "graph": false }))
         .send()
         .await
         .unwrap()
@@ -2068,38 +2109,31 @@ async fn distill_rules_mode_harvests_directives_without_an_agent() {
         .json()
         .await
         .unwrap();
-    assert_eq!(policy["mode"], "rules");
-    // A typo 400s instead of silently distilling with the default.
-    let bogus = http
+    assert_eq!(policy["graph"], false);
+    let bad = http
         .put(format!("{}/api/v1/distill", d.url))
-        .json(&serde_json::json!({ "mode": "bogus" }))
+        .json(&serde_json::json!({ "graph": "yes" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(bogus.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(bad.status(), axum::http::StatusCode::BAD_REQUEST);
 
-    // One session whose user message opens with an explicit directive.
+    // Session 1: the reply carries an entity, but graph=false means
+    // only the memory lands.
     let transcripts = d._root.join("data").join("transcripts");
-    let key = index_transcript(
+    let off_key = index_transcript(
         &d,
-        &transcripts.join("run-rules.jsonl"),
+        &transcripts.join("run-graph-off.jsonl"),
         concat!(
             "{\"ts\":\"2026-09-20T10:00:00Z\",\"seq\":1,",
-            "\"event\":{\"type\":\"user_message\",\"text\":\"记住：用户喜欢深色主题\"}}\n",
+            "\"event\":{\"type\":\"user_message\",\"text\":\"用户喜欢深色主题\"}}\n",
             "{\"ts\":\"2026-09-20T10:00:01Z\",\"seq\":2,",
-            "\"event\":{\"type\":\"agent_message_chunk\",",
-            "\"content\":[{\"type\":\"text\",\"text\":\"已记住\"}]}}\n",
-            "{\"ts\":\"2026-09-20T10:00:02Z\",\"seq\":3,",
             "\"event\":{\"type\":\"stopped\"}}\n",
         ),
     )
     .await;
-
-    // Zero tokens: the directive becomes a memory with no agent run.
-    // (The mock only echoes — an accidental agent run would 400 on the
-    // unparseable echo, so success itself proves the rules path.)
     let out: serde_json::Value = http
-        .post(format!("{}/api/v1/sessions/{key}/distill", d.url))
+        .post(format!("{}/api/v1/sessions/{off_key}/distill", d.url))
         .send()
         .await
         .unwrap()
@@ -2108,12 +2142,11 @@ async fn distill_rules_mode_harvests_directives_without_an_agent() {
         .json()
         .await
         .unwrap();
-    assert_eq!(out["distilled"]["memories_written"], 1);
-    assert_eq!(out["distilled"]["agent"], "rules");
+    assert_eq!(out["distilled"]["memories_written"], 1, "{out}");
     assert_eq!(out["distilled"]["entities_written"], 0);
     assert_eq!(out["distilled"]["relations_written"], 0);
 
-    // The memory: [distilled]-prefixed, observation/user, confidence 0.9.
+    // The memory landed, the entities table did not grow.
     let memories: serde_json::Value = http
         .get(format!(
             "{}/api/v1/memory/list?store=observation&namespace=user",
@@ -2125,35 +2158,48 @@ async fn distill_rules_mode_harvests_directives_without_an_agent() {
         .json()
         .await
         .unwrap();
-    let hit = memories["memories"]
-        .as_array()
+    assert!(
+        memories["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"] == "[distilled] 用户喜欢深色主题"),
+        "distilled memory missing: {memories}"
+    );
+    let entities = d
+        .db
+        .call(|conn| conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get::<_, i64>(0)))
+        .await
         .unwrap()
-        .iter()
-        .find(|m| m["content"] == "[distilled] 用户喜欢深色主题")
-        .unwrap_or_else(|| panic!("distilled memory missing: {memories}"));
-    assert_eq!(hit["confidence"], 0.9);
-
-    // distill_log records the rules extractor.
+        .unwrap();
+    assert_eq!(entities, 0, "graph=false must not write entities");
+    // distill_log still records the run (with zero entities).
     let logged =
         d.db.call({
-            let key = key.clone();
+            let key = off_key.clone();
             move |conn| {
                 conn.query_row(
-                    "SELECT agent FROM distill_log WHERE session_key = ?1",
+                    "SELECT entities_written FROM distill_log WHERE session_key = ?1",
                     [&key],
-                    |r| r.get::<_, Option<String>>(0),
+                    |r| r.get::<_, i64>(0),
                 )
                 .ok()
-                .flatten()
             }
         })
         .await
         .unwrap();
-    assert_eq!(logged.as_deref(), Some("rules"));
+    assert_eq!(
+        logged,
+        Some(0),
+        "distill_log row must exist with 0 entities"
+    );
 
-    // Re-distilling the same transcript skips as near-duplicate.
-    let out2: serde_json::Value = http
-        .post(format!("{}/api/v1/sessions/{key}/distill", d.url))
+    // graph=true (the default): the same shape of reply now writes the
+    // entity too — the toggle, not a broken pipeline, made the
+    // difference above.
+    let put: serde_json::Value = http
+        .put(format!("{}/api/v1/distill", d.url))
+        .json(&serde_json::json!({ "graph": true }))
         .send()
         .await
         .unwrap()
@@ -2162,18 +2208,15 @@ async fn distill_rules_mode_harvests_directives_without_an_agent() {
         .json()
         .await
         .unwrap();
-    assert_eq!(out2["distilled"]["memories_written"], 0);
-    assert_eq!(out2["distilled"]["memories_skipped"], 1);
-
-    // A transcript without directives distills to zero, not an error.
-    let plain_key = index_transcript(
+    assert_eq!(put["ok"], true);
+    let on_key = index_transcript(
         &d,
-        &transcripts.join("run-plain.jsonl"),
-        "{\"ts\":\"2026-09-20T11:00:00Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"今天天气怎么样\"}}\n",
+        &transcripts.join("run-graph-on.jsonl"),
+        "{\"ts\":\"2026-09-20T11:00:00Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"我们启动了 GraphHub 项目\"}}\n",
     )
     .await;
-    let out3: serde_json::Value = http
-        .post(format!("{}/api/v1/sessions/{plain_key}/distill", d.url))
+    let out: serde_json::Value = http
+        .post(format!("{}/api/v1/sessions/{on_key}/distill", d.url))
         .send()
         .await
         .unwrap()
@@ -2182,7 +2225,169 @@ async fn distill_rules_mode_harvests_directives_without_an_agent() {
         .json()
         .await
         .unwrap();
-    assert_eq!(out3["distilled"]["memories_written"], 0);
-    assert_eq!(out3["distilled"]["memories_skipped"], 0);
-    assert_eq!(out3["distilled"]["agent"], "rules");
+    assert_eq!(out["distilled"]["memories_written"], 1, "{out}");
+    assert_eq!(out["distilled"]["entities_written"], 1);
+    let entities =
+        d.db.call(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM entities WHERE name = 'GraphHub'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entities, 1, "graph=true writes the extracted entity");
+
+    let _ = std::fs::remove_dir_all(&replies_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Chat project cwd (the dsh-web model: a session belongs to a workspace)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_runs_in_its_project_cwd() {
+    // The write mock drops out.txt in the SESSION's cwd: with a project
+    // cwd the deliverable lands in the project, and it stays there
+    // across close/resume.
+    let project = std::env::temp_dir().join(format!(
+        "ruagent-proj-{}-{}",
+        std::process::id(),
+        chrono_tag()
+    ));
+    std::fs::create_dir_all(&project).unwrap();
+    let d = start_daemon(&mock_agent_toml("write"), "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+    let cwd_s = project.to_string_lossy().into_owned();
+
+    // A cwd that is not an existing directory is a 400 at start.
+    let bad = http
+        .post(format!("{}/api/v1/chat", d.url))
+        .json(&serde_json::json!({
+            "agent": "mock",
+            "cwd": project.join("no-such-dir"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    // Start the chat IN the project.
+    let chat: serde_json::Value = http
+        .post(format!("{}/api/v1/chat", d.url))
+        .json(&serde_json::json!({ "agent": "mock", "cwd": cwd_s }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = chat["id"].as_str().unwrap().to_string();
+    assert_eq!(chat["cwd"].as_str().unwrap(), cwd_s, "{chat}");
+
+    // The live list and the history row both carry the cwd.
+    let live: serde_json::Value = http
+        .get(format!("{}/api/v1/chat", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = live["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id.as_str())
+        .expect("live chat listed");
+    assert_eq!(entry["cwd"].as_str().unwrap(), cwd_s, "{entry}");
+    let history: serde_json::Value = http
+        .get(format!("{}/api/v1/chats?limit=10", d.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let h = history["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id.as_str())
+        .expect("history row exists");
+    assert_eq!(h["cwd"].as_str().unwrap(), cwd_s, "{h}");
+
+    // One write prompt → the deliverable is in the project dir.
+    http.post(format!("{}/api/v1/chat/{id}/messages", d.url))
+        .json(&serde_json::json!({ "text": "please write the file" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    poll_transcript(&d._root, &id, Duration::from_secs(10), "write reply", |l| {
+        l.iter()
+            .any(|e| e["event"]["type"] == "stopped" && e["event"]["stop_reason"] == "end_turn")
+    })
+    .await;
+    assert!(
+        project.join("out.txt").is_file(),
+        "the session must run in the project cwd: {}",
+        project.display()
+    );
+
+    // Close, remove the deliverable, resume: the same project cwd —
+    // the next write must land there again. (The poll must count
+    // stopped events: the transcript already carries round 1's.)
+    http.delete(format!("{}/api/v1/chat/{id}", d.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    std::fs::remove_file(project.join("out.txt")).unwrap();
+    let resumed: serde_json::Value = http
+        .post(format!("{}/api/v1/chat/{id}/resume", d.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resumed["cwd"].as_str().unwrap(), cwd_s, "{resumed}");
+    http.post(format!("{}/api/v1/chat/{id}/messages", d.url))
+        .json(&serde_json::json!({ "text": "write it again" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    poll_transcript(
+        &d._root,
+        &id,
+        Duration::from_secs(10),
+        "resumed write reply",
+        |l| {
+            l.iter()
+                .filter(|e| {
+                    e["event"]["type"] == "stopped" && e["event"]["stop_reason"] == "end_turn"
+                })
+                .count()
+                >= 2
+        },
+    )
+    .await;
+    assert!(
+        project.join("out.txt").is_file(),
+        "a resumed session keeps the project cwd: {}",
+        project.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&project);
 }

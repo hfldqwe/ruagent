@@ -230,8 +230,7 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
             agent: config.policy.distill.agent.clone(),
             language: config.policy.distill.language.clone(),
             prompt: config.policy.distill.prompt.clone(),
-            // A bad [distill] mode fails boot loudly, not silently.
-            mode: distill::DistillMode::parse_opt(config.policy.distill.mode.as_deref())?,
+            graph: config.policy.distill.graph.unwrap_or(true),
         },
         Some(knowledge.embedder()),
         distill::AgentRegistry {

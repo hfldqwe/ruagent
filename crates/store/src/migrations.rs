@@ -20,6 +20,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0012_task_selected_by.sql"),
     include_str!("migrations/0013_chats.sql"),
     include_str!("migrations/0014_agent_options.sql"),
+    include_str!("migrations/0015_chats_cwd.sql"),
 ];
 
 /// Apply all pending migrations.

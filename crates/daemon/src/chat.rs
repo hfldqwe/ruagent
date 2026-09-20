@@ -42,6 +42,10 @@ pub struct Chat {
     /// The `[runtime.X]` engine this chat currently runs on.
     pub runtime: String,
     pub model: Option<String>,
+    /// The project directory this chat works in (None = the per-chat
+    /// scratch workspace). Survives handoff, resume and model restarts
+    /// — the conversation stays in its project.
+    pub cwd: Option<PathBuf>,
     pub created_at: String,
     session: ChatSession,
     last_active: Arc<Mutex<Instant>>,
@@ -193,6 +197,7 @@ type ChatRow = (
     Option<String>, // title
     i64,            // created_at
     i64,            // updated_at
+    Option<String>, // cwd
 );
 
 /// One sessions-index join row: (key, message_count, preview).
@@ -206,6 +211,8 @@ pub struct ChatHistoryEntry {
     pub runtime: Option<String>,
     pub model: Option<String>,
     pub title: Option<String>,
+    /// The project directory the conversation ran in (None = scratch).
+    pub cwd: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     /// A live chat the daemon is still holding (history can reopen the
@@ -243,7 +250,11 @@ pub struct ChatManager {
     model_cache: Arc<Mutex<HashMap<String, CachedOptions>>>,
 }
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Idle reaping: a chat untouched for this long closes (and
+/// auto-distills). 60 minutes — sessions belong to projects now
+/// (cwd), and several concurrent ones must survive a coffee break,
+/// not just a single prompt cycle.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// How long to wait for a spawned agent to report its model catalog.
 const MODELS_WAIT: Duration = Duration::from_secs(20);
 /// Background option-catalog refresh cadence.
@@ -299,6 +310,7 @@ impl ChatManager {
                     "agent": c.agent,
                     "runtime": c.runtime,
                     "model": c.model,
+                    "cwd": c.cwd.as_ref().map(|p| p.display().to_string()),
                     "created_at": c.created_at,
                 })
             })
@@ -365,10 +377,23 @@ impl ChatManager {
     }
 
     /// Start a new chat on the given agent (optionally with a model).
-    /// Workspace = a fresh dir under workspaces/chat-<id>. Records a
-    /// chats-table history row.
-    pub async fn start(&self, card: &AgentCard, model: Option<String>) -> Result<Chat> {
-        self.start_inner(card, model, &card.name, true, None, None)
+    /// `cwd` pins the session to a project directory — the agent works
+    /// there instead of a fresh scratch dir under workspaces/chat-<id>.
+    /// Records a chats-table history row.
+    pub async fn start(
+        &self,
+        card: &AgentCard,
+        model: Option<String>,
+        cwd: Option<PathBuf>,
+    ) -> Result<Chat> {
+        // A project chat must work in an existing directory: a typo'd
+        // path fails the start request, not the first agent spawn.
+        if let Some(dir) = &cwd
+            && !dir.is_dir()
+        {
+            anyhow::bail!("cwd `{}` is not an existing directory", dir.display());
+        }
+        self.start_inner(card, model, &card.name, true, None, None, cwd)
             .await
     }
 
@@ -382,6 +407,9 @@ impl ChatManager {
             .chat(id)
             .ok_or_else(|| anyhow::anyhow!("chat not found"))?;
         let old_label = old.agent.clone();
+        // The new session continues in the same project (cwd), not a
+        // fresh scratch dir.
+        let old_cwd = old.cwd.clone();
         let msgs = crate::sessions::parse_file_messages("ruagent", &self.transcript_path(id));
         // Bounded tail: the last 8 turns, ≤ 3000 chars, char-boundary safe.
         let mut tail = String::new();
@@ -402,7 +430,7 @@ impl ChatManager {
             ))
         };
         self.close(id);
-        self.start_inner(card, None, &card.name, true, handoff, None)
+        self.start_inner(card, None, &card.name, true, handoff, None, old_cwd)
             .await
     }
 
@@ -416,12 +444,12 @@ impl ChatManager {
         if self.chat(id).is_some() {
             anyhow::bail!("chat is live — attach instead of resuming");
         }
-        let label: String = {
+        let (label, cwd): (String, Option<String>) = {
             let key = id.to_string();
             self.db
                 .call(move |conn| {
-                    conn.query_row("SELECT agent FROM chats WHERE id = ?1", [&key], |r| {
-                        r.get(0)
+                    conn.query_row("SELECT agent, cwd FROM chats WHERE id = ?1", [&key], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
                     })
                 })
                 .await
@@ -446,13 +474,23 @@ impl ChatManager {
                 "[conversation resume — you are continuing your earlier conversation with the user; the transcript below is where it left off]\n{tail}"
             ))
         };
-        self.start_inner(card, None, &label, true, handoff, Some(id))
-            .await
+        self.start_inner(
+            card,
+            None,
+            &label,
+            true,
+            handoff,
+            Some(id),
+            cwd.map(PathBuf::from),
+        )
+        .await
     }
 
     /// The spawn path shared by chats and probes. `label` is the history
     /// identity (the role the user picked); `record` decides whether a
-    /// chats row is written (probes must not pollute history).
+    /// chats row is written (probes must not pollute history); `cwd` is
+    /// the project directory (None = a fresh scratch workspace).
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         &self,
         card: &AgentCard,
@@ -461,6 +499,7 @@ impl ChatManager {
         record: bool,
         handoff: Option<String>,
         reuse: Option<RunId>,
+        cwd: Option<PathBuf>,
     ) -> Result<Chat> {
         let spec = ruagent_acp::adapter_for(card.harness)
             .spawn_spec(card)
@@ -468,9 +507,18 @@ impl ChatManager {
         // A resumed conversation keeps its RunId: the transcript
         // appends, the history row survives, the rail shows one thread.
         let id = reuse.unwrap_or_else(RunId::generate);
-        let workspace = self.root.join("workspaces").join(format!("chat-{id}"));
-        std::fs::create_dir_all(&workspace)
-            .with_context(|| format!("creating workspace {}", workspace.display()))?;
+        // A project chat works in its directory as-is (it exists —
+        // validated at start); everything else gets a fresh scratch
+        // workspace under workspaces/.
+        let workspace = match &cwd {
+            Some(dir) => dir.clone(),
+            None => {
+                let ws = self.root.join("workspaces").join(format!("chat-{id}"));
+                std::fs::create_dir_all(&ws)
+                    .with_context(|| format!("creating workspace {}", ws.display()))?;
+                ws
+            }
+        };
 
         let mcp = self
             .mcp
@@ -575,6 +623,7 @@ impl ChatManager {
             agent: label.to_string(),
             runtime,
             model,
+            cwd,
             created_at: Utc::now().to_rfc3339(),
             session,
             last_active: Arc::new(Mutex::new(Instant::now())),
@@ -583,12 +632,14 @@ impl ChatManager {
             handoff,
         };
 
-        // History row: who (agent identity) on which engine.
+        // History row: who (agent identity) on which engine, in which
+        // project.
         if record {
             let id_s = id.to_string();
             let agent_s = chat.agent.clone();
             let runtime_s = chat.runtime.clone();
             let model_s = chat.model.clone();
+            let cwd_s = chat.cwd.as_ref().map(|p| p.display().to_string());
             let now = Utc::now().timestamp_millis();
             let db = self.db.clone();
             let _ = db
@@ -598,14 +649,15 @@ impl ChatManager {
                     // same conversation continuing.
                     conn.execute(
                         "INSERT INTO chats
-                             (id, agent, runtime, model, title, created_at, updated_at)
-                         VALUES (?1,?2,?3,?4,NULL,?5,?5)
+                             (id, agent, runtime, model, title, created_at, updated_at, cwd)
+                         VALUES (?1,?2,?3,?4,NULL,?5,?5,?6)
                          ON CONFLICT(id) DO UPDATE SET
                              agent = excluded.agent,
                              runtime = excluded.runtime,
                              model = excluded.model,
-                             updated_at = excluded.updated_at",
-                        rusqlite::params![id_s, agent_s, runtime_s, model_s, now],
+                             updated_at = excluded.updated_at,
+                             cwd = excluded.cwd",
+                        rusqlite::params![id_s, agent_s, runtime_s, model_s, now, cwd_s],
                     )
                 })
                 .await;
@@ -730,8 +782,11 @@ impl ChatManager {
             }
         }
         self.close(id);
+        // The restarted session keeps the project cwd — switching model
+        // is not switching projects.
+        let cwd = chat.cwd.clone();
         let chat = self
-            .start_inner(card, model, label, true, None, None)
+            .start_inner(card, model, label, true, None, None, cwd)
             .await?;
         Ok((chat, true))
     }
@@ -805,7 +860,7 @@ impl ChatManager {
             None => {
                 // Probe: start (unrecorded), read the options, close.
                 let chat = self
-                    .start_inner(card, None, &card.name, false, None, None)
+                    .start_inner(card, None, &card.name, false, None, None, None)
                     .await?;
                 let state = wait_options(&chat).await;
                 self.close(chat.id);
@@ -895,12 +950,12 @@ impl ChatManager {
             .call(move |conn| {
                 let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &filter {
                     Some(a) => (
-                        "SELECT id, agent, runtime, model, title, created_at, updated_at
+                        "SELECT id, agent, runtime, model, title, created_at, updated_at, cwd
                            FROM chats WHERE agent = ?1 ORDER BY updated_at DESC LIMIT ?2",
                         vec![a, &limit],
                     ),
                     None => (
-                        "SELECT id, agent, runtime, model, title, created_at, updated_at
+                        "SELECT id, agent, runtime, model, title, created_at, updated_at, cwd
                            FROM chats ORDER BY updated_at DESC LIMIT ?1",
                         vec![&limit],
                     ),
@@ -916,6 +971,7 @@ impl ChatManager {
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, i64>(5)?,
                             r.get::<_, i64>(6)?,
+                            r.get::<_, Option<String>>(7)?,
                         ))
                     })
                     .map_err(ruagent_store::DbError::from)?;
@@ -933,7 +989,7 @@ impl ChatManager {
         let mut entries: Vec<ChatHistoryEntry> = rows
             .into_iter()
             .map(
-                |(id, agent, runtime, model, title, created_at, updated_at)| {
+                |(id, agent, runtime, model, title, created_at, updated_at, cwd)| {
                     let session_key = id
                         .parse::<RunId>()
                         .ok()
@@ -944,6 +1000,7 @@ impl ChatManager {
                         runtime,
                         model,
                         title,
+                        cwd,
                         created_at,
                         updated_at,
                         active: false,
@@ -1026,7 +1083,7 @@ impl ChatManager {
             registry: self.registry.clone(),
             language: policy.language,
             prompt_override: policy.prompt,
-            mode: policy.mode,
+            graph: policy.graph,
         })
     }
 

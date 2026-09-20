@@ -82,65 +82,37 @@ pub struct DistillOutcome {
     pub agent: String,
 }
 
-/// How a session becomes knowledge (`[distill] mode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DistillMode {
-    /// Extraction prompt through an agent run (the default — costs tokens).
-    #[default]
-    Agent,
-    /// Pure heuristic harvest of explicit directives — zero LLM tokens.
-    Rules,
-}
-
-impl DistillMode {
-    /// The canonical `[distill] mode` value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Rules => "rules",
-        }
-    }
-
-    /// Parse a `[distill] mode` value; None/blank means the agent
-    /// default. Unknown values are errors — a typo must not silently
-    /// fall back to spending tokens (or skipping them).
-    pub fn parse_opt(s: Option<&str>) -> Result<Self> {
-        match s.map(str::trim).filter(|s| !s.is_empty()) {
-            None => Ok(Self::Agent),
-            Some(s) => Self::parse(s),
-        }
-    }
-
-    fn parse(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "agent" => Ok(Self::Agent),
-            "rules" => Ok(Self::Rules),
-            _ => anyhow::bail!("unknown distill mode `{s}` (expected \"agent\" or \"rules\")"),
-        }
-    }
-}
-
-/// The [distill] policy from policy.toml.
-#[derive(Debug, Clone, Default)]
+/// The [distill] policy from policy.toml. The graph flag arrives
+/// resolved (None in the file = true): every consumer wants a bool.
+#[derive(Debug, Clone)]
 pub struct AutoDistill {
     pub auto: bool,
     pub agent: Option<String>,
     pub language: Option<String>,
     pub prompt: Option<String>,
-    pub mode: DistillMode,
+    /// Also extract entities/relations into the graph.
+    pub graph: bool,
+}
+
+impl Default for AutoDistill {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            agent: None,
+            language: None,
+            prompt: None,
+            graph: true,
+        }
+    }
 }
 
 /// Distill `session_key` choosing the extraction agent from the
 /// registry: the policy's agent, else dsh, else the first enabled.
-/// Rules mode skips agent selection entirely — no agent, no tokens.
 pub async fn distill_with_agent(
     distiller: &Distiller,
     session_key: &str,
     preferred: Option<&str>,
 ) -> Result<DistillOutcome> {
-    if distiller.mode == DistillMode::Rules {
-        return distiller.distill_by_rules(session_key).await;
-    }
     let agents = distiller.registry.list_enabled();
     let card = select_agent(&agents, preferred)?;
     distiller.distill(session_key, card).await
@@ -173,8 +145,9 @@ pub struct Distiller {
     pub language: Option<String>,
     /// Full prompt override, from `[distill] prompt`.
     pub prompt_override: Option<String>,
-    /// Extraction mode: agent run or zero-token rules.
-    pub mode: DistillMode,
+    /// Also write entities/relations into the graph; false = memories
+    /// only, from `[distill] graph` (default true).
+    pub graph: bool,
 }
 
 /// Minimal registry view the distiller needs (no RunManager cycle).
@@ -195,24 +168,10 @@ impl Distiller {
     fn compose_prompt(&self) -> String {
         extraction_prompt(self.language.as_deref(), self.prompt_override.as_deref())
     }
-    /// Distill one session, dispatched on the mode: agent runs the
-    /// extraction prompt through the given agent (one ACP chat turn),
-    /// rules harvests explicit directives with no LLM at all.
+    /// Distill one session: run the extraction prompt through the given
+    /// agent (one ACP chat turn), then write the results into memory
+    /// and — unless graph extraction is off — the entity graph.
     pub async fn distill(
-        &self,
-        session_key: &str,
-        card: &ruagent_core::AgentCard,
-    ) -> Result<DistillOutcome> {
-        match self.mode {
-            DistillMode::Agent => self.distill_by_agent(session_key, card).await,
-            DistillMode::Rules => self.distill_by_rules(session_key).await,
-        }
-    }
-
-    /// Agent-mode extraction: render the transcript, run the extraction
-    /// prompt through the given agent, write the results into memory +
-    /// graph.
-    async fn distill_by_agent(
         &self,
         session_key: &str,
         card: &ruagent_core::AgentCard,
@@ -230,7 +189,13 @@ impl Distiller {
         let extraction = parse_extraction(&raw)?;
 
         let (mem_w, mem_s) = self.write_memories(&extraction.memories).await?;
-        let (ent_w, rel_w) = self.write_graph(&extraction).await?;
+        // graph = false: memories only; entities/relations count 0 and
+        // the log still records the run.
+        let (ent_w, rel_w) = if self.graph {
+            self.write_graph(&extraction).await?
+        } else {
+            (0, 0)
+        };
 
         let outcome = DistillOutcome {
             session_key: session_key.to_string(),
@@ -239,39 +204,6 @@ impl Distiller {
             entities_written: ent_w,
             relations_written: rel_w,
             agent: card.name.clone(),
-        };
-        self.log_outcome(&outcome).await?;
-        Ok(outcome)
-    }
-
-    /// Rules mode: zero-token distillation. Explicit directives in the
-    /// user's own messages ("记住：…", "remember: …") become memories
-    /// verbatim — no agent run, no entity/relation extraction.
-    /// `language`/`prompt` don't apply (nothing is generated), and a
-    /// transcript with no directives distills to zero, not an error.
-    pub async fn distill_by_rules(&self, session_key: &str) -> Result<DistillOutcome> {
-        let messages = self.load_messages(session_key).await?;
-        let memories: Vec<ExtractedMemory> = messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .filter_map(|m| rule_candidate(&m.text))
-            .map(|content| ExtractedMemory {
-                store: "observation".into(),
-                namespace: "user".into(),
-                content,
-                // The user said it themselves — no extraction guesswork
-                // to second-guess, but it is still a single utterance.
-                confidence: Some(0.9),
-            })
-            .collect();
-        let (mem_w, mem_s) = self.write_memories(&memories).await?;
-        let outcome = DistillOutcome {
-            session_key: session_key.to_string(),
-            memories_written: mem_w,
-            memories_skipped: mem_s,
-            entities_written: 0,
-            relations_written: 0,
-            agent: "rules".into(),
         };
         self.log_outcome(&outcome).await?;
         Ok(outcome)
@@ -582,36 +514,6 @@ fn default_namespace(store: &str) -> &'static str {
     if store == "profile" { "user" } else { "global" }
 }
 
-/// Directive prefixes that open an explicit memory command in a user
-/// message; Latin ones match case-insensitively.
-const RULE_DIRECTIVES: &[&str] = &["记住", "请记住", "remember", "note"];
-
-/// One zero-token memory candidate from a user message: the text after
-/// `prefix + colon` when the message starts with an explicit directive
-/// ("记住：用户喜欢深色主题", "remember: dark mode"). The colon may be
-/// ASCII or full-width; a message yields at most one candidate — its
-/// first directive.
-fn rule_candidate(msg: &str) -> Option<String> {
-    let trimmed = msg.trim();
-    let content = RULE_DIRECTIVES
-        .iter()
-        .find_map(|p| strip_prefix_ci(trimmed, p))
-        .and_then(|rest| rest.trim_start().strip_prefix([':', '：']))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    Some(content.to_string())
-}
-
-/// Case-insensitive prefix strip. The directives are ASCII or CJK, so
-/// case folding never changes byte lengths — but the candidate text can
-/// be any UTF-8, so the slice only happens on a char boundary.
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len()
-        && s.is_char_boundary(prefix.len())
-        && s[..prefix.len()].eq_ignore_ascii_case(prefix))
-    .then(|| &s[prefix.len()..])
-}
-
 /// Strip markdown fences / commentary the agent may have added.
 fn parse_extraction(raw: &str) -> Result<Extraction> {
     let trimmed = raw.trim();
@@ -729,60 +631,5 @@ mod tests {
             "deploy via docker compose on the weekend",
             &existing
         ));
-    }
-
-    #[test]
-    fn distill_mode_parses_strictly() {
-        assert_eq!(DistillMode::parse_opt(None).unwrap(), DistillMode::Agent);
-        assert_eq!(
-            DistillMode::parse_opt(Some("")).unwrap(),
-            DistillMode::Agent
-        );
-        assert_eq!(
-            DistillMode::parse_opt(Some(" rules ")).unwrap(),
-            DistillMode::Rules
-        );
-        assert_eq!(
-            DistillMode::parse_opt(Some("Agent")).unwrap(),
-            DistillMode::Agent
-        );
-        assert!(DistillMode::parse_opt(Some("bogus")).is_err());
-        assert_eq!(DistillMode::Rules.as_str(), "rules");
-    }
-
-    #[test]
-    fn rule_candidate_extracts_directives() {
-        // Both colon widths, mixed case, politeness, surrounding space.
-        assert_eq!(
-            rule_candidate("记住：用户喜欢深色主题"),
-            Some("用户喜欢深色主题".into())
-        );
-        assert_eq!(
-            rule_candidate("请记住: deploy on Fridays"),
-            Some("deploy on Fridays".into())
-        );
-        assert_eq!(
-            rule_candidate("Remember: I like pie"),
-            Some("I like pie".into())
-        );
-        assert_eq!(
-            rule_candidate("NOTE: quiet hours 22:00"),
-            Some("quiet hours 22:00".into())
-        );
-        assert_eq!(
-            rule_candidate("  remember:  spaced  "),
-            Some("spaced".into())
-        );
-    }
-
-    #[test]
-    fn rule_candidate_ignores_non_directives() {
-        // Directive must open the message (with a colon right after).
-        assert_eq!(rule_candidate("帮我记住这件事"), None);
-        assert_eq!(rule_candidate("remember to use dark mode"), None);
-        assert_eq!(rule_candidate("notebook: my notes"), None);
-        // A directive with nothing after it is not a memory.
-        assert_eq!(rule_candidate("remember:"), None);
-        assert_eq!(rule_candidate("今天天气怎么样"), None);
     }
 }
