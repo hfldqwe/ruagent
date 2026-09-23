@@ -658,6 +658,10 @@ const zh: Record<string, string> = {
   "sessions.hideSystem": "隐藏系统会话",
   "sessions.showSystem": "显示系统会话（{n}）",
   "sessions.onlySystem": "只看系统会话",
+  // S9.4: the honest placeholder worn by a row whose stored name is one of our
+  // own injection headers. It says what the row IS and when it happened — it
+  // never pretends to be something the user wrote.
+  "sessions.systemName": "（含平台上下文的历史会话）· {d}",
   "sessions.archivedToast": "已归档 · 文件未被改动，可随时取消归档",
   "sessions.unarchivedToast": "已取消归档",
   "sessions.deletedToast": "已从索引中删除",
@@ -1345,6 +1349,7 @@ const en: Record<string, string> = {
   "sessions.hideSystem": "Hide system sessions",
   "sessions.showSystem": "Show system sessions ({n})",
   "sessions.onlySystem": "System sessions only",
+  "sessions.systemName": "(historical session with platform context) · {d}",
   "sessions.archivedToast": "Archived · no file was changed, and you can undo this",
   "sessions.unarchivedToast": "Unarchived",
   "sessions.deletedToast": "Removed from the index",

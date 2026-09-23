@@ -2313,7 +2313,26 @@ async function probeWig(page, restore) {
   //     wording, not by our taste.
   for (const w of [520, 390]) {
     await page.setViewportSize({ width: w, height: 900 });
-    await page.waitForTimeout(220);
+    // Sample only once the computed styles have SETTLED. A single wait was not
+    // enough: our narrow rule (index.css @media max-width:520px, font-size:16px)
+    // and antd's CSS-in-JS both write font-size, and which one is in effect
+    // when we sample depends on timing. Sampling mid-race produced fractional
+    // readings (14.9501px / 15.8496px) that are neither the 16px the DOM
+    // reports nor the 14px desktop value -- a number no user can see. This is
+    // the object-not-what-it-thinks-it-is family again: the judge was measuring
+    // a transient cascade state. Waiting for two identical consecutive reads
+    // makes the reading the settled value, and does NOT touch the threshold.
+    let prevSig = null;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await page.waitForTimeout(150);
+      const sig = await page.evaluate(() =>
+        [...document.querySelectorAll("input, textarea, select")]
+          .map((el) => getComputedStyle(el).fontSize)
+          .join(",")
+      );
+      if (sig === prevSig) break;
+      prevSig = sig;
+    }
     const r = await page.evaluate(() => {
       const vis = (el) => {
         const cs = getComputedStyle(el);

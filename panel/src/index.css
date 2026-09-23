@@ -1954,6 +1954,36 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
 @media (max-width: 520px) {
   .row-btn { column-gap: 4px; padding-left: 6px; padding-right: 6px; flex-wrap: wrap; }
 }
+
+/* t108: Web Interface Guidelines, narrow screens ONLY (the captain's same-source
+   rule: 520 is the breakpoint that already changes these layouts, so the
+   criterion that judges the narrow layout must use the same one).
+     * :28 "Mobile input size" -- input font size >= 16px on mobile, or iOS
+       Safari auto-zooms/pans on focus. Object = form controls only (the
+       standard says input, NOT "all text"): measured before 14px on 10/10
+       #chat and 8/8 #sessions narrow captures.
+     * :27 "Match visual & hit targets" -- on mobile the minimum hit target is
+       44px. Measured before: 74/76 (#chat), 95/97 (#sessions), 36/38 (#agents)
+       clickable elements below 44x44.
+   Why :root: antd injects its styles at runtime, i.e. AFTER this stylesheet, so
+   at equal specificity antd wins the tie. :root adds exactly one class worth of
+   specificity - enough to win, no !important, and no per-component class list
+   that would silently miss a control added later. The wrapper/selector rules are
+   needed because antd's own "font-size: inherit" on the inner input outranks a
+   plain element selector; setting the container to 16px is what makes the inner
+   control inherit 16px. Desktop is untouched (the whole block is narrow-only),
+   so the 32x32 desktop language stays as designed. */
+@media (max-width: 520px) {
+  :root input, :root textarea, :root select,
+  :root .ant-input-affix-wrapper, :root .ant-input-group-wrapper,
+  :root .ant-select, :root .ant-select-selector, :root .ant-select-content {
+    font-size: 16px;
+  }
+  :root button, :root a[href], :root [role="button"], :root .icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
 /* A session that is streaming right now is "now": amber. */
 .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--signal); flex: none; }
 .chat-group-more {

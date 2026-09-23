@@ -391,16 +391,35 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       setModel("");
     }
     let alive = true;
+    const apply = (list: SessionOptionInfo[]) => {
+      setOptions(list);
+      const m = list.find((o) => o.category === "model" || o.id === "model");
+      // Configured default wins; otherwise the advertised current; otherwise
+      // the FIRST advertised choice — a catalog that names no current model
+      // must still leave the picker usable instead of blank forever.
+      setModel((cur) => cur || m?.current || m?.choices?.[0]?.value || "");
+    };
     api
       .agentOptions(agent, false, engine || undefined)
       .then((r) => {
         if (!alive) return;
-        setOptions(r.options);
-        const m = r.options.find(
-          (o) => o.category === "model" || o.id === "model",
-        );
-        // Configured default wins; otherwise the advertised current.
-        setModel((cur) => cur || m?.current || "");
+        // An EMPTY catalog is not an answer. The daemon persists the result
+        // of the first probe, and on a fresh data root that persisted copy is
+        // {"options":[],"cached":true} — so the picker stayed blank forever
+        // (CI: e2e/chat.spec.ts:34 expected "mock-pro", received ""). An empty
+        // cached catalog therefore triggers exactly one real probe.
+        if (r.options.length === 0) {
+          api
+            .agentOptions(agent, true, engine || undefined)
+            .then((r2) => {
+              if (alive) apply(r2.options);
+            })
+            .catch(() => {
+              if (alive) apply([]);
+            });
+          return;
+        }
+        apply(r.options);
       })
       .catch(() => {
         if (alive) setOptions([]);

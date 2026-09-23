@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Input, Popconfirm, Segmented, Select } from "antd";
 import { api, type ArchivedMode, type SessionRecord } from "../api";
-import { useI18n } from "../i18n";
+import { dateOf, useI18n } from "../i18n";
 import { Icon } from "../icons";
 import {
   Empty,
@@ -25,7 +25,11 @@ import { SOURCE_LABEL, sourceHue, msToIso } from "./Sessions";
 // `./Sessions` re-export: the re-export exists so the ENTRY chunk
 // (CommandPalette) does not drag a route module in, and this view is already
 // that route chunk, so importing the source of truth directly costs nothing.
-import { isSystemSession, isTempWorkspace } from "../session-source";
+import {
+  isPlatformInjectedName,
+  isSystemSession,
+  isTempWorkspace,
+} from "../session-source";
 
 const ROW_H = 40;
 /** Rows rendered beyond the viewport, so a fast scroll never shows a gap.
@@ -34,6 +38,28 @@ const ROW_H = 40;
 const OVERSCAN = 2;
 /** The viewer is capped like the chat log: newest 400 messages. */
 const MSG_CAP = 400;
+
+/** The name a session wears on this page (S9.4).
+ *
+ *  When the stored name is one of OUR injection headers, the harness took the
+ *  first message it was handed — our memory-context block — as the title, so
+ *  the name is our prompt and not something the user wrote. It is replaced by
+ *  an honest placeholder that says what the row is and when it happened; the
+ *  name never pretends to be the user's words, and the session's content is
+ *  untouched (it still opens).
+ *
+ *  The date is the session's own start day (`dateOf` — the same absolute-date
+ *  helper Graph/Memory/Knowledge use), not a relative time: a name has to stay
+ *  stable in the list, and §9.5 L6 asks for a stable identity. */
+function sessionName(
+  s: { title: string | null; started_at: number },
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (isPlatformInjectedName(s.title)) {
+    return t("sessions.systemName", { d: dateOf(msToIso(s.started_at)) });
+  }
+  return s.title || t("sessions.untitled");
+}
 
 /** S7 — which platform-generated sessions the list shows. */
 type SystemMode = "exclude" | "include" | "only";
@@ -539,7 +565,7 @@ function RowList({
               {SOURCE_LABEL[s.source] ?? s.source}
             </span>
           ) : null}
-          <span className="title">{s.title || t("sessions.untitled")}</span>
+          <span className="title">{sessionName(s, t)}</span>
           {!narrow && s.archived ? (
             <span className="tag">{t("sessions.archived")}</span>
           ) : null}
@@ -696,7 +722,7 @@ export function SessionDetail({
   }, [onClose]);
 
   const shown = messages && messages.length > MSG_CAP ? messages.slice(-MSG_CAP) : messages;
-  const title = session.title || t("sessions.untitled");
+  const title = sessionName(session, t);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
