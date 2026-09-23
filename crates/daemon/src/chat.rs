@@ -1262,6 +1262,30 @@ impl ChatManager {
                 e.message_count = Some(*count);
                 e.preview.clone_from(preview);
             }
+            // The index is the cheap source, but it is written by a 60s
+            // background scan. A chat created by sending its first message
+            // therefore has NO index row yet, and used to report
+            // message_count: None -- which the panel's rule (t90: a chat with
+            // no messages is not a chat) reads as "no messages" and HIDES.
+            // The user saw the conversation they had just started vanish from
+            // the list. Real state and reported state disagreed; this is the
+            // daemon's job to fix, not the rule's.
+            //
+            // So when the index has nothing, count the chat's OWN transcript.
+            // Same object the rule asks about -- "did the user ever say
+            // anything here" -- and a chat with no message still counts 0 and
+            // stays hidden. The rule is NOT relaxed.
+            if e.message_count.is_none()
+                && let Ok(rid) = e.id.parse::<RunId>()
+            {
+                let lines =
+                    ruagent_store::read_transcript(&self.transcript_path(rid)).unwrap_or_default();
+                let n = lines
+                    .iter()
+                    .filter(|l| matches!(l.event, ruagent_core::RunEvent::UserMessage { .. }))
+                    .count();
+                e.message_count = Some(u32::try_from(n).unwrap_or(u32::MAX));
+            }
             e.active = live.contains_key(&e.id);
             e.generating = live.get(&e.id).copied().unwrap_or(false);
         }
