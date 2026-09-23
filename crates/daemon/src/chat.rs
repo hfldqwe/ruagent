@@ -32,6 +32,28 @@ use ruagent_core::{AgentCard, RunEvent, RunId};
 use ruagent_store::{TranscriptWriter, transcript_path};
 use tokio::sync::mpsc;
 
+/// Marker between the INJECTED context (role prompt, memory, handoff) and the
+/// user's own words inside the single prompt block.
+///
+/// Why a marker rather than a smarter parser (t101): the injected blocks ride
+/// in the SAME text block as the user's message, because the ACP layer joins
+/// them (context, separator, text) before sending. The harness then records the
+/// whole thing as one user message, and the sessions indexer -- which cannot
+/// tell a prompt from a question -- used it as the row preview. So the row was
+/// named after the platform's own prompt.
+///
+/// The tempting fix is to strip a leading bracket block. It is wrong: a user
+/// may genuinely start a message with a bracket, and the rule would delete real
+/// content -- the object-set-must-match-the-intent failure this team keeps
+/// catching. This marker is EMITTED BY US, so the split is structural: it fires
+/// only where we actually injected something, and a message with no injection
+/// is untouched.
+///
+/// U+2063 (INVISIBLE SEPARATOR) makes an accidental collision with typed text
+/// effectively impossible while staying invisible in any transcript a human
+/// reads.
+pub const USER_TEXT_SENTINEL: &str = "\n\n\u{2063}ruagent:user-text\u{2063}\n\n";
+
 /// One live chat.
 #[derive(Clone)]
 pub struct Chat {
@@ -49,6 +71,14 @@ pub struct Chat {
     pub created_at: String,
     session: ChatSession,
     last_active: Arc<Mutex<Instant>>,
+    /// Whether this chat is generating a reply RIGHT NOW.
+    ///
+    /// A RUN state, not a lifetime state. Set when a prompt goes out,
+    /// cleared by the session own terminal event (Stopped or Error) --
+    /// never inferred from active, from message_count, or from an
+    /// updated_at window. See ChatHistoryEntry::active for the other half
+    /// of the pair and for the implication between them.
+    generating: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the memory context already went out with a prompt (once
     /// per chat — the first message is the natural recall query).
     memory_injected: Arc<std::sync::atomic::AtomicBool>,
@@ -156,9 +186,28 @@ impl Chat {
                 })
                 .await;
         }
-        self.send(ChatCommand::Prompt { text, context })
+        // Set BEFORE the prompt is queued: the history route may be polled
+        // the instant the POST returns, and a flag set afterwards would
+        // read false on that first poll.
+        self.generating
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The sentinel goes on the END of the context, so the boundary sits
+        // exactly where the injection stops. With no context nothing was
+        // injected and nothing is marked -- a plain prompt is unchanged.
+        let context = context.map(|c| format!("{c}{USER_TEXT_SENTINEL}"));
+        let sent = self.send(ChatCommand::Prompt { text, context });
+        if sent.is_err() {
+            // Nothing went out, so nothing will ever clear it.
+            self.generating
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        sent
     }
 
+    /// Is this chat generating a reply right now?
+    pub fn is_generating(&self) -> bool {
+        self.generating.load(std::sync::atomic::Ordering::SeqCst)
+    }
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RunEvent> {
         self.session.subscribe()
     }
@@ -217,12 +266,40 @@ pub struct ChatHistoryEntry {
     pub updated_at: i64,
     /// A live chat the daemon is still holding (history can reopen the
     /// transcript; a live one also streams).
+    ///
+    /// LIFETIME, not run state: a chat stays active for as long as the
+    /// daemon holds it, including the whole time it sits idle waiting for
+    /// the next message (an idle reaper eventually drops it). It answers
+    /// the question: is this conversation still open? NOT: is it working?
     pub active: bool,
+    /// Whether this chat is generating a reply RIGHT NOW.
+    ///
+    /// RUN state, separate from active. True from the moment a prompt is
+    /// accepted until the session reports the turn finished (Stopped, or
+    /// Error). Read from the live session, never derived from active, from
+    /// message_count, or from an updated_at window.
+    ///
+    /// Implication: generating == true REQUIRES active == true (a chat
+    /// that is generating is by definition still held). The converse does
+    /// NOT hold -- an active chat is normally idle, which is exactly the
+    /// distinction active alone could not express.
+    pub generating: bool,
     pub message_count: Option<u32>,
     pub preview: Option<String>,
     /// Sessions-index key of the transcript (the shared viewer route).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+}
+
+/// Outcome of ChatManager::delete, so the API can report it honestly instead
+/// of collapsing removed and never-there into one status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatDelete {
+    /// The row was removed. was_live says whether a session had to be
+    /// stopped and closed first.
+    Deleted { was_live: bool },
+    /// No such row -- an idempotent no-op, not an error.
+    NotFound,
 }
 
 pub struct ChatManager {
@@ -520,9 +597,13 @@ impl ChatManager {
             }
         };
 
+        // Pre-flight the injected MCP servers (see the runs API for why): a
+        // command that cannot be resolved is a configuration error worth naming
+        // here, not an opaque harness "mcp-client(mcp)" failure later.
         let mcp = self
             .mcp
-            .expand_profile(card.mcp_profile.as_deref(), &card.name);
+            .expand_profile_preflighted(card.mcp_profile.as_deref(), &card.name)
+            .map_err(anyhow::Error::msg)?;
 
         // Per-chat permission channel: each ask is parked in the shared
         // inbox keyed by this chat's id (rules may auto-answer; otherwise
@@ -627,10 +708,32 @@ impl ChatManager {
             created_at: Utc::now().to_rfc3339(),
             session,
             last_active: Arc::new(Mutex::new(Instant::now())),
+            generating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_prompt: card.prompt.clone(),
             handoff,
         };
+
+        // Run-state watcher: generating is cleared by the session own
+        // terminal event, not by a timer and not by watching the clock.
+        // Stopped covers a normal turn and a cancelled one; Error is the
+        // other way a turn ends. Every other event leaves the flag alone.
+        {
+            let mut sub = chat.session.subscribe();
+            let generating = chat.generating.clone();
+            tokio::spawn(async move {
+                loop {
+                    match sub.recv().await {
+                        Ok(RunEvent::Stopped { .. }) | Ok(RunEvent::Error { .. }) => {
+                            generating.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return, // chat closed
+                    }
+                }
+            });
+        }
 
         // History row: who (agent identity) on which engine, in which
         // project.
@@ -705,6 +808,53 @@ impl ChatManager {
             }
             None => false,
         }
+    }
+
+    /// Delete one chat-history row.
+    ///
+    /// WHAT IT REMOVES: the `chats` row -- i.e. the entry in
+    /// GET /api/v1/chats. A LIVE chat is stopped first and then closed, so a
+    /// chat that is generating cannot keep writing after its record is gone.
+    ///
+    /// WHAT IT DOES NOT REMOVE: the transcript JSONL under transcripts/, the
+    /// `sessions` index row, and anything memory ingestion already
+    /// produced -- closing a chat still runs the auto-distill hook, so
+    /// memories distilled from it survive the delete. Deleting the history
+    /// entry is not the same as retracting the conversation's content.
+    ///
+    /// WHY NO TOMBSTONE (checked, not assumed): nothing rebuilds the
+    /// `chats` table. A workspace-wide grep for writes to it finds
+    /// exactly two -- the INSERT ... ON CONFLICT in start_inner (chat
+    /// start/resume) and the first-prompt title UPDATE. There is no periodic
+    /// re-index of `chats`, unlike `sessions`, which
+    /// SessionIndexer rewrites with INSERT OR REPLACE every 60s and which
+    /// therefore needs session_deletions. A resume of a deleted id DOES
+    /// re-create the row; that is a deliberate user action, not a background
+    /// rebuild, so it needs no marker.
+    ///
+    /// IDEMPOTENT: deleting an absent id is NotFound, not an error, and
+    /// repeating a delete changes nothing.
+    pub async fn delete(&self, id: RunId) -> Result<ChatDelete, anyhow::Error> {
+        // Terminate the run BEFORE dropping the record: the reverse order
+        // leaves a live session writing into a chat the list no longer
+        // knows about.
+        let live = self.chats.lock().expect("chats lock").get(&id).cloned();
+        let was_live = live.is_some();
+        if let Some(c) = &live
+            && c.is_generating()
+        {
+            let _ = c.send(ChatCommand::Stop);
+        }
+        // close() removes it from the registry and sends Shutdown; dropping
+        // the broadcast sender is what ends attached SSE streams -- they get
+        // the terminal end event from the Err(_) arm in chat_events.
+        self.close(id);
+        let removed = self.db.delete_chat(&id.to_string()).await?;
+        Ok(if removed {
+            ChatDelete::Deleted { was_live }
+        } else {
+            ChatDelete::NotFound
+        })
     }
 
     /// Spawn a background distillation for a closed chat (policy-gated).
@@ -1004,6 +1154,7 @@ impl ChatManager {
                         created_at,
                         updated_at,
                         active: false,
+                        generating: false,
                         message_count: None,
                         preview: None,
                         session_key,
@@ -1045,9 +1196,16 @@ impl ChatManager {
                 .unwrap_or_default()
         };
 
-        let live: Vec<String> = {
+        // Both flags come from the SAME live snapshot: active is registry
+        // membership, generating is the session run state. Taking them
+        // together keeps the implication (generating => active) true by
+        // construction rather than by luck.
+        let live: HashMap<String, bool> = {
             let chats = self.chats.lock().expect("chats lock");
-            chats.keys().map(|id| id.to_string()).collect()
+            chats
+                .iter()
+                .map(|(id, c)| (id.to_string(), c.is_generating()))
+                .collect()
         };
         for e in &mut entries {
             if let Some(key) = &e.session_key
@@ -1056,7 +1214,8 @@ impl ChatManager {
                 e.message_count = Some(*count);
                 e.preview.clone_from(preview);
             }
-            e.active = live.contains(&e.id);
+            e.active = live.contains_key(&e.id);
+            e.generating = live.get(&e.id).copied().unwrap_or(false);
         }
         entries
     }
@@ -1228,5 +1387,265 @@ fn truncate_chars(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod generating_tests {
+    use super::*;
+
+    /// The mock ACP agent, built by the same workspace run.
+    fn mock_agent() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?.parent()?; // target/<profile>
+        let name = if cfg!(windows) {
+            "ruagent-mock-agent.exe"
+        } else {
+            "ruagent-mock-agent"
+        };
+        let p = dir.join(name);
+        p.is_file().then_some(p)
+    }
+
+    /// Delete removes the HISTORY ROW, and does it without disturbing
+    /// anything else -- driven by the mock agent, no real harness.
+    ///
+    /// Covers the four things the contract asks to be pinned:
+    ///   * a deleted chat leaves the list while its neighbour stays;
+    ///   * deleting an absent id is NotFound (idempotent, not an error);
+    ///   * close() (the OLD endpoint) still keeps the row -- its semantics
+    ///     are unchanged, which is the whole reason a second entry point
+    ///     was added rather than changing that one;
+    ///   * deleting a GENERATING chat stops the run first, so no live
+    ///     session survives its own record.
+    #[tokio::test]
+    async fn delete_removes_the_row_and_stops_a_live_run_first() {
+        let Some(mock) = mock_agent() else {
+            panic!("mock agent binary not built next to the test exe");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-del-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000002",
+            "name": "mock",
+            "harness": "mock",
+            "command": format!("{} --behavior echo", mock.display()),
+            "description": "test",
+            "model": null,
+            "reasoning_effort": null,
+            "context_window": null,
+            "mcp_profile": null,
+            "models": [],
+            "tags": [],
+            "enabled": true
+        }))
+        .expect("agent card");
+
+        let victim = chats.start(&card, None, None).await.expect("start victim");
+        // Captured before the drop at the end of this test: the assertions
+        // above it still need the id after the handle itself is gone.
+        let vid = victim.id;
+        let neighbour = chats
+            .start(&card, None, None)
+            .await
+            .expect("start neighbour");
+        let embedder: Arc<dyn ruagent_knowledge::embed::Embedder> =
+            Arc::new(ruagent_knowledge::embed::HashEmbedder::default());
+        victim
+            .send_prompt(&db, embedder, "hello".into())
+            .await
+            .expect("send prompt");
+
+        let before = chats.history(None, 50).await;
+        assert!(before.iter().any(|e| e.id == vid.to_string()));
+        assert!(before.iter().any(|e| e.id == neighbour.id.to_string()));
+        assert!(victim.is_generating(), "the victim is mid-turn");
+
+        // A subscriber stands in for an attached SSE client: it is what the
+        // event stream is fed from, so "the sender is dropped" IS "the
+        // session can no longer produce events".
+        let mut witness = victim.subscribe();
+
+        // Delete WHILE GENERATING: the run must be terminated first.
+        let out = chats.delete(vid).await.expect("delete");
+        assert_eq!(out, ChatDelete::Deleted { was_live: true });
+        assert!(
+            chats.chat(vid).is_none(),
+            "a deleted chat must not stay in the live registry"
+        );
+        let after = chats.history(None, 50).await;
+        assert!(
+            !after.iter().any(|e| e.id == vid.to_string()),
+            "the deleted row is gone from the list"
+        );
+        assert!(
+            after.iter().any(|e| e.id == neighbour.id.to_string()),
+            "the neighbour is untouched"
+        );
+        assert_eq!(after.len(), before.len() - 1);
+
+        // The session is really gone. A broadcast channel reports Closed once
+        // every sender is dropped, so this only holds after OUR handle goes:
+        // that is the point. It proves the registry no longer holds the
+        // session, and that nothing else in-process does either.
+        //
+        // In the daemon the SSE handler ALSO holds a Chat clone, so the
+        // channel alone cannot end an attached stream -- which is exactly why
+        // chat_events now polls the registry as a second liveness signal and
+        // sends the terminal end event when the chat disappears.
+        // What the contract asks is that the agent produces NO FURTHER
+        // MESSAGES. Two details make that measurable:
+        //   * the witness subscribed before the prompt, so its buffer holds
+        //     events from BEFORE the delete -- those are drained, not counted;
+        //   * teardown is asynchronous (Shutdown ends the turn), so a
+        //     Stop/cancel event may still land. A settle window absorbs that
+        //     tail; the QUIET WINDOW after it is the actual claim.
+        drop(victim);
+        let settle = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
+        while tokio::time::Instant::now() < settle {
+            let _ = witness.try_recv();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let quiet = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
+        let mut after_teardown = 0usize;
+        while tokio::time::Instant::now() < quiet {
+            if witness.try_recv().is_ok() {
+                after_teardown += 1;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert_eq!(
+            after_teardown, 0,
+            "a deleted chat must not produce another message"
+        );
+
+        // Idempotent: a second delete is NotFound, not an error.
+        assert_eq!(
+            chats.delete(vid).await.expect("second delete"),
+            ChatDelete::NotFound
+        );
+        assert_eq!(chats.history(None, 50).await.len(), after.len());
+
+        // The OLD endpoint's semantics are unchanged: close keeps the row.
+        assert!(chats.close(neighbour.id));
+        let closed = chats.history(None, 50).await;
+        assert!(
+            closed.iter().any(|e| e.id == neighbour.id.to_string()),
+            "close() must still leave the history row (unchanged semantics)"
+        );
+        assert!(
+            !closed
+                .iter()
+                .find(|e| e.id == neighbour.id.to_string())
+                .unwrap()
+                .active
+        );
+    }
+
+    /// generating tracks the RUN; active tracks the LIFETIME. Both halves of
+    /// the pair are asserted on one real chat, driven by the mock agent:
+    ///   - while the prompt is in flight: generating == true AND active == true
+    ///   - after the turn ends:           generating == false AND active == true
+    /// The second line is the whole point -- active alone cannot express it.
+    #[tokio::test]
+    async fn generating_tracks_the_run_while_active_tracks_the_lifetime() {
+        let Some(mock) = mock_agent() else {
+            panic!("mock agent binary not built next to the test exe");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-gen-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "mock",
+            "harness": "mock",
+            "command": format!("{} --behavior echo", mock.display()),
+            "description": "test",
+            "model": null,
+            "reasoning_effort": null,
+            "context_window": null,
+            "mcp_profile": null,
+            "models": [],
+            "tags": [],
+            "enabled": true
+        }))
+        .expect("agent card");
+
+        let chat = chats.start(&card, None, None).await.expect("start chat");
+        let id = chat.id;
+        let embedder: Arc<dyn ruagent_knowledge::embed::Embedder> =
+            Arc::new(ruagent_knowledge::embed::HashEmbedder::default());
+
+        // (a) generating, and therefore active too.
+        chat.send_prompt(&db, embedder, "hello".into())
+            .await
+            .expect("send prompt");
+        assert!(
+            chat.is_generating(),
+            "generating must be true the moment the prompt is accepted"
+        );
+        let during = chats.history(None, 50).await;
+        let e = during
+            .iter()
+            .find(|e| e.id == id.to_string())
+            .expect("chat in history");
+        assert!(
+            e.generating,
+            "history must report generating during the turn"
+        );
+        assert!(e.active, "a generating chat is by definition still held");
+
+        // (b) held but idle: the reply landed, the chat is STILL active.
+        let mut idle = None;
+        for _ in 0..200 {
+            let h = chats.history(None, 50).await;
+            if let Some(e) = h.iter().find(|e| e.id == id.to_string())
+                && !e.generating
+            {
+                idle = Some(e.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let idle = idle.expect("the turn never finished");
+        assert!(!idle.generating, "generating must clear when the turn ends");
+        assert!(
+            idle.active,
+            "the chat is STILL held after the reply -- this is exactly the"
+        );
     }
 }

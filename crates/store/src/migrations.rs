@@ -21,6 +21,8 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0013_chats.sql"),
     include_str!("migrations/0014_agent_options.sql"),
     include_str!("migrations/0015_chats_cwd.sql"),
+    include_str!("migrations/0016_session_archives.sql"),
+    include_str!("migrations/0017_session_deletions.sql"),
 ];
 
 /// Apply all pending migrations.

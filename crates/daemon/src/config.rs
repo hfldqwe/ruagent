@@ -386,6 +386,21 @@ impl McpConfig {
         profile: Option<&str>,
         agent_name: &str,
     ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+        self.profile_entries(profile, agent_name)
+            .into_iter()
+            .map(|(n, e)| mcp_entry_to_acp(n, e))
+            .collect()
+    }
+
+    /// The registry entries a profile would inject, in injection order.
+    ///
+    /// Split out of [Self::expand_profile] so the pre-flight below can inspect
+    /// the raw command/url before they become ACP values.
+    fn profile_entries<'a>(
+        &'a self,
+        profile: Option<&str>,
+        agent_name: &str,
+    ) -> Vec<(&'a String, &'a McpEntry)> {
         let Some(profile_name) = profile else {
             return vec![];
         };
@@ -412,9 +427,83 @@ impl McpConfig {
                     true
                 }
             })
-            .map(|(n, e)| mcp_entry_to_acp(n, e))
             .collect()
     }
+
+    /// Cheap pre-flight of everything a profile would inject.
+    ///
+    /// The harness reports a broken injection as an opaque
+    /// `Internal error: { "details": "mcp-client(mcp): initial connection or
+    /// tool synchronization failed" }` — no server, no command, nothing to act
+    /// on. This runs on every session start (microseconds: it only resolves
+    /// paths) so the failure can be named before the harness ever sees it.
+    pub fn preflight_profile(
+        &self,
+        profile: Option<&str>,
+        agent_name: &str,
+    ) -> Vec<McpPreflightFailure> {
+        self.profile_entries(profile, agent_name)
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let target = ruagent_mcp::health::PingTarget {
+                    command: entry.command.clone(),
+                    args: entry.args.clone(),
+                    url: entry.url.clone(),
+                };
+                match ruagent_mcp::health::preflight(&target) {
+                    Ok(()) => None,
+                    Err(reason) => Some(McpPreflightFailure {
+                        server: name.clone(),
+                        command: ruagent_mcp::health::describe(&target),
+                        reason,
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// [Self::expand_profile] plus the pre-flight, as one fallible step.
+    ///
+    /// A server whose command cannot be resolved at all is a configuration
+    /// error, not a transient one: failing here — naming the server, the
+    /// command and the reason — is strictly better than letting the harness
+    /// refuse `session/new` with an unactionable string. (Servers that merely
+    /// fail their health check are still excluded, not fatal: that path is the
+    /// existing issue-#24 behaviour.)
+    pub fn expand_profile_preflighted(
+        &self,
+        profile: Option<&str>,
+        agent_name: &str,
+    ) -> Result<Vec<agent_client_protocol::schema::v1::McpServer>, String> {
+        let failures = self.preflight_profile(profile, agent_name);
+        if !failures.is_empty() {
+            let detail = failures
+                .iter()
+                .map(|f| {
+                    format!(
+                        "MCP 服务器 [{}] 无法启动：{}（配置的命令 = {}）",
+                        f.server, f.reason, f.command
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(format!(
+                "{detail}。请修正 ~/.ruagent/config/mcp.toml 里该 server 的 command/url，\
+                 或把它从 profile [{}] 中移除后重试。",
+                profile.unwrap_or("(none)")
+            ));
+        }
+        Ok(self.expand_profile(profile, agent_name))
+    }
+}
+
+/// One server that cannot even be started.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpPreflightFailure {
+    pub server: String,
+    /// The command (or url) as configured, for the message.
+    pub command: String,
+    pub reason: String,
 }
 
 fn mcp_entry_to_acp(name: &str, e: &McpEntry) -> agent_client_protocol::schema::v1::McpServer {
@@ -838,5 +927,94 @@ description = "legacy"
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].name, "dsh");
         assert!(cards[0].runtime.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mcp_preflight_tests {
+    use super::*;
+
+    /// Regression (t63): an MCP server that cannot be started must be named —
+    /// server, command and reason — BEFORE the harness turns it into
+    /// "Internal error: { mcp-client(mcp): initial connection or tool
+    /// synchronization failed }", which tells the user nothing.
+    fn mcp_config_with(entries: &[(&str, Option<&str>, &[&str])], profile: &[&str]) -> McpConfig {
+        let mut servers = BTreeMap::new();
+        for (name, command, args) in entries {
+            servers.insert(
+                (*name).to_string(),
+                McpEntry {
+                    command: command.map(|c| c.to_string()),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    url: None,
+                    inject_for: None,
+                },
+            );
+        }
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "default".to_string(),
+            profile.iter().map(|s| s.to_string()).collect(),
+        );
+        McpConfig {
+            servers,
+            profiles,
+            health: std::sync::Arc::new(crate::mcphealth::McpHealth::default()),
+        }
+    }
+
+    #[test]
+    fn preflight_names_a_server_whose_command_does_not_exist() {
+        let cfg = mcp_config_with(
+            &[("ruagent", Some(r"C:\nope-9f3a\ruagent.exe"), &["mcp-serve"])],
+            &["ruagent"],
+        );
+        let failures = cfg.preflight_profile(Some("default"), "dsh");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].server, "ruagent");
+        assert!(failures[0].command.contains("nope-9f3a"), "{failures:?}");
+        assert!(failures[0].reason.contains("nope-9f3a"), "{failures:?}");
+    }
+
+    #[test]
+    fn expand_profile_preflighted_reports_server_and_command() {
+        let cfg = mcp_config_with(
+            &[("ruagent", Some(r"C:\nope-9f3a\ruagent.exe"), &["mcp-serve"])],
+            &["ruagent"],
+        );
+        let err = cfg
+            .expand_profile_preflighted(Some("default"), "dsh")
+            .expect_err("must fail before the harness ever sees it");
+        // The three things the user needs: which server, which command, why.
+        assert!(err.contains("ruagent"), "{err}");
+        assert!(err.contains("nope-9f3a"), "{err}");
+        assert!(err.contains("mcp-serve"), "{err}");
+        assert!(err.contains("mcp.toml"), "must say what to fix: {err}");
+        // ...and it must NOT be the harness's opaque wording.
+        assert!(!err.contains("mcp-client"), "{err}");
+    }
+
+    #[test]
+    fn expand_profile_preflighted_passes_a_real_command() {
+        let exe = std::env::current_exe().expect("current exe");
+        let cfg = mcp_config_with(
+            &[("ruagent", Some(&exe.display().to_string()), &["mcp-serve"])],
+            &["ruagent"],
+        );
+        let servers = cfg
+            .expand_profile_preflighted(Some("default"), "dsh")
+            .expect("a real command passes");
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn a_healthy_profile_and_a_missing_profile_both_expand_without_error() {
+        let exe = std::env::current_exe().expect("current exe");
+        let cfg = mcp_config_with(
+            &[("ruagent", Some(&exe.display().to_string()), &[])],
+            &["ruagent"],
+        );
+        assert!(cfg.expand_profile_preflighted(None, "dsh").is_ok());
+        assert!(cfg.expand_profile_preflighted(Some("nope"), "dsh").is_ok());
     }
 }

@@ -19,6 +19,94 @@ use ruagent_policy::PermissionPolicy;
 use ruagent_store::{Db, TranscriptLine, TranscriptWriter, transcript_path};
 use tokio::sync::{broadcast, mpsc};
 
+/// Does this failure look like MCP injection / session startup?
+///
+/// Deliberately permissive: a false positive only costs one extra handshake on a
+/// run that has already failed, and the diagnosis is informative either way.
+fn looks_like_mcp_failure(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("mcp") || message.contains("会话建立失败") || m.contains("session/new")
+}
+
+/// Do the MCP handshake ourselves and report which injected server is broken.
+///
+/// The harness says only `mcp-client(mcp): initial connection or tool
+/// synchronization failed` — no server, no command, no reason. Since the run has
+/// already failed, paying for a real initialize + tools/list (10s cap, servers in
+/// parallel) is worth it: the result names the command and the actual error.
+async fn diagnose_mcp_servers(servers: &[agent_client_protocol::schema::v1::McpServer]) -> String {
+    use agent_client_protocol::schema::v1::McpServer;
+    use ruagent_mcp::health::{PingTarget, describe, ping};
+
+    let mut handles = Vec::new();
+    for server in servers {
+        let (name, target) = match server {
+            McpServer::Stdio(x) => (
+                x.name.clone(),
+                PingTarget {
+                    command: Some(x.command.display().to_string()),
+                    args: x.args.clone(),
+                    url: None,
+                },
+            ),
+            McpServer::Http(x) => (
+                x.name.clone(),
+                PingTarget {
+                    command: None,
+                    args: Vec::new(),
+                    url: Some(x.url.clone()),
+                },
+            ),
+            McpServer::Sse(x) => (
+                x.name.clone(),
+                PingTarget {
+                    command: None,
+                    args: Vec::new(),
+                    url: Some(x.url.clone()),
+                },
+            ),
+            _ => continue,
+        };
+        handles.push(tokio::spawn(async move {
+            let described = describe(&target);
+            let outcome = ping(&target).await;
+            (name, described, outcome)
+        }));
+    }
+    if handles.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![format!(
+        "\n\n[MCP 自检] 本会话注入了 {} 个 MCP 服务器，逐个做了 initialize + tools/list 握手：",
+        handles.len()
+    )];
+    for handle in handles {
+        match handle.await {
+            Ok((name, described, outcome)) if outcome.ok => lines.push(format!(
+                "  · {}（{}）：握手成功，{} 个工具，{}ms",
+                name,
+                described,
+                outcome.tools.unwrap_or(0),
+                outcome.latency_ms
+            )),
+            Ok((name, described, outcome)) => lines.push(format!(
+                "  · {}（{}）：**握手失败** —— {}（{}ms）",
+                name,
+                described,
+                outcome.error.unwrap_or_else(|| "未知原因".to_string()),
+                outcome.latency_ms
+            )),
+            Err(e) => lines.push(format!("  · 自检任务失败：{e}")),
+        }
+    }
+    lines.push(
+        "  提示：若失败的是 ruagent 自己的 mcp-serve，检查该路径是否存在、是否可执行、\
+         是否正在被 cargo 重建（CARGO_TARGET_DIR 指向的 exe 会被每次构建覆盖）。"
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
 /// A pending permission ask parked for a human decision.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PendingPermission {
@@ -705,7 +793,7 @@ impl RunManager {
                 task_id,
                 spec,
                 prompt,
-                mcp_servers,
+                mcp_servers.clone(),
                 cwd,
                 launch.routed,
                 injection,
@@ -716,7 +804,11 @@ impl RunManager {
                 tracing::error!(run_id = %run_id, error = %err, "run supervisor failed");
                 let mut run = run;
                 run.status = RunStatus::Failed;
-                run.error = Some(err.to_string());
+                let mut message = err.to_string();
+                if !mcp_servers.is_empty() && looks_like_mcp_failure(&message) {
+                    message.push_str(&diagnose_mcp_servers(&mcp_servers).await);
+                }
+                run.error = Some(message);
                 run.stop_reason = Some(StopReason::Error);
                 run.updated_at = chrono::Utc::now();
                 let _ = db.update_run(&run).await;

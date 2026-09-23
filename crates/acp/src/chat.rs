@@ -262,6 +262,11 @@ async fn supervise_chat(
     options_tx: std::sync::Arc<tokio::sync::watch::Sender<Option<Vec<SessionOptionState>>>>,
     ask_tx: mpsc::UnboundedSender<PermissionAsk>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Filled by the connect closure when session/new is refused, so the error
+    // can name the injected MCP servers (the closure's error type is fixed by
+    // the ACP library).
+    let mcp_failure_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let mcp_failure_in = mcp_failure_slot.clone();
     let ev_notification = events.clone();
     let ev_permission = events.clone();
     let ask = ask_tx.clone();
@@ -412,7 +417,14 @@ async fn supervise_chat(
             // One session for the whole chat.
             let mut new_session = NewSessionRequest::new(&opts.cwd);
             new_session.mcp_servers = opts.mcp_servers.clone();
-            let session = connection.send_request(new_session).block_task().await?;
+            let session = match connection.send_request(new_session).block_task().await {
+                Ok(s) => s,
+                Err(e) => {
+                    *mcp_failure_in.lock().expect("mcp failure slot") =
+                        Some(crate::describe_mcp_servers(&opts.mcp_servers));
+                    return Err(e);
+                }
+            };
             let session_id = session.session_id;
 
             // The agent advertises its session options here (model,
@@ -592,6 +604,13 @@ async fn supervise_chat(
             let _ = ask;
             Ok::<(), agent_client_protocol::Error>(())
         })
-        .await?;
+        .await
+        .map_err(
+            |e| match mcp_failure_slot.lock().expect("mcp failure slot").take() {
+                Some(servers) => Box::new(crate::mcp_injection_error_from(servers, e))
+                    as Box<dyn std::error::Error + Send + Sync>,
+                None => Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+            },
+        )?;
     Ok(())
 }

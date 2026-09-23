@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ruagent_acp::chat::ChatCommand;
 use ruagent_core::{Run, RunId, RunStatus, Task, TaskCreator, TaskStatus};
-use ruagent_store::{TranscriptLine, transcript_path};
+use ruagent_store::{DeleteSession, TranscriptLine, transcript_path};
 use serde::Deserialize;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -123,8 +123,23 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/chat/{id}",
             axum::routing::patch(chat_model).delete(chat_close),
         )
+        // The history resource (plural), distinct from the live-session
+        // resource (singular) above. DELETE on the plural one removes the
+        // row; DELETE on the singular one only closes the session and
+        // deliberately leaves the row -- which is why a closed chat stayed
+        // in the list.
+        .route("/api/v1/chats/{id}", axum::routing::delete(chat_delete))
         .route("/api/v1/sessions", get(sessions_list))
-        .route("/api/v1/sessions/{key}", get(sessions_messages))
+        .route(
+            "/api/v1/sessions/{key}",
+            get(sessions_messages).delete(session_delete),
+        )
+        // Archive = a ruagent-side hide. POST hides, DELETE unhides; the
+        // indexed row and the source file it points at are never touched.
+        .route(
+            "/api/v1/sessions/{key}/archive",
+            post(session_archive).delete(session_unarchive),
+        )
         .route("/api/v1/sessions/{key}/distill", post(session_distill))
         .route("/api/v1/recall", get(recall))
         .route("/api/v1/recall/log", get(recall_log))
@@ -224,6 +239,15 @@ impl ApiError {
     fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
+    }
+
+    /// The request is understood and the target exists, but this daemon
+    /// refuses to act on it (the session belongs to another tool).
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: msg.into(),
         }
     }
@@ -1478,10 +1502,15 @@ async fn start_run(
         .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{agent}`")))?;
 
     let prompt = req.prompt.unwrap_or_else(|| task.intent.clone());
+    // Pre-flight the injected MCP servers. A command that cannot be resolved is
+    // a configuration error the user can fix — say so here, instead of letting
+    // the harness refuse session/new with an opaque "mcp-client(mcp): initial
+    // connection or tool synchronization failed".
     let mcp = state
         .config
         .mcp
-        .expand_profile(card.mcp_profile.as_deref(), &card.name);
+        .expand_profile_preflighted(card.mcp_profile.as_deref(), &card.name)
+        .map_err(ApiError::bad_request)?;
 
     let workspace_spec = match (req.cwd.as_deref(), req.repo.as_deref()) {
         (Some(cwd), _) => WorkspaceSpec::Cwd(std::path::PathBuf::from(cwd)),
@@ -1842,11 +1871,49 @@ async fn run_events(
 // Session history (auto-synced from claude-code / dsh / ruagent stores)
 // ---------------------------------------------------------------------------
 
+/// Which sessions the list should return.
+#[derive(Deserialize)]
+struct SessionsQuery {
+    limit: Option<u32>,
+    /// exclude (default) | include | only
+    archived: Option<String>,
+}
+
+/// A session is only deletable by the tool that owns its history file.
+/// Everything else here is an index of a file we must not remove.
+const DELETABLE_SOURCE: &str = "ruagent";
+
 async fn sessions_list(
     State(state): State<AppState>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<SessionsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = q.limit.unwrap_or(200);
+    let mode = q.archived.as_deref().unwrap_or("exclude");
+    if !matches!(mode, "exclude" | "include" | "only") {
+        return Err(ApiError::bad_request(format!(
+            "archived must be one of exclude|include|only, got '{mode}'"
+        )));
+    }
+    // Deleted sessions are gone in *every* mode: the tombstone exists so that
+    // the indexer's next rescan (INSERT OR REPLACE, every 60s) cannot bring
+    // the row back, and a deleted key must not reappear as "archived" either.
+    let deleted: std::collections::HashSet<String> = state
+        .mgr
+        .db()
+        .deleted_session_keys()
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .collect();
+    let hidden: std::collections::HashSet<String> = state
+        .mgr
+        .db()
+        .archived_session_keys()
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .filter(|k| !deleted.contains(k))
+        .collect();
     let mut sessions = state
         .sessions
         .list(limit)
@@ -1864,7 +1931,105 @@ async fn sessions_list(
             }
         }
     }
-    Ok(Json(serde_json::json!({ "sessions": sessions })))
+    // The archived flag is not part of the index (see the session_archives
+    // migration for why it cannot be a column), so it is added here rather
+    // than in the indexer's record.
+    let mut out = Vec::with_capacity(sessions.len());
+    for s in sessions {
+        if deleted.contains(&s.key) {
+            continue;
+        }
+        let is_hidden = hidden.contains(&s.key);
+        if (mode == "exclude" && is_hidden) || (mode == "only" && !is_hidden) {
+            continue;
+        }
+        let mut v = serde_json::to_value(&s)
+            .map_err(|e| ApiError::internal(format!("session encode: {e}")))?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("archived".into(), serde_json::Value::Bool(is_hidden));
+            obj.insert(
+                "deletable".into(),
+                serde_json::Value::Bool(s.source == DELETABLE_SOURCE),
+            );
+        }
+        out.push(v);
+    }
+    Ok(Json(serde_json::json!({
+        "sessions": out,
+        "archived_count": hidden.len(),
+    })))
+}
+
+/// Hide a session from the default list. ruagent-side only: no file is
+/// read, written or moved.
+async fn session_archive(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state
+        .mgr
+        .db()
+        .session_exists(&key)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::not_found(format!("no such session: {key}")));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    state
+        .mgr
+        .db()
+        .archive_session(&key, now)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "key": key, "archived": true })))
+}
+
+/// Un-hide. Idempotent: unarchiving something that was not archived is a
+/// no-op, not an error, so a double-click cannot fail.
+async fn session_unarchive(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let was = state
+        .mgr
+        .db()
+        .unarchive_session(&key)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        serde_json::json!({ "key": key, "archived": false, "changed": was }),
+    ))
+}
+
+/// Delete a session from ruagent's index.
+///
+/// Only sessions ruagent produced itself (source = ruagent) can be deleted.
+/// Every other row points at another tool's history file — ruagent merely
+/// indexes it, so removing it is refused with 403 and an explanation the UI
+/// can show verbatim.
+async fn session_delete(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match state
+        .mgr
+        .db()
+        .delete_session(
+            &key,
+            DELETABLE_SOURCE,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .map_err(ApiError::from)?
+    {
+        DeleteSession::Deleted => Ok(Json(serde_json::json!({ "key": key, "deleted": true }))),
+        DeleteSession::NotFound => Err(ApiError::not_found(format!("no such session: {key}"))),
+        DeleteSession::SourceNotAllowed(source) => Err(ApiError::forbidden(format!(
+            "this session belongs to '{source}': ruagent only indexes that tool's \
+             history file and will not delete it. Remove it from {source} itself."
+        ))),
+    }
 }
 
 async fn sessions_messages(
@@ -2746,6 +2911,15 @@ async fn chat_events(
     }
     let replay = ruagent_store::read_transcript(&path).unwrap_or_default();
     let (tx, rx_stream) = tokio::sync::mpsc::unbounded_channel();
+    // Teardown watch (t95). A broadcast receiver only reports Closed once EVERY
+    // sender is gone -- and THIS handler holds a Chat clone, which holds the
+    // session, which holds the sender. So waiting for the channel alone means
+    // an attached client would never learn that its chat was deleted or
+    // closed: the stream would just sit there until the client hung up.
+    // The registry is therefore polled as a second, independent liveness
+    // signal; a deleted/closed chat ends the stream with the same terminal
+    // end event the Closed arm sends, within one tick.
+    let registry = state.chats.clone();
     tokio::spawn(async move {
         for line in &replay {
             let _ = tx.send(sse_data(line));
@@ -2773,16 +2947,24 @@ async fn chat_events(
             }
         }
         loop {
-            match live.recv().await {
-                Ok(event) => {
-                    if chat_sse_event(&tx, &event) {
+            tokio::select! {
+                got = live.recv() => match got {
+                    Ok(event) => {
+                        if chat_sse_event(&tx, &event) {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => {
+                        let _ = tx.send(sse_end(ruagent_core::RunStatus::Completed));
                         return;
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => {
-                    let _ = tx.send(sse_end(ruagent_core::RunStatus::Completed));
-                    return;
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    if registry.chat(id).is_none() {
+                        let _ = tx.send(sse_end(ruagent_core::RunStatus::Completed));
+                        return;
+                    }
                 }
             }
         }
@@ -2997,6 +3179,31 @@ async fn chat_close(
     }
 }
 
+/// Delete one chat-history row (the panel's forget-this-conversation).
+///
+/// NOT the same endpoint as DELETE /api/v1/chat/{id}:
+///
+/// * /chat/{id}  closes the live session and KEEPS the history row
+///   (unchanged -- the panel and history-reopen use it).
+/// * /chats/{id} removes the row, and stops the session first if one is
+///   live so nothing keeps writing into a deleted chat.
+///
+/// 204 when a row was removed, 404 when the id was never there. A repeat
+/// delete is a 404 no-op -- idempotent in effect, honest in the status.
+async fn chat_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    match state.chats.delete(id).await {
+        Ok(crate::chat::ChatDelete::Deleted { .. }) => Ok(StatusCode::NO_CONTENT),
+        Ok(crate::chat::ChatDelete::NotFound) => Err(ApiError::not_found("chat not found")),
+        Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Memory + knowledge (design SS6.5: the only seam external CLIs need)
 // ---------------------------------------------------------------------------
@@ -3192,4 +3399,213 @@ fn sse_data(line: &TranscriptLine) -> Result<Event, Infallible> {
 fn sse_end(status: RunStatus) -> Result<Event, Infallible> {
     let json = serde_json::json!({ "status": status });
     Ok(Event::default().event("end").data(json.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// A router over a throwaway root: real handlers, real SQLite, no daemon
+    /// process. A second *process* would either collide with the running
+    /// daemon's port or, worse, open the user's data root — so the session
+    /// lifecycle is exercised in-process instead.
+    async fn harness() -> (Router, ruagent_store::Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-api-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = DaemonConfig::load(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
+            .await
+            .unwrap();
+        let chats = crate::chat::ChatManager::new(
+            db.clone(),
+            root.clone(),
+            std::sync::Arc::new(|_, _| {}),
+            cfg.mcp.clone(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let mgr = std::sync::Arc::new(RunManager::new(
+            db.clone(),
+            root.clone(),
+            cfg.agents.clone(),
+            cfg.policy.to_policy(),
+            cfg.mcp.clone(),
+        ));
+        let state = AppState {
+            mgr,
+            config: std::sync::Arc::new(cfg),
+            knowledge: std::sync::Arc::new(knowledge),
+            chats,
+            sessions: std::sync::Arc::new(crate::sessions::SessionIndexer::new(
+                db.clone(),
+                std::env::temp_dir(),
+            )),
+        };
+        (router(state), db, root)
+    }
+
+    /// Insert an index row exactly the way the indexer does.
+    async fn seed(db: &ruagent_store::Db, key: &str, source: &str) {
+        let key = key.to_string();
+        let source = source.to_string();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                     (key, source, title, project, ref_path, started_at, updated_at,
+                      mtime_ms, size_bytes, message_count, preview)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params![
+                    key, source, "t", "/w", "/f.jsonl", 1i64, 2i64, 2i64, 3i64, 4i64, "p"
+                ],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    async fn hit(app: &Router, method: &str, uri: &str) -> (StatusCode, serde_json::Value, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        (status, json, text)
+    }
+
+    fn find(v: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+        v["sessions"]
+            .as_array()?
+            .iter()
+            .find(|s| s["key"] == key)
+            .cloned()
+    }
+
+    /// The whole lifecycle through the real router: the routes, the query
+    /// parameter, the source guard and the index writes.
+    #[tokio::test]
+    async fn session_archive_delete_over_the_router() {
+        let (app, db, root) = harness().await;
+        seed(&db, "ruagent:aa", "ruagent").await;
+        seed(&db, "claude-code:bb", "claude-code").await;
+
+        // Default list: everything, nothing archived, per-row deletability.
+        let (st, v, _) = hit(&app, "GET", "/api/v1/sessions").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["archived_count"], 0);
+        assert_eq!(v["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(find(&v, "ruagent:aa").unwrap()["deletable"], true);
+        assert_eq!(find(&v, "claude-code:bb").unwrap()["deletable"], false);
+        assert_eq!(find(&v, "ruagent:aa").unwrap()["archived"], false);
+
+        // Archive another tool's session: allowed (it is only a hide).
+        let (st, v, _) = hit(&app, "POST", "/api/v1/sessions/claude-code:bb/archive").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["archived"], true);
+
+        let (_, v, _) = hit(&app, "GET", "/api/v1/sessions").await;
+        assert!(find(&v, "claude-code:bb").is_none(), "hidden by default");
+        assert_eq!(v["archived_count"], 1);
+        let (_, v, _) = hit(&app, "GET", "/api/v1/sessions?archived=include").await;
+        assert_eq!(find(&v, "claude-code:bb").unwrap()["archived"], true);
+        let (_, v, _) = hit(&app, "GET", "/api/v1/sessions?archived=only").await;
+        assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(v["sessions"][0]["key"], "claude-code:bb");
+
+        let (st, _, _) = hit(&app, "GET", "/api/v1/sessions?archived=nonsense").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Unarchive: back in the default list, and idempotent.
+        let (st, v, _) = hit(&app, "DELETE", "/api/v1/sessions/claude-code:bb/archive").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["changed"], true);
+        let (_, v, _) = hit(&app, "GET", "/api/v1/sessions").await;
+        assert!(find(&v, "claude-code:bb").is_some());
+        assert_eq!(v["archived_count"], 0);
+        let (st, v, _) = hit(&app, "DELETE", "/api/v1/sessions/claude-code:bb/archive").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["changed"], false);
+
+        // Hiding an unknown key is refused rather than stored.
+        let (st, _, _) = hit(&app, "POST", "/api/v1/sessions/ruagent:nope/archive").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Delete another tool's history: 403 naming the owner, row intact.
+        let (st, _, body) = hit(&app, "DELETE", "/api/v1/sessions/claude-code:bb").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert!(body.contains("claude-code"), "body was {body}");
+        let (_, v, _) = hit(&app, "GET", "/api/v1/sessions").await;
+        assert!(find(&v, "claude-code:bb").is_some());
+
+        // Delete our own: gone, and gone means gone.
+        let (st, _, _) = hit(&app, "DELETE", "/api/v1/sessions/ruagent:aa").await;
+        assert_eq!(st, StatusCode::OK);
+        let (_, v, _) = hit(&app, "GET", "/api/v1/sessions").await;
+        assert!(find(&v, "ruagent:aa").is_none());
+        let (st, _, _) = hit(&app, "DELETE", "/api/v1/sessions/ruagent:aa").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // The indexer re-inserts every session whose file is still on disk, so
+        // simulate that 60s rescan: the tombstone must keep it gone in every
+        // mode, and it must not reappear as an "archived" row either.
+        seed(&db, "ruagent:aa", "ruagent").await;
+        for mode in ["exclude", "include", "only"] {
+            let uri = format!("/api/v1/sessions?archived={mode}");
+            let (st, v, _) = hit(&app, "GET", &uri).await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(
+                find(&v, "ruagent:aa").is_none(),
+                "resurrected by a re-index in mode {mode}"
+            );
+            assert_eq!(v["archived_count"], 0);
+        }
+        assert_eq!(db.deleted_session_keys().await.unwrap(), vec!["ruagent:aa"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deleting a row must not leave a hide marker behind: a later session
+    /// that reuses the key must not be born invisible.
+    #[tokio::test]
+    async fn deleting_a_hidden_session_clears_its_marker() {
+        let (app, db, root) = harness().await;
+        seed(&db, "ruagent:cc", "ruagent").await;
+        let (st, _, _) = hit(&app, "POST", "/api/v1/sessions/ruagent:cc/archive").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = hit(&app, "DELETE", "/api/v1/sessions/ruagent:cc").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            db.archived_session_keys().await.unwrap(),
+            Vec::<String>::new()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

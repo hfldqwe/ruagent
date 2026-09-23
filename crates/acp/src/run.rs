@@ -65,6 +65,11 @@ pub async fn run_once(
     event_tx: mpsc::UnboundedSender<RunEvent>,
     ask_tx: mpsc::UnboundedSender<PermissionAsk>,
 ) -> Result<RunOutcome, AcpError> {
+    // Filled by the connect closure when session/new is refused, so the outer
+    // level can name the injected MCP servers (the closure's error type is
+    // fixed by the ACP library).
+    let mcp_failure_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let mcp_failure_in = mcp_failure_slot.clone();
     let agent =
         AcpAgent::from_args(std::iter::once(opts.program.clone()).chain(opts.args.iter().cloned()))
             .map_err(|e| AcpError::Command(format!("{}: {e}", opts.program)))?;
@@ -231,7 +236,17 @@ pub async fn run_once(
             // 2. New session with MCP injection (design §7.1).
             let mut new_session = NewSessionRequest::new(&opts.cwd);
             new_session.mcp_servers = opts.mcp_servers.clone();
-            let session = connection.send_request(new_session).block_task().await?;
+            // Name what was injected when the session is refused: the harness
+            // only says "Internal error: { mcp-client(mcp): initial connection
+            // or tool synchronization failed }", which is unactionable.
+            let session = match connection.send_request(new_session).block_task().await {
+                Ok(s) => s,
+                Err(e) => {
+                    *mcp_failure_in.lock().expect("mcp failure slot") =
+                        Some(crate::describe_mcp_servers(&opts.mcp_servers));
+                    return Err(e);
+                }
+            };
             let session_id = session.session_id;
 
             // The session is live: the run leaves "spawning" here (the
@@ -286,5 +301,10 @@ pub async fn run_once(
             })
         })
         .await
-        .map_err(AcpError::from)
+        .map_err(
+            |e| match mcp_failure_slot.lock().expect("mcp failure slot").take() {
+                Some(servers) => crate::mcp_injection_error_from(servers, e),
+                None => AcpError::from(e),
+            },
+        )
 }

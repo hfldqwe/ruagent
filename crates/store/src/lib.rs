@@ -631,6 +631,170 @@ fn stop_reason_from_str(s: &str) -> StopReason {
 }
 
 // ---------------------------------------------------------------------------
+// Session lifecycle: archive (a ruagent-side hide) + delete (own sessions only)
+// ---------------------------------------------------------------------------
+
+/// What a delete attempt did. The source guard is evaluated inside the SAME
+/// writer closure as the DELETE, so a row can never be removed by a caller
+/// that did not first see (and accept) the row's source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteSession {
+    Deleted,
+    NotFound,
+    /// The session is another tool's history file. ruagent only indexes it,
+    /// so it must not remove it — the actual source is reported back because
+    /// the caller owes the user that explanation.
+    SourceNotAllowed(String),
+}
+
+impl Db {
+    /// Hide a session in ruagent's own list.
+    ///
+    /// Writes exactly one row in session_archives — the sessions index and the
+    /// source file it points at are never touched, so this is reversible and
+    /// works for every source (including other tools', whose files we have no
+    /// business editing).
+    pub async fn archive_session(&self, key: &str, now_ms: i64) -> Result<(), DbError> {
+        let key = key.to_string();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO session_archives (key, archived_at) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET archived_at = excluded.archived_at",
+                rusqlite::params![key, now_ms],
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Undo archive_session. false = it was not archived.
+    pub async fn unarchive_session(&self, key: &str) -> Result<bool, DbError> {
+        let key = key.to_string();
+        let n = self
+            .call(move |conn| conn.execute("DELETE FROM session_archives WHERE key = ?1", [&key]))
+            .await??;
+        Ok(n > 0)
+    }
+
+    /// Keys hidden from the default list.
+    pub async fn archived_session_keys(&self) -> Result<Vec<String>, DbError> {
+        self.call(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT key FROM session_archives")
+                .map_err(DbError::from)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for k in rows.flatten() {
+                out.push(k);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Keys the user deleted from ruagent's index. Unlike a missing row these
+    /// survive the indexer's next INSERT OR REPLACE, which is what makes the
+    /// delete stick (measured: without a tombstone the row returned in <70s).
+    pub async fn deleted_session_keys(&self) -> Result<Vec<String>, DbError> {
+        self.call(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT key FROM session_deletions")
+                .map_err(DbError::from)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for k in rows.flatten() {
+                out.push(k);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Is this key in the index at all? A hide for an unknown key would linger
+    /// and could hide an unrelated future row that reuses the key.
+    pub async fn session_exists(&self, key: &str) -> Result<bool, DbError> {
+        let key = key.to_string();
+        self.call(move |conn| {
+            conn.query_row("SELECT 1 FROM sessions WHERE key = ?1", [&key], |_| Ok(()))
+                .is_ok()
+        })
+        .await
+    }
+
+    /// Remove one chat-history row (the panel's forget-this-conversation).
+    ///
+    /// Deletes the `chats` row ONLY. The transcript JSONL, the
+    /// `sessions` index row and anything memory ingestion produced are
+    /// untouched -- retracting a conversation's content is a separate
+    /// decision with its own markers (0016_session_archives /
+    /// 0017_session_deletions).
+    ///
+    /// NO TOMBSTONE IS NEEDED HERE, unlike `sessions`: nothing rebuilds
+    /// the `chats` table. Its only writers are ChatManager::start
+    /// (INSERT ... ON CONFLICT, at chat start/resume) and the first-prompt
+    /// title UPDATE; there is no periodic re-index of it. See
+    /// ChatManager::delete for the full check.
+    ///
+    /// Returns true when a row was removed, false when the id was absent --
+    /// so a repeated delete is an idempotent no-op.
+    pub async fn delete_chat(&self, id: &str) -> Result<bool, DbError> {
+        let id = id.to_string();
+        self.call(move |conn| {
+            let n = conn
+                .execute("DELETE FROM chats WHERE id = ?1", [&id])
+                .unwrap_or(0);
+            n > 0
+        })
+        .await
+    }
+
+    /// Remove a session from ruagent's index.
+    ///
+    /// allowed_source is the only source this caller may delete from; every
+    /// other source comes back as DeleteSession::SourceNotAllowed. The hide
+    /// marker is dropped with the row, so a later session that happens to
+    /// reuse the key is not born invisible.
+    pub async fn delete_session(
+        &self,
+        key: &str,
+        allowed_source: &str,
+        now_ms: i64,
+    ) -> Result<DeleteSession, DbError> {
+        let key = key.to_string();
+        let allowed = allowed_source.to_string();
+        self.call(move |conn| {
+            let source: Option<String> = conn
+                .query_row("SELECT source FROM sessions WHERE key = ?1", [&key], |r| {
+                    r.get(0)
+                })
+                .ok();
+            let Some(source) = source else {
+                return DeleteSession::NotFound;
+            };
+            if source != allowed {
+                return DeleteSession::SourceNotAllowed(source);
+            }
+            // Tombstone first: if the process dies between the two statements
+            // the session is still hidden, whereas the reverse order would
+            // leave a row that the indexer happily re-creates.
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO session_deletions (key, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![&key, now_ms],
+            );
+            let n = conn
+                .execute("DELETE FROM sessions WHERE key = ?1", [&key])
+                .unwrap_or(0);
+            if n == 0 {
+                return DeleteSession::NotFound;
+            }
+            let _ = conn.execute("DELETE FROM session_archives WHERE key = ?1", [&key]);
+            DeleteSession::Deleted
+        })
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -792,5 +956,139 @@ mod tests {
 
         let edges = db.edges_from(a.id).await.unwrap();
         assert_eq!(edges, vec![edge]);
+    }
+
+    // -- session lifecycle -------------------------------------------------
+
+    /// Insert an index row the way the indexer does (INSERT OR REPLACE, no
+    /// archive column) so the tests exercise the real write shape.
+    async fn seed_session(db: &Db, key: &str, source: &str) {
+        let key = key.to_string();
+        let source = source.to_string();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                     (key, source, title, project, ref_path, started_at, updated_at,
+                      mtime_ms, size_bytes, message_count, preview)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params![
+                    key, source, "t", "/w", "/f.jsonl", 1i64, 2i64, 2i64, 3i64, 4i64, "p"
+                ],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_hides_and_unarchive_restores() {
+        let db = Db::open_in_memory().unwrap();
+        seed_session(&db, "dsh:aa", "dsh").await;
+
+        assert!(db.archived_session_keys().await.unwrap().is_empty());
+        db.archive_session("dsh:aa", 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(db.archived_session_keys().await.unwrap(), vec!["dsh:aa"]);
+        // Idempotent: hiding twice is not an error and does not duplicate.
+        db.archive_session("dsh:aa", 1_700_000_000_001)
+            .await
+            .unwrap();
+        assert_eq!(db.archived_session_keys().await.unwrap().len(), 1);
+        assert!(db.unarchive_session("dsh:aa").await.unwrap());
+        assert!(db.archived_session_keys().await.unwrap().is_empty());
+        assert!(!db.unarchive_session("dsh:aa").await.unwrap());
+        // The index row itself is untouched by either direction.
+        assert!(db.session_exists("dsh:aa").await.unwrap());
+    }
+
+    /// The reason the marker is a side table: the indexer re-writes the row
+    /// with INSERT OR REPLACE on every rescan, which would blank a column.
+    #[tokio::test]
+    async fn archive_survives_a_reindex() {
+        let db = Db::open_in_memory().unwrap();
+        seed_session(&db, "claude-code:bb", "claude-code").await;
+        db.archive_session("claude-code:bb", 1).await.unwrap();
+
+        seed_session(&db, "claude-code:bb", "claude-code").await; // rescan
+        assert_eq!(
+            db.archived_session_keys().await.unwrap(),
+            vec!["claude-code:bb"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_is_limited_to_the_allowed_source() {
+        let db = Db::open_in_memory().unwrap();
+        seed_session(&db, "ruagent:cc", "ruagent").await;
+        seed_session(&db, "claude-code:dd", "claude-code").await;
+
+        // Another tool's history: refused, and the row is still there.
+        assert_eq!(
+            db.delete_session("claude-code:dd", "ruagent", 9)
+                .await
+                .unwrap(),
+            DeleteSession::SourceNotAllowed("claude-code".into())
+        );
+        assert!(db.session_exists("claude-code:dd").await.unwrap());
+
+        // Our own: deleted.
+        assert_eq!(
+            db.delete_session("ruagent:cc", "ruagent", 9).await.unwrap(),
+            DeleteSession::Deleted
+        );
+        assert!(!db.session_exists("ruagent:cc").await.unwrap());
+
+        // Unknown key.
+        assert_eq!(
+            db.delete_session("ruagent:nope", "ruagent", 9)
+                .await
+                .unwrap(),
+            DeleteSession::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_drops_the_hide_marker_with_the_row() {
+        let db = Db::open_in_memory().unwrap();
+        seed_session(&db, "ruagent:ee", "ruagent").await;
+        db.archive_session("ruagent:ee", 7).await.unwrap();
+        assert_eq!(
+            db.delete_session("ruagent:ee", "ruagent", 9).await.unwrap(),
+            DeleteSession::Deleted
+        );
+        // A future session reusing the key must not be born invisible.
+        assert!(db.archived_session_keys().await.unwrap().is_empty());
+    }
+
+    /// The whole reason the tombstone exists: the indexer re-inserts every
+    /// session it finds on disk with INSERT OR REPLACE, so a deletion that
+    /// lived only in the missing row was undone by the next 60s rescan
+    /// (measured live before this test was written: the row was back in <70s).
+    #[tokio::test]
+    async fn delete_survives_a_reindex() {
+        let db = Db::open_in_memory().unwrap();
+        seed_session(&db, "ruagent:ff", "ruagent").await;
+        assert_eq!(
+            db.delete_session("ruagent:ff", "ruagent", 9).await.unwrap(),
+            DeleteSession::Deleted
+        );
+        assert_eq!(db.deleted_session_keys().await.unwrap(), vec!["ruagent:ff"]);
+
+        // The rescan puts the row back (the source file is still on disk) ...
+        seed_session(&db, "ruagent:ff", "ruagent").await;
+        assert!(db.session_exists("ruagent:ff").await.unwrap());
+        // ... but the tombstone still marks it, so the list can hide it.
+        assert_eq!(db.deleted_session_keys().await.unwrap(), vec!["ruagent:ff"]);
+
+        // A second delete of the resurrected row stays a single tombstone.
+        assert_eq!(
+            db.delete_session("ruagent:ff", "ruagent", 11)
+                .await
+                .unwrap(),
+            DeleteSession::Deleted
+        );
+        assert_eq!(db.deleted_session_keys().await.unwrap().len(), 1);
     }
 }

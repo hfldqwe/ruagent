@@ -303,7 +303,9 @@ fn parse_claude_code(text: &str) -> Parsed {
                 // Real user prompts are plain strings; tool_result blocks
                 // arrive as lists — skip those.
                 if let Some(text) = content.and_then(|c| c.as_str()) {
-                    let text = text.trim();
+                    // Injected context rides in this same string; keep only the
+                    // user's words so the row is named after the user.
+                    let text = user_text(text).trim();
                     if text.is_empty() || text.starts_with('<') {
                         continue; // command meta like <command-name>…
                     }
@@ -422,7 +424,7 @@ fn parse_dsh_jsonl(text: &str) -> Parsed {
                 if kind != Some("user") {
                     continue;
                 }
-                let text = blocks_text(data.and_then(|d| d.get("content")));
+                let text = user_text(&blocks_text(data.and_then(|d| d.get("content")))).to_string();
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -568,6 +570,29 @@ fn make_key(source: &str, path: &Path) -> String {
 }
 
 /// Join the `text` blocks of a dsh content array.
+/// The user's own words, with any injected context in front of them removed.
+///
+/// Splits on the marker the daemon emits (ChatManager::USER_TEXT_SENTINEL).
+/// Structural, not heuristic: it fires ONLY where the daemon actually injected
+/// something. A message that never carried injection -- every line in a
+/// transcript written before this change, and every later prompt with no
+/// context -- comes back untouched, so a user who really does start with a
+/// bracket keeps their bracket.
+///
+/// The ACP layer joins context and text with a separator, so the marker is
+/// followed by it; a leading separator line is dropped when present, which
+/// keeps the split correct whether or not that join format changes.
+fn user_text(raw: &str) -> &str {
+    let sentinel = crate::chat::USER_TEXT_SENTINEL;
+    let Some(idx) = raw.rfind(sentinel) else {
+        return raw;
+    };
+    let rest = raw[idx + sentinel.len()..].trim_start();
+    rest.strip_prefix("---")
+        .map(str::trim_start)
+        .unwrap_or(rest)
+}
+
 fn blocks_text(content: Option<&serde_json::Value>) -> String {
     content
         .and_then(|c| c.as_array())
@@ -912,6 +937,48 @@ fn read_files_multi(dirs: &[PathBuf], exts: &[&str]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t101: injected context must not become the row's name, and -- just as
+    /// important -- a user who really types a bracket must keep it. Both
+    /// directions are asserted, because a rule that only proves it strips is
+    /// indistinguishable from one that strips too much.
+    #[test]
+    fn injected_context_is_split_off_the_user_text() {
+        let sentinel = crate::chat::USER_TEXT_SENTINEL;
+        let injected = format!(
+            "[role -- you are]\n你是 ruagent 的权限守门人。{sentinel}---\n\n帮我看看这个报错"
+        );
+        assert_eq!(user_text(&injected), "帮我看看这个报错");
+        assert!(
+            !user_text(&injected).contains("[role"),
+            "the injected block must not survive the split"
+        );
+
+        // The regression guard: no sentinel means NO change, even when the
+        // message opens with a bracket. This is the case a "strip the leading
+        // bracket block" rule would have broken.
+        let typed = "[urgent] 请把这个文件删掉";
+        assert_eq!(user_text(typed), typed);
+        assert_eq!(user_text("普通消息"), "普通消息");
+
+        // The separator the ACP layer adds is dropped when it is there.
+        let with_sep = format!("[memory context]{sentinel}---\n\n真正的问题");
+        assert_eq!(user_text(&with_sep), "真正的问题");
+
+        // And the whole Claude-style line, end to end: preview and message
+        // text both come out as the user's words.
+        let line = serde_json::json!({
+            "type": "user",
+            "timestamp": 1,
+            "message": { "content": format!("<role block>{sentinel}---\n\n找一下 skill") },
+        })
+        .to_string()
+            + "\n";
+        let p = parse_claude_code(&line);
+        assert_eq!(p.preview.as_deref(), Some("找一下 skill"));
+        assert_eq!(p.messages.len(), 1);
+        assert_eq!(p.messages[0].text, "找一下 skill");
+    }
 
     #[test]
     fn claude_code_session_parses() {
