@@ -759,9 +759,9 @@ impl RunManager {
             // contract, mirrored for runs).
             if let Some(role) = role.as_deref().filter(|r| !r.trim().is_empty()) {
                 injection = if injection.is_empty() {
-                    format!("[role — you are]\n{role}")
+                    format!("{}]\n{role}", crate::chat::HDR_ROLE)
                 } else {
-                    format!("[role — you are]\n{role}\n---\n{injection}")
+                    format!("{}]\n{role}\n---\n{injection}", crate::chat::HDR_ROLE)
                 };
             }
             let mut prompt = prompt;
@@ -1694,15 +1694,13 @@ fn retry_context(transcripts: &std::path::Path, old: &Run) -> Option<String> {
     if text.is_empty() {
         // Died before saying anything: the death reason still rides
         // (an early-death retry must not lose it).
-        return old
-            .error
-            .as_deref()
-            .map(|_| {
-                format!(
-                    "[retry context — the previous attempt (run {}) died{why} before producing any output.]",
-                    old.id
-                )
-            });
+        return old.error.as_deref().map(|_| {
+            format!(
+                "{} — the previous attempt (run {}) died{why} before producing any output.]",
+                crate::chat::retry_head(),
+                old.id
+            )
+        });
     }
     // Keep the tail (the last thing the agent was doing), bounded in
     // CHARACTERS with a visible truncation marker — the repo's
@@ -1720,7 +1718,8 @@ fn retry_context(transcripts: &std::path::Path, old: &Run) -> Option<String> {
         .map(|t| format!(" Last tool call: {t}."))
         .unwrap_or_default();
     Some(format!(
-        "[retry context — the previous attempt (run {}) died{why}.{tool} Its last output before dying:] {tail}",
+        "{} — the previous attempt (run {}) died{why}.{tool} Its last output before dying:] {tail}",
+        crate::chat::retry_head(),
         old.id
     ))
 }

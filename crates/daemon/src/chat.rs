@@ -52,6 +52,63 @@ use tokio::sync::mpsc;
 /// U+2063 (INVISIBLE SEPARATOR) makes an accidental collision with typed text
 /// effectively impossible while staying invisible in any transcript a human
 /// reads.
+/// The injection block headers THIS daemon puts at the top of a prompt.
+///
+/// ONE list, deliberately: the indexer discards a title that starts with one of
+/// these, and the audit's contract row 50 (panel/tools/design-audit.mjs) judges
+/// the same literals. Producer, consumer and judge share one object set, so they
+/// cannot drift apart.
+///
+/// The SHORT prefixes are what matter. A harness truncates the first message to
+/// build a title, so the stored title is often a cut-off header, not the full one.
+/// One named constant per block header the platform emits.
+///
+/// Three constraints on this list, learned the hard way:
+///
+/// 1. Only headers the PLATFORM emits. A user may legitimately start a message
+///    with a bracket, and that must never be treated as ours.
+/// 2. A new header MUST be registered here. That is no longer a convention:
+///    every emitter builds its block through the builders below, and the test
+///    every_emitted_block_header_is_registered fails the moment a builder
+///    emits a header that is not in the array. The earlier version kept the
+///    literals in two places and the list had already drifted 2 short of
+///    reality.
+/// 3. The members are the SHORT discriminable PREFIXES, not the whole block.
+///    A harness truncates the first message to build a title -- the stored
+///    title is often a cut-off header -- and block bodies contain variables.
+///    Matching is starts-with, never contains: a user quoting a header in
+///    their own message is a mention, not the object.
+pub const HDR_ROLE: &str = "[role — you are";
+pub const HDR_MEMORY: &str = "[memory context";
+pub const HDR_RESUME: &str = "[conversation resume";
+pub const HDR_RETRY: &str = "[retry context";
+
+/// Every header the platform can emit. Built FROM the named constants, so the
+/// set and the literals have exactly one source.
+pub const INJECTED_HEADERS: [&str; 4] = [HDR_ROLE, HDR_MEMORY, HDR_RESUME, HDR_RETRY];
+
+/// The role prompt block. Body is the agent's role text.
+pub fn role_block(role: &str) -> String {
+    format!("{HDR_ROLE}]\n{role}")
+}
+
+/// The memory-context block. Body is the already-rendered memory text.
+pub fn memory_block(body: &str) -> String {
+    format!("{HDR_MEMORY} — what the platform remembers]\n{body}")
+}
+
+/// The conversation-resume (handoff) block.
+pub fn resume_block(tail: &str) -> String {
+    format!(
+        "{HDR_RESUME} — you are continuing your earlier conversation with the user; the transcript below is where it left off]\n{tail}"
+    )
+}
+
+/// The retry block head, for the two places that append their own tail.
+pub fn retry_head() -> &'static str {
+    HDR_RETRY
+}
+
 pub const USER_TEXT_SENTINEL: &str = "\n\n\u{2063}ruagent:user-text\u{2063}\n\n";
 
 /// One live chat.
@@ -126,10 +183,7 @@ impl Chat {
             }
             // The role prompt rides next — what this agent IS.
             if let Some(role) = &self.agent_prompt {
-                let role_block = format!(
-                    "[role — you are]
-{role}"
-                );
+                let role_block = role_block(role);
                 ctx = Some(match ctx {
                     Some(c) => format!(
                         "{role_block}
@@ -160,11 +214,10 @@ impl Chat {
                         c.push_str(&sem);
                     }
                     None => {
-                        ctx = Some(format!(
-                            "[memory context — what the platform remembers]
-[relevant memories for this conversation]
+                        ctx = Some(memory_block(&format!(
+                            "[relevant memories for this conversation]
 {sem}"
-                        ))
+                        )))
                     }
                 }
             }
@@ -426,10 +479,7 @@ impl ChatManager {
         if rows.is_empty() {
             return None;
         }
-        let mut out = String::from(
-            "[memory context — what the platform remembers about you and your work]
-",
-        );
+        let mut out = memory_block("") + "\n";
         let mut budget = 700usize;
         for (store, ns, content) in &rows {
             let content = content.trim();
@@ -547,9 +597,7 @@ impl ChatManager {
         let handoff = if tail.trim().is_empty() {
             None
         } else {
-            Some(format!(
-                "[conversation resume — you are continuing your earlier conversation with the user; the transcript below is where it left off]\n{tail}"
-            ))
+            Some(resume_block(&tail))
         };
         self.start_inner(
             card,

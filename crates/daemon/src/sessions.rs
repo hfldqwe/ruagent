@@ -354,7 +354,12 @@ fn parse_claude_code(text: &str) -> Parsed {
             }
             Some("ai-title") => {
                 if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
-                    p.title = Some(t.to_string());
+                    // Path 1 of 2. The harness titled the chat from the first
+                    // message, injected blocks and all; drop it so the row
+                    // falls back to the clean preview.
+                    if !is_injected_title(t) {
+                        p.title = Some(t.to_string());
+                    }
                 }
             }
             _ => {}
@@ -410,7 +415,11 @@ fn parse_dsh_jsonl(text: &str) -> Parsed {
             }
             Some("session/title") => {
                 if let Some(t) = data.and_then(|d| d.get("title")).and_then(|t| t.as_str()) {
-                    p.title = Some(t.to_string());
+                    // Path 2 of 2: the harness may send the same dirty title
+                    // through session/title instead. Both are covered.
+                    if !is_injected_title(t) {
+                        p.title = Some(t.to_string());
+                    }
                 }
             }
             Some("user/message") => {
@@ -570,6 +579,26 @@ fn make_key(source: &str, path: &Path) -> String {
 }
 
 /// Join the `text` blocks of a dsh content array.
+/// True when a title is one of OUR OWN injected headers rather than the user's
+/// words.
+///
+/// STARTS WITH, never contains. A user may legitimately quote a header inside
+/// their own message, and that is a mention, not the object -- this team has
+/// already paid for that confusion once (a substring match on "end" once hit
+/// "end_turn").
+///
+/// Why the title needs this at all: preview comes from the prompt text, which
+/// t101 splits on the daemon's sentinel, but title arrives from the harness's
+/// own ai-title / session/title events -- the harness titles the conversation
+/// from the first message, injected blocks included, so there is no sentinel to
+/// split on. Discarding it lets the row fall back to the clean preview.
+fn is_injected_title(t: &str) -> bool {
+    let t = t.trim_start();
+    crate::chat::INJECTED_HEADERS
+        .iter()
+        .any(|h| t.starts_with(h))
+}
+
 /// The user's own words, with any injected context in front of them removed.
 ///
 /// Splits on the marker the daemon emits (ChatManager::USER_TEXT_SENTINEL).
@@ -942,6 +971,41 @@ mod tests {
     /// important -- a user who really types a bracket must keep it. Both
     /// directions are asserted, because a rule that only proves it strips is
     /// indistinguishable from one that strips too much.
+    /// The registry must stay in step with reality, and a convention that
+    /// depends on someone remembering is not a mechanism. Every emitter builds
+    /// its block through a builder; this walks ALL of them and fails if any
+    /// block starts with a header that is not registered. Add a fifth block and
+    /// forget to register it, and this test goes red.
+    #[test]
+    fn every_emitted_block_header_is_registered() {
+        let blocks = [
+            ("role", crate::chat::role_block("你是守门人")),
+            ("memory", crate::chat::memory_block("- 一条记忆")),
+            ("resume", crate::chat::resume_block("tail")),
+            ("retry", crate::chat::retry_head().to_string()),
+        ];
+        for (name, block) in &blocks {
+            assert!(
+                crate::chat::INJECTED_HEADERS
+                    .iter()
+                    .any(|h| block.starts_with(h)),
+                "the {name} block starts with an UNREGISTERED header: {block}"
+            );
+        }
+        assert_eq!(crate::chat::INJECTED_HEADERS.len(), 4);
+        assert_eq!(blocks.len(), 4);
+
+        // Reverse evidence, same discipline as t117/t118: a user who really
+        // starts with a bracket, and a user who merely QUOTES a header, are
+        // both left alone.
+        assert!(!is_injected_title("[urgent] 请删掉这个文件"));
+        assert!(!is_injected_title(
+            "为什么列表里出现 [memory context 这种标题"
+        ));
+        assert!(!is_injected_title("看看 [role — you are] 这行"));
+        assert!(is_injected_title("[memory context — what the"));
+    }
+
     #[test]
     fn injected_context_is_split_off_the_user_text() {
         let sentinel = crate::chat::USER_TEXT_SENTINEL;
@@ -978,6 +1042,62 @@ mod tests {
         assert_eq!(p.preview.as_deref(), Some("找一下 skill"));
         assert_eq!(p.messages.len(), 1);
         assert_eq!(p.messages[0].text, "找一下 skill");
+    }
+
+    /// t117: a title the harness built out of our own injected block must not
+    /// name the row. Both directions are asserted: a title that STARTS WITH a
+    /// header is dropped, and a title that merely CONTAINS one is kept --
+    /// otherwise a user quoting a header would lose their own title.
+    #[test]
+    fn injected_titles_are_dropped_but_merely_quoting_them_is_not() {
+        // Path 1 of 2: the harness's ai-title event.
+        let dirty = serde_json::json!({
+            "type": "ai-title",
+            "timestamp": 1,
+            "aiTitle": "[memory context — what the"
+        })
+        .to_string()
+            + "\n";
+        assert!(is_injected_title("[memory context — what the"));
+        assert!(is_injected_title("[role — you are] 你是"));
+        assert!(
+            parse_claude_code(&dirty).title.is_none(),
+            "a title that IS our header must be dropped"
+        );
+
+        // Reverse evidence: the same words INSIDE a user's own title. Starts-with
+        // is the whole point -- a contains-rule would delete this title.
+        let quoting = "为什么列表里出现 [memory context — what the 这种标题";
+        assert!(
+            !is_injected_title(quoting),
+            "a title that merely QUOTES a header must survive"
+        );
+        let quoted = serde_json::json!({
+            "type": "ai-title",
+            "timestamp": 1,
+            "aiTitle": quoting
+        })
+        .to_string()
+            + "\n";
+        assert_eq!(parse_claude_code(&quoted).title.as_deref(), Some(quoting));
+
+        // A normal title is untouched.
+        assert!(!is_injected_title("AutoHotkey 配置"));
+        assert!(!is_injected_title("[urgent] 请删掉这个文件"));
+
+        // Path 2 of 2: the harness may push the same dirty title through
+        // session/title instead of ai-title.
+        let dsh = serde_json::json!({
+            "type": "session/title",
+            "timestamp": 1,
+            "data": { "title": "[role — you are] 你是" },
+        })
+        .to_string()
+            + "\n";
+        assert!(
+            parse_dsh_jsonl(&dsh).title.is_none(),
+            "the session/title path must be covered too"
+        );
     }
 
     #[test]

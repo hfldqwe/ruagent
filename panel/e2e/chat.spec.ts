@@ -35,6 +35,24 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
     timeout: 15_000,
   });
 
+  // PRECONDITION (2026-09-24): the chip only exists when there is something
+  // to inject. The daemon emits ContextInjected ONLY for a non-empty render
+  // (crates/daemon/src/runs.rs: \`if !injection.is_empty()\`) and that render
+  // is built from recalled memories (render_run_injection returns "" when
+  // there are none). A brand-new data root — which is exactly what CI boots —
+  // has no memories, so the chip could not appear and this assertion was
+  // testing the ENVIRONMENT, not the panel. Seed one memory BEFORE the turn:
+  // then the chip is required, and the assertion stays strict.
+  const seeded = await request.post("/api/v1/memory/write", {
+    data: {
+      store: "observation",
+      namespace: "user",
+      content:
+        "E2E injection probe: the panel must show the platform context it injected.",
+    },
+  });
+  expect(seeded.ok(), "could not seed the memory the injection needs").toBeTruthy();
+
   // One round-trip. alpha is a SCRIPTED mock (same file the judge spec
   // uses) — the CHAT MARKER keys its reply.
   await page.locator(".composer textarea").fill("CHAT MARKER: e2e history probe");
@@ -52,6 +70,8 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
 
   // The platform injection is inspectable: a collapsed chip that opens
   // to the full render.
+  //
+
   await expect(page.locator(".chat-injection summary")).toBeVisible();
   await page.locator(".chat-injection summary").click();
   await expect(page.locator(".chat-injection pre")).toBeVisible();

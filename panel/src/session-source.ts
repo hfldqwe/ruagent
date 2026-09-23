@@ -68,6 +68,40 @@ export function isDistillWorkspace(project: string | null | undefined): boolean 
     .endsWith(DISTILL_WORKSPACE);
 }
 
+/** The injection headers ruagent itself writes at the top of the first user
+ *  message it hands a harness (the memory-context block, the role line, the
+ *  conversation-resume block and the retry block — all of them are prepended to
+ *  the user's own words). A harness that took that first message as the session
+ *  title leaves a row whose name is our prompt, which is why such a row counts
+ *  as platform-generated rather than as something the user named.
+ *
+ *  SOURCE OF TRUTH: `crates/daemon/src/chat.rs` — `pub const INJECTED_HEADERS`
+ *  (built there from the named constants `HDR_ROLE` / `HDR_MEMORY` /
+ *  `HDR_RESUME` / `HDR_RETRY`). MASTER §12 行 50 and view-sessions S9.3 define
+ *  the object set as exactly that constant's set, so this array is a NAMED COPY
+ *  of it: the panel cannot import Rust, and naming the producer here is what
+ *  makes the two sides diffable. Add a header THERE first, then here in the
+ *  same change — a member that exists only on one side is the drift this
+ *  naming is meant to catch.
+ *
+ *  The members are the SHORT discriminating prefixes, not the whole block body
+ *  (the body carries variables and cannot be a literal). Matching is
+ *  prefix-only and never a substring: a user may quote one of these literals
+ *  inside their own message, and that is not the platform speaking. */
+const INJECTED_HEADERS = [
+  "[memory context",
+  "[role — you are",
+  "[conversation resume",
+  "[retry context",
+];
+
+export function isPlatformInjectedName(title: string | null | undefined): boolean {
+  const t = String(title ?? "")
+    .trim()
+    .toLowerCase();
+  return INJECTED_HEADERS.some((h) => t.startsWith(h));
+}
+
 /** True for a session the platform generated for itself (see above). Both
  *  distillation literals are checked — they agree on today's data (29 rows,
  *  `source=dsh`), and taking either match means a change to one of them does
@@ -79,6 +113,9 @@ export function isSystemSession(s: {
   return (
     isTempWorkspace(s.project) ||
     isDistillationTitle(s.title) ||
-    isDistillWorkspace(s.project)
+    isDistillWorkspace(s.project) ||
+    // S9.4: the stored name is our own prompt (a harness used the first
+    // message as the title), so the row is the platform's, not the user's.
+    isPlatformInjectedName(s.title)
   );
 }
