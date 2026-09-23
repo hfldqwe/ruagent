@@ -21,6 +21,11 @@ import {
 } from "../ui";
 import { Markdown } from "./lazy-markdown";
 import { SOURCE_LABEL, sourceHue, msToIso } from "./Sessions";
+// Contract S7 — read straight from the pure module rather than through the
+// `./Sessions` re-export: the re-export exists so the ENTRY chunk
+// (CommandPalette) does not drag a route module in, and this view is already
+// that route chunk, so importing the source of truth directly costs nothing.
+import { isSystemSession, isTempWorkspace } from "../session-source";
 
 const ROW_H = 40;
 /** Rows rendered beyond the viewport, so a fast scroll never shows a gap.
@@ -29,6 +34,9 @@ const ROW_H = 40;
 const OVERSCAN = 2;
 /** The viewer is capped like the chat log: newest 400 messages. */
 const MSG_CAP = 400;
+
+/** S7 — which platform-generated sessions the list shows. */
+type SystemMode = "exclude" | "include" | "only";
 
 type ListState =
   | { kind: "loading" }
@@ -46,6 +54,10 @@ export function Sessions() {
   // server-side, so this is a real query parameter and not a local flag.
   const [archivedMode, setArchivedMode] = useState<ArchivedMode>("exclude");
   const [archivedCount, setArchivedCount] = useState(0);
+  /** S7 — which platform-generated sessions the list shows. The counterpart of
+   *  archivedMode, and local (not a query parameter) because the page already
+   *  holds every row: the origin rules are pure predicates over the fields. */
+  const [systemMode, setSystemMode] = useState<SystemMode>("exclude");
   /** Key of the row whose archive/delete request is in flight. */
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState<SessionRecord | null>(null);
@@ -114,12 +126,23 @@ export function Sessions() {
   );
 
   const sources = useMemo(() => [...new Set((rows ?? []).map((s) => s.source))], [rows]);
+  /** How many rows in this window the platform generated for itself (S7). */
+  const systemCount = useMemo(
+    () => (rows ?? []).filter(isSystemSession).length,
+    [rows],
+  );
   /** Workspaces present in the current page of results, most used first.
-   *  Capped: this is a filter, not an inventory. */
+   *  Capped: this is a filter, not an inventory.
+   *  Temporary workspaces are left out (S7): the vision bridge alone files 46
+   *  throwaway `modlens-work-XXXX` workspaces here, which is half the menu and
+   *  no way to find anything. The rows are still reachable through the system
+   *  control below — this only keeps the MENU honest. */
   const workspaces = useMemo(() => {
     const counts = new Map<string, number>();
     for (const s of rows ?? []) {
-      if (s.project) counts.set(s.project, (counts.get(s.project) ?? 0) + 1);
+      if (s.project && !isTempWorkspace(s.project)) {
+        counts.set(s.project, (counts.get(s.project) ?? 0) + 1);
+      }
     }
     return [...counts.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -135,6 +158,11 @@ export function Sessions() {
     const days = when === "7d" ? 7 : when === "30d" ? 30 : 0;
     const since = days ? Date.now() - days * 86_400_000 : 0;
     return rows.filter((s) => {
+      // S7: the platform's own sessions stay out of the default list, and the
+      // system control is the explicit way back to them.
+      const system = isSystemSession(s);
+      if (systemMode === "exclude" && system) return false;
+      if (systemMode === "only" && !system) return false;
       if (filter !== "all" && s.source !== filter) return false;
       if (ws !== "all" && s.project !== ws) return false;
       if (since && s.updated_at < since) return false;
@@ -146,7 +174,7 @@ export function Sessions() {
       }
       return true;
     });
-  }, [rows, filter, ws, when, q]);
+  }, [rows, filter, ws, when, q, systemMode]);
 
   const anyFilter = filter !== "all" || ws !== "all" || when !== "all" || q.trim() !== "";
   const clearFilters = () => {
@@ -291,6 +319,26 @@ export function Sessions() {
             { value: "exclude", label: t("sessions.hideArchived") },
             { value: "include", label: t("sessions.showArchived", { n: archivedCount }) },
             { value: "only", label: t("sessions.onlyArchived") },
+          ]}
+        />
+        {/* S7: the sessions the platform generated for itself (throwaway
+            vision-bridge workspaces, memory-distillation runs) are out of the
+            default list, and this is the explicit way back to them — the same
+            three-state shape as the archived control next to it. Deliberately
+            NOT folded into the source tabs: that axis is the `source` field,
+            and these sessions' source is dsh/claude-code like everyone else's,
+            so a tab there would make the filter lie about its own axis.
+            No inline style: 行 12 bills them per route and the Selects above
+            already spend one each. */}
+        <Select
+          className="sessions-system"
+          value={systemMode}
+          onChange={(v) => setSystemMode(v as SystemMode)}
+          aria-label={t("sessions.system")}
+          options={[
+            { value: "exclude", label: t("sessions.hideSystem") },
+            { value: "include", label: t("sessions.showSystem", { n: systemCount }) },
+            { value: "only", label: t("sessions.onlySystem") },
           ]}
         />
       </div>

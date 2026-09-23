@@ -651,6 +651,13 @@ const zh: Record<string, string> = {
   "sessions.hideArchived": "隐藏已归档",
   "sessions.showArchived": "显示已归档（{n}）",
   "sessions.onlyArchived": "只看已归档",
+  // Contract S7: the platform's own sessions (throwaway vision-bridge
+  // workspaces, memory-distillation runs) are hidden by default and reachable
+  // through this control — the same three-state shape as the archived trio.
+  "sessions.system": "系统会话",
+  "sessions.hideSystem": "隐藏系统会话",
+  "sessions.showSystem": "显示系统会话（{n}）",
+  "sessions.onlySystem": "只看系统会话",
   "sessions.archivedToast": "已归档 · 文件未被改动，可随时取消归档",
   "sessions.unarchivedToast": "已取消归档",
   "sessions.deletedToast": "已从索引中删除",
@@ -1334,6 +1341,10 @@ const en: Record<string, string> = {
   "sessions.hideArchived": "Hide archived",
   "sessions.showArchived": "Show archived ({n})",
   "sessions.onlyArchived": "Archived only",
+  "sessions.system": "System sessions",
+  "sessions.hideSystem": "Hide system sessions",
+  "sessions.showSystem": "Show system sessions ({n})",
+  "sessions.onlySystem": "System sessions only",
   "sessions.archivedToast": "Archived · no file was changed, and you can undo this",
   "sessions.unarchivedToast": "Unarchived",
   "sessions.deletedToast": "Removed from the index",

@@ -55,3 +55,6 @@ docs/screenshots/light/
 # Scratch probes (committed instruments live in panel/tools/)
 panel/.*.py
 panel/.*.mjs
+
+# Member scratch dirs (instruments live in panel/tools/)
+panel/.*/
