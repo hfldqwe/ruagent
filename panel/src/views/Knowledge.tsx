@@ -1,60 +1,126 @@
 // Knowledge manager: documents, ingest, hybrid search with chunk preview,
 // and the markdown truth-source editor — doc-level raw editing, chunk-level
 // curation with revision history + rollback, and an index rebuild.
+//
+// The search box sits above the content, not inside a tab: the first move in
+// a knowledge base is always "where is the thing I stored". Expanding a row
+// shows its chunks in place, because "edit the truth source" and "read the
+// index result" belong in one line of sight (view-knowledge.md §1).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button, Input, Popconfirm, Segmented } from "antd";
 import { Icon } from "../icons";
 import { api, type KnowledgeDocument, type KnowledgeRevision, type SearchHit } from "../api";
-import { Empty, Modal, RelTime, Spinner, useToast } from "../ui";
+import {
+  Empty,
+  ErrorState,
+  Modal,
+  ReadoutStrip,
+  RelTime,
+  Spinner,
+  Zone,
+  useToast,
+} from "../ui";
 import { dateOf, useI18n } from "../i18n";
 import { WikiTab } from "./Wiki";
+
+/** Density caps (view-knowledge.md §4): three documents unfolded at most,
+ *  200 chunks per document, 50 hits per search, 50 revisions per chunk. */
+const MAX_OPEN_DOCS = 3;
+const CHUNK_CAP = 200;
+const HIT_CAP = 50;
+const REVISION_CAP = 50;
+
+/** Does the source file say anything the document name does not already say?
+ *
+ *  The index stores `source` as the file a document was ingested from, and for
+ *  a plain ingest that is exactly `${name}.md` — so rendering both repeats one
+ *  string, and at 390px it wraps the row onto three lines (measured: 90px,
+ *  versus 48px with the tag gone). The redundancy is the cause, so the fix is
+ *  to drop the repetition rather than to accept the taller row.
+ *
+ *  "Says the same" is judged on the path, not the raw string:
+ *    · one trailing extension is removed from the source — wiki/index.md ≡ wiki/index
+ *    · backslashes fold to "/" (Windows paths)             — wiki\index.md ≡ wiki/index
+ *    · the comparison trims spaces and ignores case        — Wiki/Index.MD ≡ wiki/index
+ *  The extension alone is never the difference that matters: every document
+ *  here is markdown, so it is a constant rather than information, and the name
+ *  already carries the directory the source lives in.
+ *
+ *  Everything else keeps both strings visible, e.g.
+ *    · notes vs uploads/notes-2026.md   (a directory the name does not carry)
+ *    · notes vs notes.md.txt            (only ONE extension is dropped)
+ *    · notes vs .notes.md               (the stem is ".notes", not "notes")
+ *  A bare trailing dot is NOT such a case: `notes.` folds to `notes` because
+ *  the dot carries nothing (Windows strips it anyway). So the rule is a
+ *  comparison, not "always show one". */
+function sourceEchoesName(name: string, source: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\\/g, "/").toLowerCase();
+  const stem = norm(source).replace(/\.[^./]*$/, "");
+  return stem.length > 0 && stem === norm(name);
+}
 
 export function Knowledge() {
   const { t } = useI18n();
   const [docs, setDocs] = useState<KnowledgeDocument[] | null>(null);
+  const [docsFailed, setDocsFailed] = useState(false);
   const [embedder, setEmbedder] = useState("");
   const [ingesting, setIngesting] = useState(false);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
-  const [expanded, setExpanded] = useState<number | null>(null);
-  const [chunks, setChunks] = useState<[number, string][] | null>(null);
+  const [searchFailed, setSearchFailed] = useState(false);
+  /** ids of the documents currently unfolded (ordered, <= MAX_OPEN_DOCS). */
+  const [open, setOpen] = useState<number[]>([]);
+  /** id -> chunks; null means "still loading". */
+  const [chunks, setChunks] = useState<Record<number, [number, string][] | null>>({});
+  const [capWarn, setCapWarn] = useState(false);
   const [editingDoc, setEditingDoc] = useState<KnowledgeDocument | null>(null);
-  const [editingChunk, setEditingChunk] = useState<{ id: number; content: string; doc: string } | null>(null);
+  const [editingChunk, setEditingChunk] = useState<{
+    id: number;
+    content: string;
+    doc: string;
+  } | null>(null);
   /** chunk id whose revision history is unfolded (null = none) */
   const [revChunk, setRevChunk] = useState<number | null>(null);
   const [revisions, setRevisions] = useState<KnowledgeRevision[] | null>(null);
   const [rebuilding, setRebuilding] = useState(false);
+  /** The rebuild report stays on screen: four numbers, and `errors` is a
+   *  failure, not a footnote (view-knowledge.md §4). */
+  const [rebuildReport, setRebuildReport] = useState<
+    { indexed: number; unchanged: number; removed: number; errors: number } | null
+  >(null);
   /** docs list vs the wiki tab (M2 panel surface). */
   const [tab, setTab] = useState<"docs" | "wiki">("docs");
   const toast = useToast();
 
-  const refresh = () =>
+  const refresh = useCallback(() => {
     api
       .knowledgeDocs()
       .then((r) => {
         setDocs(r.documents);
         setEmbedder(r.embedder);
+        setDocsFailed(false);
       })
-      .catch((e) => {
-        toast("err", String(e));
-        setDocs([]);
+      .catch(() => {
+        // A failed read is not an empty library (MASTER §12 row 20).
+        setDocsFailed(true);
       });
+  }, []);
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
   const search = async () => {
     if (!query.trim()) {
       setHits(null);
       return;
     }
+    setSearchFailed(false);
     try {
       setHits(await api.knowledgeSearch(query.trim()));
-    } catch (e) {
-      toast("err", String(e));
-      setHits([]);
+    } catch {
+      setSearchFailed(true);
     }
   };
 
@@ -66,27 +132,28 @@ export function Knowledge() {
     );
   };
 
-  const reloadChunks = async (id: number) => {
-    setChunks(null);
+  const loadChunks = useCallback(async (id: number) => {
+    setChunks((prev) => ({ ...prev, [id]: null }));
     try {
-      setChunks(await api.knowledgeChunks(id));
+      const c = await api.knowledgeChunks(id);
+      setChunks((prev) => ({ ...prev, [id]: c }));
     } catch {
-      setChunks([]);
+      setChunks((prev) => ({ ...prev, [id]: [] }));
     }
-  };
+  }, []);
 
-  const openChunks = (id: number) => {
-    if (expanded === id) {
-      setExpanded(null);
-      setChunks(null);
-      setRevChunk(null);
-      setRevisions(null);
+  const toggleDoc = (id: number) => {
+    if (open.includes(id)) {
+      setOpen(open.filter((x) => x !== id));
       return;
     }
-    setExpanded(id);
-    setRevChunk(null);
-    setRevisions(null);
-    reloadChunks(id);
+    if (open.length >= MAX_OPEN_DOCS) {
+      setCapWarn(true);
+      return;
+    }
+    setCapWarn(false);
+    setOpen([...open, id]);
+    if (!(id in chunks)) void loadChunks(id);
   };
 
   const toggleRevisions = async (chunkId: number) => {
@@ -98,9 +165,8 @@ export function Knowledge() {
     setRevChunk(chunkId);
     setRevisions(null);
     try {
-      setRevisions(await api.knowledgeChunkRevisions(chunkId));
-    } catch (e) {
-      toast("err", String(e));
+      setRevisions((await api.knowledgeChunkRevisions(chunkId)).slice(0, REVISION_CAP));
+    } catch {
       setRevisions([]);
     }
   };
@@ -109,12 +175,11 @@ export function Knowledge() {
     try {
       const out = await api.knowledgeRollback(revisionId);
       toast("ok", t("knowledge.rolledBack", { id: out.revision }));
-      if (expanded != null) await reloadChunks(expanded);
+      for (const id of open) await loadChunks(id);
       refresh();
-      // The rollback is itself a new revision — refresh the open history.
       if (revChunk != null) {
         try {
-          setRevisions(await api.knowledgeChunkRevisions(revChunk));
+          setRevisions((await api.knowledgeChunkRevisions(revChunk)).slice(0, REVISION_CAP));
         } catch {
           /* keep the stale list rather than blanking it */
         }
@@ -128,9 +193,8 @@ export function Knowledge() {
     setRebuilding(true);
     try {
       const { rebuild: r } = await api.knowledgeRebuild();
-      let msg = t("knowledge.rebuilt", { n: r.indexed, u: r.unchanged, r: r.removed });
-      if (r.errors > 0) msg += t("knowledge.rebuiltErr", { e: r.errors });
-      toast("ok", msg);
+      setRebuildReport(r);
+      toast("ok", t("knowledge.rebuilt", { n: r.indexed, u: r.unchanged, r: r.removed }));
       refresh();
     } catch (e) {
       toast("err", String(e));
@@ -143,22 +207,27 @@ export function Knowledge() {
    * and unfold the history under the edited chunk (ids usually survive). */
   const onChunkSaved = async (chunkId: number) => {
     setEditingChunk(null);
-    if (expanded != null) await reloadChunks(expanded);
+    for (const id of open) await loadChunks(id);
     refresh();
     setRevChunk(chunkId);
     setRevisions(null);
     try {
-      setRevisions(await api.knowledgeChunkRevisions(chunkId));
+      setRevisions((await api.knowledgeChunkRevisions(chunkId)).slice(0, REVISION_CAP));
     } catch {
       setRevisions([]);
     }
   };
 
+  const chunkTotal = (docs ?? []).reduce((s, d) => s + d.chunk_count, 0);
+
   return (
     <div>
+      <h1 className="sr-only micro">{t("knowledge.title")}</h1>
       <div className="view-bar">
         <h2>{t("knowledge.title")}</h2>
-        <span className="muted">{t("knowledge.subtitle")} ({embedder || "…"})</span>
+        <span className="muted">
+          {t("knowledge.subtitle")} ({embedder || "…"})
+        </span>
         <Segmented
           value={tab}
           onChange={(v) => setTab(v as "docs" | "wiki")}
@@ -168,16 +237,18 @@ export function Knowledge() {
           ]}
         />
         <span className="grow" />
-        {tab === "docs" && <Popconfirm
-          title={t("knowledge.rebuild.title")}
-          description={t("knowledge.rebuild.body")}
-          okText={t("knowledge.rebuild")}
-          cancelText={t("common.cancel")}
-          okButtonProps={{ danger: true }}
-          onConfirm={rebuild}
-        >
-          <Button loading={rebuilding}>{t("knowledge.rebuild")}</Button>
-        </Popconfirm>}
+        {tab === "docs" && (
+          <Popconfirm
+            title={t("knowledge.rebuild.title")}
+            description={t("knowledge.rebuild.body")}
+            okText={t("knowledge.rebuild")}
+            cancelText={t("common.cancel")}
+            okButtonProps={{ danger: true }}
+            onConfirm={rebuild}
+          >
+            <Button loading={rebuilding}>{t("knowledge.rebuild")}</Button>
+          </Popconfirm>
+        )}
         {tab === "docs" && (
           <Button type="primary" onClick={() => setIngesting(true)}>
             + {t("knowledge.ingest")}
@@ -185,161 +256,198 @@ export function Knowledge() {
         )}
       </div>
 
+      {tab === "docs" && (
+        <ReadoutStrip
+          grid
+          items={[
+            { key: "docs", label: t("knowledge.tab.docs"), value: docs?.length ?? 0 },
+            { key: "chunks", label: t("metric.chunks"), value: chunkTotal },
+          ]}
+        />
+      )}
+
+      {rebuildReport && tab === "docs" && (
+        <p className="row tight">
+          <span className={rebuildReport.errors > 0 ? "tag err" : "tag ok"}>
+            {t("knowledge.rebuild")}
+          </span>
+          <span className="muted mono">
+            {t("knowledge.rebuilt", {
+              n: rebuildReport.indexed,
+              u: rebuildReport.unchanged,
+              r: rebuildReport.removed,
+            })}
+          </span>
+          {rebuildReport.errors > 0 && (
+            <span className="tag err">
+              {t("knowledge.rebuiltErr", { e: rebuildReport.errors })}
+            </span>
+          )}
+        </p>
+      )}
+
       {tab === "wiki" ? (
         <WikiTab openEditor={openWikiEditor} />
       ) : (
-      <>
-      <div className="search-bar">
-        <Input
-          autoFocus
-          className="grow"
-          placeholder={t("knowledge.search")}
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onPressEnter={search}
-        />
-        <Button type="primary" onClick={search}>
-          {t("common.search")}
-        </Button>
-        {hits ? (
-          <Button type="link" onClick={() => { setHits(null); setQuery(""); }}>
-            {t("common.clear")}
-          </Button>
-        ) : null}
-      </div>
-
-      {hits ? (
-        hits.length === 0 ? (
-          <Empty icon="search" title={t("knowledge.noResults")} />
-        ) : (
-          <div className="card">
-            {hits.map((h) => (
-              <div key={h.chunk_id} className="search-hit">
-                <div className="row tight">
-                  <span className="tag">{h.document}</span>
-                  <span className="muted mono">score {h.score.toFixed(3)}</span>
-                </div>
-                <p className="hit-content">{h.content}</p>
-              </div>
-            ))}
-          </div>
-        )
-      ) : docs === null ? (
-        <Spinner label={`${t("knowledge.title")}…`} />
-      ) : docs.length === 0 ? (
-        <Empty
-          icon="book"
-          title={t("knowledge.empty.title")}
-          hint={t("knowledge.empty.hint")}
-        />
-      ) : (
-        <div className="card">
-          {docs.map((d) => (
-            <div key={d.id}>
-              <div
-                role="button"
-                tabIndex={0}
-                aria-label={`${d.name}`}
-                className="row-btn"
-                onClick={() => openChunks(d.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    openChunks(d.id);
-                  }
+        <Zone title={t("knowledge.tab.docs")} note={`${docs?.length ?? 0} · ${chunkTotal}`}>
+          <div className="search-bar">
+            <Input
+              autoFocus
+              className="grow"
+              aria-label={t("knowledge.search")}
+              placeholder={t("knowledge.search")}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onPressEnter={search}
+            />
+            <Button type="primary" onClick={search}>
+              {t("common.search")}
+            </Button>
+            {hits ? (
+              <Button
+                type="text"
+                onClick={() => {
+                  setHits(null);
+                  setQuery("");
                 }}
               >
-                <span className="doc-icon"><Icon name="doc" size={15} /></span>
-                <strong className="title">{d.name}</strong>
-                {d.source ? <span className="tag">{d.source}</span> : null}
-                <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
-                <span className="grow" />
-                <span className="time">{<RelTime iso={d.created_at} />}</span>
-                {d.source ? (
-                  <Button
-                    size="small"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setEditingDoc(d);
+                {t("common.clear")}
+              </Button>
+            ) : null}
+          </div>
+
+          {searchFailed || docsFailed ? (
+            <ErrorState
+              title={t("knowledge.err")}
+              hint={t("knowledge.err.hint")}
+              onRetry={searchFailed ? search : refresh}
+              retryLabel={t("common.retry")}
+            />
+          ) : hits ? (
+            hits.length === 0 ? (
+              <Empty icon="search" title={t("knowledge.noResults")} />
+            ) : (
+              <div className="card">
+                {hits.slice(0, HIT_CAP).map((h) => (
+                  <div key={h.chunk_id} className="search-hit">
+                    <div className="row tight">
+                      <span className="tag">{h.document}</span>
+                      <span className="muted mono">score {h.score.toFixed(3)}</span>
+                    </div>
+                    <p className="hit-content">{h.content}</p>
+                  </div>
+                ))}
+                {hits.length > HIT_CAP && (
+                  <p className="muted micro">{t("knowledge.hitCap", { n: HIT_CAP })}</p>
+                )}
+              </div>
+            )
+          ) : docs === null ? (
+            <Spinner label={`${t("knowledge.title")}…`} />
+          ) : docs.length === 0 ? (
+            <Empty
+              icon="book"
+              title={t("knowledge.empty.title")}
+              hint={t("knowledge.empty.hint")}
+              action={
+                <Button type="primary" onClick={() => setIngesting(true)}>
+                  + {t("knowledge.ingest")}
+                </Button>
+              }
+            />
+          ) : (
+            <div className="card">
+              {docs.map((d) => (
+                <div key={d.id}>
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    aria-label={d.name}
+                    aria-expanded={open.includes(d.id)}
+                    className="row-btn"
+                    onClick={() => toggleDoc(d.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggleDoc(d.id);
+                      }
                     }}
                   >
-                    {t("knowledge.edit")}
-                  </Button>
-                ) : (
-                  <span className="legacy-hint">{t("knowledge.legacyHint")}</span>
-                )}
-                <Button
-                  danger
-                  size="small"
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    try {
-                      await api.knowledgeDelete(d.id);
-                      toast("ok", t("knowledge.deleted", { name: d.name }));
-                      refresh();
-                    } catch (err) {
-                      toast("err", String(err));
-                    }
-                  }}
-                >
-                  {t("common.delete")}
-                </Button>
-              </div>
-              {expanded === d.id && (
-                <div className="chunks">
-                  {chunks === null ? (
-                    <Spinner />
-                  ) : (
-                    chunks.map(([id, text]) => (
-                      <div key={id} className="chunk-item">
-                        <pre className="raw">{text}</pre>
-                        <div className="row tight end chunk-actions">
-                          <Button
-                            type="link"
-                            size="small"
-                            onClick={() => setEditingChunk({ id, content: text, doc: d.name })}
-                          >
-                            {t("knowledge.editChunk")}
-                          </Button>
-                          <Button type="link" size="small" onClick={() => toggleRevisions(id)}>
-                            {t("knowledge.history")}
-                          </Button>
-                        </div>
-                        {revChunk === id &&
-                          (revisions === null ? (
-                            <Spinner />
-                          ) : revisions.length === 0 ? (
-                            <p className="muted">{t("knowledge.noRevisions")}</p>
-                          ) : (
-                            <div className="chunk-revisions">
-                              {revisions.map((r) => (
-                                <div key={r.id} className="revision">
-                                  <div className="row tight">
-                                    <span className="time mono">{dateOf(r.edited_at)}</span>
-                                    <span className="muted mono">#{r.id} · {r.document_name}</span>
-                                    <span className="grow" />
-                                    <Button type="link" size="small" onClick={() => rollback(r.id)}>
-                                      {t("knowledge.rollback")}
-                                    </Button>
-                                  </div>
-                                  <span className="rev-label">{t("knowledge.old")}</span>
-                                  <pre className="raw rev-old">{r.old_content}</pre>
-                                  <span className="rev-label">{t("knowledge.new")}</span>
-                                  <pre className="raw">{r.new_content}</pre>
-                                </div>
-                              ))}
-                            </div>
-                          ))}
-                      </div>
-                    ))
+                    <span className="doc-icon">
+                      <Icon name="doc" size={15} />
+                    </span>
+                    {/* The title stays `name`: it is the row's accessible
+                        name (aria-label below), it is what every follow-up
+                        dialog says (edit title, delete confirm, toast), and
+                        WCAG 2.5.3 wants the accessible name to contain the
+                        visible label. When the source only repeats it, the tag
+                        is the redundant one and it goes. */}
+                    <strong className="title">{d.name}</strong>
+                    {d.source && !sourceEchoesName(d.name, d.source) ? (
+                      <span className="tag">{d.source}</span>
+                    ) : null}
+                    <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
+                    <span className="grow" />
+                    {/* The timestamp rides a hoverable .row-btn, and
+                        --surface-hover (#262a31) drops the quaternary grade
+                        to 4.04:1 there (measured). It sits at the row's
+                        metadata grade instead — the same move the shared layer
+                        already makes for .row-btn.selected. Revert to
+                        className="time" once index.css carries the hover
+                        companion (rule handed to systems, see report). */}
+                    <span className="micro mono muted">
+                      <RelTime iso={d.created_at} />
+                    </span>
+                    {/* Row actions must not re-open the row, and a
+                        destructive one confirms first (audit P2). */}
+                    <span onClick={(e) => e.stopPropagation()}>
+                      {d.source ? (
+                        <Button onClick={() => setEditingDoc(d)}>{t("knowledge.edit")}</Button>
+                      ) : (
+                        <span className="legacy-hint">{t("knowledge.legacyHint")}</span>
+                      )}
+                    </span>
+                    <span onClick={(e) => e.stopPropagation()}>
+                      <Popconfirm
+                        title={t("knowledge.delete.confirm", { name: d.name })}
+                        okText={t("common.delete")}
+                        cancelText={t("common.cancel")}
+                        okButtonProps={{ danger: true }}
+                        onConfirm={async () => {
+                          try {
+                            await api.knowledgeDelete(d.id);
+                            toast("ok", t("knowledge.deleted", { name: d.name }));
+                            refresh();
+                          } catch (err) {
+                            toast("err", String(err));
+                          }
+                        }}
+                      >
+                        <Button danger>{t("common.delete")}</Button>
+                      </Popconfirm>
+                    </span>
+                  </div>
+                  {open.includes(d.id) && (
+                    <div className="chunks">
+                      <ChunkList
+                        chunks={chunks[d.id] ?? null}
+                        revChunk={revChunk}
+                        revisions={revisions}
+                        onEdit={(id, text, name) =>
+                          setEditingChunk({ id, content: text, doc: name })
+                        }
+                        onToggleRevisions={toggleRevisions}
+                        onRollback={rollback}
+                      />
+                    </div>
                   )}
                 </div>
-              )}
+              ))}
             </div>
-          ))}
-        </div>
-      )}
-      </>
+          )}
+
+          {capWarn && <p className="muted micro">{t("knowledge.expandCap")}</p>}
+        </Zone>
       )}
 
       {ingesting && (
@@ -359,7 +467,7 @@ export function Knowledge() {
           onSaved={(saved) => {
             setEditingDoc(null);
             refresh();
-            if (expanded === saved.id) reloadChunks(saved.id);
+            if (open.includes(saved.id)) void loadChunks(saved.id);
           }}
         />
       )}
@@ -372,6 +480,85 @@ export function Knowledge() {
         />
       )}
     </div>
+  );
+}
+
+/** The chunk list of one document. Capped so 11 long chunks cannot stretch
+ *  the page; the note says so rather than silently truncating. */
+function ChunkList({
+  chunks,
+  revChunk,
+  revisions,
+  onEdit,
+  onToggleRevisions,
+  onRollback,
+}: {
+  chunks: [number, string][] | null;
+  revChunk: number | null;
+  revisions: KnowledgeRevision[] | null;
+  onEdit: (id: number, content: string, doc: string) => void;
+  onToggleRevisions: (id: number) => void;
+  onRollback: (revisionId: number) => void;
+}) {
+  const { t } = useI18n();
+  if (chunks === null) return <Spinner />;
+  return (
+    <>
+      {chunks.slice(0, CHUNK_CAP).map(([id, text]) => (
+        <div key={id} className="chunk-item">
+          <pre className="raw">{text}</pre>
+          <div className="row tight end chunk-actions">
+            <Button type="text" onClick={() => onEdit(id, text, "")}>
+              {t("knowledge.editChunk")}
+            </Button>
+            <Button type="text" onClick={() => onToggleRevisions(id)}>
+              {t("knowledge.history")}
+            </Button>
+          </div>
+          {revChunk === id &&
+            (revisions === null ? (
+              <Spinner />
+            ) : revisions.length === 0 ? (
+              <p className="muted micro">{t("knowledge.noRevisions")}</p>
+            ) : (
+              <div className="chunk-revisions">
+                {revisions.map((r) => (
+                  <div key={r.id} className="revision">
+                    <div className="row tight">
+                      {/* One timestamp voice per view (see the doc-row
+                          timestamp above for why the grade is tertiary). */}
+                      <span className="micro mono muted">{dateOf(r.edited_at)}</span>
+                      <span className="muted mono">
+                        #{r.id} · {r.document_name}
+                      </span>
+                      <span className="grow" />
+                      {/* Rollback rewrites the chunk: confirm + busy. */}
+                      <Popconfirm
+                        title={t("knowledge.rollback.confirm")}
+                        okText={t("knowledge.rollback")}
+                        cancelText={t("common.cancel")}
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => onRollback(r.id)}
+                      >
+                        <Button type="text">{t("knowledge.rollback")}</Button>
+                      </Popconfirm>
+                    </div>
+                    <span className="rev-label">{t("knowledge.old")}</span>
+                    <pre className="raw rev-old">{r.old_content}</pre>
+                    <span className="rev-label">{t("knowledge.new")}</span>
+                    <pre className="raw">{r.new_content}</pre>
+                  </div>
+                ))}
+              </div>
+            ))}
+        </div>
+      ))}
+      {chunks.length > CHUNK_CAP && (
+        <p className="muted micro">
+          {t("knowledge.chunkCap", { n: CHUNK_CAP, total: chunks.length })}
+        </p>
+      )}
+    </>
   );
 }
 
@@ -391,6 +578,7 @@ function RawEditorModal({
   const { t } = useI18n();
   const [content, setContent] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
   const toast = useToast();
 
   useEffect(() => {
@@ -400,14 +588,14 @@ function RawEditorModal({
       .then((c) => {
         if (alive) setContent(c);
       })
-      .catch((e) => {
-        toast("err", String(e));
-        onClose();
+      .catch(() => {
+        // Keep the editor open with a retry: closing on a failed read loses
+        // the user's place for no reason.
+        if (alive) setFailed(true);
       });
     return () => {
       alive = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc.name]);
 
   const save = async () => {
@@ -418,6 +606,7 @@ function RawEditorModal({
       toast("ok", t("knowledge.saved", { file: r.file, n: r.chunks }));
       onSaved(doc);
     } catch (e) {
+      // The edited text stays in the textarea (view-knowledge.md §5).
       toast("err", String(e));
     } finally {
       setBusy(false);
@@ -427,7 +616,9 @@ function RawEditorModal({
   return (
     <Modal title={t("knowledge.editTitle", { name: doc.name })} onClose={onClose} wide>
       <p className="muted">{t("knowledge.editor")}</p>
-      {content === null ? (
+      {failed ? (
+        <ErrorState title={t("knowledge.err")} hint={t("knowledge.err.hint")} />
+      ) : content === null ? (
         <Spinner />
       ) : (
         <Input.TextArea
@@ -500,6 +691,9 @@ function ChunkEditorModal({
       <p className="muted">
         {target.doc} · {t("knowledge.editor")}
       </p>
+      {/* The warning is permanent, not a tooltip: without it a chunk edit
+          reads as durable when the next rebuild overwrites it (K11). */}
+      <p className="legacy-hint">{t("knowledge.chunkWarn")}</p>
       <Input.TextArea
         className="md-editor"
         rows={10}
@@ -528,6 +722,8 @@ function ChunkEditorModal({
 function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested: () => void }) {
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
   const { t } = useI18n();
   const toast = useToast();
   return (
@@ -547,20 +743,33 @@ function IngestModal({ onClose, onIngested }: { onClose: () => void; onIngested:
           rows={12}
           value={content}
           onChange={(e) => setContent(e.target.value)}
-          placeholder={"# Deploy runbook\n\n1. Run scripts/release.sh from the repo root…"}
+          placeholder={`# Deploy runbook
+
+1. Run scripts/release.sh from the repo root…`}
         />
       </label>
+      {failed && (
+        <ErrorState
+          title={t("knowledge.err")}
+          hint={t("knowledge.ingest.failed")}
+        />
+      )}
       <div className="row end">
         <Button
           type="primary"
+          loading={busy}
           disabled={!name.trim() || !content.trim()}
           onClick={async () => {
+            setBusy(true);
             try {
               const r = await api.knowledgeIngest(name.trim(), content);
               toast("ok", t("knowledge.ingested", { n: r.chunks }));
               onIngested();
-            } catch (e) {
-              toast("err", String(e));
+            } catch {
+              // The pasted text stays in the editor (view-knowledge.md §5).
+              setFailed(true);
+            } finally {
+              setBusy(false);
             }
           }}
         >

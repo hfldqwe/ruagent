@@ -1,7 +1,7 @@
-// Faces are bundled (woff2, no network at runtime): Inter Variable is the
-// UI face for Latin; IBM Plex Mono is the data face. CJK falls back to the
+// Faces are bundled (woff2, no network at runtime): IBM Plex Sans is the
+// UI face, IBM Plex Mono its data counterpart. CJK falls back to the
 // system face.
-import "@fontsource-variable/inter";
+import "@fontsource-variable/ibm-plex-sans";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";

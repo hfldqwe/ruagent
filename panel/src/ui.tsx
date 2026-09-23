@@ -2,7 +2,7 @@
 // useToast/Modal/Empty/Spinner — the implementations are antd's now.
 
 import { useEffect, type ReactNode } from "react";
-import { App as AntApp, Empty as AntEmpty, Modal as AntModal, Spin } from "antd";
+import { Alert, App as AntApp, Button, Empty as AntEmpty, Modal as AntModal, Spin } from "antd";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { IconName } from "./icons";
@@ -70,11 +70,51 @@ export function Modal({
 // ---------------------------------------------------------------------------
 
 export const Spinner = ({ label }: { label?: string }) => (
-  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "72px 0" }}>
+  <div className="spinner-block">
     <Spin size="large" />
     {label ? <span className="muted">{label}</span> : null}
   </div>
 );
+
+/**
+ * Error: must never read as an empty (a failed load is not "no data yet").
+ * antd Alert carries role="alert"; retry is offered whenever the caller can.
+ */
+export function ErrorState({
+  title,
+  hint,
+  onRetry,
+  retryLabel,
+}: {
+  title: string;
+  hint?: string;
+  onRetry?: () => void;
+  retryLabel?: string;
+}) {
+  return (
+    <div className="error-state">
+      <Alert
+        type="error"
+        showIcon
+        message={title}
+        description={hint}
+        action={
+          onRetry ? (
+            <Button size="small" onClick={onRetry}>
+              {retryLabel ?? "Retry"}
+            </Button>
+          ) : undefined
+        }
+      />
+    </div>
+  );
+}
+
+/** Any request resolves to one of three states - never to a wrong one. */
+export type LoadState<T> =
+  | { kind: "loading" }
+  | { kind: "error"; err: unknown }
+  | { kind: "ready"; data: T };
 
 export function Empty({
   icon,
@@ -89,21 +129,20 @@ export function Empty({
 }) {
   return (
     <AntEmpty
-      image={<Icon name={icon} size={44} style={{ opacity: 0.35 }} />}
-      imageStyle={{ height: 52, display: "flex", justifyContent: "center" }}
+      className="empty-state"
+      image={
+        <span className="empty-mark">
+          <Icon name={icon} size={24} />
+        </span>
+      }
       description={
-        <div>
-          <div style={{ fontWeight: 600 }}>{title}</div>
-          {hint ? (
-            <div className="muted" style={{ maxWidth: 420, margin: "4px auto 0", fontSize: 13 }}>
-              {hint}
-            </div>
-          ) : null}
+        <div className="empty-copy">
+          <div className="empty-title">{title}</div>
+          {hint ? <p className="empty-hint">{hint}</p> : null}
         </div>
       }
-      style={{ padding: "56px 0" }}
     >
-      {action}
+      {action ? <div className="empty-action">{action}</div> : null}
     </AntEmpty>
   );
 }
@@ -121,23 +160,36 @@ export function RelTime({ iso }: { iso: string | null | undefined }) {
 // Status — colors valid on both light and dark surfaces
 // ---------------------------------------------------------------------------
 
-// Theme-aware status colors: CSS vars defined per mode in index.css
-// (--status-ok/err/warn/idle), amber for the active states. Dots are
-// non-text marks (3:1 floor on every surface); pill text uses the same
-// vars and clears 4.5:1 in both modes.
+// Theme-aware status colors (CSS vars per mode in index.css).
+//
+// Colour encodes the liveness CLASS, the label carries the exact status:
+// now (signal) / terminal-ok / terminal-bad / not started.
+// interrupted is a past-tense terminal state, so it sits with cancelled;
+// waiting_permission and blocked are literally "waiting on you" -> signal.
 const STATUS_COLORS: Record<string, string> = {
   done: "var(--status-ok)",
   completed: "var(--status-ok)",
   failed: "var(--status-err)",
   cancelled: "var(--status-err)",
-  interrupted: "var(--status-warn)",
-  in_progress: "var(--ant-color-primary)",
-  running: "var(--ant-color-primary)",
-  spawning: "var(--ant-color-primary)",
+  interrupted: "var(--status-err)",
+  in_progress: "var(--signal)",
+  running: "var(--signal)",
+  spawning: "var(--signal)",
   queued: "var(--status-idle)",
   pending: "var(--status-idle)",
-  waiting_permission: "var(--status-warn)",
-  blocked: "var(--status-warn)",
+  waiting_permission: "var(--signal)",
+  blocked: "var(--signal)",
+};
+
+// Pill text is 11px on the chip, so live states need the accent TEXT grade
+// (the fill grade lands at 2.75:1 there in light mode).
+const STATUS_TEXT_COLORS: Record<string, string> = {
+  ...STATUS_COLORS,
+  in_progress: "var(--signal-text)",
+  running: "var(--signal-text)",
+  spawning: "var(--signal-text)",
+  waiting_permission: "var(--signal-text)",
+  blocked: "var(--signal-text)",
 };
 
 export function StatusDot({ status }: { status: string }) {
@@ -154,13 +206,87 @@ export function StatusPill({ status }: { status: string }) {
   return (
     <span
       className="pill"
-      style={{
-        color: STATUS_COLORS[status] ?? "inherit",
-        borderColor: STATUS_COLORS[status] ?? "var(--ant-color-border)",
-      }}
+      style={{ color: STATUS_TEXT_COLORS[status] ?? "var(--ant-color-text-secondary)" }}
     >
       {t(`status.${status}`)}
     </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Zone - the third container role: a rule + a label, never a box
+// ---------------------------------------------------------------------------
+
+/**
+ * A section head plus its content, with no surface of its own (container tree:
+ * zone / panel / overlay). The DOM is identical to hand-writing
+ * .zone/.zone-head/.zone-title/.zone-note, and className lets a view keep its
+ * frozen class alongside it (e.g. "kanban-col zone").
+ */
+export function Zone({
+  title,
+  note,
+  actions,
+  className,
+  children,
+}: {
+  title?: ReactNode;
+  note?: ReactNode;
+  actions?: ReactNode;
+  className?: string;
+  children: ReactNode;
+}) {
+  const head = title || note || actions;
+  return (
+    <section className={className ? "zone " + className : "zone"}>
+      {head ? (
+        <div className="zone-head">
+          {title ? <div className="zone-title">{title}</div> : null}
+          {note ? <span className="zone-note">{note}</span> : null}
+          <span className="grow" />
+          {actions}
+        </div>
+      ) : null}
+      {children}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// IconButton - the one icon-button shape
+// ---------------------------------------------------------------------------
+
+/** A 24x24 minimum hit area, and a name is required of every caller so an
+ *  unnamed icon button cannot ship. */
+export function IconButton({
+  label,
+  icon,
+  onClick,
+  size = 16,
+  disabled,
+  className,
+  title,
+}: {
+  /** Accessible name (aria-label). */
+  label: string;
+  icon: IconName;
+  onClick?: () => void;
+  size?: number;
+  disabled?: boolean;
+  className?: string;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      className={className ? "icon-btn " + className : "icon-btn"}
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={title ?? label}
+    >
+      <Icon name={icon} size={size} />
+    </button>
   );
 }
 
@@ -191,9 +317,56 @@ export function fmtUsd(n: number | null | undefined): string {
 export function UsageMeter({ used, size }: { used: number; size: number }) {
   const pct = size > 0 ? Math.min(100, (used / size) * 100) : 0;
   return (
-    <span title={`${fmtTokens(used)} / ${fmtTokens(size)}`} className="mono" style={{ fontSize: 12 }}>
+    <span title={`${fmtTokens(used)} / ${fmtTokens(size)}`} className="mono">
       {fmtTokens(used)}/{fmtTokens(size)} · {pct.toFixed(0)}%
     </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Instrument strip — the readout row a view opens with.
+//
+// Every desk shows its gauges: 2-4 numbers at display size on one plate,
+// separated by rules instead of boxed into identical cards. It is the one
+// place type is allowed to be big, which is what gives each view a centre
+// of gravity it otherwise lacks.
+// ---------------------------------------------------------------------------
+
+export interface Readout {
+  key: string;
+  label: string;
+  value: ReactNode;
+  /** Makes the gauge a jump-link into the view that owns the number. */
+  onOpen?: () => void;
+  /** Wears the signal color: the number means "live" or "waiting on you". */
+  signal?: boolean;
+}
+
+/**
+ * The page-opening gauge row. `grid` turns the strip into the <=520 2-up grid
+ * (`.readout-strip.grid`), where four gauges in one row would each be ~70px
+ * wide (README §3.4 X4). At >520 it is a no-op, so views pass it unconditionally
+ * and still get the flex geometry at desk widths - the layout is shared-layer,
+ * views must not write this CSS themselves.
+ */
+export function ReadoutStrip({ items, grid }: { items: Readout[]; grid?: boolean }) {
+  return (
+    <div className={grid ? "panel readout-strip grid" : "panel readout-strip"}>
+      {items.map((it) => {
+        const value = <span className={it.signal ? "readout signal" : "readout"}>{it.value}</span>;
+        return it.onOpen ? (
+          <button key={it.key} className="readout-btn" onClick={it.onOpen}>
+            {value}
+            <span className="readout-label">{it.label}</span>
+          </button>
+        ) : (
+          <div key={it.key} className="readout-cell">
+            {value}
+            <span className="readout-label">{it.label}</span>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

@@ -37,8 +37,19 @@ test("the raw editor shows the file's exact markdown", async ({ page }) => {
 
   const row = page.locator(".row-btn").filter({ hasText: DOC });
   await expect(row).toBeVisible();
-  // file-backed: shows its source file and the edit affordance
-  await expect(row.locator(".tag").filter({ hasText: `${DOC}.md` })).toBeVisible();
+  // File-backed, asserted on the contract rather than on one rendering detail:
+  // the edit button is rendered only when the document has a source file, and a
+  // source-less document shows .legacy-hint in its place. The assertion that
+  // used to live here looked for the source inside a .tag; t102 now suppresses
+  // that tag whenever the source merely repeats the name (source === name +
+  // ".md", which is how ingestion names every document), so the tag stopped
+  // being evidence for "this document is file-backed".
+  // The case where the source says something the name does not — and is
+  // therefore still rendered — is covered by t102's boundary table (7 stubbed
+  // documents, 3 of which show both strings) and deliberately NOT here: the
+  // source tag is not "never shown".
+  await expect(row.locator(".legacy-hint")).toHaveCount(0);
+  await expect(row.locator("button").filter({ hasText: /编\s*辑|Edit/ })).toBeVisible();
 
   await row.locator("button").filter({ hasText: /编 辑|Edit/ }).click();
 

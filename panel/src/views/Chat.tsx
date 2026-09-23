@@ -5,8 +5,8 @@
 // nobody is asked to choose every time. The history drawer reopens
 // past conversations (live ones reattach and stream).
 
-import { Fragment, useEffect, useRef, useState } from "react";
-import { Button, Input, Select, Tooltip } from "antd";
+import { Fragment, memo, useCallback, useEffect, useRef, useState } from "react";
+import { Button, Input, Popconfirm, Select, Tooltip } from "antd";
 import {
   api,
   isRoleAgent,
@@ -14,23 +14,64 @@ import {
   type ChatHistoryEntry,
   type OptionChoice,
   type SessionOptionInfo,
+  HttpError,
 } from "../api";
 import { BrandMark } from "../brand";
 import { Icon, type IconName } from "../icons";
 import { useI18n } from "../i18n";
-import { Markdown, RelTime, Spinner, useToast } from "../ui";
+import { ErrorState, RelTime, Spinner, useToast } from "../ui";
+import { Markdown } from "./lazy-markdown";
 import { msToIso } from "./Sessions";
 
-/** Deterministic per-workspace hue from a curated set — the workspace
- * tree reads at a glance (each project keeps its color across visits). */
-const WS_HUES = [
-  "#7c86f0", "#e0916a", "#56b4a4", "#d97f8e", "#78b874",
-  "#a887e8", "#5fa8dc", "#d8ac5c", "#9aa4b8", "#c8877a",
-];
-const wsColor = (ws: string) =>
-  WS_HUES[
-    [...ws].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % WS_HUES.length
-  ];
+/** Deterministic per-workspace hue — the workspace tree reads at a glance
+ * (each project keeps its colour across visits).
+ *
+ * The ten hues are tokens, not hexes: `--ws-1 … --ws-10` (primitives.md §7.1
+ * R7). The view owns only the deterministic index; the light-mode
+ * compensation lives in the token, so `getComputedStyle` can read the final
+ * colour instead of a `filter` nobody can audit through. */
+const WS_HUES = 10;
+const wsColor = (ws: string) => {
+  const i =
+    [...ws].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % WS_HUES;
+  return `var(--ws-${i + 1})`;
+};
+
+/** The workspace grouping key — view-chat.md §9.1, six ordered rules. Only
+ *  the KEY is normalized; the group title still shows the raw cwd, so
+ *  `C:\x` and `C:/x` land in one group without rewriting what the user
+ *  typed. Rule 5 is Windows-only on purpose: on POSIX `Foo` and `foo` are
+ *  different directories and lowercasing them would merge two real ones. */
+export const normCwd = (raw: string): string => {
+  let s = (raw ?? "").trim();
+  if (!s) return "";
+  // 1. strip the \?\ prefix (\?UNCsrvshare -> \srvshare)
+  if (s.startsWith("\\\\?\\UNC\\")) s = "\\\\" + s.slice(8);
+  else if (s.startsWith("\\\\?\\")) s = s.slice(4);
+  // 2. one separator
+  s = s.replace(/\\/g, "/");
+  // 3. fold repeats, but keep a leading // (UNC) — 6. UNC stays distinct
+  const unc = s.startsWith("//");
+  s = s.replace(/\/{2,}/g, "/");
+  if (unc) s = "/" + s;
+  // 4. drop the trailing slash, except for roots (C:/ and /)
+  if (s !== "/" && !/^[A-Za-z]:\/$/.test(s)) s = s.replace(/\/+$/, "");
+  // 5. drive letter up, the rest down — Windows form only
+  if (/^[A-Za-z]:(\/|$)/.test(s)) s = s[0].toUpperCase() + s.slice(1).toLowerCase();
+  return s;
+};
+
+/** view-chat.md §C9 already pins the number: a group shows five rows by
+ *  default and the rest sit behind "show more". Five — not a new value — and
+ *  the cap is PER GROUP, so expanding one workspace never moves another. */
+const GROUP_CAP = 5;
+
+/** Density caps (view-chat.md §4.2). `#task` measured 153k nodes from an
+ * unbounded log (MASTER §12 row 25); a full session is the same risk surface,
+ * so the same two bounds apply here: at most 400 mounted turns, and a single
+ * body over 2,000 characters collapses behind its own summary. */
+const MSG_CAP = 400;
+const LONG_MSG = 2000;
 
 /** Known option ids get translated labels; others show the agent's name. */
 function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
@@ -173,6 +214,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const { t } = useI18n();
   const toast = useToast();
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
+  /** A failed agent load is an ERROR, not an empty list (MASTER §12 row 20). */
+  const [agentsError, setAgentsError] = useState<unknown>(null);
+  /** A failed send: shown persistently above the composer, with a retry. */
+  const [sendError, setSendError] = useState<unknown>(null);
   const [agent, setAgent] = useState(initialAgent ?? "");
   const [model, setModel] = useState("");
   /** The engine the chat currently runs on (roles can switch). */
@@ -184,6 +229,8 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [configModels, setConfigModels] = useState<string[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  /** "Show earlier": the log mounts the last MSG_CAP turns by default. */
+  const [showAll, setShowAll] = useState(false);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -203,7 +250,52 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     () => localStorage.getItem("chat.cwd") ?? "",
   );
   const [sessionQuery, setSessionQuery] = useState("");
+  /** §9 C4: an OPTIONAL agent filter — view-level and never persisted (no
+   *  localStorage, no URL), so "default off" cannot be broken by a deep link.
+   *  Filtering is not isolation: the rail lists every chat by default. */
+  /** Groups expanded past GROUP_CAP — per group and IN MEMORY ONLY. Not
+   *  persisted on purpose: one visit must not rewrite the default view, the
+   *  same reason C4 gives for keeping the agent filter unpersisted. */
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [agentFilter, setAgentFilter] = useState<string | null>(null);
+  /** §9.4 D4: a row that is pending must not accept a second delete.
+   *  D3: after a failure it must NOT stay pending, and the error must be
+   *  readable on screen (a toast alone disappears). */
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  /** The filter's own disclosure state — also view-level, also not persisted. */
+  const [filterOpen, setFilterOpen] = useState(false);
+  /** Collapsed workspaces. Persisted under `chat.collapsedGroups` — the same
+   *  `chat.*` namespace as `chat.cwd` / `chat.workspaces` /
+   *  `chat.railCollapsed`; we store the collapsed (usually few) keys rather
+   *  than every expanded one, so a fresh install starts fully expanded. */
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+    try {
+      return new Set(
+        JSON.parse(localStorage.getItem("chat.collapsedGroups") ?? "[]") as string[],
+      );
+    } catch {
+      return new Set();
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem("chat.collapsedGroups", JSON.stringify([...collapsedGroups]));
+  }, [collapsedGroups]);
+  const toggleGroup = (key: string) =>
+    setCollapsedGroups((g) => {
+      const next = new Set(g);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  /** The sessions index joined by `session_key`. `archived` is a ruagent-side
+   *  marker and `deletable` is false for every source whose transcript file
+   *  ruagent only indexes — the chat history payload carries neither, so the
+   *  rail cannot tell an archived row from a live one without this join. */
+  const [index, setIndex] = useState<
+    Record<string, { archived: boolean; deletable: boolean }>
+  >({});
+  const [showArchived, setShowArchived] = useState(false);
   /** Explicitly added workspaces (the folder picker) — persisted; the
    * rendered groups are these UNION the cwd of recorded chats. */
   const [workspaces, setWorkspaces] = useState<string[]>(() => {
@@ -251,15 +343,28 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     [],
   );
 
-  useEffect(() => {
-    api.agents().then((a) => {
-      const enabled = a.filter((x) => x.enabled);
-      setAgents(enabled);
-      setAgent((cur) =>
-        cur && enabled.some((a) => a.name === cur) ? cur : (enabled[0]?.name ?? ""),
-      );
-    }).catch(() => setAgents([]));
+  const loadAgents = useCallback(() => {
+    setAgentsError(null);
+    setAgents(null);
+    api
+      .agents()
+      .then((a) => {
+        const enabled = a.filter((x) => x.enabled);
+        setAgents(enabled);
+        setAgent((cur) =>
+          cur && enabled.some((a) => a.name === cur) ? cur : (enabled[0]?.name ?? ""),
+        );
+      })
+      .catch((e) => {
+        // Swallowing this into `[]` used to render a picker with no options
+        // and no explanation, forever. Say what happened and offer a retry.
+        setAgentsError(e);
+        setAgents([]);
+      });
   }, []);
+  useEffect(() => {
+    loadAgents();
+  }, [loadAgents]);
 
   // Session options for the selected agent: the daemon's cached catalog
   // (instant after restart), read for the CURRENT engine — model
@@ -577,21 +682,47 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
-  const send = async () => {
-    const text = input.trim();
+  /** The last prompt we handed to the daemon — what a retry re-delivers. */
+  const lastSendRef = useRef<string | null>(null);
+
+  const send = async (override?: string) => {
+    const text = (override ?? input).trim();
     if (!text || streaming || starting || !agent) return;
     setInput("");
+    setSendError(null);
+    lastSendRef.current = text;
     setMessages((prev) => [...prev, { role: "user", text, done: true }]);
     setStreaming(true);
     try {
       const id = await ensureChat();
       attachStream(id);
       await api.chatMessage(id, text);
+      // This chat may be brand new and is now generating: re-read the list so
+      // its row appears with the "running" marker (and the poll below starts).
+      refreshHistory();
     } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", text: String(e), done: true, notice: true, icon: "warn" },
-      ]);
+      // A failed send must not cost the user their prompt, and it must not
+      // disappear into a 2s toast: the text goes back in the box and the
+      // failure stays on screen until it is retried (view-chat.md §5).
+      setInput((cur) => (cur ? cur : text));
+      setSendError(e);
+      setStreaming(false);
+    }
+  };
+
+  /** Re-deliver the last prompt. It is already in the log, so this does not
+   * append a second copy — it only retries the transport. */
+  const retryLastSend = async () => {
+    const text = lastSendRef.current;
+    if (!text) return;
+    setSendError(null);
+    setStreaming(true);
+    try {
+      const id = await ensureChat();
+      attachStream(id);
+      await api.chatMessage(id, text);
+    } catch (e) {
+      setSendError(e);
       setStreaming(false);
     }
   };
@@ -748,14 +879,145 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   // transcript, then streams); closed ones open the shared read-only
   // viewer. Refreshed when the agent changes and after each reply.
   // ------------------------------------------------------------------
+  /** Merge a poll result into the rail BY ID (§9.5 L5/L6). Unchanged rows
+   *  keep their OBJECT identity — the previous code replaced the whole array
+   *  every 3–5s, re-rendering every row, which is what made the rail feel
+   *  un-smooth. When nothing at all changed we return the PREVIOUS array, so
+   *  React does not even re-render: no data change ⇒ no movement, no scroll
+   *  jump, no focus loss. A genuinely new chat enters at the position the
+   *  daemon's order gives it; rows the daemon dropped go away. */
+  const mergeHistory = (next: ChatHistoryEntry[]) =>
+    setHistory((cur) => {
+      const prev = cur ?? [];
+      if (!prev.length) return next;
+      const byId = new Map(prev.map((h) => [h.id, h]));
+      let changed = prev.length !== next.length;
+      const merged = next.map((h) => {
+        const old = byId.get(h.id);
+        if (!old) return h;
+        const same = (Object.keys(h) as (keyof ChatHistoryEntry)[]).every(
+          (k) => old[k] === h[k],
+        );
+        if (same) return old;
+        changed = true;
+        return { ...old, ...h };
+      });
+      if (!changed) {
+        for (let i = 0; i < prev.length; i += 1) {
+          if (prev[i].id !== merged[i].id) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      return changed ? merged : prev;
+    });
+
   const refreshHistory = () => {
-    if (!agent) return;
-    api.chatsHistory(agent).then(setHistory).catch(() => setHistory([]));
+    // §9 C1: the rail lists EVERY chat — a session is found by looking for
+    // it, not by first guessing which agent owns it. The agent deep link
+    // (`#chat?agent=<id>`) no longer filters this list: it is the default
+    // for the NEXT new session (C6).
+    api.chatsHistory().then(mergeHistory).catch(() => setHistory([]));
+    api
+      .sessionsList({ archived: "include" })
+      .then((r) => {
+        const next = Object.fromEntries(
+          r.sessions.map((s) => [
+            s.key,
+            { archived: !!s.archived, deletable: !!s.deletable },
+          ]),
+        );
+        // Same discipline for the index map: an unchanged index must not
+        // re-render the rail every few seconds either.
+        setIndex((cur) =>
+          JSON.stringify(cur) === JSON.stringify(next) ? cur : next,
+        );
+      })
+      .catch(() => setIndex({}));
+  };
+
+  /** Archive is a ruagent-side marker on any source; delete is refused by the
+   *  daemon (403) for every source whose file ruagent does not own, which is
+   *  why the row only renders the delete affordance for `deletable` rows. */
+  const toggleArchive = async (key: string, archived: boolean) => {
+    try {
+      if (archived) await api.sessionUnarchive(key);
+      else await api.sessionArchive(key);
+      refreshHistory();
+      toast("ok", archived ? t("chat.unarchived") : t("chat.archived"));
+    } catch (e) {
+      toast("err", String(e));
+    }
+  };
+  /** C8 / §9.4 D1–D6: delete the chat RECORD — the row itself. The old
+   *  button only removed the sessions-index entry, which is exactly why the
+   *  user could not clear a row from this list (the rail is fed by
+   *  /api/v1/chats, not by the index).
+   *
+   *  Optimistic, and D3 makes the failure path explicit: the row comes BACK
+   *  at its old position, an error is readable, and nothing is left pending.
+   *  "Row gone but not deleted" is the worst outcome — the user believes it
+   *  worked and the row returns on the next refresh. */
+  const removeChat = async (h: ChatHistoryEntry) => {
+    if (deleting === h.id) return; // D4: no second delete while pending
+    const at = (history ?? []).findIndex((x) => x.id === h.id);
+    setDeleting(h.id);
+    setDeleteError(null);
+    setHistory((cur) => (cur ?? []).filter((x) => x.id !== h.id));
+    if (chatId === h.id) {
+      // The chat being viewed is going away: drop it instead of leaving a
+      // composer pointed at a deleted id (D2: no spinner, no stop button).
+      if (streamRef.current) streamRef.current();
+      setChatId(null);
+      setStreaming(false);
+      setMessages([]);
+      setViewing(null);
+    }
+    try {
+      await api.chatDelete(h.id);
+      refreshHistory();
+    } catch (e) {
+      // D4: a 404 means the row is already gone — which IS the state we
+      // wanted, so it must not surface as an error and must not roll back.
+      // The branch reads the HTTP STATUS via HttpError: matching the message
+      // text never worked, because the daemon's 404 body is "chat not found"
+      // and carries no "404".
+      const alreadyGone = e instanceof HttpError && e.status === 404;
+      if (!alreadyGone) {
+        setHistory((cur) => {
+          const next = [...(cur ?? [])];
+          if (!next.some((x) => x.id === h.id)) {
+            next.splice(at < 0 ? 0 : Math.min(at, next.length), 0, h);
+          }
+          return next;
+        });
+        setDeleteError(String(e));
+        toast("err", t("chat.deleteFailed"));
+      }
+    } finally {
+      setDeleting(null);
+    }
   };
   useEffect(() => {
     refreshHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agent]);
+  }, []);
+
+  /** view-chat.md §9.3: `generating` is LIVE state while `history` is a
+   *  snapshot, so the rail must re-read it. One adaptive interval, always on:
+   *  **3s while a reply is being generated**, **5s otherwise** (one
+   *  GET /api/v1/chats per tick). The slow baseline is not decoration — a
+   *  generation can start outside this panel (another tab, an agent-driven
+   *  chat), and a poll that only runs *while already generating* could never
+   *  notice it starting. Cost: ≤12 requests/min idle, ≤20 while generating;
+   *  in the audit's 11.5s window that is ≤3, well under the row-28 cap of 7. */
+  const anyGenerating = (history ?? []).some((h) => h.generating);
+  useEffect(() => {
+    const i = setInterval(refreshHistory, anyGenerating ? 3000 : 5000);
+    return () => clearInterval(i);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anyGenerating]);
 
   /** Session switching: clicking a past conversation RESUMES it — the
    * session restarts under the same id (transcript appends, one
@@ -779,10 +1041,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       const r = await api.chatResume(h.id);
       setViewing(null);
       if (streamRef.current) streamRef.current();
-      setAgent(r.agent);
+      // §9 C3: identity comes from the ENTRY, never from the selector state.
+      setAgent(r.agent || h.agent);
       setChatId(r.id);
-      setModel(r.model ?? "");
-      setRuntime(r.runtime ?? "");
+      setModel(r.model ?? h.model ?? "");
+      setRuntime(r.runtime ?? h.runtime ?? "");
       setMessages([]);
       setStreaming(false);
       attachStream(r.id, true); // replay rebuilds the whole thread
@@ -792,51 +1055,115 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
-  /** Sessions grouped by project (the workspace tree, dsh-web style):
-   * the current project's group first, then others, then ungrouped. */
-  const historyGroups: [string, ChatHistoryEntry[]][] = (() => {
+  /** Sessions grouped by WORKSPACE (§9 C1/C7) — the group key is
+   * `normCwd(cwd)`, the title keeps the first raw spelling seen, and the
+   * current project's group sorts first, then named ones, then ungrouped. */
+  const {
+    groups: historyGroups,
+    labels: groupLabels,
+    visible: visibleRows,
+    filtering: filterActive,
+  } = (() => {
     const q = sessionQuery.trim().toLowerCase();
-    const filtered = (history ?? []).filter((h) =>
-      !q ||
-      (h.title ?? "").toLowerCase().includes(q) ||
-      (h.preview ?? "").toLowerCase().includes(q) ||
-      (h.agent ?? "").toLowerCase().includes(q),
-    );
+    const filtering = !!agentFilter || !!q;
+    const filtered = (history ?? []).filter((h) => {
+      // A chat with no messages is not a session. The panel only ever creates
+      // one when a message is sent (ensureChat has exactly two call sites:
+      // send and retry), so a message-less chat can only come from calling the
+      // API directly — a test or script residue. Hidden BY RULE, so the next
+      // residue never reaches the user instead of relying on someone
+      // remembering to clean up.
+      if (!h.message_count) return false;
+      // Archived rows are hidden by default — that is what archiving means.
+      if (!showArchived && h.session_key && index[h.session_key]?.archived) {
+        return false;
+      }
+      if (agentFilter && h.agent !== agentFilter) return false;
+      return (
+        !q ||
+        (h.title ?? "").toLowerCase().includes(q) ||
+        (h.preview ?? "").toLowerCase().includes(q) ||
+        (h.agent ?? "").toLowerCase().includes(q)
+      );
+    });
     const by = new Map<string, ChatHistoryEntry[]>();
+    const labels = new Map<string, string>();
     // Explicit workspaces exist even with no sessions yet (暂无会话).
     for (const ws of workspaces) {
-      if (!by.has(ws)) by.set(ws, []);
+      const k = normCwd(ws);
+      if (!by.has(k)) by.set(k, []);
+      if (!labels.has(k)) labels.set(k, ws);
     }
     for (const h of filtered) {
-      const key = h.cwd?.trim() || "";
-      const list = by.get(key) ?? [];
+      const raw = (h.cwd ?? "").trim();
+      const k = normCwd(raw);
+      if (!labels.has(k)) labels.set(k, raw);
+      const list = by.get(k) ?? [];
       list.push(h);
-      by.set(key, list);
+      by.set(k, list);
     }
-    const cur = project.trim().toLowerCase();
-    // A search filters visible rows; workspaces without hits keep
-
-    return [...by.entries()].sort((a, b) => {
-      const rank = (k: string) =>
-        k.toLowerCase() === cur ? 0 : k === "" ? 2 : 1;
+    const cur = normCwd(project);
+    const groups = [...by.entries()].sort((a, b) => {
+      const rank = (k: string) => (k === cur ? 0 : k === "" ? 2 : 1);
       return rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]);
     });
+    return { groups, labels, visible: filtered.length, filtering };
   })();
 
+  const archivedCount = (history ?? []).filter(
+    (h) => h.session_key && index[h.session_key]?.archived,
+  ).length;
+
+  // A failed agent load used to fall through to a spinner or an empty
+  // picker. It is a page-level error with a retry (MASTER §12 row 20).
+  if (agentsError) {
+    return (
+      <ErrorState
+        title={t("common.offline")}
+        hint={String(agentsError)}
+        onRetry={loadAgents}
+        retryLabel={t("task.retryRun")}
+      />
+    );
+  }
   if (!agents) return <Spinner label={`${t("chat.title")}…`} />;
 
   const currentAgent = agents.find((a) => a.name === agent);
+
+  /** The conversation the user is actually in: its recorded title (real
+   * data, `ChatHistoryEntry.title`), falling back to the first prompt. The
+   * view-bar used to say only "对话", so the page never told you WHICH
+   * conversation you were reading (view-chat.md §3). */
+  const currentSession = history?.find((h) => h.id === chatId) ?? null;
+  const sessionTitle =
+    currentSession?.title?.trim() ||
+    messages.find((m) => m.role === "user" && !m.notice && !m.kind)?.text.slice(0, 80) ||
+    agent;
+  const active = !viewing && messages.length > 0;
+  const windowOffset = showAll ? 0 : Math.max(0, messages.length - MSG_CAP);
+  const shownMessages = showAll ? messages : messages.slice(-MSG_CAP);
 
   /** The composer unit: input row + hairline-divided controls row (agent,
    * model, mode/effort, project). Rendered centered when the conversation
    * is empty, sticky at the bottom once it has messages. */
   const composerBlock = (
     <div className="chat-bottom">
+      {sendError ? (
+        <ErrorState
+          title={t("common.offline")}
+          hint={String(sendError)}
+          onRetry={() => {
+            void retryLastSend();
+          }}
+          retryLabel={t("task.retryRun")}
+        />
+      ) : null}
       <div className="composer">
         <div className="composer-row">
           <textarea
             ref={inputRef}
             rows={2}
+            aria-label={t("chat.inputPh")}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -864,7 +1191,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
               type="primary"
               className="send-btn"
               disabled={streaming || starting || !input.trim()}
-              onClick={send}
+              onClick={() => {
+                void send();
+              }}
               title={t("chat.send")}
             >
               {starting ? "…" : <Icon name="arrowUp" size={16} />}
@@ -977,7 +1306,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   return (
     <div className={`chat-layout${railCollapsed ? " rail-collapsed" : ""}`}>
       <aside className={`chat-side${sideOpen ? " open" : ""}`}>
-        <div className="chat-side-head">
+        <div className="chat-side-head zone-head">
           <Button
             type="primary"
             size="small"
@@ -1001,6 +1330,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             </Button>
           </Tooltip>
         </div>
+        {deleteError ? (
+          <p className="muted truncated" role="alert">
+            {t("chat.deleteFailed")}
+          </p>
+        ) : null}
         <Input
           allowClear
           variant="filled"
@@ -1010,28 +1344,110 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           size="small"
           prefix={<Icon name="search" size={12} />}
         />
+        {/* §9 C4 — an optional filter, deliberately built from plain buttons:
+            an antd Select adds two inline-styled nodes to the route (row 12's
+            budget is per row), and this needs aria-expanded + a pressed state
+            anyway. It never persists. */}
+        <div className="chat-filter">
+          <button
+            className="chat-group-more"
+            aria-expanded={filterOpen}
+            onClick={() => setFilterOpen((v) => !v)}
+          >
+            {agentFilter
+              ? t("chat.filteringBy", { name: agentFilter })
+              : t("chat.filterAgent")}
+          </button>
+          {filterOpen ? (
+            <div className="chat-filter-list">
+              <button
+                className="chat-group-more"
+                aria-pressed={agentFilter === null}
+                onClick={() => {
+                  setAgentFilter(null);
+                  setFilterOpen(false);
+                }}
+              >
+                {t("chat.allAgents")}
+              </button>
+              {agents.filter(isRoleAgent).map((a) => (
+                <button
+                  key={a.name}
+                  className="chat-group-more"
+                  aria-pressed={agentFilter === a.name}
+                  onClick={() => {
+                    setAgentFilter(a.name);
+                    setFilterOpen(false);
+                  }}
+                >
+                  {a.name}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
         <div className="chat-side-list">
-          <div className="chat-ws-title">{t("chat.workspaces")}</div>
+          <div className="chat-ws-title zone-title">{t("chat.workspaces")}</div>
           {history === null ? (
             <Spinner />
+          ) : visibleRows === 0 && filterActive ? (
+            /* §9.2: a filter that matches nothing must SAY so — falling back
+               to "all sessions" would read as "the filter did nothing". */
+            <div className="chat-filter-empty">
+              <p className="muted">
+                {agentFilter
+                  ? t("chat.noAgentSessions", { name: agentFilter })
+                  : t("chat.noResults")}
+              </p>
+              <button className="chat-group-more" onClick={() => setAgentFilter(null)}>
+                {t("chat.clearFilter")}
+              </button>
+            </div>
           ) : historyGroups.length === 0 ? (
-            <p className="muted">{sessionQuery ? t("chat.noResults") : t("chat.historyEmpty")}</p>
+            <p className="muted">{t("chat.historyEmpty")}</p>
           ) : (
-            historyGroups.map(([cwd, items]) => {
-              const key = cwd || "";
-              const shown = expandedGroups.has(key) ? items : items.slice(0, 5);
+            historyGroups.map(([key, items], gi) => {
+              const cwd = groupLabels.get(key) ?? "";
+              // While filtering, an empty group is noise — the explicit empty
+              // state below owns that case (§9.2).
+              if (filterActive && items.length === 0) return null;
+              // §C9: five rows per group by default, the rest behind this
+              // group's own "show more" — one workspace never expands another.
+              const shown = expandedGroups.has(key) ? items : items.slice(0, GROUP_CAP);
+              const collapsed = collapsedGroups.has(key);
+              const wsLabel = cwd ? cwd.replace(/.*[\\/]/, "") : t("chat.noProject");
+              const rowsId = `chat-ws-rows-${gi}`;
+              const foldLabel = collapsed
+                ? t("chat.expandGroup", { name: wsLabel })
+                : t("chat.collapseGroup", { name: wsLabel });
               return (
                 <div key={key || "none"} className="chat-group">
-                  <div className="chat-group-head" title={cwd || undefined}>
-                    <Icon
-                      name="folderOpen"
-                      size={14}
-                      className="ws-folder"
-                      style={{ color: key ? wsColor(key) : undefined, flex: "none" }}
-                    />
-                    <span className="chat-group-name">
-                      {cwd ? cwd.replace(/.*[\\/]/, "") : t("chat.noProject")}
-                    </span>
+                  {/* Clicking the head folds the group; the folder icon is the
+                      keyboard-reachable control (row 17/18: named + 24x24). */}
+                  <div
+                    className="chat-group-head"
+                    title={cwd || undefined}
+                    onClick={() => toggleGroup(key)}
+                  >
+                    <button
+                      className="icon-btn chat-group-toggle"
+                      aria-expanded={!collapsed}
+                      aria-controls={rowsId}
+                      aria-label={foldLabel}
+                      title={foldLabel}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleGroup(key);
+                      }}
+                    >
+                      <Icon
+                        name={collapsed ? "folder" : "folderOpen"}
+                        size={14}
+                        className="ws-folder"
+                        style={{ color: key ? wsColor(key) : undefined, flex: "none" }}
+                      />
+                    </button>
+                    <span className="chat-group-name zone-title">{wsLabel}</span>
                     <span className="ws-count">{items.length}</span>
                     <span className="grow" />
                     <Tooltip title={t("chat.newSessionHere")}>
@@ -1044,45 +1460,131 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                       </button>
                     </Tooltip>
                   </div>
-                  {shown.map((h) => {
+                  {/* The rows sit one indent level in (32px — the same step
+                      .chat-group-empty / .chat-group-more already use), so a
+                      session reads as belonging to its workspace instead of
+                      sitting flush with the group head. */}
+                  <div
+                    id={rowsId}
+                    className="chat-session-list"
+                    style={{ paddingLeft: 32, marginLeft: 8 }}
+                  >
+                    {collapsed
+                      ? null
+                      : shown.map((h) => {
                     const harness = agents?.find((a) => a.name === h.runtime)?.harness;
+                    const meta = h.session_key ? index[h.session_key] : undefined;
+                    const label = h.title || h.preview || t("sessions.untitled");
                     return (
-                      <button
-                        key={h.id}
-                        className={`row-btn chat-session${h.id === chatId ? " selected" : ""}`}
-                        onClick={() => openPast(h)}
-                        title={h.title || h.preview || t("sessions.untitled")}
-                      >
-                        {h.active ? <span className="live-dot" /> : null}
-                        <span className="title">
-                          {h.title || h.preview || t("sessions.untitled")}
-                        </span>
-                        {harness ? (
-                          <BrandMark harness={harness} size={12} mono className="muted" />
+                      <div key={h.id} className="row chat-session-row">
+                        <button
+                          className={`row-btn chat-session grow${h.id === chatId ? " selected" : ""}`}
+                          onClick={() => openPast(h)}
+                          title={label}
+                        >
+                          {h.generating ? (
+                            <span className="live-dot" title={t("chat.generating")} />
+                          ) : null}
+                          <span className="title muted">{label}</span>
+                          {harness ? (
+                            <BrandMark harness={harness} size={12} mono className="muted" />
+                          ) : null}
+                          {/* Row 40: a 197px row holds title + agent + brand
+                              + time + two 32px actions, so the short labels
+                              must never wrap — .truncated (pre-existing) is
+                              nowrap + ellipsis, no new CSS. */}
+                          <span className="micro muted truncated chat-session-agent">
+                            {h.agent}
+                          </span>
+                          <span className="time truncated">
+                            <RelTime iso={msToIso(h.updated_at)} />
+                          </span>
+                        </button>
+                        {h.session_key ? (
+                          <button
+                            className="icon-btn icon-btn-lg"
+                            aria-label={meta?.archived ? t("chat.unarchive") : t("chat.archive")}
+                            title={meta?.archived ? t("chat.unarchive") : t("chat.archive")}
+                            onClick={() =>
+                              void toggleArchive(h.session_key as string, !!meta?.archived)
+                            }
+                          >
+                            <Icon name={meta?.archived ? "unarchive" : "archive"} size={14} />
+                          </button>
                         ) : null}
-                        <span className="time">
-                          <RelTime iso={msToIso(h.updated_at)} />
-                        </span>
-                      </button>
+                        {/* D5: two-step, because this is irreversible and it
+                            is user data. The confirm states the identity of
+                            what is about to go (title + agent + messages), and
+                            the wording says what actually happens: the row
+                            leaves the list — the transcript and any distilled
+                            memory are NOT erased. Claiming it erases the
+                            conversation would be the UI lying. */}
+                        <Popconfirm
+                          title={t("chat.deleteChatConfirm", { name: label })}
+                          description={
+                            <span className="muted">
+                              {t("chat.deleteChatMeta", {
+                                agent: h.agent ?? "",
+                                n: h.message_count ?? 0,
+                              })}
+                              {" · "}
+                              {t("chat.deleteChatBody")}
+                            </span>
+                          }
+                          okText={t("chat.deleteChat")}
+                          cancelText={t("chat.cancel")}
+                          okButtonProps={{ danger: true, disabled: deleting === h.id }}
+                          onConfirm={() => void removeChat(h)}
+                        >
+                          <button
+                            className="icon-btn icon-btn-lg"
+                            aria-label={t("chat.deleteChat")}
+                            title={t("chat.deleteChat")}
+                            disabled={deleting === h.id}
+                          >
+                            <Icon name="trash" size={14} />
+                          </button>
+                        </Popconfirm>
+                      </div>
                     );
                   })}
+                  </div>
                   {shown.length === 0 ? (
                     <div className="chat-group-empty muted">{t("chat.noSessions")}</div>
                   ) : null}
-                  {items.length > shown.length ? (
+                  {!collapsed && items.length > GROUP_CAP ? (
                     <button
-                      className="chat-group-more"
+                      className="chat-group-more truncated"
+                      aria-expanded={expandedGroups.has(key)}
                       onClick={() =>
-                        setExpandedGroups((g) => new Set(g).add(key))
+                        setExpandedGroups((g) => {
+                          const next = new Set(g);
+                          if (next.has(key)) next.delete(key);
+                          else next.add(key);
+                          return next;
+                        })
                       }
                     >
-                      {t("chat.showAll", { n: items.length })}
+                      {expandedGroups.has(key)
+                        ? t("chat.showLess")
+                        : t("chat.showMore", { n: items.length - GROUP_CAP })}
                     </button>
                   ) : null}
                 </div>
               );
             })
           )}
+          {archivedCount > 0 ? (
+            <button
+              className="chat-group-more"
+              aria-pressed={showArchived}
+              onClick={() => setShowArchived((v) => !v)}
+            >
+              {showArchived
+                ? t("chat.hideArchived")
+                : t("chat.showArchived", { n: archivedCount })}
+            </button>
+          ) : null}
         </div>
       </aside>
       {sideOpen && <div className="chat-side-backdrop" onClick={() => setSideOpen(false)} />}
@@ -1101,7 +1603,18 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         >
           <Icon name={railCollapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
         </Button>
+        {/* Row 24: every route owes the document outline exactly one h1.
+            The visible 20px title stays `.view-bar h2` (frozen selector). */}
+        {/* `.micro` on purpose: `.sr-only` does not reset font-size, and a
+            hidden h1 inheriting the UA 2em would be an off-ladder 28px that
+            MASTER §12 row 8 counts. */}
+        <h1 className="sr-only micro">{t("chat.title")}</h1>
         <h2>{t("chat.title")}</h2>
+        {active && currentSession?.message_count != null ? (
+          <span className="readout s" title={t("sessions.messages")}>
+            {currentSession.message_count} {t("sessions.messages")}
+          </span>
+        ) : null}
         <span className="grow" />
         <Button
           size="small"
@@ -1146,55 +1659,31 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         </div>
       ) : (
         <>
+          {/* The conversation's own title, at title grade (20/26): the page's
+              hierarchy centre when a conversation is open (C2's upgrade path:
+              h2 + this h3 + the turn-count readout = 3 nodes ≥18px). It
+              reuses `.chat-hero`, the page's existing title-grade primitive;
+              the spec asked for it inside `.view-bar`, which has no
+              subtitle slot at this grade (see output notes). */}
+          <div className="chat-hero chat-session-head">
+            <h3>{sessionTitle}</h3>
+            <p>
+              {agent}
+              {model ? ` · ${model}` : ""}
+            </p>
+          </div>
           <div className="chat-log grow">
-          {messages.map((m, i) => {
-            if (m.kind === "injection") {
-              return (
-                <details key={i} className="chat-injection">
-                  <summary>
-                    <Icon name="brain" size={12} />{" "}
-                    {t("chat.injection")} ·{" "}
-                    {t("chat.chars", { n: m.text.length })}
-                  </summary>
-                  <pre>{m.text}</pre>
-                </details>
-              );
-            }
-            if (m.kind === "thought") {
-              // Open while streaming (the tail stays live — the page
-              // auto-scrolls on every message change); collapses when
-              // the turn ends, reopenable in full.
-              return (
-                <details
-                  key={i}
-                  className="chat-thought"
-                  open={!m.done ? true : undefined}
-                >
-                  <summary>
-                    <Icon name="thought" size={12} />{" "}
-                    {t("chat.thought")} ·{" "}
-                    {t("chat.chars", { n: m.text.length })}
-                  </summary>
-                  <div className="thought-body">{m.text}</div>
-                </details>
-              );
-            }
-            return (
-              <div
-                key={i}
-                className={
-                  m.notice
-                    ? "chat-msg notice"
-                    : m.role === "user"
-                      ? "chat-msg user"
-                      : "chat-msg agent"
-                }
-              >
-                {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
-                {m.role === "user" || m.notice ? m.text : <Markdown>{m.text}</Markdown>}
-              </div>
-            );
-          })}
+          {windowOffset > 0 ? (
+            <button
+              className="row-btn chat-earlier"
+              onClick={() => setShowAll(true)}
+            >
+              {t("chat.showAll", { n: windowOffset })}
+            </button>
+          ) : null}
+          {shownMessages.map((m, i) => (
+            <ChatRow key={windowOffset + i} m={m} />
+          ))}
           {streaming && (
             <div className="chat-typing">
               <i /> <i /> <i />
@@ -1212,6 +1701,64 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   );
 }
 
+
+/** One turn of the log.
+ *
+ * Memoized on the `Message` object: the stream appends a new object for the
+ * tail only, so the turns above it keep their identity and stop re-parsing
+ * their markdown on every chunk (view-chat.md §4.2 — the old inline map
+ * rebuilt the whole list, and `Markdown`, per chunk). */
+const ChatRow = memo(function ChatRow({ m }: { m: Message }) {
+  const { t } = useI18n();
+  if (m.kind === "injection") {
+    return (
+      <details className="chat-injection">
+        <summary>
+          <Icon name="brain" size={12} /> {t("chat.injection")} ·{" "}
+          {t("chat.chars", { n: m.text.length })}
+        </summary>
+        <pre>{m.text}</pre>
+      </details>
+    );
+  }
+  if (m.kind === "thought") {
+    // Open while streaming (the tail stays live — the page auto-scrolls on
+    // every message change); collapses when the turn ends, reopenable.
+    return (
+      <details className="chat-thought" open={!m.done ? true : undefined}>
+        <summary>
+          <Icon name="thought" size={12} /> {t("chat.thought")} ·{" "}
+          {t("chat.chars", { n: m.text.length })}
+        </summary>
+        <div className="thought-body">{m.text}</div>
+      </details>
+    );
+  }
+  const plain = m.role === "user" || m.notice;
+  const body =
+    m.text.length > LONG_MSG ? (
+      <details className="chat-long">
+        <summary className="muted micro">
+          {t("chat.chars", { n: m.text.length })}
+        </summary>
+        {plain ? <pre className="raw">{m.text}</pre> : <Markdown>{m.text}</Markdown>}
+      </details>
+    ) : plain ? (
+      m.text
+    ) : (
+      <Markdown>{m.text}</Markdown>
+    );
+  return (
+    <div
+      className={
+        m.notice ? "chat-msg notice" : m.role === "user" ? "chat-msg user" : "chat-msg agent"
+      }
+    >
+      {m.notice && m.icon ? <Icon name={m.icon} size={12} /> : null}
+      {body}
+    </div>
+  );
+});
 
 /** A closed conversation, rendered inline in the chat main area —
  * clicking history enters the conversation (ChatGPT-style), it does

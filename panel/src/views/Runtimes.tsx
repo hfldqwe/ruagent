@@ -6,10 +6,10 @@
 // agents.toml (comments preserved) and hot-reloads the registry.
 
 import { useEffect, useState } from "react";
-import { Button, Card, Input, Popconfirm, Select, Tooltip } from "antd";
+import { Button, Card, Input, Popconfirm, Select } from "antd";
 import { api, isRoleAgent, type AgentInfo, type SessionOptionInfo } from "../api";
 import { brandClass, BrandMark } from "../brand";
-import { Empty, Modal, Spinner, useToast } from "../ui";
+import { Empty, ErrorState, Modal, ReadoutStrip, Spinner, useToast } from "../ui";
 import { useI18n } from "../i18n";
 import { Icon } from "../icons";
 
@@ -39,13 +39,16 @@ function useModelCounts(names: string[]) {
       alive = false;
     };
   }, [key]);
+  // Returns whether the probe succeeded: R11 wants a visible failure, not a
+  // silent no-op (this catch used to swallow it).
   const sync = async (name: string) => {
     setSyncing(name);
     try {
       const o = await api.agentOptions(name, true);
       setCounts((c) => ({ ...c, [name]: modelOption(o.options)?.choices.length ?? 0 }));
+      return true;
     } catch {
-      /* keep the cached count */
+      return false;
     } finally {
       setSyncing(null);
     }
@@ -75,15 +78,32 @@ const EMPTY_FORM: FormState = {
 export function Runtimes() {
   const { t } = useI18n();
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
+  const [err, setErr] = useState<unknown>(null);
+  const [probeErr, setProbeErr] = useState<Record<string, boolean>>({});
   const [editing, setEditing] = useState<AgentInfo | null>(null);
   const [creating, setCreating] = useState(false);
   const toast = useToast();
 
-  const load = () => api.agents().then(setAgents).catch(() => setAgents([]));
+  // 行 20: a failed read is not "no runtimes registered". The previous
+  // `catch(() => setAgents([]))` rendered the empty state on a broken daemon.
+  const load = () =>
+    api
+      .agents()
+      .then((v) => {
+        setAgents(v);
+        setErr(null);
+      })
+      .catch((e) => setErr(e));
+  // The registry only changes when this page writes to it, and every write
+  // reloads explicitly — a 5s poll here was pure traffic (3 GET /agents per
+  // 11.5s window, F2's class of defect). Returning to the tab re-reads.
   useEffect(() => {
     load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
+    const onVisible = () => {
+      if (!document.hidden) load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // Model-count chips per runtime, from the daemon's cached catalog.
@@ -92,11 +112,33 @@ export function Runtimes() {
     (agents ?? []).filter((a) => !isRoleAgent(a) && a.enabled).map((a) => a.name),
   );
 
-  if (!agents) return <Spinner label={`${t("runtimes.title")}…`} />;
+  if (agents === null) {
+    if (err) {
+      return (
+        <>
+          <h1 className="sr-only">{t("runtimes.title")}</h1>
+          <ErrorState
+            title={t("runtimes.err")}
+            hint={t("runtimes.err.hint")}
+            onRetry={load}
+            retryLabel={t("common.retry")}
+          />
+        </>
+      );
+    }
+    return <Spinner label={`${t("runtimes.title")}…`} />;
+  }
+
   const roles = agents.filter(isRoleAgent);
   // Disabled runtimes are configured off — the mock agent template for
   // instance never belongs on the user surface.
-  const runtimes = agents.filter((a) => !isRoleAgent(a) && a.enabled);
+  const runtimes = agents
+    .filter((a) => !isRoleAgent(a) && a.enabled)
+    // Stable order across the 5s poll (§5 密集): harness, then name.
+    .sort(
+      (a, b) =>
+        (a.harness ?? "").localeCompare(b.harness ?? "") || a.name.localeCompare(b.name),
+    );
 
   const remove = async (name: string) => {
     try {
@@ -108,8 +150,14 @@ export function Runtimes() {
     }
   };
 
+  const probe = async (name: string) => {
+    const ok = await sync(name);
+    setProbeErr((m) => ({ ...m, [name]: !ok }));
+  };
+
   return (
     <div>
+      <h1 className="sr-only">{t("runtimes.title")}</h1>
       <div className="view-bar">
         <h2>{t("runtimes.title")}</h2>
         <span className="muted">{t("runtimes.subtitle")}</span>
@@ -118,86 +166,168 @@ export function Runtimes() {
           + {t("runtimes.create")}
         </Button>
       </div>
+
+      {err && runtimes.length > 0 ? (
+        <ErrorState
+          title={t("common.stale")}
+          hint={t("runtimes.stale.hint")}
+          onRetry={load}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
+
+      {runtimes.length > 0 && (
+        // `grid` -> .readout-strip.grid (README §3.4 X4). The rule lives in
+        // index.css; the view only asks for the variant.
+        <ReadoutStrip
+          grid
+          items={[
+            { key: "runtimes", label: t("runtimes.title"), value: runtimes.length },
+            { key: "roles", label: t("agents.title"), value: roles.length },
+            {
+              key: "models",
+              label: t("metric.models"),
+              value: Object.values(counts).reduce((s, n) => s + n, 0),
+            },
+          ]}
+        />
+      )}
       {runtimes.length === 0 ? (
-        <Empty icon="layers" title={t("agents.runtimes.empty")} hint={t("agents.runtimes.hint")} />
+        <Empty
+          icon="layers"
+          title={t("agents.runtimes.empty")}
+          hint={t("agents.runtimes.hint")}
+          action={
+            <Button type="primary" onClick={() => setCreating(true)}>
+              + {t("runtimes.create")}
+            </Button>
+          }
+        />
       ) : (
         <div className="agent-grid">
           {runtimes.map((r) => {
-            const usedBy = roles.filter((a) => a.runtimes?.includes(r.name));
+            // §4: derived, no endpoint — a role reaches a runtime either
+            // through `runtime` or through the `runtimes` list.
+            const usedBy = roles.filter(
+              (a) => a.runtime === r.name || a.runtimes?.includes(r.name),
+            );
             return (
               <Card key={r.name} className="agent-card" size="small">
                 <div className="row">
                   {/* Brand logo tile — the runtime's own mark on a tint of
-                      its brand color (mock and unknowns stay neutral). */}
-                  <span className={`runtime-logo${brandClass(r.harness) ? " " + brandClass(r.harness) : ""}`}>
-                    <BrandMark harness={r.harness} size={20} mono fallback="bot" />
+                      its brand color (mock and unknowns stay neutral).
+                      The mark must NOT be `mono` for a branded harness:
+                      `mono` forces it into the inherited text color, which
+                      is why all three tiles measured the same rgb(173,178,187)
+                      and 1.56:1 (t13 F1). `mono` now means "no brand" only. */}
+                  <span
+                    className={`runtime-logo${brandClass(r.harness) ? " " + brandClass(r.harness) : ""}`}
+                  >
+                    <BrandMark
+                      harness={r.harness}
+                      size={20}
+                      mono={!brandClass(r.harness)}
+                      fallback="bot"
+                    />
                   </span>
                   <div>
-                    <strong>{r.name}</strong>
-                    <div className="muted">{r.harness}</div>
+                    {/* §4: the harness is the identity here; `name` is the
+                        local alias and only shows when the two differ. */}
+                    <strong>{r.harness}</strong>
+                    {r.name !== r.harness ? (
+                      <div className="muted mono">{r.name}</div>
+                    ) : null}
                   </div>
                   <span className="grow" />
-                  <span className="tag ok">{t("agents.enabled")}</span>
+                  {r.enabled ? (
+                    <span className="tag ok">{t("agents.enabled")}</span>
+                  ) : (
+                    <span className="tag">{t("agents.disabled")}</span>
+                  )}
                 </div>
-                <p className="muted" style={{ margin: "10px 0 6px" }}>{r.description}</p>
+                <p className="muted" style={{ margin: "10px 0 6px" }}>
+                  {r.description}
+                </p>
                 {r.command ? (
                   <div className="row">
                     <span className="doc-icon">
                       <Icon name="zap" size={13} />
                     </span>
-                    <span className="muted mono truncated" style={{ fontSize: 12 }}>{r.command}</span>
+                    {/* Full value on hover; 12/16 comes from .mono itself
+                        (the inline font-size:12 that used to sit here was
+                        both redundant and a 行 11 violation). */}
+                    <span className="muted mono truncated" title={r.command}>
+                      {r.command}
+                    </span>
                   </div>
                 ) : null}
-                <div className="row" style={{ marginTop: 10 }}>
+                <div className="row">
                   {counts[r.name] ? (
-                    <Tooltip title={t("chat.sync")}>
-                      <span className="tag">
-                        {t("runtimes.models", { n: counts[r.name] })}
-                      </span>
-                    </Tooltip>
-                  ) : null}
-                  {usedBy.length > 0 ? (
-                    usedBy.map((a) => <span key={a.name} className="tag">{a.name}</span>)
+                    <span className="tag">{t("runtimes.models", { n: counts[r.name] })}</span>
                   ) : (
-                    <span className="muted" style={{ fontSize: 12 }}>
-                      {t("agents.runtimes.noRoles")}
+                    // "not probed" is not "0 models" (§5 empty ②).
+                    <span className="muted">{t("runtimes.notProbed")}</span>
+                  )}
+                  <Button
+                    loading={syncing === r.name}
+                    onClick={() => probe(r.name)}
+                    aria-label={t("chat.sync")}
+                    title={t("chat.sync")}
+                  >
+                    <Icon name="sync" size={13} />
+                  </Button>
+                  {probeErr[r.name] ? (
+                    <span className="tag err" role="alert">
+                      {t("runtimes.probeFailed")}
                     </span>
+                  ) : null}
+                  <span className="grow" />
+                </div>
+                <div className="row wrap">
+                  {usedBy.length > 0 ? (
+                    <>
+                      {/* Capped: a runtime referenced by 20 roles must not
+                          stretch the card (§4 密度上限). */}
+                      {usedBy.slice(0, 5).map((a) => (
+                        <span key={a.name} className="tag">
+                          {a.name}
+                        </span>
+                      ))}
+                      {usedBy.length > 5 ? (
+                        <span className="tag">+{usedBy.length - 5}</span>
+                      ) : null}
+                    </>
+                  ) : (
+                    <span className="muted">{t("agents.runtimes.noRoles")}</span>
                   )}
                   <span className="grow" />
                 </div>
-                <div className="row end" style={{ marginTop: 8 }}>
-                  <Tooltip title={t("chat.sync")}>
-                    <Button
-                      size="small"
-                      loading={syncing === r.name}
-                      onClick={() => sync(r.name)}
-                      aria-label={t("chat.sync")}
-                    >
-                      <Icon name="sync" size={13} />
-                    </Button>
-                  </Tooltip>
+                <div className="row end">
                   <Button
-                    size="small"
                     onClick={() => {
                       window.location.hash = `chat?agent=${encodeURIComponent(r.name)}`;
                     }}
                   >
                     {t("agents.runtimes.direct")}
                   </Button>
-                  <Button size="small" onClick={() => setEditing(r)}>
-                    {t("common.edit")}
-                  </Button>
+                  <Button onClick={() => setEditing(r)}>{t("common.edit")}</Button>
                   <Popconfirm
-                    title={t("runtimes.deleteConfirm.title")}
-                    description={t("runtimes.deleteConfirm.body")}
+                    title={t("runtimes.deleteConfirm.title", { name: r.name })}
+                    description={
+                      // R9: deleting a runtime breaks every role that names
+                      // it — the confirm says which ones.
+                      usedBy.length > 0
+                        ? `${t("runtimes.deleteConfirm.body")} ${t("runtimes.usedBy", {
+                            names: usedBy.map((a) => a.name).join(", "),
+                          })}`
+                        : t("runtimes.deleteConfirm.body")
+                    }
                     okText={t("common.delete")}
                     cancelText={t("common.keep")}
                     okButtonProps={{ danger: true }}
                     onConfirm={() => remove(r.name)}
                   >
-                    <Button size="small" danger>
-                      {t("common.delete")}
-                    </Button>
+                    <Button danger>{t("common.delete")}</Button>
                   </Popconfirm>
                 </div>
               </Card>
@@ -205,7 +335,7 @@ export function Runtimes() {
           })}
         </div>
       )}
-      <p className="muted pad" style={{ marginTop: 14 }}>{t("runtimes.hint")}</p>
+      <p className="muted pad" style={{ marginTop: 16 }}>{t("runtimes.hint")}</p>
       {(creating || editing) && (
         <RuntimeModal
           editing={editing}
@@ -223,7 +353,6 @@ export function Runtimes() {
     </div>
   );
 }
-
 function RuntimeModal({
   editing,
   onClose,

@@ -1,6 +1,6 @@
 // App shell: antd Layout sidebar + hash routing + theme/lang toggles.
 
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import {
   Alert,
   Badge,
@@ -13,20 +13,54 @@ import { api } from "./api";
 import { Icon } from "./icons";
 import { useI18n } from "./i18n";
 import { ThemeProvider, useThemeMode } from "./theme";
+import { Spinner, ToastBridge } from "./ui";
+
+// Route-level code splitting (row 27): every view is its own chunk, fetched
+// the first time its hash is visited. The shell — sider, brand, palette,
+// toasts, offline banner — stays in the entry chunk, so the layout and the
+// frozen .app-sider / .kbd-hint / .brand-* selectors are never behind the
+// fallback. Board and Agents export more than one route component; both
+// lazy() calls resolve the same chunk, so nothing is fetched twice.
+const Board = lazy(() =>
+  import("./views/Board").then((m) => ({ default: m.Board })),
+);
+const CreateTaskModal = lazy(() =>
+  import("./views/Board").then((m) => ({ default: m.CreateTaskModal })),
+);
+const Home = lazy(() => import("./views/Home").then((m) => ({ default: m.Home })));
+const TaskDetail = lazy(() =>
+  import("./views/TaskDetail").then((m) => ({ default: m.TaskDetail })),
+);
+const Memory = lazy(() =>
+  import("./views/Memory").then((m) => ({ default: m.Memory })),
+);
+const Knowledge = lazy(() =>
+  import("./views/Knowledge").then((m) => ({ default: m.Knowledge })),
+);
+const Graph = lazy(() => import("./views/Graph").then((m) => ({ default: m.Graph })));
+const Agents = lazy(() =>
+  import("./views/Agents").then((m) => ({ default: m.Agents })),
+);
+const Inbox = lazy(() => import("./views/Agents").then((m) => ({ default: m.Inbox })));
+const Stats = lazy(() => import("./views/Agents").then((m) => ({ default: m.Stats })));
+const Runtimes = lazy(() =>
+  import("./views/Runtimes").then((m) => ({ default: m.Runtimes })),
+);
+const Settings = lazy(() =>
+  import("./views/Settings").then((m) => ({ default: m.Settings })),
+);
+const Chat = lazy(() => import("./views/Chat").then((m) => ({ default: m.Chat })));
+// The palette stays in the entry ON PURPOSE: it is a keyboard-first surface,
+// and every attempt to make it a chunk was measured worse — the chunk was not
+// ready when Ctrl+K arrived, which loses the keystrokes typed straight after
+// it and breaks e2e/palette.spec.ts:65 ("Enter executes a navigation
+// command", which does not wait for .cmdk before typing). 5.2KB is not worth
+// a hotkey that races the network.
 import { CommandPalette } from "./CommandPalette";
-import { ToastBridge } from "./ui";
-import { Board } from "./views/Board";
-import { Home } from "./views/Home";
-import { TaskDetail } from "./views/TaskDetail";
-import { Memory } from "./views/Memory";
-import { Knowledge } from "./views/Knowledge";
-import { Graph } from "./views/Graph";
-import { Agents, Inbox, Stats } from "./views/Agents";
-import { Runtimes } from "./views/Runtimes";
-import { Settings } from "./views/Settings";
-import { Chat } from "./views/Chat";
+// Sessions is split differently: its module is also imported for the pure
+// SOURCE_LABEL / sourceHue / msToIso helpers (CommandPalette, Home, Chat), so
+// the module itself exports a lazy route component and stays tiny.
 import { Sessions } from "./views/Sessions";
-import { CreateTaskModal } from "./views/Board";
 
 const { Sider, Content } = Layout;
 
@@ -88,7 +122,12 @@ function Shell() {
   const { lang, setLang, t } = useI18n();
   const { mode, toggle } = useThemeMode();
   const [view, setView] = useState<View>(() => parseHash());
-  const [inboxCount, setInboxCount] = useState(0);
+  // `null` = the queue has not been read yet. The count lives HERE and only
+  // here (t50): Home consumes it as a prop instead of polling the same
+  // endpoint a second time. `null` vs `0` stays distinguishable, because
+  // "no pending permissions" and "cannot reach the daemon" are different
+  // facts (MASTER §12 row 20).
+  const [inboxCount, setInboxCount] = useState<number | null>(null);
   const [daemonUp, setDaemonUp] = useState(true);
   const [cmdk, setCmdk] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -112,19 +151,43 @@ function Shell() {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
+  // The permission queue has exactly ONE 2s poller at a time (MASTER §12 行 28,
+  // judged cap = 7 per 11.5s = one 2s poller; the shell's copy used to run
+  // alongside the view's and produced 14). While #inbox is mounted the view
+  // owns the request — it renders the same list the badge counts, so the badge
+  // has nothing to add; leaving #inbox re-runs this effect and polls at once.
+  //
+  // This is also the ONLY reader of the queue: #home renders the count it
+  // receives as a prop, so the sider badge and the home todo card can never
+  // disagree, and the route spends 6 of the 7 judged requests instead of 7.
+  const inboxRoute = view.kind === "inbox";
   useEffect(() => {
+    if (inboxRoute) return;
+    let alive = true;
     const poll = () =>
       api
         .pendingPermissions()
         .then((p) => {
+          if (!alive) return;
           setInboxCount(p.length);
           setDaemonUp(true);
         })
-        .catch(() => setDaemonUp(false));
+        .catch(() => alive && setDaemonUp(false));
     poll();
-    const i = setInterval(poll, 2000);
-    return () => clearInterval(i);
-  }, []);
+    const i = setInterval(() => {
+      // A hidden tab asks for nothing (行 28 同源).
+      if (!document.hidden) poll();
+    }, 2000);
+    const onVisible = () => {
+      if (!document.hidden) poll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      clearInterval(i);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [inboxRoute]);
 
   const nav = (hash: string) => {
     window.location.hash = hash;
@@ -148,7 +211,7 @@ function Shell() {
     {
       key: "inbox",
       icon: collapsed ? (
-        <Badge count={inboxCount} size="small" offset={[4, -4]}>
+        <Badge count={inboxCount ?? 0} size="small" offset={[4, -4]}>
           <Icon name="inbox" size={16} />
         </Badge>
       ) : (
@@ -157,7 +220,9 @@ function Shell() {
       label: (
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           {t("nav.inbox")}
-          {inboxCount > 0 && <span className="nav-badge">{inboxCount}</span>}
+          {inboxCount !== null && inboxCount > 0 && (
+            <span className="nav-badge">{inboxCount}</span>
+          )}
         </span>
       ),
     },
@@ -218,12 +283,26 @@ function Shell() {
           />
         </div>
         <div className="sidebar-foot">
-          <Tooltip title={`${daemonUp ? t("common.online") : t("common.offline")} · b ${__BUILD_ID__}`}>
+          <Tooltip
+            title={`${daemonUp ? t("common.online") : t("common.offline")} · ${t("common.buildId", { id: __BUILD_ID__ })}`}
+          >
             <span className={`conn ${daemonUp ? "ok" : "err"}`}>
               {collapsed ? "●" : `● ${daemonUp ? t("common.online") : t("common.offline")}`}
             </span>
           </Tooltip>
-          {!collapsed && <span className="build-id" title="panel build">b {__BUILD_ID__}</span>}
+          {/* The compact "b <id>" stays (footer width is a hard budget:
+              seven items in a 203px column), but the bare prefix must not be
+              the only name this element has — screen readers and tooltips get
+              the spelled-out, localized one. */}
+          {!collapsed && (
+            <span
+              className="build-id"
+              title={t("common.buildId", { id: __BUILD_ID__ })}
+              aria-label={t("common.buildId", { id: __BUILD_ID__ })}
+            >
+              b {__BUILD_ID__}
+            </span>
+          )}
           {!collapsed && <span className="grow" />}
           {!collapsed && (
             <button className="kbd-hint" onClick={() => setCmdk(true)} title={t("cmd.placeholder")}>
@@ -245,7 +324,7 @@ function Shell() {
               size="small"
               type="text"
               onClick={toggle}
-              aria-label="toggle theme"
+              aria-label={t("theme.toggle")}
             >
               {mode === "dark" ? <Icon name="sun" size={14} /> : <Icon name="moon" size={14} />}
             </Button>
@@ -257,13 +336,15 @@ function Shell() {
         </div>
       </Sider>
       {creating && (
-        <CreateTaskModal
-          onClose={() => setCreating(false)}
-          onCreated={(id) => {
-            setCreating(false);
-            nav(`task/${id}`);
-          }}
-        />
+        <Suspense fallback={null}>
+          <CreateTaskModal
+            onClose={() => setCreating(false)}
+            onCreated={(id) => {
+              setCreating(false);
+              nav(`task/${id}`);
+            }}
+          />
+        </Suspense>
       )}
       <Layout>
         <Content className="content">
@@ -276,8 +357,10 @@ function Shell() {
               message={t("common.offlineBanner")}
             />
           )}
+          <Suspense fallback={<Spinner label={t("common.loading")} />}>
           {view.kind === "home" && (
             <Home
+              inbox={inboxCount}
               onOpenTask={(id) => nav(`task/${id}`)}
               onNav={(hash) => nav(hash || "board")}
             />
@@ -296,6 +379,7 @@ function Shell() {
           {view.kind === "stats" && <Stats />}
           {view.kind === "settings" && <Settings />}
           {view.kind === "inbox" && <Inbox />}
+          </Suspense>
         </Content>
       </Layout>
     </Layout>

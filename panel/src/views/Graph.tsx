@@ -2,16 +2,20 @@
 // their currently-valid facts, with an inspector panel (bi-temporal facts,
 // as-of queries, neighbors). A plain list mode stays one toggle away.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Input, Segmented, Table } from "antd";
 import { Icon, type IconName } from "../icons";
 import { api, type GraphEdge, type GraphEntity } from "../api";
-import { Empty, Markdown, Modal, Spinner, useToast } from "../ui";
+import { Empty, ErrorState, Modal, ReadoutStrip, Spinner, useToast } from "../ui";
+import { Markdown } from "./lazy-markdown";
 import { dateOf, useI18n } from "../i18n";
 import { useThemeMode } from "../theme";
 
 /** Over this the canvas only renders the most-connected nodes. */
 const MAX_NODES = 150;
+/** §4 density ceilings for the inspector — a hub entity can have hundreds. */
+const FACTS_CAP = 100;
+const NEIGHBORS_CAP = 50;
 
 function kindIcon(kind: string | null) {
   const name: IconName =
@@ -38,51 +42,75 @@ export function Graph() {
   const { mode: theme } = useThemeMode();
   const [mode, setMode] = useState<"graph" | "list">("graph");
   const [entities, setEntities] = useState<[GraphEntity, number][] | null>(null);
-  const [edges, setEdges] = useState<GraphEdge[] | null>(null);
+  /** Facts of the entity the inspector is showing, handed up by the
+   *  inspector itself (it already fetches them) — the canvas draws their
+   *  edges. */
+  const [focusFacts, setFocusFacts] = useState<GraphEdge[]>([]);
   const [query, setQuery] = useState("");
   const [hitIds, setHitIds] = useState<Set<number> | null>(null);
   const [selected, setSelected] = useState<GraphEntity | null>(null);
   const [creating, setCreating] = useState(false);
+  const [err, setErr] = useState<unknown>(null);
+  const [canvasFailed, setCanvasFailed] = useState(false);
   const toast = useToast();
 
+  // F2: `/graph/entity/<id>` is a per-entity endpoint, so prefetching the
+  // facts of every rendered node was an N+1 — 55 requests on the first
+  // screen (the burst the audit's row 28 catches). The canvas now draws the
+  // neighbourhood of the entity you pick, from the facts the inspector has
+  // already fetched, and the first screen costs exactly one graph request.
   const refresh = () => {
     api
       .graphEntitiesAll()
-      .then(async (ents) => {
+      .then((ents) => {
         setEntities(ents);
-        setEdges(null);
-        // Edges come from each rendered entity's current facts (the
-        // endpoint already excludes invalidated ones); dedupe by id.
-        const rendered =
-          ents.length > MAX_NODES
-            ? [...ents].sort((a, b) => b[1] - a[1]).slice(0, MAX_NODES)
-            : ents;
-        const perEntity = await Promise.all(
-          rendered.map(([e]) => api.graphEntity(e.id).catch(() => [] as GraphEdge[])),
-        );
-        const ids = new Set(rendered.map(([e]) => e.id));
-        const seen = new Set<number>();
-        const list: GraphEdge[] = [];
-        for (const facts of perEntity) {
-          for (const f of facts) {
-            if (!seen.has(f.id) && ids.has(f.src) && ids.has(f.dst)) {
-              seen.add(f.id);
-              list.push(f);
-            }
-          }
-        }
-        setEdges(list);
+        setErr(null);
       })
+      // 行 20: the old catch emptied the list, so a broken daemon rendered
+      // "the graph is empty". Keep the failure instead, and keep whatever
+      // the last successful read put on screen.
       .catch((e) => {
         toast("err", String(e));
-        setEntities([]);
-        setEdges([]);
+        setErr(e);
       });
   };
 
   useEffect(() => {
     refresh();
   }, []);
+
+  // A new selection (or none) starts with no edges — the inspector's own
+  // request fills them in when it lands.
+  useEffect(() => {
+    setFocusFacts([]);
+  }, [selected?.id]);
+
+  // G10: the canvas draws the most-connected MAX_NODES entities, not all of
+  // them — the cap used to apply to the prefetch only, so the node count was
+  // never actually bounded.
+  const rendered = useMemo(
+    () =>
+      entities && entities.length > MAX_NODES
+        ? [...entities].sort((a, b) => b[1] - a[1]).slice(0, MAX_NODES)
+        : (entities ?? []),
+    [entities],
+  );
+
+  /** Edges are the selected entity's facts, filtered to nodes that are on
+   *  the canvas and deduped by id (the endpoint already drops invalidated
+   *  facts). Nothing is fetched here. */
+  const edges = useMemo(() => {
+    const ids = new Set(rendered.map(([e]) => e.id));
+    const seen = new Set<number>();
+    const out: GraphEdge[] = [];
+    for (const f of focusFacts) {
+      if (!seen.has(f.id) && ids.has(f.src) && ids.has(f.dst)) {
+        seen.add(f.id);
+        out.push(f);
+      }
+    }
+    return out;
+  }, [focusFacts, rendered]);
 
   const search = async () => {
     if (!query.trim()) {
@@ -99,14 +127,18 @@ export function Graph() {
       }
     } catch (e) {
       toast("err", String(e));
+      setErr(e);
     }
   };
 
+  const factTotal = entities?.reduce((s, [, n]) => s + n, 0) ?? 0;
   const capped = (entities?.length ?? 0) > MAX_NODES;
-  const loading = entities === null || (mode === "graph" && edges === null);
+  const loading = entities === null;
+  const noHits = mode === "graph" && hitIds !== null && hitIds.size === 0;
 
   return (
     <div>
+      <h1 className="sr-only">{t("graph.title")}</h1>
       <div className="view-bar">
         <h2>{t("graph.title")}</h2>
         <span className="muted">{t("graph.subtitle")}</span>
@@ -124,6 +156,18 @@ export function Graph() {
         </Button>
       </div>
 
+      {!loading && entities.length > 0 && (
+        // `grid` -> .readout-strip.grid (README §3.4 X4); the rule lives in
+        // index.css, the view only asks for the variant.
+        <ReadoutStrip
+          grid
+          items={[
+            { key: "entities", label: t("metric.entities"), value: entities.length },
+            { key: "facts", label: t("graph.facts"), value: factTotal },
+          ]}
+        />
+      )}
+
       <div className="search-bar">
         <Input
           className="grow"
@@ -134,30 +178,79 @@ export function Graph() {
         />
       </div>
 
+      {err && entities && entities.length > 0 ? (
+        <ErrorState
+          title={t("common.stale")}
+          hint={t("graph.stale.hint")}
+          onRetry={refresh}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
+      {canvasFailed ? (
+        <ErrorState
+          title={t("graph.canvasFailed")}
+          hint={t("graph.canvasFailed.hint")}
+        />
+      ) : null}
+      {/* G10: the MAX_NODES cut is stated once, above the layout, so it is
+          visible in BOTH modes — the hint under the canvas only exists in
+          graph mode. */}
+      {capped ? (
+        <p className="muted pad">{t("graph.tooMany", { n: MAX_NODES })}</p>
+      ) : null}
+
       {loading ? (
-        <Spinner label={`${t("graph.title")}…`} />
+        // 行 20: a failed read must not read as "still loading" — and must
+        // certainly not read as "the graph is empty".
+        err && entities === null ? (
+          <ErrorState
+            title={t("graph.err")}
+            hint={t("graph.err.hint")}
+            onRetry={refresh}
+            retryLabel={t("common.retry")}
+          />
+        ) : (
+          <Spinner label={`${t("graph.title")}…`} />
+        )
       ) : entities.length === 0 ? (
         <Empty
           icon="graph"
           title={t("graph.empty.title")}
           hint={t("graph.empty.hint")}
+          action={
+            <Button type="primary" onClick={() => setCreating(true)}>
+              + {t("graph.newEntity")}
+            </Button>
+          }
         />
+      ) : noHits ? (
+        // §5 empty ②: a search that matches nothing says so; the search bar
+        // stays put, so clearing it brings the whole graph back.
+        <Empty icon="search" title={t("graph.noHits")} hint={t("graph.noHits.hint")} />
       ) : (
         <div className="graph-layout">
           <div className="graph-main">
             {mode === "graph" ? (
               <>
                 <GraphCanvas
-                  entities={entities}
-                  edges={edges ?? []}
+                  entities={rendered}
+                  edges={edges}
                   selectedId={selected?.id ?? null}
                   hitIds={hitIds}
                   theme={theme}
                   onSelect={setSelected}
+                  onUnavailable={() => {
+                    // §5 error ②: a canvas that cannot get a 2D context must
+                    // degrade to the list, not silently draw nothing.
+                    setCanvasFailed(true);
+                    setMode("list");
+                  }}
                 />
                 <div className="graph-hint">
                   {t("graph.hint")}
-                  {capped ? ` — ${t("graph.tooMany", { n: MAX_NODES })}` : ""}
+                  {/* F2: with no prefetch the canvas starts edgeless on
+                      purpose — say so instead of looking broken. */}
+                  {edges.length === 0 ? ` · ${t("graph.pickHint")}` : ""}
                 </div>
               </>
             ) : (
@@ -176,14 +269,26 @@ export function Graph() {
             )}
           </div>
 
-          {selected && (
+          {selected ? (
             <EntityDetail
               key={selected.id}
               entity={selected}
               onClose={() => setSelected(null)}
               onSelectEntity={setSelected}
               onGraphChanged={refresh}
+              onFacts={setFocusFacts}
             />
+          ) : (
+            // G9: the inspector column is reserved even with nothing
+            // selected. Without it the canvas is 1149px wide and collapses
+            // to ~735px the moment an entity is picked, restarting the force
+            // layout under the user's cursor.
+            <div className="graph-detail">
+              <div className="zone-head">
+                <div className="zone-title">{t("graph.inspector")}</div>
+              </div>
+              <p className="muted pad">{t("graph.pickHint")}</p>
+            </div>
           )}
         </div>
       )}
@@ -244,6 +349,8 @@ interface Sim {
   alpha: number;
   calm: number;
   rest: number;
+  /** `prefers-reduced-motion: reduce` — static layout, no physics (G11). */
+  reduce: boolean;
 }
 
 const REPULSION = 3000;
@@ -292,6 +399,7 @@ function GraphCanvas({
   hitIds,
   theme,
   onSelect,
+  onUnavailable,
 }: {
   entities: [GraphEntity, number][];
   edges: GraphEdge[];
@@ -299,7 +407,9 @@ function GraphCanvas({
   hitIds: Set<number> | null;
   theme: string;
   onSelect: (e: GraphEntity | null) => void;
+  onUnavailable?: () => void;
 }) {
+  const { t } = useI18n();
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const simRef = useRef<Sim>({
@@ -323,10 +433,11 @@ function GraphCanvas({
     alpha: 1,
     calm: 0,
     rest: 85,
+    reduce: false,
   });
   // live props for the event handlers (no listener churn)
-  const propsRef = useRef({ entities, edges, selectedId, hitIds, onSelect });
-  propsRef.current = { entities, edges, selectedId, hitIds, onSelect };
+  const propsRef = useRef({ entities, edges, selectedId, hitIds, onSelect, onUnavailable });
+  propsRef.current = { entities, edges, selectedId, hitIds, onSelect, onUnavailable };
 
   // (re)build the simulation when the data changes
   useEffect(() => {
@@ -335,9 +446,19 @@ function GraphCanvas({
     if (!canvas || !wrap) return;
     const s = simRef.current;
 
+    // The canvas element's own box owns the geometry: index.css sets
+    // `height: clamp(360px, 56vh, 620px)` (R4/B3), so the old hard-coded
+    // 520 drew into a buffer of the wrong height and squashed the layout.
+    const box = canvas.getBoundingClientRect();
     const rect = wrap.getBoundingClientRect();
-    s.w = Math.max(rect.width, 200);
-    s.h = 520;
+    s.w = Math.max(box.width || rect.width, 200);
+    s.h = Math.max(box.height, 200);
+    s.reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!canvas.getContext("2d")) {
+      // §5 error ②: no 2D context — hand it to the view to degrade to list.
+      propsRef.current.onUnavailable?.();
+      return;
+    }
 
     const maxFacts = Math.max(1, ...entities.map(([, n]) => n));
     s.nodes = entities.map(([e, facts], i) => {
@@ -537,6 +658,12 @@ function GraphCanvas({
       }
     };
     const kick = () => {
+      // §9.4 / G11: under `prefers-reduced-motion: reduce` a redraw is fine,
+      // a physics loop is not.
+      if (s.reduce) {
+        draw();
+        return;
+      }
       if (!s.running) {
         s.running = true;
         s.raf = requestAnimationFrame(tick);
@@ -548,9 +675,9 @@ function GraphCanvas({
 
     const size = () => {
       const dpr = window.devicePixelRatio || 1;
-      const r = wrap.getBoundingClientRect();
-      s.w = Math.max(r.width, 200);
-      s.h = 520;
+      const r = canvas.getBoundingClientRect();
+      s.w = Math.max(r.width || wrap.getBoundingClientRect().width, 200);
+      s.h = Math.max(r.height, 200);
       canvas.width = Math.round(s.w * dpr);
       canvas.height = Math.round(s.h * dpr);
       const ctx = canvas.getContext("2d");
@@ -647,7 +774,15 @@ function GraphCanvas({
     };
 
     size();
-    kick();
+    if (s.reduce) {
+      // G11: settle synchronously, then freeze — no rAF, no motion.
+      for (let i = 0; i < 400; i++) step();
+      s.alpha = ALPHA_FLOOR;
+      s.calm = 999;
+      draw();
+    } else {
+      kick();
+    }
     const ro = new ResizeObserver(size);
     ro.observe(wrap);
     canvas.addEventListener("pointerdown", onDown);
@@ -671,7 +806,13 @@ function GraphCanvas({
         return acc;
       }, {}),
     };
-    (window as unknown as Record<string, unknown>).__graphDebug = debug;
+    // G14: the debug hook is a development tool — a production build must
+    // not publish it.
+    // (cast so the file typechecks without vite/client in tsconfig; the
+    // emitted JS is the literal `import.meta.env.DEV` Vite replaces)
+    if ((import.meta as unknown as { env: { DEV: boolean } }).env.DEV) {
+      (window as unknown as Record<string, unknown>).__graphDebug = debug;
+    }
 
     return () => {
       cancelAnimationFrame(s.raf);
@@ -691,7 +832,7 @@ function GraphCanvas({
   // selection / search-pulse / theme redraws without rebuilding physics
   useEffect(() => {
     const s = simRef.current;
-    if (hitIds && hitIds.size > 0) s.pulseUntil = performance.now() + 2400;
+    if (hitIds && hitIds.size > 0 && !s.reduce) s.pulseUntil = performance.now() + 2400;
     if (s.lastTheme !== theme) {
       s.lastTheme = theme;
       s.palette = null; // colors come from CSS vars — re-read
@@ -704,7 +845,15 @@ function GraphCanvas({
 
   return (
     <div ref={wrapRef} className="graph-canvas-wrap" style={{ position: "relative" }}>
-      <canvas ref={canvasRef} className="graph-canvas" />
+      {/* G12: the canvas itself carries no text — the list mode is the
+          equivalent path, and this label states the counts for a reader who
+          never sees a pixel. */}
+      <canvas
+        ref={canvasRef}
+        className="graph-canvas"
+        role="img"
+        aria-label={t("graph.canvasAlt", { nodes: entities.length, edges: edges.length })}
+      />
     </div>
   );
 }
@@ -718,24 +867,37 @@ function EntityDetail({
   onClose,
   onSelectEntity,
   onGraphChanged,
+  onFacts,
 }: {
   entity: GraphEntity;
   onClose: () => void;
   onSelectEntity: (e: GraphEntity) => void;
   onGraphChanged: () => void;
+  /** Publishes this entity's facts to the canvas, so the one request this
+   *  panel makes also draws the edges (F2: no per-node prefetch). */
+  onFacts?: (facts: GraphEdge[]) => void;
 }) {
   const { t } = useI18n();
   const [facts, setFacts] = useState<GraphEdge[] | null>(null);
+  const [factsErr, setFactsErr] = useState<unknown>(null);
   const [neighbors, setNeighbors] = useState<[GraphEntity, number][] | null>(null);
   const [at, setAt] = useState("");
   const [addingFact, setAddingFact] = useState(false);
   const toast = useToast();
 
+  // 行 20: a failed read used to leave the panel on a spinner forever.
   const loadFacts = (asOf?: string) =>
     api
       .graphFacts(entity.id, asOf || undefined)
-      .then(setFacts)
-      .catch((e) => toast("err", String(e)));
+      .then((f) => {
+        setFacts(f);
+        setFactsErr(null);
+        onFacts?.(f);
+      })
+      .catch((e) => {
+        toast("err", String(e));
+        setFactsErr(e);
+      });
 
   useEffect(() => {
     loadFacts();
@@ -753,22 +915,28 @@ function EntityDetail({
         </h3>
         {entity.kind ? <span className="tag">{entity.kind}</span> : null}
         <span className="grow" />
-        <Button size="small" type="primary" onClick={() => setAddingFact(true)}>
+        {/* 行 18: default size — a 24px target in the inspector header is
+            below the 32px ladder (view-graph.md §7 keeps .neighbor, which is
+            a shared-layer class and reported separately). */}
+        <Button type="primary" onClick={() => setAddingFact(true)}>
           + {t("graph.addFact")}
         </Button>
-        <Button size="small" type="text" onClick={onClose} aria-label="close">
+        <Button type="text" onClick={onClose} aria-label={t("common.close")}>
           <Icon name="x" size={14} />
         </Button>
       </div>
       {entity.summary ? <p className="muted intent">{entity.summary}</p> : null}
 
       <div className="card">
-        <div className="row tight">
-          <strong>{t("graph.facts")}</strong>
+        {/* Z1: the inspector's two sections become zones (README §3.4 X3). */}
+        <div className="zone-head">
+          <div className="zone-title">{t("graph.facts")}</div>
+          <span className="zone-note">{facts ? t("graph.rows", { n: facts.length }) : ""}</span>
+          <span className="grow" />
           <span className="muted">{t("graph.asOf")}</span>
           <Input
             className="mono"
-            size="small"
+            aria-label={t("graph.asOf")}
             placeholder={t("graph.asOfPh")}
             value={at}
             onChange={(e) => setAt(e.target.value)}
@@ -779,7 +947,6 @@ function EntityDetail({
           {at ? (
             <Button
               type="link"
-              size="small"
               onClick={() => {
                 setAt("");
                 loadFacts();
@@ -789,7 +956,14 @@ function EntityDetail({
             </Button>
           ) : null}
         </div>
-        {facts === null ? (
+        {factsErr ? (
+          <ErrorState
+            title={t("graph.factsFailed")}
+            hint={String(factsErr)}
+            onRetry={() => loadFacts(at)}
+            retryLabel={t("common.retry")}
+          />
+        ) : facts === null ? (
           <Spinner />
         ) : facts.length === 0 ? (
           <p className="muted pad">{t("graph.noFacts")}</p>
@@ -797,7 +971,7 @@ function EntityDetail({
           <Table
             className="facts"
             size="small"
-            dataSource={facts}
+            dataSource={facts.slice(0, FACTS_CAP)}
             rowKey="id"
             pagination={false}
             rowClassName={(f) => (f.invalid_at ? "row-old" : "")}
@@ -813,23 +987,34 @@ function EntityDetail({
             ]}
           />
         )}
+        {facts && facts.length > FACTS_CAP ? (
+          <p className="muted micro pad">{t("graph.capped", { n: FACTS_CAP })}</p>
+        ) : null}
       </div>
 
       <div className="card">
-        <strong>{t("graph.neighbors")}</strong>
+        <div className="zone-head">
+          <div className="zone-title">{t("graph.neighbors")}</div>
+          <span className="zone-note">
+            {neighbors ? t("graph.rows", { n: neighbors.length }) : ""}
+          </span>
+        </div>
         {neighbors === null ? (
           <Spinner />
         ) : neighbors.length === 0 ? (
           <p className="muted pad">{t("graph.noNeighbors")}</p>
         ) : (
           <div className="row wrap">
-            {neighbors.map(([n, d]) => (
+            {neighbors.slice(0, NEIGHBORS_CAP).map(([n, d]) => (
               <button key={n.id} className="neighbor" onClick={() => onSelectEntity(n)}>
                 {kindIcon(n.kind)} {n.name} <span className="muted">·{d}</span>
               </button>
             ))}
           </div>
         )}
+        {neighbors && neighbors.length > NEIGHBORS_CAP ? (
+          <p className="muted micro pad">{t("graph.capped", { n: NEIGHBORS_CAP })}</p>
+        ) : null}
       </div>
 
       {addingFact && (
@@ -851,6 +1036,7 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
   const [name, setName] = useState("");
   const [kind, setKind] = useState("");
   const [summary, setSummary] = useState("");
+  const [err, setErr] = useState<string | null>(null);
   const { t } = useI18n();
   const toast = useToast();
   return (
@@ -867,6 +1053,7 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
         <span>{t("graph.newEntity.summary")}</span>
         <Input value={summary} onChange={(e) => setSummary(e.target.value)} />
       </label>
+      {err ? <ErrorState title={t("graph.createFailed")} hint={err} /> : null}
       <div className="row end">
         <Button
           type="primary"
@@ -877,7 +1064,8 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
               toast("ok", t("toast.entityCreated"));
               onCreated();
             } catch (e) {
-              toast("err", String(e));
+              // §5 error ③: a line that stays, and every field keeps its value.
+              setErr(String(e));
             }
           }}
         >
@@ -902,6 +1090,7 @@ function AddFactModal({
   const [factText, setFactText] = useState("");
   const [validAt, setValidAt] = useState("");
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const { t } = useI18n();
   const toast = useToast();
   return (
@@ -932,6 +1121,7 @@ function AddFactModal({
         <span>{t("graph.addFact.valid")}</span>
         <Input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder={t("graph.datePh")} />
       </label>
+      {err ? <ErrorState title={t("graph.addFactFailed")} hint={err} /> : null}
       <div className="row end">
         <Button
           type="primary"
@@ -939,6 +1129,7 @@ function AddFactModal({
           disabled={!targetName.trim() || !relation.trim() || !factText.trim()}
           onClick={async () => {
             setBusy(true);
+            setErr(null);
             try {
               const target = await api.graphCreateEntity(targetName.trim());
               await api.graphAddFact({
@@ -951,7 +1142,8 @@ function AddFactModal({
               toast("ok", t("toast.factAdded"));
               onAdded();
             } catch (e) {
-              toast("err", String(e));
+              // §5 error ③: a line that stays, and every field keeps its value.
+              setErr(String(e));
             } finally {
               setBusy(false);
             }

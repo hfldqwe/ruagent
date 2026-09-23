@@ -70,8 +70,12 @@ export interface ChatHistoryEntry {
   title: string | null;
   created_at: number;
   updated_at: number;
-  /** The daemon is still holding this chat (streams live). */
+  /** The daemon is still holding this chat (streams live). A LIFECYCLE
+   *  fact, not "is generating" — it stays true long after the reply landed. */
   active: boolean;
+  /** The daemon is producing a reply RIGHT NOW (t85). This is the field the
+   *  rail's "running" marker reads. */
+  generating?: boolean;
   /** Project working directory the chat runs in (workspace grouping). */
   cwd?: string | null;
   message_count: number | null;
@@ -154,6 +158,9 @@ export interface PendingPermission {
   raw_input: unknown;
   choices: { option_id: string; name: string; kind: string }[];
 }
+/** Which archived sessions a list request should return. */
+export type ArchivedMode = "exclude" | "include" | "only";
+
 export interface SessionRecord {
   key: string;
   source: string; // claude-code | dsh | ruagent | opencode | codex
@@ -166,6 +173,10 @@ export interface SessionRecord {
   preview: string | null;
   /** ruagent chats: the agent (role/runtime) the conversation was with. */
   agent?: string;
+  /** Hidden from the default list by a ruagent-side archive marker. */
+  archived?: boolean;
+  /** False for every source whose history file ruagent only indexes. */
+  deletable?: boolean;
 }
 
 export interface RecallResult {
@@ -423,9 +434,22 @@ export interface GraphEdge {
 
 const BASE = "";
 
+/** An HTTP failure that still knows its STATUS CODE. The message keeps the
+ *  body-first shape callers already print; `status` is what callers must
+ *  branch on — matching on the message text is exactly how a 404 once leaked
+ *  into the UI as an error ("chat not found" contains no "404"). */
+export class HttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 async function get<T>(path: string): Promise<T> {
   const resp = await fetch(`${BASE}${path}`);
-  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status}`);
+  if (!resp.ok) throw new HttpError((await resp.text()) || `${resp.status}`, resp.status);
   return resp.json() as Promise<T>;
 }
 
@@ -435,7 +459,7 @@ async function send(method: string, path: string, body?: unknown): Promise<Respo
     headers: { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status}`);
+  if (!resp.ok) throw new HttpError((await resp.text()) || `${resp.status}`, resp.status);
   return resp;
 }
 
@@ -446,7 +470,7 @@ const patch = (path: string, body?: unknown) => send("PATCH", path, body);
 /** GET a non-JSON body (the raw markdown endpoint). */
 async function getText(path: string): Promise<string> {
   const resp = await fetch(`${BASE}${path}`);
-  if (!resp.ok) throw new Error((await resp.text()) || `${resp.status}`);
+  if (!resp.ok) throw new HttpError((await resp.text()) || `${resp.status}`, resp.status);
   return resp.text();
 }
 
@@ -697,6 +721,15 @@ export const api = {
     post("/api/v1/directory/pick").then(
       (r) => r.json() as Promise<{ path: string | null }>,
     ),
+  /** Remove a chat’s history entry — the rail row. NOT chatClose:
+   *  closing keeps the row, this deletes it (the daemon stops a live
+   *  session first). A 404 means already-gone: a no-op, never a
+   *  user-visible error (D4). */
+  /** Remove a chat's history entry — the rail row. NOT chatClose: closing
+   *  keeps the row, this deletes it (the daemon stops a live session first).
+   *  A 404 means already-gone: a no-op, never a user-visible error (D4). */
+  chatDelete: (id: string) =>
+    send("DELETE", `/api/v1/chats/${id}`).then(() => undefined),
   chatResume: (id: string) =>
     post(`/api/v1/chat/${id}/resume`).then(
       (r) =>
@@ -735,8 +768,26 @@ export const api = {
   chatClose: (id: string) => send("DELETE", `/api/v1/chat/${id}`),
 
   // session history (auto-synced)
+  /** Full envelope — the list plus how many keys are hidden, so the filter
+   *  bar can offer "show archived (N)" without a second request. */
+  sessionsList: (opts?: { archived?: ArchivedMode }) =>
+    get<{ sessions: SessionRecord[]; archived_count: number }>(
+      `/api/v1/sessions${opts?.archived ? `?archived=${opts.archived}` : ""}`,
+    ),
+  /** Newest sessions, archived ones excluded — what Home and the command
+   *  palette want. */
   sessions: () =>
     get<{ sessions: SessionRecord[] }>("/api/v1/sessions").then((r) => r.sessions),
+  /** Hide a session in ruagent's list. Touches no file: the daemon writes one
+   *  row in its own session_archives table. */
+  sessionArchive: (key: string) =>
+    post(`/api/v1/sessions/${key}/archive`).then(() => undefined),
+  sessionUnarchive: (key: string) =>
+    send("DELETE", `/api/v1/sessions/${key}/archive`).then(() => undefined),
+  /** Delete a ruagent-owned session. Other sources answer 403 with the reason
+   *  (their history file is not ours to remove). */
+  sessionDelete: (key: string) =>
+    send("DELETE", `/api/v1/sessions/${key}`).then(() => undefined),
   sessionMessages: (key: string) =>
     get<{ messages: { role: string; text: string; ts: number }[] }>(
       `/api/v1/sessions/${key}`,

@@ -3,7 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0a0a0c" />
+    <!-- Browser chrome. Two token values, media-scoped, so the pre-JS document
+         is already correct in both modes: D.appShell / L.appShell from
+         panel/src/theme.tsx. Once JS runs, theme.tsx owns the runtime switch and
+         rewrites EVERY theme-color meta to the current shell colour, so chrome
+         follows the app theme regardless of the OS preference (index.html ships
+         no script). -->
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#08090b" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#eaebee" />
     <title>ruagent</title>
   </head>
   <body>
