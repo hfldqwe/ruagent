@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ruagent 平台架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1160, 700],
+    "views": [
+      {
+        "id": "orchestration",
+        "label": "编排主线",
+        "focus": ["panel", "daemon", "claude-code", "opencode", "deepseek"],
+        "note": "从控制台经 daemon 到 ACP harness 的主执行链路。"
+      },
+      {
+        "id": "knowledge-loop",
+        "label": "知识闭环",
+        "focus": ["daemon", "knowledge", "memory", "store", "mcp-serve"],
+        "note": "会话蒸馏为知识，召回注入回会话，全部落在本机。"
+      }
+    ]
+  },
+  "components": [
+    { "id": "panel", "type": "frontend", "label": "Panel 控制台", "sublabel": "React + antd", "brand": "react", "pos": [64, 296], "size": [148, 72] },
+    { "id": "daemon", "type": "backend", "label": "Daemon", "sublabel": "会话 · 任务 · 审批 · 蒸馏", "pos": [300, 288], "size": [168, 88] },
+    { "id": "opencode", "type": "external", "label": "OpenCode", "sublabel": "原生 ACP", "pos": [680, 112], "size": [148, 72] },
+    { "id": "claude-code", "type": "external", "label": "Claude Code", "sublabel": "ACP 适配器", "brand": "claude", "pos": [680, 296], "size": [148, 72] },
+    { "id": "deepseek", "type": "external", "label": "DeepSeek", "sublabel": "dsh --profile acp", "brand": "deepseek", "pos": [680, 480], "size": [148, 72] },
+    { "id": "mcp-serve", "type": "backend", "label": "ruagent mcp-serve", "sublabel": "平台 MCP 服务 · stdio→HTTP 桥", "pos": [920, 112], "size": [168, 72] },
+    { "id": "knowledge", "type": "backend", "label": "Knowledge", "sublabel": "递归树 · 实体图谱", "pos": [64, 560], "size": [148, 72] },
+    { "id": "store", "type": "database", "label": "SQLite Store", "sublabel": "会话 · 知识 · 记忆 · 策略", "brand": "sqlite", "pos": [250, 560], "size": [148, 72] },
+    { "id": "memory", "type": "backend", "label": "Memory", "sublabel": "六层记忆引擎 · 注入契约", "pos": [436, 560], "size": [148, 72] }
+  ],
+  "connections": [
+    { "id": "panel-daemon", "from": "panel", "to": "daemon", "label": "HTTP / WS · :8787", "variant": "emphasis" },
+    { "id": "daemon-claude", "from": "daemon", "to": "claude-code", "label": "ACP", "variant": "emphasis", "labelDx": 30 },
+    { "id": "daemon-opencode", "from": "daemon", "to": "opencode", "label": "ACP" },
+    { "id": "daemon-deepseek", "from": "daemon", "to": "deepseek", "label": "ACP" },
+    { "id": "claude-mcp", "from": "claude-code", "to": "mcp-serve", "label": "MCP stdio", "labelDx": 40 },
+    { "id": "opencode-mcp", "from": "opencode", "to": "mcp-serve" },
+    { "id": "deepseek-mcp", "from": "deepseek", "to": "mcp-serve" },
+    { "id": "mcp-daemon", "from": "mcp-serve", "to": "daemon", "label": "REST API 回连", "fromSide": "top", "toSide": "top" },
+    { "id": "daemon-knowledge", "from": "daemon", "to": "knowledge", "label": "蒸馏 · 召回" },
+    { "id": "daemon-memory", "from": "daemon", "to": "memory", "label": "上下文注入", "fromSide": "bottom", "toSide": "top" },
+    { "id": "knowledge-store", "from": "knowledge", "to": "store" },
+    { "id": "memory-store", "from": "memory", "to": "store" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "本地优先", "items": ["单二进制 daemon，面板由 daemon 托管", "全部数据落本机 SQLite，无云端依赖"] },
+    { "dot": "violet", "title": "一个回连缝", "items": ["harness 经 mcp-serve 访问记忆 / 知识 / 任务", "不为每个 harness 写 SDK 适配器"] },
+    { "dot": "emerald", "title": "标准协议接入", "items": ["ACP 统一三种 harness，即插即用", "orchestrator / policy 以纯 crate 内嵌 daemon 进程"] }
+  ]
+}

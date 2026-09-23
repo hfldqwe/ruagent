@@ -39,3 +39,19 @@ desktop.ini
 docs/design-study/
 /*_stderr.log
 /*_stdout.log
+
+# AgentTeams runtime state (live team/task/mailbox state, not source)
+/.agent-teams/
+
+# Per-run screenshot artifacts (curated dirs like after/ before/ review/ stay tracked)
+docs/screenshots/*-run*/
+docs/screenshots/*-run/
+docs/screenshots/audit-run*/
+docs/screenshots/_misplaced-cwd/
+docs/screenshots/t[0-9]*/
+docs/screenshots/chat2/
+docs/screenshots/light/
+
+# Scratch probes (committed instruments live in panel/tools/)
+panel/.*.py
+panel/.*.mjs

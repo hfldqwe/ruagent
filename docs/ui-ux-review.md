@@ -216,7 +216,7 @@ CDP 抓 11.5 秒窗口内 `/api` 请求数：
 - 原始结果：`audit-desktop.json`、`audit-mobile.json`（390×844）、`audit-light.json`（`?mode=light`）
 - 截图 13 张：`%TEMP%\ruagent-ui-review\*.png`（1440×900，Chrome headless）
 
-复现前提：`cargo run -p ruagent-cli -- serve` 已在 8787 运行，然后 `chrome --headless=new --remote-debugging-port=9333`。
+复现前提：`cargo run -p ruagent -- serve` 已在 8787 运行，然后 `chrome --headless=new --remote-debugging-port=9333`。
 
 ---
 
