@@ -8,6 +8,14 @@
 import { expect, test } from "@playwright/test";
 
 test("fan-out judge picks a winner with provenance", async ({ page, request }) => {
+  // This test owns three assertion waits (20s cards + 20s judge-ready + 20s
+  // verdict), so its own budget must exceed their sum: otherwise a failure
+  // inside one of them is reported as an opaque 30s test timeout instead of
+  // the specific precondition that broke. The happy path is fast (measured
+  // 4.8s end to end with working mock agents), so this is a diagnosability
+  // bound, not a workaround -- raising it alone does NOT make the test pass
+  // (a 180s run still failed on the disabled judge button).
+  test.setTimeout(60_000);
   const list = await request.get("/api/v1/agents");
   test.skip(!list.ok(), "agents API unavailable");
   const { agents } = (await list.json()) as {
@@ -44,10 +52,21 @@ test("fan-out judge picks a winner with provenance", async ({ page, request }) =
     await expect(page.locator(".judge-bar")).toBeVisible();
     await page.locator(".judge-bar .ant-select-input").click();
     await page.locator(".ant-select-item-option").filter({ hasText: judge.name }).click();
-    await page
+
+    // Wait for the judge button's OWN precondition, not a proxy for it.
+    // canJudge (TaskDetail.tsx) turns true only once >=2 runs are completed
+    // AND carry a non-empty result; the comparison cards above appear much
+    // earlier (measured with working mock agents: cards at +455ms, button
+    // enabled about 2s later). Clicking straight after the cards therefore
+    // raced the panel -- Playwright retried a disabled button until the whole
+    // 30s test budget was gone (element is not enabled -> Test timeout of
+    // 30000ms exceeded). The flow itself is fast (4.8s end to end), so the
+    // fix is to wait for the real precondition, not to widen the timeout.
+    const judgeGo = page
       .locator(".judge-bar button")
-      .filter({ hasText: /^开始评审$|^Judge$/ })
-      .click();
+      .filter({ hasText: /^开始评审$|^Judge$/ });
+    await expect(judgeGo).toBeEnabled({ timeout: 20_000 });
+    await judgeGo.click();
 
     // Verdict: ok tag with the AI pick + the mock's rationale.
     await expect(

@@ -5,20 +5,41 @@
 
 import { expect, test } from "@playwright/test";
 
-test("knowledge view exposes the wiki tab with compile entry", async ({ page }) => {
+test("knowledge view exposes the wiki tab with compile entry", async ({ page, request }) => {
   await page.goto("/#knowledge");
   await expect(page.locator(".view-bar h2")).toBeVisible();
 
   await page.locator(".ant-segmented-item-label").filter({ hasText: /^Wiki$/ }).click();
 
-  // the compile button and the stat line render on an empty wiki too
-  await expect(
-    page.locator("button").filter({ hasText: /编译 Wiki|Compile wiki/ }),
-  ).toBeVisible();
-  // page inventory rows or the empty state (fresh CI daemon has none)
-  await expect(page.locator(".card .row-btn, .ant-empty").first()).toBeVisible({
-    timeout: 10_000,
-  });
+  // The compile entry belongs to the Wiki zone's OWN header (Wiki.tsx hands it
+  // to Zone as its actions slot), so it renders on an empty wiki too -- that
+  // is the entry point this test is about. Scope to that header: a fresh CI
+  // daemon also renders the empty state's own CTA with the same accessible
+  // name (Wiki.tsx Empty action), which made the previous unscoped
+  // page.locator('button') name filter resolve to 2 elements. The ambiguity
+  // was in the locator, not in the panel: the two buttons live in different
+  // regions (header vs empty-state body) and only the header one is
+  // state-independent.
+  const headerCompile = page
+    .locator(".zone-head button")
+    .filter({ hasText: /编译 Wiki|Compile wiki/ });
+  await expect(headerCompile).toHaveCount(1);
+  await expect(headerCompile).toBeVisible();
+
+  // Data-conditional: an empty library additionally offers the CTA inside the
+  // empty state (this is the second button CI sees).
+  const res = await request.get("/api/v1/knowledge/wiki/pages");
+  const pages = res.ok() ? ((await res.json()) as { pages: unknown[] }).pages : [];
+  if (pages.length === 0) {
+    await expect(
+      page.locator(".empty-state button").filter({ hasText: /编译 Wiki|Compile wiki/ }),
+    ).toBeVisible();
+  } else {
+    // page inventory rows (a set: at least one row is the assertion)
+    await expect(page.locator(".card .row-btn").first()).toBeVisible({
+      timeout: 10_000,
+    });
+  }
 
   // and back to docs
   await page.locator(".ant-segmented-item-label").filter({ hasText: /文档|Docs/ }).click();
