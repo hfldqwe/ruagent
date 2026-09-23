@@ -37,7 +37,9 @@ cargo test --workspace
 cd panel && npm ci && npm run build   # tsc + vite build
 ```
 
-Run the daemon locally: `cargo run -p ruagent-cli -- serve` (serves the panel + API on localhost).
+Run the daemon locally: `cargo run -p ruagent -- serve` (serves the panel + API on localhost).
+
+The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
 
 ## Conventions
 
