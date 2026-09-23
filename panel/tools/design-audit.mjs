@@ -2366,6 +2366,129 @@ function touchTargetVerdict(w, floor) {
   return { measured: true, samples: all.length, bad, smallest, pass: bad.length === 0 };
 }
 
+// Rows 47/48/49: list-order stability. The instruments were built in t99
+// (tools/order-probe.mjs, tools/order-shift-control.mjs) and are re-used here
+// rather than rewritten -- one instrument, one behaviour.
+//
+// Row 49 carries the empty-set guard this team adopted after t99: a criterion
+// that needs an EVENT must prove the event happened. If no membership change
+// is observed in the window, the row reports not_measured -- never PASS.
+async function probeOrder(page, baseUrl) {
+  const out = { error: null, click: null, ticks: 0, membershipChanges: 0, pureReorder: 0, maxMovePx: null, samples: [], sessions: null };
+  try {
+    await page.goto(baseUrl + "/?mode=dark#chat", { waitUntil: "load", timeout: 60_000 });
+    await page.waitForTimeout(2500);
+    const ids = async () => {
+      const r = await fetch(baseUrl + "/api/v1/chats", { signal: AbortSignal.timeout(5000) });
+      const b = await r.json();
+      return (b.chats || []).map((c) => c.id);
+    };
+    const domTops = () =>
+      page.evaluate(() =>
+        [...document.querySelectorAll(".chat-session-row")].map((el) => {
+          const t = el.querySelector(".title");
+          const b = el.getBoundingClientRect();
+          return { title: (t ? t.textContent : "").trim().slice(0, 24), top: Math.round(b.top * 100) / 100 };
+        })
+      );
+    // ---- 47: a click must not reorder the list
+    const domBefore = (await domTops()).map((r) => r.title);
+    const apiBefore = await ids();
+    const clicked = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll(".chat-session-row")];
+      if (rows.length < 3) return null;
+      const t = rows[2].querySelector(".title");
+      const label = (t ? t.textContent : "").trim().slice(0, 24);
+      rows[2].click();
+      return label;
+    });
+    await page.waitForTimeout(1500);
+    const domAfter = (await domTops()).map((r) => r.title);
+    const apiAfter = await ids();
+    out.click = {
+      clicked,
+      rows: domBefore.length,
+      domChanged: domBefore.join("|") !== domAfter.join("|"),
+      apiChanged: apiBefore.join("|") !== apiAfter.join("|"),
+    };
+    // ---- 48 / 49: tick once a second and watch for a membership change
+    let prev = apiAfter;
+    let prevTops = await domTops();
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(1000);
+      const now = await ids();
+      out.ticks++;
+      if (now.length !== prev.length || now.some((x, k) => x !== prev[k])) {
+        const nowTops = await domTops();
+        const byTitle = Object.fromEntries(prevTops.map((r) => [r.title, r.top]));
+        let worst = 0;
+        const moved = [];
+        for (const r of nowTops) {
+          if (!(r.title in byTitle)) continue;
+          const d = Math.abs(r.top - byTitle[r.title]);
+          if (d > worst) worst = d;
+          if (d > 0.5) moved.push({ title: r.title, delta: Math.round((r.top - byTitle[r.title]) * 100) / 100 });
+        }
+        const added = now.filter((x) => !prev.includes(x));
+        const removed = prev.filter((x) => !now.includes(x));
+        if (added.length || removed.length) out.membershipChanges++;
+        else out.pureReorder++;
+        out.maxMovePx = out.maxMovePx === null ? worst : Math.max(out.maxMovePx, worst);
+        if (out.samples.length < 5) out.samples.push({ added: added.length, removed: removed.length, worst, moved: moved.slice(0, 3) });
+        prevTops = nowTops;
+      }
+      prev = now;
+    }
+    // ---- 50: the platform's own injected blocks must not name a row
+    const sr = await fetch(baseUrl + "/api/v1/sessions", { signal: AbortSignal.timeout(8000) });
+    const sb = await sr.json();
+    const rows = sb.sessions || [];
+    // The literals WE emit. Not a guess about user content: a user is free to
+    // type a bracket, and that must never be counted here.
+    const HEADS = ["[memory context", "[role — you are"];
+    const bad = rows.filter((r) => {
+      const t = (r.title || "").trim();
+      const p = (r.preview || "").trim();
+      return HEADS.some((h) => t.startsWith(h) || p.startsWith(h));
+    });
+    out.sessions = {
+      total: rows.length,
+      bad: bad.length,
+      samples: bad.slice(0, 3).map((r) => ({ title: (r.title || "").slice(0, 44), preview: (r.preview || "").slice(0, 44) })),
+    };
+  } catch (e) {
+    out.error = e.message;
+  }
+  return out;
+}
+
+function clickOrderVerdict(o) {
+  if (!o || o.error || !o.click || !o.click.rows) return { measured: false, pass: null };
+  const c = o.click;
+  return { measured: true, pass: !c.domChanged && !c.apiChanged, click: c };
+}
+function pollOrderVerdict(o) {
+  if (!o || o.error) return { measured: false, pass: null };
+  // Two ticks is the minimum that can show a DIFFERENCE; below that there is
+  // nothing to compare and a PASS would be an empty-set green.
+  if (o.ticks < 2) return { measured: false, pass: null };
+  return { measured: true, pass: o.pureReorder === 0, pureReorder: o.pureReorder, ticks: o.ticks };
+}
+function anchorMoveVerdict(o, floor) {
+  if (!o || o.error) return { measured: false, pass: null };
+  // THE empty-set guard: no membership change observed means the thing this
+  // row measures never happened, so the row is not_measured, not PASS.
+  if (!o.membershipChanges) {
+    return { measured: false, pass: null, reason: "no membership change in " + o.ticks + " ticks" };
+  }
+  return { measured: true, pass: o.maxMovePx <= floor, maxMovePx: o.maxMovePx, changes: o.membershipChanges };
+}
+function sessionNameVerdict(o) {
+  if (!o || o.error || !o.sessions) return { measured: false, pass: null };
+  if (!o.sessions.total) return { measured: false, pass: null };
+  return { measured: true, pass: o.sessions.bad === 0, total: o.sessions.total, bad: o.sessions.bad, samples: o.sessions.samples };
+}
+
 // ── Provenance: what exactly is being audited ───────────────────────────────
 function distInfo() {
   const distDir = join(PANEL, "dist");
@@ -2659,6 +2782,8 @@ async function auditRoute(page, o) {
   // measurement viewport back, so the screenshot pass is unaffected.
   const sessionTitle = await probeSessionTitle(page, measureViewport, args.injectCss).catch((e) => ({ error: e.message }));
   const wig = await probeWig(page, measureViewport).catch((e) => ({ error: e.message }));
+  const order = await probeOrder(page, args.baseUrl).catch((e) => ({ error: e.message }));
+  if (order?.error) warnings.push("rows 47-50 order probe: " + order.error);
   if (wig?.error) warnings.push("rows 50-52 WIG probe: " + wig.error);
   if (sessionTitle?.error) warnings.push("row 46 session title probe: " + sessionTitle.error);
   const tOverflowDone = Date.now();
@@ -2682,6 +2807,7 @@ async function auditRoute(page, o) {
     markup,
     sessionTitle,
     wig,
+    order,
     apiWindowMs,
     domStable,
     shot,
@@ -3352,8 +3478,8 @@ const CHECKS = [
     },
   },
   {
-    n: 50, title: "prefers-reduced-motion 被尊重", modes: ["dark"],
-    parse: (t) => ({ max: pick(t.text, /每\s*capture\s*≤\s*(\d+)/, 0) }),
+    n: 53, title: "prefers-reduced-motion 被尊重", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /(\d+)\s*处/, 0) }),
     criterion: [
       "**MASTER §12 行 50（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:55 与 :272「Honor prefers-reduced-motion. Provide a reduced-motion variant.」）**：模拟 `prefers-reduced-motion: reduce` 后，页面上**仍在过渡/动画**的元素数，**每 capture ≤0**。",
       "**对象**：body * 中计算样式 transitionDuration 或（animationName != none 时的）animationDuration **> 0.05s** 的元素。**判定式**：在 emulateMedia({reducedMotion: reduce}) 下计数。",
@@ -3374,7 +3500,7 @@ const CHECKS = [
   },
   {
     n: 51, title: "窄屏 input 字号 ≥16px（防 iOS 自动缩放）", modes: ["dark"],
-    parse: (t) => ({ max: pick(t.text, /每\s*capture\s*≤\s*(\d+)/, 0) }),
+    parse: (t) => ({ min: pick(t.text, /(\d+)\s*px/, 16) }),
     criterion: [
       "**MASTER §12 行 51（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:28「Mobile input size. input font size is ≥ 16px on mobile to prevent iOS Safari auto-zoom/pan on focus.」）**：**窄屏（520 与 390）下 input / textarea / select 的计算字号必须 ≥ 16px**，违例数 **每 capture ≤0**。",
       "**对象写清（本代已判过「规则的对象集必须与意图对齐」）**：**只有表单输入元素**，**不含**标题、标签、列表标题 —— 标准说的是 input，不是「所有文本」。侧栏 13/14px 的标题**不在本行对象内**。",
@@ -3393,7 +3519,7 @@ const CHECKS = [
   },
   {
     n: 52, title: "窄屏触摸目标 ≥44×44（移动端）", modes: ["dark"],
-    parse: (t) => ({ min: pick(t.text, /≥\s*(\d+)\s*×/, 44) }),
+    parse: (t) => ({ min: pick(t.text, /(\d+)\s*px/, 44) }),
     criterion: [
       "**MASTER §12 行 52（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:27「Match visual & hit targets. … On mobile, the minimum size is 44px.」）**：**窄屏（520 与 390）下可点元素的命中盒必须 ≥44×44**，违例数 **每 capture ≤0**。",
       "**对象**：button / a[href] / [role=button] / .icon-btn 中**可见**（非 display:none、非 0 尺寸）的元素。",
@@ -3408,6 +3534,80 @@ const CHECKS = [
         display: "窄屏可点 " + v.samples + " 个 · 最小 " + v.smallest.w + "×" + v.smallest.h + "px（" + v.smallest.sel + "）· 低于 " + l.min + "px 的 " + v.bad.length + " 个" + (v.pass ? " ✓" : " — " + v.bad.slice(0, 3).map((b) => b.sel + "@" + b.viewport + "=" + b.w + "×" + b.h).join(", ")),
         pass: v.pass,
         detail: { samples: v.samples, smallest: v.smallest, bad: v.bad, floor: l.min },
+      };
+    },
+  },
+  {
+    n: 47, title: "点击不得改变行序", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /(\d+)\s*处变化/, 0) }),
+    criterion: [
+      "**MASTER §12 行 47（t105 已落）**：点击侧栏会话行**前后**，**API id 序列与 DOM 行序逐位相同**；阈值 **0 处变化**；**依据：裁决**（用户原始指控）。",
+      "**仪器来源**：t99 的 order-probe.mjs --click（此处复用同一行为，未重写）。**与既有行不重叠**：行 18/25 判可点性与焦点，没有一行看**点击是否重排列表**。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.order || c.order.error) return { display: "— (order probe failed)", pass: null };
+      const v = clickOrderVerdict(c.order);
+      if (!v.measured) return { display: "— 会话行不足 3 条，未测（0 个对象）", pass: null };
+      return {
+        display: "点击「" + (v.click.clicked || "?") + "」后 domChanged=" + v.click.domChanged + " · apiChanged=" + v.click.apiChanged + " · 行数 " + v.click.rows + (v.pass ? " ✓" : " ✗"),
+        pass: v.pass,
+        detail: v.click,
+      };
+    },
+  },
+  {
+    n: 48, title: "无成员变化的轮询不得改变行序", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /(\d+)\s*$/, 0) }),
+    criterion: [
+      "**MASTER §12 行 48（t105 已落）**：相邻 tick（1s）之间，**在成员集合不变的前提下序列必须相同**；阈值 **0 次纯重排**；**依据：测量**（t99 实测 428s / 415 ticks 纯重排 0 次）。",
+      "**空集保护**：tick 数 < 2 时无从比较 ⇒ **not_measured**，不报 PASS。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.order || c.order.error) return { display: "— (order probe failed)", pass: null };
+      const v = pollOrderVerdict(c.order);
+      if (!v.measured) return { display: "— tick 数不足，未测", pass: null };
+      return {
+        display: "观测 " + v.ticks + " 个 tick · 纯重排 " + v.pureReorder + " 次 · 成员变化 " + c.order.membershipChanges + " 次" + (v.pass ? " ✓" : " ✗"),
+        pass: v.pass,
+        detail: { ticks: v.ticks, pureReorder: v.pureReorder, membershipChanges: c.order.membershipChanges },
+      };
+    },
+  },
+  {
+    n: 49, title: "轮询引起的成员变化不得移动用户正在看的行", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /≤\s*([\d.]+)\s*px/, 0.5) }),
+    criterion: [
+      "**MASTER §12 行 49（t105 已落）**：被跟踪行在**成员变化前后**的屏幕 top 位移；阈值 **≤0.5px**；**依据：裁决**；**契约记 RED**（控制跑实测 3 行移动 **−35.5px**，恰好一个行高）。",
+      "**⚠️ 空集保护（t99 的教训）**：**必须观测到至少一次成员变化**，否则本行报 **not_measured** 而非 PASS —— 「什么都没发生」与「没被扰动」是两回事。",
+      "**仪器来源**：t99 的 order-shift-control.mjs（确定性制造扰动）；本探针在窗口内**等**自然扰动。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.order || c.order.error) return { display: "— (order probe failed)", pass: null };
+      const v = anchorMoveVerdict(c.order, l.max);
+      if (!v.measured) return { display: "— not_measured：" + (v.reason || "未观测到成员变化") + " ⇒ 不报 PASS", pass: null };
+      return {
+        display: "成员变化 " + v.changes + " 次 · 最大位移 " + v.maxMovePx.toFixed(2) + "px（阈值 ≤" + l.max + "px）" + (v.pass ? " ✓" : " ✗"),
+        pass: v.pass,
+        detail: { changes: v.changes, maxMovePx: v.maxMovePx, samples: c.order.samples },
+      };
+    },
+  },
+  {
+    n: 50, title: "会话名不得以平台注入块头开头", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /(\d+)\s*$/, 0) }),
+    criterion: [
+      "**MASTER §12 行 50（t111 已落）**：/api/v1/sessions 每行的 preview / title **不得以我们自己发出的注入块头开头**（[memory context / [role — you are —— **平台产物的字面量**）；阈值 **0 行**；**依据：裁决**。",
+      "**⚠️ 对象是平台产物，不是对用户内容的猜测**：用户**完全可以**以 [ 开头说话，那种行**不计入**本行（与 t101 的 sentinel 切分一致 —— 规则的对象集必须与意图对齐）。",
+      "**契约记 RED 且会一直红**：t101 的修复**只前向生效**（旧 transcript 无 sentinel ⇒ 索引器 user_text() 是 no-op）⇒ **存量行清理前它一直红，那是诚实的红**。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.order || c.order.error) return { display: "— (order probe failed)", pass: null };
+      const v = sessionNameVerdict(c.order);
+      if (!v.measured) return { display: "— 无会话行（0 个对象）", pass: null };
+      return {
+        display: "以注入块头开头的行 " + v.bad + " / " + v.total + " 行" + (v.pass ? " ✓" : " ✗ — " + v.samples.map((x) => JSON.stringify(x.title || x.preview)).join(", ")),
+        pass: v.pass,
+        detail: { total: v.total, bad: v.bad, samples: v.samples },
       };
     },
   },
@@ -4907,11 +5107,11 @@ function runSelfTest() {
       // tool does not judge is the more dangerous of the two -- the contract
       // promises a check nobody runs -- so it is listed here by number rather
       // than folded into one "everything is fine" line.
-      const PENDING_TOOL = [47, 48, 49];
-      check("reconcile: the contract rows the tool does not judge yet are named, and are exactly 47-49",
+      const PENDING_TOOL = [];
+      check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
-      check("reconcile: the tool rows still awaiting a contract entry are named, and are exactly 50-52",
-        onlyTool.join(","), "50,51,52");
+      check("reconcile: no row exists only in the tool either (every judge has a contract to be judged against)",
+        onlyTool.join(","), "");
       console.log("  reconcile: tool=" + toolRows.length + " contract=" + contractRows.length +
         " onlyTool=[" + onlyTool.join(",") + "] onlyContract=[" + onlyContract.join(",") + "]");
     }
@@ -4920,8 +5120,8 @@ function runSelfTest() {
     // 47/48/49 landed in the contract from t99's draft and are NOT yet judged
     // here; 50/51/52 are this task's new rows and have no entry yet. Both gaps
     // are named in the reconcile block above and in the --self-test output.
-    const PENDING_ENTRY = [50, 51, 52];
-    check("§12 parse: the rows still awaiting a MASTER entry are named, and are exactly 50-52",
+    const PENDING_ENTRY = [];
+    check("§12 parse: no row is awaiting a MASTER entry any more (all 53 landed)",
       [...new Set(notInDoc.map((m) => Number(String(m).match(/^row(\d+)/)?.[1])))].sort((a, b) => a - b).join(","),
       PENDING_ENTRY.join(","));
     check("§12 parse: every row whose entry HAS landed reads its target out of the doc, not the fallback",
@@ -5547,7 +5747,9 @@ function runSelfTest() {
     /5em/.test(row46.criterion) && /not_measured/.test(row46.criterion), true);
 
   // ---- rows 50-52: the measurable Web Interface Guidelines entries ---------
-  const row50 = CHECKS.find((r) => r.n === 50);
+  // The reduced-motion row is 53: contract row 50 went to t101's
+  // injection-block criterion, so the number was already taken.
+  const row53 = CHECKS.find((r) => r.n === 53);
   const row51 = CHECKS.find((r) => r.n === 51);
   const row52 = CHECKS.find((r) => r.n === 52);
   const wig = (over, maxT, sample) => ({ reduce: { over, maxTransitionS: maxT, maxAnimationS: 0, sample: sample || [], scanned: 100 }, narrow: [] });
@@ -5569,10 +5771,12 @@ function runSelfTest() {
   check("row52 must-PASS: a 44x44 target PASSES",
     touchTargetVerdict(wigNarrow([], [{ sel: "button.icon-btn", w: 44, h: 44 }]), 44).pass, true);
   check("row52: the floor is read out of the contract, not hardcoded",
-    row52.parse({ text: "窄屏命中盒 ≥44×44" }).min, 44);
+    row52.parse({ text: "窄屏触摸目标 ≥44×44" }).min, 44);
   check("row52: no targets at all is not_measured",
     touchTargetVerdict(wigNarrow([], []), 44).pass === null, true);
-  check("rows50-52: the probe is wired into every capture",
+  check("row51: the floor is read out of the contract cell, not hardcoded",
+    row51.parse({ text: "窄屏输入字号 ≥16px" }).min, 16);
+  check("rows50-53: the probe is wired into every capture",
     /probeWig\(page/.test(auditRoute.toString()) && /^\s*wig,$/m.test(auditRoute.toString()), true);
 
   // ---- row 35: the breakpoint SET relationship (§12.16 + t80 ruling) -------

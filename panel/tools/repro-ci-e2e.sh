@@ -86,5 +86,5 @@ echo "[t107] sessions at boot: $(curl -s "http://127.0.0.1:$PORT/api/v1/sessions
 
 # --- the suite, pointed at this instance ------------------------------------
 cd "$REPO/panel"
-E2E_BASE_URL="http://127.0.0.1:$PORT" npm run test:e2e 2>&1 | tail -60
+E2E_BASE_URL="http://127.0.0.1:$PORT" npm run test:e2e 2>&1 | tee /tmp/t107-full.log | tail -60
 echo "[t107] e2e exit = ${PIPESTATUS[0]}"
