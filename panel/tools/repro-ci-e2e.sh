@@ -23,6 +23,16 @@ ROOT="${T107_ROOT:-$(mktemp -d 2>/dev/null || echo "/tmp/t107-$$")}"
 BIN="${T107_MOCK_BIN:-D:/rust_cache/debug/ruagent-mock-agent.exe}"
 KEEP="${1:-}"
 
+# The daemon and the mock agent are NATIVE Windows binaries. An MSYS path like
+# /tmp/tmp.X is a shell-side spelling they cannot open: the mock exits 2
+# (cannot read replies file) and the member run dies before ACP initialises,
+# which silently turned every earlier run of this script into a BROKEN
+# environment -- the readings it produced were about the instrument, not the
+# app. NROOT is the same directory spelled natively (C:/...), so both sides can
+# read it, and it needs no TOML escaping because the separators are forward
+# slashes.
+NROOT="$(cygpath -m "$ROOT" 2>/dev/null || echo "$ROOT")"
+echo "[t107] native = $NROOT"
 echo "[t107] repo   = $REPO"
 echo "[t107] root   = $ROOT"
 echo "[t107] port   = $PORT"
@@ -35,12 +45,12 @@ printf '[{"marker":"FANOUT MARKER","reply":"answer from beta"}]' > "$ROOT/config
 cat > "$ROOT/config/agents.toml" <<EOF
 [agent.alpha]
 harness = "mock"
-command = "$BIN --behavior scripted --replies $ROOT/config/e2e-alpha.json"
+command = "$BIN --behavior scripted --replies $NROOT/config/e2e-alpha.json"
 description = "e2e fan-out member"
 
 [agent.beta]
 harness = "mock"
-command = "$BIN --behavior scripted --replies $ROOT/config/e2e-beta.json"
+command = "$BIN --behavior scripted --replies $NROOT/config/e2e-beta.json"
 description = "e2e fan-out member"
 
 [agent.judge]
@@ -48,6 +58,13 @@ harness = "mock"
 command = "$BIN --behavior judge"
 description = "e2e fan-out judge"
 EOF
+
+# Fail LOUDLY when the native spelling is unreadable. A quiet broken
+# environment is exactly what produced the earlier false readings.
+if [ ! -r "$NROOT/config/e2e-alpha.json" ]; then
+  echo "[t107] FATAL: mock cannot read $NROOT/config/e2e-alpha.json" >&2
+  exit 2
+fi
 
 # --- boot the daemon on its own port over its own root ----------------------
 export RUAGENT_HOME="$ROOT"
