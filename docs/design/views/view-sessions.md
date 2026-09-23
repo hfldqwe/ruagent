@@ -284,3 +284,22 @@ export function sourceHue(s: string): string {
 **现状**：该页已有 **source 过滤页签**（全部 / ruagent / dsh / Claude Code / opencode）但**没有「隐藏系统 / 临时来源」** ⇒ 需要补**一个开关或一个「系统来源」页签**（形态由实现定，**但默认必须是隐藏** ✓）
 **可判定**：**默认进入该页时，列表里不得出现 `cwd` 属于临时目录（含 `Temp` / `tmp`）或来源为「记忆蒸馏」的行**；**且必须存在一个可见入口能显示它们**（存在性可判定：入口元素可见且可聚焦 ✓）
 **为什么是「规则保证」而不是「人记得清理」**：**列表卫生是需求** —— 与 t90（不列出没有消息的会话）同一条纪律：**不靠人记得清理，靠规则保证** ✓（**这次的残留里有 captain 自己的 modlens 临时会话** ⇒ 正好证明「靠人记得」不成立 ✓）
+
+### S8 存量注入名行的补救：三个选项（**需用户裁决**，2026-09-23）
+
+**事实（t101 查明）**：本修复**只前向生效** —— 旧 transcript **没有 sentinel** ⇒ 索引器 `user_text()` 是 **no-op** ⇒ **旧行永久保留注入名**（**26 行**）· **即使重新索引也不会好** ✓ ⇒ **§12 行 50 会一直红，那是诚实的红** ✓
+
+**⚠️ 这是用户的真实数据 ⇒ 不替他选** ⇒ 三个选项（影响 / 代价 / 可否撤销）：
+
+| # | 选项 | 影响 | 代价 | 可否撤销 |
+|---|---|---|---|---|
+| **(a)** | **用删除端点删掉这些 `chats` / `sessions` 行** | 这些会话**从列表消失**（**内容仍在 transcript 里** ⇒ **删历史条目 ≠ 撤回内容** ✓） | 需逐条 / 批量操作；依赖删除端点可用（t95） | **不可撤销**（列表条目删后无法从 UI 恢复；**transcript 内容仍在** ✓） |
+| **(b)** | **对旧 transcript 做一次性重写** | 注入名消失、内容保留 | **会改动用户的数据** ✗（改的是历史文件本身） | **不可撤销**（除非事先备份） |
+| **(c)** | **什么都不做** | 26 行继续显示注入名 | **行 50 长期为红**（**诚实的红** ✓） | **可撤销**（随时可改选 (a) / (b)） |
+
+**推荐顺序（design-lead 的建议，最终由用户定）**：**(a) > (c) > (b)** —— **(a)** 只动**列表条目**、不动内容，且**与 t95 的删除能力同源**；**(c)** 零风险但让判据长期红；**(b)** 唯一会**改动用户数据**的选项 ⇒ 只在用户明确接受时才做 ✓
+
+**(a) 的语义核实（已读代码，不是假设）**：
+- **`sessions` 侧**：`0017_session_deletions` 墓碑**阻止索引器重新加回** ✓ —— `crates/store/src/lib.rs:695-698` 的注释原话：「Unlike a missing row these survive the indexer's next INSERT OR REPLACE, **which is what makes the delete stick (measured: without a tombstone the row returned in <70s)**」✓（写入在 `:781`，读取在 `:701`）
+- **`chats` 侧：没有墓碑，而且不需要** ✓ —— `crates/daemon/src/chat.rs:825-834` 的原话：「**WHY NO TOMBSTONE (checked, not assumed)**：nothing rebuilds the `chats` table …… **There is no periodic re-index of `chats`, unlike `sessions`**」✓
+- **⚠️ 但 `chats` 有一条例外**：**`resume` 一个已删除的 chat id 会重建该行** ✓（`chat.rs:834-836`：「A resume of a deleted id **DOES** re-create the row; that is a **deliberate user action**, not a background rebuild」）⇒ **删掉 chat 行之后，只要用户不再 resume 它，它就不会回来** ✓

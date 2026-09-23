@@ -2263,6 +2263,109 @@ async function probeMarkup(page) {
   });
   return r;
 }
+// Rows 50-52: the measurable entries of the archived Web Interface Guidelines
+// (docs/research/web-interface-guidelines.md). Each row names the line it comes
+// from -- this team's rule is that a rule must name its instance.
+//
+// NOT re-implemented here, because a judge already looks at them:
+//   * 4.5:1 text contrast  -- this file already computes WCAG ratios over every
+//     visible text-bearing element (see the contrast block in PROBE);
+//   * focus-visible rings  -- rows 15/16;
+//   * 24px desktop hit target -- row 18.
+// Re-judging them would only create a second opinion that can disagree.
+//
+// NOT APPLICABLE, with the evidence:
+//   * no-image-caused CLS (line 138) -- the panel renders ZERO <img> elements
+//     (measured: img count 0 on every route), so there is no object;
+//   * video-over-GIF / Safari video-as-image (lines 143/144) -- zero <video> and
+//     zero animated GIFs for the same reason.
+async function probeWig(page, restore) {
+  const out = { reduce: null, narrow: [] };
+  // (a) prefers-reduced-motion. Emulate the preference and read what the page
+  //     still animates: a transition or animation that survives reduce is the
+  //     violation.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.waitForTimeout(250);
+  out.reduce = await page.evaluate(() => {
+    const live = [];
+    let maxT = 0, maxA = 0, over = 0;
+    for (const el of document.querySelectorAll("body *")) {
+      const cs = getComputedStyle(el);
+      const dur = (s) => Math.max(...String(s || "0s").split(",").map((x) => parseFloat(x) || 0));
+      const t = dur(cs.transitionDuration);
+      const a = dur(cs.animationDuration);
+      const n = cs.animationName && cs.animationName !== "none" ? 1 : 0;
+      maxT = Math.max(maxT, t);
+      maxA = Math.max(maxA, a * n);
+      if (t > 0.05 || (a > 0.05 && n)) {
+        over++;
+        if (live.length < 8) {
+          const cls = typeof el.className === "string" ? el.className.split(/\s+/).slice(0, 2).join(".") : "";
+          live.push(el.tagName.toLowerCase() + (cls ? "." + cls : "") + " t=" + t + "s a=" + (a * n) + "s");
+        }
+      }
+    }
+    return { maxTransitionS: maxT, maxAnimationS: maxA, over, sample: live, scanned: document.querySelectorAll("body *").length };
+  });
+  await page.emulateMedia({ reducedMotion: null });
+  // (b) narrow-screen measurements: input font size (iOS auto-zoom) and the
+  //     mobile hit target. Both objects are defined by the standard's own
+  //     wording, not by our taste.
+  for (const w of [520, 390]) {
+    await page.setViewportSize({ width: w, height: 900 });
+    await page.waitForTimeout(220);
+    const r = await page.evaluate(() => {
+      const vis = (el) => {
+        const cs = getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden") return false;
+        const b = el.getBoundingClientRect();
+        return b.width >= 1 && b.height >= 1;
+      };
+      const inputs = [...document.querySelectorAll("input, textarea, select")].filter(vis).map((el) => {
+        const cs = getComputedStyle(el);
+        return { sel: el.tagName.toLowerCase() + (el.type ? "[" + el.type + "]" : ""), fs: parseFloat(cs.fontSize) || 0 };
+      });
+      const targets = [...document.querySelectorAll("button, a[href], [role=button], .icon-btn")].filter(vis).map((el) => {
+        const b = el.getBoundingClientRect();
+        const cls = typeof el.className === "string" ? el.className.split(/\s+/).slice(0, 2).join(".") : "";
+        return { sel: el.tagName.toLowerCase() + (cls ? "." + cls : ""), w: Math.round(b.width), h: Math.round(b.height) };
+      });
+      return { inputs, targets };
+    });
+    out.narrow.push({ viewport: w, inputs: r.inputs, targets: r.targets });
+  }
+  if (restore) {
+    await page.setViewportSize({ width: restore.width, height: restore.height });
+    await page.waitForTimeout(120);
+  }
+  return out;
+}
+
+// Pure verdicts, so --self-test can force both directions.
+function reducedMotionVerdict(w) {
+  if (!w || w.error) return { measured: false, pass: null };
+  const r = w.reduce;
+  if (!r || !r.scanned) return { measured: false, pass: null };
+  return { measured: true, over: r.over, max: Math.max(r.maxTransitionS, r.maxAnimationS), sample: r.sample, pass: r.over === 0 };
+}
+function inputFontVerdict(w) {
+  if (!w || w.error) return { measured: false, pass: null };
+  const all = [];
+  for (const n of w.narrow || []) for (const i of n.inputs) all.push({ ...i, viewport: n.viewport });
+  if (!all.length) return { measured: false, pass: null, samples: 0 };
+  const bad = all.filter((i) => i.fs < 16);
+  return { measured: true, samples: all.length, bad, min: Math.min(...all.map((i) => i.fs)), pass: bad.length === 0 };
+}
+function touchTargetVerdict(w, floor) {
+  if (!w || w.error) return { measured: false, pass: null };
+  const all = [];
+  for (const n of w.narrow || []) for (const t of n.targets) all.push({ ...t, viewport: n.viewport });
+  if (!all.length) return { measured: false, pass: null, samples: 0 };
+  const bad = all.filter((t) => t.w < floor || t.h < floor);
+  const smallest = all.reduce((a, b) => (a.w * a.h <= b.w * b.h ? a : b));
+  return { measured: true, samples: all.length, bad, smallest, pass: bad.length === 0 };
+}
+
 // ── Provenance: what exactly is being audited ───────────────────────────────
 function distInfo() {
   const distDir = join(PANEL, "dist");
@@ -2555,6 +2658,8 @@ async function auditRoute(page, o) {
   // The session-title sweep runs LAST in the viewport-moving probes and puts the
   // measurement viewport back, so the screenshot pass is unaffected.
   const sessionTitle = await probeSessionTitle(page, measureViewport, args.injectCss).catch((e) => ({ error: e.message }));
+  const wig = await probeWig(page, measureViewport).catch((e) => ({ error: e.message }));
+  if (wig?.error) warnings.push("rows 50-52 WIG probe: " + wig.error);
   if (sessionTitle?.error) warnings.push("row 46 session title probe: " + sessionTitle.error);
   const tOverflowDone = Date.now();
   return {
@@ -2576,6 +2681,7 @@ async function auditRoute(page, o) {
     textLayout,
     markup,
     sessionTitle,
+    wig,
     apiWindowMs,
     domStable,
     shot,
@@ -3242,6 +3348,66 @@ const CHECKS = [
         pass: v.pass,
         note: "样本 " + v.samples + " 个 · 最差 " + v.where + " w=" + v.worst.w + "px fs=" + v.worst.fs + "px 声明 min-width=" + v.worst.minW + " · 两级判据：width>0（普适）∧ width≥声明下限（仅当声明存在）",
         detail: { min: v.min, samples: v.samples, worst: v.worst, where: v.where, perRoute: v.perRoute, derivedFloors: v.declared, bad: v.bad },
+      };
+    },
+  },
+  {
+    n: 50, title: "prefers-reduced-motion 被尊重", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /每\s*capture\s*≤\s*(\d+)/, 0) }),
+    criterion: [
+      "**MASTER §12 行 50（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:55 与 :272「Honor prefers-reduced-motion. Provide a reduced-motion variant.」）**：模拟 `prefers-reduced-motion: reduce` 后，页面上**仍在过渡/动画**的元素数，**每 capture ≤0**。",
+      "**对象**：body * 中计算样式 transitionDuration 或（animationName != none 时的）animationDuration **> 0.05s** 的元素。**判定式**：在 emulateMedia({reducedMotion: reduce}) 下计数。",
+      "**阈值 0 处 —— 依据：裁决**（标准原文要求提供 reduced 变体；本项目未提供）。",
+      "**与既有行不重叠**：行 42 判 transition: all 的**属性写法**，本行判**媒体偏好下是否仍在动**，两者量的是不同的东西。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.wig || c.wig.error) return { display: "— (WIG probe failed)", pass: null };
+      const v = reducedMotionVerdict(c.wig);
+      if (!v.measured) return { display: "— 无对象", pass: null };
+      return {
+        display: "reduce 下仍在动 " + v.over + " 处 · 最长 " + v.max.toFixed(2) + "s · 扫描 " + (c.wig.reduce.scanned || 0) + " 元素" + (v.pass ? " ✓" : " — " + v.sample.slice(0, 3).join(", ")),
+        pass: v.pass,
+        note: v.sample.join(" | "),
+        detail: { over: v.over, maxS: v.max, sample: v.sample },
+      };
+    },
+  },
+  {
+    n: 51, title: "窄屏 input 字号 ≥16px（防 iOS 自动缩放）", modes: ["dark"],
+    parse: (t) => ({ max: pick(t.text, /每\s*capture\s*≤\s*(\d+)/, 0) }),
+    criterion: [
+      "**MASTER §12 行 51（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:28「Mobile input size. input font size is ≥ 16px on mobile to prevent iOS Safari auto-zoom/pan on focus.」）**：**窄屏（520 与 390）下 input / textarea / select 的计算字号必须 ≥ 16px**，违例数 **每 capture ≤0**。",
+      "**对象写清（本代已判过「规则的对象集必须与意图对齐」）**：**只有表单输入元素**，**不含**标题、标签、列表标题 —— 标准说的是 input，不是「所有文本」。侧栏 13/14px 的标题**不在本行对象内**。",
+      "**阈值 16px —— 依据：裁决**（标准原文给的就是这个数）。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.wig || c.wig.error) return { display: "— (WIG probe failed)", pass: null };
+      const v = inputFontVerdict(c.wig);
+      if (!v.measured) return { display: "— 窄屏无表单输入（0 个对象）", pass: null };
+      return {
+        display: "窄屏输入 " + v.samples + " 个 · 最小字号 " + v.min + "px" + (v.pass ? " ✓" : " — 低于 16px 的 " + v.bad.length + " 个：" + v.bad.slice(0, 3).map((b) => b.sel + "@" + b.viewport + "=" + b.fs + "px").join(", ")),
+        pass: v.pass,
+        detail: { samples: v.samples, min: v.min, bad: v.bad },
+      };
+    },
+  },
+  {
+    n: 52, title: "窄屏触摸目标 ≥44×44（移动端）", modes: ["dark"],
+    parse: (t) => ({ min: pick(t.text, /≥\s*(\d+)\s*×/, 44) }),
+    criterion: [
+      "**MASTER §12 行 52（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:27「Match visual & hit targets. … On mobile, the minimum size is 44px.」）**：**窄屏（520 与 390）下可点元素的命中盒必须 ≥44×44**，违例数 **每 capture ≤0**。",
+      "**对象**：button / a[href] / [role=button] / .icon-btn 中**可见**（非 display:none、非 0 尺寸）的元素。",
+      "**与行 18 的关系（写明，避免重复造）**：行 18 判「可交互元素 <32px」（**全站、含桌面**）；本行判「**窄屏下 ≥44px**」（标准给移动端的数）。**对象与阈值都不同**：一个管桌面最小 32，一个管移动最小 44。**不合并、也不重复**。",
+      "**阈值 44px —— 依据：裁决**（标准原文）。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.wig || c.wig.error) return { display: "— (WIG probe failed)", pass: null };
+      const v = touchTargetVerdict(c.wig, l.min);
+      if (!v.measured) return { display: "— 窄屏无可点元素（0 个对象）", pass: null };
+      return {
+        display: "窄屏可点 " + v.samples + " 个 · 最小 " + v.smallest.w + "×" + v.smallest.h + "px（" + v.smallest.sel + "）· 低于 " + l.min + "px 的 " + v.bad.length + " 个" + (v.pass ? " ✓" : " — " + v.bad.slice(0, 3).map((b) => b.sel + "@" + b.viewport + "=" + b.w + "×" + b.h).join(", ")),
+        pass: v.pass,
+        detail: { samples: v.samples, smallest: v.smallest, bad: v.bad, floor: l.min },
       };
     },
   },
@@ -4737,17 +4903,25 @@ function runSelfTest() {
       const contractRows = [...TH.rows.keys()].sort((a, b) => a - b);
       const onlyTool = toolRows.filter((n) => !contractRows.includes(n));
       const onlyContract = contractRows.filter((n) => !toolRows.includes(n));
-      check("reconcile: no contract row is left unjudged (contract promises a row nobody verifies)",
-        onlyContract.join(","), "");
-      check("reconcile: no row exists only in the tool either (every judge has a contract to be judged against)",
-        onlyTool.join(","), "");
+      // Both directions are named and asserted. A row the CONTRACT has but the
+      // tool does not judge is the more dangerous of the two -- the contract
+      // promises a check nobody runs -- so it is listed here by number rather
+      // than folded into one "everything is fine" line.
+      const PENDING_TOOL = [47, 48, 49];
+      check("reconcile: the contract rows the tool does not judge yet are named, and are exactly 47-49",
+        onlyContract.join(","), PENDING_TOOL.join(","));
+      check("reconcile: the tool rows still awaiting a contract entry are named, and are exactly 50-52",
+        onlyTool.join(","), "50,51,52");
       console.log("  reconcile: tool=" + toolRows.length + " contract=" + contractRows.length +
         " onlyTool=[" + onlyTool.join(",") + "] onlyContract=[" + onlyContract.join(",") + "]");
     }
     // 42/43/44 landed while t80 ran, 45 while t81 ran, 46 while t93 ran: the
     // pending list is empty again. Any row added ahead of its entry fails here.
-    const PENDING_ENTRY = [];
-    check("§12 parse: no row is awaiting a MASTER entry any more (rows 42-46 all landed)",
+    // 47/48/49 landed in the contract from t99's draft and are NOT yet judged
+    // here; 50/51/52 are this task's new rows and have no entry yet. Both gaps
+    // are named in the reconcile block above and in the --self-test output.
+    const PENDING_ENTRY = [50, 51, 52];
+    check("§12 parse: the rows still awaiting a MASTER entry are named, and are exactly 50-52",
       [...new Set(notInDoc.map((m) => Number(String(m).match(/^row(\d+)/)?.[1])))].sort((a, b) => a - b).join(","),
       PENDING_ENTRY.join(","));
     check("§12 parse: every row whose entry HAS landed reads its target out of the doc, not the fallback",
@@ -5371,6 +5545,35 @@ function runSelfTest() {
     /if \(restore\)/.test(probeSessionTitle.toString()) && /setViewportSize\(\{ width: restore/.test(probeSessionTitle.toString()), true);
   check("row46: the criterion states the 5em derivation and the not_measured boundary",
     /5em/.test(row46.criterion) && /not_measured/.test(row46.criterion), true);
+
+  // ---- rows 50-52: the measurable Web Interface Guidelines entries ---------
+  const row50 = CHECKS.find((r) => r.n === 50);
+  const row51 = CHECKS.find((r) => r.n === 51);
+  const row52 = CHECKS.find((r) => r.n === 52);
+  const wig = (over, maxT, sample) => ({ reduce: { over, maxTransitionS: maxT, maxAnimationS: 0, sample: sample || [], scanned: 100 }, narrow: [] });
+  check("row50 must-FAIL: an element still animating under reduce FAILS",
+    reducedMotionVerdict(wig(3, 0.2, ["div.ant-btn t=0.2s"])).pass, false);
+  check("row50 must-PASS: nothing animating under reduce PASSES",
+    reducedMotionVerdict(wig(0, 0)).pass, true);
+  check("row50: a failed probe is not_measured, never pass",
+    reducedMotionVerdict({ error: "boom" }).pass === null, true);
+  const wigNarrow = (inputs, targets) => ({ reduce: { over: 0, maxTransitionS: 0, maxAnimationS: 0, sample: [], scanned: 10 }, narrow: [{ viewport: 390, inputs, targets }] });
+  check("row51 must-FAIL: a 14px input on a narrow screen FAILS",
+    inputFontVerdict(wigNarrow([{ sel: "input[text]", fs: 14 }], [])).pass, false);
+  check("row51 must-PASS: a 16px input PASSES",
+    inputFontVerdict(wigNarrow([{ sel: "input[text]", fs: 16 }], [])).pass, true);
+  check("row51: no inputs at all is not_measured (0 objects is not verified compliant)",
+    inputFontVerdict(wigNarrow([], [])).pass === null, true);
+  check("row52 must-FAIL: a 32x32 target on a narrow screen FAILS the 44px floor",
+    touchTargetVerdict(wigNarrow([], [{ sel: "button.icon-btn", w: 32, h: 32 }]), 44).pass, false);
+  check("row52 must-PASS: a 44x44 target PASSES",
+    touchTargetVerdict(wigNarrow([], [{ sel: "button.icon-btn", w: 44, h: 44 }]), 44).pass, true);
+  check("row52: the floor is read out of the contract, not hardcoded",
+    row52.parse({ text: "窄屏命中盒 ≥44×44" }).min, 44);
+  check("row52: no targets at all is not_measured",
+    touchTargetVerdict(wigNarrow([], []), 44).pass === null, true);
+  check("rows50-52: the probe is wired into every capture",
+    /probeWig\(page/.test(auditRoute.toString()) && /^\s*wig,$/m.test(auditRoute.toString()), true);
 
   // ---- row 35: the breakpoint SET relationship (§12.16 + t80 ruling) -------
   // The superseded wording scored the live panel FAIL because 520 appeared on
