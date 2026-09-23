@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "i18n:check": "node e2e/i18n-check.mjs",
+    "build": "node e2e/i18n-check.mjs && tsc -b && vite build",
     "check": "tsc -b --noEmit",
     "test:e2e": "playwright test"
   },
