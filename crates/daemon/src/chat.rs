@@ -1279,7 +1279,7 @@ impl ChatManager {
                 && let Ok(rid) = e.id.parse::<RunId>()
             {
                 let lines =
-                    ruagent_store::read_transcript(&self.transcript_path(rid)).unwrap_or_default();
+                    ruagent_store::read_transcript(self.transcript_path(rid)).unwrap_or_default();
                 let n = lines
                     .iter()
                     .filter(|l| matches!(l.event, ruagent_core::RunEvent::UserMessage { .. }))
@@ -1719,5 +1719,91 @@ mod generating_tests {
             idle.active,
             "the chat is STILL held after the reply -- this is exactly the"
         );
+    }
+    /// t127: message_count must reflect the REAL state, not whatever the 60s
+    /// sessions-index has reached so far.
+    ///
+    /// The panel rule (t90: a chat with no messages is not a chat) reads this
+    /// field. A fresh database has no index row, and the daemon used to report
+    /// None -- which the rule reads as no messages and HIDES. A user who had
+    /// just sent their first message watched that conversation vanish from the
+    /// list. Real state and reported state disagreed.
+    ///
+    /// Both directions are asserted. (a) proves the rule was NOT relaxed: a
+    /// chat with no message still reports 0 and is still hidden. (b) proves
+    /// the fix: one message reports 1 at once, with no index row anywhere.
+    #[tokio::test]
+    async fn message_count_is_real_before_the_index_catches_up() {
+        let Some(mock) = mock_agent() else {
+            panic!("mock agent binary not built next to the test exe");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-count-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000003",
+            "name": "mock",
+            "harness": "mock",
+            "command": format!("{} --behavior echo", mock.display()),
+            "description": "test",
+            "model": null,
+            "reasoning_effort": null,
+            "context_window": null,
+            "mcp_profile": null,
+            "models": [],
+            "tags": [],
+            "enabled": true
+        }))
+        .unwrap();
+        let embedder: Arc<dyn ruagent_knowledge::embed::Embedder> =
+            Arc::new(ruagent_knowledge::embed::HashEmbedder::default());
+
+        // (a) REVERSE EVIDENCE: no message gives 0, NOT None, so the t90 rule
+        // still hides a genuinely empty chat. The rule was not relaxed; only
+        // the reported value was made true.
+        let empty = chats.start(&card, None, None).await.expect("start empty");
+        let h = chats.history(None, 50).await;
+        let e = h
+            .iter()
+            .find(|e| e.id == empty.id.to_string())
+            .expect("a fresh chat is still listed by the API");
+        assert_eq!(e.message_count, Some(0), "no message must be 0, never None");
+
+        // (b) THE FIX: one message gives 1 at once, with NO index row at all.
+        empty
+            .send_prompt(&db, embedder, "hello".into())
+            .await
+            .expect("send prompt");
+        // The transcript is written as the event lands, so poll briefly rather
+        // than assuming it is already flushed.
+        let mut seen = None;
+        for _ in 0..40 {
+            let h = chats.history(None, 50).await;
+            seen = h
+                .iter()
+                .find(|e| e.id == empty.id.to_string())
+                .and_then(|e| e.message_count);
+            if seen == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(seen, Some(1), "the count must be real at once");
     }
 }
