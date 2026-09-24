@@ -87,20 +87,33 @@ html[data-mode="dark"] {
   --ws-8: #d8ac5c;
   --ws-9: #9aa4b8;
   --ws-10: #c8877a;
-  /* Categorical kind palette for the graph canvas (3:1+ on surface). */
-  --graph-person: #eb827b;
-  --graph-org: #a495f0;
-  --graph-project: #00bcc5;
-  --graph-repo: #31be98;
-  --graph-tool: #6dba70;
-  --graph-concept: #c889d7;
-  --graph-product: #60aaf3;
+  /* Categorical kind palette for the graph canvas (3:1+ on surface).
+     t153: the nine kind colours were re-spread for colour-vision deficiency.
+     Measured before (Machado 2009 severity-1.0 simulation in linear RGB, CIE76
+     dE in Lab D65): the worst pair was person<->tool at dE 1.6 under
+     deuteranopia - effectively the same colour - and product<->protocol 4.3
+     under protanopia. Nine categories share one canvas, so the fix is to spread
+     them over BOTH hue and lightness: dichromats lose the red-green axis, and
+     lightness is the channel that survives. After (measured): the worst pair
+     over all 36 pairs x protanopia/deuteranopia/tritanopia is dE 12.6
+     (person<->repo protanopia 12.6, concept<->protocol 12.6, product<->protocol
+     deuteranopia 12.6), min normal-vision pair 22.5, min contrast vs the dark
+     canvas 5.27:1. Threshold dE >= 10 = the conventional "clearly different"
+     band for categorical colour, ~4x the CIE76 JND (~2.3); WCAG has no
+     colour-separation criterion of its own - 1.4.1 asks for a second channel,
+     which the canvas' node labels already provide. */
+  --graph-person: #e47980;
+  --graph-org: #9c8bf2;
+  --graph-project: #34ced2;
+  --graph-repo: #25b28d;
+  --graph-tool: #6bb461;
+  --graph-concept: #b671bd;
+  --graph-product: #87c3ee;
   /* G4 / §3.1 I: was #ca9d33, the palette's only warm-yellow - it read as the
-     signal ("running") in a view that has no such concept, and it is a real
-     node colour (one protocol entity renders today). Periwinkle family, hue 227
-     - the non-warm example view-graph.md §3 names: 7.76:1 on the dark canvas,
-     6.82:1 on the panel. */
-  --graph-protocol: #8fa3e8;
+     signal ("running") in a view that has no such concept. Still non-warm; the
+     periwinkle it became was too close to --graph-org (dE 5.9 under
+     deuteranopia), so t153 pulled it toward blue and left --graph-org violet. */
+  --graph-protocol: #8b9fe3;
   --graph-default: #838891;
   --graph-edge: rgba(255, 255, 255, 0.34);
   --graph-edge-hi: rgba(255, 255, 255, 0.55);
@@ -142,16 +155,20 @@ html[data-mode="light"] {
   --ws-8: #9c7c42;
   --ws-9: #6f7684;
   --ws-10: #906158;
-  --graph-person: #a74541;
-  --graph-org: #6959ae;
-  --graph-project: #007d86;
-  --graph-repo: #00805d;
-  --graph-tool: #2e7c35;
-  --graph-concept: #894d97;
-  --graph-product: #1f6cb0;
-  /* Same hue (229) darkened for the light palette, matching how every other
-     --graph-* flips: 4.65:1 on white, 4.34:1 on the light canvas. */
-  --graph-protocol: #5b6fc4;
+  /* t153: same re-spread as the dark set (see the note above), darkened for the
+     light canvas. Measured after: worst pair over all 36 pairs x the three CVD
+     types is dE 10.7 (repo<->product tritanopia 10.7, concept<->product
+     deuteranopia 10.8, concept<->product protanopia 11.3), min normal pair
+     18.5, min contrast vs the light canvas 4.51:1 (it was 4.34:1, so this is
+     also an improvement). */
+  --graph-person: #a74542;
+  --graph-org: #5e56ab;
+  --graph-project: #155265;
+  --graph-repo: #008251;
+  --graph-tool: #1a6a17;
+  --graph-concept: #874a91;
+  --graph-product: #3077aa;
+  --graph-protocol: #455ed2;
   --graph-default: #656a73;
   --graph-edge: rgba(15, 23, 42, 0.50);
   --graph-edge-hi: rgba(15, 23, 42, 0.55);
