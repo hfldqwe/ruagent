@@ -2124,3 +2124,61 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
      12.906, light 3.013 / 3.220 / 17.582 (tightest: light claude 3.013). */
   border: 1px solid color-mix(in srgb, currentColor 97%, transparent);
 }
+
+/* ---------------------------------------------------------------------------
+   S2 (docs/design/views/README.md:406): the sider splitter is ONE 1px rule
+   line, heavier on hover. rules-not-boxes: no card, no rounded block, and the
+   element stays <= 2px wide in every state including hover (the form criterion
+   reads width + border-radius).
+   No transition on purpose: the reduced-motion contract counts anything still
+   animating under prefers-reduced-motion, and a hover tint does not need one.
+   The 1023px gate mirrors the JS gate (draggable at viewport >= 1024): below
+   that the chat rail is a drawer, so a splitter would fight overflow-0. */
+.resize-handle {
+  position: relative;
+  flex: none;
+  align-self: stretch;
+  width: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: var(--rule-soft);
+  cursor: col-resize;
+  touch-action: none;
+}
+/* A 1px line is the contract's shape, but 1px is also nearly impossible to
+   grab: measured in the harness, the neighbouring content won the hit test at
+   the handle's own centre (Playwright reported "probe-content intercepts
+   pointer events"), so a drag could not even start. The GRAB AREA therefore
+   comes from a transparent pseudo-element - the same "enlarge the hit box, not
+   the visual" move t108 used for its 44px targets. The element itself stays
+   1px wide in every state (including hover), so the form criterion (element
+   width <= 2px, border-radius 0) still reads 1px; the pseudo paints nothing. */
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline: -5px;
+  z-index: 1;
+  background: transparent;
+}
+.resize-handle:hover,
+.resize-handle.dragging {
+  background: var(--rule);
+}
+.resize-handle:focus-visible {
+  outline: 1px solid var(--focus-ring);
+  outline-offset: 0;
+}
+.resize-handle[aria-disabled="true"] {
+  cursor: default;
+  /* The drag gate is ONE condition (viewport >= 1024, evaluated in the hook)
+     mirrored here through the same attribute the hook already sets. It is
+     deliberately NOT a second media query: adding 1023px would push the CSS
+     breakpoint set to five values and trip the breakpoint-set contract (row 35
+     measured "越界 1023 — 计数 5 > 4" when this was written as
+     @media (max-width: 1023px)). One gate, expressed once. */
+  display: none;
+}
+

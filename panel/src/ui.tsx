@@ -1,7 +1,7 @@
 // Shared UI bridge: our small primitives on top of antd. Views keep calling
 // useToast/Modal/Empty/Spinner — the implementations are antd's now.
 
-import { useEffect, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, App as AntApp, Button, Empty as AntEmpty, Modal as AntModal, Spin } from "antd";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -381,3 +381,237 @@ export function Markdown({ children }: { children: string }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// S2: draggable sider splitter (contract: docs/design/views/README.md:406)
+// ---------------------------------------------------------------------------
+// Shared mechanism only. Which column renders the handle, and what it does with
+// the returned width, belongs to App.tsx / Chat.tsx. The rules live here so the
+// wiring cannot get them wrong:
+//   * never dragged  => width stays null => the owner keeps its own default and
+//     writes NO inline width (228 / 248 stay bit-identical to today);
+//   * min = the default itself (the contract derives it: the nav footer already
+//     wraps at 228, and the chat rail's label collapses below 248);
+//   * max = min(2 x default, viewport - other column - 390). 390 is the
+//     measured narrowest usable content width; 2x is a DESIGN RULING (marked as
+//     such in the contract, not a measurement);
+//   * draggable only at viewport >= 1024: below that the chat rail is a drawer,
+//     so dragging would fight the overflow-0 contract;
+//   * APG window splitter: focusable, role=separator, aria-orientation=vertical,
+//     aria-valuenow/min/max, arrows step 8px, Home/End jump to the bounds.
+
+const RESIZE_STEP = 8;
+const RESIZE_CONTENT_MIN = 390;
+const RESIZE_GATE = 1024;
+
+const resizeKey = (id: string) => "ruagent.sidebar." + id;
+
+function readStoredWidth(id: string): number | null {
+  try {
+    const raw = window.localStorage.getItem(resizeKey(id));
+    if (raw === null) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Viewport width, kept in state so the drag gate reacts to a window resize. */
+export function useViewportWidth(): number {
+  const [w, setW] = useState(() =>
+    typeof window === "undefined" ? RESIZE_GATE : window.innerWidth,
+  );
+  useEffect(() => {
+    const onResize = () => setW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return w;
+}
+
+export interface SidebarResizeOptions {
+  /** Storage suffix: the width persists under "ruagent.sidebar.<id>". */
+  id: string;
+  /** The default width. It is also the minimum - see the contract derivation. */
+  def: number;
+  /** The OTHER column's current width, for the max formula. */
+  other: number;
+  contentMin?: number;
+  /** Owner-side gate (e.g. "the sider is collapsed, do not drag"). */
+  enabled?: boolean;
+  /** Set for a column whose handle sits on its LEFT edge. */
+  invert?: boolean;
+}
+
+export interface SidebarResize {
+  /** null until the user drags: the owner must then render its own default. */
+  width: number | null;
+  /** width ?? def, clamped - what aria-valuenow reports. */
+  value: number;
+  min: number;
+  max: number;
+  canDrag: boolean;
+  dragging: boolean;
+  setWidth: (w: number) => void;
+  reset: () => void;
+  /** Spread onto <ResizeHandle {...handleProps} label={...} />. */
+  handleProps: {
+    value: number;
+    min: number;
+    max: number;
+    disabled: boolean;
+    invert: boolean;
+    dragging: boolean;
+    onChange: (w: number) => void;
+    onDragStateChange: (dragging: boolean) => void;
+  };
+}
+
+export function useSidebarResize({
+  id,
+  def,
+  other,
+  contentMin = RESIZE_CONTENT_MIN,
+  enabled = true,
+  invert = false,
+}: SidebarResizeOptions): SidebarResize {
+  const viewport = useViewportWidth();
+  const [stored, setStored] = useState<number | null>(() => readStoredWidth(id));
+  const [dragging, setDragging] = useState(false);
+  const min = def;
+  const max = Math.max(min, Math.min(2 * def, viewport - other - contentMin));
+  const clamp = useCallback((w: number) => Math.min(max, Math.max(min, Math.round(w))), [max, min]);
+  const canDrag = enabled && viewport >= RESIZE_GATE;
+  const width = stored === null ? null : clamp(stored);
+  const value = width === null ? min : width;
+  const setWidth = useCallback(
+    (w: number) => {
+      const next = clamp(w);
+      setStored(next);
+      try {
+        window.localStorage.setItem(resizeKey(id), String(next));
+      } catch {
+        /* Storage is a nicety here, never a gate: a private-mode failure must
+           not break dragging. */
+      }
+    },
+    [clamp, id],
+  );
+  const reset = useCallback(() => {
+    setStored(null);
+    try {
+      window.localStorage.removeItem(resizeKey(id));
+    } catch {
+      /* see setWidth */
+    }
+  }, [id]);
+  return {
+    width,
+    value,
+    min,
+    max,
+    canDrag,
+    dragging,
+    setWidth,
+    reset,
+    handleProps: {
+      value,
+      min,
+      max,
+      disabled: !canDrag,
+      invert,
+      dragging,
+      onChange: setWidth,
+      onDragStateChange: setDragging,
+    },
+  };
+}
+
+export interface ResizeHandleProps {
+  value: number;
+  min: number;
+  max: number;
+  /** Required: the wiring owns i18n, this file does not add dictionary keys. */
+  label: string;
+  disabled?: boolean;
+  invert?: boolean;
+  dragging?: boolean;
+  onChange: (w: number) => void;
+  onDragStateChange?: (dragging: boolean) => void;
+}
+
+/**
+ * APG window splitter, rendered as the contract's 1px rule line (rules-not-boxes:
+ * the element stays <= 2px wide in every state, including hover).
+ */
+export function ResizeHandle({
+  value,
+  min,
+  max,
+  label,
+  disabled = false,
+  invert = false,
+  dragging = false,
+  onChange,
+  onDragStateChange,
+}: ResizeHandleProps) {
+  const origin = useRef<{ x: number; w: number } | null>(null);
+  const dir = invert ? -1 : 1;
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      onChange(value - dir * RESIZE_STEP);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      onChange(value + dir * RESIZE_STEP);
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      onChange(min);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      onChange(max);
+    }
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (disabled || e.button !== 0) return;
+    e.preventDefault();
+    origin.current = { x: e.clientX, w: value };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    onDragStateChange?.(true);
+  };
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const from = origin.current;
+    if (!from) return;
+    onChange(from.w + dir * (e.clientX - from.x));
+  };
+  const endDrag = () => {
+    if (!origin.current) return;
+    origin.current = null;
+    onDragStateChange?.(false);
+  };
+
+  return (
+    <div
+      className={"resize-handle" + (dragging ? " dragging" : "")}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={value}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-disabled={disabled || undefined}
+      tabIndex={disabled ? -1 : 0}
+      onKeyDown={onKeyDown}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
+    />
+  );
+}
+
