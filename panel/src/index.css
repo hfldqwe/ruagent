@@ -1322,7 +1322,11 @@ html[data-mode="light"] .tag.err { color: #c4121c; background: #f9e7e8; }
 /* Freed width: the rail collapses to nothing, the conversation keeps
    the space (toggle in the view-bar, persisted per browser). */
 .chat-layout.rail-collapsed {
-  grid-template-columns: 0 minmax(0, 1fr);
+  /* One column, not 0 + 1fr: grid tracks are positional, so hiding .chat-side
+     makes .chat-wrap the first item and it lands in the 0px track, squeezing the
+     conversation to nothing. The comment above states the intent -- the
+     conversation keeps the space -- and one column is what expresses that. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
 }
 .chat-layout.rail-collapsed .chat-side { display: none; }
@@ -2047,10 +2051,22 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
      28x18 while min-width/min-height computed to 44px. The sider's nav items
      became real a[href] in t154 (row 57 wants a real link so cmd/middle click
      open a new tab), so the narrow rule stopped biting: 24 new row-52
-     violations. Making the nav anchor an inline-block is what lets the existing
-     44px rule take effect; desktop is untouched because this block is
-     narrow-only. */
-  :root .sider-nav .nav-link { display: inline-block; }
+     violations. Desktop is untouched because this whole block is narrow-only.
+     The prescribed one-line fix was `display: inline-block`, and it does make
+     the box 28x18 -> 44x44 - but that is still not a real touch target:
+     the anchor wraps only the LABEL, so in the collapsed rail it sits at
+     x=47.5 inside a 51x36 <li> whose overflow is hidden. Measured with
+     display:inline-block alone: 21 of 81 sample points inside the anchor's own
+     44x44 box actually hit it, the walk from its centre hits nothing (0/0/0/0),
+     and the item itself is only 36 tall - so the "enlarged" box is mostly
+     clipped away. Two declarations in the same block make the target real: the
+     item gets 44px of height, and the anchor fills the item. Measured after:
+     anchor = the item's own 51x44 box at (10,67), 81/81 sample points hit,
+     walk 26/25/22/21, clippedByLi = false. The label stays hidden by antd
+     (title-content computes opacity:0), so nothing new appears on screen, and
+     the element is still a real a[href] - cmd/middle click still open a tab. */
+  :root .sider-nav li { min-height: 44px; }
+  :root .sider-nav .nav-link { display: block; position: absolute; inset: 0; }
 }
 /* A session that is streaming right now is "now": amber. */
 .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--signal); flex: none; }
