@@ -662,6 +662,9 @@ const zh: Record<string, string> = {
   // own injection headers. It says what the row IS and when it happened — it
   // never pretends to be something the user wrote.
   "sessions.systemName": "（含平台上下文的历史会话）· {d}",
+  // S10: at <=520 a row keeps one primary action and one menu, so the menu's
+  // accessible name has to say WHICH row it belongs to (never a bare 「更多」).
+  "sessions.more": "更多操作（{name}）",
   "sessions.archivedToast": "已归档 · 文件未被改动，可随时取消归档",
   "sessions.unarchivedToast": "已取消归档",
   "sessions.deletedToast": "已从索引中删除",
@@ -1350,6 +1353,7 @@ const en: Record<string, string> = {
   "sessions.showSystem": "Show system sessions ({n})",
   "sessions.onlySystem": "System sessions only",
   "sessions.systemName": "(historical session with platform context) · {d}",
+  "sessions.more": "More actions ({name})",
   "sessions.archivedToast": "Archived · no file was changed, and you can undo this",
   "sessions.unarchivedToast": "Unarchived",
   "sessions.deletedToast": "Removed from the index",

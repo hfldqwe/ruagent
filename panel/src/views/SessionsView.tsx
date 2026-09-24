@@ -6,7 +6,7 @@
 // The page's own notes live at the top of Sessions.tsx.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Input, Popconfirm, Segmented, Select } from "antd";
+import { Button, Dropdown, Input, Popconfirm, Segmented, Select } from "antd";
 import { api, type ArchivedMode, type SessionRecord } from "../api";
 import { dateOf, useI18n } from "../i18n";
 import { Icon } from "../icons";
@@ -14,6 +14,7 @@ import {
   Empty,
   ErrorState,
   IconButton,
+  Modal,
   ReadoutStrip,
   RelTime,
   Spinner,
@@ -490,6 +491,39 @@ function RowList({
      8px-per-button growth would take a 3-action row's title from 41px to 17px
      — trading a hit-target win for a worse reading win. */
   const actionCls = narrow ? undefined : "icon-btn-lg";
+  /** Key of the row whose narrow-screen "more" menu is open (S10). Tracked so
+   *  the trigger can carry aria-expanded and so only one menu is open at once. */
+  const [moreOpen, setMoreOpen] = useState<string | null>(null);
+  /** The row a narrow-screen delete is waiting on. The wide row confirms with
+   *  an inline Popconfirm; a menu item cannot host one (the menu closes on
+   *  click), so the narrow path confirms in the page's own Modal instead —
+   *  same copy, same two-step discipline, and it still touches no file. */
+  const [confirmDelete, setConfirmDelete] = useState<SessionRecord | null>(null);
+  /** The "more" trigger that opened the current menu. antd hands focus back to
+   *  the trigger only when the trigger kept it; once the menu takes focus (see
+   *  below) Esc drops focus to <body> instead, so the page has to return it —
+   *  view-sessions S10 ④ and the house rule for overlays (row 22) both ask for
+   *  the trigger. One menu is open at a time, so one ref is enough. */
+  const lastTrigger = useRef<HTMLElement | null>(null);
+  /** Which row's wide delete confirm is open (t130 rev=1). antd's Popconfirm
+   *  ignores Escape, and MASTER:767 ("键盘：Escape 关闭浮层") does not exempt
+   *  it: a keyboard user could open a destructive confirm and be stuck inside
+   *  it. Scope is deliberately that one behaviour — Escape closes it and hands
+   *  focus back to the button that opened it (row 22 family); nothing else
+   *  about the Popconfirm changes. */
+  const [confirmPop, setConfirmPop] = useState<string | null>(null);
+  const popTrigger = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!confirmPop) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setConfirmPop(null);
+      requestAnimationFrame(() => popTrigger.current?.focus());
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [confirmPop]);
   const card = useRef<HTMLDivElement>(null);
   const [range, setRange] = useState<[number, number]>(() => [0, Math.min(rows.length, 40)]);
 
@@ -537,12 +571,28 @@ function RowList({
           role="button"
           tabIndex={0}
           onClick={(e) => {
-            // An action button owns its click; without this the row opened
-            // the viewer on every archive/delete/distill press too.
-            if ((e.target as HTMLElement).closest(".icon-btn")) return;
+            // Two guards, both measured. (1) The narrow "more" menu lives in a
+            // portal, so its clicks bubble through the REACT tree and land here
+            // even though the item is not a DOM descendant of this row —
+            // activating 归档 from the menu also opened the viewer. Only react
+            // to clicks inside the row's own subtree. (2) An action button owns
+            // its click; without this the row opened the viewer on every
+            // archive/delete/distill press too.
+            const el = e.target as HTMLElement;
+            if (!e.currentTarget.contains(el)) return;
+            if (el.closest(".icon-btn")) return;
             onOpen(s, e.currentTarget);
           }}
           onKeyDown={(e) => {
+            // The same two guards the click has: a focused row control owns its
+            // own Enter/Space, and a key pressed inside the portal menu is not
+            // this row's. Measured without the first one — Enter on the narrow
+            // "more" trigger bubbled here and opened the viewer instead of the
+            // menu, so the menu was mouse-only. It was already true of the
+            // distill and archive buttons.
+            const el = e.target as HTMLElement;
+            if (!e.currentTarget.contains(el)) return;
+            if (el.closest(".icon-btn")) return;
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
               onOpen(s, e.currentTarget);
@@ -621,45 +671,182 @@ function RowList({
             disabled={distilling === s.key}
             onClick={() => void onDistill(s)}
           />
-          {/* Archive is a ruagent-side hide and works for every source: it
-              writes one row in the daemon's own table and touches no file. */}
-          <IconButton
-            label={s.archived ? t("sessions.unarchiveHint") : t("sessions.archiveHint")}
-            title={s.archived ? t("sessions.unarchiveHint") : t("sessions.archiveHint")}
-            icon={s.archived ? "unarchive" : "archive"}
-            size={14}
-            className={actionCls}
-            disabled={busy === s.key}
-            onClick={() => void onArchive(s, !s.archived)}
-          />
-          {/* No delete control at all for the other tools' histories: the row
-              is an index of a file ruagent must not remove, so offering the
-              button (even disabled) would misdescribe what ruagent can do. */}
-          {s.deletable ? (
-            <Popconfirm
-              title={t("sessions.deleteConfirm")}
-              description={t("sessions.deleteConfirmHint")}
-              okText={t("sessions.delete")}
-              cancelText={t("common.cancel")}
-              okButtonProps={{ danger: true }}
-              onConfirm={() => void onDelete(s)}
+          {narrow ? (
+            /* S10 (ii) — a narrow row carries exactly two controls: the primary
+               action above, and this menu. At <=520 the shared layer raises
+               every button to the 44px touch target (index.css, the t108
+               block), and three of them wrapped the row to 114px, i.e. three
+               sessions per screen. Both halves of that conflict are real
+               requirements — the 44px target (95/97 elements were under it) and
+               the list's scanability — so the secondary actions move one tap
+               deeper instead of either one giving way. Each menu item still
+               clears 44px (a two-line label), because shrinking them would
+               just move the touch defect inside the menu. */
+            <Dropdown
+              trigger={["click"]}
+              open={moreOpen === s.key}
+              onOpenChange={(o) => {
+                setMoreOpen(o ? s.key : null);
+                if (!o) {
+                  lastTrigger.current?.focus();
+                  lastTrigger.current = null;
+                  return;
+                }
+                lastTrigger.current = document.activeElement as HTMLElement | null;
+                /* antd renders the menu with tabindex="0" but does not move
+                   focus into it when the trigger is activated by Enter, so the
+                   arrow keys went nowhere (measured: ArrowDown left the active
+                   item on the first entry, i.e. the second action could not be
+                   reached without a mouse). Only one menu is open at a time
+                   (moreOpen), so this query is unambiguous; Esc hands focus
+                   back to the trigger on its own. */
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() =>
+                    document.querySelector<HTMLElement>(".ant-dropdown-menu")?.focus(),
+                  ),
+                );
+              }}
+              menu={{
+                /* Focus the menu when it opens, so the keyboard path works
+                   end to end: Enter opens it, the arrow keys move between
+                   items, Esc closes it and hands focus back to the trigger
+                   (measured without this: Enter opened the menu but focus
+                   stayed on the trigger and the arrows did nothing). */
+                autoFocus: true,
+                items: [
+                  {
+                    key: "archive",
+                    label: (
+                      <span>
+                        {s.archived ? t("sessions.unarchive") : t("sessions.archive")}
+                        <br />
+                        <span className="micro muted">
+                          {s.archived
+                            ? t("sessions.unarchiveHint")
+                            : t("sessions.archiveHint")}
+                        </span>
+                      </span>
+                    ),
+                    onClick: () => void onArchive(s, !s.archived),
+                  },
+                  ...(s.deletable
+                    ? [
+                        {
+                          key: "delete",
+                          danger: true,
+                          label: (
+                            <span>
+                              {t("sessions.delete")}
+                              <br />
+                              <span className="micro muted">
+                                {t("sessions.deleteHint")}
+                              </span>
+                            </span>
+                          ),
+                          onClick: () => setConfirmDelete(s),
+                        },
+                      ]
+                    : []),
+                ],
+              }}
             >
+              {/* A host <button>, not IconButton: antd's Dropdown clones its
+                  child to inject aria-haspopup / aria-expanded, and IconButton
+                  takes a fixed prop list, so the injected attributes would be
+                  dropped. Same .icon-btn class, so the row keeps one shape. */}
               <button
                 type="button"
-                className={actionCls ? "icon-btn " + actionCls : "icon-btn"}
-                aria-label={t("sessions.deleteHint")}
-                title={t("sessions.deleteHint")}
-                disabled={busy === s.key}
+                className="icon-btn"
+                aria-label={t("sessions.more", { name: sessionName(s, t) })}
+                aria-haspopup="menu"
+                aria-expanded={moreOpen === s.key}
+                title={t("sessions.more", { name: sessionName(s, t) })}
               >
-                <Icon name="trash" size={14} />
+                ⋯
               </button>
-            </Popconfirm>
-          ) : null}
+            </Dropdown>
+          ) : (
+            <>
+              {/* Archive is a ruagent-side hide and works for every source: it
+                  writes one row in the daemon's own table and touches no file. */}
+              <IconButton
+                label={s.archived ? t("sessions.unarchiveHint") : t("sessions.archiveHint")}
+                title={s.archived ? t("sessions.unarchiveHint") : t("sessions.archiveHint")}
+                icon={s.archived ? "unarchive" : "archive"}
+                size={14}
+                className={actionCls}
+                disabled={busy === s.key}
+                onClick={() => void onArchive(s, !s.archived)}
+              />
+              {/* No delete control at all for the other tools' histories: the
+                  row is an index of a file ruagent must not remove, so offering
+                  the button (even disabled) would misdescribe what ruagent can
+                  do. */}
+              {s.deletable ? (
+                <Popconfirm
+                  title={t("sessions.deleteConfirm")}
+                  description={t("sessions.deleteConfirmHint")}
+                  okText={t("sessions.delete")}
+                  cancelText={t("common.cancel")}
+                  okButtonProps={{ danger: true }}
+                  /* Controlled so the Escape handler above can close it. */
+                  open={confirmPop === s.key}
+                  onOpenChange={(o) => setConfirmPop(o ? s.key : null)}
+                  onConfirm={() => void onDelete(s)}
+                >
+                  <button
+                    type="button"
+                    className={actionCls ? "icon-btn " + actionCls : "icon-btn"}
+                    aria-label={t("sessions.deleteHint")}
+                    title={t("sessions.deleteHint")}
+                    disabled={busy === s.key}
+                    /* Remember the trigger for the Escape hand-back; antd
+                       chains this with its own click handler. */
+                    onClick={(e) => {
+                      popTrigger.current = e.currentTarget;
+                    }}
+                  >
+                    <Icon name="trash" size={14} />
+                  </button>
+                </Popconfirm>
+              ) : null}
+            </>
+          )}
         </div>
       ))}
       {end < rows.length && (
         <div style={{ height: (rows.length - end) * ROW_H }} aria-hidden="true" />
       )}
+      {/* The narrow "more" menu's delete confirm (S10): the wide row confirms
+          in an inline Popconfirm, but a menu item cannot host one — the menu
+          closes on click. Same copy and the same two-step discipline, in the
+          page's own Modal. */}
+      {confirmDelete ? (
+        <Modal
+          title={t("sessions.deleteConfirm")}
+          onClose={() => setConfirmDelete(null)}
+          footer={
+            <span className="row tight">
+              <span className="grow" />
+              <Button onClick={() => setConfirmDelete(null)}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                danger
+                onClick={() => {
+                  const s = confirmDelete;
+                  setConfirmDelete(null);
+                  void onDelete(s);
+                }}
+              >
+                {t("sessions.delete")}
+              </Button>
+            </span>
+          }
+        >
+          <p className="muted">{t("sessions.deleteConfirmHint")}</p>
+        </Modal>
+      ) : null}
     </div>
   );
 }
