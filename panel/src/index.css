@@ -2042,6 +2042,15 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
     min-width: 44px;
     min-height: 44px;
   }
+  /* t158: the rule above is the author's intent for anchors, but an anchor is
+     display:inline and an inline box IGNORES min-width/min-height - measured
+     28x18 while min-width/min-height computed to 44px. The sider's nav items
+     became real a[href] in t154 (row 57 wants a real link so cmd/middle click
+     open a new tab), so the narrow rule stopped biting: 24 new row-52
+     violations. Making the nav anchor an inline-block is what lets the existing
+     44px rule take effect; desktop is untouched because this block is
+     narrow-only. */
+  :root .sider-nav .nav-link { display: inline-block; }
 }
 /* A session that is streaming right now is "now": amber. */
 .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--signal); flex: none; }
