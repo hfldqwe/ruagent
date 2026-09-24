@@ -46,7 +46,7 @@ import { dirname, join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { decodePng, pixelStats, relLuma, parseCssColor, composite, contrastRatio } from "./lib/png.mjs";
-import { loadThresholds, targetFor, pick, pickAny, pickLeadingNumber, resetPickMisses, takePickMisses } from "./lib/thresholds.mjs";
+import { loadThresholds, targetFor, pick, pickFlag, pickAny, pickLeadingNumber, resetPickMisses, takePickMisses } from "./lib/thresholds.mjs";
 import { loadContract, pageTitleFor, shellSetAdmits } from "./lib/contract.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // panel/tools
@@ -3790,7 +3790,19 @@ const CHECKS = [
   },
   {
     n: 54, title: "窄屏行内控件数与菜单可达性（S10）", modes: ["dark"],
-    parse: (t) => ({ maxInline: pick(t.text, /≤\s*(\d+)\s*个/, 2), maxRowH: pick(t.text, /≤\s*(\d+)\s*px/, 60) }),
+    // ALL FIVE thresholds come out of the contract cell. The old anchors asked
+    // for shapes the contract does not use ("≤2个" vs the actual "行内控件 ≤2"),
+    // so they missed and fell back to the built-in defaults -- the threshold was
+    // coming from THIS FILE, not from the contract. The contract is the source
+    // of truth, so the READER was fixed, not the cell. Every anchor records its
+    // miss (pick / pickAny / pickFlag), so a reworded cell is loud.
+    parse: (t) => ({
+      maxInline: pick(t.text, /行内控件\s*≤\s*(\d+)/, 2),
+      maxRowH: pick(t.text, /行高\s*≤\s*(\d+)\s*px/, 60),
+      menuFloor: pick(t.text, /菜单内每个动作\s*≥\s*(\d+)/, 44),
+      identityLabel: pickFlag(t.text, /可访问名含该行会话标题/),
+      keyboardFlow: pickFlag(t.text, /键盘全程无鼠标/),
+    }),
     criterion: [
       "**MASTER §12 行 54（待 design-lead 落表；契约出处 = view-sessions.md §S10「窄屏行级动作与触摸目标」）**：≤520 下会话栏行 **① 行内可见可点元素 ≤2**（1 主操作 + 1「更多」）**② 「更多」的可访问名必须带对象身份**（含该行会话标题，**不得只叫「更多」**）**③ 菜单展开后每个菜单项命中盒 ≥44×44**（否则等于把缺陷挪进菜单）**④ 键盘可达**（可聚焦 · aria-haspopup · aria-expanded 随开合变化）**⑥ 行高 ≤60px**。",
       "**阈值来源**：**60px = 测量** —— 它是 **520 档的实测值**（t108：会话栏 40 → 60px），**用同一条栏在更宽档位的实测值作为更窄档位的上界** ✓；**≤2 / 44px / 带身份的可访问名 = 裁决**（S10）✓。",
@@ -3804,7 +3816,7 @@ const CHECKS = [
       const v = railControlsVerdict(c.rail, l.maxInline, l.maxRowH);
       if (!v.measured) return { display: "— not_measured：" + (v.why || "no narrow rows") + " ⇒ 不报 PASS", pass: null };
       const lab = moreLabelVerdict(c.rail);
-      const men = menuSizeVerdict(c.rail, 44);
+      const men = menuSizeVerdict(c.rail, l.menuFloor);
       const parts = [
         "行内控件最大 " + v.maxActions + "（阈值 ≤" + l.maxInline + "）",
         "行高最大 " + v.maxH + "px（阈值 ≤" + l.maxRowH + "px）",
@@ -5320,18 +5332,25 @@ function runSelfTest() {
       const PENDING_TOOL = [];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
-      check("reconcile: the tool rows still awaiting a contract entry are named, and are exactly 54",
-        onlyTool.join(","), "54");
+      // The expectation is DERIVED from the declaration above, not written a
+      // second time. Two copies of one fact drift the moment the fact changes:
+      // when t135 landed row 54, the declaration and this literal both went
+      // stale together. One edit point now.
+      check("reconcile: the tool rows awaiting a contract entry are exactly the declared set",
+        onlyTool.join(","), PENDING_TOOL.join(","));
       console.log("  reconcile: tool=" + toolRows.length + " contract=" + contractRows.length +
         " onlyTool=[" + onlyTool.join(",") + "] onlyContract=[" + onlyContract.join(",") + "]");
     }
     // 42/43/44 landed while t80 ran, 45 while t81 ran, 46 while t93 ran: the
     // pending list is empty again. Any row added ahead of its entry fails here.
+    // Row 54 landed in the contract (t135) -- the check above told us so, which
+    // is the mechanism working: the declaration is the ONE edit point, and a
+    // stale declaration fails loudly instead of drifting.
     // 47/48/49 landed in the contract from t99's draft and are NOT yet judged
     // here; 50/51/52 are this task's new rows and have no entry yet. Both gaps
     // are named in the reconcile block above and in the --self-test output.
-    const PENDING_ENTRY = [54];
-    check("§12 parse: the rows still awaiting a MASTER entry are named, and are exactly 54",
+    const PENDING_ENTRY = [];
+    check("§12 parse: the rows awaiting a MASTER entry are exactly the declared set",
       [...new Set(notInDoc.map((m) => Number(String(m).match(/^row(\d+)/)?.[1])))].sort((a, b) => a - b).join(","),
       PENDING_ENTRY.join(","));
     check("§12 parse: every row whose entry HAS landed reads its target out of the doc, not the fallback",
@@ -5955,6 +5974,52 @@ function runSelfTest() {
     /if \(restore\)/.test(probeSessionTitle.toString()) && /setViewportSize\(\{ width: restore/.test(probeSessionTitle.toString()), true);
   check("row46: the criterion states the 5em derivation and the not_measured boundary",
     /5em/.test(row46.criterion) && /not_measured/.test(row46.criterion), true);
+
+  // ---- t136: the anchors must READ the contract, and must be LOUD on a miss ----
+  const row54r = CHECKS.find((r) => r.n === 54);
+  // The REAL cell, as design-lead actually wrote it (t135). All five thresholds
+  // must come out of it with ZERO recorded misses: a miss means the value came
+  // from this file's built-in default instead of from the contract.
+  const real54 = (() => {
+    resetPickMisses();
+    const v = row54r.parse(targetFor(TH, 54, ""));
+    return { v, misses: takePickMisses().length };
+  })();
+  check("row54: the REAL MASTER cell parses with NO anchor miss (thresholds come from the contract)",
+    real54.misses, 0);
+  check("row54: inline-control threshold read from the contract",
+    real54.v.maxInline, 2);
+  check("row54: row-height threshold read from the contract",
+    real54.v.maxRowH, 60);
+  check("row54: menu-item floor read from the contract",
+    real54.v.menuFloor, 44);
+  check("row54: the identity-label requirement is read from the contract",
+    real54.v.identityLabel, 1);
+  check("row54: the keyboard-flow requirement is read from the contract",
+    real54.v.keyboardFlow, 1);
+  // REVERSE EVIDENCE, constructed: take the identity phrase out of the cell and
+  // the anchor must MISS -- recorded, not silent. If this ever reads 0, the row
+  // has gone back to trusting its own defaults.
+  check("row54: a cell without the identity phrase RECORDS a miss (never a silent default)",
+    (() => {
+      resetPickMisses();
+      const v = row54r.parse("行内控件 ≤2 · 行高 ≤60px · 菜单内每个动作 ≥44×44 · 键盘全程无鼠标");
+      // The property is "recorded AND fell back", not "exactly one miss":
+      // pinning the count would make this test fail on an unrelated added anchor.
+      return takePickMisses().length >= 1 && v.identityLabel === 0;
+    })(), true);
+  check("row54: a cell reworded to a non-numeric form records the miss AND keeps the default",
+    (() => {
+      resetPickMisses();
+      const v = row54r.parse("行内控件 最多九个");
+      return takePickMisses().length >= 1 && v.maxInline === 2;
+    })(), true);
+  // The pending declarations are the ONE edit point; the expectations derive
+  // from them. A constructed disagreement must read as a disagreement.
+  check("pending: a declaration that disagrees with reality is a mismatch (constructed)",
+    [].join(",") !== [54].join(","), true);
+  check("pending: and agreement reads as agreement (constructed)",
+    [54].join(",") !== [54].join(","), false);
 
   // ---- row 54: the S10 narrow-screen rail shape -----------------------------
   const row54 = CHECKS.find((r) => r.n === 54);

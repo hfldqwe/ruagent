@@ -68,9 +68,23 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: panel/package-lock.json
+      - name: Install
+        working-directory: panel
+        run: npm ci
+      # The audit guards 54 criteria by parsing thresholds out of the contract.
+      # Its self-test is the only thing that can catch the two ways that guard
+      # goes silently wrong: an anchor that stops matching the contract cell and
+      # falls back to a built-in default, and the reconcile declaration drifting
+      # from the expected value. Both happened on 2026-09-24 and were found only
+      # because a human re-ran this by hand.
+      # It is a separate step so a failure names the instrument, not the build.
+      # 433ms, no browser, no daemon, no network: the self-test branch never
+      # reaches chromium.launch, so it does not need Playwright's browsers.
+      - name: Audit self-test
+        working-directory: panel
+        run: node tools/design-audit.mjs --self-test
       - name: Typecheck + build
         working-directory: panel
         run: |
-          npm ci
           npx tsc -b
           npm run build

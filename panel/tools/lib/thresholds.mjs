@@ -65,6 +65,20 @@ export function takePickMisses() {
  * contract drift when it is not. This tries each phrasing and records a miss
  * only when NONE of them match.
  */
+/// A PRESENCE anchor: 1 when the phrase is in the contract cell, else the
+/// fallback -- and the miss is recorded exactly like pick/pickAny.
+///
+/// Row 54 has two thresholds that are not numbers (the accessible name must
+/// carry the row identity; the keyboard path must exist). They still have to be
+/// read from the contract: a reworded cell must show up as a RECORDED MISS,
+/// never as a silent built-in default. That is the failure this file exists to
+/// prevent, and a flag is as much a threshold as a number is.
+export function pickFlag(text, re, fallback = 0) {
+  if (re.test(String(text ?? ""))) return 1;
+  pickMisses.push({ re: String(re), fallback });
+  return fallback;
+}
+
 export function pickAny(text, res, fallback) {
   for (const re of res) {
     const m = String(text ?? "").match(re);
