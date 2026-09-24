@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Dropdown, Input, Popconfirm, Segmented, Select } from "antd";
-import { api, type ArchivedMode, type SessionRecord } from "../api";
+import { api, type SessionRecord } from "../api";
 import { dateOf, useI18n } from "../i18n";
 import { Icon } from "../icons";
 import {
@@ -126,10 +126,14 @@ export function Sessions() {
   const [ws, setWs] = useState<string>(fromUrl.ws); // workspace (= project)
   const [when, setWhen] = useState<string>(fromUrl.when); // time window
   const [q, setQ] = useState(""); // keyword
-  // Which archived sessions the daemon should return. The hide marker lives
-  // server-side, so this is a real query parameter and not a local flag.
-  const [archivedMode, setArchivedMode] = useState<ArchivedMode>("exclude");
+  /* t170: archived sessions have their own place and never appear in this list,
+     so the list always asks the daemon for the non-archived set. The count is
+     what the 归档 entry shows. */
   const [archivedCount, setArchivedCount] = useState(0);
+  /** The separate archive destination. It does its own read-only fetch, so
+   *  opening it never changes what the list is showing. */
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveRows, setArchiveRows] = useState<SessionRecord[] | null>(null);
   /** S7 — which platform-generated sessions the list shows. The counterpart of
    *  archivedMode, and local (not a daemon query parameter) because the page
    *  already holds every row: the origin rules are pure predicates over the
@@ -205,7 +209,7 @@ export function Sessions() {
 
   const load = useCallback(async () => {
     try {
-      const r = await api.sessionsList({ archived: archivedMode });
+      const r = await api.sessionsList({ archived: "exclude" });
       setState({ kind: "ready", rows: r.sessions, at: Date.now() });
       // `?? 0` is not defensive noise: an older daemon without the field
       // answered undefined, and the label rendered the literal string
@@ -225,7 +229,7 @@ export function Sessions() {
             },
       );
     }
-  }, [archivedMode]);
+  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => setSlow(true), 200);
@@ -342,6 +346,23 @@ export function Sessions() {
     }
   };
 
+  /* t170 — the archive destination reads the archived set itself. Read-only:
+     it never changes what the list is showing. */
+  const loadArchived = useCallback(async () => {
+    try {
+      const r = await api.sessionsList({ archived: "only" });
+      setArchiveRows(r.sessions);
+      setArchivedCount(r.archived_count ?? 0);
+    } catch {
+      // An empty destination is the honest reading of a failed fetch here; the
+      // list itself keeps its own error state.
+      setArchiveRows([]);
+    }
+  }, []);
+  useEffect(() => {
+    if (archiveOpen) void loadArchived();
+  }, [archiveOpen, loadArchived]);
+
   const openRow = (s: SessionRecord, el: HTMLElement | null) => {
     trigger.current = el;
     setOpen(s);
@@ -433,27 +454,23 @@ export function Sessions() {
           ]}
         />
         <span className="grow" />
-        {/* A Select, not a Segmented: the three labels are long enough that a
-            segmented control is 377px wide, and a 390px phone only has 294px
-            of column (measured: +71px of horizontal overflow). A Select
-            ellipsises instead of pushing the page sideways.
-            Row 58: this mode is deliberately NOT encoded in the URL (the
-            source tab and the system tri-state are). Measured today its three
-            values render the same list — archived_count is 0 — so it is not a
-            state that changes what you are looking at. If archived rows ever
-            exist it would change the list, and this is then the one view state
-            that a shared URL would not replay: flagged to the captain. */}
-        <Select
-          value={archivedMode}
-          onChange={(v) => setArchivedMode(v as ArchivedMode)}
-          aria-label={t("sessions.archived")}
-          style={{ minWidth: 160 }}
-          options={[
-            { value: "exclude", label: t("sessions.hideArchived") },
-            { value: "include", label: t("sessions.showArchived", { n: archivedCount }) },
-            { value: "only", label: t("sessions.onlyArchived") },
-          ]}
-        />
+        {/* t170 — the user's ruling: archived sessions are stored SEPARATELY
+            and must not be shown back in this list. So there is no "show
+            archived" control any more; this is an ENTRY to their own place, and
+            the list never contains them. (The three-state Select that used to
+            sit here is gone. Its i18n keys stay: this file may only add keys,
+            and removing them is a separate call.) The count is in the label so
+            the entry still says how much is over there. */}
+        <Button
+          className="sessions-archive-entry"
+          onClick={() => setArchiveOpen(true)}
+          aria-label={t("sessions.archivedEntry", { n: archivedCount })}
+        >
+          <Icon name="archive" size={14} />
+          <span className="muted">
+            {t("sessions.archivedEntry", { n: archivedCount })}
+          </span>
+        </Button>
         {/* S7: the sessions the platform generated for itself (throwaway
             vision-bridge workspaces, memory-distillation runs) are out of the
             default list, and this is the explicit way back to them — the same
@@ -539,6 +556,48 @@ export function Sessions() {
             />
           )}
         </>
+      )}
+
+      {/* t170 — the archive destination. Archived sessions are stored and
+          listed HERE and nowhere else; the list above always asks the daemon
+          for the non-archived set, so they can never be mixed back in. Undoing
+          an archive uses the same daemon call the row button makes. */}
+      {archiveOpen && (
+        <Modal
+          title={t("sessions.archivedTitle")}
+          onClose={() => setArchiveOpen(false)}
+        >
+          <p className="muted micro">{t("sessions.archivedNote")}</p>
+          {archiveRows === null ? (
+            <Spinner label={t("common.loading")} />
+          ) : archiveRows.length === 0 ? (
+            <p className="muted">{t("sessions.archivedEmpty")}</p>
+          ) : (
+            <div className="card">
+              {archiveRows.map((s) => (
+                <div key={s.key} className="row tight">
+                  <span className="title">{sessionName(s, t)}</span>
+                  <span className="muted micro">
+                    {SOURCE_LABEL[s.source] ?? s.source}
+                    {s.project ? " · " + s.project : ""} · {s.message_count}{" "}
+                    {t("sessions.messages")}
+                  </span>
+                  <span className="grow" />
+                  <Button
+                    size="small"
+                    disabled={busy === s.key}
+                    onClick={async () => {
+                      await setArchived(s, false);
+                      await loadArchived();
+                    }}
+                  >
+                    {t("sessions.unarchive")}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
       )}
 
       {open && <SessionDetail session={open} onClose={closeRow} />}

@@ -641,7 +641,7 @@ const zh: Record<string, string> = {
   // The shape channel (t160): the canvas draws these nine shapes from the
   // same table the legend renders, so silhouette carries kind without colour.
   "graph.legend": "形状即类型",
-  "graph.zoomHint": "滚轮缩放 · 拖拽空白处平移 · 双击空白处重置视图",
+  "graph.zoomHint": "滚轮缩放（窄屏 Ctrl+滚轮）· 拖拽空白处平移 · 双击空白处重置视图",
   "graph.kind.person": "人物",
   "graph.kind.org": "组织",
   "graph.kind.project": "项目",
@@ -673,6 +673,12 @@ const zh: Record<string, string> = {
   "sessions.hideArchived": "隐藏已归档",
   "sessions.showArchived": "显示已归档（{n}）",
   "sessions.onlyArchived": "只看已归档",
+  // t170: the user's ruling — archived sessions are stored separately, not
+  // mixed back into the list. The entry leads to their own place.
+  "sessions.archivedEntry": "归档（{n}）",
+  "sessions.archivedTitle": "已归档的会话",
+  "sessions.archivedNote": "已归档的会话只在这里出现，不会混回会话列表。",
+  "sessions.archivedEmpty": "还没有已归档的会话",
   // Contract S7: the platform's own sessions (throwaway vision-bridge
   // workspaces, memory-distillation runs) are hidden by default and reachable
   // through this control — the same three-state shape as the archived trio.
@@ -1360,7 +1366,7 @@ const en: Record<string, string> = {
   "graph.err.hint": "The daemon is unreachable or the endpoint errored. That is not the same as “the graph is empty”.",
   "graph.stale.hint": "Showing the last successful read; retry to refresh.",
   "graph.legend": "Shape = kind",
-  "graph.zoomHint": "Wheel to zoom · drag empty space to pan · double-click empty space to reset",
+  "graph.zoomHint": "Wheel to zoom (Ctrl+wheel on narrow screens) · drag empty space to pan · double-click to reset",
   "graph.kind.person": "Person",
   "graph.kind.org": "Organization",
   "graph.kind.project": "Project",
@@ -1386,6 +1392,10 @@ const en: Record<string, string> = {
   "sessions.hideArchived": "Hide archived",
   "sessions.showArchived": "Show archived ({n})",
   "sessions.onlyArchived": "Archived only",
+  "sessions.archivedEntry": "Archived ({n})",
+  "sessions.archivedTitle": "Archived sessions",
+  "sessions.archivedNote": "Archived sessions appear only here — they are never mixed back into the list.",
+  "sessions.archivedEmpty": "Nothing is archived yet",
   "sessions.system": "System sessions",
   "sessions.hideSystem": "Hide system sessions",
   "sessions.showSystem": "Show system sessions ({n})",
