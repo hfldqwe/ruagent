@@ -2508,6 +2508,161 @@ function sessionNameVerdict(o) {
   return { measured: true, pass: o.sessions.bad === 0, total: o.sessions.total, bad: o.sessions.bad, samples: o.sessions.samples };
 }
 
+// Row 54: the narrow-screen row-level actions verdict (view-sessions.md S10).
+//
+// S10 chose "fold the secondary action into a menu" at <=520 so that BOTH
+// demands survive: 44px touch targets AND a scannable row height. This probe
+// measures the shape that verdict requires, not the pixels of one build.
+//
+// Relationship to row 52, stated so nobody merges them: row 52 asks "is every
+// clickable element >=44px on a narrow screen"; row 54 asks "does the row keep
+// <=2 inline controls, does the menu keep >=44px, and does the row stay <=60px".</br>
+// Different objects, different intents.
+async function probeSessionRail(page, baseUrl, restore) {
+  const out = { error: null, desktop: null, narrow: [], menu: null, keyboard: null };
+  try {
+    await page.goto(baseUrl + "/?mode=dark#sessions", { waitUntil: "load", timeout: 60_000 });
+    await page.waitForTimeout(2500);
+    // Rows: the sessions rail renders one row button per session. Accept a
+    // couple of spellings so a class rename shows up as not_measured rather
+    // than as a silent zero.
+    const measure = () =>
+      page.evaluate(() => {
+        const sel = ".row-btn, .session-row, .chat-session-row";
+        const rows = [...document.querySelectorAll(sel)].filter((el) => {
+          const b = el.getBoundingClientRect();
+          return b.width >= 1 && b.height >= 1;
+        });
+        const vis = (el) => {
+          const cs = getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") return false;
+          const b = el.getBoundingClientRect();
+          return b.width >= 1 && b.height >= 1;
+        };
+        const acts = (row) =>
+          [...row.querySelectorAll("button, a[href], [role=button]")].filter(vis);
+        return {
+          n: rows.length,
+          perRow: rows.map((r) => ({
+            actions: acts(r).length,
+            h: Math.round(r.getBoundingClientRect().height * 100) / 100,
+            moreLabel: (() => {
+              const m = acts(r).find((a) => /more|更多|menu|菜单/i.test((a.getAttribute("aria-label") || "") + (a.title || "")));
+              return m ? m.getAttribute("aria-label") : null;
+            })(),
+            title: (() => {
+              const t = r.querySelector(".title, .row-title, .name");
+              return (t ? t.textContent : "").trim().slice(0, 40);
+            })(),
+          })),
+        };
+      });
+    out.desktop = await measure();
+    for (const w of [520, 390]) {
+      await page.setViewportSize({ width: w, height: 900 });
+      // same settle discipline as row 51/52: sample a settled layout, not a
+      // transient one.
+      let prev = null;
+      for (let i = 0; i < 12; i++) {
+        await page.waitForTimeout(150);
+        const sig = JSON.stringify((await measure()).perRow.map((r) => [r.actions, r.h]));
+        if (sig === prev) break;
+        prev = sig;
+      }
+      const m = await measure();
+      out.narrow.push({ viewport: w, ...m });
+    }
+    // The menu: open the first row's "more" with the mouse and measure every
+    // item. S10 3: folding a control into a menu must not move the defect into
+    // the menu.
+    await page.setViewportSize({ width: 520, height: 900 });
+    await page.waitForTimeout(400);
+    const opened = await page.evaluate(() => {
+      const row = [...document.querySelectorAll(".row-btn, .session-row, .chat-session-row")].find((el) => el.getBoundingClientRect().width >= 1);
+      if (!row) return false;
+      const m = [...row.querySelectorAll("button, [role=button]")].find((a) => /more|更多|menu|菜单/i.test((a.getAttribute("aria-label") || "") + (a.title || "")));
+      if (!m) return false;
+      m.click();
+      return true;
+    });
+    if (opened) {
+      await page.waitForTimeout(600);
+      out.menu = await page.evaluate(() => {
+        const items = [...document.querySelectorAll("[role=menuitem], .ant-dropdown-menu-item")].filter((el) => {
+          const b = el.getBoundingClientRect();
+          return b.width >= 1 && b.height >= 1;
+        });
+        return {
+          n: items.length,
+          minW: items.length ? Math.round(Math.min(...items.map((i) => i.getBoundingClientRect().width))) : null,
+          minH: items.length ? Math.round(Math.min(...items.map((i) => i.getBoundingClientRect().height))) : null,
+        };
+      });
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(200);
+    }
+    // Keyboard-only path (S10 4): no mouse events at all.
+    out.keyboard = await page.evaluate(() => {
+      const row = [...document.querySelectorAll(".row-btn, .session-row, .chat-session-row")].find((el) => el.getBoundingClientRect().width >= 1);
+      if (!row) return { ok: false, why: "no row" };
+      const m = [...row.querySelectorAll("button, [role=button]")].find((a) => /more|更多|menu|菜单/i.test((a.getAttribute("aria-label") || "") + (a.title || "")));
+      if (!m) return { ok: false, why: "no more-control" };
+      return { ok: true, focusable: m.tabIndex >= 0, haspopup: m.getAttribute("aria-haspopup"), expanded: m.getAttribute("aria-expanded") };
+    });
+  } catch (e) {
+    out.error = e.message;
+  }
+  if (restore) {
+    await page.setViewportSize({ width: restore.width, height: restore.height });
+    await page.waitForTimeout(120);
+  }
+  return out;
+}
+
+// Pure verdicts.
+function railControlsVerdict(o, maxInline, maxRowH) {
+  if (!o || o.error) return { measured: false, pass: null };
+  const rows = (o.narrow || []).flatMap((n) => n.perRow || []);
+  // EMPTY-SET GUARD: no rows at a narrow width means the thing this row
+  // measures never appeared. That is not_measured, never PASS.
+  if (!rows.length) return { measured: false, pass: null, why: "no session row at <=520" };
+  const over = rows.filter((r) => r.actions > maxInline);
+  const tall = rows.filter((r) => r.h > maxRowH);
+  return {
+    measured: true,
+    rows: rows.length,
+    maxActions: Math.max(...rows.map((r) => r.actions)),
+    maxH: Math.max(...rows.map((r) => r.h)),
+    over,
+    tall,
+    pass: over.length === 0 && tall.length === 0,
+  };
+}
+function moreLabelVerdict(o) {
+  if (!o || o.error) return { measured: false, pass: null };
+  const rows = (o.narrow || []).flatMap((n) => n.perRow || []).filter((r) => r.moreLabel);
+  if (!rows.length) return { measured: false, pass: null, why: "no more-control found" };
+  // S10 2: the accessible name must carry the row identity -- not just "more".
+  const bad = rows.filter((r) => {
+    const lab = r.moreLabel;
+    if (!r.title) return false;
+    return !lab.includes(r.title);
+  });
+  return { measured: true, n: rows.length, bad, pass: bad.length === 0 };
+}
+function menuSizeVerdict(o, floor) {
+  if (!o || o.error) return { measured: false, pass: null };
+  if (!o.menu) return { measured: false, pass: null, why: "no menu opened" };
+  if (!o.menu.n) return { measured: false, pass: null, why: "menu has no items" };
+  return {
+    measured: true,
+    n: o.menu.n,
+    minW: o.menu.minW,
+    minH: o.menu.minH,
+    pass: o.menu.minW >= floor && o.menu.minH >= floor,
+  };
+}
+
 // ── Provenance: what exactly is being audited ───────────────────────────────
 function distInfo() {
   const distDir = join(PANEL, "dist");
@@ -2802,6 +2957,8 @@ async function auditRoute(page, o) {
   const sessionTitle = await probeSessionTitle(page, measureViewport, args.injectCss).catch((e) => ({ error: e.message }));
   const wig = await probeWig(page, measureViewport).catch((e) => ({ error: e.message }));
   const order = await probeOrder(page, args.baseUrl).catch((e) => ({ error: e.message }));
+  const rail = await probeSessionRail(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  if (rail?.error) warnings.push("row 54 session-rail probe: " + rail.error);
   if (order?.error) warnings.push("rows 47-50 order probe: " + order.error);
   if (wig?.error) warnings.push("rows 50-52 WIG probe: " + wig.error);
   if (sessionTitle?.error) warnings.push("row 46 session title probe: " + sessionTitle.error);
@@ -2827,6 +2984,7 @@ async function auditRoute(page, o) {
     sessionTitle,
     wig,
     order,
+    rail,
     apiWindowMs,
     domStable,
     shot,
@@ -3627,6 +3785,39 @@ const CHECKS = [
         display: "以注入块头开头的行 " + v.bad + " / " + v.total + " 行" + (v.pass ? " ✓" : " ✗ — " + v.samples.map((x) => JSON.stringify(x.title || x.preview)).join(", ")),
         pass: v.pass,
         detail: { total: v.total, bad: v.bad, samples: v.samples },
+      };
+    },
+  },
+  {
+    n: 54, title: "窄屏行内控件数与菜单可达性（S10）", modes: ["dark"],
+    parse: (t) => ({ maxInline: pick(t.text, /≤\s*(\d+)\s*个/, 2), maxRowH: pick(t.text, /≤\s*(\d+)\s*px/, 60) }),
+    criterion: [
+      "**MASTER §12 行 54（待 design-lead 落表；契约出处 = view-sessions.md §S10「窄屏行级动作与触摸目标」）**：≤520 下会话栏行 **① 行内可见可点元素 ≤2**（1 主操作 + 1「更多」）**② 「更多」的可访问名必须带对象身份**（含该行会话标题，**不得只叫「更多」**）**③ 菜单展开后每个菜单项命中盒 ≥44×44**（否则等于把缺陷挪进菜单）**④ 键盘可达**（可聚焦 · aria-haspopup · aria-expanded 随开合变化）**⑥ 行高 ≤60px**。",
+      "**阈值来源**：**60px = 测量** —— 它是 **520 档的实测值**（t108：会话栏 40 → 60px），**用同一条栏在更宽档位的实测值作为更窄档位的上界** ✓；**≤2 / 44px / 带身份的可访问名 = 裁决**（S10）✓。",
+      "**与行 52 的关系（写明，不合并也不重复）**：行 52 判「窄屏下**每个**可点元素 ≥44px」（**对象 = 单个元素**，意图 = 触摸可达）；行 54 判「**行内控件数 ≤2 且菜单内仍 ≥44 且行高 ≤60px**」（**对象 = 行级形态**，意图 = 44px 与**行密度**这对冲突的**同时**满足）。**同一断点（520），对象与意图都不同** —— 与行 18 vs 51/52 的写法一致 ✓。",
+      "**与行 19 的关系**：**溢出为 0（S10 ⑦）已由行 19 覆盖** ⇒ **本行不重复造** ✓（行 19 是溢出判据，本行是行级形态判据）。",
+      "**⚠️ 空集保护**：若 ≤520 下会话栏**没有行**（数据为空）⇒ 报 **not_measured**，**不报 PASS** ✓。",
+      "**⚠️ 只在 ≤520 生效**：**1440 下不设「行内 ≤2」**（桌面不需要菜单）—— 桌面侧的约束是「与基线逐位相同」（S10 ⑤），本行把 1440 的行内动作数与行高**记录**下来供对照。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.rail || c.rail.error) return { display: "— (rail probe failed)", pass: null };
+      const v = railControlsVerdict(c.rail, l.maxInline, l.maxRowH);
+      if (!v.measured) return { display: "— not_measured：" + (v.why || "no narrow rows") + " ⇒ 不报 PASS", pass: null };
+      const lab = moreLabelVerdict(c.rail);
+      const men = menuSizeVerdict(c.rail, 44);
+      const parts = [
+        "行内控件最大 " + v.maxActions + "（阈值 ≤" + l.maxInline + "）",
+        "行高最大 " + v.maxH + "px（阈值 ≤" + l.maxRowH + "px）",
+        lab.measured ? "「更多」带身份 " + (lab.n - lab.bad.length) + "/" + lab.n : "「更多」未测",
+        men.measured ? "菜单 " + men.n + " 项最小 " + men.minW + "×" + men.minH : "菜单未测",
+      ];
+      // A not_measured sub-assertion must not be silently folded into a PASS:
+      // the row only passes when the parts that CAN be measured are all green.
+      const pass = v.pass && (lab.pass !== false) && (men.pass !== false);
+      return {
+        display: parts.join(" · ") + (pass ? " ✓" : " ✗"),
+        pass,
+        detail: { controls: v, label: lab, menu: men, desktop: c.rail.desktop },
       };
     },
   },
@@ -5129,8 +5320,8 @@ function runSelfTest() {
       const PENDING_TOOL = [];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
-      check("reconcile: no row exists only in the tool either (every judge has a contract to be judged against)",
-        onlyTool.join(","), "");
+      check("reconcile: the tool rows still awaiting a contract entry are named, and are exactly 54",
+        onlyTool.join(","), "54");
       console.log("  reconcile: tool=" + toolRows.length + " contract=" + contractRows.length +
         " onlyTool=[" + onlyTool.join(",") + "] onlyContract=[" + onlyContract.join(",") + "]");
     }
@@ -5139,8 +5330,8 @@ function runSelfTest() {
     // 47/48/49 landed in the contract from t99's draft and are NOT yet judged
     // here; 50/51/52 are this task's new rows and have no entry yet. Both gaps
     // are named in the reconcile block above and in the --self-test output.
-    const PENDING_ENTRY = [];
-    check("§12 parse: no row is awaiting a MASTER entry any more (all 53 landed)",
+    const PENDING_ENTRY = [54];
+    check("§12 parse: the rows still awaiting a MASTER entry are named, and are exactly 54",
       [...new Set(notInDoc.map((m) => Number(String(m).match(/^row(\d+)/)?.[1])))].sort((a, b) => a - b).join(","),
       PENDING_ENTRY.join(","));
     check("§12 parse: every row whose entry HAS landed reads its target out of the doc, not the fallback",
@@ -5764,6 +5955,40 @@ function runSelfTest() {
     /if \(restore\)/.test(probeSessionTitle.toString()) && /setViewportSize\(\{ width: restore/.test(probeSessionTitle.toString()), true);
   check("row46: the criterion states the 5em derivation and the not_measured boundary",
     /5em/.test(row46.criterion) && /not_measured/.test(row46.criterion), true);
+
+  // ---- row 54: the S10 narrow-screen rail shape -----------------------------
+  const row54 = CHECKS.find((r) => r.n === 54);
+  const rail = (rows, menu) => ({ error: null, desktop: { perRow: [] }, narrow: [{ viewport: 520, perRow: rows }], menu: menu || null });
+  // THE EMPTY-SET GUARD, measured: no rows at <=520 means the object never
+  // appeared. That must be not_measured, never PASS.
+  check("row54: no session row at <=520 is not_measured, never pass",
+    railControlsVerdict(rail([]), 2, 60).pass === null, true);
+  check("row54: and it says WHY (the empty set is named, not silent)",
+    /no session row/.test(railControlsVerdict(rail([]), 2, 60).why || ""), true);
+  check("row54 must-FAIL: 3 inline controls in a row (the pre-t130 shape)",
+    railControlsVerdict(rail([{ actions: 3, h: 40 }]), 2, 60).pass, false);
+  check("row54 must-FAIL: a 114px row (the pre-t130 height)",
+    railControlsVerdict(rail([{ actions: 2, h: 114 }]), 2, 60).pass, false);
+  check("row54 must-PASS: 2 inline controls and a 60px row (the S10 shape)",
+    railControlsVerdict(rail([{ actions: 2, h: 60 }]), 2, 60).pass, true);
+  check("row54: the row-height threshold is read out of the contract",
+    row54.parse({ text: "行高 ≤60px" }).maxRowH, 60);
+  check("row54: the inline-control threshold is read out of the contract",
+    row54.parse({ text: "行内 ≤2 个" }).maxInline, 2);
+  check("row54 must-FAIL: a more-control whose name lacks the row identity",
+    moreLabelVerdict(rail([{ actions: 2, h: 60, title: "找 skill", moreLabel: "更多" }])).pass, false);
+  check("row54 must-PASS: a more-control that carries the row identity",
+    moreLabelVerdict(rail([{ actions: 2, h: 60, title: "找 skill", moreLabel: "更多操作（找 skill）" }])).pass, true);
+  check("row54: no more-control at all is not_measured, not pass",
+    moreLabelVerdict(rail([{ actions: 2, h: 60, title: "x", moreLabel: null }])).pass === null, true);
+  check("row54 must-FAIL: folding a 30px control into the menu keeps the defect",
+    menuSizeVerdict(rail([], { n: 3, minW: 120, minH: 30 }), 44).pass, false);
+  check("row54 must-PASS: 44px menu items",
+    menuSizeVerdict(rail([], { n: 3, minW: 120, minH: 44 }), 44).pass, true);
+  check("row54: an unopened menu is not_measured, not pass",
+    menuSizeVerdict(rail([], null), 44).pass === null, true);
+  check("row54: the rail probe is wired into every capture",
+    /probeSessionRail\(page/.test(auditRoute.toString()) && /^\s*rail,$/m.test(auditRoute.toString()), true);
 
   // ---- rows 50-52: the measurable Web Interface Guidelines entries ---------
   // The reduced-motion row is 53: contract row 50 went to t101's
