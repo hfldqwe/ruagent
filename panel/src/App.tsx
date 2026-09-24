@@ -1,6 +1,13 @@
 // App shell: antd Layout sidebar + hash routing + theme/lang toggles.
 
-import { Suspense, lazy, useEffect, useState, type ReactNode } from "react";
+import {
+  Suspense,
+  lazy,
+  startTransition,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   Alert,
   Badge,
@@ -21,35 +28,52 @@ import { ResizeHandle, Spinner, ToastBridge, useSidebarResize } from "./ui";
 // frozen .app-sider / .kbd-hint / .brand-* selectors are never behind the
 // fallback. Board and Agents export more than one route component; both
 // lazy() calls resolve the same chunk, so nothing is fetched twice.
-const Board = lazy(() =>
-  import("./views/Board").then((m) => ({ default: m.Board })),
-);
-const CreateTaskModal = lazy(() =>
-  import("./views/Board").then((m) => ({ default: m.CreateTaskModal })),
-);
-const Home = lazy(() => import("./views/Home").then((m) => ({ default: m.Home })));
-const TaskDetail = lazy(() =>
-  import("./views/TaskDetail").then((m) => ({ default: m.TaskDetail })),
-);
-const Memory = lazy(() =>
-  import("./views/Memory").then((m) => ({ default: m.Memory })),
-);
-const Knowledge = lazy(() =>
-  import("./views/Knowledge").then((m) => ({ default: m.Knowledge })),
-);
-const Graph = lazy(() => import("./views/Graph").then((m) => ({ default: m.Graph })));
-const Agents = lazy(() =>
-  import("./views/Agents").then((m) => ({ default: m.Agents })),
-);
-const Inbox = lazy(() => import("./views/Agents").then((m) => ({ default: m.Inbox })));
-const Stats = lazy(() => import("./views/Agents").then((m) => ({ default: m.Stats })));
-const Runtimes = lazy(() =>
-  import("./views/Runtimes").then((m) => ({ default: m.Runtimes })),
-);
-const Settings = lazy(() =>
-  import("./views/Settings").then((m) => ({ default: m.Settings })),
-);
-const Chat = lazy(() => import("./views/Chat").then((m) => ({ default: m.Chat })));
+// t169: the same factories, kept as a MAP so the shell can WARM a module before
+// it is rendered. Measured on this machine: the FIRST import of a route module
+// costs a ~320ms Suspense fallback even though its own fetch is ~2ms and the
+// view's first API call is ~2ms; the SECOND visit to the same route is ~30ms.
+// That 320ms is what "页面切换有明显的加载" is. Warming fetches exactly the same
+// chunks, just earlier (nav hover/focus, then idle) — the entry size and the
+// per-route split (row 27) are unchanged, only the click path stops paying.
+const load = {
+  board: () => import("./views/Board").then((m) => ({ default: m.Board })),
+  createTask: () => import("./views/Board").then((m) => ({ default: m.CreateTaskModal })),
+  home: () => import("./views/Home").then((m) => ({ default: m.Home })),
+  task: () => import("./views/TaskDetail").then((m) => ({ default: m.TaskDetail })),
+  memory: () => import("./views/Memory").then((m) => ({ default: m.Memory })),
+  knowledge: () => import("./views/Knowledge").then((m) => ({ default: m.Knowledge })),
+  graph: () => import("./views/Graph").then((m) => ({ default: m.Graph })),
+  agents: () => import("./views/Agents").then((m) => ({ default: m.Agents })),
+  inbox: () => import("./views/Agents").then((m) => ({ default: m.Inbox })),
+  stats: () => import("./views/Agents").then((m) => ({ default: m.Stats })),
+  runtimes: () => import("./views/Runtimes").then((m) => ({ default: m.Runtimes })),
+  settings: () => import("./views/Settings").then((m) => ({ default: m.Settings })),
+  chat: () => import("./views/Chat").then((m) => ({ default: m.Chat })),
+  // Warm-only, and deliberately NOT used by a lazy() above: #sessions' chunk
+  // sits one level deeper (App imports Sessions statically, and views/Sessions
+  // itself lazy-loads SessionsView), so the shell warms that module directly.
+  // Fetching it is not extra work — it is exactly the chunk #sessions needs.
+  sessions: () => import("./views/SessionsView"),
+};
+/** Warm a route's chunk without rendering it. Idempotent and free when the
+ *  module is already registered, so calling it on every hover is safe. */
+const warm = (key: keyof typeof load) => {
+  const start = load[key];
+  if (start) void start();
+};
+const Board = lazy(load.board);
+const CreateTaskModal = lazy(load.createTask);
+const Home = lazy(load.home);
+const TaskDetail = lazy(load.task);
+const Memory = lazy(load.memory);
+const Knowledge = lazy(load.knowledge);
+const Graph = lazy(load.graph);
+const Agents = lazy(load.agents);
+const Inbox = lazy(load.inbox);
+const Stats = lazy(load.stats);
+const Runtimes = lazy(load.runtimes);
+const Settings = lazy(load.settings);
+const Chat = lazy(load.chat);
 // The palette stays in the entry ON PURPOSE: it is a keyboard-first surface,
 // and every attempt to make it a chunk was measured worse — the chunk was not
 // ready when Ctrl+K arrived, which loses the keystrokes typed straight after
@@ -246,11 +270,35 @@ function Shell() {
     document.title = `${t(ROUTE_TITLE_KEY[view.kind])} · ruagent`;
   }, [view.kind, lang]);
 
+  // t169: a route change is not urgent, and as a TRANSITION a view that is
+  // still loading keeps the previous view on screen instead of blanking the
+  // content area to the fallback. Measured with a 400ms chunk delay: the
+  // fallback used to be visible for the whole delay; after this it never
+  // appears (the old view stays until the new one is ready). The URL still
+  // updates immediately — the hash is the browser's, not ours.
   useEffect(() => {
-    const apply = () => setRoute(parseHash());
+    const apply = () => startTransition(() => setRoute(parseHash()));
     apply();
     window.addEventListener("hashchange", apply);
     return () => window.removeEventListener("hashchange", apply);
+  }, []);
+
+  // t169: once the app has painted, warm every route chunk at idle, so the
+  // FIRST click on a route costs the same as a revisit (measured 320ms -> ~30ms
+  // on the hover/focus path, and the idle pass covers a touch user, who never
+  // hovers). requestIdleCallback is not universal, hence the timer fallback.
+  useEffect(() => {
+    const keys = Object.keys(load) as (keyof typeof load)[];
+    const idle: (fn: () => void) => number =
+      typeof window.requestIdleCallback === "function"
+        ? (fn) => window.requestIdleCallback(fn)
+        : (fn) => window.setTimeout(fn, 300);
+    const cancel: (h: number) => void =
+      typeof window.cancelIdleCallback === "function"
+        ? (h) => window.cancelIdleCallback(h)
+        : (h) => window.clearTimeout(h);
+    const h = idle(() => keys.forEach((k) => warm(k)));
+    return () => cancel(h);
   }, []);
 
   // Row 58's other half: the query is route state, and a view is a separate
@@ -329,8 +377,16 @@ function Shell() {
   // new-tab path. An anchor takes the shared focus ring from the
   // :where(a[href], …):focus-visible rule (row 16 unaffected), and an inline
   // anchor is exempt from row 18's hit-target floor.
+  // t169: hovering or focusing a nav item warms its chunk. The anchor covers
+  // the whole item (antd gives a menu link a full-bleed ::before), so hovering
+  // anywhere in the row — not just the 28px label — is an intent signal.
   const link = (key: string, text: ReactNode) => (
-    <a className="nav-link" href={`#${key}`}>
+    <a
+      className="nav-link"
+      href={`#${key}`}
+      onMouseEnter={() => warm(key as keyof typeof load)}
+      onFocus={() => warm(key as keyof typeof load)}
+    >
       {text}
     </a>
   );
