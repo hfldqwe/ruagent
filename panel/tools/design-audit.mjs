@@ -147,7 +147,42 @@ async function probeFailureState(page, o) {
     await page.goto(o.url, { waitUntil: "load", timeout: 60_000 });
     await page.reload({ waitUntil: "load", timeout: 60_000 });
     out.hash = await page.evaluate(() => location.hash);
-    await page.waitForTimeout(2500);
+    // t150: a FIXED SLEEP is a probability, not a guarantee -- three people hit
+    // the same shape independently (h1=0 / sider width null / an empty rail) and
+    // each time a judge read an EMPTY SET and either mis-red or landed on
+    // not_measured, which costs the judge its signal. So wait for a STABLE READY
+    // SIGNAL instead: the app shell is mounted AND the view has rendered its
+    // heading (measured across 26 captures: every route has exactly one h1 and an
+    // .app-sider). Polling is bounded, and if the signal never arrives the
+    // capture is marked NOT READY -- the judges then report not_measured naming
+    // that reason, instead of photographing an unrendered page and calling it a
+    // defect.
+    const READY_TIMEOUT_MS = 15_000;
+    let ready = false;
+    let readyAt = null;
+    const readyT0 = Date.now();
+    for (;;) {
+      const st = await page.evaluate(() => ({
+        sider: !!document.querySelector("aside.app-sider, .app-sider"),
+        h1: document.querySelectorAll("h1").length,
+      }));
+      if (st.sider && st.h1 >= 1) {
+        ready = true;
+        readyAt = Date.now() - readyT0;
+        break;
+      }
+      if (Date.now() - readyT0 > READY_TIMEOUT_MS) break;
+      await page.waitForTimeout(100);
+    }
+    out.ready = ready;
+    out.readyMs = readyAt;
+    if (!ready) {
+      warnings.push("capture " + o.url + ": page never reached the ready signal within " + READY_TIMEOUT_MS + "ms" +
+        " (no .app-sider or no h1) -- its judges must report not_measured, not read an empty set");
+    }
+    // A short post-ready settle for layout only. The readiness signal above is
+    // the mechanism; this is not a substitute for it.
+    await page.waitForTimeout(300);
     const seen = await page.evaluate(() => {
       const vis = (el) => {
         const r = el.getBoundingClientRect();
@@ -4140,6 +4175,12 @@ const CHECKS = [
     parse: (t) => ({
       expected: pick(t.text, /恰好\s*(\d+)\s*个/, 1),
       minVp: pick(t.text, /≥\s*(\d+)/, 1024),
+      // NOTE (t150): the object-set definition (accessible name starts with the
+      // collapse verb; containment scoping) lives in the 判定法 column, NOT in
+      // this threshold cell -- so it cannot be anchored from here. Reported to
+      // the captain rather than silently asserted, and the contract was NOT
+      // edited to suit this reader. The probe's rules are documented in the
+      // criterion text below until a second-cell reader exists.
     }),
     criterion: [
       "**MASTER §12 行 55（待 design-lead 落表；契约出处 = views/README.md §S1.1「每条栏在 ≥1024 下只能有「一个」可见的收起入口」）**：**≥1024 下每条侧栏（主导航栏 · chat 会话栏）「可见的」收起入口恰好 1 个** ✓。",
@@ -4151,6 +4192,8 @@ const CHECKS = [
       "**⚠️ 空集保护**：该路由没有该栏 / 没有入口 ⇒ **not_measured 并点名原因**（不得静默 PASS）✓。",
     ].join("\n"),
     judge: (c, l) => {
+      if (c.ready === false)
+        return { display: "— not_measured：capture 未达到就绪信号（无 .app-sider 或无 h1）⇒ 空集不是缺陷", pass: null };
       if (!c.railT || c.railT.error) return { display: "— (rail-toggle probe failed)", pass: null };
       const v = railToggleVerdict(c.railT, l.expected);
       if (!v.measured) return { display: "— not_measured：" + (v.why || "no entry") + " ⇒ 不报 PASS", pass: null };
@@ -5667,7 +5710,10 @@ function runSelfTest() {
     // Row 55 (S1.1) is implemented here but its §12 entry is not written yet --
     // design-lead landed S1.1 in views/README.md and deliberately left the table
     // alone. Named here so the gap is asserted in BOTH directions.
-    const PENDING_ENTRY = [55];
+    // design-lead landed the §12 row (t149), so the declaration is now empty --
+    // and because the expectations DERIVE from it (t136), this one edit is the
+    // whole change. The check below proves the anchors now read the real cell.
+    const PENDING_ENTRY = [];
     {
       const toolRows = [...new Set(CHECKS.map((r) => r.n))].sort((a, b) => a - b);
       const contractRows = [...TH.rows.keys()].sort((a, b) => a - b);
@@ -6375,8 +6421,12 @@ function runSelfTest() {
   // RECORDED miss (PENDING_ENTRY names it) -- never a silent built-in default.
   check("row55: a §12 cell without the phrase records an anchor miss (no silent fallback)",
     (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse({ text: "没有阈值" }); return takePickMisses().length >= 1; })(), true);
-  check("row55: and the real cell, when it lands, reads exactly 1",
-    CHECKS.find((r) => r.n === 55).parse({ text: "恰好 1 个" }).expected, 1);
+  check("row55: the REAL §12 cell now parses with NO anchor miss (threshold from the contract)",
+    (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse(targetFor(TH, 55, "")); return takePickMisses().length; })(), 0);
+  check("row55: the real cell reads exactly 1",
+    CHECKS.find((r) => r.n === 55).parse(targetFor(TH, 55, "")).expected, 1);
+  check("row55: a threshold cell missing the viewport bound RECORDS a miss (not silent)",
+    (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse({ text: "恰好 1 个" }); return takePickMisses().length >= 1; })(), true);
 
   // ---- t143: the probe point must be a point that EXISTS -------------------
   // The real case: a handle spanning the whole column. h=3937 in a 900px
