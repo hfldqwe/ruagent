@@ -359,7 +359,17 @@ html[data-mode="light"] .ruagent {
   padding: 10px 0;
 }
 .ant-layout-sider-collapsed .sidebar-foot .ant-btn { padding-inline: 8px; }
-.ant-layout-sider-collapsed .sider-nav .ant-menu-item { padding-inline: calc(50% - 16px / 2 - 4px); }
+/* t165: the collapsed rail's items must stay a >=44px touch target at EVERY
+   width where the rail is collapsed, not only at <=520. Measured before: at 768
+   the item is 51x36 - 8px short - while 390/520 are already 51x44 (t158's
+   narrow-block rule). The object is the COLLAPSED RAIL, so the rule is keyed on
+   the collapsed class antd puts on the layout (which is exactly the 521-992
+   band here) instead of widening a media query: the CSS breakpoint count stays
+   4 (row 35), and the expanded rail at 1024/1440 is untouched by construction.
+   antd gives the menu link a full-bleed ::before hit layer (position:absolute;
+   inset:0 - measured 51x44 at <=520), so growing the item grows the real hit
+   area with it; the anchor's own box is irrelevant here (28x18 inline). */
+.ant-layout-sider-collapsed .sider-nav .ant-menu-item { padding-inline: calc(50% - 16px / 2 - 4px); min-height: 44px; }
 .build-id { font-family: var(--ant-font-family-code, monospace); font-size: 11px; line-height: 15px; color: var(--ant-color-text-quaternary); }
 .conn { font-family: var(--ant-font-family-code, monospace); font-size: 11px; line-height: 15px; letter-spacing: 0.03em; }
 .conn.ok { color: var(--ant-color-success); }
