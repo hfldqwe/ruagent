@@ -91,6 +91,9 @@ export function checkTable12(masked) {
   const gaps = [];
   for (let n = 1; n <= max; n++) if (nums.indexOf(n) < 0) gaps.push(n);
   const findings = [];
+  if (nums.length === 0) {
+    findings.push({ id: 'table12', severity: 'high', line: header + 1, message: '§12 表头下没有任何数据行（表格被非表行截断？）' });
+  }
   if (gaps.length) findings.push({ id: 'table12', severity: 'high', line: header + 1, message: '§12 表行号有缺口：' + JSON.stringify(gaps) + '（现有 ' + nums.length + ' 行，最大 ' + max + '）' });
   return { findings, rows: { rows: nums.length, max: max, gaps: gaps } };
 }
