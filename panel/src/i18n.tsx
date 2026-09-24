@@ -9,6 +9,9 @@ export type Lang = "zh" | "en";
 const zh: Record<string, string> = {
   // nav
   "nav.home": "首页",
+  // §12 row 56: the parameterised route has no nav item, but its <title> still
+  // needs the route's display name.
+  "nav.task": "任务详情",
   "theme.dark": "切换到夜间",
   "theme.light": "切换到日间",
   "theme.toggle": "切换主题",
@@ -726,6 +729,7 @@ const zh: Record<string, string> = {
 
 const en: Record<string, string> = {
   "nav.home": "Home",
+  "nav.task": "Task detail",
   "theme.dark": "Switch to dark",
   "theme.light": "Switch to light",
   "theme.toggle": "Toggle theme",

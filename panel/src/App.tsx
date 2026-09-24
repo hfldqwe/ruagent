@@ -1,6 +1,6 @@
 // App shell: antd Layout sidebar + hash routing + theme/lang toggles.
 
-import { Suspense, lazy, useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState, type ReactNode } from "react";
 import {
   Alert,
   Badge,
@@ -78,6 +78,28 @@ type View =
   | { kind: "stats" }
   | { kind: "settings" }
   | { kind: "inbox" };
+
+// MASTER §12 row 56: every route's <title> must identify that route and the 13
+// titles must be pairwise distinct. The identifier is the route's i18n display
+// name — the same string the nav shows — never a hardcoded literal (so the
+// title follows the language toggle like every other label) and never the bare
+// product name, which is what all 13 routes used to share.
+// Keyed by View["kind"], so adding a route without a title key is a type error.
+const ROUTE_TITLE_KEY: Record<View["kind"], string> = {
+  home: "nav.home",
+  chat: "chat.title",
+  sessions: "sessions.title",
+  board: "nav.board",
+  memory: "nav.memory",
+  knowledge: "nav.knowledge",
+  graph: "nav.graph",
+  agents: "nav.agents",
+  runtimes: "nav.runtimes",
+  stats: "nav.stats",
+  settings: "nav.settings",
+  inbox: "nav.inbox",
+  task: "nav.task",
+};
 
 // ---------------------------------------------------------------------------
 // Sidebar geometry (S1/S2). The dragged WIDTH is ui.tsx's business (the hook
@@ -185,6 +207,15 @@ function Shell() {
     enabled: !collapsed,
   });
 
+  // MASTER §12 row 56: before this every route inherited the static
+  // <title>ruagent</title> from index.html, so a tab or a bookmark said nothing
+  // about where you were. The title is derived from the route's display name, so
+  // switching the language re-titles the tab too. The dependency is `lang` and
+  // not `t`: `t` is rebuilt on every render and would re-run this each time.
+  useEffect(() => {
+    document.title = `${t(ROUTE_TITLE_KEY[view.kind])} · ruagent`;
+  }, [view.kind, lang]);
+
   useEffect(() => {
     const apply = () => setView(parseHash());
     apply();
@@ -244,18 +275,32 @@ function Shell() {
   const selected =
     view.kind === "task" ? "board" : view.kind === "home" ? "home" : view.kind;
 
+  // MASTER §12 row 57: a nav item must be a real anchor carrying the route's
+  // hash. Before this the item was a <li> with an onClick, so Cmd+click,
+  // middle-click and "open in new tab" did nothing at all. The anchor wraps the
+  // label; the item keeps its own onClick, so keyboard activation and clicks on
+  // the item's padding still navigate, while the browser — not React — owns the
+  // new-tab path. An anchor takes the shared focus ring from the
+  // :where(a[href], …):focus-visible rule (row 16 unaffected), and an inline
+  // anchor is exempt from row 18's hit-target floor.
+  const link = (key: string, text: ReactNode) => (
+    <a className="nav-link" href={`#${key}`}>
+      {text}
+    </a>
+  );
+
   const navItems = [
-    { key: "home", icon: <Icon name="home" size={16} />, label: t("nav.home") },
-    { key: "chat", icon: <Icon name="chat" size={16} />, label: t("chat.title") },
-    { key: "sessions", icon: <Icon name="history" size={16} />, label: t("sessions.title") },
-    { key: "board", icon: <Icon name="grid" size={16} />, label: t("nav.board") },
-    { key: "memory", icon: <Icon name="cloud" size={16} />, label: t("nav.memory") },
-    { key: "knowledge", icon: <Icon name="book" size={16} />, label: t("nav.knowledge") },
-    { key: "graph", icon: <Icon name="graph" size={16} />, label: t("nav.graph") },
-    { key: "agents", icon: <Icon name="bot" size={16} />, label: t("nav.agents") },
-    { key: "runtimes", icon: <Icon name="layers" size={16} />, label: t("nav.runtimes") },
-    { key: "stats", icon: <Icon name="stats" size={16} />, label: t("nav.stats") },
-    { key: "settings", icon: <Icon name="settings" size={16} />, label: t("nav.settings") },
+    { key: "home", icon: <Icon name="home" size={16} />, label: link("home", t("nav.home")) },
+    { key: "chat", icon: <Icon name="chat" size={16} />, label: link("chat", t("chat.title")) },
+    { key: "sessions", icon: <Icon name="history" size={16} />, label: link("sessions", t("sessions.title")) },
+    { key: "board", icon: <Icon name="grid" size={16} />, label: link("board", t("nav.board")) },
+    { key: "memory", icon: <Icon name="cloud" size={16} />, label: link("memory", t("nav.memory")) },
+    { key: "knowledge", icon: <Icon name="book" size={16} />, label: link("knowledge", t("nav.knowledge")) },
+    { key: "graph", icon: <Icon name="graph" size={16} />, label: link("graph", t("nav.graph")) },
+    { key: "agents", icon: <Icon name="bot" size={16} />, label: link("agents", t("nav.agents")) },
+    { key: "runtimes", icon: <Icon name="layers" size={16} />, label: link("runtimes", t("nav.runtimes")) },
+    { key: "stats", icon: <Icon name="stats" size={16} />, label: link("stats", t("nav.stats")) },
+    { key: "settings", icon: <Icon name="settings" size={16} />, label: link("settings", t("nav.settings")) },
     {
       key: "inbox",
       icon: collapsed ? (
@@ -265,13 +310,14 @@ function Shell() {
       ) : (
         <Icon name="inbox" size={16} />
       ),
-      label: (
+      label: link(
+        "inbox",
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           {t("nav.inbox")}
           {inboxCount !== null && inboxCount > 0 && (
             <span className="nav-badge">{inboxCount}</span>
           )}
-        </span>
+        </span>,
       ),
     },
   ];
@@ -326,7 +372,7 @@ function Shell() {
             mode="inline"
             items={items}
             selectedKeys={[selected]}
-            onClick={({ key }) => nav(key === "home" ? "" : key)}
+            onClick={({ key }) => nav(String(key))}
             style={{ borderInlineEnd: "none", paddingBlock: 4 }}
           />
         </div>
