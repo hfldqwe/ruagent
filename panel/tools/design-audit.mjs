@@ -4175,12 +4175,13 @@ const CHECKS = [
     parse: (t) => ({
       expected: pick(t.text, /恰好\s*(\d+)\s*个/, 1),
       minVp: pick(t.text, /≥\s*(\d+)/, 1024),
-      // NOTE (t150): the object-set definition (accessible name starts with the
-      // collapse verb; containment scoping) lives in the 判定法 column, NOT in
-      // this threshold cell -- so it cannot be anchored from here. Reported to
-      // the captain rather than silently asserted, and the contract was NOT
-      // edited to suit this reader. The probe's rules are documented in the
-      // criterion text below until a second-cell reader exists.
+      // The OBJECT SET comes from the 判定方式 column (MASTER: that column is
+      // its single source -- the threshold cell must NOT repeat it). This is the
+      // uniform reading, not a row-55 special case: any row reads its object set
+      // the same way, via t.method. A reworded contract makes these miss LOUDLY
+      // rather than leaving the probe testing a definition nobody agreed to.
+      collapseVerb: pickFlag(t.method ?? "", /可访问名以「收起」或「展开」开头/),
+      containment: pickFlag(t.method ?? "", /按包含关系定界/),
     }),
     criterion: [
       "**MASTER §12 行 55（待 design-lead 落表；契约出处 = views/README.md §S1.1「每条栏在 ≥1024 下只能有「一个」可见的收起入口」）**：**≥1024 下每条侧栏（主导航栏 · chat 会话栏）「可见的」收起入口恰好 1 个** ✓。",
@@ -5723,7 +5724,11 @@ function runSelfTest() {
       // tool does not judge is the more dangerous of the two -- the contract
       // promises a check nobody runs -- so it is listed here by number rather
       // than folded into one "everything is fine" line.
-      const PENDING_TOOL = [];
+      // Rows 56/57/58 landed in §12 (t152) and have NO judge yet. They are
+      // named here so the gap is asserted rather than assumed: this list must
+      // shrink to [] when t156 implements them, and the check below fails if
+      // the contract and this declaration ever disagree.
+      const PENDING_TOOL = [56, 57, 58];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
 
@@ -6427,6 +6432,13 @@ function runSelfTest() {
     CHECKS.find((r) => r.n === 55).parse(targetFor(TH, 55, "")).expected, 1);
   check("row55: a threshold cell missing the viewport bound RECORDS a miss (not silent)",
     (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse({ text: "恰好 1 个" }); return takePickMisses().length >= 1; })(), true);
+  // The object set now comes from the 判定方式 column, uniformly.
+  check("row55: the object set is read from the 判定方式 column, not hardcoded",
+    (() => { const v = CHECKS.find((r) => r.n === 55).parse(targetFor(TH, 55, "")); return v.collapseVerb === 1 && v.containment === 1; })(), true);
+  check("row55: and the whole real row parses with NO anchor miss",
+    (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse(targetFor(TH, 55, "")); return takePickMisses().length; })(), 0);
+  check("row55: a 判定方式 cell missing the containment phrase RECORDS a miss (not silent)",
+    (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse({ text: "恰好 1 个 ≥1024", method: "可访问名以「收起」或「展开」开头" }); return takePickMisses().length >= 1; })(), true);
 
   // ---- t143: the probe point must be a point that EXISTS -------------------
   // The real case: a handle spanning the whole column. h=3937 in a 900px

@@ -176,9 +176,14 @@ export function targetFor(thresholds, n, fallback) {
   const row = thresholds.rows.get(n);
   const nums = row ? extractNums(row.target) : [];
   const source = row && nums.length ? "MASTER.md" : "builtin";
+  // The 判定方式 column is the SINGLE SOURCE for the object set (MASTER, above
+  // the table header: 判定方式 = 可判定的测法 + 对象集定义 + 依据标注 + 出处).
+  // It rides along on every target so a row can read its object set from there
+  // -- uniformly, with no per-row special case and no second copy of the fact.
   return {
     row: n,
     text: row?.target ?? "(row missing)",
+    method: row?.judge ?? "",
     nums,
     source,
     fallback,
