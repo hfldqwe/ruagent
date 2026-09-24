@@ -2154,12 +2154,17 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
    comes from a transparent pseudo-element - the same "enlarge the hit box, not
    the visual" move t108 used for its 44px targets. The element itself stays
    1px wide in every state (including hover), so the form criterion (element
-   width <= 2px, border-radius 0) still reads 1px; the pseudo paints nothing. */
+   width <= 2px, border-radius 0) still reads 1px; the pseudo paints nothing.
+   t140: -5px gave an 11px effective hit width, still under the 24px hit-target
+   floor the audit measures (row 18 read div.resize-handle as 1x900 once t133
+   wired it). -12px makes it 1 + 12 + 12 = 25px while the element box stays 1px,
+   and it is simply easier to grab with a real mouse (t133 measured 228 -> 348
+   with the old 11px area; wider is better regardless of how row 18 is worded). */
 .resize-handle::after {
   content: "";
   position: absolute;
   inset-block: 0;
-  inset-inline: -5px;
+  inset-inline: -12px;
   z-index: 1;
   background: transparent;
 }
@@ -2167,8 +2172,13 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
 .resize-handle.dragging {
   background: var(--rule);
 }
+/* t140: the focus indicator is 2px, not 1px. This is the OUTLINE width (the
+   ring drawn around the box) and must not be confused with the element box,
+   which stays 1px in every state - S2's form criterion constrains the box, the
+   accessibility criterion constrains the ring, and they are different objects
+   (audit row 16 requires solid && width >= 2px). */
 .resize-handle:focus-visible {
-  outline: 1px solid var(--focus-ring);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 0;
 }
 .resize-handle[aria-disabled="true"] {
