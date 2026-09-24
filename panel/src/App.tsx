@@ -458,17 +458,22 @@ function Shell() {
         className="app-sider"
       >
         <div className="sider-inner">
-        <div
-          className="brand"
-          onClick={() => nav("")}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => e.key === "Enter" && nav("")}
-          title="ruagent"
-        >
+        {/* Row 57: the brand IS a navigation entry point (it goes home), so it
+            is a real <a href> like every nav item — Cmd/middle click and "open
+            in new tab" work, the browser (not React) owns the new-tab path, and
+            it takes the shared focus ring from the
+            :where(a[href], …):focus-visible rule (row 16). The markup inside is
+            deliberately untouched: .brand-mark and .brand-name are frozen e2e
+            selectors. role="button", tabIndex and onKeyDown are gone because a
+            real link is already focusable, Enter-activatable and announced as a
+            link — keeping role="button" on an anchor would have been a lie.
+            The href is "#home" and not "" so the URL says where you are (row
+            58); parseHash maps both "#" and "#home" to home, so the destination
+            is bit-identical. */}
+        <a className="brand" href="#home" title="ruagent">
           <span className="brand-mark">ru</span>
           {!collapsed && <span className="brand-name">ruagent</span>}
-        </div>
+        </a>
         <div className="sider-nav">
           <Menu
             mode="inline"
