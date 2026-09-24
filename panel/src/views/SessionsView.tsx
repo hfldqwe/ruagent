@@ -71,24 +71,31 @@ type ListState =
   | { kind: "error"; err: unknown; rows: SessionRecord[] | null; at: number | null };
 
 /* MASTER §12 row 58 — the part of this page's state that changes WHAT YOU ARE
- * LOOKING AT (source tab, S7 system tri-state, archived mode, workspace, time
- * window) lives in the URL, so the URL replays the view. Two measured
- * constraints fixed the encoding:
- *   · App.parseHash() matches this route with strict equality against
- *     "sessions", so ANY hash suffix — including the obvious
- *     "#sessions?src=dsh" form — falls through to the fallback view and
- *     unmounts this page. The hash therefore has to stay exactly "#sessions"
- *     until the router learns the optional query its #chat route already has.
+ * LOOKING AT (source tab, S7 system tri-state, workspace, time window) lives in
+ * the URL, so the URL replays the view. Row 58's letter asks for the HASH to
+ * change, and since App.parseHash() learned the route[?query] form the state
+ * rides there: "#sessions?src=dsh&sys=only". Only non-default values are
+ * written, so the default view's URL is still exactly "#sessions". Two other
+ * rules:
  *   · A tab switch must not become a back-button step, so every write goes
  *     through replaceState, never pushState.
- * The state rides in the real query string (?src=dsh&sys=only#sessions), which
- * the hash router never sees and which a reload or a pasted link replays
- * verbatim. Only non-default values are written, so the default view's URL is
- * still exactly "#sessions".
- * The search box is deliberately NOT here: it is an uncommitted input, which
- * row 58 excludes by name. */
-const ARCH_MODES: ArchivedMode[] = ["exclude", "include", "only"];
+ *   · The archived mode is NOT encoded: it is not one of the list's switchable
+ *     states (see the note at its Select).
+ * The search box is deliberately not here either: it is an uncommitted input,
+ * which row 58 excludes by name. */
 const SYS_MODES: SystemMode[] = ["exclude", "include", "only"];
+
+/** This route's query, read straight off the hash. The shell publishes the same
+ *  string on <html> (dataset.routeQuery), but this runs during the FIRST RENDER
+ *  — before any effect, and React runs child effects before the parent's — so
+ *  the dataset is not written yet, and being written from route state it also
+ *  cannot follow a replaceState. The hash is the source of truth and needs no
+ *  timing assumptions. */
+function routeQuery(): URLSearchParams {
+  const h = window.location.hash.replace(/^#/, "");
+  const i = h.indexOf("?");
+  return new URLSearchParams(i >= 0 ? h.slice(i + 1) : "");
+}
 
 /** The view state as the URL carries it. An unknown enum value falls back to
  *  the default instead of reaching a Select, which would render empty. */
@@ -96,19 +103,14 @@ function readViewState(): {
   filter: string;
   ws: string;
   when: string;
-  archivedMode: ArchivedMode;
   systemMode: SystemMode;
 } {
-  const p = new URLSearchParams(window.location.search);
-  const arch = p.get("arch");
+  const p = routeQuery();
   const sys = p.get("sys");
   return {
     filter: p.get("src") ?? "all",
     ws: p.get("ws") ?? "all",
     when: p.get("when") ?? "all",
-    archivedMode: ARCH_MODES.includes(arch as ArchivedMode)
-      ? (arch as ArchivedMode)
-      : "exclude",
     systemMode: SYS_MODES.includes(sys as SystemMode)
       ? (sys as SystemMode)
       : "exclude",
@@ -126,7 +128,7 @@ export function Sessions() {
   const [q, setQ] = useState(""); // keyword
   // Which archived sessions the daemon should return. The hide marker lives
   // server-side, so this is a real query parameter and not a local flag.
-  const [archivedMode, setArchivedMode] = useState<ArchivedMode>(fromUrl.archivedMode);
+  const [archivedMode, setArchivedMode] = useState<ArchivedMode>("exclude");
   const [archivedCount, setArchivedCount] = useState(0);
   /** S7 — which platform-generated sessions the list shows. The counterpart of
    *  archivedMode, and local (not a daemon query parameter) because the page
@@ -155,30 +157,51 @@ export function Sessions() {
      comparison keeps this idempotent — the first render of an already-correct
      URL (including a pasted one) writes nothing, so no needless history churn. */
   useEffect(() => {
+    const loc = window.location;
+    const h = loc.hash.replace(/^#/, "");
+    // Never rewrite another route's hash: while this page is leaving, the hash
+    // already points elsewhere and a write here would drag it back (that is the
+    // exact shape of the bug the removed cleanup caused).
+    if (h !== "sessions" && !h.startsWith("sessions?")) return;
     const p = new URLSearchParams();
     if (filter !== "all") p.set("src", filter);
     if (ws !== "all") p.set("ws", ws);
     if (when !== "all") p.set("when", when);
-    if (archivedMode !== "exclude") p.set("arch", archivedMode);
     if (systemMode !== "exclude") p.set("sys", systemMode);
     const qs = p.toString();
-    const loc = window.location;
-    const next = loc.pathname + (qs ? "?" + qs : "") + "#sessions";
+    const next = loc.pathname + loc.search + "#sessions" + (qs ? "?" + qs : "");
     if (loc.pathname + loc.search + loc.hash !== next) {
       window.history.replaceState(window.history.state, "", next);
     }
-  }, [filter, ws, when, archivedMode, systemMode]);
+  }, [filter, ws, when, systemMode]);
 
-  /* There is deliberately NO unmount cleanup that strips the query. One was
-     written and measured, and it broke the back button: the sider's items are
-     fragment-only anchors (row 57), so leaving this page lands on e.g.
-     "?src=dsh#board"; rewriting that fresh entry with replaceState was
-     followed by a back traversal that fired popstate WITHOUT hashchange (event
-     trace measured), so the URL said "#sessions" while the board was still
-     rendered. Measured without the cleanup: leaving the query
-     on another route's URL is harmless (the #home control case behaves the
-     same) and back works. Coming back through the 会话 anchor therefore keeps
-     the filters, which is what a URL that describes the view should do. */
+  /* The reverse direction while this page stays mounted: a hash edited in the
+     address bar, or a back/forward to another "#sessions?…", changes the route
+     query without unmounting the view, because the route KIND is unchanged.
+     Writes above use replaceState, which fires no hashchange, so this cannot
+     loop with the effect above. The route guard keeps a navigation away from
+     being read as a state change. */
+  useEffect(() => {
+    const apply = () => {
+      const h = window.location.hash.replace(/^#/, "");
+      if (h !== "sessions" && !h.startsWith("sessions?")) return;
+      const v = readViewState();
+      setFilter(v.filter);
+      setWs(v.ws);
+      setWhen(v.when);
+      setSystemMode(v.systemMode);
+    };
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
+
+  /* There is deliberately NO unmount cleanup. One was written while the state
+     lived in the real query and it was measured to break the back button: a
+     back traversal then fired popstate WITHOUT hashchange, so the URL changed
+     while the board stayed rendered. With the state in the hash it is not
+     needed at all — the sider's items are fragment-only anchors (row 57), so
+     leaving this page replaces the whole fragment and the state goes with it,
+     leaving no query behind. */
 
   const load = useCallback(async () => {
     try {
@@ -413,7 +436,13 @@ export function Sessions() {
         {/* A Select, not a Segmented: the three labels are long enough that a
             segmented control is 377px wide, and a 390px phone only has 294px
             of column (measured: +71px of horizontal overflow). A Select
-            ellipsises instead of pushing the page sideways. */}
+            ellipsises instead of pushing the page sideways.
+            Row 58: this mode is deliberately NOT encoded in the URL (the
+            source tab and the system tri-state are). Measured today its three
+            values render the same list — archived_count is 0 — so it is not a
+            state that changes what you are looking at. If archived rows ever
+            exist it would change the list, and this is then the one view state
+            that a shared URL would not replay: flagged to the captain. */}
         <Select
           value={archivedMode}
           onChange={(v) => setArchivedMode(v as ArchivedMode)}
