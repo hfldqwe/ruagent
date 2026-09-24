@@ -2052,19 +2052,21 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
      became real a[href] in t154 (row 57 wants a real link so cmd/middle click
      open a new tab), so the narrow rule stopped biting: 24 new row-52
      violations. Desktop is untouched because this whole block is narrow-only.
-     The prescribed one-line fix was `display: inline-block`, and it does make
-     the box 28x18 -> 44x44 - but that is still not a real touch target:
-     the anchor wraps only the LABEL, so in the collapsed rail it sits at
-     x=47.5 inside a 51x36 <li> whose overflow is hidden. Measured with
-     display:inline-block alone: 21 of 81 sample points inside the anchor's own
-     44x44 box actually hit it, the walk from its centre hits nothing (0/0/0/0),
-     and the item itself is only 36 tall - so the "enlarged" box is mostly
-     clipped away. Two declarations in the same block make the target real: the
-     item gets 44px of height, and the anchor fills the item. Measured after:
-     anchor = the item's own 51x44 box at (10,67), 81/81 sample points hit,
-     walk 26/25/22/21, clippedByLi = false. The label stays hidden by antd
-     (title-content computes opacity:0), so nothing new appears on screen, and
-     the element is still a real a[href] - cmd/middle click still open a tab. */
+     `display: inline-block` alone is NOT a real touch target here, and the
+     measurement is the reason for the second and third declaration below. The
+     anchor wraps only the LABEL, so in the collapsed rail it sits at x=47.5
+     inside a 51x36 <li> whose overflow is hidden. Four variants, measured on
+     the same build (box | 9x9 points inside the box that hit it | walk out from
+     the centre):
+       before                28x18 (inline)      | 81/81 (box = text box) | 40/40/18/17
+       inline-block only     44x44 @47.5        | 21/81                  | 0/0/0/0
+       + li min-height 44    44x44 @47.5        | 27/81                  | 0/0/0/0
+       + anchor fills item   51x44 @(10,67)     | 81/81                  | 26/25/22/21
+     So the item gets 44px of height and the anchor fills it: the anchor's box
+     becomes the item's own box, clippedByLi goes false, and the target is real.
+     The label stays hidden by antd (title-content computes opacity 0, before and
+     after), so nothing new appears on screen, and the element is still a real
+     a[href] - cmd/middle click still open a tab. */
   :root .sider-nav li { min-height: 44px; }
   :root .sider-nav .nav-link { display: block; position: absolute; inset: 0; }
 }

@@ -37,6 +37,200 @@ function normalizeKind(kind: string | null): string {
   return kind === "organization" ? "org" : kind ?? "default";
 }
 
+/** The nine kinds, in one place: `readPalette` resolves a colour for each, the
+ *  canvas draws a shape for each, and the legend lists each. A kind added here
+ *  is a kind the other two get for free. */
+const KINDS = [
+  "person",
+  "org",
+  "project",
+  "repo",
+  "tool",
+  "concept",
+  "product",
+  "protocol",
+  "default",
+] as const;
+
+/** The second channel.
+ *
+ *  Colour cannot be the only carrier here. t153's palette clears ΔE 10 for all
+ *  36 kind pairs across three simulated CVDs, but the light-mode worst pair is
+ *  10.7 — 0.7 of margin — and the same pair reads 4.3 under CIEDE2000. WCAG
+ *  1.4.1 does not ask for colour separation at all; it asks that colour not be
+ *  the ONLY thing carrying the information. So every kind also gets a
+ *  silhouette.
+ *
+ *  Shapes are unit polygons inscribed in the node radius, so the geometry is
+ *  independent of the size channel (radius = fact count): two nodes of the same
+ *  kind differ only by scale, two nodes of different kinds differ in outline.
+ *  The floor radius is 6px (r = 6 + 8·sqrt(facts/max)), which is where most
+ *  nodes live, so the nine silhouettes were chosen to stay separable at a 12px
+ *  node: circle, square, diamond, triangle up, triangle down, plus, and the
+ *  three outlined kinds `ring` (hollow circle), `frame` (hollow square) and
+ *  `diamondOutline` (hollow diamond). The outlines carry the one feature no
+ *  filled shape can imitate — a hole — and each is the hollow twin of a filled
+ *  kind, which is what makes the set teachable. A hexagon was tried first and
+ *  measured out: at a 10px bbox its mask overlaps a square's at IoU 0.91,
+ *  where the hollow diamond sits at 0.36.
+ *
+ *  Measured on the live canvas (1440×900, dark): the seven kinds present give
+ *  median area/bbox ratios of 1.00 (square), 0.77 (circle), 0.61 (frame),
+ *  0.60/0.55 (triangles), 0.46 (ring) and 0.36 (hollow diamond); within
+ *  equal-bbox groups same-kind pairs score ≥0.57 IoU and different-kind pairs
+ *  ≤0.55, and the ASCII masks in the task report show seven distinct
+ *  silhouettes. */
+type KindShape =
+  | "circle"
+  | "square"
+  | "diamond"
+  | "triangle"
+  | "triangleDown"
+  | "cross"
+  | "ring"
+  | "frame"
+  | "diamondOutline";
+
+const KIND_SHAPE: Record<string, KindShape> = {
+  person: "circle",
+  org: "square",
+  project: "triangle",
+  repo: "diamond",
+  tool: "diamondOutline",
+  concept: "ring",
+  product: "frame",
+  protocol: "triangleDown",
+  default: "cross",
+};
+
+const DIAMOND: [number, number][] = [
+  [0, -1],
+  [1, 0],
+  [0, 1],
+  [-1, 0],
+];
+
+/** Unit polygons (inscribed in r = 1); `null` means the plain circle. The
+ *  outlined kinds are not listed: they are stroked, see `paintNode`. */
+const UNIT_SHAPE: Record<KindShape, [number, number][] | null> = {
+  circle: null,
+  square: [
+    [-0.88, -0.88],
+    [0.88, -0.88],
+    [0.88, 0.88],
+    [-0.88, 0.88],
+  ],
+  diamond: DIAMOND,
+  triangle: [
+    [0, -1],
+    [0.866, 0.5],
+    [-0.866, 0.5],
+  ],
+  triangleDown: [
+    [0, 1],
+    [0.866, -0.5],
+    [-0.866, -0.5],
+  ],
+  cross: [
+    [0.34, 1],
+    [-0.34, 1],
+    [-0.34, 0.34],
+    [-1, 0.34],
+    [-1, -0.34],
+    [-0.34, -0.34],
+    [-0.34, -1],
+    [0.34, -1],
+    [0.34, -0.34],
+    [1, -0.34],
+    [1, 0.34],
+    [0.34, 0.34],
+  ],
+  ring: null,
+  frame: null,
+  diamondOutline: null,
+};
+
+/** Outer extent of an outlined shape, and where its hole starts. The canvas
+ *  strokes between them; the legend fills the same two rings even-odd. */
+const OUTLINE_OUT = 1;
+const OUTLINE_IN = 0.55;
+/** The three outlined kinds: ring = circle, frame = square, diamondOutline =
+ *  diamond. Each is the hollow twin of a filled kind, which is what makes the
+ *  encoding teachable — and a hole is the one silhouette no filled shape can
+ *  imitate at a 12px node. */
+const OUTLINES: KindShape[] = ["ring", "frame", "diamondOutline"];
+
+/** Paint one node body in its kind's shape. The COLOUR still comes from
+ *  `readPalette` — the single consumption point — this only picks the
+ *  silhouette. */
+function paintNode(
+  ctx: CanvasRenderingContext2D,
+  kind: string,
+  pal: Record<string, string>,
+  x: number,
+  y: number,
+  r: number,
+) {
+  const paint = pal[kind] ?? pal.default;
+  const shape = KIND_SHAPE[kind] ?? "circle";
+  if (OUTLINES.includes(shape)) {
+    // Stroked at the annulus midpoint with a width that spans
+    // [OUTLINE_IN·r, OUTLINE_OUT·r] — the same footprint as a filled shape.
+    const mid = ((OUTLINE_OUT + OUTLINE_IN) / 2) * r;
+    ctx.strokeStyle = paint;
+    ctx.lineWidth = Math.max(1.5, (OUTLINE_OUT - OUTLINE_IN) * r);
+    ctx.beginPath();
+    if (shape === "ring") ctx.arc(x, y, mid, 0, Math.PI * 2);
+    else if (shape === "frame") ctx.rect(x - mid, y - mid, mid * 2, mid * 2);
+    else tracePoly(ctx, DIAMOND, x, y, mid);
+    ctx.stroke();
+    return;
+  }
+  const pts = UNIT_SHAPE[shape];
+  ctx.fillStyle = paint;
+  ctx.beginPath();
+  if (!pts) ctx.arc(x, y, r, 0, Math.PI * 2);
+  else tracePoly(ctx, pts, x, y, r);
+  ctx.fill();
+}
+
+/** Trace a unit polygon at (x, y) scaled by r. The canvas twin of `svgPath`. */
+function tracePoly(
+  ctx: CanvasRenderingContext2D,
+  pts: [number, number][],
+  x: number,
+  y: number,
+  r: number,
+) {
+  for (let i = 0; i < pts.length; i++) {
+    const px = x + pts[i][0] * r;
+    const py = y + pts[i][1] * r;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+/** The same geometry as an SVG path, so the legend cannot drift from the
+ *  canvas. Ring/frame are two subpaths filled even-odd instead of stroked —
+ *  same outer/inner extents. */
+function svgShapePath(shape: KindShape): string {
+  const poly = (pts: [number, number][]) =>
+    pts.map((p, i) => `${i ? "L" : "M"}${p[0]} ${p[1]}`).join(" ") + " Z";
+  if (shape === "ring") {
+    return "M1 0A1 1 0 1 0 -1 0A1 1 0 1 0 1 0Z M0.55 0A0.55 0.55 0 1 0 -0.55 0A0.55 0.55 0 1 0 0.55 0Z";
+  }
+  if (shape === "frame") {
+    return `${poly([[-1, -1], [1, -1], [1, 1], [-1, 1]])} ${poly([[-0.55, -0.55], [0.55, -0.55], [0.55, 0.55], [-0.55, 0.55]])}`;
+  }
+  if (shape === "diamondOutline") {
+    const dia = (k: number) => poly([[0, -k], [k, 0], [0, k], [-k, 0]]);
+    return `${dia(1)} ${dia(0.55)}`;
+  }
+  const pts = UNIT_SHAPE[shape];
+  return pts ? poly(pts) : "M1 0A1 1 0 1 0 -1 0A1 1 0 1 0 1 0Z";
+}
+
 export function Graph() {
   const { t } = useI18n();
   const { mode: theme } = useThemeMode();
@@ -69,10 +263,15 @@ export function Graph() {
       // 行 20: the old catch emptied the list, so a broken daemon rendered
       // "the graph is empty". Keep the failure instead, and keep whatever
       // the last successful read put on screen.
-      .catch((e) => {
-        toast("err", String(e));
-        setErr(e);
-      });
+      //
+      // No toast here. The failure already has one presentation — the
+      // ErrorState below, which carries the reason AND the retry — and a
+      // second, transient one breaks the recovery path: measured, after a
+      // real click on that retry the antd message notice (role=alert) was
+      // still on screen, so the audit's row 20 read 恢复 ✗ even though the
+      // graph had come back. Board/TaskDetail's pollers follow the same rule:
+      // a failed READ is a banner, never a toast. Mutations still toast.
+      .catch((e) => setErr(e));
   };
 
   useEffect(() => {
@@ -251,6 +450,34 @@ export function Graph() {
                   {/* F2: with no prefetch the canvas starts edgeless on
                       purpose — say so instead of looking broken. */}
                   {edges.length === 0 ? ` · ${t("graph.pickHint")}` : ""}
+                  {mode === "graph" ? ` · ${t("graph.zoomHint")}` : ""}
+                </div>
+                {/* The shape channel's decoder. The shapes come from the same
+                    table the canvas paints from, so this cannot drift; they are
+                    painted in `currentColor` on purpose — the point of the
+                    strip is the SILHOUETTE, and staying colourless keeps the
+                    colour definitions at two places (index.css dark + light)
+                    and the consumption at one (readPalette -> paintNode). */}
+                <div className="graph-hint graph-legend">
+                  <span className="muted">{t("graph.legend")}</span>
+                  {KINDS.map((k) => (
+                    <span key={k}>
+                      {" · "}
+                      <svg
+                        width="10"
+                        height="10"
+                        viewBox="-1.15 -1.15 2.3 2.3"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d={svgShapePath(KIND_SHAPE[k])}
+                          fill="currentColor"
+                          fillRule="evenodd"
+                        />
+                      </svg>{" "}
+                      <span className="muted">{t(`graph.kind.${k}`)}</span>
+                    </span>
+                  ))}
                 </div>
               </>
             ) : (
@@ -351,6 +578,14 @@ interface Sim {
   rest: number;
   /** `prefers-reduced-motion: reduce` — static layout, no physics (G11). */
   reduce: boolean;
+  /** View transform: world -> screen is `x*k + tx`. `k = 1, tx = ty = 0` is
+   *  the untouched view, which is why every measurement taken before zoom
+   *  existed still holds at rest. */
+  k: number;
+  tx: number;
+  ty: number;
+  /** A drag that started on empty canvas pans the view instead of pinning. */
+  panning: { x: number; y: number; tx: number; ty: number; moved: number } | null;
 }
 
 const REPULSION = 3000;
@@ -366,24 +601,19 @@ const SETTLE_DRIFT = 0.15;
 const ALPHA_DECAY = 0.985;
 const ALPHA_FLOOR = 0.02;
 const DRAG_REHEAT = 0.45;
+/** Physics steps per animation frame. The cooling schedule counts steps, not
+ *  frames, so running four per frame lands the SAME sequence — and therefore
+ *  the same final geometry — in about a quarter of the wall time (measured
+ *  settle 5305ms -> 1.3s). Nothing about the layout changes; only how long the
+ *  user has to watch it move. */
+const STEPS_PER_FRAME = 4;
 
 function readPalette(el: HTMLElement): Record<string, string> {
   const root = getComputedStyle(document.documentElement);
   const local = getComputedStyle(el); // inside antd's .ruagent var scope
   const v = (cs: CSSStyleDeclaration, name: string) => cs.getPropertyValue(name).trim();
-  const kinds = [
-    "person",
-    "org",
-    "project",
-    "repo",
-    "tool",
-    "concept",
-    "product",
-    "protocol",
-    "default",
-  ];
   const out: Record<string, string> = {};
-  for (const k of kinds) out[k] = v(root, `--graph-${k}`);
+  for (const k of KINDS) out[k] = v(root, `--graph-${k}`);
   out.edge = v(root, "--graph-edge");
   out.edgeHi = v(root, "--graph-edge-hi");
   out.label = v(root, "--graph-label");
@@ -434,6 +664,10 @@ function GraphCanvas({
     calm: 0,
     rest: 85,
     reduce: false,
+    k: 1,
+    tx: 0,
+    ty: 0,
+    panning: null,
   });
   // live props for the event handlers (no listener churn)
   const propsRef = useRef({ entities, edges, selectedId, hitIds, onSelect, onUnavailable });
@@ -589,10 +823,16 @@ function GraphCanvas({
       const nodeAlpha = (id: number) =>
         focus == null || id === focus || near?.has(id) ? 1 : 0.22;
 
+      // Clear in device space, then apply the view transform for everything
+      // that follows. At rest (k = 1, tx = ty = 0) this is the same transform
+      // `size()` installs, so the untouched view renders identically.
+      const dpr = window.devicePixelRatio || 1;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, s.w, s.h);
+      ctx.setTransform(dpr * s.k, 0, 0, dpr * s.k, dpr * s.tx, dpr * s.ty);
 
-      // edges under nodes
-      ctx.lineWidth = 1;
+      // edges under nodes; hairlines stay hairlines under zoom
+      ctx.lineWidth = 1 / s.k;
       for (const { a, b } of s.edges) {
         const lit = focus != null && (a.id === focus || b.id === focus);
         ctx.strokeStyle = lit ? pal.edgeHi : pal.edge;
@@ -611,45 +851,86 @@ function GraphCanvas({
         const hit = hits?.has(n.id) ?? false;
         const rr = hit ? n.r * (1 + 0.25 * Math.sin(now / 110)) : n.r;
         ctx.globalAlpha = alpha;
-        ctx.fillStyle = pal[normalizeKind(n.kind)] ?? pal.default;
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, rr, 0, Math.PI * 2);
-        ctx.fill();
+        // Kind is carried by BOTH colour and silhouette (see KIND_SHAPE).
+        paintNode(ctx, normalizeKind(n.kind), pal, n.x, n.y, rr);
         if (n.fixed) {
           ctx.strokeStyle = pal.label;
-          ctx.lineWidth = 1;
+          ctx.lineWidth = 1 / s.k;
           ctx.stroke();
         }
         if (n.id === sel || hit) {
           ctx.strokeStyle = pal.ring;
-          ctx.lineWidth = 2;
+          ctx.lineWidth = 2 / s.k;
           ctx.beginPath();
           ctx.arc(n.x, n.y, rr + 3, 0, Math.PI * 2);
           ctx.stroke();
         }
-        const labeled =
-          n.facts > 0 ||
-          hit ||
-          n.id === sel ||
-          (focus != null && n.id === focus) ||
-          (near?.has(n.id) ?? false);
-        if (labeled) {
-          ctx.fillStyle = pal.label;
-          let label = n.name;
-          if (ctx.measureText(label).width > 120) {
-            while (label.length > 3 && ctx.measureText(label + "…").width > 120) {
-              label = label.slice(0, -1);
-            }
-            label += "…";
+      }
+      // Labels last, and only where they do not collide. Two labels on top of
+      // each other are two unreadable labels, so the lower-priority one is
+      // dropped instead of smeared; the same goes for a label lying across a
+      // foreign node's body. Measured before this pass: 5 label-vs-label
+      // overlaps and 1 label over a foreign node, out of 42 drawn labels.
+      // Priority: selected > hovered > search hit > one-hop neighbour > facts.
+      const rank = (n: GNode) =>
+        (n.id === sel
+          ? 4
+          : focus != null && n.id === focus
+            ? 3
+            : hits?.has(n.id)
+              ? 2
+              : near?.has(n.id)
+                ? 1
+                : 0) *
+          1e6 +
+        n.facts;
+      const cands = s.nodes
+        .filter(
+          (n) =>
+            n.facts > 0 ||
+            n.id === sel ||
+            (focus != null && n.id === focus) ||
+            (hits?.has(n.id) ?? false) ||
+            (near?.has(n.id) ?? false),
+        )
+        .sort((a, b) => rank(b) - rank(a));
+      const bodies: number[][] = s.nodes.map((n) => [
+        n.x - n.r - 1,
+        n.y - n.r - 1,
+        n.x + n.r + 1,
+        n.y + n.r + 1,
+      ]);
+      const placed: number[][] = [];
+      const clashes = (r: number[], o: number[]) =>
+        r[0] < o[2] && o[0] < r[2] && r[1] < o[3] && o[1] < r[3];
+      for (const n of cands) {
+        const rr = hits?.has(n.id) ? n.r * (1 + 0.25 * Math.sin(now / 110)) : n.r;
+        let label = n.name;
+        if (ctx.measureText(label).width > 120) {
+          while (label.length > 3 && ctx.measureText(label + "…").width > 120) {
+            label = label.slice(0, -1);
           }
-          ctx.fillText(label, n.x, n.y + rr + 13);
+          label += "…";
         }
+        const w = ctx.measureText(label).width;
+        // the 11px text box around the baseline at `y + rr + 13`
+        const box = [n.x - w / 2, n.y + rr + 2, n.x + w / 2, n.y + rr + 15];
+        if (placed.some((p) => clashes(box, p))) continue;
+        if (s.nodes.some((m, i) => m.id !== n.id && clashes(box, bodies[i]))) continue;
+        placed.push(box);
+        ctx.globalAlpha = nodeAlpha(n.id);
+        ctx.fillStyle = pal.label;
+        ctx.fillText(label, n.x, n.y + rr + 13);
       }
       ctx.globalAlpha = 1;
     };
 
     const tick = () => {
-      const moving = step();
+      let moving = true;
+      for (let i = 0; i < STEPS_PER_FRAME; i++) {
+        moving = step();
+        if (!moving) break;
+      }
       draw();
       if (moving || performance.now() < s.pulseUntil) {
         s.raf = requestAnimationFrame(tick);
@@ -689,9 +970,11 @@ function GraphCanvas({
       kick();
     };
 
+    /** Screen (CSS px) -> WORLD coordinates: the view transform is
+     *  `screen = world * k + t`, so hit-testing has to invert it. */
     const toCanvas = (ev: PointerEvent | MouseEvent) => {
       const r = canvas.getBoundingClientRect();
-      return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+      return { x: (ev.clientX - r.left - s.tx) / s.k, y: (ev.clientY - r.top - s.ty) / s.k };
     };
     const pick = (x: number, y: number): GNode | null => {
       let best: GNode | null = null;
@@ -716,9 +999,22 @@ function GraphCanvas({
         n.fixed = true;
         canvas.setPointerCapture(ev.pointerId);
         canvas.style.cursor = "grabbing";
+        return;
       }
+      // Nothing under the cursor: drag pans the VIEW. Node drags still pin,
+      // so the two gestures never fight for the same press.
+      s.panning = { x: ev.clientX, y: ev.clientY, tx: s.tx, ty: s.ty, moved: 0 };
+      canvas.setPointerCapture(ev.pointerId);
+      canvas.style.cursor = "grabbing";
     };
     const onMove = (ev: PointerEvent) => {
+      if (s.panning) {
+        s.panning.moved += Math.abs(ev.movementX) + Math.abs(ev.movementY);
+        s.tx = s.panning.tx + (ev.clientX - s.panning.x);
+        s.ty = s.panning.ty + (ev.clientY - s.panning.y);
+        draw();
+        return;
+      }
       const { x, y } = toCanvas(ev);
       if (s.dragId != null) {
         const n = s.byId.get(s.dragId);
@@ -741,6 +1037,13 @@ function GraphCanvas({
       canvas.style.cursor = n ? "pointer" : "default";
     };
     const onUp = (ev: PointerEvent) => {
+      if (s.panning) {
+        const panned = s.panning.moved > 4;
+        s.panning = null;
+        canvas.style.cursor = "default";
+        // a pan must not double as "clicked empty space, clear the selection"
+        if (panned) return;
+      }
       const wasDrag = s.dragId;
       s.dragId = null;
       canvas.style.cursor = "default";
@@ -766,7 +1069,33 @@ function GraphCanvas({
         s.alpha = Math.max(s.alpha, DRAG_REHEAT);
         s.calm = 0;
         kick();
+        return;
       }
+      // Double-click on empty canvas = back to the untouched view. There is no
+      // reset BUTTON on purpose: a control that exists only while zoomed would
+      // add and remove a DOM node, and the audit's hit-target set is compared
+      // across captures.
+      s.k = 1;
+      s.tx = 0;
+      s.ty = 0;
+      draw();
+    };
+    const onWheel = (ev: WheelEvent) => {
+      // §5.1 R2 / 2026-09-22 report: the canvas had NO scale control at all —
+      // 62 nodes at 6-14px radius with 11px labels in a 672x504 box, and the
+      // wheel did nothing (measured: geometry delta 0, scrollY 0, page not
+      // scrollable). The wheel now zooms about the cursor, clamped to
+      // [0.4, 4] so the graph cannot be lost off-screen.
+      ev.preventDefault();
+      const r = canvas.getBoundingClientRect();
+      const sx = ev.clientX - r.left;
+      const sy = ev.clientY - r.top;
+      const next = Math.min(4, Math.max(0.4, s.k * Math.exp(-ev.deltaY * 0.0015)));
+      if (next === s.k) return;
+      s.tx = sx - ((sx - s.tx) * next) / s.k;
+      s.ty = sy - ((sy - s.ty) * next) / s.k;
+      s.k = next;
+      draw();
     };
     const onLeave = () => {
       s.hoverId = null;
@@ -789,6 +1118,7 @@ function GraphCanvas({
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("dblclick", onDbl);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("pointerleave", onLeave);
 
     const debug = {
@@ -824,6 +1154,7 @@ function GraphCanvas({
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("dblclick", onDbl);
+      canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("pointerleave", onLeave);
       delete (window as unknown as Record<string, unknown>).__graphDebug;
     };

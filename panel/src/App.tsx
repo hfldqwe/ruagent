@@ -131,14 +131,43 @@ function writeStoredCollapsed(v: boolean) {
   }
 }
 
-function parseHash(): View {
-  const h = window.location.hash.replace(/^#/, "");
-  const mTask = h.match(/^task\/([\w-]+)/);
+// MASTER §12 row 58: the URL carries the view state, and this app routes on the
+// hash — so the hash is `route[?query]` (e.g. "#sessions?src=dsh&sys=only").
+// Splitting the query off BEFORE routing is what makes that reachable: every
+// arm below matches the PATH only, so a suffix can no longer fall through to
+// the fallback view (which is exactly what "#sessions?src=dsh" used to do, and
+// why the sessions filter had to be smuggled into the real query instead).
+// The fallback still owns every unknown PATH — appending a query never turns an
+// unknown route into a valid one.
+export type Route = { view: View; query: URLSearchParams };
+
+/** Parse `route[?query]` out of a hash. Pure: it reads no history and writes
+ *  none, so it can never add or rewrite an entry (a cleanup that rewrites the
+ *  entry the browser just created is what breaks Back: a traversal fires
+ *  popstate WITHOUT hashchange, so the URL moves and the page does not). */
+export function parseHash(raw: string = window.location.hash): Route {
+  const h = raw.replace(/^#/, "");
+  const q = h.indexOf("?");
+  const path = q === -1 ? h : h.slice(0, q);
+  const query = new URLSearchParams(q === -1 ? "" : h.slice(q + 1));
+  return { view: viewOf(path, query), query };
+}
+
+function viewOf(path: string, query: URLSearchParams): View {
+  const mTask = path.match(/^task\/([\w-]+)/);
   if (mTask) return { kind: "task", id: mTask[1] };
-  const mChat = h.match(/^chat(?:\?agent=([\w-]+))?/);
-  if (mChat) return { kind: "chat", agent: mChat[1] };
-  if (h === "sessions") return { kind: "sessions" };
-  switch (h) {
+  // Same prefix semantics as before (the old regex was unanchored, so "chatty"
+  // also matched "chat"); the `agent` value now comes from the parsed query,
+  // which is where it always belonged — but its GRAMMAR is preserved verbatim.
+  // The old parser matched /[\w-]+/ against the raw hash, so it stopped at the
+  // first non-word character and reported an empty value as "absent". Both
+  // quirks stay: this change's contract is bit-identical parsing of the forms
+  // that already existed (verified over a 32-hash table), and widening the
+  // agent-value grammar is a separate decision. It is never hit in practice —
+  // every agent id in this repo is [\w-]+.
+  if (path.startsWith("chat")) return { kind: "chat", agent: (query.get("agent") ?? "").match(/^[\w-]+/)?.[0] };
+  if (path === "sessions") return { kind: "sessions" };
+  switch (path) {
     case "board":
       return { kind: "board" };
     case "memory":
@@ -173,7 +202,8 @@ export default function App() {
 function Shell() {
   const { lang, setLang, t } = useI18n();
   const { mode, toggle } = useThemeMode();
-  const [view, setView] = useState<View>(() => parseHash());
+  const [route, setRoute] = useState<Route>(() => parseHash());
+  const view = route.view;
   // `null` = the queue has not been read yet. The count lives HERE and only
   // here (t50): Home consumes it as a prop instead of polling the same
   // endpoint a second time. `null` vs `0` stays distinguishable, because
@@ -217,11 +247,27 @@ function Shell() {
   }, [view.kind, lang]);
 
   useEffect(() => {
-    const apply = () => setView(parseHash());
+    const apply = () => setRoute(parseHash());
     apply();
     window.addEventListener("hashchange", apply);
     return () => window.removeEventListener("hashchange", apply);
   }, []);
+
+  // Row 58's other half: the query is route state, and a view is a separate
+  // chunk that must not import the shell (that would pull the shell into the
+  // view's chunk and undo the route-level splitting). The shell therefore
+  // publishes the parsed query on <html>, next to the `lang` the i18n provider
+  // already writes there; a view reads
+  // `document.documentElement.dataset.routeQuery` and parses it with
+  // URLSearchParams. Absent = "no query", so the default URL stays clean and a
+  // reader can never pick up a stale value from the previous route. This writes
+  // no history entry — see parseHash's note on Back.
+  useEffect(() => {
+    const root = document.documentElement;
+    const q = route.query.toString();
+    if (q) root.dataset.routeQuery = q;
+    else delete root.dataset.routeQuery;
+  }, [route]);
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 992px)");

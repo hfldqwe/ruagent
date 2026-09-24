@@ -204,7 +204,7 @@ impl SessionIndexer {
                     rusqlite::params![
                         key,
                         source,
-                        parsed.title,
+                        usable_title(parsed.title.as_deref(), parsed.preview.as_deref()),
                         parsed.project,
                         ref_path,
                         parsed.started_at,
@@ -246,7 +246,14 @@ impl SessionIndexer {
                     })
                 })?;
                 let mut out = Vec::new();
-                for rec in rows.flatten() {
+                for mut rec in rows.flatten() {
+                    // Rows indexed before titles were derived from the user's
+                    // words keep whatever the source said. Normalise on the way
+                    // out instead of rewriting stored rows: the index is a
+                    // cache of the source files, and a read-time derivation
+                    // fixes the existing rows without a single write (see
+                    // usable_title).
+                    rec.title = usable_title(rec.title.as_deref(), rec.preview.as_deref());
                     out.push(rec);
                 }
                 Ok(out)
@@ -308,6 +315,15 @@ fn parse_claude_code(text: &str) -> Parsed {
                     let text = user_text(text).trim();
                     if text.is_empty() || text.starts_with('<') {
                         continue; // command meta like <command-name>…
+                    }
+                    // A transcript written before the sentinel existed has no
+                    // marker to split on, so its first user message IS the
+                    // injected prompt. Skipping it here lets the row be named
+                    // after the first message that is actually the user's --
+                    // the same skip the command-meta line above already does,
+                    // and the same STARTS WITH test is_injected_title uses.
+                    if is_injected_title(text) {
+                        continue;
                     }
                     if p.started_at == 0 {
                         p.started_at = ts;
@@ -434,7 +450,7 @@ fn parse_dsh_jsonl(text: &str) -> Parsed {
                     continue;
                 }
                 let text = user_text(&blocks_text(data.and_then(|d| d.get("content")))).to_string();
-                if text.trim().is_empty() {
+                if text.trim().is_empty() || is_injected_title(&text) {
                     continue;
                 }
                 if p.preview.is_none() {
@@ -599,6 +615,33 @@ fn is_injected_title(t: &str) -> bool {
         .any(|h| t.starts_with(h))
 }
 
+/// A title the row can be recognised by, derived from the user's own words.
+///
+/// The harness names a conversation from its first message -- injected blocks
+/// included -- and a dsh/opencode record can carry such a name verbatim, so a
+/// stored title is not trustworthy on its own. `preview` is: it is built from
+/// `user_text()`, which cuts everything before the daemon's sentinel. Order: a
+/// usable stored title wins (it is the harness's own naming and, once it
+/// survives the guard, it is about the user's words); otherwise the first real
+/// user message; otherwise nothing, and the panel falls back to its own
+/// placeholder.
+///
+/// Applied BOTH on the way in (the indexer stores what a reader should see) and
+/// on the way out (`list`), so rows indexed before this change read correctly
+/// without rewriting a single row of the user's data.
+pub fn usable_title(title: Option<&str>, preview: Option<&str>) -> Option<String> {
+    if let Some(t) = title {
+        let t = t.trim();
+        if !t.is_empty() && !is_injected_title(t) && !t.starts_with("New session") {
+            return Some(truncate(t, 80));
+        }
+    }
+    preview
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| truncate(p, 80))
+}
+
 /// The user's own words, with any injected context in front of them removed.
 ///
 /// Splits on the marker the daemon emits (ChatManager::USER_TEXT_SENTINEL).
@@ -726,7 +769,7 @@ impl SessionIndexer {
                         rusqlite::params![
                             format!("opencode:{}", record.session_id),
                             "opencode",
-                            record.title,
+                            usable_title(record.title.as_deref(), record.preview.as_deref()),
                             record.project,
                             db_ref,
                             record.started_at,
@@ -1004,6 +1047,39 @@ mod tests {
         ));
         assert!(!is_injected_title("看看 [role — you are] 这行"));
         assert!(is_injected_title("[memory context — what the"));
+    }
+
+    #[test]
+    fn usable_title_prefers_the_user_words_over_an_injected_title() {
+        // An injected header as the stored title falls back to the preview,
+        // which user_text() already stripped.
+        assert_eq!(
+            usable_title(Some("[memory context — what the"), Some("帮我看下这个报错")).as_deref(),
+            Some("帮我看下这个报错")
+        );
+        // A title that is about the user's words is kept as the harness wrote it.
+        assert_eq!(
+            usable_title(Some("修一下登录页"), Some("帮我看下这个报错")).as_deref(),
+            Some("修一下登录页")
+        );
+        // Harness placeholders are not names either.
+        assert_eq!(
+            usable_title(Some("New session"), Some("帮我看下这个报错")).as_deref(),
+            Some("帮我看下这个报错")
+        );
+        // A user who really does start with a bracket keeps it (the guard is
+        // STARTS WITH our own headers, not "contains a bracket").
+        assert_eq!(
+            usable_title(Some("[草稿] 帮我看看"), Some("x")).as_deref(),
+            Some("[草稿] 帮我看看")
+        );
+        // Nothing to name it after stays empty: the panel owns the placeholder.
+        assert_eq!(usable_title(None, None), None);
+        assert_eq!(usable_title(Some("   "), Some("  ")), None);
+        // Long titles are truncated to one readable line.
+        let long = "长".repeat(200);
+        let got = usable_title(None, Some(&long)).unwrap();
+        assert!(got.chars().count() <= 81, "truncated: {got}");
     }
 
     #[test]
