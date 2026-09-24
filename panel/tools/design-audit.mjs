@@ -2578,6 +2578,129 @@ function sessionNameVerdict(o) {
   return { measured: true, pass: o.sessions.bad === 0, total: o.sessions.total, bad: o.sessions.bad, samples: o.sessions.samples };
 }
 
+// Row 55: S1.1 -- each sidebar has EXACTLY ONE visible collapse entry at >=1024.
+//
+// The object is defined POSITIVELY, in two halves:
+//   1. a control (button / [role=button]) whose ACCESSIBLE NAME is the
+//      collapse verb -- it is the name a screen-reader user hears, and S1.1
+//      quotes exactly these names ("收起侧栏" / "收起 / 展开会话历史");
+//   2. inside that bar's OWN subtree -- scoping by CONTAINMENT, not by class.
+// Class-name substrings are deliberately not used: t142's [class*=resizer]
+// failing to match .resize-handle is the precedent. A class rename must not
+// silently empty this set.
+//
+// Note what is NOT used: aria-expanded. The group toggles in the chat rail
+// carry aria-expanded + aria-controls (they fold a WORKSPACE, not a bar), so
+// keying on aria-expanded would count the wrong controls.
+const RAIL_COLLAPSE_RE = /^\s*(收起|展开)/;
+async function probeRailToggles(page, baseUrl, restore) {
+  const out = { error: null, wide: null, narrowClosed: null, narrowOpen: null };
+  const measure = () =>
+    page.evaluate(() => {
+      const inVp = (r) =>
+        r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+      // Which bar does this control belong to? Walk up to the nearest
+      // complementary landmark. That is a structural answer, not a name.
+      const barOf = (el) => {
+        let n = el;
+        while (n && n !== document.body) {
+          if (n.tagName === "ASIDE" || n.getAttribute("role") === "complementary") {
+            const c = String(n.className || "");
+            return c.includes("app-sider") ? "主导航栏" : c.includes("chat") ? "chat 会话栏" : "侧栏";
+          }
+          n = n.parentElement;
+        }
+        return null;
+      };
+      const entries = [];
+      const cands = [...document.querySelectorAll("button, [role=button]")];
+      for (const el of cands) {
+        const name = (el.getAttribute("aria-label") || el.textContent || "").trim();
+        if (!/^\s*(收起|展开)/.test(name)) continue;
+        const r = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        entries.push({
+          name: name.slice(0, 24),
+          bar: barOf(el),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          x: Math.round(r.left),
+          inVp: inVp(r),
+          shown: cs.display !== "none" && cs.visibility !== "hidden",
+          // the OTHER half of S1.1: off-screen but focusable is NOT visible
+          focusable: el.tabIndex >= 0,
+        });
+      }
+      return entries;
+    });
+  try {
+    await page.goto(baseUrl + "/?mode=dark#chat", { waitUntil: "load", timeout: 60_000 });
+    await page.waitForTimeout(2500);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.waitForTimeout(600);
+    out.wide = await measure();
+    // <1024: the drawer tier. Closed first (the header control is off-screen but
+    // focusable -- it must NOT be counted), then opened (both visible => the
+    // same "exactly one" rule must hold, or the hole leaks back from narrow).
+    await page.setViewportSize({ width: 900, height: 900 });
+    await page.waitForTimeout(600);
+    out.narrowClosed = await measure();
+    const opened = await page.evaluate(() => {
+      const el = document.querySelector(".chat-side-toggle");
+      if (!el) return false;
+      el.click();
+      return true;
+    });
+    if (opened) {
+      await page.waitForTimeout(700);
+      out.narrowOpen = await measure();
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(300);
+    }
+  } catch (e) {
+    out.error = e.message;
+  }
+  if (restore) {
+    await page.setViewportSize({ width: restore.width, height: restore.height });
+    await page.waitForTimeout(120);
+  }
+  return out;
+}
+
+// S1.1 verdict: at >=1024 each bar has exactly one VISIBLE entry. Visible means
+// the box is non-empty AND intersects the viewport -- the second half is what
+// keeps off-screen-but-focusable controls out.
+function railToggleVerdict(o, expected) {
+  if (!o || o.error) return { measured: false, pass: null, why: "rail-toggle probe failed" };
+  const rows = o.wide || [];
+  if (!rows.length) return { measured: false, pass: null, why: "no collapse entry on this route at >=1024" };
+  // An entry whose bar cannot be identified must NOT be quietly bucketed on its
+  // own -- that bucket then holds exactly one and the row passes while a real
+  // duplicate hides inside it. Live example: the x=517 control sits outside any
+  // complementary landmark, landed in "(bar 未识别)" and made this row green
+  // with TWO collapse entries for the same bar on screen. Unknown scope is
+  // not_measured, loudly.
+  const unknown = rows.filter((r) => r.inVp && !r.bar);
+  if (unknown.length)
+    return {
+      measured: false,
+      pass: null,
+      why:
+        "collapse entry outside any identifiable bar (" +
+        unknown.map((r) => r.name + " @x=" + r.x).join("，") +
+        ") -- scope unknown, so the count cannot be trusted",
+    };
+  const bars = {};
+  for (const r of rows) {
+    const key = r.bar || "(bar 未识别)";
+    bars[key] = bars[key] || [];
+    if (r.inVp) bars[key].push(r);
+  }
+  const counts = Object.fromEntries(Object.entries(bars).map(([k, v]) => [k, v.length]));
+  const bad = Object.entries(counts).filter(([, n]) => n !== expected).map(([k, n]) => ({ bar: k, n }));
+  return { measured: true, counts, bad, expected, pass: bad.length === 0 };
+}
+
 // Row 54: the narrow-screen row-level actions verdict (view-sessions.md S10).
 //
 // S10 chose "fold the secondary action into a menu" at <=520 so that BOTH
@@ -3115,6 +3238,8 @@ async function auditRoute(page, o) {
   const wig = await probeWig(page, measureViewport).catch((e) => ({ error: e.message }));
   const order = await probeOrder(page, args.baseUrl).catch((e) => ({ error: e.message }));
   const rail = await probeSessionRail(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  const railT = await probeRailToggles(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  if (railT?.error) warnings.push("row 55 rail-toggle probe: " + railT.error);
   if (rail?.error) warnings.push("row 54 session-rail probe: " + rail.error);
   if (order?.error) warnings.push("rows 47-50 order probe: " + order.error);
   if (wig?.error) warnings.push("rows 50-52 WIG probe: " + wig.error);
@@ -3142,6 +3267,7 @@ async function auditRoute(page, o) {
     wig,
     order,
     rail,
+    railT,
     apiWindowMs,
     domStable,
     shot,
@@ -4006,6 +4132,45 @@ const CHECKS = [
         display: parts.join(" · ") + (pass ? " ✓" : " ✗"),
         pass,
         detail: { controls: v, label: lab, menu: men, desktop: c.rail.desktop },
+      };
+    },
+  },
+  {
+    n: 55, title: "每条侧栏可见的收起入口数（S1.1）", modes: ["dark"],
+    parse: (t) => ({
+      expected: pick(t.text, /恰好\s*(\d+)\s*个/, 1),
+      minVp: pick(t.text, /≥\s*(\d+)/, 1024),
+    }),
+    criterion: [
+      "**MASTER §12 行 55（待 design-lead 落表；契约出处 = views/README.md §S1.1「每条栏在 ≥1024 下只能有「一个」可见的收起入口」）**：**≥1024 下每条侧栏（主导航栏 · chat 会话栏）「可见的」收起入口恰好 1 个** ✓。",
+      "**阈值来源 = 裁决**（**不是测量** ✓ —— S1.1 的意图是「同义入口会让人不确定点哪个」，S1 要求的是「一个控件」而不是「每个入口长得一样」）✓。",
+      "**「可见」的可判定定义（契约原文，最易错处）**：**width > 0 ∧ height > 0 且边界盒与视口相交** ✓ —— **必须含「与视口相交」这一半** ✗，否则**屏外但可聚焦**的元素会被算进来 ✓。",
+      "**对象集的正面定义（不用类名子串猜）**：「收起入口」= **① 一个控件（button / [role=button]），其**可访问名**以「收起」或「展开」开头**（这是屏幕阅读器用户听到的语义，且 **S1.1 原文就引用了这两个名字**：收起侧栏 / 收起 展开会话历史）**∧ ② 位于该栏自身的 DOM 子树内**（**按包含关系定界，不按类名**）✓。**为什么不用 aria-expanded**：chat 会话栏里的**分组折叠**控件带 aria-expanded + aria-controls（它们折叠的是**工作区**，不是栏）⇒ 按 aria-expanded 取会数错对象 ✗（**实测：.chat-group-more / .chat-group-toggle 都有 aria-expanded** ✓）。**为什么不用类名子串**：t142 的 [class*=resizer] 匹配不到 .resize-handle 就是前车之鉴 —— 改类名不得让这个集合静默变空 ✗。",
+      "**与既有行的关系（对象不同 ⇒ 不合并也不重复）**：**行 18 = 命中可达**（有效命中盒 ≥24px）· **行 52 = 单个元素 ≥44px**（触摸可达）· **行 54 = 窄屏行级形态**（行内控件数 / 行高）· **本行 = 入口的数量** ✓。",
+      "**<1024 的形态（契约原文）**：.chat-side-toggle 是**冻结选择器、是抽屉入口 ⇒ 保留** ✓；**头部控件在抽屉关闭时位于屏外但可聚焦 ⇒ 不重复计数**（该档只对「抽屉入口」计数）✓；**抽屉打开时若两者同时可见 ⇒ 该档同样必须满足「恰好 1 个」**（否则洞会从窄屏漏回来）✓。",
+      "**⚠️ 空集保护**：该路由没有该栏 / 没有入口 ⇒ **not_measured 并点名原因**（不得静默 PASS）✓。",
+    ].join("\n"),
+    judge: (c, l) => {
+      if (!c.railT || c.railT.error) return { display: "— (rail-toggle probe failed)", pass: null };
+      const v = railToggleVerdict(c.railT, l.expected);
+      if (!v.measured) return { display: "— not_measured：" + (v.why || "no entry") + " ⇒ 不报 PASS", pass: null };
+      const openRows = (c.railT.narrowOpen || []).filter((r) => r.inVp);
+      const openBars = {};
+      for (const r of openRows) {
+        const k = r.bar || "(bar 未识别)";
+        openBars[k] = (openBars[k] || 0) + 1;
+      }
+      const openBad = Object.entries(openBars).filter(([, n]) => n !== l.expected);
+      const parts = [
+        Object.entries(v.counts).map(([k, n]) => k + "=" + n).join(" · ") + "（阈值 恰好 " + v.expected + "）",
+        "抽屉关闭时可见入口 " + (c.railT.narrowClosed || []).filter((r) => r.inVp).length + "（屏外可聚焦的不计）",
+        c.railT.narrowOpen ? "抽屉打开时可见 " + openRows.length : "抽屉未打开（未测）",
+      ];
+      const pass = v.pass && (c.railT.narrowOpen ? openBad.length === 0 : true);
+      return {
+        display: parts.join(" · ") + (pass ? " ✓" : " ✗") + (v.bad.length ? " 超出：" + v.bad.map((b) => b.bar + " " + b.n + " 个").join("，") : ""),
+        pass,
+        detail: { wide: v, narrowClosed: c.railT.narrowClosed, narrowOpen: c.railT.narrowOpen },
       };
     },
   },
@@ -5496,6 +5661,13 @@ function runSelfTest() {
     // straight out of MASTER §12 by loadThresholds; docs/design/check-contract.mjs
     // (design-lead) independently reports the same row set via --json, so the two
     // can be cross-checked without either script depending on the other.
+    // ONE declaration for both directions of the reconcile AND for the §12 parse
+    // check below, so a fact lives in exactly one place. It sits OUTSIDE the
+    // reconcile block because the §12 check reads it after that block closes.
+    // Row 55 (S1.1) is implemented here but its §12 entry is not written yet --
+    // design-lead landed S1.1 in views/README.md and deliberately left the table
+    // alone. Named here so the gap is asserted in BOTH directions.
+    const PENDING_ENTRY = [55];
     {
       const toolRows = [...new Set(CHECKS.map((r) => r.n))].sort((a, b) => a - b);
       const contractRows = [...TH.rows.keys()].sort((a, b) => a - b);
@@ -5508,12 +5680,13 @@ function runSelfTest() {
       const PENDING_TOOL = [];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
-      // The expectation is DERIVED from the declaration above, not written a
-      // second time. Two copies of one fact drift the moment the fact changes:
-      // when t135 landed row 54, the declaration and this literal both went
-      // stale together. One edit point now.
+
+      // Pairing matters and is easy to invert: onlyTool (the tool has it, the
+      // contract does not) belongs with PENDING_ENTRY; onlyContract (the contract
+      // promises it, no judge exists) belongs with PENDING_TOOL. t136 had this
+      // pair the wrong way round and it stayed green only because both were empty.
       check("reconcile: the tool rows awaiting a contract entry are exactly the declared set",
-        onlyTool.join(","), PENDING_TOOL.join(","));
+        onlyTool.join(","), PENDING_ENTRY.join(","));
       console.log("  reconcile: tool=" + toolRows.length + " contract=" + contractRows.length +
         " onlyTool=[" + onlyTool.join(",") + "] onlyContract=[" + onlyContract.join(",") + "]");
     }
@@ -5525,7 +5698,6 @@ function runSelfTest() {
     // 47/48/49 landed in the contract from t99's draft and are NOT yet judged
     // here; 50/51/52 are this task's new rows and have no entry yet. Both gaps
     // are named in the reconcile block above and in the --self-test output.
-    const PENDING_ENTRY = [];
     check("§12 parse: the rows awaiting a MASTER entry are exactly the declared set",
       [...new Set(notInDoc.map((m) => Number(String(m).match(/^row(\d+)/)?.[1])))].sort((a, b) => a - b).join(","),
       PENDING_ENTRY.join(","));
@@ -6164,6 +6336,47 @@ function runSelfTest() {
     menuSizeVerdict(menuRail({ n: 14, minW: 51, minH: 36 }), 44).pass, false);
   check("row54: the SCOPED reading (the row's own 2 items, 74px) PASSES",
     menuSizeVerdict(menuRail({ n: 2, minW: 284, minH: 74 }), 44).pass, true);
+
+  // An entry whose bar cannot be identified is not_measured, NOT bucketed into a
+  // singleton that quietly passes. This is the bug the live 1440 reading exposed.
+  check("row55: an entry outside any identifiable bar is not_measured, never a quiet singleton",
+    railToggleVerdict({ error: null, wide: [{ bar: null, name: "收起 / 展开会话历史", x: 517, inVp: true, shown: true, focusable: true }], narrowClosed: [] }, 1).pass === null, true);
+  check("row55: and it names the offending control and its x",
+    /x=517/.test(railToggleVerdict({ error: null, wide: [{ bar: null, name: "收起 / 展开会话历史", x: 517, inVp: true }], narrowClosed: [] }, 1).why || ""), true);
+
+  // ---- t147: row 55, S1.1 (exactly one visible collapse entry per bar) ------
+  const bar = (name, entries) => ({ error: null, wide: entries.map((e) => ({ bar: name, name: "收起侧栏", w: 32, h: 32, x: 400, focusable: true, shown: true, ...e })), narrowClosed: [], narrowOpen: null });
+  // REVERSE EVIDENCE 1: two visible entries on the same bar => FAIL. This is the
+  // live 1440 reading before t134 (both .chat-rail-toggle were 32x32 and shown).
+  check("row55 must-FAIL: two visible collapse entries on one bar",
+    railToggleVerdict(bar("主导航栏", [{ inVp: true }, { inVp: true }]), 1).pass, false);
+  check("row55 must-PASS: exactly one visible entry",
+    railToggleVerdict(bar("主导航栏", [{ inVp: true }]), 1).pass, true);
+  // REVERSE EVIDENCE 2: the "intersects the viewport" half. An entry that is
+  // off-screen but FOCUSABLE must not be counted -- drop that half and this
+  // reads 2 and goes red for no reason.
+  check("row55: an off-screen but focusable entry is NOT counted (the viewport half)",
+    railToggleVerdict(bar("主导航栏", [{ inVp: true }, { inVp: false, x: -400, focusable: true }]), 1).pass, true);
+  check("row55: ...and without that half it would have counted 2 (the guard is load-bearing)",
+    (() => { const o = bar("主导航栏", [{ inVp: true }, { inVp: false, x: -400, focusable: true }]); return o.wide.filter((r) => r.shown).length; })(), 2);
+  // REVERSE EVIDENCE 3: <1024 with the drawer OPEN and both visible => FAIL.
+  // Same rule, so the hole cannot leak back from the narrow tier.
+  const drawerOpen = { error: null, wide: bar("主导航栏", [{ inVp: true }]).wide, narrowClosed: [{ bar: "chat 会话栏", inVp: false, focusable: true }], narrowOpen: [{ bar: "chat 会话栏", inVp: true }, { bar: "chat 会话栏", inVp: true }] };
+  check("row55 must-FAIL: drawer open with two visible entries in the same bar",
+    (() => { const open = drawerOpen.narrowOpen.filter((r) => r.inVp); const bars = {}; for (const r of open) bars[r.bar] = (bars[r.bar] || 0) + 1; return Object.values(bars).some((n) => n !== 1); })(), true);
+  check("row55: and with the drawer SHUT that same header entry is not counted",
+    drawerOpen.narrowClosed.filter((r) => r.inVp).length, 0);
+  // EMPTY SET: no entry at all is not_measured, never PASS.
+  check("row55: no collapse entry on the route is not_measured, never pass",
+    railToggleVerdict({ error: null, wide: [], narrowClosed: [] }, 1).pass === null, true);
+  check("row55: and it names why (the empty set is not silent)",
+    /no collapse entry/.test(railToggleVerdict({ error: null, wide: [] }, 1).why || ""), true);
+  // The threshold is read from the contract cell, and a missing entry is a
+  // RECORDED miss (PENDING_ENTRY names it) -- never a silent built-in default.
+  check("row55: a §12 cell without the phrase records an anchor miss (no silent fallback)",
+    (() => { resetPickMisses(); CHECKS.find((r) => r.n === 55).parse({ text: "没有阈值" }); return takePickMisses().length >= 1; })(), true);
+  check("row55: and the real cell, when it lands, reads exactly 1",
+    CHECKS.find((r) => r.n === 55).parse({ text: "恰好 1 个" }).expected, 1);
 
   // ---- t143: the probe point must be a point that EXISTS -------------------
   // The real case: a handle spanning the whole column. h=3937 in a 900px

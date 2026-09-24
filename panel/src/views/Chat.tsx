@@ -1337,6 +1337,26 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           >
             <Icon name="squarePen" size={13} /> {t("chat.new")}
           </Button>
+          {/* S1 (README:400): the chat rail's collapse entry. Before this the
+              ONLY entry was .chat-side-toggle, which is 0x0 on desktop and can
+              only ever OPEN — the user's report. Same icon pair, same 32x32 box
+              and the same aria naming as the nav rail (t133): the name states
+              the action for the current state. On narrow the rail is a drawer,
+              so the same button also closes it. */}
+          <Tooltip title={t("common.toggleSidebar")}>
+            <Button
+              size="small"
+              type="text"
+              className="icon-btn icon-btn-lg chat-rail-toggle"
+              onClick={() => {
+                setRailCollapsed((v) => !v);
+                setSideOpen(false);
+              }}
+              aria-label={railCollapsed ? t("sider.expand") : t("sider.collapse")}
+            >
+              <Icon name={railCollapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
+            </Button>
+          </Tooltip>
           <Tooltip title={t("chat.addWorkspace")}>
             <Button
               size="small"
@@ -1612,16 +1632,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         className={`chat-wrap${!viewing && messages.length === 0 ? " is-empty" : ""}`}
       >
       <div className="view-bar">
-        <Button
-          size="small"
-          type="text"
-          className="chat-rail-toggle"
-          onClick={() => setRailCollapsed((c) => !c)}
-          title={t("chat.toggleRail")}
-          aria-label={t("chat.toggleRail")}
-        >
-          <Icon name={railCollapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
-        </Button>
+        {/* t134 item 7: the DUPLICATE collapse entry used to live here
+            (.view-bar .chat-rail-toggle, chat.toggleRail). It is removed: the
+            chat rail's one and only collapse entry is the head control below
+            (32x32, sider.collapse / sider.expand), so at 1440 exactly one
+            entry is visible. The narrow-screen frozen .chat-side-toggle stays. */}
         {/* Row 24: every route owes the document outline exactly one h1.
             The visible 20px title stays `.view-bar h2` (frozen selector). */}
         {/* `.micro` on purpose: `.sr-only` does not reset font-size, and a
@@ -1635,13 +1650,25 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           </span>
         ) : null}
         <span className="grow" />
+        {/* The other half of S1: when the desktop rail is collapsed the head
+            button is gone with it (the rail is display:none), so the expand
+            path has to live outside the rail. This is the frozen
+            .chat-side-toggle: it already opens the narrow drawer; it now also
+            restores the desktop rail, and it becomes VISIBLE on desktop while
+            collapsed (inline display is the mechanism, not decoration — at rest
+            no inline style is emitted). */}
         <Button
           size="small"
           className="chat-side-toggle"
-          onClick={() => setSideOpen(true)}
-          title={t("chat.history")}
+          onClick={() => {
+            setSideOpen(true);
+            setRailCollapsed(false);
+          }}
+          style={railCollapsed ? { display: "inline-flex" } : undefined}
+          title={railCollapsed ? t("sider.expand") : t("chat.history")}
+          aria-label={railCollapsed ? t("sider.expand") : t("chat.history")}
         >
-          <Icon name="history" size={13} />
+          <Icon name={railCollapsed ? "panelLeftOpen" : "history"} size={13} />
         </Button>
       </div>
 
