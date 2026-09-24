@@ -5,7 +5,15 @@
 // nobody is asked to choose every time. The history drawer reopens
 // past conversations (live ones reattach and stream).
 
-import { Fragment, memo, useCallback, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { Button, Input, Popconfirm, Select, Tooltip } from "antd";
 import {
   api,
@@ -19,7 +27,14 @@ import {
 import { BrandMark } from "../brand";
 import { Icon, type IconName } from "../icons";
 import { useI18n } from "../i18n";
-import { ErrorState, RelTime, Spinner, useToast } from "../ui";
+import {
+  ErrorState,
+  RelTime,
+  ResizeHandle,
+  Spinner,
+  useSidebarResize,
+  useToast,
+} from "../ui";
 import { Markdown } from "./lazy-markdown";
 import { msToIso } from "./Sessions";
 
@@ -243,6 +258,32 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   useEffect(() => {
     localStorage.setItem("chat.railCollapsed", railCollapsed ? "1" : "0");
   }, [railCollapsed]);
+
+  // S2: the chat rail is the resizable column (t132's shared mechanism).
+  // The width goes into the CSS variable t144 added (--chat-rail-w): the
+  // column is a GRID TRACK, so the track is what must move - writing a width
+  // onto .chat-side changed its box but not the layout (F-134a, measured:
+  // box 248->300 while grid-template-columns stayed 248px and the content
+  // stayed at x=517). `other` is the nav rail's LIVE width, measured from
+  // the DOM: the hook uses it only for the max formula, but a stale constant
+  // would drift as soon as the user widens the nav rail.
+  const [navRailWidth, setNavRailWidth] = useState(228);
+  useEffect(() => {
+    const el = document.querySelector(".app-sider");
+    if (!el) return;
+    const measure = () =>
+      setNavRailWidth(Math.round(el.getBoundingClientRect().width) || 228);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const chatRail = useSidebarResize({
+    id: "chat",
+    def: 248,
+    other: navRailWidth,
+    enabled: !railCollapsed,
+  });
   const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
   /** Working directory for new chats — which project the agent works
    * in (persisted; the daemon spawns the session there). */
@@ -1323,7 +1364,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   );
 
   return (
-    <div className={`chat-layout${railCollapsed ? " rail-collapsed" : ""}`}>
+    <div
+      className={`chat-layout${railCollapsed ? " rail-collapsed" : ""}`}
+      /* null until the user drags: an untouched column must keep the CSS
+         default byte-for-byte, so no inline style is emitted at rest. */
+      style={
+        chatRail.width === null
+          ? undefined
+          : ({ "--chat-rail-w": `${chatRail.width}px` } as unknown as CSSProperties)
+      }
+    >
+      {/* S2: the splitter is a DIRECT child of .chat-layout - that is the
+          scope t144's rule targets (.chat-layout > .resize-handle), and an
+          absolutely positioned child is not a grid item, so it adds no
+          implicit track and eats no gap. */}
+      <ResizeHandle label={t("sider.resizeChat")} {...chatRail.handleProps} />
       <aside className={`chat-side${sideOpen ? " open" : ""}`}>
         <div className="chat-side-head zone-head">
           <Button
