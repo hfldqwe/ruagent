@@ -1261,12 +1261,46 @@ html[data-mode="light"] .tag.err { color: #c4121c; background: #f9e7e8; }
 }
 .chat-layout {
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr);
+  /* t144: the rail column is DRIVEN BY A VARIABLE, so the S2 splitter changes
+     the layout instead of only the rail's own box (ui-work measured the old
+     behaviour: an inline width:300px moved the box to 300 while the track
+     stayed 248px and the conversation's x stayed 517). The wiring sets
+     --chat-rail-w (any ancestor works, it inherits); leaving it unset keeps the
+     default. --chat-rail-default carries the per-breakpoint default so the
+     column AND the handle's position fall back to the same number in one place
+     (248 here, 200 in the <=1024 block). */
+  --chat-rail-default: 248px;
+  position: relative;
+  grid-template-columns: var(--chat-rail-w, var(--chat-rail-default)) minmax(0, 1fr);
   gap: 0 24px;
   align-items: start;
   min-height: calc(100vh - 140px);
   padding-inline-start: 16px;
   padding-inline-end: clamp(16px, 2.6vw, 48px);
+}
+/* t144: the splitter is taken OUT of grid flow on purpose. As a grid item it
+   would land in an implicit THIRD column, which (a) creates a second 24px gap
+   and shifts the conversation right, and (b) leaves the track list itself
+   unchanged - the very bug this task exists to fix. An absolutely positioned
+   child is not a grid item: it creates no track, consumes no gap, and the
+   default track list stays byte-identical. The element box stays 1px (S2); only
+   its transparent ::after provides the grab area, exactly as on the nav rail.
+   The line sits ON the rail's existing hairline border (left = column - 1px),
+   so it does not add a second rule. */
+.chat-layout > .resize-handle {
+  position: absolute;
+  inset-block: 0;
+  /* 16px = this layout's own padding-inline-start (declared just above): an
+     absolutely positioned child is offset from its containing block's PADDING
+     box, so the rail's right edge is padding + column, and -1px puts the line
+     exactly on the rail's hairline border instead of beside it. */
+  left: calc(16px + var(--chat-rail-w, var(--chat-rail-default)) - 1px);
+}
+/* A collapsed rail has nothing to resize, and <=768 turns the rail into a
+   slide-over drawer (the 768 block below). Both are structural, not gates the
+   wiring has to remember. */
+.chat-layout.rail-collapsed > .resize-handle {
+  display: none;
 }
 /* Freed width: the rail collapses to nothing, the conversation keeps
    the space (toggle in the view-bar, persisted per browser). */
@@ -1310,10 +1344,18 @@ html[data-mode="light"] .tag.err { color: #c4121c; background: #f9e7e8; }
      scan; see primitives §10.4). */
 }
 @media (max-width: 1024px) {
-  .chat-layout { grid-template-columns: 200px minmax(0, 1fr); gap: 0 16px; }
+  /* t144: the narrow default lives here so the column and the handle position
+     keep falling back to the same value. */
+  .chat-layout {
+    --chat-rail-default: 200px;
+    grid-template-columns: var(--chat-rail-w, var(--chat-rail-default)) minmax(0, 1fr);
+    gap: 0 16px;
+  }
 }
 @media (max-width: 768px) {
   .chat-layout, .chat-layout.rail-collapsed { grid-template-columns: minmax(0, 1fr); }
+  /* t144: the rail is a slide-over here, so there is no column to split. */
+  .chat-layout > .resize-handle { display: none; }
   /* rail-collapsed is a desktop concept — phones always get the
      slide-over when summoned. */
   .chat-layout.rail-collapsed .chat-side { display: flex; }
