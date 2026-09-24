@@ -13,7 +13,7 @@ import { api } from "./api";
 import { Icon } from "./icons";
 import { useI18n } from "./i18n";
 import { ThemeProvider, useThemeMode } from "./theme";
-import { Spinner, ToastBridge } from "./ui";
+import { ResizeHandle, Spinner, ToastBridge, useSidebarResize } from "./ui";
 
 // Route-level code splitting (row 27): every view is its own chunk, fetched
 // the first time its hash is visited. The shell — sider, brand, palette,
@@ -79,6 +79,36 @@ type View =
   | { kind: "settings" }
   | { kind: "inbox" };
 
+// ---------------------------------------------------------------------------
+// Sidebar geometry (S1/S2). The dragged WIDTH is ui.tsx's business (the hook
+// owns "ruagent.sidebar.<id>"); what the shell owns is the collapse preference.
+// ---------------------------------------------------------------------------
+
+/** The other resident column's default width — the second term of the S2 max
+ *  formula (max = min(2 x def, viewport - other - 390)). t134 swaps this
+ *  constant for the live chat-rail width once that rail is resizable. */
+const CHAT_RAIL_DEFAULT = 248;
+
+/** The nav rail's explicit collapse choice, or null when the user never made
+ *  one. Visiting must never write this (S1): the default comes from the frozen
+ *  lg breakpoint, so "just looking at the app" cannot rewrite a default. */
+const COLLAPSE_KEY = "ruagent.sidebar.collapsed";
+function readStoredCollapsed(): boolean | null {
+  try {
+    const raw = window.localStorage.getItem(COLLAPSE_KEY);
+    return raw === null ? null : raw === "true";
+  } catch {
+    return null; // private mode: the preference is a nicety, never a gate
+  }
+}
+function writeStoredCollapsed(v: boolean) {
+  try {
+    window.localStorage.setItem(COLLAPSE_KEY, String(v));
+  } catch {
+    /* see readStoredCollapsed */
+  }
+}
+
 function parseHash(): View {
   const h = window.location.hash.replace(/^#/, "");
   const mTask = h.match(/^task\/([\w-]+)/);
@@ -131,11 +161,29 @@ function Shell() {
   const [daemonUp, setDaemonUp] = useState(true);
   const [cmdk, setCmdk] = useState(false);
   const [creating, setCreating] = useState(false);
-  // Auto-collapse below lg; the footer toggle keeps manual control on
-  // desktop too. MatchMedia drives it so resizing the window adapts live.
+  // Auto-collapse below lg (frozen breakpoint); the footer toggle keeps manual
+  // control on desktop too. MatchMedia drives the automatic path, so resizing
+  // the window adapts live; an EXPLICIT choice is persisted (S1) and therefore
+  // survives a reload. The automatic path deliberately does not write: only the
+  // user may overwrite the default.
   const [collapsed, setCollapsed] = useState(
-    () => window.matchMedia("(max-width: 992px)").matches,
+    () => readStoredCollapsed() ?? window.matchMedia("(max-width: 992px)").matches,
   );
+  const toggleCollapsed = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    writeStoredCollapsed(next);
+  };
+
+  // S2: the nav rail is the resizable column. Dragging is off while the rail is
+  // collapsed (there is nothing to widen) and below 1024 (the hook's single
+  // viewport gate, mirrored by CSS through the same aria-disabled attribute).
+  const navRail = useSidebarResize({
+    id: "nav",
+    def: 228,
+    other: CHAT_RAIL_DEFAULT,
+    enabled: !collapsed,
+  });
 
   useEffect(() => {
     const apply = () => setView(parseHash());
@@ -255,7 +303,7 @@ function Shell() {
       <ToastBridge />
       <CommandPalette open={cmdk} onOpenChange={setCmdk} nav={nav} onNewTask={() => setCreating(true)} />
       <Sider
-        width={228}
+        width={navRail.width ?? 228}
         collapsedWidth={72}
         collapsed={collapsed}
         trigger={null}
@@ -309,12 +357,16 @@ function Shell() {
               Ctrl K ⌘K
             </button>
           )}
+          {/* S1 unified collapse control: same icon, same 32x32 box, same
+              aria naming pattern as the chat rail's (t134). The name states the
+              ACTION for the current state — "expand" while collapsed, "collapse"
+              while expanded. */}
           <Tooltip title={t("common.toggleSidebar")}>
             <Button
               size="small"
               type="text"
-              onClick={() => setCollapsed((c) => !c)}
-              aria-label={t("common.toggleSidebar")}
+              onClick={toggleCollapsed}
+              aria-label={collapsed ? t("sider.expand") : t("sider.collapse")}
             >
               <Icon name={collapsed ? "panelLeftOpen" : "panelLeftClose"} size={14} />
             </Button>
@@ -335,6 +387,11 @@ function Shell() {
         </div>
         </div>
       </Sider>
+      {/* S2: the splitter is a flex SIBLING of the column it resizes. The outer
+          antd Layout is already a flex row and .resize-handle stretches itself,
+          so this needs no wrapper and no inline geometry. The hook hides it
+          (aria-disabled -> display:none) below 1024 and while collapsed. */}
+      <ResizeHandle label={t("sider.resizeNav")} {...navRail.handleProps} />
       {creating && (
         <Suspense fallback={null}>
           <CreateTaskModal

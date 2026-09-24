@@ -84,9 +84,11 @@ test.describe("desktop", () => {
     const wide = await page.locator(".ant-layout-sider").boundingBox();
     expect(wide?.width).toBe(228);
 
-    // Manual toggle: desktop users get the rail too.
+    // Manual toggle: desktop users get the rail too. Since S1 (t133) the
+    // accessible name is state-specific — "收起侧栏" while expanded, "展开侧栏"
+    // while collapsed — so the selector accepts either direction.
     await page
-      .getByRole("button", { name: /collapse|收起/i })
+      .getByRole("button", { name: /collapse|expand|收起|展开/i })
       .first()
       .click();
     await page.waitForTimeout(300);
@@ -98,7 +100,7 @@ test.describe("desktop", () => {
 
     // Toggle back — state persists across a route change.
     await page
-      .getByRole("button", { name: /collapse|收起/i })
+      .getByRole("button", { name: /collapse|expand|收起|展开/i })
       .first()
       .click();
     await page.waitForTimeout(300);

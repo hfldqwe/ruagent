@@ -32,6 +32,11 @@ const zh: Record<string, string> = {
   "common.offlineBanner": "daemon 不可达 — 无法加载数据，正在自动重试",
   "common.toggleSidebar": "收起 / 展开侧栏",
   "common.buildId": "面板构建 {id}",
+  // S1/S2 sidebar (2026-09-23): the unified collapse control's name states the
+  // action for the current state; the two splitter labels are per rail.
+  "sider.collapse": "收起侧栏",
+  "sider.expand": "展开侧栏",
+  "sider.resizeNav": "拖动调整导航栏宽度",
   "cmd.placeholder": "搜索命令…",
   "cmd.list": "命令",
   "cmd.foot": "↑↓ 选择 · Enter 执行 · Esc 关闭",
@@ -742,6 +747,9 @@ const en: Record<string, string> = {
   "common.offlineBanner": "daemon unreachable — data may be stale, retrying automatically",
   "common.toggleSidebar": "Collapse / expand sidebar",
   "common.buildId": "Panel build {id}",
+  "sider.collapse": "Collapse sidebar",
+  "sider.expand": "Expand sidebar",
+  "sider.resizeNav": "Resize the navigation rail",
   "cmd.placeholder": "Search commands…",
   "cmd.list": "Commands",
   "cmd.foot": "↑↓ select · Enter run · Esc close",
