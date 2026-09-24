@@ -2546,6 +2546,11 @@ async function probeSessionRail(page, baseUrl, restore) {
           perRow: rows.map((r) => ({
             actions: acts(r).length,
             h: Math.round(r.getBoundingClientRect().height * 100) / 100,
+            // t137: the row height is CONTENT-driven, so the decidable question
+            // at 390 is not "how tall" but "is the content being squeezed". A
+            // row whose content overflows horizontally is the case where the
+            // height is NOT what the content needs.
+            overflowX: r.scrollWidth > r.clientWidth + 1,
             moreLabel: (() => {
               const m = acts(r).find((a) => /more|更多|menu|菜单/i.test((a.getAttribute("aria-label") || "") + (a.title || "")));
               return m ? m.getAttribute("aria-label") : null;
@@ -2588,14 +2593,39 @@ async function probeSessionRail(page, baseUrl, restore) {
     if (opened) {
       await page.waitForTimeout(600);
       out.menu = await page.evaluate(() => {
-        const items = [...document.querySelectorAll("[role=menuitem], .ant-dropdown-menu-item")].filter((el) => {
+        // POSITIVE definition of the object set: the items inside an open
+        // DROPDOWN overlay.
+        //
+        // The earlier selector asked for every menuitem on the page, and the
+        // left navigation is an antd Menu too -- its 12 items (51x36) were
+        // being measured as if they were this row's menu, which made the row
+        // report 14 items with a 36px minimum. ui-list's own menu was 284x74
+        // and compliant; the reading was about someone else's list.
+        //
+        // Excluding the sidebar by name would define the set as "everything
+        // except the ones we happen to know about" -- the next Menu anywhere
+        // would be swept in again. So the scope is stated positively: inside
+        // the dropdown. What is outside is REPORTED, not merely dropped.
+        const visible = (el) => {
           const b = el.getBoundingClientRect();
           return b.width >= 1 && b.height >= 1;
-        });
+        };
+        const size = (el) => {
+          const b = el.getBoundingClientRect();
+          return { w: Math.round(b.width), h: Math.round(b.height) };
+        };
+        const all = [...document.querySelectorAll("[role=menuitem], .ant-dropdown-menu-item")].filter(visible);
+        const inside = all.filter((el) => el.closest(".ant-dropdown"));
+        const outside = all.filter((el) => !el.closest(".ant-dropdown"));
         return {
-          n: items.length,
-          minW: items.length ? Math.round(Math.min(...items.map((i) => i.getBoundingClientRect().width))) : null,
-          minH: items.length ? Math.round(Math.min(...items.map((i) => i.getBoundingClientRect().height))) : null,
+          n: inside.length,
+          sizes: inside.map(size).slice(0, 8),
+          minW: inside.length ? Math.min(...inside.map((i) => Math.round(i.getBoundingClientRect().width))) : null,
+          minH: inside.length ? Math.min(...inside.map((i) => Math.round(i.getBoundingClientRect().height))) : null,
+          // The evidence that the scope is positive: these are the menuitems
+          // that exist on the page and are NOT in the dropdown (the sidebar).
+          outsideN: outside.length,
+          outsideSizes: outside.map(size).slice(0, 4),
         };
       });
       await page.keyboard.press("Escape");
@@ -2620,22 +2650,35 @@ async function probeSessionRail(page, baseUrl, restore) {
 }
 
 // Pure verdicts.
-function railControlsVerdict(o, maxInline, maxRowH) {
+function railControlsVerdict(o, maxInline, absMax520) {
   if (!o || o.error) return { measured: false, pass: null };
-  const rows = (o.narrow || []).flatMap((n) => n.perRow || []);
+  const at = (w) => (o.narrow || []).find((n) => n.viewport === w) || null;
+  const n520 = at(520);
+  const n390 = at(390);
+  const rows = [...((n520 || {}).perRow || []), ...((n390 || {}).perRow || [])];
   // EMPTY-SET GUARD: no rows at a narrow width means the thing this row
   // measures never appeared. That is not_measured, never PASS.
   if (!rows.length) return { measured: false, pass: null, why: "no session row at <=520" };
   const over = rows.filter((r) => r.actions > maxInline);
-  const tall = rows.filter((r) => r.h > maxRowH);
+  // t137 rewrote 6: at 390 the height IS the content-driven minimum (the
+  // arithmetic shows 2 controls need 302px of a 254px content box, so 114px is
+  // unavoidable and NOT a defect). So there is no numeric bound at 390 -- what
+  // must not happen is the content being SQUEEZED. The 520 bound survives as an
+  // absolute sentry.
+  const h390 = n390 && n390.perRow.length ? Math.max(...n390.perRow.map((r) => r.h)) : null;
+  const h520 = n520 && n520.perRow.length ? Math.max(...n520.perRow.map((r) => r.h)) : null;
+  const tall = (n520 ? n520.perRow : []).filter((r) => r.h > absMax520);
+  const squeezed = rows.filter((r) => r.overflowX);
   return {
     measured: true,
     rows: rows.length,
     maxActions: Math.max(...rows.map((r) => r.actions)),
-    maxH: Math.max(...rows.map((r) => r.h)),
+    h390,
+    h520,
     over,
     tall,
-    pass: over.length === 0 && tall.length === 0,
+    squeezed,
+    pass: over.length === 0 && tall.length === 0 && squeezed.length === 0,
   };
 }
 function moreLabelVerdict(o) {
@@ -3798,7 +3841,11 @@ const CHECKS = [
     // miss (pick / pickAny / pickFlag), so a reworded cell is loud.
     parse: (t) => ({
       maxInline: pick(t.text, /行内控件\s*≤\s*(\d+)/, 2),
-      maxRowH: pick(t.text, /行高\s*≤\s*(\d+)\s*px/, 60),
+      // t137 rewrote the row-height threshold: it is now "the height the
+      // content set needs at that width" plus an absolute 520 sentry. Both are
+      // read out of the cell; neither is a built-in number.
+      contentDriven: pickFlag(t.text, /行高\s*=\s*该行内容集在该宽度下所需的最小高度/),
+      absMax520: pick(t.text, /520\s*档\s*≤\s*(\d+)\s*px/, 60),
       menuFloor: pick(t.text, /菜单内每个动作\s*≥\s*(\d+)/, 44),
       identityLabel: pickFlag(t.text, /可访问名含该行会话标题/),
       keyboardFlow: pickFlag(t.text, /键盘全程无鼠标/),
@@ -3813,15 +3860,21 @@ const CHECKS = [
     ].join("\n"),
     judge: (c, l) => {
       if (!c.rail || c.rail.error) return { display: "— (rail probe failed)", pass: null };
-      const v = railControlsVerdict(c.rail, l.maxInline, l.maxRowH);
+      const v = railControlsVerdict(c.rail, l.maxInline, l.absMax520);
       if (!v.measured) return { display: "— not_measured：" + (v.why || "no narrow rows") + " ⇒ 不报 PASS", pass: null };
       const lab = moreLabelVerdict(c.rail);
       const men = menuSizeVerdict(c.rail, l.menuFloor);
       const parts = [
         "行内控件最大 " + v.maxActions + "（阈值 ≤" + l.maxInline + "）",
-        "行高最大 " + v.maxH + "px（阈值 ≤" + l.maxRowH + "px）",
+        "行高 390=" + v.h390 + "px（内容驱动，无绝对上界）",
+        "520=" + v.h520 + "px（绝对上界 ≤" + l.absMax520 + "px）",
         lab.measured ? "「更多」带身份 " + (lab.n - lab.bad.length) + "/" + lab.n : "「更多」未测",
-        men.measured ? "菜单 " + men.n + " 项最小 " + men.minW + "×" + men.minH : "菜单未测",
+        men.measured
+          ? "下拉内 " + men.n + " 项最小 " + men.minW + "×" + men.minH +
+            (c.rail.menu && c.rail.menu.outsideN
+              ? "（页面另有 " + c.rail.menu.outsideN + " 项 menuitem 不在下拉内，已排除）"
+              : "")
+          : "菜单未测",
       ];
       // A not_measured sub-assertion must not be silently folded into a PASS:
       // the row only passes when the parts that CAN be measured are all green.
@@ -5975,6 +6028,20 @@ function runSelfTest() {
   check("row46: the criterion states the 5em derivation and the not_measured boundary",
     /5em/.test(row46.criterion) && /not_measured/.test(row46.criterion), true);
 
+  // ---- t138: the menu scope is POSITIVE (inside the dropdown), not a subtraction ----
+  check("row54: the menu scope is stated positively (inside .ant-dropdown)",
+    /closest\(".ant-dropdown"\)/.test(probeSessionRail.toString()), true);
+  check("row54: and what falls outside the scope is REPORTED, not silently dropped",
+    /outsideN/.test(probeSessionRail.toString()), true);
+  // The unscoped reading (14 items, min 36) was the SIDEBAR being measured. With
+  // the scope fixed, the row sees the dropdown's own items. Both readings are
+  // run through the same verdict so the difference is visible in one place.
+  const menuRail = (m) => ({ error: null, desktop: { perRow: [] }, narrow: [{ viewport: 520, perRow: [{ actions: 2, h: 60 }] }], menu: m });
+  check("row54: the OLD unscoped reading (14 items, 36px min) FAILS -- it was measuring the sidebar",
+    menuSizeVerdict(menuRail({ n: 14, minW: 51, minH: 36 }), 44).pass, false);
+  check("row54: the SCOPED reading (the row's own 2 items, 74px) PASSES",
+    menuSizeVerdict(menuRail({ n: 2, minW: 284, minH: 74 }), 44).pass, true);
+
   // ---- t136: the anchors must READ the contract, and must be LOUD on a miss ----
   const row54r = CHECKS.find((r) => r.n === 54);
   // The REAL cell, as design-lead actually wrote it (t135). All five thresholds
@@ -5989,8 +6056,8 @@ function runSelfTest() {
     real54.misses, 0);
   check("row54: inline-control threshold read from the contract",
     real54.v.maxInline, 2);
-  check("row54: row-height threshold read from the contract",
-    real54.v.maxRowH, 60);
+  check("row54: 520 absolute sentry read from the REAL cell", real54.v.absMax520, 60);
+  check("row54: content-driven row-height requirement read from the REAL cell", real54.v.contentDriven, 1);
   check("row54: menu-item floor read from the contract",
     real54.v.menuFloor, 44);
   check("row54: the identity-label requirement is read from the contract",
@@ -6036,8 +6103,11 @@ function runSelfTest() {
     railControlsVerdict(rail([{ actions: 2, h: 114 }]), 2, 60).pass, false);
   check("row54 must-PASS: 2 inline controls and a 60px row (the S10 shape)",
     railControlsVerdict(rail([{ actions: 2, h: 60 }]), 2, 60).pass, true);
-  check("row54: the row-height threshold is read out of the contract",
-    row54.parse({ text: "行高 ≤60px" }).maxRowH, 60);
+  // t137 rewrote the row-height criterion; both halves are read from the cell.
+  check("row54: the 520 absolute sentry is read out of the contract",
+    row54.parse({ text: "520 档 ≤60px（绝对上界 / 回归哨）" }).absMax520, 60);
+  check("row54: the content-driven row-height requirement is read from the contract",
+    row54.parse({ text: "行高 = 该行内容集在该宽度下所需的最小高度" }).contentDriven, 1);
   check("row54: the inline-control threshold is read out of the contract",
     row54.parse({ text: "行内 ≤2 个" }).maxInline, 2);
   check("row54 must-FAIL: a more-control whose name lacks the row identity",
