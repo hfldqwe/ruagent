@@ -70,21 +70,69 @@ type ListState =
   | { kind: "ready"; rows: SessionRecord[]; at: number }
   | { kind: "error"; err: unknown; rows: SessionRecord[] | null; at: number | null };
 
+/* MASTER §12 row 58 — the part of this page's state that changes WHAT YOU ARE
+ * LOOKING AT (source tab, S7 system tri-state, archived mode, workspace, time
+ * window) lives in the URL, so the URL replays the view. Two measured
+ * constraints fixed the encoding:
+ *   · App.parseHash() matches this route with strict equality against
+ *     "sessions", so ANY hash suffix — including the obvious
+ *     "#sessions?src=dsh" form — falls through to the fallback view and
+ *     unmounts this page. The hash therefore has to stay exactly "#sessions"
+ *     until the router learns the optional query its #chat route already has.
+ *   · A tab switch must not become a back-button step, so every write goes
+ *     through replaceState, never pushState.
+ * The state rides in the real query string (?src=dsh&sys=only#sessions), which
+ * the hash router never sees and which a reload or a pasted link replays
+ * verbatim. Only non-default values are written, so the default view's URL is
+ * still exactly "#sessions".
+ * The search box is deliberately NOT here: it is an uncommitted input, which
+ * row 58 excludes by name. */
+const ARCH_MODES: ArchivedMode[] = ["exclude", "include", "only"];
+const SYS_MODES: SystemMode[] = ["exclude", "include", "only"];
+
+/** The view state as the URL carries it. An unknown enum value falls back to
+ *  the default instead of reaching a Select, which would render empty. */
+function readViewState(): {
+  filter: string;
+  ws: string;
+  when: string;
+  archivedMode: ArchivedMode;
+  systemMode: SystemMode;
+} {
+  const p = new URLSearchParams(window.location.search);
+  const arch = p.get("arch");
+  const sys = p.get("sys");
+  return {
+    filter: p.get("src") ?? "all",
+    ws: p.get("ws") ?? "all",
+    when: p.get("when") ?? "all",
+    archivedMode: ARCH_MODES.includes(arch as ArchivedMode)
+      ? (arch as ArchivedMode)
+      : "exclude",
+    systemMode: SYS_MODES.includes(sys as SystemMode)
+      ? (sys as SystemMode)
+      : "exclude",
+  };
+}
+
 export function Sessions() {
   const { t } = useI18n();
   const [state, setState] = useState<ListState>({ kind: "loading" });
-  const [filter, setFilter] = useState<string>("all"); // source
-  const [ws, setWs] = useState<string>("all"); // workspace (= project)
-  const [when, setWhen] = useState<string>("all"); // time window
+  // Row 58: the first render takes its view state from the URL.
+  const [fromUrl] = useState(readViewState);
+  const [filter, setFilter] = useState<string>(fromUrl.filter); // source
+  const [ws, setWs] = useState<string>(fromUrl.ws); // workspace (= project)
+  const [when, setWhen] = useState<string>(fromUrl.when); // time window
   const [q, setQ] = useState(""); // keyword
   // Which archived sessions the daemon should return. The hide marker lives
   // server-side, so this is a real query parameter and not a local flag.
-  const [archivedMode, setArchivedMode] = useState<ArchivedMode>("exclude");
+  const [archivedMode, setArchivedMode] = useState<ArchivedMode>(fromUrl.archivedMode);
   const [archivedCount, setArchivedCount] = useState(0);
   /** S7 — which platform-generated sessions the list shows. The counterpart of
-   *  archivedMode, and local (not a query parameter) because the page already
-   *  holds every row: the origin rules are pure predicates over the fields. */
-  const [systemMode, setSystemMode] = useState<SystemMode>("exclude");
+   *  archivedMode, and local (not a daemon query parameter) because the page
+   *  already holds every row: the origin rules are pure predicates over the
+   *  fields. Row 58 puts it in the URL all the same: it changes what you see. */
+  const [systemMode, setSystemMode] = useState<SystemMode>(fromUrl.systemMode);
   /** Key of the row whose archive/delete request is in flight. */
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState<SessionRecord | null>(null);
@@ -102,6 +150,35 @@ export function Sessions() {
   const [, forceTick] = useState(0);
   const toast = useToast();
   const trigger = useRef<HTMLElement | null>(null);
+
+  /* Row 58, the other direction: keep the URL in step with the state. The
+     comparison keeps this idempotent — the first render of an already-correct
+     URL (including a pasted one) writes nothing, so no needless history churn. */
+  useEffect(() => {
+    const p = new URLSearchParams();
+    if (filter !== "all") p.set("src", filter);
+    if (ws !== "all") p.set("ws", ws);
+    if (when !== "all") p.set("when", when);
+    if (archivedMode !== "exclude") p.set("arch", archivedMode);
+    if (systemMode !== "exclude") p.set("sys", systemMode);
+    const qs = p.toString();
+    const loc = window.location;
+    const next = loc.pathname + (qs ? "?" + qs : "") + "#sessions";
+    if (loc.pathname + loc.search + loc.hash !== next) {
+      window.history.replaceState(window.history.state, "", next);
+    }
+  }, [filter, ws, when, archivedMode, systemMode]);
+
+  /* There is deliberately NO unmount cleanup that strips the query. One was
+     written and measured, and it broke the back button: the sider's items are
+     fragment-only anchors (row 57), so leaving this page lands on e.g.
+     "?src=dsh#board"; rewriting that fresh entry with replaceState was
+     followed by a back traversal that fired popstate WITHOUT hashchange (event
+     trace measured), so the URL said "#sessions" while the board was still
+     rendered. Measured without the cleanup: leaving the query
+     on another route's URL is harmless (the #home control case behaves the
+     same) and back works. Coming back through the 会话 anchor therefore keeps
+     the filters, which is what a URL that describes the view should do. */
 
   const load = useCallback(async () => {
     try {
