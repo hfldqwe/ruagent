@@ -5724,11 +5724,13 @@ function runSelfTest() {
       // tool does not judge is the more dangerous of the two -- the contract
       // promises a check nobody runs -- so it is listed here by number rather
       // than folded into one "everything is fine" line.
-      // Rows 56/57/58 landed in §12 (t152) and have NO judge yet. They are
-      // named here so the gap is asserted rather than assumed: this list must
-      // shrink to [] when t156 implements them, and the check below fails if
-      // the contract and this declaration ever disagree.
-      const PENDING_TOOL = [56, 57, 58];
+      // Rows 56/57/58 (t152) and 59 (t153) landed in §12 and have NO judge yet.
+      // They are named here so the gap is asserted rather than assumed: this
+      // list must shrink to [] when their judges land, and the check below
+      // fails if the contract and this declaration ever disagree. Row 59 was
+      // added by the contract while t150 was in flight -- the check caught it
+      // (got="56,57,58,59" want="56,57,58") rather than letting it pass unseen.
+      const PENDING_TOOL = [56, 57, 58, 59];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
 
