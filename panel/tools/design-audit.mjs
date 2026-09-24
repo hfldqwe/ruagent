@@ -1010,9 +1010,18 @@ const PROBE = (cfg) => {
       if (!named && value && value.trim()) named = value.trim();
       if (!named && el.tagName === "INPUT") named = el.getAttribute("placeholder")?.trim() || "";
       if (!named) { inter.unnamedCount++; pushSample(inter.unnamed, el, { tag: el.tagName }); }
+      // t142 / t141 ruling: a splitter is a 1px rule line BY DESIGN (S2), so its
+      // ELEMENT box can never reach 24px. The 24px floor is about reachability,
+      // and reachability is decided by the EFFECTIVE hit box: the element box
+      // unioned with the pseudo-elements that take part in hit testing. It is
+      // excluded from the element-box count here and judged separately below, by
+      // a real pointer hit test rather than by static reasoning about
+      // pointer-events and stacking -- that reasoning is exactly what makes this
+      // class of judge lie.
+      const isSplitter = el.matches(".resize-handle, .ant-splitter, .ant-splitter-bar, [class*=splitter], [class*=resizer]");
       // primitives §5.4: an inline text link rides the text flow and is exempt.
       const inlineLink = el.tagName === "A" && cs.display === "inline";
-      if (!inlineLink) {
+      if (!inlineLink && !isSplitter) {
         const root = hitTarget(el);
         const rr = root === el ? r : root.getBoundingClientRect();
         if (root !== el) { inter.promoted++; inter.viaRoot++; }
@@ -1049,6 +1058,67 @@ const PROBE = (cfg) => {
         else if (pb.width < 32 || pb.height < 32) inter.paint32++;
       }
     }
+
+    // ── t142: the splitter's EFFECTIVE hit box, by real pointer hit testing.
+    // t141 fixed the method: hit the element at its centre and walk outward
+    // until the point stops hitting it, then take the width that actually
+    // responds. Reading styles would require re-deriving pointer-events and
+    // stacking by hand, and a judge that reasons statically about hit testing
+    // is a judge that can be wrong about it.
+    inter.splitters = (() => {
+      const out = [];
+      const cands = [...document.querySelectorAll(".resize-handle, .ant-splitter, .ant-splitter-bar, [class*=splitter], [class*=resizer]")];
+      for (const el of cands) {
+        const b = el.getBoundingClientRect();
+        if (b.width < 1 || b.height < 1) continue;
+        const cls = typeof el.className === "string" && el.className ? "." + el.className.split(/\s+/).slice(0, 2).join(".") : "";
+        const sel = el.tagName.toLowerCase() + cls;
+        // THE PROBE POINT MUST BE A POINT THAT EXISTS. The handle spans the
+        // whole column (h=3937 in a 900px viewport), so its geometric centre
+        // y=1968 is OFF SCREEN and elementFromPoint returns null there -- the
+        // instrument then read "the pseudo-element does not take part in hit
+        // testing" when the truth was "the probe never touched anything".
+        // Those are two different facts and must not share a verdict.
+        // So the probe y comes from rect INTERSECT viewport, and if that
+        // intersection is empty the splitter is not_measured, not 1px.
+        const vh = window.innerHeight;
+        const vTop = Math.max(0, b.top);
+        const vBot = Math.min(vh, b.bottom);
+        const intersectH = Math.round((vBot - vTop) * 100) / 100;
+        const geoCenterY = b.top + b.height / 2;
+        const centerInViewport = geoCenterY >= 0 && geoCenterY <= vh;
+        const base = {
+          sel,
+          boxW: Math.round(b.width * 100) / 100,
+          boxH: Math.round(b.height * 100) / 100,
+          rectTop: Math.round(b.top * 100) / 100,
+          viewportH: vh,
+          intersectH,
+          geoCenterY: Math.round(geoCenterY * 100) / 100,
+          centerInViewport,
+        };
+        if (intersectH < 1) {
+          out.push({ ...base, probeY: null, effectiveW: null, why: "element does not intersect the viewport" });
+          continue;
+        }
+        const cy = (vTop + vBot) / 2;
+        const cx = b.left + b.width / 2;
+        const hits = (x) => {
+          const t = document.elementFromPoint(x, cy);
+          return !!t && (t === el || el.contains(t) || t.contains(el));
+        };
+        let left = cx;
+        let right = cx;
+        for (let d = 1; d <= 40 && hits(cx - d); d++) left = cx - d;
+        for (let d = 1; d <= 40 && hits(cx + d); d++) right = cx + d;
+        out.push({
+          ...base,
+          probeY: Math.round(cy * 100) / 100,
+          effectiveW: Math.round((right - left + 1) * 100) / 100,
+        });
+      }
+      return out;
+    })();
 
     // ── (d2) primitives §11 row 4 extra: .inbox-card must stay a ridge (no border)
     if (visText && cls.includes("inbox-card")) {
@@ -2693,6 +2763,50 @@ function moreLabelVerdict(o) {
   });
   return { measured: true, n: rows.length, bad, pass: bad.length === 0 };
 }
+/// t142 / t141: the splitter's reachability is decided by its EFFECTIVE hit box
+/// (element box unioned with the pseudo-elements that take part in hit testing),
+/// not by its element box -- a splitter is a 1px rule line BY DESIGN (S2), so its
+/// element box can never reach 24px and the two requirements would be
+/// unsatisfiable together. The floor is unchanged; only the measured object is.
+function splitterHitVerdict(splitters, hard) {
+  // EMPTY-SET GUARD: no splitter on the route means the object never appeared.
+  // not_measured, never PASS -- otherwise this collapses into "1px elements all
+  // pass".
+  if (!Array.isArray(splitters) || !splitters.length)
+    return { measured: false, pass: null, why: "no splitter on this route" };
+  // A splitter whose probe point could not be placed inside (rect ∩ viewport)
+  // is not_measured. "The probe touched nothing" and "the pseudo-element does
+  // not take part in hit testing" are two different facts; conflating them
+  // reported a 25px hit box as 1px and sent a fix after a defect that did not
+  // exist.
+  const unprobed = splitters.filter((x) => x.effectiveW == null);
+  if (unprobed.length)
+    return { measured: false, pass: null, why: unprobed[0].why || "no probe point inside the viewport" };
+  // ONE EDIT POINT for the probe point: y must lie inside BOTH the element rect
+  // and the viewport. A handle spanning the whole column (h=3937 in a 900px
+  // viewport) has its geometric centre off screen -- if a future edit goes back
+  // to that centre, this fails LOUDLY instead of quietly measuring nothing.
+  const outside = splitters.filter(
+    (x) =>
+      x.probeY != null &&
+      !(x.probeY >= Math.max(0, x.rectTop) && x.probeY <= Math.min(x.viewportH, x.rectTop + x.boxH)),
+  );
+  if (outside.length)
+    return {
+      measured: false,
+      pass: null,
+      why: "probe y is outside (rect ∩ viewport) -- the instrument measured the wrong point",
+    };
+  const bad = splitters.filter((x) => x.effectiveW < hard);
+  return {
+    measured: true,
+    n: splitters.length,
+    minBox: Math.min(...splitters.map((x) => x.boxW)),
+    minEff: Math.min(...splitters.map((x) => x.effectiveW)),
+    bad,
+    pass: bad.length === 0,
+  };
+}
 function menuSizeVerdict(o, floor) {
   if (!o || o.error) return { measured: false, pass: null };
   if (!o.menu) return { measured: false, pass: null, why: "no menu opened" };
@@ -3407,10 +3521,16 @@ const CHECKS = [
       "【§12.9（2026-09-21 裁决，t39 落地）】<32px 预算**只判内容区**（main.ant-layout-content.content 子树，含 .view-bar）；外壳（aside.ant-layout-sider.app-sider 子树）是 13 条路由共享的同一份 DOM，逐路由计入等于把同一个常数算 13 次，故**不计入每路由预算**。外壳改为**第三个子断言、只查一次**：外壳 <32px 集合 ⊆ MASTER §12.9 的**具名闭集**（读自契约、不硬编码）∧ 外壳 <24px == 0；**⊆ 是子集语义 —— 成员变少满足、变多 FAIL**（凭票入场，与 §12.6 的出血闭集同一手法）。",
       "**「常数」这个前提本身也要被检验**：逐 capture 比对外壳 <32px 清单的**选择器路径 + className + 几何**三者，全部一致才认定为外壳常数；任一条不同 ⇒ 该元素不是常数 ⇒ **按内容区计入**（防止把「外壳」当豁免口袋）。",
       "两套读法并列输出：判定用内容区口径，display 同时给出「旧口径（每路由总数）」供对照 —— 与行 1 的双数字、行 30 的双基准、行 37 的 raw 同构。",
+      "【§S2.1（2026-09-23 裁决，t141 落定）splitter 的测量对象】**按「有效命中盒（含伪元素）」测**：**有效命中盒 = 元素盒 ∪ 参与命中测试的伪元素（::after / ::before）**，**判定法 = 真实指针命中测试**（在元素中心向两侧逐 px 命中，取实际能触发的横向范围）—— **不读样式**，因为对 pointer-events / 层叠做静态推理正是让这类判据说谎的原因。**阈值 24px 一字未改**，改的是**测量对象**（与 t126 修行 51 同一招）。",
+      "【三条判据对象不同，互不覆盖也不重复（下一个读到这里的人请注意）】**行 16 管焦点环**（outline 1px → 2px，对象 = 键盘焦点指示）· **行 18 管命中可达**（有效命中盒 ≥24px，对象 = 指针/触摸能触发的区域）· **S2 管元素视觉形态**（元素盒 ≤2px、1px 规则线，对象 = 视觉粗细）⇒ **1px 元素 + 25px 有效命中盒同时成立，不是矛盾** —— 视觉上是细线、命中上是宽区，这正是 S2.1 裁决要表达的东西。",
+      "【空集语义】**页面上没有 splitter ⇒ not_measured，不报 PASS**（否则这条口径会退化成「凡 1px 元素都自动通过」）。**反向证据已实装**：去掉伪元素 ⇒ 有效命中盒 == 元素盒 ⇒ 行 18 必须 FAIL。",
     ].join(" "),
     judge: (c, l, ctx) => {
       const it = c.metrics.inter;
-      const floorOk = it.hit24 === 0;
+      // t142: the splitter is judged by its EFFECTIVE hit box. A not_measured
+      // splitter must not be folded into a PASS.
+      const spl = splitterHitVerdict(it.splitters, l.hard);
+      const floorOk = it.hit24 === 0 && spl.pass !== false;
       // §12.9: the budget is judged on the CONTENT AREA only. The shell is one
       // shared DOM, so charging its constant to every route counts the same
       // constant 13 times — the same structural error as §12.5 counting the
@@ -3437,7 +3557,10 @@ const CHECKS = [
       const constTxt = sc.constants.map((s) => `${s.cls.split(/\s+/)[0]} ${s.w}x${s.h}`).join(", ") || "无";
       return {
         display: [
-          `命中区 地板<24px ${it.hit24} · 内容区<32px ${content32}/≤${l.max} ${targetOk ? "✓" : "✗"}`,
+          `命中区 地板<24px ${it.hit24} · 内容区<32px ${content32}/≤${l.max} ${targetOk ? "✓" : "✗"}` +
+          (spl.measured
+            ? ` · 分隔条 元素盒 ${spl.minBox}px / 有效命中 ${spl.minEff}px（≥${l.hard}px）`
+            : ` · 分隔条 not_measured：${spl.why}`),
           `外壳闭集 ${shellOk === null ? "?" : shellOk ? "✓" : "✗"}`,
           `｜ 旧口径（每路由总数）<32px ${it.hit32}`,
           `｜ 对照（绘制口径）<24px ${it.paint24} · <32px ${it.paint32}`,
@@ -6041,6 +6164,55 @@ function runSelfTest() {
     menuSizeVerdict(menuRail({ n: 14, minW: 51, minH: 36 }), 44).pass, false);
   check("row54: the SCOPED reading (the row's own 2 items, 74px) PASSES",
     menuSizeVerdict(menuRail({ n: 2, minW: 284, minH: 74 }), 44).pass, true);
+
+  // ---- t143: the probe point must be a point that EXISTS -------------------
+  // The real case: a handle spanning the whole column. h=3937 in a 900px
+  // viewport, so the geometric centre y=1968 is OFF SCREEN.
+  const tallHandle = { sel: "div.resize-handle", boxW: 1, boxH: 3937, rectTop: 0, viewportH: 900 };
+  // REVERSE EVIDENCE / REGRESSION GUARD: probing the geometric centre must be
+  // not_measured -- NOT a 1px reading. Reporting 1px here sent a fix after a
+  // defect that did not exist.
+  check("row18: probing the off-screen geometric centre is not_measured, never a 1px reading",
+    splitterHitVerdict([{ ...tallHandle, probeY: 1968, effectiveW: 1 }], 24).pass === null, true);
+  check("row18: and it says the probe point was wrong, not that the pseudo-element is absent",
+    /probe y is outside/.test(splitterHitVerdict([{ ...tallHandle, probeY: 1968, effectiveW: 1 }], 24).why || ""), true);
+  // THE FIX: with the probe point inside (rect ∩ viewport) the SAME element
+  // measures correctly -- taller than the viewport is not a problem at all.
+  check("row18: a handle TALLER than the viewport still measures correctly (probe inside the intersection)",
+    splitterHitVerdict([{ ...tallHandle, probeY: 450, effectiveW: 25 }], 24).pass, true);
+  check("row18: ...and reports the real numbers: element box 1px, effective hit 25px",
+    (() => { const v = splitterHitVerdict([{ ...tallHandle, probeY: 450, effectiveW: 25 }], 24); return v.minBox === 1 && v.minEff === 25; })(), true);
+  check("row18: a probe point above the viewport is caught too",
+    splitterHitVerdict([{ ...tallHandle, rectTop: -500, probeY: -1, effectiveW: 25 }], 24).pass === null, true);
+  // An element that does not intersect the viewport at all cannot be probed.
+  check("row18: an unprobeable splitter is not_measured and names why",
+    splitterHitVerdict([{ ...tallHandle, probeY: null, effectiveW: null, why: "element does not intersect the viewport" }], 24).pass === null, true);
+  check("row18: ...and the reason is the probe, not a claimed 1px hit box",
+    /does not intersect/.test(splitterHitVerdict([{ ...tallHandle, probeY: null, effectiveW: null, why: "element does not intersect the viewport" }], 24).why || ""), true);
+
+  // ---- t142: the splitter is judged by its EFFECTIVE hit box (t141 ruling) ----
+  // THE TWO READINGS the ruling is about: a 1px rule line whose effective hit
+  // box is 25px satisfies both S2 (visual) and row 18 (reachability).
+  check("row18: element box 1px + effective hit box 25px PASSES (S2 and row 18 together)",
+    splitterHitVerdict([{ sel: "div.ant-splitter-bar", boxW: 1, boxH: 400, effectiveW: 25 }], 24).pass, true);
+  check("row18: and the two readings are reported separately",
+    (() => { const v = splitterHitVerdict([{ sel: "x", boxW: 1, boxH: 400, effectiveW: 25 }], 24); return v.minBox === 1 && v.minEff === 25; })(), true);
+  // REVERSE EVIDENCE, required by the ruling: remove the pseudo-element and the
+  // effective box collapses onto the element box. Without this the criterion
+  // would degrade into "every 1px element passes".
+  check("row18 must-FAIL: pseudo-element removed => effective == element box (1px) => FAIL",
+    splitterHitVerdict([{ sel: "div.ant-splitter-bar", boxW: 1, boxH: 400, effectiveW: 1 }], 24).pass, false);
+  check("row18 must-FAIL: t132's original 11px grab area was genuinely too small",
+    splitterHitVerdict([{ sel: "x", boxW: 1, boxH: 400, effectiveW: 11 }], 24).pass, false);
+  check("row18 must-FAIL: one bad splitter fails the row even beside good ones",
+    splitterHitVerdict([{ sel: "a", boxW: 1, boxH: 400, effectiveW: 25 }, { sel: "b", boxW: 1, boxH: 400, effectiveW: 2 }], 24).pass, false);
+  // EMPTY-SET GUARD: no splitter on the route is not_measured, never PASS.
+  check("row18: no splitter on the route is not_measured, never pass",
+    splitterHitVerdict([], 24).pass === null, true);
+  check("row18: and it names why (the empty set is not silent)",
+    /no splitter/.test(splitterHitVerdict(undefined, 24).why || ""), true);
+  check("row18: the splitter floor is the row's own contract floor, not a literal",
+    CHECKS.find((r) => r.n === 18).parse(targetFor(TH, 18, "")).hard, 24);
 
   // ---- t136: the anchors must READ the contract, and must be LOUD on a miss ----
   const row54r = CHECKS.find((r) => r.n === 54);
