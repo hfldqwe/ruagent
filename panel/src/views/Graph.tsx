@@ -54,12 +54,13 @@ const KINDS = [
 
 /** The second channel.
  *
- *  Colour cannot be the only carrier here. t153's palette clears ΔE 10 for all
- *  36 kind pairs across three simulated CVDs, but the light-mode worst pair is
- *  10.7 — 0.7 of margin — and the same pair reads 4.3 under CIEDE2000. WCAG
- *  1.4.1 does not ask for colour separation at all; it asks that colour not be
- *  the ONLY thing carrying the information. So every kind also gets a
- *  silhouette.
+ *  Colour cannot be the only carrier here. WCAG 1.4.1 does not ask for colour
+ *  separation at all; it asks that colour not be the ONLY thing carrying the
+ *  information. How well the palette separates kinds — the threshold and the
+ *  measurement — belongs to the palette and to MASTER §12 row 59, which is
+ *  where the audit prints it. A copy of a measurement in this file goes stale
+ *  the moment the instrument changes, which is why this comment does not carry
+ *  one. So every kind also gets a silhouette.
  *
  *  Shapes are unit polygons inscribed in the node radius, so the geometry is
  *  independent of the size channel (radius = fact count): two nodes of the same
@@ -586,6 +587,9 @@ interface Sim {
   ty: number;
   /** A drag that started on empty canvas pans the view instead of pinning. */
   panning: { x: number; y: number; tx: number; ty: number; moved: number } | null;
+  /** Labels the last frame actually drew, with their boxes — the instrument
+   *  for the collision pass (a label dropped by it must not be counted). */
+  labels: { name: string; x0: number; y0: number; x1: number; y1: number }[];
 }
 
 const REPULSION = 3000;
@@ -668,6 +672,7 @@ function GraphCanvas({
     tx: 0,
     ty: 0,
     panning: null,
+    labels: [],
   });
   // live props for the event handlers (no listener churn)
   const propsRef = useRef({ entities, edges, selectedId, hitIds, onSelect, onUnavailable });
@@ -894,6 +899,7 @@ function GraphCanvas({
             (near?.has(n.id) ?? false),
         )
         .sort((a, b) => rank(b) - rank(a));
+      s.labels = [];
       const bodies: number[][] = s.nodes.map((n) => [
         n.x - n.r - 1,
         n.y - n.r - 1,
@@ -918,6 +924,7 @@ function GraphCanvas({
         if (placed.some((p) => clashes(box, p))) continue;
         if (s.nodes.some((m, i) => m.id !== n.id && clashes(box, bodies[i]))) continue;
         placed.push(box);
+        s.labels.push({ name: label, x0: box[0], y0: box[1], x1: box[2], y1: box[3] });
         ctx.globalAlpha = nodeAlpha(n.id);
         ctx.fillStyle = pal.label;
         ctx.fillText(label, n.x, n.y + rr + 13);
@@ -1081,11 +1088,19 @@ function GraphCanvas({
       draw();
     };
     const onWheel = (ev: WheelEvent) => {
-      // §5.1 R2 / 2026-09-22 report: the canvas had NO scale control at all —
-      // 62 nodes at 6-14px radius with 11px labels in a 672x504 box, and the
-      // wheel did nothing (measured: geometry delta 0, scrollY 0, page not
-      // scrollable). The wheel now zooms about the cursor, clamped to
-      // [0.4, 4] so the graph cannot be lost off-screen.
+      // §5.1 R2 / the 2026-09-22 report: the canvas had NO scale control at
+      // all — 62 nodes at 6-14px radius with 11px labels in a 672x504 box, and
+      // the wheel did nothing (measured: geometry delta 0, scrollY 0).
+      //
+      // The page is NOT always unscrollable: measured 995px of content at
+      // 768x900 and 1095px at 390x844, so swallowing every wheel event would
+      // trade one regression for another. Zoom therefore takes the wheel only
+      // when the page has nothing left to scroll (desktop) or when the user
+      // asks for it explicitly with Ctrl/Cmd — the gesture every browser
+      // already uses for zoom.
+      const scroller = document.scrollingElement ?? document.documentElement;
+      const pageScrolls = scroller.scrollHeight - scroller.clientHeight > 1;
+      if (pageScrolls && !ev.ctrlKey && !ev.metaKey) return;
       ev.preventDefault();
       const r = canvas.getBoundingClientRect();
       const sx = ev.clientX - r.left;
@@ -1130,6 +1145,9 @@ function GraphCanvas({
       pinned: () => s.nodes.filter((n) => n.fixed).map((n) => n.id),
       positions: () =>
         s.nodes.map((n) => ({ id: n.id, name: n.name, x: Math.round(n.x), y: Math.round(n.y), r: Math.round(n.r) })),
+      /** The labels the last frame drew (the collision pass drops the rest). */
+      labels: () => s.labels.map((l) => ({ ...l })),
+      view: () => ({ k: s.k, tx: s.tx, ty: s.ty }),
       kinds: s.nodes.reduce<Record<string, number>>((acc, n) => {
         const k = normalizeKind(n.kind);
         acc[k] = (acc[k] ?? 0) + 1;

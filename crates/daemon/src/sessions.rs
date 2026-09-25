@@ -153,21 +153,34 @@ impl SessionIndexer {
         let key = make_key(source, path);
 
         // Unchanged? skip.
-        let known: Option<(i64, i64)> = self
+        let known: Option<(i64, i64, Option<String>)> = self
             .db
             .call({
                 let key = key.clone();
                 move |conn| {
                     conn.query_row(
-                        "SELECT mtime_ms, size_bytes FROM sessions WHERE key = ?1",
+                        "SELECT mtime_ms, size_bytes, preview FROM sessions WHERE key = ?1",
                         [&key],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)),
                     )
                     .ok()
                 }
             })
             .await?;
-        if known == Some((mtime, size)) {
+        // Re-parse when the file changed -- or when the STORED preview is one of
+        // our own injected blocks. That is a cache entry written before the parse
+        // loop skipped injected user messages, and the only way to correct it is
+        // to parse the file again: the cache heals itself on the next scan
+        // instead of us rewriting rows of the user's data.
+        let preview_is_injected = known
+            .as_ref()
+            .and_then(|(_, _, p)| p.as_deref())
+            .is_some_and(is_injected_title);
+        if !preview_is_injected
+            && known
+                .as_ref()
+                .is_some_and(|(m, s, _)| *m == mtime && *s == size)
+        {
             return Ok(());
         }
 

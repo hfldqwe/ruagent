@@ -48,11 +48,11 @@ const D = {
   borderSecondary: "rgba(255, 255, 255, 0.07)",
   panelTop: "rgba(255, 255, 255, 0.055)",
   text: "#f4f5f7",
-  textSecondary: "#adb2bb", // 7.8:1 on panel
-  textTertiary: "#8e939c", // 5.4:1 on panel
-  textQuaternary: "#838891", // 4.7:1 on panel / 5.4:1 on shell
-  brand: "#f0a93b", // amber — fills (dark ink on it is 9.2:1)
-  link: "#f5b457", // amber text grade (10:1 on canvas)
+  textSecondary: "#adb2bb", // secondary grade on the panel (readings: audit rows 13/14)
+  textTertiary: "#8e939c", // tertiary grade on the panel
+  textQuaternary: "#838891", // quaternary grade: the quietest step that still clears the text bar
+  brand: "#f0a93b", // amber is for fills, not text - ink rides on it (see `ink`)
+  link: "#f5b457", // amber text grade on the canvas
   ink: "#1a1206", // text on amber
   success: "#4fb477",
   warning: "#e2894f", // degraded/caution, not the signal amber
@@ -72,19 +72,18 @@ const L = {
   surfaceSelected: "#e4e7ec",
   border: "#d6d9df",
   // t28 §12.7.1 (threshold row 30): the panel ring is 0 0 0 1px drawn *outside*
-  // the panel box, so its backdrop is pageCanvas, not white. #e7e9ed measured
-  // 1.1340:1 on the canvas (1.2155:1 on white); 1.2 is the system's hairline
-  // floor, so the token moves and the target stays. #e7e9ed x 0.9615 keeps the
-  // channel ratio 231:233:237 -> 222:224:228 (no new hue):
-  // L = 0.744423 -> 1.2330:1 on canvas / 1.3217:1 on white.
+  // the panel box, so its backdrop is pageCanvas, not white. #e7e9ed sat under
+  // the system's hairline floor there (1.2), so the token moves and the target
+  // stays; scaling every channel by one factor keeps the hue (no new hue).
+  // Readings: audit row 30.
   borderSecondary: "#dee0e4",
   panelTop: "rgba(255, 255, 255, 0)",
   text: "#0c0d10",
-  textSecondary: "#5b6068", // 6.2:1 on white
-  textTertiary: "#5f646d", // 5.95:1 on white / 4.99:1 on shell
-  textQuaternary: "#656a72", // 5.44:1 on white / 4.57:1 on shell
-  brand: "#c88413", // fill grade: 3.10:1 on white (dot/spine floor)
-  link: "#8a5600", // 6.2:1 as text on white
+  textSecondary: "#5b6068", // secondary grade on white (readings: audit rows 13/14)
+  textTertiary: "#5f646d", // tertiary grade - must also clear the bar on the shell
+  textQuaternary: "#656a72", // quaternary grade - must also clear the bar on the shell
+  brand: "#c88413", // fill grade: meets the dot/spine floor on white
+  link: "#8a5600", // amber text grade on white
   ink: "#241703",
   success: "#17793b",
   warning: "#8a4a12",
@@ -185,7 +184,7 @@ const lightTokens = {
   colorFillQuaternary: "rgba(15, 20, 30, 0.035)",
   colorFillTertiary: "rgba(15, 20, 30, 0.06)",
   colorFillSecondary: "rgba(15, 20, 30, 0.09)",
-  colorBorder: "#8a9198", // 3.19:1 on white
+  colorBorder: "#8a9198", // form-control edge grade on white (readings: audit contrast rows)
   colorBorderSecondary: L.borderSecondary,
   colorText: L.text,
   colorTextSecondary: L.textSecondary,

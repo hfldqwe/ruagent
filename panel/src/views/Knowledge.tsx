@@ -388,13 +388,18 @@ export function Knowledge() {
                     ) : null}
                     <span className="muted">{t("knowledge.chunks", { n: d.chunk_count })}</span>
                     <span className="grow" />
-                    {/* The timestamp rides a hoverable .row-btn, and
-                        --surface-hover (#262a31) drops the quaternary grade
-                        to 4.04:1 there (measured). It sits at the row's
-                        metadata grade instead — the same move the shared layer
-                        already makes for .row-btn.selected. Revert to
-                        className="time" once index.css carries the hover
-                        companion (rule handed to systems, see report). */}
+                    {/* The timestamp rides a hoverable .row-btn, and the
+                        quaternary grade does not clear its floor on that
+                        hover surface. It sits at the row's metadata grade
+                        instead — the same move the shared layer already makes
+                        for .row-btn.selected. The grade itself and how far it
+                        misses belong to the token in index.css and to MASTER
+                        §12's contrast rows, which is where the audit prints
+                        them; a copy of a measurement here goes stale the moment
+                        the token changes, which is why this comment carries
+                        none. Revert to className="time" once index.css carries
+                        the hover companion (rule handed to systems, see
+                        report). */}
                     <span className="micro mono muted">
                       <RelTime iso={d.created_at} />
                     </span>

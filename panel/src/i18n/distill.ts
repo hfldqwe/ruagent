@@ -1,0 +1,68 @@
+// i18n domain: distill.*
+//
+// Copy for this domain only. New strings for a view belong in THAT view domain
+// file (see panel/src/i18n/README.md and the header of panel/src/i18n.tsx): the point
+// of the split is that two tasks editing two different views never touch one file.
+// Keep both languages in step: a key added here must be added to zh AND en.
+
+export const zh: Record<string, string> = {
+  "distill.title": "蒸馏",
+  "distill.subtitle": "会话关闭时如何提炼为记忆与图谱",
+  "distill.auto": "自动蒸馏",
+  "distill.autoHint": "会话关闭（或空闲超时）时，后台提取记忆、实体与关系",
+  "distill.agent": "提取智能体",
+  "distill.agentDefault": "默认（dsh → 第一个启用的）",
+  "distill.language": "输出语言",
+  "distill.languagePh": "例如：简体中文",
+  "distill.prompt": "提取提示词",
+  "distill.promptHint": "已预填内置提示词，可直接修改；清空保存或点「重置」即恢复内置。",
+  "distill.promptReset": "重置",
+  "distill.customized": "已自定义",
+  "distill.save": "保存",
+  "distill.saved": "蒸馏设置已保存，即时生效",
+  "distill.graph": "知识图谱提取",
+  "distill.graphHint": "关闭后蒸馏只写记忆（向量召回），不提取实体与关系",
+  "distill.autoOn": "自动",
+  "distill.autoOff": "手动",
+  "distill.on": "开",
+  "distill.off": "关",
+  "distill.graphFollow": "跟随默认",
+  "distill.agentUnset": "未设置",
+  "distill.err": "无法读取蒸馏策略",
+  "distill.err.hint": "daemon 不可达或接口出错。表单没有被清空——它根本没读到值。",
+  "distill.saveFailed": "保存失败——你改的值已保留，请重试。",
+  "distill.builtin": "内置提示词（只读）",
+  "distill.builtinTag": "内置",
+  "distill.noAgents": "没有可选角色",
+};
+
+export const en: Record<string, string> = {
+  "distill.title": "Distill",
+  "distill.subtitle": "how closed sessions become memories and graph",
+  "distill.auto": "Auto-distill",
+  "distill.autoHint": "extract memories, entities and relations in the background when a session closes (or idles out)",
+  "distill.agent": "Extraction agent",
+  "distill.agentDefault": "Default (dsh → first enabled)",
+  "distill.language": "Output language",
+  "distill.languagePh": "e.g. English",
+  "distill.prompt": "Extraction prompt",
+  "distill.promptHint": "Pre-filled with the built-in prompt — edit freely; saving it empty (or Reset) restores the built-in.",
+  "distill.promptReset": "Reset",
+  "distill.customized": "customized",
+  "distill.save": "Save",
+  "distill.saved": "Distillation settings saved — effective immediately",
+  "distill.graph": "Knowledge graph extraction",
+  "distill.graphHint": "Off = distillation writes memories only (vector recall); no entities or relations",
+  "distill.autoOn": "auto",
+  "distill.autoOff": "manual",
+  "distill.on": "on",
+  "distill.off": "off",
+  "distill.graphFollow": "follow default",
+  "distill.agentUnset": "not set",
+  "distill.err": "Cannot read the distillation policy",
+  "distill.err.hint": "The daemon is unreachable or the endpoint errored. The form was not blanked — nothing was read.",
+  "distill.saveFailed": "Save failed — your edits are kept, try again.",
+  "distill.builtin": "Built-in prompt (read-only)",
+  "distill.builtinTag": "built-in",
+  "distill.noAgents": "No roles available",
+};

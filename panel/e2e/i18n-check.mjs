@@ -92,9 +92,49 @@ function walk(dir, out = []) {
 }
 
 const i18nPath = join(SRC, "i18n.tsx");
+const i18nDir = join(SRC, "i18n");
 const src = readFileSync(i18nPath, "utf8");
-const zh = dictKeys(src, "zh");
-const en = dictKeys(src, "en");
+
+/** t182: the dictionaries now live in panel/src/i18n/<domain>.ts (one file per
+ *  key prefix) and i18n.tsx only assembles them — that split is what stops two
+ *  view tasks from serialising on a single file. This merges each domain's
+ *  exported `zh` / `en`. i18n.tsx is still tried FIRST so the gate works in
+ *  both layouts, and the domains are only a SOURCE OF KEYS: they never widen
+ *  what counts as a passing dictionary, so a key present on one side only is
+ *  still a failure (see the negative control in the t182 report). */
+function domainKeys(name) {
+  let entries = [];
+  try {
+    entries = readdirSync(i18nDir).filter((f) => f.endsWith(".ts")).sort();
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const f of entries) {
+    const text = readFileSync(join(i18nDir, f), "utf8");
+    const m = new RegExp(`export\\s+const\\s+${name}\\s*(?::[^=]*)?=\\s*\\{`).exec(text);
+    if (!m) continue;
+    const brace = text.indexOf("{", m.index + m[0].length - 1);
+    out.push(...objectKeys(text, brace).map((k) => ({ ...k, file: f })));
+  }
+  return out;
+}
+
+function dictKeysAnywhere(text, name) {
+  let keys = [];
+  try {
+    keys = dictKeys(text, name);
+  } catch {
+    keys = [];
+  }
+  if (keys.length) return keys;
+  const merged = domainKeys(name);
+  if (!merged.length) throw new Error(`dictionary "${name}" not found in i18n.tsx nor in src/i18n/*.ts`);
+  return merged;
+}
+
+const zh = dictKeysAnywhere(src, "zh");
+const en = dictKeysAnywhere(src, "en");
 const zhKeys = zh.map((k) => k.key);
 const enKeys = en.map((k) => k.key);
 const setZh = new Set(zhKeys);
@@ -143,7 +183,15 @@ const missingEn = refs.filter((r) => !setEn.has(r.key));
 // `{ key: "home.stat.agents" }` and labelKey tables without pretending to
 // understand the call graph. A key that never appears anywhere is a dead-key
 // candidate — registered, not a failure.
-const outside = files.filter((f) => resolve(f) !== resolve(i18nPath)).map((f) => readFileSync(f, "utf8")).join("\n");
+// t182: the domain files ARE dictionaries, so a key's own definition must not
+// count as "a string literal somewhere outside i18n.tsx" — otherwise every key
+// would look referenced and this check would stop biting. Exclude the whole
+// src/i18n directory, not just i18n.tsx.
+const inI18nDir = (f) => {
+  const r = resolve(f);
+  return r === resolve(i18nDir) || r.startsWith(resolve(i18nDir) + "\\") || r.startsWith(resolve(i18nDir) + "/");
+};
+const outside = files.filter((f) => resolve(f) !== resolve(i18nPath) && !inI18nDir(f)).map((f) => readFileSync(f, "utf8")).join("\n");
 const unreferenced = zhKeys.filter((k) => !outside.includes(`"${k}"`) && !outside.includes(`'${k}'`));
 const dynamicFamilies = [...new Set(dynamic.map((d) => /^`([^`$]*)\$\{/.exec(d.expr)?.[1]).filter(Boolean))].map((p) => ({
   prefix: p,

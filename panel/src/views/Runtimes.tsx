@@ -218,8 +218,12 @@ export function Runtimes() {
                       its brand color (mock and unknowns stay neutral).
                       The mark must NOT be `mono` for a branded harness:
                       `mono` forces it into the inherited text color, which
-                      is why all three tiles measured the same rgb(173,178,187)
-                      and 1.56:1 (t13 F1). `mono` now means "no brand" only. */}
+                      is why every tile collapsed into one grade and lost the
+                      separation the tint exists for (t13 F1). The tint and its
+                      measured contrast belong to the palette tokens and to
+                      MASTER §12's contrast rows, which is where the audit
+                      prints them, so this comment does not carry a copy.
+                      `mono` now means "no brand" only. */}
                   <span
                     className={`runtime-logo${brandClass(r.harness) ? " " + brandClass(r.harness) : ""}`}
                   >
