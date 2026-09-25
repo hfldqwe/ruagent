@@ -181,8 +181,8 @@ const STATUS_COLORS: Record<string, string> = {
   blocked: "var(--signal)",
 };
 
-// Pill text is 11px on the chip, so live states need the accent TEXT grade
-// (the fill grade lands at 2.75:1 there in light mode).
+// Pill text is 11px on the chip, so live states need the accent TEXT grade,
+// not the fill grade. Readings: the audit's text-contrast rows (13/14).
 const STATUS_TEXT_COLORS: Record<string, string> = {
   ...STATUS_COLORS,
   in_progress: "var(--signal-text)",

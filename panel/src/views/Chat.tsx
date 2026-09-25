@@ -374,11 +374,20 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [viewing, setViewing] = useState<ChatHistoryEntry | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const streamRef = useRef<(() => void) | null>(null);
-  /** Which chat id the SSE is attached to — reattaching replays the
-   * whole transcript, so the same chat must only attach once (the
-   * duplicate-append bug on multi-turn conversations). */
-  const attachedRef = useRef<string | null>(null);
+  /** t183: one SSE per chat, not one SSE per panel. Switching away must not
+   * tear down a run's feed — the daemon keeps generating either way (one Chat
+   * per id, and send_prompt has no busy gate), but a closed feed means the
+   * tokens land nowhere and the user returns to a chat that looks frozen.
+   * Keyed by chat id, so a chat still attaches only once (reattaching replays
+   * the transcript — the duplicate-append bug on multi-turn conversations). */
+  const streamsRef = useRef<Map<string, () => void>>(new Map());
+  /** The chat the transcript on screen belongs to. An SSE handler for any
+   * other chat must never append into it. */
+  const chatIdRef = useRef<string | null>(null);
+  /** Chats with a reply in flight, from SSE events plus the rail poll. Per
+   * chat on purpose: A generating must not disable B's composer (t183). */
+  const [runningIds, setRunningIds] = useState<string[]>([]);
+  const runningRef = useRef<string[]>([]);
   /** SSE reconnection: a drop mid-reply reattaches with backoff — the
    * transcript replay rebuilds state including any Stopped we missed —
    * capped at five tries. A chat killed by a daemon restart 404s, which
@@ -394,11 +403,20 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     streamingRef.current = streaming;
   }, [streaming]);
 
-  // Never leak a pending reconnect timer past the component.
+  // The SSE handlers read the open chat id synchronously, so keep the ref in
+  // step with the state (openPast/newChat also set it inline, for the window
+  // before this effect runs).
+  useEffect(() => {
+    chatIdRef.current = chatId;
+  }, [chatId]);
+
+  // Never leak a pending reconnect timer — or a stream — past the component.
   useEffect(
     () => () => {
       const st = reconnectRef.current;
       if (st.timer !== null) clearTimeout(st.timer);
+      for (const close of streamsRef.current.values()) close();
+      streamsRef.current.clear();
     },
     [],
   );
@@ -557,10 +575,34 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
+  /** t183: the running set is the panel's per-chat truth. SSE events feed it
+   * (a chunk means alive, stopped/error means finished) and so does the rail
+   * poll's own `generating` flag, so a chat started in another tab shows up. */
+  const markRunning = (id: string, on: boolean) => {
+    const cur = runningRef.current;
+    if (on === cur.includes(id)) return;
+    const next = on ? [...cur, id] : cur.filter((x) => x !== id);
+    runningRef.current = next;
+    setRunningIds(next);
+  };
+
+  /** Drop one chat's feed. Used when that chat's session is replaced or
+   * deleted — never when the user merely looks at a different chat. */
+  const closeStream = (id: string | null) => {
+    if (!id) return;
+    streamsRef.current.get(id)?.();
+    streamsRef.current.delete(id);
+    markRunning(id, false);
+  };
+
   const scheduleReconnect = (id: string) => {
     const st = reconnectRef.current;
     if (st.timer !== null) return;
     if (st.tries >= 5) {
+      markRunning(id, false);
+      // Only the chat on screen can carry a notice; a background chat's
+      // transcript is rebuilt by the replay when the user returns to it.
+      if (chatIdRef.current !== id) return;
       setStreaming(false);
       setMessages((prev) => [
         ...prev,
@@ -578,25 +620,29 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     st.tries += 1;
     st.timer = window.setTimeout(() => {
       st.timer = null;
-      setMessages([]); // the replay rebuilds the transcript
+      // The replay rebuilds the transcript — but only the open one's; a
+      // background chat reattaches without touching what is on screen.
+      if (chatIdRef.current === id) setMessages([]);
       attachStream(id, true);
     }, delay);
   };
 
   const attachStream = (id: string, force = false) => {
-    if (!force && attachedRef.current === id && streamRef.current) return;
-    attachedRef.current = id;
-    if (streamRef.current) streamRef.current();
+    // t183: per-chat. Attaching B leaves A's stream open — that is the whole
+    // point (parallel conversations), and the map key replaces the old
+    // single "attached to" ref.
+    if (!force && streamsRef.current.has(id)) return;
+    streamsRef.current.get(id)?.();
     const es = new EventSource(`/api/v1/chat/${id}/events`);
     const close = () => es.close();
-    streamRef.current = close;
+    streamsRef.current.set(id, close);
     es.onmessage = (e) => {
       reconnectRef.current.tries = 0; // liveness
       try {
         const parsed = JSON.parse(e.data) as { event?: ChatEvent } & ChatEvent;
         // Transcript replay lines wrap the event ({ts, seq, event});
         // live events arrive flat. Handle both.
-        handleEvent(parsed.event ?? parsed);
+        handleEvent(parsed.event ?? parsed, id);
       } catch {
         /* skip */
       }
@@ -609,20 +655,33 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       }
       st.tries = 0;
       es.close();
-      setStreaming(false);
+      streamsRef.current.delete(id);
+      markRunning(id, false);
+      // Only the chat on screen owns the composer's spinner.
+      if (chatIdRef.current === id) setStreaming(false);
     });
     es.onerror = () => {
       es.close();
+      streamsRef.current.delete(id);
       // The server closes the stream after each prompt's `end` — an
       // error with no reply in flight is that close racing us (or a
       // dead daemon nobody is talking to). Only a drop mid-reply is
-      // worth reconnecting.
-      if (!streamingRef.current) return;
+      // worth reconnecting, and "mid-reply" is now per chat: a
+      // background conversation deserves its feed back too.
+      const inFlight =
+        chatIdRef.current === id ? streamingRef.current : runningRef.current.includes(id);
+      if (!inFlight) return;
       scheduleReconnect(id);
     };
   };
 
-  const handleEvent = (ev: ChatEvent) => {
+  const handleEvent = (ev: ChatEvent, id: string) => {
+    // t183: this is what makes parallel chats safe. A chunk from a chat the
+    // user is not looking at must NOT append into the transcript on screen —
+    // it only refreshes that chat's running marker (and the replay rebuilds
+    // its transcript when the user switches back).
+    markRunning(id, !(ev.type === "stopped" || ev.type === "error"));
+    if (id !== chatIdRef.current) return;
     switch (ev.type) {
       case "user_message": {
         // Transcript replay (history reattach) re-adds user turns; the
@@ -791,6 +850,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     setStreaming(true);
     try {
       const id = await ensureChat();
+      markRunning(id, true);
       attachStream(id);
       await api.chatMessage(id, text);
       // This chat may be brand new and is now generating: re-read the list so
@@ -815,6 +875,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     setStreaming(true);
     try {
       const id = await ensureChat();
+      markRunning(id, true);
       attachStream(id);
       await api.chatMessage(id, text);
     } catch (e) {
@@ -824,11 +885,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   };
 
   const newChat = () => {
-    if (streamRef.current) streamRef.current();
-    streamRef.current = null;
-    attachedRef.current = null;
+    // t183: opening a blank composer is not a reason to stop listening to
+    // the chats that are still generating — they keep their feeds.
     setViewing(null);
     setChatId(null);
+    chatIdRef.current = null;
     setMessages([]);
     setStreaming(false);
   };
@@ -841,9 +902,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     if (chatId && !streaming) {
       try {
         const r = await api.chatHandoff(chatId, name);
-        if (streamRef.current) streamRef.current();
+        closeStream(chatId); // this chat's session is being replaced
         setAgent(name);
         setChatId(r.id);
+        chatIdRef.current = r.id;
         setModel(r.model ?? "");
         setRuntime(r.runtime ?? "");
         attachStream(r.id, true);
@@ -902,7 +964,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const switchRuntime = async (r: string) => {
     if (!chatId) return;
     // Runtime switch restarts the engine; the role prompt travels.
-    if (streamRef.current) streamRef.current();
+    closeStream(chatId);
     try {
       const chat = await api.chatModel(chatId, null, r);
       setChatId(chat.id);
@@ -945,8 +1007,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         ]);
       } else {
         // Restarted: new session, context reset; reattach the stream.
-        if (streamRef.current) streamRef.current();
+        closeStream(chatId);
         setChatId(chat.id);
+        chatIdRef.current = chat.id;
         setModel(chat.model ?? m);
         setRuntime(chat.runtime ?? runtime);
         setMessages((prev) => [
@@ -1124,7 +1187,8 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         // t178: archiving the conversation you are looking at moves it out of
         // the rail (membership) and STOPS it being tracked — the stream is
         // detached, so an archived chat no longer reports agent progress.
-        if (streamRef.current) streamRef.current();
+        // t183: only THIS chat's feed goes; the others keep running.
+        closeStream(chatId);
         setStreaming(false);
         setArchivedOpen(key);
       } else if (archived && archivedOpen === key) {
@@ -1154,8 +1218,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     if (chatId === h.id) {
       // The chat being viewed is going away: drop it instead of leaving a
       // composer pointed at a deleted id (D2: no spinner, no stop button).
-      if (streamRef.current) streamRef.current();
+      closeStream(h.id);
       setChatId(null);
+      chatIdRef.current = null;
       setStreaming(false);
       setMessages([]);
       setViewing(null);
@@ -1198,7 +1263,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
    *  chat), and a poll that only runs *while already generating* could never
    *  notice it starting. Cost: ≤12 requests/min idle, ≤20 while generating;
    *  in the audit's 11.5s window that is ≤3, well under the row-28 cap of 7. */
-  const anyGenerating = (history ?? []).some((h) => h.generating);
+  // t183: a background chat we hold a stream for counts as generating too, so
+  // the rail's marker and the faster poll keep up with it.
+  const anyGenerating = (history ?? []).some((h) => h.generating) || runningIds.length > 0;
   useEffect(() => {
     const i = setInterval(refreshHistory, anyGenerating ? 3000 : 5000);
     return () => clearInterval(i);
@@ -1213,27 +1280,31 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     setSideOpen(false);
     if (h.active) {
       setViewing(null);
-      if (streamRef.current) streamRef.current();
       setAgent(h.agent);
       setChatId(h.id);
+      chatIdRef.current = h.id;
       setModel(h.model ?? "");
       setRuntime(h.runtime ?? "");
       setMessages([]);
-      setStreaming(false);
+      // t183: the composer reflects THIS chat's run, not the panel's — a
+      // chat that is still generating elsewhere must not grey out this one.
+      setStreaming(runningRef.current.includes(h.id));
       attachStream(h.id, true);
       return;
     }
     try {
       const r = await api.chatResume(h.id);
       setViewing(null);
-      if (streamRef.current) streamRef.current();
       // §9 C3: identity comes from the ENTRY, never from the selector state.
       setAgent(r.agent || h.agent);
       setChatId(r.id);
+      chatIdRef.current = r.id;
       setModel(r.model ?? h.model ?? "");
       setRuntime(r.runtime ?? h.runtime ?? "");
       setMessages([]);
-      setStreaming(false);
+      // Resuming restarts the session, so this chat is generating again.
+      setStreaming(true);
+      markRunning(r.id, true);
       attachStream(r.id, true); // replay rebuilds the whole thread
       refreshHistory();
     } catch {
@@ -1775,7 +1846,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                           onClick={() => openPast(h)}
                           title={label}
                         >
-                          {h.generating ? (
+                          {/* t183: the rail marks EVERY chat with a reply in
+                              flight, not just the one on screen — otherwise
+                              switching away hides who is still working. */}
+                          {h.generating || runningIds.includes(h.id) ? (
                             <span className="live-dot" title={t("chat.generating")} />
                           ) : null}
                           <span className="title muted">{label}</span>
