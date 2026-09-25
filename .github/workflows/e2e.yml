@@ -77,3 +77,20 @@ jobs:
           npx playwright install chromium --with-deps
           npm run test:e2e
         working-directory: panel
+      - name: Upload Playwright artefacts
+        # An E2E red must be readable from the run itself. An E2E failure once
+        # came back with a 403 on the job log, so the failing assertion was
+        # unreadable -- and it could not be reproduced locally either (the
+        # suite skips the spec when the mock agents are not registered). The
+        # trace and the HTML report are the only record of what happened, so
+        # they are uploaded even on success: 'which tests were skipped' is
+        # exactly the question a green run gets asked.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            panel/test-results
+            panel/playwright-report
+          if-no-files-found: warn
+          retention-days: 7

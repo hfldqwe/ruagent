@@ -8,6 +8,21 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  // EVERY RUN WRITES TO ITS OWN DIRECTORY.
+  //
+  // Playwright EMPTIES its output directory when it starts. Two suites running
+  // at the same time in this repo therefore shared test-results, and each one
+  // deleted the other's artefacts: the failures that surfaced were
+  // browserContext.close: ENOENT ...traces/*.trace|.network, never an
+  // assertion -- a red that says nothing about the panel. Measured before this
+  // change: two concurrent full runs produced ENOENT failures; after: none.
+  //
+  // Why PID + timestamp: the PID separates CONCURRENT runs on one machine, the
+  // timestamp separates SEQUENTIAL ones. It stays under test-results/ (already
+  // in .gitignore) so artefacts remain easy to find -- unlike a mkdtemp path --
+  // and it needs no flag, unlike --output= : a countermeasure that depends on
+  // the caller remembering to pass it is not a countermeasure.
+  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR ?? "test-results/run-" + process.pid + "-" + Date.now(),
   timeout: 30_000,
   fullyParallel: true,
   retries: process.env.CI ? 1 : 0,
