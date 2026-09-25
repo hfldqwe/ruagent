@@ -17,6 +17,13 @@ test("chat round-trip lands in history and reattaches live", async ({ page, requ
   // A bare mock runtime card (no role prompt) — the direct-chat case.
   const mock = agents.find((a) => a.enabled && a.harness === "Mock" && !a.prompt);
   test.skip(!mock, "needs an e2e mock agent (chat with real runtimes costs money)");
+  // t190: test.skip() is a runtime decision, not a type guard, so TypeScript
+  // still sees mock as possibly undefined below. This line narrows it AND
+  // names the precondition, instead of letting a missing mock agent surface as
+  // "cannot read properties of undefined" somewhere later.
+  if (!mock) return; // unreachable: test.skip above already ended the test.
+  // Using return rather than throw keeps the outcome a SKIP: a throw would
+  // turn a missing mock agent into a suite FAILURE, which is worse than a skip.
 
   await page.goto("/#chat");
   await expect(page.locator(".view-bar h2")).toBeVisible();

@@ -25,6 +25,13 @@ test("fan-out judge picks a winner with provenance", async ({ page, request }) =
   const judge = mocks.find((a) => a.name === "judge");
   const members = mocks.filter((a) => a.name !== "judge");
   test.skip(!judge || members.length < 2, "needs the e2e mock agents (2 members + judge)");
+  // t190: test.skip() is a runtime decision, not a type guard, so TypeScript still
+  // sees judge as possibly undefined below. This narrows it AND names the
+  // precondition, instead of letting a missing judge surface as "cannot read
+  // properties of undefined" somewhere later.
+  if (!judge) return; // unreachable: test.skip above already ended the test.
+  // Using return rather than throw keeps the outcome a SKIP: a throw would
+  // turn a missing mock agent into a suite FAILURE, which is worse than a skip.
 
   // Scratch task; deleted in finally.
   const made = await request.post("/api/v1/tasks", {
