@@ -10,6 +10,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -286,6 +287,14 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     enabled: !railCollapsed,
   });
   const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
+  /** t200: the rail's row order while the pointer is inside it. A prompt in
+   *  ANY chat refreshes that chat's updated_at and the rail is ordered by it
+   *  (chat.rs:1157), so the list used to reorder itself under the user's
+   *  cursor — measured 10 reorders/minute while another chat was being
+   *  prompted, 0 when quiet. Holding the order fixes the experience without
+   *  touching the rule: conversations still drive the order, they just stop
+   *  doing it while you are reading. */
+  const [heldOrder, setHeldOrder] = useState<string[] | null>(null);
   /** t171: the rail's read failed — the rail then shows WHY (with a retry),
    *  instead of an empty list that reads as「你没有会话」. Same rule as the
    *  page-level error: one presentation per failure, and it is never an empty
@@ -1312,6 +1321,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     }
   };
 
+  /** t200: the rail reads this, not `history` directly. While the pointer is
+   *  inside the rail the rows keep their positions (live flags still update —
+   *  the running dot is the reason a row climbed, so it must stay truthful);
+   *  the pending order lands as soon as the pointer leaves. Rows that appear
+   *  while held sort after the held ones, so nothing jumps above the cursor. */
+  const railOrdered = useMemo(() => {
+    const list = history ?? [];
+    if (!heldOrder) return list;
+    const rank = new Map(heldOrder.map((id, i) => [id, i]));
+    return [...list].sort(
+      (a, b) =>
+        (rank.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.id) ?? Number.MAX_SAFE_INTEGER),
+    );
+  }, [history, heldOrder]);
+
   /** Sessions grouped by WORKSPACE (§9 C1/C7) — the group key is
    * `normCwd(cwd)`, the title keeps the first raw spelling seen, and the
    * current project's group sorts first, then named ones, then ungrouped. */
@@ -1323,7 +1347,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   } = (() => {
     const q = sessionQuery.trim().toLowerCase();
     const filtering = !!agentFilter || !!q;
-    const filtered = (history ?? []).filter((h) => {
+    const filtered = railOrdered.filter((h) => {
       // A chat with no messages is not a session. The panel only ever creates
       // one when a message is sent (ensureChat has exactly two call sites:
       // send and retry), so a message-less chat can only come from calling the
@@ -1628,7 +1652,13 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           absolutely positioned child is not a grid item, so it adds no
           implicit track and eats no gap. */}
       <ResizeHandle label={t("sider.resizeChat")} {...chatRail.handleProps} />
-      <aside className={`chat-side${sideOpen ? " open" : ""}`}>
+      <aside
+        className={`chat-side${sideOpen ? " open" : ""}`}
+        // t200: reading the list must not be a race with the list. Held here
+        // rather than on the list alone so scrolling the head counts too.
+        onPointerEnter={() => setHeldOrder((history ?? []).map((h) => h.id))}
+        onPointerLeave={() => setHeldOrder(null)}
+      >
         <div className="chat-side-head zone-head">
           <Button
             type="primary"
