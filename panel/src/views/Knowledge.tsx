@@ -55,7 +55,16 @@ const REVISION_CAP = 50;
  *  the dot carries nothing (Windows strips it anyway). So the rule is a
  *  comparison, not "always show one". */
 function sourceEchoesName(name: string, source: string): boolean {
-  const norm = (s: string) => s.trim().replace(/\\/g, "/").toLowerCase();
+  const norm = (s: string) =>
+    s
+      .trim()
+      .replace(/\\/g, "/")
+      .toLowerCase()
+      // A leading "./" is the same path spelled longer ("the file in the
+      // current directory"), so it folds too. Not seen in this index today
+      // (all 5 documents store a bare relative path), but the rule is about
+      // what the two strings MEAN, and "./x.md" means x.
+      .replace(/^\.\//, "");
   const stem = norm(source).replace(/\.[^./]*$/, "");
   return stem.length > 0 && stem === norm(name);
 }
