@@ -302,6 +302,33 @@ export function Graph() {
   const [hitIds, setHitIds] = useState<Set<number> | null>(null);
   const [selected, setSelected] = useState<GraphEntity | null>(null);
   const [creating, setCreating] = useState(false);
+  /** The inspector's own dialog (「添加事实」), reported up by EntityDetail —
+   *  see the Escape handler below for why this view needs to know. */
+  const [detailDialog, setDetailDialog] = useState(false);
+
+  // t209: the inspector had no *cancel* path. Clicking empty canvas already
+  // calls onSelect(null) (the canvas' pointer-up), but nothing else did, and
+  // in list mode the row was a one-way select. Escape now clears it, and the
+  // list row toggles. Note for readers: dimming you see with no selection is
+  // HOVER dimming (GraphCanvas: `focus = s.hoverId ?? sel`) — the pointer is
+  // still resting on the node; it is not a selection that refused to clear.
+  //
+  // BOTH of this view's dialogs own Escape while they are open (antd closes
+  // them itself), so this handler has to stay out of their way: a window
+  // listener fires whatever has focus. Measured with the inspector's
+  // 「添加事实」 dialog open, before this guard covered it, Escape closed the
+  // dialog *and* dropped the selection — the panel vanished under the user in
+  // the same keystroke. `creating` guarded only the view-bar dialog.
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== "Escape") return;
+      // A dialog owns Escape while it is open (it closes itself).
+      if (creating || detailDialog) return;
+      setSelected((prev) => (prev ? null : prev));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [creating, detailDialog]);
   const [err, setErr] = useState<unknown>(null);
   const [canvasFailed, setCanvasFailed] = useState(false);
   const toast = useToast();
@@ -558,7 +585,11 @@ export function Graph() {
             ) : (
               <div className="card">
                 {entities.map(([e, factCount]) => (
-                  <button key={e.id} className="row-btn" onClick={() => setSelected(e)}>
+                  <button
+                    key={e.id}
+                    className="row-btn"
+                    onClick={() => setSelected((prev) => (prev?.id === e.id ? null : e))}
+                  >
                     <span className="doc-icon">{kindIcon(e.kind)}</span>
                     <strong>{e.name}</strong>
                     {e.kind ? <span className="tag">{e.kind}</span> : null}
@@ -579,6 +610,7 @@ export function Graph() {
               onSelectEntity={setSelected}
               onGraphChanged={refresh}
               onFacts={setFocusFacts}
+              onDialogChange={setDetailDialog}
             />
           ) : (
             // G9: the inspector column is reserved even with nothing
@@ -1301,6 +1333,7 @@ function EntityDetail({
   onSelectEntity,
   onGraphChanged,
   onFacts,
+  onDialogChange,
 }: {
   entity: GraphEntity;
   onClose: () => void;
@@ -1309,6 +1342,10 @@ function EntityDetail({
   /** Publishes this entity's facts to the canvas, so the one request this
    *  panel makes also draws the edges (F2: no per-node prefetch). */
   onFacts?: (facts: GraphEdge[]) => void;
+  /** Reports whether this panel's own dialog is open, so the view's Escape
+   *  handler can hand Escape over to the dialog instead of closing the panel
+   *  as well (see Graph's keydown handler). */
+  onDialogChange?: (open: boolean) => void;
 }) {
   const { t } = useI18n();
   const [facts, setFacts] = useState<GraphEdge[] | null>(null);
@@ -1316,6 +1353,12 @@ function EntityDetail({
   const [neighbors, setNeighbors] = useState<[GraphEntity, number][] | null>(null);
   const [at, setAt] = useState("");
   const [addingFact, setAddingFact] = useState(false);
+  // Publish the dialog's open state upward; the cleanup also clears it on
+  // unmount, so a stale `true` can never disable Escape for good.
+  useEffect(() => {
+    onDialogChange?.(addingFact);
+    return () => onDialogChange?.(false);
+  }, [addingFact, onDialogChange]);
   const toast = useToast();
 
   // 行 20: a failed read used to leave the panel on a spinner forever.
