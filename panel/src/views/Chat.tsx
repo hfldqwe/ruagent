@@ -14,7 +14,7 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import { Button, Input, Popconfirm, Select, Tooltip } from "antd";
+import { Button, Input, Modal, Popconfirm, Select, Tooltip } from "antd";
 import {
   api,
   isRoleAgent,
@@ -22,6 +22,7 @@ import {
   type ChatHistoryEntry,
   type OptionChoice,
   type SessionOptionInfo,
+  type SessionRecord,
   HttpError,
 } from "../api";
 import { BrandMark } from "../brand";
@@ -341,7 +342,24 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [index, setIndex] = useState<
     Record<string, { archived: boolean; deletable: boolean }>
   >({});
-  const [showArchived, setShowArchived] = useState(false);
+  /** t178 — the rail's membership test. It comes from
+   *  `GET /api/v1/sessions?archived=exclude`, so an archived session is not a
+   *  member of this set and therefore cannot be rendered in the rail at all.
+   *  The previous shape kept every archived row in `history` and hid it behind
+   *  a `showArchived` toggle — exactly the behaviour the user reported
+   *  (「点击显示归档，然后又回到了原来的位置」). `null` = not read yet: the rail
+   *  shows its spinner rather than guessing. */
+  const [liveKeys, setLiveKeys] = useState<Set<string> | null>(null);
+  /** Count from the same response (`archived_count`) — the entry's label. */
+  const [archivedCount, setArchivedCount] = useState(0);
+  /** The archived destination: opened on demand, nothing prefetched. */
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archivedRows, setArchivedRows] = useState<SessionRecord[] | null>(null);
+  const [archivedErr, setArchivedErr] = useState<unknown>(null);
+  const [unarchiving, setUnarchiving] = useState<string | null>(null);
+  /** A conversation that is open AND archived: a bin is not a place to talk,
+   *  so the composer stays disabled until it is restored. */
+  const [archivedOpen, setArchivedOpen] = useState<string | null>(null);
   /** Explicitly added workspaces (the folder picker) — persisted; the
    * rendered groups are these UNION the cwd of recorded chats. */
   const [workspaces, setWorkspaces] = useState<string[]>(() => {
@@ -766,7 +784,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
 
   const send = async (override?: string) => {
     const text = (override ?? input).trim();
-    if (!text || streaming || starting || !agent) return;
+    // t178: an archived conversation is not a place to talk. The composer is
+    // disabled, and the guard lives here too so Enter/retry cannot slip past a
+    // disabled control.
+    if (archivedOpen || !text || streaming || starting || !agent) return;
     setInput("");
     setSendError(null);
     lastSendRef.current = text;
@@ -1024,22 +1045,35 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         setHistoryError(e);
         setHistory([]);
       });
+    // t178 — the rail asks for the NON-archived set and keeps it as the
+    // membership test, so archiving is a move out of the list rather than a
+    // flag the list has to remember to respect. The same response carries the
+    // per-key `deletable` marker the rows need and the archived count.
     api
-      .sessionsList({ archived: "include" })
+      .sessionsList({ archived: "exclude" })
       .then((r) => {
-        const next = Object.fromEntries(
-          r.sessions.map((s) => [
-            s.key,
-            { archived: !!s.archived, deletable: !!s.deletable },
-          ]),
-        );
+        const next: Record<string, { archived: boolean; deletable: boolean }> = {};
+        const keys = new Set<string>();
+        for (const s of r.sessions) {
+          next[s.key] = { archived: !!s.archived, deletable: !!s.deletable };
+          keys.add(s.key);
+        }
         // Same discipline for the index map: an unchanged index must not
         // re-render the rail every few seconds either.
         setIndex((cur) =>
           JSON.stringify(cur) === JSON.stringify(next) ? cur : next,
         );
+        setLiveKeys((cur) =>
+          cur && cur.size === keys.size && [...keys].every((k) => cur.has(k))
+            ? cur
+            : keys,
+        );
+        setArchivedCount(r.archived_count ?? 0);
       })
-      .catch(() => setIndex({}));
+      .catch(() => {
+        setIndex({});
+        setLiveKeys(new Set());
+      });
   };
   const refreshHistory = (force = false) => {
     const now = Date.now();
@@ -1051,11 +1085,60 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   /** Archive is a ruagent-side marker on any source; delete is refused by the
    *  daemon (403) for every source whose file ruagent does not own, which is
    *  why the row only renders the delete affordance for `deletable` rows. */
+  /** t178 — the archived destination. It reads the archived set ITSELF, only
+   *  when it is opened: while a conversation is in the bin, nothing about it is
+   *  fetched (no messages, no rail entry, no per-chat stream). */
+  const openArchive = () => {
+    setArchiveOpen(true);
+    setArchivedRows(null);
+    setArchivedErr(null);
+    api
+      .sessionsList({ archived: "only" })
+      .then((r) => {
+        setArchivedRows(r.sessions);
+        setArchivedCount(r.archived_count ?? 0);
+      })
+      .catch((e) => setArchivedErr(e));
+  };
+  /** Restoring is the only way back — that is the user's model (「只有还原归档
+   *  的时候才需要恢复到原来的位置」). */
+  const unarchive = async (key: string) => {
+    setUnarchiving(key);
+    try {
+      await api.sessionUnarchive(key);
+      setArchivedOpen((cur) => (cur === key ? null : cur));
+      // force: the user acted, so the rail's membership query must re-run now
+      // rather than wait out the coalescing window.
+      refreshHistory(true);
+      api
+        .sessionsList({ archived: "only" })
+        .then((r) => {
+          setArchivedRows(r.sessions);
+          setArchivedCount(r.archived_count ?? 0);
+        })
+        .catch((e) => setArchivedErr(e));
+    } catch (e) {
+      setArchivedErr(e);
+    } finally {
+      setUnarchiving(null);
+    }
+  };
   const toggleArchive = async (key: string, archived: boolean) => {
     try {
       if (archived) await api.sessionUnarchive(key);
       else await api.sessionArchive(key);
-      refreshHistory();
+      const open = (history ?? []).find((h) => h.id === chatId);
+      if (!archived && open?.session_key === key) {
+        // t178: archiving the conversation you are looking at moves it out of
+        // the rail (membership) and STOPS it being tracked — the stream is
+        // detached, so an archived chat no longer reports agent progress.
+        if (streamRef.current) streamRef.current();
+        setStreaming(false);
+        setArchivedOpen(key);
+      } else if (archived && archivedOpen === key) {
+        setArchivedOpen(null);
+      }
+      refreshHistory(true);
       toast("ok", archived ? t("chat.unarchived") : t("chat.archived"));
     } catch (e) {
       toast("err", String(e));
@@ -1185,10 +1268,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       // residue never reaches the user instead of relying on someone
       // remembering to clean up.
       if (!h.message_count) return false;
-      // Archived rows are hidden by default — that is what archiving means.
-      if (!showArchived && h.session_key && index[h.session_key]?.archived) {
-        return false;
-      }
+      // t178: MEMBERSHIP, not a toggle. `liveKeys` is the ?archived=exclude
+      // set, so a session that is archived is not a member and cannot be
+      // rendered here — there is no state a stray flag could flip back on.
+      // A chat with no session_key cannot be archived at all, so it stays.
+      if (h.session_key && !liveKeys?.has(h.session_key)) return false;
       if (agentFilter && h.agent !== agentFilter) return false;
       return (
         !q ||
@@ -1220,10 +1304,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     });
     return { groups, labels, visible: filtered.length, filtering };
   })();
-
-  const archivedCount = (history ?? []).filter(
-    (h) => h.session_key && index[h.session_key]?.archived,
-  ).length;
 
   // A failed agent load used to fall through to a spinner or an empty
   // picker. It is a page-level error with a retry (MASTER §12 row 20).
@@ -1302,11 +1382,28 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         />
       ) : null}
       <div className="composer">
+        {archivedOpen ? (
+          /* t178: disabled rather than hidden — the reason has to be readable
+             next to the control it explains, and the way back is right here. */
+          <div className="chat-archived-note">
+            <span className="muted">{t("chat.archivedCantChat")}</span>
+            <Button
+              size="small"
+              loading={unarchiving === archivedOpen}
+              onClick={() => {
+                void unarchive(archivedOpen);
+              }}
+            >
+              {t("sessions.unarchive")}
+            </Button>
+          </div>
+        ) : null}
         <div className="composer-row">
           <textarea
             ref={inputRef}
             rows={2}
             aria-label={t("chat.inputPh")}
+            disabled={!!archivedOpen}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -1333,7 +1430,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             <Button
               type="primary"
               className="send-btn"
-              disabled={streaming || starting || !input.trim()}
+              disabled={streaming || starting || !input.trim() || !!archivedOpen}
               onClick={() => {
                 void send();
               }}
@@ -1669,7 +1766,12 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                     const meta = h.session_key ? index[h.session_key] : undefined;
                     const label = h.title || h.preview || t("sessions.untitled");
                     return (
-                      <div key={h.id} className="row chat-session-row">
+                      <div
+                        key={h.id}
+                        className="row chat-session-row"
+                        data-chat-id={h.id}
+                        data-session-key={h.session_key ?? ""}
+                      >
                         <button
                           className={`row-btn chat-session grow${h.id === chatId ? " selected" : ""}`}
                           onClick={() => openPast(h)}
@@ -1768,21 +1870,71 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             })
           )}
           {archivedCount > 0 ? (
-            /* t171 row 23: this control REVEALS the archived rows in place —
-               that is a disclosure, so aria-expanded is the correct attribute
-               (it was aria-pressed, and it was the one .chat-group-more
-               carrier the audit found without aria-expanded: measured
-               .chat-group-more 2/3). */
+            /* t178 — an ENTRY to the archived destination, not a disclosure
+               that mixes the archived rows back into this list. It opens a
+               dialog which reads the archived set itself; the rail's own list
+               is `?archived=exclude`. (t171's row-23 lesson still holds: the
+               class marks an expander, so it carries aria-expanded — here it
+               tracks whether the destination is showing.) */
             <button
               className="chat-group-more"
-              aria-expanded={showArchived}
-              onClick={() => setShowArchived((v) => !v)}
+              aria-expanded={archiveOpen}
+              aria-haspopup="dialog"
+              aria-label={t("sessions.archivedEntry", { n: archivedCount })}
+              onClick={openArchive}
             >
-              {showArchived
-                ? t("chat.hideArchived")
-                : t("chat.showArchived", { n: archivedCount })}
+              {t("sessions.archivedEntry", { n: archivedCount })}
             </button>
           ) : null}
+          <Modal
+            open={archiveOpen}
+            onCancel={() => setArchiveOpen(false)}
+            footer={null}
+            title={t("sessions.archivedTitle")}
+            width={520}
+          >
+            <p className="muted micro">{t("sessions.archivedNote")}</p>
+            {archivedErr ? (
+              <ErrorState
+                title={t("common.offline")}
+                hint={String(archivedErr)}
+                onRetry={openArchive}
+                retryLabel={t("task.retryRun")}
+              />
+            ) : archivedRows === null ? (
+              <Spinner />
+            ) : archivedRows.length === 0 ? (
+              <p className="muted">{t("sessions.archivedEmpty")}</p>
+            ) : (
+              <div className="chat-archived-list">
+                {archivedRows.map((s) => (
+                  /* data-session-key: the restore path is verified BY KEY.
+                     t170 lost two rows to title-based location (titles
+                     collide), so the archived destination names its rows. */
+                  <div
+                    key={s.key}
+                    className="row chat-session-row"
+                    data-session-key={s.key}
+                  >
+                    <span className="title muted truncated">
+                      {s.title || s.preview || t("sessions.untitled")}
+                    </span>
+                    <span className="grow" />
+                    <Button
+                      size="small"
+                      loading={unarchiving === s.key}
+                      title={t("sessions.unarchiveHint")}
+                      onClick={() => {
+                        void unarchive(s.key);
+                      }}
+                    >
+                      {t("sessions.unarchive")}
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Modal>
         </div>
       </aside>
       {sideOpen && <div className="chat-side-backdrop" onClick={() => setSideOpen(false)} />}
