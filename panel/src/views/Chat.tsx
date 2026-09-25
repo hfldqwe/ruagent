@@ -285,6 +285,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     enabled: !railCollapsed,
   });
   const [history, setHistory] = useState<ChatHistoryEntry[] | null>(null);
+  /** t171: the rail's read failed — the rail then shows WHY (with a retry),
+   *  instead of an empty list that reads as「你没有会话」. Same rule as the
+   *  page-level error: one presentation per failure, and it is never an empty
+   *  state. */
+  const [historyError, setHistoryError] = useState<unknown>(null);
   /** Working directory for new chats — which project the agent works
    * in (persisted; the daemon spawns the session there). */
   const [project, setProject] = useState(
@@ -414,6 +419,14 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   // configured model, then the agent's advertised current.
   const lastAgentRef = useRef("");
   const lastEngineRef = useRef("");
+  /** t171 item 3: the (agent, engine) pair we already asked for. This effect
+   *  runs TWICE on a normal load — the first run stores the agent's runtime,
+   *  which re-runs the effect — and the fetch below was unconditional, so
+   *  /api/v1/agents/<id>/options went out twice with the SAME url (measured:
+   *  ?runtime=dsh x2). One (agent, engine) pair is one catalog: the second run
+   *  has nothing new to ask for. A failed read clears the key so a later run
+   *  may retry. */
+  const loadedKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!agent) return;
     const a = agents?.find((x) => x.name === agent);
@@ -431,6 +444,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       // Same role, other engine: the old model id is not portable.
       setModel("");
     }
+    const key = agent + "|" + engine;
+    if (!agentChanged && !engineChanged && loadedKeyRef.current === key) return;
+    loadedKeyRef.current = key;
     let alive = true;
     const apply = (list: SessionOptionInfo[]) => {
       setOptions(list);
@@ -463,7 +479,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         apply(r.options);
       })
       .catch(() => {
-        if (alive) setOptions([]);
+        if (alive) {
+          loadedKeyRef.current = null;
+          setOptions([]);
+        }
       });
     return () => {
       alive = false;
@@ -973,12 +992,38 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       return changed ? merged : prev;
     });
 
-  const refreshHistory = () => {
+  /** t171 item 3 — one switch, one read.
+   *
+   *  The rail has three independent triggers that can land inside the same
+   *  switch: the resume path, the stream's "done" event, and the 5s poll. Each
+   *  one re-read BOTH /api/v1/chats and /api/v1/sessions, and each call was
+   *  unconditional — measured on one row click: chats x3 + sessions x3.
+   *
+   *  Coalescing window: the first trigger in a window does the read, later
+   *  triggers inside the same window are DROPPED (not queued). Dropping is safe
+   *  because every trigger is a「the rail may have changed」hint, and the poll
+   *  re-reads within 5s anyway; nothing is lost, only repeated. Explicit user
+   *  actions (the two retry buttons) pass `force` so a click always reads. */
+  const REFRESH_WINDOW_MS = 1200;
+  const lastRefreshRef = useRef(0);
+  const readHistory = () => {
     // §9 C1: the rail lists EVERY chat — a session is found by looking for
     // it, not by first guessing which agent owns it. The agent deep link
     // (`#chat?agent=<id>`) no longer filters this list: it is the default
     // for the NEXT new session (C6).
-    api.chatsHistory().then(mergeHistory).catch(() => setHistory([]));
+    api
+      .chatsHistory()
+      .then((rows) => {
+        setHistoryError(null);
+        mergeHistory(rows);
+      })
+      // Measured (t171): this used to swallow into `[]`, so a 500 on
+      // /api/v1/chats rendered the rail as「还没有会话」with no explanation —
+      // the exact shape row 20 exists to catch.
+      .catch((e) => {
+        setHistoryError(e);
+        setHistory([]);
+      });
     api
       .sessionsList({ archived: "include" })
       .then((r) => {
@@ -995,6 +1040,12 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         );
       })
       .catch(() => setIndex({}));
+  };
+  const refreshHistory = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastRefreshRef.current < REFRESH_WINDOW_MS) return;
+    lastRefreshRef.current = now;
+    readHistory();
   };
 
   /** Archive is a ruagent-side marker on any source; delete is refused by the
@@ -1176,17 +1227,49 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
 
   // A failed agent load used to fall through to a spinner or an empty
   // picker. It is a page-level error with a retry (MASTER §12 row 20).
+  //
+  // t171: this branch keeps the route's own heading. The row-20 probe waits for
+  // a ready signal of「sider 在 ∧ 本页有 h1」— and row 24 owes every route
+  // exactly one h1 — so a branch that returned ONLY an ErrorState left the page
+  // with h1 = 0. Measured with this route's endpoints 500ing: h1 = 0, the probe
+  // never became ready, and row 20 then reported a white screen it had never
+  // measured (the tool's own throw is reported separately). The heading is part
+  // of the view in every state, error included.
   if (agentsError) {
     return (
-      <ErrorState
-        title={t("common.offline")}
-        hint={String(agentsError)}
-        onRetry={loadAgents}
-        retryLabel={t("task.retryRun")}
-      />
+      <div className="chat-wrap">
+        <div className="view-bar">
+          <h1 className="sr-only micro">{t("chat.title")}</h1>
+          <h2>{t("chat.title")}</h2>
+        </div>
+        <ErrorState
+          title={t("common.offline")}
+          hint={String(agentsError)}
+          onRetry={() => {
+            // t171: the page-level retry re-runs EVERY read this view owns, not
+            // just the one that failed first. Measured with agents + chats both
+            // 500ing: retrying only the agents load brought the rail back with
+            // its own error still on screen (1 affordance left), so the page
+            // never reached a clean state.
+            loadAgents();
+            refreshHistory(true);
+          }}
+          retryLabel={t("task.retryRun")}
+        />
+      </div>
     );
   }
-  if (!agents) return <Spinner label={`${t("chat.title")}…`} />;
+  if (!agents) {
+    return (
+      <div className="chat-wrap">
+        <div className="view-bar">
+          <h1 className="sr-only micro">{t("chat.title")}</h1>
+          <h2>{t("chat.title")}</h2>
+        </div>
+        <Spinner label={`${t("chat.title")}…`} />
+      </div>
+    );
+  }
 
   const currentAgent = agents.find((a) => a.name === agent);
 
@@ -1454,8 +1537,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           </button>
           {filterOpen ? (
             <div className="chat-filter-list">
-              <button
-                className="chat-group-more"
+              {/* t171 row 23: .chat-group-more is the audit's EXPANDER selector
+                  — the class has to mean「这是展开控件」. The panel's entries are
+                  not expanders (they dismiss the panel), so they no longer
+                  carry it; they are antd text buttons, which is the same
+                  borderless look the class used to give them. Measured before:
+                  .chat-group-more 2/3 (the two entries matched the expander
+                  selector without an aria-expanded). */}
+              <Button
+                type="text"
+                size="small"
                 aria-pressed={agentFilter === null}
                 onClick={() => {
                   setAgentFilter(null);
@@ -1463,11 +1554,12 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                 }}
               >
                 {t("chat.allAgents")}
-              </button>
+              </Button>
               {agents.filter(isRoleAgent).map((a) => (
-                <button
+                <Button
                   key={a.name}
-                  className="chat-group-more"
+                  type="text"
+                  size="small"
                   aria-pressed={agentFilter === a.name}
                   onClick={() => {
                     setAgentFilter(a.name);
@@ -1475,14 +1567,21 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                   }}
                 >
                   {a.name}
-                </button>
+                </Button>
               ))}
             </div>
           ) : null}
         </div>
         <div className="chat-side-list">
           <div className="chat-ws-title zone-title">{t("chat.workspaces")}</div>
-          {history === null ? (
+          {historyError ? (
+            <ErrorState
+              title={t("common.offline")}
+              hint={String(historyError)}
+              onRetry={() => refreshHistory(true)}
+              retryLabel={t("task.retryRun")}
+            />
+          ) : history === null ? (
             <Spinner />
           ) : visibleRows === 0 && filterActive ? (
             /* §9.2: a filter that matches nothing must SAY so — falling back
@@ -1493,9 +1592,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                   ? t("chat.noAgentSessions", { name: agentFilter })
                   : t("chat.noResults")}
               </p>
-              <button className="chat-group-more" onClick={() => setAgentFilter(null)}>
+              <Button type="text" size="small" onClick={() => setAgentFilter(null)}>
                 {t("chat.clearFilter")}
-              </button>
+              </Button>
             </div>
           ) : historyGroups.length === 0 ? (
             <p className="muted">{t("chat.historyEmpty")}</p>
@@ -1669,9 +1768,14 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             })
           )}
           {archivedCount > 0 ? (
+            /* t171 row 23: this control REVEALS the archived rows in place —
+               that is a disclosure, so aria-expanded is the correct attribute
+               (it was aria-pressed, and it was the one .chat-group-more
+               carrier the audit found without aria-expanded: measured
+               .chat-group-more 2/3). */
             <button
               className="chat-group-more"
-              aria-pressed={showArchived}
+              aria-expanded={showArchived}
               onClick={() => setShowArchived((v) => !v)}
             >
               {showArchived
