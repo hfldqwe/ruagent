@@ -342,14 +342,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [index, setIndex] = useState<
     Record<string, { archived: boolean; deletable: boolean }>
   >({});
-  /** t178 — the rail's membership test. It comes from
-   *  `GET /api/v1/sessions?archived=exclude`, so an archived session is not a
-   *  member of this set and therefore cannot be rendered in the rail at all.
-   *  The previous shape kept every archived row in `history` and hid it behind
-   *  a `showArchived` toggle — exactly the behaviour the user reported
-   *  (「点击显示归档，然后又回到了原来的位置」). `null` = not read yet: the rail
-   *  shows its spinner rather than guessing. */
-  const [liveKeys, setLiveKeys] = useState<Set<string> | null>(null);
+  /** t178 — membership is decided from `index` (below), which carries each
+   *  session's archived flag. The previous shape kept every archived row in
+   *  `history` and hid it behind a `showArchived` toggle — exactly the behaviour
+   *  the user reported (「点击显示归档，然后又回到了原来的位置」). */
   /** Count from the same response (`archived_count`) — the entry's label. */
   const [archivedCount, setArchivedCount] = useState(0);
   /** The archived destination: opened on demand, nothing prefetched. */
@@ -1045,35 +1041,31 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         setHistoryError(e);
         setHistory([]);
       });
-    // t178 — the rail asks for the NON-archived set and keeps it as the
-    // membership test, so archiving is a move out of the list rather than a
-    // flag the list has to remember to respect. The same response carries the
-    // per-key `deletable` marker the rows need and the archived count.
+    // t178 — the rail reads the session index to decide membership, so archiving
+    // is a move out of the list rather than a flag the list has to remember to
+    // respect. It asks for `include` on purpose: the membership test needs the
+    // archived FLAG, and a response that omits archived sessions cannot be told
+    // apart from one that omits sessions the indexer has not reached yet. It is
+    // still a single request carrying the per-key `deletable` marker and the
+    // archived count, and archived rows are still never rendered or tracked.
     api
-      .sessionsList({ archived: "exclude" })
+      .sessionsList({ archived: "include" })
       .then((r) => {
         const next: Record<string, { archived: boolean; deletable: boolean }> = {};
-        const keys = new Set<string>();
         for (const s of r.sessions) {
           next[s.key] = { archived: !!s.archived, deletable: !!s.deletable };
-          keys.add(s.key);
         }
         // Same discipline for the index map: an unchanged index must not
         // re-render the rail every few seconds either.
         setIndex((cur) =>
           JSON.stringify(cur) === JSON.stringify(next) ? cur : next,
         );
-        setLiveKeys((cur) =>
-          cur && cur.size === keys.size && [...keys].every((k) => cur.has(k))
-            ? cur
-            : keys,
-        );
         setArchivedCount(r.archived_count ?? 0);
       })
-      .catch(() => {
-        setIndex({});
-        setLiveKeys(new Set());
-      });
+      // Fail OPEN on purpose: with no index every session is unknown, and an
+      // unknown session is shown (see the membership test). Failing closed here
+      // is what hid freshly created conversations until the indexer caught up.
+      .catch(() => setIndex({}));
   };
   const refreshHistory = (force = false) => {
     const now = Date.now();
@@ -1268,11 +1260,17 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       // residue never reaches the user instead of relying on someone
       // remembering to clean up.
       if (!h.message_count) return false;
-      // t178: MEMBERSHIP, not a toggle. `liveKeys` is the ?archived=exclude
-      // set, so a session that is archived is not a member and cannot be
-      // rendered here — there is no state a stray flag could flip back on.
-      // A chat with no session_key cannot be archived at all, so it stays.
-      if (h.session_key && !liveKeys?.has(h.session_key)) return false;
+      // t178: MEMBERSHIP, not a toggle — a stray flag cannot flip it back on.
+      // The test asks whether the session is KNOWN to be archived, not whether
+      // it is present in a set. Absence from ?archived=exclude means one of two
+      // things — archived, or not yet picked up by the indexer — and reading it
+      // as archived hid every freshly created conversation until the index
+      // caught up. On a fresh data root that is always the case, which is why
+      // the e2e chat round-trip failed deterministically: its own conversation
+      // was the one being hidden. An unknown session is therefore shown; only a
+      // session the index marks archived is hidden. A chat with no session_key
+      // cannot be archived at all, so it stays.
+      if (h.session_key && index[h.session_key]?.archived) return false;
       if (agentFilter && h.agent !== agentFilter) return false;
       return (
         !q ||
