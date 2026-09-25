@@ -1326,6 +1326,17 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
    *  the running dot is the reason a row climbed, so it must stay truthful);
    *  the pending order lands as soon as the pointer leaves. Rows that appear
    *  while held sort after the held ones, so nothing jumps above the cursor. */
+  /** t206: the hold is only worth explaining when something is really waiting.
+   *  Showing "the list is holding its order" with nothing to apply would claim
+   *  a pending update that does not exist — the one thing the notice must not
+   *  do. So it appears exactly when the fresh order differs from the held one. */
+  const holdPending = useMemo(() => {
+    if (!heldOrder) return false;
+    const ids = (history ?? []).map((h) => h.id);
+    if (ids.length !== heldOrder.length) return true;
+    return ids.some((id, i) => heldOrder[i] !== id);
+  }, [history, heldOrder]);
+
   const railOrdered = useMemo(() => {
     const list = history ?? [];
     if (!heldOrder) return list;
@@ -1769,7 +1780,18 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           ) : null}
         </div>
         <div className="chat-side-list">
-          <div className="chat-ws-title zone-title">{t("chat.workspaces")}</div>
+          {/* t206: while the pointer holds the rail AND the order is actually
+              pending, the line the user is already looking at explains why the
+              list is not moving. Same element, same 16px line — no new row, no
+              shift under the cursor — and `.truncated` keeps the sentence to
+              one line (the full text rides in the tooltip). In the normal path
+              nothing changes: the class is not added and the label is the label. */}
+          <div
+            className={`chat-ws-title zone-title${holdPending ? " truncated" : ""}`}
+            title={holdPending ? t("chat.railHold") : undefined}
+          >
+            {holdPending ? t("chat.railHold") : t("chat.workspaces")}
+          </div>
           {historyError ? (
             <ErrorState
               title={t("common.offline")}
