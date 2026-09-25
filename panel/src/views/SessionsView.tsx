@@ -52,14 +52,36 @@ const MSG_CAP = 400;
  *  The date is the session's own start day (`dateOf` — the same absolute-date
  *  helper Graph/Memory/Knowledge use), not a relative time: a name has to stay
  *  stable in the list, and §9.5 L6 asks for a stable identity. */
+/** t199 — a compact local stamp (date + time) for rows that have no name of
+ *  their own. The day alone is not enough: measured on the live index, the
+ *  title-less rows cover 11 distinct days but 46 rows, so a day-granularity
+ *  suffix would leave ten rows showing the same string. The stamp is built
+ *  from the session's OWN started_at, so it never moves. */
+function stampOf(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return dateOf(msToIso(ms)) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
 function sessionName(
-  s: { title: string | null; started_at: number },
+  s: { title: string | null; started_at: number; preview?: string | null },
   t: (key: string, params?: Record<string, string | number>) => string,
 ): string {
   if (isPlatformInjectedName(s.title)) {
     return t("sessions.systemName", { d: dateOf(msToIso(s.started_at)) });
   }
-  return s.title || t("sessions.untitled");
+  // A real title is returned verbatim — not trimmed, not decorated: the
+  // rows that already have a name must not change by one character.
+  const title = s.title ?? "";
+  if (title.trim()) return title;
+  // t199 / S9.4: no usable title. Derive from the preview when there is one;
+  // otherwise the row still has to be distinguishable from its neighbours,
+  // so it carries the session's own start stamp. Measured: every title-less
+  // row on the live index has an empty preview, so the stamp is what they
+  // all show today — 46 rows that used to render one identical string.
+  const preview = (s.preview ?? "").trim();
+  if (preview) return preview.slice(0, 80);
+  return t("sessions.untitled") + " · " + stampOf(s.started_at);
 }
 
 /** S7 — which platform-generated sessions the list shows. */
@@ -91,6 +113,11 @@ const SYS_MODES: SystemMode[] = ["exclude", "include", "only"];
  *  the dataset is not written yet, and being written from route state it also
  *  cannot follow a replaceState. The hash is the source of truth and needs no
  *  timing assumptions. */
+/** t179 — how the list is ordered. "updated" is what the daemon already does
+ *  (ORDER BY updated_at DESC), so it is the default and the URL stays clean;
+ *  "created" is the user-asked-for alternative. */
+type SortKey = "updated" | "created";
+
 function routeQuery(): URLSearchParams {
   const h = window.location.hash.replace(/^#/, "");
   const i = h.indexOf("?");
@@ -103,6 +130,7 @@ function readViewState(): {
   filter: string;
   ws: string;
   when: string;
+  sort: SortKey;
   systemMode: SystemMode;
 } {
   const p = routeQuery();
@@ -111,6 +139,7 @@ function readViewState(): {
     filter: p.get("src") ?? "all",
     ws: p.get("ws") ?? "all",
     when: p.get("when") ?? "all",
+    sort: p.get("sort") === "created" ? "created" : "updated",
     systemMode: SYS_MODES.includes(sys as SystemMode)
       ? (sys as SystemMode)
       : "exclude",
@@ -139,6 +168,8 @@ export function Sessions() {
    *  already holds every row: the origin rules are pure predicates over the
    *  fields. Row 58 puts it in the URL all the same: it changes what you see. */
   const [systemMode, setSystemMode] = useState<SystemMode>(fromUrl.systemMode);
+  /** t179 — the order the user picked (row 58: it lives in the URL). */
+  const [sort, setSort] = useState<SortKey>(fromUrl.sort);
   /** Key of the row whose archive/delete request is in flight. */
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState<SessionRecord | null>(null);
@@ -172,12 +203,13 @@ export function Sessions() {
     if (ws !== "all") p.set("ws", ws);
     if (when !== "all") p.set("when", when);
     if (systemMode !== "exclude") p.set("sys", systemMode);
+    if (sort !== "updated") p.set("sort", sort);
     const qs = p.toString();
     const next = loc.pathname + loc.search + "#sessions" + (qs ? "?" + qs : "");
     if (loc.pathname + loc.search + loc.hash !== next) {
       window.history.replaceState(window.history.state, "", next);
     }
-  }, [filter, ws, when, systemMode]);
+  }, [filter, ws, when, systemMode, sort]);
 
   /* The reverse direction while this page stays mounted: a hash edited in the
      address bar, or a back/forward to another "#sessions?…", changes the route
@@ -194,6 +226,7 @@ export function Sessions() {
       setWs(v.ws);
       setWhen(v.when);
       setSystemMode(v.systemMode);
+      setSort(v.sort);
     };
     window.addEventListener("hashchange", apply);
     return () => window.removeEventListener("hashchange", apply);
@@ -288,7 +321,7 @@ export function Sessions() {
     const needle = q.trim().toLowerCase();
     const days = when === "7d" ? 7 : when === "30d" ? 30 : 0;
     const since = days ? Date.now() - days * 86_400_000 : 0;
-    return rows.filter((s) => {
+    const out = rows.filter((s) => {
       // S7: the platform's own sessions stay out of the default list, and the
       // system control is the explicit way back to them.
       const system = isSystemSession(s);
@@ -305,7 +338,18 @@ export function Sessions() {
       }
       return true;
     });
-  }, [rows, filter, ws, when, q, systemMode]);
+    /* t179 — the order is the user's choice. "updated" is deliberately NOT
+       re-sorted: that is exactly what the daemon already returns
+       (ORDER BY updated_at DESC), so the default path is bit-identical.
+       "created" re-orders the same set by started_at. Caveat, measured: the
+       SET is the daemon's window (the most recently ACTIVE sessions), so
+       "created" orders that window — a true whole-index created-order needs a
+       daemon-side sort parameter (out of this task's scope). */
+    if (sort === "created") {
+      out.sort((a, b) => b.started_at - a.started_at || b.updated_at - a.updated_at);
+    }
+    return out;
+  }, [rows, filter, ws, when, q, systemMode, sort]);
 
   const anyFilter = filter !== "all" || ws !== "all" || when !== "all" || q.trim() !== "";
   const clearFilters = () => {
@@ -489,6 +533,21 @@ export function Sessions() {
             { value: "exclude", label: t("sessions.hideSystem") },
             { value: "include", label: t("sessions.showSystem", { n: systemCount }) },
             { value: "only", label: t("sessions.onlySystem") },
+          ]}
+        />
+        {/* t179 — the user asked for a selectable order. 最近对话 is the
+            daemon's own ORDER BY updated_at DESC, so it is the default and the
+            URL stays clean; 最近创建 orders by started_at. Row 58: it lives in
+            the URL with the rest of the view state. No inline style (row 12
+            bills them per route). */}
+        <Select
+          className="sessions-sort"
+          value={sort}
+          onChange={(v) => setSort(v as SortKey)}
+          aria-label={t("sessions.sort")}
+          options={[
+            { value: "updated", label: t("sessions.sortUpdated") },
+            { value: "created", label: t("sessions.sortCreated") },
           ]}
         />
       </div>
