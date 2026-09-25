@@ -60,6 +60,23 @@ function sourceEchoesName(name: string, source: string): boolean {
   return stem.length > 0 && stem === norm(name);
 }
 
+/* MASTER §12 row 58 — the URL carries the view state. This app routes on the
+   hash and App.parseHash splits "route[?query]" before matching the path, so a
+   suffix reaches this view instead of falling through to the fallback. The view
+   owns both directions, exactly as SessionsView does: a first render precedes
+   any effect, so the URL has to be the source of truth for the initial state. */
+function routeQuery(): URLSearchParams {
+  const h = window.location.hash.replace(/^#/, "");
+  const i = h.indexOf("?");
+  return new URLSearchParams(i >= 0 ? h.slice(i + 1) : "");
+}
+
+/** An unknown value falls back to the default instead of reaching the
+ *  Segmented, which would then render with nothing selected. */
+function readTab(): "docs" | "wiki" {
+  return routeQuery().get("tab") === "wiki" ? "wiki" : "docs";
+}
+
 export function Knowledge() {
   const { t } = useI18n();
   const [docs, setDocs] = useState<KnowledgeDocument[] | null>(null);
@@ -89,9 +106,46 @@ export function Knowledge() {
   const [rebuildReport, setRebuildReport] = useState<
     { indexed: number; unchanged: number; removed: number; errors: number } | null
   >(null);
-  /** docs list vs the wiki tab (M2 panel surface). */
-  const [tab, setTab] = useState<"docs" | "wiki">("docs");
+  /** docs list vs the wiki tab (M2 panel surface). Initialised from the URL:
+   *  row 58's replay is what makes a shared or refreshed link land here. */
+  const [tab, setTab] = useState<"docs" | "wiki">(readTab);
   const toast = useToast();
+
+  /* Row 58, the other direction: keep the URL in step with the tab. The
+     comparison keeps this idempotent — the first render of an already-correct
+     URL (including a pasted one) writes nothing, so no needless history churn,
+     and "docs" is the default so the plain "#knowledge" stays clean. */
+  useEffect(() => {
+    const loc = window.location;
+    const h = loc.hash.replace(/^#/, "");
+    // Never rewrite another route's hash: while this page is leaving, the hash
+    // already points elsewhere and a write here would drag it back (that is the
+    // exact shape of the bug a removed unmount cleanup caused in the sessions
+    // view). Writes use replaceState, which fires no hashchange, so the two
+    // effects cannot loop.
+    if (h !== "knowledge" && !h.startsWith("knowledge?")) return;
+    const p = new URLSearchParams();
+    if (tab !== "docs") p.set("tab", tab);
+    const qs = p.toString();
+    const next = loc.pathname + loc.search + "#knowledge" + (qs ? "?" + qs : "");
+    if (loc.pathname + loc.search + loc.hash !== next) {
+      window.history.replaceState(window.history.state, "", next);
+    }
+  }, [tab]);
+
+  /* The reverse direction while this page stays mounted: a hash edited in the
+     address bar, or a back/forward to another "#knowledge?…", changes the route
+     query without unmounting the view (the route KIND is unchanged). The guard
+     keeps a navigation away from being read as a state change. */
+  useEffect(() => {
+    const apply = () => {
+      const h = window.location.hash.replace(/^#/, "");
+      if (h !== "knowledge" && !h.startsWith("knowledge?")) return;
+      setTab(readTab());
+    };
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
 
   const refresh = useCallback(() => {
     api

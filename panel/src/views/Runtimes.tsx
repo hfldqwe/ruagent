@@ -281,8 +281,17 @@ export function Runtimes() {
                     <Icon name="sync" size={13} />
                   </Button>
                   {probeErr[r.name] ? (
-                    <span className="tag err" role="alert">
-                      {t("runtimes.probeFailed")}
+                    // R11: the failure must be visible AND recoverable. The
+                    // label already says "retry", so the line has to BE the
+                    // retry -- a bare span promised an action it did not offer.
+                    <span role="alert">
+                      <button
+                        type="button"
+                        className="tag err"
+                        onClick={() => probe(r.name)}
+                      >
+                        {t("runtimes.probeFailed")}
+                      </button>
                     </span>
                   ) : null}
                   <span className="grow" />

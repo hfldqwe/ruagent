@@ -203,7 +203,9 @@ function DistillSettings() {
               ...(agents ?? []).map((a) => ({ value: a.name, label: a.name })),
             ]}
             // §5 empty: no enabled role must say so, not open an empty list.
-            notFoundContent={t("distill.noAgents")}
+            // The string belongs to THIS view's domain: a settings-only
+            // message keyed under distill.* is copy that outlives its owner.
+            notFoundContent={t("settings.noRoles")}
           />
         </label>
         <label className="chat-field" style={{ flex: "1 1 220px" }}>

@@ -8,9 +8,11 @@
 export const zh: Record<string, string> = {
   "settings.title": "设置",
   "settings.subtitle": "蒸馏策略",
+  "settings.noRoles": "没有可选角色",
 };
 
 export const en: Record<string, string> = {
   "settings.title": "Settings",
   "settings.subtitle": "distillation policy",
+  "settings.noRoles": "No roles available",
 };
