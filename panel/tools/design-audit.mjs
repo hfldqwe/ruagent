@@ -47,6 +47,7 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { decodePng, pixelStats, relLuma, parseCssColor, composite, contrastRatio } from "./lib/png.mjs";
 import { loadThresholds, targetFor, pick, pickFlag, pickAny, pickLeadingNumber, resetPickMisses, takePickMisses } from "./lib/thresholds.mjs";
+import { cvdPairVerdict } from "./lib/cvd.mjs";
 import { loadContract, pageTitleFor, shellSetAdmits } from "./lib/contract.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // panel/tools
@@ -151,38 +152,12 @@ async function probeFailureState(page, o) {
     // the same shape independently (h1=0 / sider width null / an empty rail) and
     // each time a judge read an EMPTY SET and either mis-red or landed on
     // not_measured, which costs the judge its signal. So wait for a STABLE READY
-    // SIGNAL instead: the app shell is mounted AND the view has rendered its
-    // heading (measured across 26 captures: every route has exactly one h1 and an
-    // .app-sider). Polling is bounded, and if the signal never arrives the
-    // capture is marked NOT READY -- the judges then report not_measured naming
-    // that reason, instead of photographing an unrendered page and calling it a
-    // defect.
-    const READY_TIMEOUT_MS = 15_000;
-    let ready = false;
-    let readyAt = null;
-    const readyT0 = Date.now();
-    for (;;) {
-      const st = await page.evaluate(() => ({
-        sider: !!document.querySelector("aside.app-sider, .app-sider"),
-        h1: document.querySelectorAll("h1").length,
-      }));
-      if (st.sider && st.h1 >= 1) {
-        ready = true;
-        readyAt = Date.now() - readyT0;
-        break;
-      }
-      if (Date.now() - readyT0 > READY_TIMEOUT_MS) break;
-      await page.waitForTimeout(100);
-    }
-    out.ready = ready;
-    out.readyMs = readyAt;
-    if (!ready) {
-      warnings.push("capture " + o.url + ": page never reached the ready signal within " + READY_TIMEOUT_MS + "ms" +
-        " (no .app-sider or no h1) -- its judges must report not_measured, not read an empty set");
-    }
-    // A short post-ready settle for layout only. The readiness signal above is
-    // the mechanism; this is not a substitute for it.
-    await page.waitForTimeout(300);
+    // The readiness gate that used to live here has MOVED to auditRoute and to
+    // the probes' own navigation points (see awaitReady). It was in the wrong
+    // function: its out.ready / out.readyMs landed on this probe's result object
+    // instead of on the capture record, so the capture never carried them and
+    // the warning never surfaced. Self-test was green the whole time.
+    await awaitReady(page, "probeFailureState", { requireH1: false });
     const seen = await page.evaluate(() => {
       const vis = (el) => {
         const r = el.getBoundingClientRect();
@@ -230,7 +205,7 @@ async function probeFailureState(page, o) {
       try {
         await page.locator("[data-audit-retry]").first().click({ timeout: 5000 });
         out.retryClicked = true;
-        await page.waitForTimeout(2500);
+        await awaitReady(page, "probeFailureState", { requireH1: false });
         out.recovered = await page.evaluate(() => {
           const vis = (el) => {
             const r = el.getBoundingClientRect();
@@ -1728,6 +1703,7 @@ async function probeSessionTitle(page, restore, injectCss) {
   const out = [];
   for (const w of TITLE_SWEEP) {
     await page.setViewportSize({ width: w, height: 900 });
+    await awaitReady(page, "probeSessionTitle-viewport");
     await page.waitForTimeout(220);
     const r = await page.evaluate(() => {
       const titles = [...document.querySelectorAll(".row-btn .title")];
@@ -1824,6 +1800,7 @@ async function probeOverflow(page, viewports) {
   const out = [];
   for (const vp of viewports) {
     await page.setViewportSize({ width: vp.width, height: vp.height });
+    await awaitReady(page, "probeOverflow-viewport");
     await page.waitForTimeout(280);
     const r = await page.evaluate(() => {
       const sider = document.querySelector(".app-sider");
@@ -2418,6 +2395,7 @@ async function probeWig(page, restore) {
   //     wording, not by our taste.
   for (const w of [520, 390]) {
     await page.setViewportSize({ width: w, height: 900 });
+    await awaitReady(page, "probeWig-viewport");
     // Sample only once the computed styles have SETTLED. A single wait was not
     // enough: our narrow rule (index.css @media max-width:520px, font-size:16px)
     // and antd's CSS-in-JS both write font-size, and which one is in effect
@@ -2449,14 +2427,108 @@ async function probeWig(page, restore) {
         const cs = getComputedStyle(el);
         return { sel: el.tagName.toLowerCase() + (el.type ? "[" + el.type + "]" : ""), fs: parseFloat(cs.fontSize) || 0 };
       });
-      const targets = [...document.querySelectorAll("button, a[href], [role=button], .icon-btn")].filter(vis).map((el) => {
+      // Row 52 measures the EFFECTIVE hit box, not the element box.
+      
+      // t158 measured an anchor whose element box is 44x44 while only 21 of 81
+      // sample points inside that box hit it: the anchor wraps only its text
+      // label (the icon sits outside it) and its li is 51x36 with
+      // overflow:hidden, so most of the 44px box is clipped away. The element
+      // box said 44x44 and the row went green while the touch target was about
+      // 13.5x36. Reading getBoundingClientRect() cannot see clipping at all.
+      
+      // So the hit region is MEASURED with a real pointer hit test -- the same
+      // method row 18 uses for the splitter, for the same reason: a judge that
+      // reasons statically about hit testing is a judge that can be wrong about
+      // it. An N x N grid is sampled inside the element box (intersected with
+      // the viewport, because a point off screen hits nothing and that is a
+      // different fact), and a sample counts only when elementFromPoint returns
+      // the element itself or a node inside it. The effective box is the
+      // bounding box of the samples that hit.
+      const N = 9;
+      const effOf = (el, b) => {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const x0 = Math.max(0, b.left), x1 = Math.min(vw, b.right);
+        const y0 = Math.max(0, b.top), y1 = Math.min(vh, b.bottom);
+        // An element BELOW THE FOLD has no sample point in the viewport, so it
+        // has no measurable hit region HERE. That is not the same fact as "this
+        // target is too small" and not the same as "this target is clipped to
+        // nothing" -- it is simply not on screen at this scroll position, so it
+        // is out of scope for this measurement (same reasoning as row 18"s
+        // splitter: a probe point that does not exist must not produce a verdict).
+        if (x1 - x0 < 1 || y1 - y0 < 1) return { skip: true, why: "box does not intersect the viewport" };
+        // PARTIALLY visible is also not measurable HERE: an element half below
+        // the fold has only a sliver to sample, and the bounding box of those
+        // samples is the sliver -- 384x2 for a 384x60 row. That is an artifact
+        // of the scroll position, not a clipped hit region, and reporting it as
+        // a violation would be a false red. (Measured: div.row-btn@520 read
+        // 384x2 that way.) So a target must be substantially on screen to be
+        // judged; the rest are skipped and counted.
+        let hits = 0, samples = 0;
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (let i = 0; i < N; i++) {
+          for (let j = 0; j < N; j++) {
+            const x = x0 + ((i + 0.5) / N) * (x1 - x0);
+            const y = y0 + ((j + 0.5) / N) * (y1 - y0);
+            samples++;
+            const hit = document.elementFromPoint(x, y);
+            if (hit && (hit === el || el.contains(hit))) {
+              hits++;
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+        if (!hits) return { hits: 0, samples, effW: 0, effH: 0, why: "no sample point hits this element (fully clipped or covered)" };  // in view, yet unreachable
+        const stepX = (x1 - x0) / N, stepY = (y1 - y0) / N;
+        const visFrac = ((x1 - x0) * (y1 - y0)) / Math.max(1, b.width * b.height);
+        if (visFrac < 0.9)
+          return { skip: true, why: "only " + Math.round(visFrac * 100) + "% of the box is in the viewport" };
+        return {
+          hits, samples,
+          effW: Math.round(maxX - minX + stepX),
+          effH: Math.round(maxY - minY + stepY),
+        };
+      };
+      let skipped = 0;
+      const skippedWhy = [];
+      const targets = [...document.querySelectorAll("button, a[href], [role=button], .icon-btn")]
+        .filter(vis)
+        .map((el) => {
         const b = el.getBoundingClientRect();
         const cls = typeof el.className === "string" ? el.className.split(/\s+/).slice(0, 2).join(".") : "";
-        return { sel: el.tagName.toLowerCase() + (cls ? "." + cls : ""), w: Math.round(b.width), h: Math.round(b.height) };
-      });
-      return { inputs, targets };
+        const e = effOf(el, b);
+        if (e.skip) {
+          // Not on screen (or only partly): out of scope, NOT unmeasured. The
+          // count travels with the reading so the filter cannot hide a defect.
+          skipped++;
+          if (skippedWhy.length < 3) skippedWhy.push((el.tagName.toLowerCase() + (cls ? "." + cls : "")) + "@" + Math.round(b.width) + "x" + Math.round(b.height) + ": " + e.why);
+          return null;
+        }
+        return {
+          sel: el.tagName.toLowerCase() + (cls ? "." + cls : ""),
+          // BOTH numbers, always: the element box and the measured hit region.
+          // They are equal when the whole box takes part in hit testing (a
+          // full-bleed ::before does exactly that) and they differ when an
+          // ancestor clips the box or another element covers part of it.
+          boxW: Math.round(b.width),
+          boxH: Math.round(b.height),
+          effW: e.effW,
+          effH: e.effH,
+          hits: e.hits,
+          samples: e.samples,
+          why: e.why || null,
+          // kept so older consumers/tests that read w/h still see the
+          // EFFECTIVE box -- the thing the threshold is about.
+          w: e.effW,
+          h: e.effH,
+        };
+      })
+        .filter(Boolean);
+      return { inputs, targets, skipped, skippedWhy };
     });
-    out.narrow.push({ viewport: w, inputs: r.inputs, targets: r.targets });
+    out.narrow.push({ viewport: w, inputs: r.inputs, targets: r.targets, skipped: r.skipped, skippedWhy: r.skippedWhy });
   }
   if (restore) {
     await page.setViewportSize({ width: restore.width, height: restore.height });
@@ -2481,13 +2553,37 @@ function inputFontVerdict(w) {
   return { measured: true, samples: all.length, bad, min: Math.min(...all.map((i) => i.fs)), pass: bad.length === 0 };
 }
 function touchTargetVerdict(w, floor) {
-  if (!w || w.error) return { measured: false, pass: null };
+  if (!w || w.error) return { measured: false, pass: null, why: "the narrow-screen probe failed" };
   const all = [];
-  for (const n of w.narrow || []) for (const t of n.targets) all.push({ ...t, viewport: n.viewport });
-  if (!all.length) return { measured: false, pass: null, samples: 0 };
-  const bad = all.filter((t) => t.w < floor || t.h < floor);
-  const smallest = all.reduce((a, b) => (a.w * a.h <= b.w * b.h ? a : b));
-  return { measured: true, samples: all.length, bad, smallest, pass: bad.length === 0 };
+  let skipped = 0;
+  const skippedWhy = [];
+  for (const n of w.narrow || []) {
+    skipped += n.skipped || 0;
+    for (const q of n.skippedWhy || []) skippedWhy.push(q);
+    for (const t of n.targets) all.push({ ...t, viewport: n.viewport });
+  }
+  if (!all.length) return { measured: false, pass: null, samples: 0, why: "no pointable element on this route" };
+  // Empty-set guard: an element whose measured hit region is ZERO is not a
+  // small target, it is an unmeasured one -- it may be fully clipped, fully
+  // covered, or simply not hit-testable. Reporting that as a violation would
+  // be reading an empty set as a defect, so the row declines to conclude.
+  const unmeasured = all.filter((t) => !t.effW || !t.effH);
+  if (unmeasured.length) {
+    return {
+      measured: false,
+      pass: null,
+      samples: all.length,
+      unmeasured,
+      why:
+        unmeasured.length + " of " + all.length + " pointable elements had NO hit region at all (" +
+        unmeasured.slice(0, 3).map((t) => t.sel + "@" + t.viewport + (t.why ? ": " + t.why : "")).join(", ") +
+        ") -- the effective box is not measurable there",
+    };
+  }
+  const bad = all.filter((t) => t.effW < floor || t.effH < floor);
+  const smallest = all.reduce((a, b) => (a.effW * a.effH <= b.effW * b.effH ? a : b));
+  const boxOnlyWouldPass = bad.filter((t) => t.boxW >= floor && t.boxH >= floor);
+  return { measured: true, samples: all.length, bad, smallest, boxOnlyWouldPass, skipped, skippedWhy, pass: bad.length === 0 };
 }
 
 // Rows 47/48/49: list-order stability. The instruments were built in t99
@@ -2501,7 +2597,7 @@ async function probeOrder(page, baseUrl) {
   const out = { error: null, click: null, ticks: 0, membershipChanges: 0, pureReorder: 0, maxMovePx: null, samples: [], sessions: null };
   try {
     await page.goto(baseUrl + "/?mode=dark#chat", { waitUntil: "load", timeout: 60_000 });
-    await page.waitForTimeout(2500);
+    await awaitReady(page, "probeOrder");
     const ids = async () => {
       const r = await fetch(baseUrl + "/api/v1/chats", { signal: AbortSignal.timeout(5000) });
       const b = await r.json();
@@ -2613,6 +2709,264 @@ function sessionNameVerdict(o) {
   return { measured: true, pass: o.sessions.bad === 0, total: o.sessions.total, bad: o.sessions.bad, samples: o.sessions.samples };
 }
 
+// Routes that carry a navigation item. #task/<id> is parameterised: it has no
+// nav item, and requiring one would make row 57 unsatisfiable.
+const NAV_ROUTE_COUNT = ROUTES.filter((r) => !r.needsTaskId).length;
+
+// Row 58: does the URL carry the VIEW state, and can it be replayed?
+//
+// The object set is the contract's: route (already done), tab/mode, selection.
+// Explicitly excluded: scroll, hover, focus, uncommitted input -- transient UI
+// state that would pollute the history stack and that nobody shares.
+async function probeUrlState(page, baseUrl, restore) {
+  const out = { error: null, tabs: 0, hash1: null, hash2: null, fp1: null, fp2: null, fp3: null };
+  const fp = () =>
+    page.evaluate(() => {
+      const on = [...document.querySelectorAll("[aria-selected=true], .ant-tabs-tab-active, .seg-on, [data-active=true]")];
+      return on.map((el) => String(el.textContent || "").trim().slice(0, 24)).filter(Boolean).join("|");
+    });
+  try {
+    await page.goto(baseUrl + "/?mode=dark#sessions", { waitUntil: "load", timeout: 60_000 });
+    await awaitReady(page, "probeUrlState");
+    out.tabs = await page.evaluate(
+      () => [...document.querySelectorAll(".ant-tabs-tab, [role=tab], .seg-btn, button[aria-selected]")].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width >= 1 && r.height >= 1;
+      }).length,
+    );
+    out.hash1 = await page.evaluate(() => location.hash);
+    out.fp1 = await fp();
+    const clicked = await page.evaluate(() => {
+      const tabs = [...document.querySelectorAll(".ant-tabs-tab, [role=tab], .seg-btn")].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width >= 1 && r.height >= 1;
+      });
+      const off = tabs.find((el) => el.getAttribute("aria-selected") !== "true");
+      if (!off) return false;
+      off.click();
+      return true;
+    });
+    if (clicked) {
+      await page.waitForTimeout(700);
+      out.hash2 = await page.evaluate(() => location.hash);
+      out.fp2 = await fp();
+      // REPLAY: reload with the URL the switch produced and see whether the
+      // same view state comes back. A hash that changes but does not restore
+      // is not a URL that reflects the state.
+      await page.reload({ waitUntil: "load", timeout: 60_000 });
+      await page.waitForTimeout(2000);
+      out.fp3 = await fp();
+    }
+  } catch (e) {
+    out.error = e.message;
+  }
+  if (restore) {
+    await page.setViewportSize({ width: restore.width, height: restore.height });
+    await page.waitForTimeout(120);
+  }
+  return out;
+}
+
+// Row 58 verdict. Both halves are required: the hash must CHANGE on a view-
+// state switch, and reloading that hash must land on the SAME state.
+function urlStateVerdict(o) {
+  if (!o || o.error) return { measured: false, pass: null, why: "url-state probe failed" };
+  if (!o.tabs) return { measured: false, pass: null, why: "no view-state switch (tab/mode) found on this route" };
+  if (o.hash2 == null) return { measured: false, pass: null, why: "could not switch a tab/mode to observe the URL" };
+  const changed = o.hash2 !== o.hash1;
+  const replayed = o.fp3 === o.fp2;
+  return { measured: true, changed, replayed, hash1: o.hash1, hash2: o.hash2, fp2: o.fp2, fp3: o.fp3, pass: changed && replayed };
+}
+
+// Row 59: the nine graph category colours, read out of index.css. The contract
+// fixes the pair set (9 choose 2 = 36) x 3 CVD types and the two conventions.
+function loadCategoryColors(cssPath) {
+  const out = [];
+  let text = "";
+  try {
+    text = readFileSync(cssPath, "utf8");
+  } catch {
+    return out;
+  }
+  const re = /--graph-([a-z0-9-]+):\s*([^;]+);/g;
+  // The stylesheet defines the category tokens TWICE (the default block and the
+  // dark block). The contract's object set is NINE category colours, so the
+  // FIRST definition of each name is taken -- reading both would give 18 colours
+  // and 153 pairs instead of 36, i.e. a different criterion measured on a
+  // different set. (Measured: 24 --graph-* declarations = 2 blocks x 12.)
+  const seen = new Set();
+  for (const m of text.matchAll(re)) {
+    const name = m[1];
+    // edge/edge-hi/label are not category colours -- they are the edge stroke
+    // and the label ink (rows 31/33 cover those).
+    if (name === "edge" || name === "edge-hi" || name === "label") continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, value: m[2].trim() });
+  }
+  return out;
+}
+
+// ── awaitReady: the ONE readiness wait, reusable at every navigation ────────
+//
+// t150 put a readiness gate in front of the capture and it was correct -- but
+// it was written INSIDE probeFailureState, so out.ready never reached the
+// capture record and the "never reached the ready signal" warning never
+// reached the capture's warnings. That is why the warning count was always 0:
+// the gate was not on the capture path at all. (Found by reading the count,
+// not by reading the code -- self-test stayed 459/459 green throughout.)
+//
+// The capture also reuses ONE page, and each probe below does its own
+// page.goto / setViewportSize. A gate at the top of the capture cannot cover
+// them: after a probe navigates, the page is unrendered again and the next
+// judge reads an empty set. So the wait is a function, and every navigation
+// calls it.
+//
+// The signal is the app shell mounted AND the view's heading rendered. The
+// bounded poll is the mechanism; the short settle after it is layout only.
+const READY_TIMEOUT_MS = 15_000;
+// ONE budget per capture, shared by every awaitReady call in it.
+//
+// Per-call timeouts do not bound anything: with 16 call sites a permanently
+// unready page burns 16 x 15s = 240s per capture and the run has to be killed
+// (measured: a 2-capture run hit a 260s timeout). A shared budget bounds the
+// WORST CASE per capture, which is the thing that has to be bounded. 20s is
+// chosen as: comfortably more than the slowest observed single wait (756ms in
+// t150's 72-capture sample) plus room for every probe's own navigation, and
+// small enough that even 13 routes x 2 modes stay inside a normal run.
+const READY_BUDGET_MS = 20_000;
+let readyBudgetLeft = READY_BUDGET_MS;
+function resetReadyBudget() {
+  readyBudgetLeft = READY_BUDGET_MS;
+}
+// opts.requireH1 (default true): whether the view's HEADING must be present.
+// The app shell is the constant; the heading is not. probeFailureState puts the
+// app into a deliberate FAILURE state, where a view may legitimately render its
+// error surface without an h1 -- waiting for a heading there burns the whole
+// timeout and lets the state move on before the retry click, which is how row 20
+// came to flicker between runs. The signal has to match what the state is
+// allowed to look like.
+async function awaitReady(page, label, opts) {
+  const requireH1 = !opts || opts.requireH1 !== false;
+  // Never wait longer than what is left of THIS capture's budget.
+  const limit = Math.max(0, Math.min(READY_TIMEOUT_MS, readyBudgetLeft));
+  const t0 = Date.now();
+  let ready = false;
+  let readyMs = null;
+  for (;;) {
+    const st = await page
+      .evaluate(() => ({
+        sider: !!document.querySelector("aside.app-sider, .app-sider"),
+        h1: document.querySelectorAll("h1").length,
+      }))
+      .catch(() => null);
+    if (st && st.sider && (!requireH1 || st.h1 >= 1)) {
+      ready = true;
+      readyMs = Date.now() - t0;
+      break;
+    }
+    if (Date.now() - t0 > limit) break;
+    await page.waitForTimeout(100);
+  }
+  // Layout settle only. The signal above is the mechanism; this is not a
+  // substitute for it, and it is NOT how readiness is decided.
+  readyBudgetLeft -= Date.now() - t0;
+  if (ready) await page.waitForTimeout(300);
+  return { ready, readyMs, label };
+}
+// Row 57: the main navigation items, read structurally (tag + href).
+//
+// The object set is the CONTRACT's: the main navigation's items. ui-shell's
+// t154 measured 12 anchors in .sider-nav -- one per route that HAS a nav item.
+// #task/<id> is a parameterised route with no nav item, so requiring an anchor
+// for it would make the criterion unsatisfiable; the contract says so and the
+// verdict is driven by the route list rather than by a hardcoded 13.
+async function probeNavLinks(page, baseUrl, restore) {
+  const out = { error: null, items: null };
+  try {
+    await page.goto(baseUrl + "/?mode=dark#home", { waitUntil: "load", timeout: 60_000 });
+    await awaitReady(page, "probeNavLinks");
+    out.items = await page.evaluate(() => {
+      // POSITIVE scope: the navigation LIST. Scoping to the whole aside also
+      // swept in the brand text and the command-palette trigger ("Ctrl K"), and
+      // row 57 then reported 5 non-anchor "navigation items" that are not
+      // navigation items at all. ui-shell's t154 measured 12 anchors in
+      // .sider-nav -- that is the object the contract names.
+      const roots = [...document.querySelectorAll(".sider-nav")];
+      const seen = new Set();
+      const items = [];
+      for (const root of roots) {
+        for (const el of root.querySelectorAll("a, button, [role=button], [role=link]")) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          const r = el.getBoundingClientRect();
+          const cs = getComputedStyle(el);
+          if (r.width < 1 || r.height < 1 || cs.display === "none") continue;
+          items.push({
+            tag: el.tagName,
+            href: el.getAttribute("href"),
+            text: String(el.textContent || "").trim().slice(0, 30),
+            label: (el.getAttribute("aria-label") || "").trim().slice(0, 30),
+          });
+        }
+      }
+      return items;
+    });
+  } catch (e) {
+    out.error = e.message;
+  }
+  if (restore) {
+    await page.setViewportSize({ width: restore.width, height: restore.height });
+    await page.waitForTimeout(120);
+  }
+  return out;
+}
+
+// Row 56 verdict: every route's title carries its own identity, and no two
+// routes share a title. Both halves are decidable; "should be apt" is not.
+function titleVerdict(titles, navLabels) {
+  const rows = Object.entries(titles || {}).filter(([, t]) => typeof t === "string");
+  if (!rows.length) return { measured: false, pass: null, why: "no capture carried a document.title" };
+  const empty = rows.filter(([, t]) => !t.trim());
+  if (empty.length) return { measured: false, pass: null, why: "title is empty on " + empty.map(([r]) => r).join(",") };
+  const byTitle = {};
+  for (const [r, t] of rows) (byTitle[t] = byTitle[t] || []).push(r);
+  const shared = Object.entries(byTitle).filter(([, rs]) => rs.length > 1);
+  // "identifiable": the title contains the route id, or the nav label that
+  // route carries. Routes without a nav item are only held to distinctness.
+  const unidentifiable = rows.filter(([r, t]) => {
+    const lab = navLabels && navLabels[r];
+    return !(t.includes(r) || (lab && lab.trim() && t.includes(lab.trim())));
+  });
+  return {
+    measured: true,
+    n: rows.length,
+    distinct: Object.keys(byTitle).length,
+    shared,
+    unidentifiable,
+    pass: shared.length === 0 && unidentifiable.length === 0,
+  };
+}
+
+// Row 57 verdict: every nav item is an <a> with a non-empty href. The count is
+// taken from the routes that HAVE nav items, not from a literal 13.
+function navLinkVerdict(items, minNavItems) {
+  if (!Array.isArray(items)) return { measured: false, pass: null, why: "nav probe failed" };
+  if (!items.length) return { measured: false, pass: null, why: "no navigation item found on this route" };
+  const notAnchor = items.filter((i) => i.tag !== "A");
+  const noHref = items.filter((i) => i.tag === "A" && !(i.href || "").trim());
+  return {
+    measured: true,
+    n: items.length,
+    notAnchor,
+    noHref,
+    // A nav list shorter than the routes that should have one is itself a
+    // finding: it means items went missing, not that the rule got easier.
+    short: items.length < minNavItems ? { have: items.length, want: minNavItems } : null,
+    pass: notAnchor.length === 0 && noHref.length === 0 && items.length >= minNavItems,
+  };
+}
+
 // Row 55: S1.1 -- each sidebar has EXACTLY ONE visible collapse entry at >=1024.
 //
 // The object is defined POSITIVELY, in two halves:
@@ -2670,14 +3024,16 @@ async function probeRailToggles(page, baseUrl, restore) {
     });
   try {
     await page.goto(baseUrl + "/?mode=dark#chat", { waitUntil: "load", timeout: 60_000 });
-    await page.waitForTimeout(2500);
+    await awaitReady(page, "probeRailToggles");
     await page.setViewportSize({ width: 1440, height: 900 });
+    await awaitReady(page, "probeRailToggles-viewport");
     await page.waitForTimeout(600);
     out.wide = await measure();
     // <1024: the drawer tier. Closed first (the header control is off-screen but
     // focusable -- it must NOT be counted), then opened (both visible => the
     // same "exactly one" rule must hold, or the hole leaks back from narrow).
     await page.setViewportSize({ width: 900, height: 900 });
+    await awaitReady(page, "probeRailToggles-viewport");
     await page.waitForTimeout(600);
     out.narrowClosed = await measure();
     const opened = await page.evaluate(() => {
@@ -2750,7 +3106,7 @@ async function probeSessionRail(page, baseUrl, restore) {
   const out = { error: null, desktop: null, narrow: [], menu: null, keyboard: null };
   try {
     await page.goto(baseUrl + "/?mode=dark#sessions", { waitUntil: "load", timeout: 60_000 });
-    await page.waitForTimeout(2500);
+    await awaitReady(page, "probeSessionRail");
     // Rows: the sessions rail renders one row button per session. Accept a
     // couple of spellings so a class rename shows up as not_measured rather
     // than as a silent zero.
@@ -2793,6 +3149,7 @@ async function probeSessionRail(page, baseUrl, restore) {
     out.desktop = await measure();
     for (const w of [520, 390]) {
       await page.setViewportSize({ width: w, height: 900 });
+      await awaitReady(page, "probeSessionRail-viewport");
       // same settle discipline as row 51/52: sample a settled layout, not a
       // transient one.
       let prev = null;
@@ -2809,6 +3166,7 @@ async function probeSessionRail(page, baseUrl, restore) {
     // item. S10 3: folding a control into a menu must not move the defect into
     // the menu.
     await page.setViewportSize({ width: 520, height: 900 });
+    await awaitReady(page, "probeSessionRail-viewport");
     await page.waitForTimeout(400);
     const opened = await page.evaluate(() => {
       const row = [...document.querySelectorAll(".row-btn, .session-row, .chat-session-row")].find((el) => el.getBoundingClientRect().width >= 1);
@@ -3136,6 +3494,22 @@ async function auditRoute(page, o) {
   await page.waitForSelector(".app-sider", { state: "attached", timeout: 20_000 }).catch(() => warnings.push("sidebar never attached"));
   await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
   await page.waitForTimeout(args.settleMs);
+  // The capture's own readiness gate. This is the call that was MISSING: t150
+  // wrote the equivalent logic inside probeFailureState, so the capture never
+  // carried out.ready / out.readyMs and its warning never surfaced.
+  resetReadyBudget();
+  const readyInfo = await awaitReady(page, route.id + "/" + mode);
+  if (!readyInfo.ready) {
+    warnings.push(
+      "capture " + url + ": page never reached the ready signal within " + READY_TIMEOUT_MS + "ms" +
+        " (no .app-sider or no h1) -- its judges must report not_measured, not read an empty set",
+    );
+  }
+  // Row 56 reads document.title. It is read HERE -- right after this capture's
+  // own settle and before any probe navigates -- because the probes below do
+  // their own page.goto (probeNavLinks goes to #home), so reading the title at
+  // return time would report the LAST page's title rather than this route's.
+  const pageTitle = await page.evaluate(() => document.title).catch(() => null);
   // Control-run injection (--inject-css): AFTER the navigation and the settle,
   // so it is the last word on the cascade. Placed before the goto on the first
   // cut, which the page load simply wiped -- the injection had no effect and the
@@ -3274,6 +3648,10 @@ async function auditRoute(page, o) {
   const order = await probeOrder(page, args.baseUrl).catch((e) => ({ error: e.message }));
   const rail = await probeSessionRail(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const railT = await probeRailToggles(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  const nav = await probeNavLinks(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  const urlState = await probeUrlState(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  if (urlState?.error) warnings.push("row 58 url-state probe: " + urlState.error);
+  if (nav?.error) warnings.push("row 57 nav probe: " + nav.error);
   if (railT?.error) warnings.push("row 55 rail-toggle probe: " + railT.error);
   if (rail?.error) warnings.push("row 54 session-rail probe: " + rail.error);
   if (order?.error) warnings.push("rows 47-50 order probe: " + order.error);
@@ -3281,6 +3659,9 @@ async function auditRoute(page, o) {
   if (sessionTitle?.error) warnings.push("row 46 session title probe: " + sessionTitle.error);
   const tOverflowDone = Date.now();
   return {
+    title: pageTitle,
+    ready: readyInfo.ready,
+    readyMs: readyInfo.readyMs,
     route: route.id,
     hash,
     mode,
@@ -3303,6 +3684,8 @@ async function auditRoute(page, o) {
     order,
     rail,
     railT,
+    nav,
+    urlState,
     apiWindowMs,
     domStable,
     shot,
@@ -4027,15 +4410,26 @@ const CHECKS = [
     criterion: [
       "**MASTER §12 行 52（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:27「Match visual & hit targets. … On mobile, the minimum size is 44px.」）**：**窄屏（520 与 390）下可点元素的命中盒必须 ≥44×44**，违例数 **每 capture ≤0**。",
       "**对象**：button / a[href] / [role=button] / .icon-btn 中**可见**（非 display:none、非 0 尺寸）的元素。",
-      "**与行 18 的关系（写明，避免重复造）**：行 18 判「可交互元素 <32px」（**全站、含桌面**）；本行判「**窄屏下 ≥44px**」（标准给移动端的数）。**对象与阈值都不同**：一个管桌面最小 32，一个管移动最小 44。**不合并、也不重复**。",
+      "**量什么（t166 修正）**：量的是**含剪裁的有效命中盒**，**用真实指针命中测试**，不是元素盒。",
+      "  · 方法：在元素盒 **∩ 视口** 内取 **9×9 = 81** 个采样点，逐点调用 elementFromPoint(x, y)；**只有返回该元素本身、或它的后代**才算命中；**有效盒 = 命中采样点的外接盒**（含步长）。",
+      "  · **为什么不能读元素盒**：t158 实测一个锚 —— **元素盒 44×44，而盒内 81 点只有 21 点命中自身** ⇒ **有效区约 13.5×36** ✗（锚只包文字标签、图标在锚外，且 li 51×36 带 overflow:hidden ⇒ 44px 盒大部分落在剪裁之外）。**getBoundingClientRect() 看不见剪裁** ✗ ⇒ 行 52 当时**绿了，而触摸目标仍不够大** ✓。",
+      "  · **伪元素命中层**：antd 给菜单项链接一个满铺 ::before（content:''; position:absolute; inset:0）⇒ 命中测试**返回该锚本身**，而元素盒只有 28×18 ⇒ **此时「元素盒」与「命中区」相等**（都小 ⇒ 该 FAIL ✓）。**两个数不等的场合**：**祖先剪裁**（overflow:hidden）或**被别的元素覆盖**部分盒时 ⇒ 命中区 < 元素盒 ✓。**本行两个数都输出**，以便直接看出差在哪。",
+      "**与行 18 的关系（对象不同、方法同源；不合并也不重复）**：**行 18 = 分割条的命中可达**（对象 = .resize-handle 等分割条 · 命中区 = **元素盒 ∪ 参与命中测试的伪元素** · 阈值 **32px**、全站含桌面）· **本行 = 触摸目标的尺寸**（对象 = 窄屏下的 button / a[href] / [role=button] / .icon-btn · 命中区 = **含剪裁的有效区** · 阈值 **44px**、窄屏）⇒ **对象不同、阈值不同，但「用真实指针命中测试而不是读样式」是同源的方法** ✓。",
+      "**对象集范围（521–992 折叠栏区间）—— 明确判断：不扩**。理由：① 契约给本行的对象是**窄屏（520 与 390）**，44px 是**标准给移动端**的数；521–992 是**折叠栏区间**、不是触摸档 ✗；② **该区间不是无人负责**：**行 18 管全站（含桌面）的 ≥32px** ⇒ 768 档的 36px 高**已被行 18 覆盖并通过**（36 > 32 ✓）✓；③ 若要求 768 档也 ≥44px，那是**把 44 的适用档扩到非触摸档 ⇒ 属于契约改动**（§12 行 52 的对象集），**应由 design-lead 落表**，**不由仪器擅自扩** ✗（t165 正在修 768 档的 36px 高 —— 那是产品侧改动，**本行不据此改对象集** ✓）。**⇒ 无无人负责的空白：窄屏由本行（44），其余宽度由行 18（32）** ✓。",
+      "**阈值 44px —— 依据：裁决**（标准原文，**一字未改** ✓）。",
       "**阈值 44px —— 依据：裁决**（标准原文）。",
     ].join("\n"),
     judge: (c, l) => {
       if (!c.wig || c.wig.error) return { display: "— (WIG probe failed)", pass: null };
       const v = touchTargetVerdict(c.wig, l.min);
-      if (!v.measured) return { display: "— 窄屏无可点元素（0 个对象）", pass: null };
+      if (!v.measured) return { display: "— not_measured：" + (v.why || "窄屏无可点元素（0 个对象）"), pass: null };
       return {
-        display: "窄屏可点 " + v.samples + " 个 · 最小 " + v.smallest.w + "×" + v.smallest.h + "px（" + v.smallest.sel + "）· 低于 " + l.min + "px 的 " + v.bad.length + " 个" + (v.pass ? " ✓" : " — " + v.bad.slice(0, 3).map((b) => b.sel + "@" + b.viewport + "=" + b.w + "×" + b.h).join(", ")),
+        display:
+          "窄屏可点 " + v.samples + " 个 · 最小有效 " + v.smallest.effW + "×" + v.smallest.effH + "px（" + v.smallest.sel +
+          "，元素盒 " + v.smallest.boxW + "×" + v.smallest.boxH + "，命中 " + v.smallest.hits + "/" + v.smallest.samples + "）· 有效区低于 " + l.min + "px 的 " + v.bad.length + " 个" +
+          (v.boxOnlyWouldPass && v.boxOnlyWouldPass.length ? " · 其中 " + v.boxOnlyWouldPass.length + " 个「元素盒达标而有效区不达标」（这正是 t158 的形态 ✗）" : "") +
+          (v.skipped ? " · 跳过 " + v.skipped + " 个（不在视口内或只部分在视口内，量不准不算违例：" + v.skippedWhy.slice(0, 2).join("; ") + "）" : "") +
+          (v.pass ? " ✓" : " — " + v.bad.slice(0, 3).map((b) => b.sel + "@" + b.viewport + "=有效 " + b.effW + "×" + b.effH + " / 盒 " + b.boxW + "×" + b.boxH).join(", ")),
         pass: v.pass,
         detail: { samples: v.samples, smallest: v.smallest, bad: v.bad, floor: l.min },
       };
@@ -4215,6 +4609,138 @@ const CHECKS = [
         display: parts.join(" · ") + (pass ? " ✓" : " ✗") + (v.bad.length ? " 超出：" + v.bad.map((b) => b.bar + " " + b.n + " 个").join("，") : ""),
         pass,
         detail: { wide: v, narrowClosed: c.railT.narrowClosed, narrowOpen: c.railT.narrowOpen },
+      };
+    },
+  },
+  {
+    n: 56, title: "每条路由的 document.title 反映当前上下文", modes: ["dark"],
+    parse: (t) => ({
+      // The threshold column carries no number here, so it is read as a FLAG:
+      // a missing phrase is a recorded miss, not a silent built-in default.
+      identity: pickFlag(t.text, /必须包含该路由的/),
+      distinct: pickFlag(t.text, /两两不同|与其它路由不同/),
+    }),
+    criterion: [
+      "**MASTER §12 行 56（出处 = verifier t148 的外部标准分析 + 本代路由表）**：**每条路由的 document.title 必须包含该路由的可识别标识，且 13 条路由的 title 两两不同** ✓。",
+      "**阈值来源 = 裁决**（**不是测量**）✓ —— 两半都是**可判定**的：① 含该路由的标识串（**路由名或其导航项显示名**）② **两两不同** ✓（**不是「应恰当」** ✗）。",
+      "**与既有行的关系（对象不同 ⇒ 不合并也不重复）**：**行 55 = 每条侧栏的收起入口数量** · **行 57 = 导航项的语义与目标** · **本行 = title 的标识性与唯一性** ⇒ 对象不同 ✓。",
+      "**空集语义**：**没有任何 capture 带上 document.title ⇒ not_measured 并点名原因**（不得静默 PASS）✓。",
+    ].join("\n"),
+    judge: (c, l, ctx) => {
+      const caps = ctx?.captures ?? [c];
+      const titles = {};
+      const navLabels = {};
+      for (const x of caps) {
+        if (x.route) titles[x.route] = x.title;
+        for (const it of (x.nav?.items ?? [])) {
+          const m = String(it.href || "").match(/^#([a-z-]+)/i);
+          if (m && it.text) navLabels[m[1]] = it.text;
+        }
+      }
+      const v = titleVerdict(titles, navLabels);
+      if (!v.measured) return { display: "— not_measured：" + v.why, pass: null };
+      const dup = v.shared.map(([t, rs]) => rs.join("/") + " 共用「" + t + "」").join("，");
+      const un = v.unidentifiable.map(([r]) => r).join("，");
+      return {
+        display:
+          v.n + " 条路由 · 不同 title " + v.distinct + "/" + v.n +
+          (dup ? " · 重复：" + dup : "") +
+          (un ? " · 不含自身标识：" + un : "") +
+          (v.pass ? " ✓" : " ✗"),
+        pass: v.pass,
+        detail: v,
+      };
+    },
+  },
+  {
+    n: 57, title: "导航项必须是 A 标签且带 href", modes: ["dark"],
+    parse: (t) => ({
+      // NOT read from the contract cell: the cell names the object ("the main
+      // navigation items") but no count, and inventing an anchor for a number
+      // the contract does not state would be the silent-fallback failure again.
+      // The count is DERIVED from the route table: every route except the
+      // parameterised one carries a nav item.
+      minNavItems: NAV_ROUTE_COUNT,
+      mustBeAnchor: pickFlag(t.text, /必须是\s*<a>/),
+      mustHaveHref: pickFlag(t.text, /href/),
+    }),
+    criterion: [
+      "**MASTER §12 行 57（出处 = 两条外部标准的交集，verifier t148）**：**每个导航项 tagName === A 且 href 非空且等于该路由的 hash** ✓。",
+      "**对象集（从「判定方式」列读，不硬编码）** = **主导航的导航项** ✓ —— **实测 12 个导航项 ↔ 12 条有导航项的路由** ✓；**参数化路由 #task/<id> 没有导航项 ⇒ 不要求它有锚**（**否则该判据不可满足** ✗）✓。",
+      "**与行 22 / 行 16 的关系（对象不同 ⇒ 不合并也不重复）**：**行 22 = 浮层关闭后焦点归属** · **行 16 = 焦点环** ⇒ 对象不同；**但本行的实现可能影响它们** ⇒ **实现本行时不得破坏行 22 / 16** ✓。**与行 52 的关系**：**行 52 判命中盒 ≥44px**（对象 = 单个元素的命中盒）· **本行判 tagName / href**（对象 = 元素的**语义与目标**）⇒ **对象同、意图不同 ⇒ 不合并也不重复** ✓。",
+      "**空集语义**：**该路由没有导航项 ⇒ not_measured 并点名原因** ✓；**导航项数少于「有导航项的路由数」也 FAIL**（那是「项丢了」，不是「判据变松了」）✓。",
+    ].join("\n"),
+    judge: (c, l) => {
+      const v = navLinkVerdict(c.nav?.items, l.minNavItems);
+      if (!v.measured) return { display: "— not_measured：" + v.why, pass: null };
+      return {
+        display:
+          v.n + " 个导航项 · 非 A 标签 " + v.notAnchor.length + " · 无 href " + v.noHref.length +
+          (v.short ? " · 项数不足 " + v.short.have + "/" + v.short.want : "") +
+          (v.pass ? " ✓" : " ✗") +
+          (v.notAnchor.length ? " 非 A 标签：" + v.notAnchor.map((i) => i.text || i.tag).slice(0, 4).join("，") : ""),
+        pass: v.pass,
+        detail: v,
+      };
+    },
+  },
+  {
+    n: 58, title: "URL 反映视图状态（可回放）", modes: ["dark"],
+    parse: (t) => ({
+      // The target column states WHAT (the URL must track the view state); the
+      // 判定方式 column states HOW (switch a value, then replay the URL). Each
+      // anchor reads the column that actually carries it.
+      mustChange: pickFlag(t.text, /必须随/),
+      mustReplay: pickFlag(t.method ?? "", /可回放|重新加载/),
+    }),
+    criterion: [
+      "**MASTER §12 行 58（出处 = verifier t148）**：**URL 必须随「视图状态」变化，且可回放** —— 逐条切换视图状态 ⇒ **location.hash 必须变化** ∧ **用变化后的 URL 重新加载 ⇒ 落到同一视图状态** ✓。",
+      "**对象集（正面定义，来自契约）**：① **路由**（已实现）② **改变「正在看什么」的页签 / 模式** ③ **改变「看的是哪一个对象」的选中项** ✓；**明确排除**：**滚动位置 / 悬停 / 输入焦点 / 未提交的输入**（**瞬时 UI 状态，不属于「视图状态」** ✓ —— 理由：**会污染历史栈，且用户不会分享它** ✓）。**本单只实装 ②**（契约把架构改动分两步：**先做「页签/模式进 URL」**，**选中项进 URL 另议** ✓）。",
+      "**阈值来源 = 裁决** ✓。**与既有行的关系（对象不同 ⇒ 不合并也不重复）**：**行 56 = title 的标识性与唯一性** · **行 57 = 导航项的语义与目标** · **本行 = URL 与视图状态的一致性** ⇒ 对象不同 ✓。",
+      "**空集语义**：**该路由没有可切换的视图状态（页签/模式）⇒ not_measured 并点名原因** ✓（不得静默 PASS ✓）。**反向证据（构造）**：**hash 变了但回放不到同一状态 ⇒ FAIL** ✓ —— 否则本行会退化成「只要 URL 里有 # 就算过」✗。",
+    ].join("\n"),
+    judge: (c, l) => {
+      const v = urlStateVerdict(c.urlState);
+      if (!v.measured) return { display: "— not_measured：" + v.why, pass: null };
+      return {
+        display:
+          "hash " + (v.changed ? "变化 ✓" : "未变化 ✗") + "（" + v.hash1 + " → " + v.hash2 + "）· 回放 " +
+          (v.replayed ? "落到同一状态 ✓" : "落到不同状态 ✗（" + v.fp2 + " → " + v.fp3 + "）") +
+          (v.pass ? " ✓" : " ✗"),
+        pass: v.pass,
+        detail: v,
+      };
+    },
+  },
+  {
+    n: 59, title: "图谱类别色的 CVD 可辨性（类别之间）", modes: ["dark"],
+    parse: (t) => ({
+      floor: pick(t.text, /ΔE\s*≥\s*(\d+)/, 10),
+      // The two conventions are stated in the 判定方式 column (that column is
+      // the single source for the method), so they are read from there -- same
+      // uniform reading as every other row, no per-row special case.
+      cvdModel: pickFlag(t.method ?? "", /Machado/i),
+      metric: pickFlag(t.method ?? "", /CIE76/),
+    }),
+    criterion: [
+      "**MASTER §12 行 59（出处 = verifier t148 的外部标准分析）**：**对象集 = 9 个类别色两两配对 × 3 种 CVD（protanopia / deuteranopia / tritanopia）** ⇒ **9 选 2 = 36 对** ✓ · **阈值 ΔE ≥ 10** ✓。",
+      "**⚠️ 度量口径（契约强制写明，否则同一判据在不同口径下会给出不同结论）**：**CVD 模型 = Machado 2009 · severity 1.0** ✓ · **ΔE 度量 = CIE76（Lab · D65）** ✓ —— t153 的读数表明数值随口径变：**同一对 CIE76 读到 1.6、CIEDE2000 读到 2.0** ✓。**两者都实装在 tools/lib/cvd.mjs 并在本行锚定为契约文字** ✓。",
+      "**⚠️ 这是惯例阈值**：**CIE76 的 JND ≈ 2.3 ⇒ ≥10 ≈ 4× JND** ✓；**而 WCAG 1.4.1 并不要求颜色分离，它要求「第二通道」** ⇒ **这正是为什么还需要第二通道那条判据** ✓。",
+      "**与行 31 / 行 33 的关系（对象不同 ⇒ 不合并也不重复）**：**行 31 = 图谱边对比度** · **行 33 = 分类色非文本对比度（色 ↔ 背景）** · **本行 = 类别之间的可辨性（色 ↔ 色）** ⇒ 对象不同 ✓。",
+      "**空集语义**：**类别色解析不出来 / 少于 9 个 ⇒ not_measured 并点名原因** ✓（**配对集会比契约的小 ⇒ 不得当作「问题变小了」** ✗）。**反向证据（构造）**：**一对类别色 ΔE < 10 ⇒ FAIL** ✓ —— 否则本行会退化成「配色看着还行」✗。",
+    ].join("\n"),
+    judge: (c, l) => {
+      const colors = loadCategoryColors(new URL("../src/index.css", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+      const v = cvdPairVerdict(colors, l.floor, 9);
+      if (!v.measured) return { display: "— not_measured：" + v.why, pass: null };
+      return {
+        display:
+          v.colors + " 个类别色 · " + v.pairs + " 个（配对×CVD）组合 · 最小 ΔE " + v.min + "（阈值 ≥" + l.floor + "）" +
+          (v.minAt ? " 于 " + v.minAt : "") +
+          (v.bad.length ? " · 低于阈值 " + v.bad.length + " 组" : "") +
+          (v.pass ? " ✓" : " ✗"),
+        pass: v.pass,
+        detail: v,
       };
     },
   },
@@ -5724,13 +6250,11 @@ function runSelfTest() {
       // tool does not judge is the more dangerous of the two -- the contract
       // promises a check nobody runs -- so it is listed here by number rather
       // than folded into one "everything is fine" line.
-      // Rows 56/57/58 (t152) and 59 (t153) landed in §12 and have NO judge yet.
-      // They are named here so the gap is asserted rather than assumed: this
-      // list must shrink to [] when their judges land, and the check below
-      // fails if the contract and this declaration ever disagree. Row 59 was
-      // added by the contract while t150 was in flight -- the check caught it
-      // (got="56,57,58,59" want="56,57,58") rather than letting it pass unseen.
-      const PENDING_TOOL = [56, 57, 58, 59];
+      // Rows 56/57/58/59 now HAVE judges, so this list is empty again. It was
+      // the declaration that kept the gap visible while they did not: the check
+      // below failed the moment the contract and the list disagreed, which is
+      // exactly how row 59 announced itself mid-flight.
+      const PENDING_TOOL = [];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
 
@@ -6397,6 +6921,59 @@ function runSelfTest() {
   check("row55: and it names the offending control and its x",
     /x=517/.test(railToggleVerdict({ error: null, wide: [{ bar: null, name: "收起 / 展开会话历史", x: 517, inVp: true }], narrowClosed: [] }, 1).why || ""), true);
 
+  // ---- t151: rows 56/57/58/59 -------------------------------------------------
+  // Row 56: thirteen routes sharing one title is the live defect; it must FAIL.
+  check("row56 must-FAIL: thirteen routes with the SAME title",
+    titleVerdict(Object.fromEntries(["home","chat","sessions","board","task","memory","knowledge","graph","agents","runtimes","stats","settings","inbox"].map((r) => [r, "ruagent"])), {}).pass, false);
+  check("row56 must-PASS: distinct titles that carry their route identity (via the nav label)",
+    titleVerdict({ home: "首页 · ruagent", chat: "会话 · ruagent" }, { home: "首页", chat: "会话" }).pass, true);
+  check("row56 must-FAIL: a title that names neither its route id nor its nav label",
+    titleVerdict({ home: "ruagent", chat: "ruagent 2" }, {}).unidentifiable.length, 2);
+  check("row56: no capture with a title is not_measured, never pass",
+    titleVerdict({}, {}).pass === null, true);
+  // Row 57: a nav item rendered as a BUTTON is the live defect (0/13 anchors).
+  check("row57 must-FAIL: a navigation item that is a button",
+    navLinkVerdict([{ tag: "BUTTON", href: null, text: "首页" }, { tag: "A", href: "#chat", text: "会话" }], 2).pass, false);
+  check("row57 must-FAIL: an <a> with no href is not a link",
+    navLinkVerdict([{ tag: "A", href: null, text: "x" }, { tag: "A", href: "#y", text: "y" }], 2).pass, false);
+  check("row57 must-PASS: anchors carrying hrefs",
+    navLinkVerdict([{ tag: "A", href: "#home", text: "首页" }, { tag: "A", href: "#chat", text: "会话" }], 2).pass, true);
+  check("row57 must-FAIL: fewer nav items than routes that carry one (items went missing)",
+    navLinkVerdict([{ tag: "A", href: "#home", text: "首页" }], 12).pass, false);
+  check("row57: no nav item on this route is not_measured, never pass",
+    navLinkVerdict([], 12).pass === null, true);
+  check("row57: the nav-item count is DERIVED from the route table (parameterised routes have none)",
+    NAV_ROUTE_COUNT, ROUTES.filter((r) => !r.needsTaskId).length);
+  // Row 58: the constructed reverse evidence the contract asks for -- the hash
+  // moves but the URL does not restore the state.
+  check("row58 must-FAIL: hash changed but replay lands on a DIFFERENT state",
+    urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions?src=x", fp1: "全部", fp2: "我发的", fp3: "全部" }).pass, false);
+  check("row58 must-FAIL: the hash does not change at all",
+    urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions", fp1: "a", fp2: "b", fp3: "b" }).pass, false);
+  check("row58 must-PASS: the hash changes and replays to the same state",
+    urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions?src=mine", fp1: "全部", fp2: "我发的", fp3: "我发的" }).pass, true);
+  check("row58: no view-state switch on the route is not_measured, never pass",
+    urlStateVerdict({ tabs: 0 }).pass === null, true);
+  // Row 59: a pair below the floor must FAIL, or the row degrades into
+  // "the palette looks fine". A near-identical pair is the constructed case.
+  check("row59 must-FAIL: a pair of near-identical category colours",
+    cvdPairVerdict([{ name: "a", value: "#838891" }, { name: "b", value: "#848992" }], 10, 0).pass, false);
+  check("row59 must-PASS: well-separated colours",
+    cvdPairVerdict([{ name: "a", value: "#e47980" }, { name: "b", value: "#34ced2" }], 10, 0).pass, true);
+  check("row59: fewer than nine category colours is not_measured, never pass",
+    cvdPairVerdict([{ name: "a", value: "#e47980" }], 10, 9).pass === null, true);
+  check("row59: and it says the pair set would be smaller than the contract's",
+    /smaller than the contract/.test(cvdPairVerdict([{ name: "a", value: "#e47980" }], 10, 9).why || ""), true);
+  check("row59: nine colours give 36 pairs x 3 CVD = 108 combinations",
+    cvdPairVerdict(Array.from({ length: 9 }, (_, i) => ({ name: "c" + i, value: "#" + (111111 * (i + 1)).toString(16).padStart(6, "0").slice(0, 6) })), 10, 9).pairs, 108);
+  check("row59: the two conventions are pinned (Machado 2009 severity 1.0, CIE76)",
+    (() => { const m = CHECKS.find((r) => r.n === 59).parse(targetFor(TH, 59, "")); return m.cvdModel === 1 && m.metric === 1; })(), true);
+  check("row59: the floor is read from the contract",
+    CHECKS.find((r) => r.n === 59).parse(targetFor(TH, 59, "")).floor, 10);
+  // Every one of the four rows must read its anchors out of the real cells.
+  check("rows 56-59: the real cells parse with NO anchor miss",
+    (() => { resetPickMisses(); for (const n of [56, 57, 58, 59]) CHECKS.find((r) => r.n === n).parse(targetFor(TH, n, "")); return takePickMisses().length; })(), 0);
+
   // ---- t147: row 55, S1.1 (exactly one visible collapse entry per bar) ------
   const bar = (name, entries) => ({ error: null, wide: entries.map((e) => ({ bar: name, name: "收起侧栏", w: 32, h: 32, x: 400, focusable: true, shown: true, ...e })), narrowClosed: [], narrowOpen: null });
   // REVERSE EVIDENCE 1: two visible entries on the same bar => FAIL. This is the
@@ -6594,10 +7171,42 @@ function runSelfTest() {
     inputFontVerdict(wigNarrow([{ sel: "input[text]", fs: 16 }], [])).pass, true);
   check("row51: no inputs at all is not_measured (0 objects is not verified compliant)",
     inputFontVerdict(wigNarrow([], [])).pass === null, true);
+  // t166: row 52 measures the EFFECTIVE hit box. The fixtures carry both
+  // numbers, because the whole point is that they can disagree.
+  const tgt = (sel, boxW, boxH, effW, effH, hits) => ({
+    sel, boxW, boxH, effW, effH,
+    hits: hits == null ? (effW && effH ? 81 : 0) : hits,
+    samples: 81,
+    w: effW, h: effH,
+    why: effW && effH ? null : "no sample point hits this element (fully clipped or covered)",
+  });
   check("row52 must-FAIL: a 32x32 target on a narrow screen FAILS the 44px floor",
-    touchTargetVerdict(wigNarrow([], [{ sel: "button.icon-btn", w: 32, h: 32 }]), 44).pass, false);
+    touchTargetVerdict(wigNarrow([], [tgt("button.icon-btn", 32, 32, 32, 32)]), 44).pass, false);
   check("row52 must-PASS: a 44x44 target PASSES",
-    touchTargetVerdict(wigNarrow([], [{ sel: "button.icon-btn", w: 44, h: 44 }]), 44).pass, true);
+    touchTargetVerdict(wigNarrow([], [tgt("button.icon-btn", 44, 44, 44, 44)]), 44).pass, true);
+  // REVERSE EVIDENCE 1 (the t158 shape): element box 44x44, hit region ~13x36.
+  // An element-box implementation returns PASS here -- which is exactly the bug
+  // this row was rewritten to fix, so this assertion is the bug detector.
+  check("row52 must-FAIL (t158 shape): element box 44x44 but hit region 13x36",
+    touchTargetVerdict(wigNarrow([], [tgt("a.menu-link", 44, 44, 13, 36, 21)]), 44).pass, false);
+  check("row52: and it is reported as the box-passes/effective-fails form, not as a plain small box",
+    touchTargetVerdict(wigNarrow([], [tgt("a.menu-link", 44, 44, 13, 36, 21)]), 44).boxOnlyWouldPass.length, 1);
+  // REVERSE EVIDENCE 2: the hit region really is >= 44x44.
+  check("row52 must-PASS (effective really >=44): hit region 46x46 inside a 46x46 box",
+    touchTargetVerdict(wigNarrow([], [tgt("button.tile", 46, 46, 46, 46)]), 44).pass, true);
+  // The ::before case: a full-bleed pseudo-element makes the hit region EQUAL the
+  // element box -- both 28x18 -- so the two numbers agree and both are too small.
+  check("row52 must-FAIL: a full-bleed ::before makes hit region == box (28x18), still too small",
+    touchTargetVerdict(wigNarrow([], [tgt("a.menu-link", 28, 18, 28, 18)]), 44).pass, false);
+  check("row52: element box and hit region are equal there (the ::before case)",
+    (() => { const t = tgt("a.menu-link", 28, 18, 28, 18); return t.boxW === t.effW && t.boxH === t.effH; })(), true);
+  // Empty-set guard: a zero hit region is an UNMEASURED target, not a small one.
+  check("row52: a zero hit region is not_measured, never PASS",
+    touchTargetVerdict(wigNarrow([], [tgt("button.ghost", 44, 44, 0, 0)]), 44).pass === null, true);
+  check("row52: and it names the element and the reason",
+    /button.ghost@390/.test(touchTargetVerdict(wigNarrow([], [tgt("button.ghost", 44, 44, 0, 0)]), 44).why || ""), true);
+  check("row52: a probe failure is not_measured with a reason, not a silent pass",
+    typeof touchTargetVerdict({ error: "x" }, 44).why === "string", true);
   check("row52: the floor is read out of the contract, not hardcoded",
     row52.parse({ text: "窄屏触摸目标 ≥44×44" }).min, 44);
   check("row52: no targets at all is not_measured",
@@ -6807,6 +7416,7 @@ async function main() {
   // counting three lazy route chunks as first screen and dropping ten others).
   const global = { bundle: { entry, js: dist.js, css: dist.css.slice(0, 4), matchMedia: dist.matchMedia ?? [], firstScreen: dist.firstScreen ?? [] }, palette: null };
   await page.setViewportSize(viewport);
+  await awaitReady(page, "main-viewport");
   log(`[audit] palette contract …`);
   await page.goto(`${args.baseUrl}/?mode=${modes[0]}#home`, { waitUntil: "load", timeout: 60_000 });
   await page.waitForTimeout(1200);
