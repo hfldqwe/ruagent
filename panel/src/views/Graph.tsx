@@ -237,10 +237,56 @@ function svgShapePath(shape: KindShape): string {
   return pts ? poly(pts) : "M1 0A1 1 0 1 0 -1 0A1 1 0 1 0 1 0Z";
 }
 
+/* MASTER §12 row 58 — the URL carries the view state, the same shape
+   SessionsView / Knowledge / Board / Memory use. App.parseHash splits
+   "route[?query]" before matching the path, so a suffix reaches this view. */
+function routeQuery(): URLSearchParams {
+  const h = window.location.hash.replace(/^#/, "");
+  const i = h.indexOf("?");
+  return new URLSearchParams(i >= 0 ? h.slice(i + 1) : "");
+}
+
+/** Only the two documented values; anything else falls back to the default
+ *  rather than reaching the Segmented, which would render with nothing
+ *  selected. */
+function readMode(): "graph" | "list" {
+  return routeQuery().get("mode") === "list" ? "list" : "graph";
+}
+
 export function Graph() {
   const { t } = useI18n();
   const { mode: theme } = useThemeMode();
-  const [mode, setMode] = useState<"graph" | "list">("graph");
+  const [mode, setMode] = useState<"graph" | "list">(readMode);
+
+  /* Row 58, both directions. Nothing here touches the edge layer: this only
+     mirrors the mode into the URL. The write is idempotent (an already-correct
+     URL writes nothing), "graph" is the default so a plain "#graph" stays
+     clean, and replaceState fires no hashchange, so the two effects cannot
+     loop with each other. */
+  useEffect(() => {
+    const loc = window.location;
+    const h = loc.hash.replace(/^#/, "");
+    // Never rewrite another route's hash: while this page is leaving, the hash
+    // already points elsewhere and a write here would drag it back.
+    if (h !== "graph" && !h.startsWith("graph?")) return;
+    const p = new URLSearchParams();
+    if (mode !== "graph") p.set("mode", mode);
+    const qs = p.toString();
+    const next = loc.pathname + loc.search + "#graph" + (qs ? "?" + qs : "");
+    if (loc.pathname + loc.search + loc.hash !== next) {
+      window.history.replaceState(window.history.state, "", next);
+    }
+  }, [mode]);
+
+  useEffect(() => {
+    const apply = () => {
+      const h = window.location.hash.replace(/^#/, "");
+      if (h !== "graph" && !h.startsWith("graph?")) return;
+      setMode(readMode());
+    };
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
   const [entities, setEntities] = useState<[GraphEntity, number][] | null>(null);
   /** t191: the whole live edge list, in one batch request. Without it the
    *  default view was a point cloud — edges only appeared once you picked a
