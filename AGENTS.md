@@ -50,6 +50,36 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
 - New adapters must come with mock-driven tests; real-harness smoke tests are feature-gated (`--features smoke`).
 - Windows is a first-class platform: no Unix-only assumptions (paths, process groups, signals).
 
+## E2E specs that write the daemon's real config
+
+Most of panel/e2e/ is read-only: it drives the panel and the HTTP API and changes nothing.
+**One spec writes real data**, and running it against a daemon whose config matters is a
+data-loss-shaped mistake:
+
+| spec | what it writes |
+| --- | --- |
+| panel/e2e/registry.spec.ts | creates a **runtime** and a **role** in the daemon's own config (agents.toml), through the UI, and deletes them again |
+
+Two protections, because one was not enough:
+
+1. **It cannot run by accident.** panel/e2e/write-guard.ts exposes writeAccess(), true only when
+   RUAGENT_E2E_ALLOW_WRITES=1. That flag is set by the suite's single entry point,
+   npm run test:e2e -> panel/e2e/run-e2e.mjs, and by nothing else. A bare npx playwright test
+   does **not** set it, so the spec skips itself and prints why.
+2. **It cannot leave residue.** The cleanup runs from a finally block and calls the API directly
+   (DELETE /api/v1/agents/{name}, DELETE /api/v1/runtimes/{name}) instead of clicking through the
+   UI. The UI path is what failed in practice: the cleanup lived in a later step, so a failure in
+   an earlier step skipped it and left [runtime.e2e-rt] and [agent.e2e-role] behind.
+
+When adding a spec that writes anything, call writeAccess() and test.skip() on it, and add the
+spec to the table above.
+
+To run the suite the intended way (private artefacts, write access armed):
+
+```bash
+cd panel && npm run test:e2e -- --output=/tmp/pw
+```
+
 ## Testing philosophy
 
 The mock ACP agent (`crates/mock-agent`) is the backbone of CI: every orchestration/policy/memory behavior must be testable without real harnesses or API keys. Property tests guard the injection contract (bounded, tagged, visible truncation).

@@ -8,7 +8,7 @@
     "i18n:check": "node e2e/i18n-check.mjs",
     "build": "node e2e/i18n-check.mjs && tsc -b && vite build",
     "check": "tsc -b --noEmit",
-    "test:e2e": "playwright test"
+    "test:e2e": "node e2e/run-e2e.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.4",

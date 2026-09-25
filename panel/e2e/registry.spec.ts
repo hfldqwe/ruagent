@@ -1,12 +1,39 @@
-// Registry editing UI: create a runtime + a role through the real forms,
-// then delete both — self-cleaning so it is safe on any daemon (the user's
-// real one included; agents.toml is round-tripped and restored).
-// Backend semantics (409 guards, hot reload) live in the Rust integration
-// test; this spec only covers the panel wiring.
+// Registry editing UI: create a runtime + a role through the real forms, then
+// delete both. Backend semantics (409 guards, hot reload) live in the Rust
+// integration test; this spec only covers the panel wiring.
+//
+// THIS SPEC WRITES THE DAEMON'S REAL CONFIG. It used to say it was "self-cleaning
+// so it is safe on any daemon (the user's real one included)" -- that claim was
+// measured false on 2026-09-24: step 2 threw, step 3's UI cleanup never ran, and
+// [runtime.e2e-rt] + [agent.e2e-role] were left in the user's agents.toml.
+//
+// Two independent protections now, because one was not enough:
+//   1. the spec refuses to run at all unless the suite's entry point armed it
+//      (see write-guard.ts), so a bare "npx playwright test" cannot reach it;
+//   2. the cleanup runs from a finally block and goes straight to the API, so a
+//      failure in ANY step still removes the residue.
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-test("runtimes and roles can be created and deleted from the panel", async ({ page }) => {
+import { removeResidue, writeAccess } from "./write-guard";
+
+// The gate. Skipped -- with a named reason -- unless e2e/run-e2e.mjs armed it.
+const access = writeAccess();
+test.skip(!access.allowed, access.reason);
+
+test("runtimes and roles can be created and deleted from the panel", async ({ page, request, baseURL }) => {
+  try {
+    await run(page);
+  } finally {
+    // NOT through the UI, and NOT conditional: this is the half that was missing
+    // on 2026-09-24. It is idempotent, so running it after a clean pass is a
+    // no-op that reports 404s, and running it after a step-2 failure still
+    // removes whatever was created.
+    await removeResidue(request, baseURL ?? "http://127.0.0.1:8787");
+  }
+});
+
+async function run(page: Page) {
   await page.goto("/#runtimes");
   await expect(page.locator(".view-bar h2")).toBeVisible();
   await expect(
@@ -77,4 +104,4 @@ test("runtimes and roles can be created and deleted from the panel", async ({ pa
   await expect(
     page.locator(".agent-grid .agent-card").filter({ hasText: "e2e-rt" }),
   ).toHaveCount(0, { timeout: 10_000 });
-});
+}
