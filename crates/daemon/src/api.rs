@@ -155,22 +155,69 @@ pub fn router(state: AppState) -> Router {
         .fallback_service(panel_service())
 }
 
-/// Serve the built web panel (SPA) when `panel/dist` exists; the API
-/// works fine without it. Override with `RUAGENT_PANEL_DIST`.
+/// Resolve the built web panel directory.
+///
+/// This used to be a bare `panel/dist`, i.e. relative to the process'
+/// **working directory** — so `ruagent serve` started from anywhere but
+/// the repo root silently served the API with no panel (a 404 on `/`),
+/// which is indistinguishable from "the panel is broken". Resolution is
+/// now independent of the CWD: the first candidate that actually holds
+/// an `index.html` wins.
+///
+///   1. `RUAGENT_PANEL_DIST` — the explicit override, as before.
+///   2. next to the executable (`<exe dir>/panel/dist`) — a deployed
+///      layout, where the panel ships beside the binary.
+///   3. the source tree the binary was built from
+///      (`<crates/daemon>/../../panel/dist`) — what a `cargo run` /
+///      `cargo build` binary needs, and the case that used to break.
+///   4. `./panel/dist` — the old behaviour, kept last so that a daemon
+///      started from the repo root resolves exactly as it did before.
+fn panel_dist_dir() -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("RUAGENT_PANEL_DIST") {
+        candidates.push(PathBuf::from(explicit));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("panel").join("dist"));
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo) = manifest.parent().and_then(Path::parent) {
+        candidates.push(repo.join("panel").join("dist"));
+    }
+    candidates.push(PathBuf::from("panel/dist"));
+    for candidate in &candidates {
+        if candidate.join("index.html").is_file() {
+            return candidate.clone();
+        }
+    }
+    // Nothing is built: report the first candidate so the log still says
+    // something actionable, and let ServeDir 404 as it did before.
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("panel/dist"))
+}
+
+/// Serve the built web panel (SPA) when it exists; the API works fine
+/// without it. See `panel_dist_dir` for how the directory is found.
 ///
 /// Cache policy: hashed `/assets/*` are immutable; the HTML shell is
 /// `no-cache` so a rebuild always lands (a stale index.html referencing
 /// a dead bundle renders a blank page).
 fn panel_service() -> CacheDir {
     use tower_http::services::{ServeDir, ServeFile};
-    let dist = std::env::var("RUAGENT_PANEL_DIST")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("panel/dist"));
+    let dist = panel_dist_dir();
     if !dist.join("index.html").is_file() {
         tracing::info!(
             dist = %dist.display(),
+            cwd = %std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
             "panel not built — serving API only (cd panel && npm run build)"
         );
+    } else {
+        tracing::info!(dist = %dist.display(), "serving the web panel");
     }
     let inner = ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
     CacheDir { inner }
@@ -3436,6 +3483,41 @@ fn sse_end(status: RunStatus) -> Result<Event, Infallible> {
 
 #[cfg(test)]
 mod tests {
+    /// t188: the panel directory must not be resolved against the working
+    /// directory. `cargo test` runs with the CWD set to this package's root
+    /// (`crates/daemon`), where a bare `panel/dist` does not exist — so a
+    /// resolution that still finds an `index.html` has to have come from a
+    /// CWD-independent candidate (the build tree this binary came from).
+    #[test]
+    fn panel_dist_does_not_depend_on_the_working_directory() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let found = panel_dist_dir();
+        assert!(
+            !found.join("index.html").is_file() || found.is_absolute(),
+            "resolved to the relative path {} — still CWD-dependent",
+            found.display()
+        );
+        if found.join("index.html").is_file() {
+            assert_ne!(found, std::path::PathBuf::from("panel/dist"));
+            eprintln!("cwd={} -> panel dist={}", cwd.display(), found.display());
+            // A second working directory, far from the repo: the whole point of
+            // the fix is that the answer does not move. Process-wide chdir, so
+            // run this with --test-threads=1.
+            let second = std::path::PathBuf::from("C:\\");
+            if std::env::set_current_dir(&second).is_ok() {
+                let from_root = panel_dist_dir();
+                let _ = std::env::set_current_dir(&cwd);
+                eprintln!("cwd={} -> panel dist={}", second.display(), from_root.display());
+                assert_eq!(
+                    from_root, found,
+                    "the panel resolved differently from a different working directory"
+                );
+            }
+        } else {
+            eprintln!("panel/dist not built in this checkout — nothing to assert");
+        }
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;

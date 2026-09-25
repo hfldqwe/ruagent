@@ -37,7 +37,37 @@ cargo test --workspace
 cd panel && npm ci && npm run build   # tsc + vite build
 ```
 
-Run the daemon locally: `cargo run -p ruagent -- serve` (serves the panel + API on localhost).
+### Running the daemon (the reliable start)
+
+`ruagent serve` resolves the panel **independently of the working directory** (t188): the
+first of `RUAGENT_PANEL_DIST`, `<exe dir>/panel/dist`, `<repo>/panel/dist` (derived from the
+build tree the binary came from) and `./panel/dist` that actually holds an `index.html`
+wins. Before that fix, starting the daemon from anywhere but the repo root silently served
+the API with no panel — a 404 on `/`, indistinguishable from a broken build. Starting it
+from the repo root is still the habit to keep: it makes the log say which directory it picked.
+
+Start it through the script rather than a bare background job:
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ruagent-daemon.ps1 start
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ruagent-daemon.ps1 status
+```
+
+* `start` launches the daemon through WMI (`Win32_Process.Create`), so the process belongs
+  to the WMI service rather than to the calling shell. `nohup ... &` dies with the shell
+  call it was started from, and `Start-Process -RedirectStandardOutput` both hung and
+  **truncated** the previous log — which is how the evidence of the previous death was lost.
+* Output goes to `~/.ruagent/logs/daemon.log`, **appended** (rotated to `daemon.log.1` at
+  5 MB). A daemon whose output goes nowhere is undiagnosable: two deaths left no panic, no
+  error and no process behind.
+* `status` prints the health check, the recorded pid and the log tail. `watch` starts the
+  daemon only when the health check fails, and `install-task` registers it as a scheduled
+  task (at logon + every 5 minutes) so nobody has to remember to restart it.
+* `stop` stops the pid recorded in `~/.ruagent/data/daemon.pid` — never a sweep by process
+  name or port.
+
+`cargo run -p ruagent -- serve` still works for a foreground run (it resolves the panel the
+same way); it simply dies with the terminal.
 
 The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
 
