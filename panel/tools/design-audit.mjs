@@ -2720,32 +2720,120 @@ const NAV_ROUTE_COUNT = ROUTES.filter((r) => !r.needsTaskId).length;
 // state that would pollute the history stack and that nobody shares.
 async function probeUrlState(page, baseUrl, restore) {
   const out = { error: null, tabs: 0, hash1: null, hash2: null, fp1: null, fp2: null, fp3: null };
+  // THE FINGERPRINT OF "WHAT AM I LOOKING AT", read from ARIA STATE, not from
+  // class names. t142 taught this the hard way: [class*=resizer] matched an
+  // unrelated element and the judge reported a defect that did not exist.
+  // antd renders its Segmented as radios and its Tabs with aria-selected, so
+  // the ARIA state IS the state; .ant-tabs-tab-active / .seg-on are just how
+  // one version of the library paints it.
   const fp = () =>
     page.evaluate(() => {
-      const on = [...document.querySelectorAll("[aria-selected=true], .ant-tabs-tab-active, .seg-on, [data-active=true]")];
-      return on.map((el) => String(el.textContent || "").trim().slice(0, 24)).filter(Boolean).join("|");
+      const on = [
+        ...document.querySelectorAll("[aria-selected=true], [aria-checked=true], [aria-pressed=true], [data-active=true]"),
+        ...document.querySelectorAll("input[type=radio]:checked, input[type=checkbox]:checked"),
+        ...document.querySelectorAll("select"),
+      ];
+      return on
+        .map((el) => {
+          if (el.tagName === "SELECT") return String(el.value || "").trim().slice(0, 24);
+          // a checked radio names its choice through its wrapping label
+          if (el.tagName === "INPUT") {
+            const lb = el.closest("label") || el.parentElement;
+            return String((lb && lb.textContent) || "").trim().slice(0, 24);
+          }
+          const t = String(el.textContent || "").trim().slice(0, 24);
+          if (t) return t;
+          // a Segmented item whose label lives in a sibling/child node
+          const lbl = el.getAttribute("aria-label") || el.getAttribute("value") || el.id || "";
+          return String(lbl).trim().slice(0, 24);
+        })
+        .filter(Boolean)
+        .join("|");
     });
   try {
     await page.goto(baseUrl + "/?mode=dark#sessions", { waitUntil: "load", timeout: 60_000 });
     await awaitReady(page, "probeUrlState");
-    out.tabs = await page.evaluate(
-      () => [...document.querySelectorAll(".ant-tabs-tab, [role=tab], .seg-btn, button[aria-selected]")].filter((el) => {
-        const r = el.getBoundingClientRect();
-        return r.width >= 1 && r.height >= 1;
-      }).length,
-    );
+    // THE OBJECT SET OF "A VIEW-STATE SWITCH", defined POSITIVELY by the role
+    // the control plays -- never by a class name substring. The four shapes are
+    // the ones that actually mean "change what I am looking at":
+    //   tabs        [role=tab]                        (antd Tabs)
+    //   segmented   [role=radio] / input[type=radio]  (antd Segmented)
+    //   toggles     button[aria-pressed]              (a pressed-state button)
+    //   pickers     select / [role=combobox]          (antd Select)
+    // The old set (.ant-tabs-tab, .seg-btn, button[aria-selected]) was class-
+    // based, so the sessions page -- which switches its view with a Segmented
+    // and a Select -- produced zero objects and the row went not_measured while
+    // the feature was in fact implemented and replayable.
+    // VISIBILITY IS JUDGED ON WHAT THE USER CAN SEE. An antd Segmented radio is
+    // a 0x0 or clipped input whose LABEL is the visible control, so filtering on
+    // the input box discards every Segmented switch. MEASURED on #sessions:
+    // input[type=radio] has no box at all while its label is about 40x28.
+    out.tabs = await page.evaluate(() => {
+      const shown = (el) => {
+        const box = el.tagName === "INPUT" && el.closest("label") ? el.closest("label") : el;
+        const r = box.getBoundingClientRect();
+        const cs = getComputedStyle(box);
+        return r.width >= 1 && r.height >= 1 && cs.display !== "none" && cs.visibility !== "hidden";
+      };
+      return [
+        ...document.querySelectorAll("[role=tab], [role=radio], input[type=radio], button[aria-pressed], select, [role=combobox]"),
+      ].filter(shown).length;
+    });
     out.hash1 = await page.evaluate(() => location.hash);
     out.fp1 = await fp();
     const clicked = await page.evaluate(() => {
-      const tabs = [...document.querySelectorAll(".ant-tabs-tab, [role=tab], .seg-btn")].filter((el) => {
+      const vis = (el) => {
         const r = el.getBoundingClientRect();
         return r.width >= 1 && r.height >= 1;
+      };
+      // 1) SEGMENTED: click the LABEL of a radio that is not checked. MEASURED:
+      //    this is the only path that works. Clicking the input itself changes
+      //    nothing, and the ARIA-state test cannot be used at all here because
+      //    every Segmented item reports aria-checked = null. Measured effect:
+      //    #sessions becomes #sessions?src=dsh, checked mask 10000 -> 01000.
+      const radios = [...document.querySelectorAll("input[type=radio]")].filter((r) => {
+        const lb = r.closest("label");
+        if (!lb) return false;
+        const b = lb.getBoundingClientRect();
+        return b.width >= 1 && b.height >= 1;
       });
-      const off = tabs.find((el) => el.getAttribute("aria-selected") !== "true");
-      if (!off) return false;
-      off.click();
-      return true;
+      const offRadio = radios.find((r) => !r.checked);
+      if (offRadio) {
+        (offRadio.closest("label") || offRadio.parentElement).click();
+        return "segmented";
+      }
+      // 2) TABS / pressed toggles, by their own ARIA state
+      const ctrls = [...document.querySelectorAll("[role=tab], button[aria-pressed]")].filter(vis);
+      const off = ctrls.find((el) => {
+        const a = el.getAttribute("aria-selected"), p = el.getAttribute("aria-pressed");
+        return a === "false" || p === "false";
+      });
+      if (off) {
+        off.click();
+        return "control";
+      }
+      // 2) a Select: open it here, the option is picked in the next step
+      const picker = [...document.querySelectorAll("[role=combobox], select")].filter(vis)[0];
+      if (picker) {
+        picker.click();
+        return "picker-opened";
+      }
+      return false;
     });
+    if (clicked === "picker-opened") {
+      // antd Select renders its choices in a portal with role=option.
+      await page.waitForTimeout(400);
+      await page
+        .evaluate(() => {
+          const opt = [...document.querySelectorAll("[role=option]")].filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width >= 1 && r.height >= 1;
+          })[0];
+          if (opt) opt.click();
+          return !!opt;
+        })
+        .catch(() => false);
+    }
     if (clicked) {
       await page.waitForTimeout(700);
       out.hash2 = await page.evaluate(() => location.hash);
@@ -2771,7 +2859,17 @@ async function probeUrlState(page, baseUrl, restore) {
 // state switch, and reloading that hash must land on the SAME state.
 function urlStateVerdict(o) {
   if (!o || o.error) return { measured: false, pass: null, why: "url-state probe failed" };
-  if (!o.tabs) return { measured: false, pass: null, why: "no view-state switch (tab/mode) found on this route" };
+  if (!o.tabs)
+    return {
+      measured: false,
+      pass: null,
+      // A NAMED REASON, not a bare "nothing found": the object set is spelled
+      // out so a reader can tell "this route really has no view state" apart
+      // from "the probe looked for the wrong thing". The second is what
+      // happened to #sessions before this fix.
+      why:
+        "no view-state switch found on this route: looked for [role=tab], a radio inside a visible label, button[aria-pressed], select and [role=combobox], and none was visible",
+    };
   if (o.hash2 == null) return { measured: false, pass: null, why: "could not switch a tab/mode to observe the URL" };
   const changed = o.hash2 !== o.hash1;
   const replayed = o.fp3 === o.fp2;
@@ -4662,6 +4760,8 @@ const CHECKS = [
     }),
     criterion: [
       "**MASTER §12 行 57（出处 = 两条外部标准的交集，verifier t148）**：**每个导航项 tagName === A 且 href 非空且等于该路由的 hash** ✓。",
+      "**对象集边界（t175 写明）**：对象 = **主导航栏里的导航项**，**DOM 定界 = .sider-nav 子树**（**不是整条 aside.app-sider** ✗）✓。**理由（有读数）**：收在 aside.app-sider 会把 **品牌名 ruruagent** 与 **命令面板触发器 Ctrl K ⌘K** 算成导航项 ⇒ **5 个假违例** ✗（t151 实测 ✓）；**收窄到 .sider-nav 后 = PASS** ✓。**收窄的依据是契约的对象集（「主导航导航项」），不是「这些项红了不好看」** ✓。",
+      "**侧栏品牌算不算导航项 —— 判定：不算** ✓。**理由**：① 契约的对象集是**主导航导航项**，品牌是**品牌标识**（它的作用是标识产品，不是「在这个栏里导航到某处」✓）；② **它今天不是 A 标签** ✗（若算进来，判据会因「不是 A 标签」而红 ⇒ **那会把一条导航语义的判据变成品牌实现的判据** ✗）；③ **但它是可点的回首页入口** ⇒ **那属于另一条判据的对象**（可交互元素与可达性 ✓）—— **已派 t174 把品牌改成真 A 标签** ✓ ⇒ **改完后它仍不在 .sider-nav 里、本行仍不计入** ✓（**本行对象集不变** ✓）。",
       "**对象集（从「判定方式」列读，不硬编码）** = **主导航的导航项** ✓ —— **实测 12 个导航项 ↔ 12 条有导航项的路由** ✓；**参数化路由 #task/<id> 没有导航项 ⇒ 不要求它有锚**（**否则该判据不可满足** ✗）✓。",
       "**与行 22 / 行 16 的关系（对象不同 ⇒ 不合并也不重复）**：**行 22 = 浮层关闭后焦点归属** · **行 16 = 焦点环** ⇒ 对象不同；**但本行的实现可能影响它们** ⇒ **实现本行时不得破坏行 22 / 16** ✓。**与行 52 的关系**：**行 52 判命中盒 ≥44px**（对象 = 单个元素的命中盒）· **本行判 tagName / href**（对象 = 元素的**语义与目标**）⇒ **对象同、意图不同 ⇒ 不合并也不重复** ✓。",
       "**空集语义**：**该路由没有导航项 ⇒ not_measured 并点名原因** ✓；**导航项数少于「有导航项的路由数」也 FAIL**（那是「项丢了」，不是「判据变松了」）✓。",
@@ -4690,7 +4790,9 @@ const CHECKS = [
       mustReplay: pickFlag(t.method ?? "", /可回放|重新加载/),
     }),
     criterion: [
-      "**MASTER §12 行 58（出处 = verifier t148）**：**URL 必须随「视图状态」变化，且可回放** —— 逐条切换视图状态 ⇒ **location.hash 必须变化** ∧ **用变化后的 URL 重新加载 ⇒ 落到同一视图状态** ✓。",
+      "**对象集（正面定义 · t175 修正）**：一个「视图状态切换」= 激活后会改变「正在看什么」的控件，按**它扮演的角色**认定，**不按类名子串**（t142 的 [class*=resizer] 是前车之鉴 ✗）：① [role=tab]（页签）② **input[type=radio] 且包在可见 label 里**（antd Segmented）③ button[aria-pressed]（按下态按钮）④ select / [role=combobox]（antd Select）✓。**可见性按用户看得见的东西判**：radio 自己是 0×0（实测 input[type=radio] 在 #sessions 上**没有盒子**，而它的 label 约 40×28 ✓）⇒ **radio 用 label 的盒子判可见** ✓。",
+      "**状态指纹（t175）**：从 **ARIA 状态**读，**不读类名** ✓ —— 但**实测发现 antd 的 Segmented 根本不发 ARIA**：**每个 ant-segmented-item 的 aria-checked 都是 null** ✗ ⇒ **唯一诚实的来源是 radio 自己的 checked，名字来自它 label 的文字** ✓。**实测读数**：checked 掩码 10000 → 01000、fp1=全部 → fp2=dsh ✓。",
+      "**切换动作（实测唯一可行的一条）**：**点「未选中 radio 的 label」** ✓ —— **点 input 本身无效** ✗、**点已选中项的 label 也无效** ✗（我第一版就踩了这个：ARIA 判据在全是 null 时把第一项当「未激活」⇒ 点了已选中项 ⇒ hash 不变 ⇒ 假红 ✗）。**实测效果**：#sessions → #sessions?src=dsh ✓。",      "**MASTER §12 行 58（出处 = verifier t148）**：**URL 必须随「视图状态」变化，且可回放** —— 逐条切换视图状态 ⇒ **location.hash 必须变化** ∧ **用变化后的 URL 重新加载 ⇒ 落到同一视图状态** ✓。",
       "**对象集（正面定义，来自契约）**：① **路由**（已实现）② **改变「正在看什么」的页签 / 模式** ③ **改变「看的是哪一个对象」的选中项** ✓；**明确排除**：**滚动位置 / 悬停 / 输入焦点 / 未提交的输入**（**瞬时 UI 状态，不属于「视图状态」** ✓ —— 理由：**会污染历史栈，且用户不会分享它** ✓）。**本单只实装 ②**（契约把架构改动分两步：**先做「页签/模式进 URL」**，**选中项进 URL 另议** ✓）。",
       "**阈值来源 = 裁决** ✓。**与既有行的关系（对象不同 ⇒ 不合并也不重复）**：**行 56 = title 的标识性与唯一性** · **行 57 = 导航项的语义与目标** · **本行 = URL 与视图状态的一致性** ⇒ 对象不同 ✓。",
       "**空集语义**：**该路由没有可切换的视图状态（页签/模式）⇒ not_measured 并点名原因** ✓（不得静默 PASS ✓）。**反向证据（构造）**：**hash 变了但回放不到同一状态 ⇒ FAIL** ✓ —— 否则本行会退化成「只要 URL 里有 # 就算过」✗。",
@@ -6957,6 +7059,14 @@ function runSelfTest() {
     NAV_ROUTE_COUNT, ROUTES.filter((r) => !r.needsTaskId).length);
   // Row 58: the constructed reverse evidence the contract asks for -- the hash
   // moves but the URL does not restore the state.
+  // t175: the empty-set reason must NAME the object set. Without that, "the
+  // probe looked for the wrong thing" and "this route has no view state" are
+  // the same string, and the first one is invisible -- which is how #sessions
+  // stayed not_measured while the feature was implemented and replayable.
+  check("row58: the not_measured reason NAMES the object set it looked for",
+    /role=tab/.test(urlStateVerdict({ tabs: 0, hash1: "#a" }).why || "") && /role=combobox/.test(urlStateVerdict({ tabs: 0, hash1: "#a" }).why || ""), true);
+  check("row58 must-not-PASS: a view state the probe cannot recognise is not_measured, never pass",
+    urlStateVerdict({ tabs: 0, hash1: "#a", hash2: null }).pass === null, true);
   check("row58 must-FAIL: hash changed but replay lands on a DIFFERENT state",
     urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions?src=x", fp1: "全部", fp2: "我发的", fp3: "全部" }).pass, false);
   check("row58 must-FAIL: the hash does not change at all",
