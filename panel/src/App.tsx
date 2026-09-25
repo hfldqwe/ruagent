@@ -283,23 +283,21 @@ function Shell() {
     return () => window.removeEventListener("hashchange", apply);
   }, []);
 
-  // t169: once the app has painted, warm every route chunk at idle, so the
-  // FIRST click on a route costs the same as a revisit (measured 320ms -> ~30ms
-  // on the hover/focus path, and the idle pass covers a touch user, who never
-  // hovers). requestIdleCallback is not universal, hence the timer fallback.
-  useEffect(() => {
-    const keys = Object.keys(load) as (keyof typeof load)[];
-    const idle: (fn: () => void) => number =
-      typeof window.requestIdleCallback === "function"
-        ? (fn) => window.requestIdleCallback(fn)
-        : (fn) => window.setTimeout(fn, 300);
-    const cancel: (h: number) => void =
-      typeof window.cancelIdleCallback === "function"
-        ? (h) => window.cancelIdleCallback(h)
-        : (h) => window.clearTimeout(h);
-    const h = idle(() => keys.forEach((k) => warm(k)));
-    return () => cancel(h);
-  }, []);
+  // t214: there is deliberately NO idle "warm every route" pass here.
+  //
+  // t169 added one so the first click on a route would cost what a revisit
+  // costs. It worked, and it also made the route split cosmetic: measured on
+  // the built panel, every one of the 13 routes fetched 16 chunks / 1452KB
+  // within 2.5s of load — all 12 route chunks plus lazy-markdown, none of
+  // them needed by the route on screen. Row 27's structural assertion ② is
+  // that a route chunk is taken by the route that needs it; a fetch-everything
+  // pass is exactly what makes that false.
+  //
+  // The latency t169 was buying is kept, at INTENT instead of at idle: hover
+  // and focus (below) cover mouse and keyboard, and pointerdown covers touch —
+  // the one case the idle pass existed for. A touch user's pointerdown lands
+  // before the click resolves, so the fetch is in flight on the same path; a
+  // route nobody points at is never fetched.
 
   // Row 58's other half: the query is route state, and a view is a separate
   // chunk that must not import the shell (that would pull the shell into the
@@ -380,12 +378,16 @@ function Shell() {
   // t169: hovering or focusing a nav item warms its chunk. The anchor covers
   // the whole item (antd gives a menu link a full-bleed ::before), so hovering
   // anywhere in the row — not just the 28px label — is an intent signal.
+  // t214: pointerdown is the third intent signal, and the one that keeps the
+  // touch case the idle pass used to cover — without fetching routes nobody
+  // asked for.
   const link = (key: string, text: ReactNode) => (
     <a
       className="nav-link"
       href={`#${key}`}
       onMouseEnter={() => warm(key as keyof typeof load)}
       onFocus={() => warm(key as keyof typeof load)}
+      onPointerDown={() => warm(key as keyof typeof load)}
     >
       {text}
     </a>
