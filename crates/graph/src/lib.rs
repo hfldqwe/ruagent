@@ -131,6 +131,38 @@ pub async fn current_facts(db: &Db, entity: i64) -> Result<Vec<Edge>, DbError> {
     .map_err(DbError::from)
 }
 
+/// Every currently-valid edge, in one request.
+///
+/// The per-entity queries above answer "what do I know about X" one entity at a
+/// time; a canvas that draws the graph needs all of them at once, and asking per
+/// node is N+1 (design §12 row 39: K=1 ⇒ R<=4). Bounded by `limit`/`offset` and
+/// returning the total, so a large graph is PAGED rather than pulled whole --
+/// the reason this is not just `SELECT *`.
+pub async fn list_edges(db: &Db, limit: u32, offset: u32) -> Result<(Vec<Edge>, i64), DbError> {
+    let limit = limit as i64;
+    let offset = offset as i64;
+    db.call(move |conn| -> Result<(Vec<Edge>, i64), rusqlite::Error> {
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entity_edges WHERE invalid_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, src, dst, relation, fact_text, valid_at, invalid_at, source_episode
+             FROM entity_edges
+             WHERE invalid_at IS NULL
+             ORDER BY id
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit, offset], edge_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((rows, total))
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
 /// "What was true as of X" — the bi-temporal payoff (design §6.6 #1).
 pub async fn facts_as_of(db: &Db, entity: i64, at: &str) -> Result<Vec<Edge>, DbError> {
     let at = at.to_string();

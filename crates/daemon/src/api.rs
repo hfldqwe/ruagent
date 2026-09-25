@@ -47,6 +47,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/skills", get(list_skills))
         .route("/api/v1/skills/sync", post(sync_skills))
         .route("/api/v1/graph/entities", get(graph_entities))
+        // Batch edges: the whole graph in ONE request (row 39: K=1 ⇒ R<=4).
+        .route("/api/v1/graph/edges", get(graph_edges))
         .route("/api/v1/graph/search", get(graph_search))
         .route("/api/v1/graph/entity", post(graph_create_entity))
         .route("/api/v1/graph/fact", post(graph_add_fact))
@@ -658,6 +660,33 @@ async fn graph_entities(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let entities = ruagent_graph::list_entities(state.mgr.db(), q.limit.unwrap_or(50)).await?;
     Ok(Json(serde_json::json!({ "entities": entities })))
+}
+
+/// The whole edge list in ONE request. A canvas that draws the graph must not
+/// fan out one request per node (design §12 row 39: K=1 ⇒ R<=4), so the edges
+/// come back together -- bounded by limit/offset with the total, so a large
+/// graph is paged instead of pulled whole.
+async fn graph_edges(
+    State(state): State<AppState>,
+    Query(q): Query<EdgeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = q.limit.unwrap_or(500).min(5_000);
+    let offset = q.offset.unwrap_or(0);
+    let (edges, total) = ruagent_graph::list_edges(state.mgr.db(), limit, offset).await?;
+    Ok(Json(serde_json::json!({
+        "edges": edges,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+#[derive(Deserialize)]
+struct EdgeQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
 }
 
 async fn graph_search(
