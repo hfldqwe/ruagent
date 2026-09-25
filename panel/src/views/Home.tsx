@@ -16,7 +16,7 @@ import { useI18n } from "../i18n";
 import { ErrorState, ReadoutStrip, RelTime, Spinner } from "../ui";
 import { Icon, type IconName } from "../icons";
 import { SOURCE_LABEL, msToIso, sourceHue } from "./Sessions";
-import { CreateTaskModal } from "./Board";
+import { CreateTaskModal } from "./CreateTaskModal";
 
 /** `null` = the endpoint did not answer. It is never coerced to 0. */
 type Maybe<T> = T | null;

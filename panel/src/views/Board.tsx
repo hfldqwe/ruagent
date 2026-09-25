@@ -17,14 +17,13 @@
 //     「失败」 with no reason is not a diagnosis.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Input, Segmented } from "antd";
+import { Button, Segmented } from "antd";
 import { api, type Run, type Task } from "../api";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
 import {
   Empty,
   ErrorState,
-  Modal,
   ReadoutStrip,
   RelTime,
   Spinner,
@@ -32,6 +31,14 @@ import {
   StatusPill,
   useToast,
 } from "../ui";
+
+// t219: the modal now lives in its own module. Home renders it too, and Home's
+// static import of Board made #home fetch this whole chunk (measured 7KB
+// fetched, 96% of it unused on that route). The re-export keeps App's lazy
+// createTask import — import("./views/Board").then((m) => m.CreateTaskModal) —
+// working unchanged, so App.tsx is untouched.
+import { CreateTaskModal } from "./CreateTaskModal";
+export { CreateTaskModal };
 
 const COLUMNS = ["pending", "in_progress", "blocked", "done"] as const;
 type Column = (typeof COLUMNS)[number];
@@ -453,72 +460,5 @@ function RunPeek({ task }: { task: Task }) {
         </div>
       ) : null}
     </div>
-  );
-}
-
-export function CreateTaskModal({
-  onClose,
-  onCreated,
-}: {
-  onClose: () => void;
-  onCreated: (id: string) => void;
-}) {
-  const { t } = useI18n();
-  const [title, setTitle] = useState("");
-  const [intent, setIntent] = useState("");
-  const [project, setProject] = useState("");
-  const [busy, setBusy] = useState(false);
-  const toast = useToast();
-  const create = async () => {
-    if (!title.trim() || busy) return;
-    setBusy(true);
-    try {
-      const task = await api.createTask(
-        title.trim(),
-        intent.trim() || title.trim(),
-        project.trim() || undefined,
-      );
-      toast("ok", t("newtask.created"));
-      onCreated(task.id);
-    } catch (e) {
-      toast("err", String(e));
-      setBusy(false);
-    }
-  };
-  return (
-    <Modal title={t("newtask.title")} onClose={onClose}>
-      <label className="field">
-        <span>{t("newtask.titleLabel")}</span>
-        <Input
-          autoFocus
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          onPressEnter={create}
-          placeholder={t("newtask.titlePh")}
-        />
-      </label>
-      <label className="field">
-        <span>{t("newtask.intentLabel")}</span>
-        <Input.TextArea
-          rows={4}
-          value={intent}
-          onChange={(e) => setIntent(e.target.value)}
-          placeholder={t("newtask.intentPh")}
-        />
-      </label>
-      <label className="field">
-        <span>{t("newtask.projectLabel")}</span>
-        <Input
-          value={project}
-          onChange={(e) => setProject(e.target.value)}
-          placeholder="ruagent…"
-        />
-      </label>
-      <div className="row end">
-        <Button type="primary" loading={busy} disabled={!title.trim()} onClick={create}>
-          {t("common.create")}
-        </Button>
-      </div>
-    </Modal>
   );
 }
