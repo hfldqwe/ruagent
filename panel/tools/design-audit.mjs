@@ -2778,62 +2778,63 @@ function urlStateVerdict(o) {
   return { measured: true, changed, replayed, hash1: o.hash1, hash2: o.hash2, fp2: o.fp2, fp3: o.fp3, pass: changed && replayed };
 }
 
-// Row 59: the nine graph category colours, read out of index.css. The contract
-// fixes the pair set (9 choose 2 = 36) x 3 CVD types and the two conventions.
-function loadCategoryColors(cssPath) {
-  const out = [];
+// Row 59: the nine graph category colours PER MODE, read out of index.css.
+//
+// t172: the old reader took the FIRST definition of each name across the whole
+// file. index.css defines the tokens TWICE -- once under html[data-mode="dark"]
+// and once under html[data-mode="light"] -- so "the first of each name" is
+// "the dark block", and the two blocks never mixed. What DID mix, before the
+// dedupe was added, was the pairing: 18 colours made 153 pairs, and a pair that
+// spans the two modes compares a dark colour against a light one. Measured:
+// that is where the min dE 6.2 (concept <-> product, protanopia) came from.
+// Each mode ALONE has min 12.22 (dark) / 10.27 (light) -- both above the floor.
+//
+// So the object set is now defined POSITIVELY as "the nine category colours of
+// ONE mode", taken from the block that mode opens. A mode whose block yields
+// anything other than nine is not measured, because a short list would silently
+// shrink the pair set (36 pairs) into a different criterion.
+const GRAPH_MODE_OPENERS = {
+  dark: /^\s*html\[data-mode="dark"\]/,
+  light: /^\s*html\[data-mode="light"\]/,
+};
+function loadCategoryColorsByMode(cssPath) {
+  const out = { dark: [], light: [] };
   let text = "";
   try {
     text = readFileSync(cssPath, "utf8");
   } catch {
     return out;
   }
-  const re = /--graph-([a-z0-9-]+):\s*([^;]+);/g;
-  // The stylesheet defines the category tokens TWICE (the default block and the
-  // dark block). The contract's object set is NINE category colours, so the
-  // FIRST definition of each name is taken -- reading both would give 18 colours
-  // and 153 pairs instead of 36, i.e. a different criterion measured on a
-  // different set. (Measured: 24 --graph-* declarations = 2 blocks x 12.)
-  const seen = new Set();
-  for (const m of text.matchAll(re)) {
-    const name = m[1];
-    // edge/edge-hi/label are not category colours -- they are the edge stroke
-    // and the label ink (rows 31/33 cover those).
+  const re = /--graph-([a-z0-9-]+):\s*([^;]+);/;    // NO /g here: with the global flag String.match returns only full matches and drops the capture groups, which made d[2] undefined.
+  let mode = null;
+  for (const line of text.split(/\r?\n/)) {
+    for (const m of Object.keys(GRAPH_MODE_OPENERS)) if (GRAPH_MODE_OPENERS[m].test(line)) mode = m;
+    const d = line.match(re);
+    if (!d || !mode) continue;
+    const name = d[1];
+    // edge/edge-hi/label are the edge stroke and the label ink (rows 31/33).
     if (name === "edge" || name === "edge-hi" || name === "label") continue;
-    if (seen.has(name)) continue;
-    seen.add(name);
-    out.push({ name, value: m[2].trim() });
+    out[mode].push({ name, value: d[2].trim() });
   }
   return out;
 }
-
 // ── awaitReady: the ONE readiness wait, reusable at every navigation ────────
 //
 // t150 put a readiness gate in front of the capture and it was correct -- but
 // it was written INSIDE probeFailureState, so out.ready never reached the
-// capture record and the "never reached the ready signal" warning never
-// reached the capture's warnings. That is why the warning count was always 0:
-// the gate was not on the capture path at all. (Found by reading the count,
-// not by reading the code -- self-test stayed 459/459 green throughout.)
+// capture record and the warning never reached the capture's warnings.
 //
-// The capture also reuses ONE page, and each probe below does its own
-// page.goto / setViewportSize. A gate at the top of the capture cannot cover
-// them: after a probe navigates, the page is unrendered again and the next
-// judge reads an empty set. So the wait is a function, and every navigation
-// calls it.
-//
-// The signal is the app shell mounted AND the view's heading rendered. The
-// bounded poll is the mechanism; the short settle after it is layout only.
+// The capture also reuses ONE page, and each probe does its own page.goto /
+// setViewportSize. A gate at the top of the capture cannot cover them: after a
+// probe navigates, the page is unrendered again and the next judge reads an
+// empty set. So the wait is a function, and every navigation calls it.
 const READY_TIMEOUT_MS = 15_000;
-// ONE budget per capture, shared by every awaitReady call in it.
-//
-// Per-call timeouts do not bound anything: with 16 call sites a permanently
-// unready page burns 16 x 15s = 240s per capture and the run has to be killed
-// (measured: a 2-capture run hit a 260s timeout). A shared budget bounds the
-// WORST CASE per capture, which is the thing that has to be bounded. 20s is
-// chosen as: comfortably more than the slowest observed single wait (756ms in
-// t150's 72-capture sample) plus room for every probe's own navigation, and
-// small enough that even 13 routes x 2 modes stay inside a normal run.
+// ONE budget per capture, shared by every awaitReady call in it. Per-call
+// timeouts do not bound anything: with 16 call sites a permanently unready
+// page burns 16 x 15s per capture. Measured: 2 captures then finish in 70s
+// instead of being killed at 260s. 20s is comfortably more than the slowest
+// observed single wait (756ms over t150's 72-capture sample) plus room for
+// every probe's own navigation, and small enough for a full 26-capture run.
 const READY_BUDGET_MS = 20_000;
 let readyBudgetLeft = READY_BUDGET_MS;
 function resetReadyBudget() {
@@ -2843,12 +2844,9 @@ function resetReadyBudget() {
 // The app shell is the constant; the heading is not. probeFailureState puts the
 // app into a deliberate FAILURE state, where a view may legitimately render its
 // error surface without an h1 -- waiting for a heading there burns the whole
-// timeout and lets the state move on before the retry click, which is how row 20
-// came to flicker between runs. The signal has to match what the state is
-// allowed to look like.
+// timeout and lets the state move on before the retry click.
 async function awaitReady(page, label, opts) {
   const requireH1 = !opts || opts.requireH1 !== false;
-  // Never wait longer than what is left of THIS capture's budget.
   const limit = Math.max(0, Math.min(READY_TIMEOUT_MS, readyBudgetLeft));
   const t0 = Date.now();
   let ready = false;
@@ -2868,8 +2866,6 @@ async function awaitReady(page, label, opts) {
     if (Date.now() - t0 > limit) break;
     await page.waitForTimeout(100);
   }
-  // Layout settle only. The signal above is the mechanism; this is not a
-  // substitute for it, and it is NOT how readiness is decided.
   readyBudgetLeft -= Date.now() - t0;
   if (ready) await page.waitForTimeout(300);
   return { ready, readyMs, label };
@@ -4730,14 +4726,29 @@ const CHECKS = [
       "**空集语义**：**类别色解析不出来 / 少于 9 个 ⇒ not_measured 并点名原因** ✓（**配对集会比契约的小 ⇒ 不得当作「问题变小了」** ✗）。**反向证据（构造）**：**一对类别色 ΔE < 10 ⇒ FAIL** ✓ —— 否则本行会退化成「配色看着还行」✗。",
     ].join("\n"),
     judge: (c, l) => {
-      const colors = loadCategoryColors(new URL("../src/index.css", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
-      const v = cvdPairVerdict(colors, l.floor, 9);
+      const cssPath = new URL("../src/index.css", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+      const byMode = loadCategoryColorsByMode(cssPath);
+      // EACH MODE IS JUDGED ON ITS OWN PAIRS. Pooling the two blocks is what
+      // produced the 6.2 reading: it compared dark colours against light ones.
+      const parts = {};
+      for (const m of Object.keys(byMode)) parts[m] = cvdPairVerdict(byMode[m], l.floor, 9);
+      const bad = Object.keys(parts).filter((m) => parts[m].measured && !parts[m].pass);
+      const unmeasured = Object.keys(parts).filter((m) => !parts[m].measured);
+      const v = { measured: unmeasured.length === 0, pass: null, parts, bad, unmeasured };
+      if (unmeasured.length) {
+        v.why = unmeasured.map((m) => m + ": " + parts[m].why).join(" | ");
+        return { display: "— not_measured：" + v.why, pass: null, detail: v };
+      }
+      v.pass = bad.length === 0;
+      const vv = (m) => m + " 最差 " + parts[m].min + "（" + parts[m].minAt + "，" + parts[m].pairs + " 组合，余量 " + (Math.round((parts[m].min - l.floor) * 100) / 100) + "）";
+      const v0 = null;
       if (!v.measured) return { display: "— not_measured：" + v.why, pass: null };
       return {
         display:
-          v.colors + " 个类别色 · " + v.pairs + " 个（配对×CVD）组合 · 最小 ΔE " + v.min + "（阈值 ≥" + l.floor + "）" +
-          (v.minAt ? " 于 " + v.minAt : "") +
-          (v.bad.length ? " · 低于阈值 " + v.bad.length + " 组" : "") +
+          Object.keys(parts).map(vv).join(" · ") +
+          (bad.length
+            ? " · 低于阈值：" + bad.map((m) => m + " " + parts[m].bad.length + " 组（" + parts[m].bad.slice(0, 2).map((x) => x.a + "↔" + x.b + "/" + x.type + "=" + x.d).join("，") + "）").join("；")
+            : "") +
           (v.pass ? " ✓" : " ✗"),
         pass: v.pass,
         detail: v,
