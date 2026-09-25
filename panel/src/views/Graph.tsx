@@ -13,6 +13,11 @@ import { useThemeMode } from "../theme";
 
 /** Over this the canvas only renders the most-connected nodes. */
 const MAX_NODES = 150;
+/** t191: how many edges the view asks for. The endpoint accepts up to 5000,
+ *  but the contract caps drawn density at 600 (views/view-graph.md) and its
+ *  remedy past the cap is the valid_at window — so the ceiling the view obeys
+ *  is the contract's, not the endpoint's. */
+const EDGE_LIMIT = 600;
 /** §4 density ceilings for the inspector — a hub entity can have hundreds. */
 const FACTS_CAP = 100;
 const NEIGHBORS_CAP = 50;
@@ -237,9 +242,15 @@ export function Graph() {
   const { mode: theme } = useThemeMode();
   const [mode, setMode] = useState<"graph" | "list">("graph");
   const [entities, setEntities] = useState<[GraphEntity, number][] | null>(null);
+  /** t191: the whole live edge list, in one batch request. Without it the
+   *  default view was a point cloud — edges only appeared once you picked a
+   *  node, which is the regression the user reported. */
+  const [allEdges, setAllEdges] = useState<GraphEdge[] | null>(null);
+  /** How many edges the daemon has in total (the request may be capped). */
+  const [edgesTotal, setEdgesTotal] = useState<number | null>(null);
   /** Facts of the entity the inspector is showing, handed up by the
    *  inspector itself (it already fetches them) — the canvas draws their
-   *  edges. */
+   *  edges, highlighted. */
   const [focusFacts, setFocusFacts] = useState<GraphEdge[]>([]);
   const [query, setQuery] = useState("");
   const [hitIds, setHitIds] = useState<Set<number> | null>(null);
@@ -251,14 +262,20 @@ export function Graph() {
 
   // F2: `/graph/entity/<id>` is a per-entity endpoint, so prefetching the
   // facts of every rendered node was an N+1 — 55 requests on the first
-  // screen (the burst the audit's row 28 catches). The canvas now draws the
-  // neighbourhood of the entity you pick, from the facts the inspector has
-  // already fetched, and the first screen costs exactly one graph request.
+  // screen (the burst the audit's row 28 catches). The first screen now costs
+  // exactly TWO batch requests (entities + edges, row 39: K=2 ⇒ R≤6), and the
+  // inspector's own facts still come from its one request when you pick a
+  // node.
+  //
+  // t191: the edges are fetched with `EDGE_LIMIT`, never the endpoint's own
+  // maximum of 5000 — the contract caps density at 600 edges and its remedy
+  // past the cap is the valid_at window, not a bigger request.
   const refresh = () => {
-    api
-      .graphEntitiesAll()
-      .then((ents) => {
+    Promise.all([api.graphEntitiesAll(), api.graphEdges(EDGE_LIMIT)])
+      .then(([ents, edgesRes]) => {
         setEntities(ents);
+        setAllEdges(edgesRes.edges);
+        setEdgesTotal(edgesRes.total);
         setErr(null);
       })
       // 行 20: the old catch emptied the list, so a broken daemon rendered
@@ -279,8 +296,8 @@ export function Graph() {
     refresh();
   }, []);
 
-  // A new selection (or none) starts with no edges — the inspector's own
-  // request fills them in when it lands.
+  // A new selection drops the previous highlight; the batch edges stay on the
+  // canvas (t191), so the graph never returns to being a point cloud.
   useEffect(() => {
     setFocusFacts([]);
   }, [selected?.id]);
@@ -296,21 +313,31 @@ export function Graph() {
     [entities],
   );
 
-  /** Edges are the selected entity's facts, filtered to nodes that are on
-   *  the canvas and deduped by id (the endpoint already drops invalidated
-   *  facts). Nothing is fetched here. */
+  /** The lines the canvas draws: every live edge in one batch, plus the
+   *  selected entity's own facts (the highlight layer), filtered to nodes
+   *  that are on the canvas.
+   *
+   *  Dedupe is by UNORDERED PAIR, not by edge id: several relations between
+   *  the same two entities are separate facts, but they are the same line —
+   *  keying by id drew them on top of each other and the overlap read as one
+   *  thicker stroke. Nothing is lost from the data: the inspector lists every
+   *  fact, and the canvas is a topology view, so one line per pair is the
+   *  honest drawing. */
   const edges = useMemo(() => {
     const ids = new Set(rendered.map(([e]) => e.id));
-    const seen = new Set<number>();
+    const seen = new Set<string>();
     const out: GraphEdge[] = [];
-    for (const f of focusFacts) {
-      if (!seen.has(f.id) && ids.has(f.src) && ids.has(f.dst)) {
-        seen.add(f.id);
-        out.push(f);
-      }
-    }
+    const add = (e: GraphEdge) => {
+      if (!ids.has(e.src) || !ids.has(e.dst)) return;
+      const key = e.src < e.dst ? `${e.src}:${e.dst}` : `${e.dst}:${e.src}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(e);
+    };
+    for (const e of allEdges ?? []) add(e);
+    for (const f of focusFacts) add(f);
     return out;
-  }, [focusFacts, rendered]);
+  }, [allEdges, focusFacts, rendered]);
 
   const search = async () => {
     if (!query.trim()) {
@@ -435,6 +462,7 @@ export function Graph() {
                 <GraphCanvas
                   entities={rendered}
                   edges={edges}
+                  edgesTotal={edgesTotal}
                   selectedId={selected?.id ?? null}
                   hitIds={hitIds}
                   theme={theme}
@@ -629,6 +657,7 @@ function readPalette(el: HTMLElement): Record<string, string> {
 function GraphCanvas({
   entities,
   edges,
+  edgesTotal,
   selectedId,
   hitIds,
   theme,
@@ -637,6 +666,10 @@ function GraphCanvas({
 }: {
   entities: [GraphEntity, number][];
   edges: GraphEdge[];
+  /** t191: how many edges the daemon has in total — the canvas may be
+   *  showing fewer because the view asks for at most EDGE_LIMIT. Published
+   *  on the dev-only debug hook so a reading can tell drawn from total. */
+  edgesTotal: number | null;
   selectedId: number | null;
   hitIds: Set<number> | null;
   theme: string;
@@ -1138,7 +1171,12 @@ function GraphCanvas({
 
     const debug = {
       nodeCount: s.nodes.length,
+      /** Lines actually drawn (after the unordered-pair dedupe). */
       edgeCount: s.edges.length,
+      /** t191: how many edges exist in total, and the ceiling the view asked
+       *  for — the endpoint allows 5000, the contract caps density at 600. */
+      edgesTotal,
+      edgeLimit: EDGE_LIMIT,
       get selectedId() {
         return propsRef.current.selectedId;
       },

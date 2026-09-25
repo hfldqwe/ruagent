@@ -54,6 +54,23 @@ function outcomeKey(outcome: string): string {
   return `memory.outcome.${variant.charAt(0).toLowerCase()}${variant.slice(1)}`;
 }
 
+/* MASTER §12 row 58 — the URL carries the view state, the same shape
+   SessionsView / Knowledge / Board use. App.parseHash splits "route[?query]"
+   before matching the path, so a suffix reaches this view. */
+function routeQuery(): URLSearchParams {
+  const h = window.location.hash.replace(/^#/, "");
+  const i = h.indexOf("?");
+  return new URLSearchParams(i >= 0 ? h.slice(i + 1) : "");
+}
+
+/** Whitelist over ALL THREE values: an unknown one falls back to the default
+ *  rather than reaching the Segmented, which would render with nothing
+ *  selected. */
+function readTab(): "browse" | "recall" | "audit" {
+  const v = routeQuery().get("tab");
+  return v === "recall" || v === "audit" ? v : "browse";
+}
+
 export function Memory() {
   const { t } = useI18n();
   const [counts, setCounts] = useState<[string, string, number][] | null>(null);
@@ -62,7 +79,35 @@ export function Memory() {
   const [memories, setMemories] = useState<MemoryRow[] | null>(null);
   const [memError, setMemError] = useState(false);
   const [writing, setWriting] = useState(false);
-  const [tab, setTab] = useState<"browse" | "recall" | "audit">("browse");
+  const [tab, setTab] = useState<"browse" | "recall" | "audit">(readTab);
+
+  /* Row 58, both directions (idempotent write; "browse" is the default so the
+     plain "#memory" stays clean; replaceState fires no hashchange, so the two
+     effects cannot loop). Only the tab is written: the store and namespace
+     controls are filters INSIDE browse, and the capture set is ②/③ — a tab or
+     mode that changes what you are looking at — not filters. */
+  useEffect(() => {
+    const loc = window.location;
+    const h = loc.hash.replace(/^#/, "");
+    if (h !== "memory" && !h.startsWith("memory?")) return;
+    const p = new URLSearchParams();
+    if (tab !== "browse") p.set("tab", tab);
+    const qs = p.toString();
+    const next = loc.pathname + loc.search + "#memory" + (qs ? "?" + qs : "");
+    if (loc.pathname + loc.search + loc.hash !== next) {
+      window.history.replaceState(window.history.state, "", next);
+    }
+  }, [tab]);
+
+  useEffect(() => {
+    const apply = () => {
+      const h = window.location.hash.replace(/^#/, "");
+      if (h !== "memory" && !h.startsWith("memory?")) return;
+      setTab(readTab());
+    };
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
 
   const refresh = useCallback(() => {
     api

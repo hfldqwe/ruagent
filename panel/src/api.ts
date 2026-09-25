@@ -664,6 +664,16 @@ export const api = {
   // graph
   graphEntities: () =>
     get<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities").then((r) => r.entities),
+  /** t191: every live edge in ONE request, so the default graph is a graph
+   * and not a point cloud. `limit` is deliberately pinned to the contract's
+   * density ceiling (views/view-graph.md: ≤600 edges) rather than the
+   * endpoint's own maximum of 5000 — the endpoint allowing more is not a
+   * reason to draw more, and past the ceiling the contract's remedy is to
+   * narrow to the valid_at window, not to widen the request. */
+  graphEdges: (limit = 600) =>
+    get<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
+      `/api/v1/graph/edges?limit=${limit}`,
+    ),
   /** The whole entity list (graphEntities caps at the daemon default of 50). */
   graphEntitiesAll: (limit = 500) =>
     get<{ entities: [GraphEntity, number][] }>(`/api/v1/graph/entities?limit=${limit}`).then(

@@ -41,11 +41,55 @@ const isColumn = (s: string): s is Column => (COLUMNS as readonly string[]).incl
 const CARD_CAP = 200;
 const LANE_CAP = 20;
 
+/* MASTER §12 row 58 — the URL carries the view state, exactly the way
+   SessionsView and Knowledge do it. App.parseHash already splits
+   "route[?query]" before matching the path, so a suffix reaches this view
+   instead of falling through to the fallback. */
+function routeQuery(): URLSearchParams {
+  const h = window.location.hash.replace(/^#/, "");
+  const i = h.indexOf("?");
+  return new URLSearchParams(i >= 0 ? h.slice(i + 1) : "");
+}
+
+/** Only the two documented values; anything else falls back to the default. */
+function readView(): string {
+  return routeQuery().get("view") === "list" ? "list" : "board";
+}
+
 export function Board({ onOpen }: { onOpen: (id: string) => void }) {
   const { t } = useI18n();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [err, setErr] = useState<unknown>(null);
-  const [view, setView] = useState<string>("board");
+  const [view, setView] = useState<string>(readView);
+
+  /* Row 58, both directions. The comparison keeps the write idempotent (an
+     already-correct URL writes nothing), "board" is the default so a plain
+     "#board" stays clean, and replaceState fires no hashchange so these two
+     effects cannot loop with each other. */
+  useEffect(() => {
+    const loc = window.location;
+    const h = loc.hash.replace(/^#/, "");
+    // Never rewrite another route's hash: while this page is leaving, the hash
+    // already points elsewhere and a write here would drag it back.
+    if (h !== "board" && !h.startsWith("board?")) return;
+    const p = new URLSearchParams();
+    if (view !== "board") p.set("view", view);
+    const qs = p.toString();
+    const next = loc.pathname + loc.search + "#board" + (qs ? "?" + qs : "");
+    if (loc.pathname + loc.search + loc.hash !== next) {
+      window.history.replaceState(window.history.state, "", next);
+    }
+  }, [view]);
+
+  useEffect(() => {
+    const apply = () => {
+      const h = window.location.hash.replace(/^#/, "");
+      if (h !== "board" && !h.startsWith("board?")) return;
+      setView(readView());
+    };
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
   const [creating, setCreating] = useState(false);
   const lanes = useRef<Record<string, HTMLDivElement | null>>({});
 
