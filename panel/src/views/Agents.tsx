@@ -207,7 +207,27 @@ export function Agents() {
                       {t("agents.runtime")} · {a.harness}
                     </div>
                   </div>
-                  <span className="grow" />
+                </div>
+                {/* t180 (attempt 2): the chips used to end the header row behind
+                    a .grow spacer, so their left edge was the SUM of their own
+                    text widths and the wrap point moved with the copy. Measured
+                    pre-fix, card-relative: the runtime chip's x was 196.3 / 216
+                    / 249 / 249.1 / 255.2 (58.9px spread) and the state chip fell
+                    to line 2 on architect and impl (y 127.9 -> 168.9, 41px line
+                    pitch) while the other five stayed on line 1 - so every block
+                    below the band started 41px lower on those two cards. That is
+                    the "labels differ per agent => the layout is not uniform" the
+                    user reported.
+
+                    The band is now its own row starting at the card's left edge
+                    and reserving two lines (.agent-chips), which is what makes
+                    the fields below it line up; the CHIP ORDER IS UNCHANGED
+                    (runtime -> portable -> state) because e2e/registry.spec.ts:46
+                    asserts a role card's first .tag is the runtime name, and the
+                    order is information, not decoration. Every chip still renders
+                    in full: a fixed-track grid was rejected because it would
+                    ellipsize a long runtime name, which is the t71 regression. */}
+                <div className="agent-chips">
                   {a.runtime ? <span className="tag">{a.runtime}</span> : null}
                   {(a.runtimes?.length ?? 0) > 1 ? (
                     <span className="tag">{t("agents.portable", { n: a.runtimes!.length })}</span>

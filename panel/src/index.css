@@ -68,8 +68,9 @@ html[data-mode="dark"] {
   /* The chip surface (status pills, tags): the shell tone recessed out of the
      panel, so a chip never competes with the accent and the variant color
      lives entirely in the text. Opaque on purpose - a translucent chip pulled
-     its backdrop into the contrast maths and fell to 4.42:1 on a selected row.
-     Worst case over all five statuses: 4.95:1 dark / 4.85:1 light. */
+     its backdrop into the contrast maths and dropped under the text bar on a
+     selected row. Readings: the audit's contrast rows, both modes (per t159 the
+     numbers live in the instrument, not in a comment). */
   --chip: #16191e;
   /* Official runtime brand colors, promoted to vars so inline styles
      (source dots) can reference them without a second palette. */
@@ -89,19 +90,22 @@ html[data-mode="dark"] {
   --ws-10: #c8877a;
   /* Categorical kind palette for the graph canvas (3:1+ on surface).
      t153: the nine kind colours were re-spread for colour-vision deficiency.
-     Measured before (Machado 2009 severity-1.0 simulation in linear RGB, CIE76
-     dE in Lab D65): the worst pair was person<->tool at dE 1.6 under
-     deuteranopia - effectively the same colour - and product<->protocol 4.3
-     under protanopia. Nine categories share one canvas, so the fix is to spread
-     them over BOTH hue and lightness: dichromats lose the red-green axis, and
-     lightness is the channel that survives. After (measured): the worst pair
-     over all 36 pairs x protanopia/deuteranopia/tritanopia is dE 12.6
-     (person<->repo protanopia 12.6, concept<->protocol 12.6, product<->protocol
-     deuteranopia 12.6), min normal-vision pair 22.5, min contrast vs the dark
-     canvas 5.27:1. Threshold dE >= 10 = the conventional "clearly different"
-     band for categorical colour, ~4x the CIE76 JND (~2.3); WCAG has no
-     colour-separation criterion of its own - 1.4.1 asks for a second channel,
-     which the canvas' node labels already provide. */
+     Nine categories share one canvas, so the fix is to spread them over BOTH
+     hue and lightness: dichromats lose the red-green axis, and lightness is the
+     channel that survives. Before the re-spread the worst pairs were
+     effectively the same colour (person<->tool under deuteranopia,
+     product<->protocol under protanopia).
+     Readings live in the instrument, not here (t159: values and readings are
+     owned by the implementation and the audit):
+       - audit row 59 = pairwise CVD separability. Threshold dE >= 10, the
+         conventional "clearly different" band for categorical colour, ~4x the
+         CIE76 JND (~2.3); the row pins the method (Machado 2009 severity-1.0
+         simulation in linear RGB, CIE76 dE in Lab D65) and the 36-pair x
+         three-CVD matrix.
+       - audit row 33 = each kind colour's non-text contrast against the canvas,
+         threshold >= 3:1, both modes.
+     WCAG has no colour-separation criterion of its own - 1.4.1 asks for a
+     second channel, which the canvas' node labels already provide. */
   --graph-person: #e47980;
   --graph-org: #9c8bf2;
   --graph-project: #34ced2;
@@ -111,8 +115,9 @@ html[data-mode="dark"] {
   --graph-product: #87c3ee;
   /* G4 / §3.1 I: was #ca9d33, the palette's only warm-yellow - it read as the
      signal ("running") in a view that has no such concept. Still non-warm; the
-     periwinkle it became was too close to --graph-org (dE 5.9 under
-     deuteranopia), so t153 pulled it toward blue and left --graph-org violet. */
+     periwinkle it became sat too close to --graph-org under deuteranopia, so
+     t153 pulled it toward blue and left --graph-org violet. That separation is
+     measured by audit row 59. */
   --graph-protocol: #8b9fe3;
   --graph-default: #838891;
   --graph-edge: rgba(255, 255, 255, 0.34);
@@ -126,19 +131,20 @@ html[data-mode="light"] {
   --panel-shadow: 0 0 0 1px var(--rule-soft), 0 1px 2px rgba(15, 20, 30, 0.05);
   --rule: #d6d9df;
   /* = B2 (borderSecondary) per MASTER §2.1 B4. t28 §12.7.1 moved B2 to #dee0e4
-     so the ring (--panel-shadow = 0 0 0 1px var(--rule-soft)) reaches 1.2330:1
-     on the canvas; this literal has to follow or the ring and the separators
-     stay at 1.1340 / 1.22. Dark is untouched (rgba(255, 255, 255, 0.07)). */
+     so the ring (--panel-shadow = 0 0 0 1px var(--rule-soft)) clears the
+     separator bar on the canvas; this literal has to follow or the ring and the
+     separators drop back under it. Dark is untouched
+     (rgba(255, 255, 255, 0.07)). Readings: the audit's contrast rows. */
   --rule-soft: #dee0e4;
-  --signal: #c88413;        /* fill grade: 3.10:1 on white */
-  --signal-text: #8a5600;   /* text grade: 6.16:1 on white */
+  --signal: #c88413;        /* fill grade: the non-text bar on white */
+  --signal-text: #8a5600;   /* text grade: the text bar on white */
   --signal-ink: #241703;
   --signal-wash: rgba(224, 160, 42, 0.16);
   --status-ok: #17793b;
   --status-err: #c4121c;
   --status-warn: #8a4a12;
   --status-idle: #656a73;
-  --control-border: #8a9198;  /* 3.19:1 on white */
+  --control-border: #8a9198;  /* form-control edge grade on white */
   --chip: #f1f2f4;            /* opaque chip for tags and status pills */
   --focus-ring: #8a5600;
   --brand-claude: #d97757;
@@ -156,11 +162,9 @@ html[data-mode="light"] {
   --ws-9: #6f7684;
   --ws-10: #906158;
   /* t153: same re-spread as the dark set (see the note above), darkened for the
-     light canvas. Measured after: worst pair over all 36 pairs x the three CVD
-     types is dE 10.7 (repo<->product tritanopia 10.7, concept<->product
-     deuteranopia 10.8, concept<->product protanopia 11.3), min normal pair
-     18.5, min contrast vs the light canvas 4.51:1 (it was 4.34:1, so this is
-     also an improvement). */
+     light canvas. Readings: audit row 59 (pairwise CVD separability) and audit
+     row 33 (non-text contrast against the canvas), both modes - the method and
+     the thresholds are in the note above. */
   --graph-person: #a74542;
   --graph-org: #5e56ab;
   --graph-project: #155265;
@@ -182,8 +186,9 @@ html[data-mode="light"] {
    no pin. */
 html[data-mode="dark"] .ruagent {
   --ant-color-primary: #f0a93b;
-  /* antd paints focus as 3px solid colorPrimaryBorder; pinning the token to
-     the ring voice turns its 1.73:1 ring into 9.18:1 with no !important. */
+  /* antd paints focus as 3px solid colorPrimaryBorder; that derived ring is
+     far under the focus-ring bar, so pinning the token to the ring voice fixes
+     it with no !important. Readings: the audit's focus rows (row 16). */
   --ant-color-primary-border: #f5b457;
   --ant-color-success: #4fb477;
   --ant-color-warning: #e2894f;
@@ -376,7 +381,8 @@ html[data-mode="light"] .ruagent {
 .conn.err { color: var(--ant-color-error); }
 .nav-badge {
   /* Waiting on you is the signal, not an error: white text on the error red
-     measured 3.20:1 at 11px, and a red badge put a second accent in the shell. */
+     fell under the text bar at 11px, and a red badge put a second accent in the
+     shell. Readings: the audit's contrast rows. */
   background: var(--signal);
   color: var(--signal-ink);
   font-size: 11px;
@@ -603,9 +609,10 @@ h3.sec {
 .card > .row-btn + .row-btn,
 .card > div + div > .row-btn { box-shadow: 0 -1px 0 0 var(--ant-color-border-secondary); }
 /* On a selected surface the secondary text steps up one grade: the muted
-   grades are calibrated against the panel (dark quaternary is 4.69:1 there,
-   only 3.29:1 on --surface-selected). A selected row is emphasized, so its
-   metadata should not be the quietest thing on screen. */
+   grades are calibrated against the panel, and against --surface-selected they
+   drop under the text bar. A selected row is emphasized, so its metadata
+   should not be the quietest thing on screen. Readings: the audit's contrast
+   rows. */
 .row-btn.selected .muted, .row-btn.selected .time, .row-btn.selected .mono,
 .cmdk-item.selected .muted, .kanban-card.selected .muted {
   color: var(--ant-color-text-secondary);
@@ -1147,6 +1154,21 @@ html[data-mode="light"] .tag.err { color: #c4121c; background: #f9e7e8; }
    overflow sideways; a chip longer than a whole row would still ellipsize -
    the documented bound. Nothing is hidden, truncated or clamped. */
 .agent-card .tag { flex: none; max-width: 100%; }
+/* t180: the chip band is its own row and reserves two lines. It has to be CSS,
+   not the view: reserving a band's height so the blocks below start at the same
+   y is not expressible from TSX without an inline style (row 12 forbids new
+   ones), and the wrap must stay a flow so a chip keeps its full text - a
+   fixed-track grid would ellipsize a long runtime name, which is exactly the
+   t71 regression. min-height mirrors the #runtimes band (.row.wrap, 62px) and
+   62px is the measured maximum here (2 lines at 390..1440). */
+.agent-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: flex-start;
+  min-height: 62px;
+  margin-top: 10px;
+}
 .agent-card .ant-card-body > .row { flex-wrap: wrap; }
 .agent-card > .ant-card-body > .tag { margin-bottom: 6px; }
 .agent-stats {
@@ -1971,8 +1993,9 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
    the row returns to its pre-t65 height and the hover background lines up with
    the row edges again. */
 .chat-session-row { padding: 0; }
-/* t76: row 41 - the .row-btn / first action button overlap (2.0 x 32.0) is
-   HORIZONTAL and comes from the bleed, not from width. .row-btn carries
+/* t76: row 41 - the .row-btn / first action button overlap is HORIZONTAL and
+   comes from the bleed, not from width (the audit prints the extent). .row-btn
+   carries
    margin: 0 -12px so its hover plate reaches into the container's padding; the
    chat rail's container has none, and the actions are siblings only 10px away
    (the .row flex gap), so the plate's right edge lands 2px PAST the first
