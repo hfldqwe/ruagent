@@ -392,8 +392,18 @@ pub async fn search_entities_loose(
             }
             Ok(())
         };
-        fts(&all, &mut out, &mut seen)?;
-        if out.is_empty() {
+        // An empty expression is not a query: FTS5 rejects MATCH '' with
+        // "fts5: syntax error near \"\"". The recall form comes out empty
+        // whenever EVERY term is below the recall floor (see
+        // ruagent_store::fts::MIN_RECALL_ASCII), so a two-letter query such as
+        // "v4" or "A2" would otherwise become a hard error instead of degrading
+        // to the LIKE stage below. The precision form is empty only for an
+        // empty term list, which the caller already rejected -- skipped anyway,
+        // because the rule is "never hand MATCH an empty pattern".
+        if !all.is_empty() {
+            fts(&all, &mut out, &mut seen)?;
+        }
+        if out.is_empty() && !any.is_empty() {
             fts(&any, &mut out, &mut seen)?;
         }
         for pat in likes {
