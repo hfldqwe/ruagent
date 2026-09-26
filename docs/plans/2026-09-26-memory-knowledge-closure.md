@@ -1736,3 +1736,27 @@ watch 的分支条件是 Test-Health（:138），不是身份
 **身份定义一处、三处共用**：`Get-DaemonIdentity` 返回 `Pid/ProcessExists/NameMatches/RootMatches/Ours` ⇒ `status` 打印它（并说明为什么不是 ours）· `stop` 用它拒绝 · `watch` 用它写日志 ✓ —— 与 7.86 的清理是同一份身份 ✓。
 
 （**已知未共用的一处**：`scripts/ruagent-canary.ps1` 有它自己的一套 root 匹配 ✓ —— 那条是我早先重写过的、当时是对的，但它现在**不是**从 `Get-DaemonIdentity` 来的 ⇒ 记在这里，免得下一个人以为「一份身份」已经覆盖全仓 ✓。）
+
+### 7.111 不要 dot-source 一个末尾是 switch ($Action) 的脚本（2026-09-26，mem-core）
+
+mem-core 拒绝了我提的「把 canary 接过去」的最省事形状 —— 而它的理由是硬的：
+
+```
+ruagent-daemon.ps1 末尾是 switch ($Action)
+⇒ dot-source 它 = 立刻执行一次 action（默认 status；若传参还可能 start / stop）✗✗
+⇒ 正确形状: 把 Get-DaemonIdentity / Get-NormalizedPath 抽到 scripts/lib/daemon-identity.ps1
+   两个脚本各 dot-source 那个 lib（它无副作用）
+```
+
+⇒ **规则：共享代码必须住在一个「被加载时不做任何事」的文件里。** 这与「一个模块不该在 import 时产生副作用」是同一条 —— 只不过 PowerShell 的 dot-source 把这件事变得更直接：**它执行文件。**
+
+**而它顺手在 canary 里找到两条真实缺陷**（`scripts/ruagent-canary.ps1:40-48` 的 `Get-CanaryProcess`，`:52` 直接 `Stop-Process`）：
+
+1. **没有 Name 过滤** ✗ —— 7.86 的收紧版要求「名字 + root」两条都要；只按命令行子串匹配会命中**任何**提到该 root 的进程，**包括把 root 当参数传的 shell**（正是 t336 里两个人各踩一次的形状）⇒ **canary 的 -Stop 可能杀掉一个只是提到该 root 的 shell** ✓（生产脚本里的真实风险，不是假设）；
+2. **没有规范化** ✗ —— 原样子串比较 ⇒ 命令行拼 C:/ 而参数拼 C:\ 匹配不上 ⇒ **正是 t340 刚量到的假阴**（拒绝停掉自己的 daemon）✓。
+
+⇒ **所以「把 canary 接过去」不是统一风格，而是关掉两条已经量过形状的缺陷** ✓ —— 这也是我批准它的理由（不是「一份身份」那个审美理由）。
+
+**而它给出的第三条验收值得单独记**：**同一 pid + 同一 root ⇒ 两个脚本给出同一个 Ours** ✓ —— 这是「一份身份」的**可机械复核形式**：不是「两个脚本都调用同一个函数」，而是「两个脚本对同一输入给同一判定」✓。
+
+**而 canary 那两处是队长早先重写过的**（当时它比「按进程名/端口批量杀」好，但缺了名字过滤与规范化）⇒ 这次是**对我自己那次改动的补正** ✓。
