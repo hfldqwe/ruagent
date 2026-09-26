@@ -209,6 +209,12 @@ export interface RecallResult {
     semantic_score?: number | null;
     keyword_rank?: number | null;
     keyword_score?: number | null;
+    /** t290/t311: how the keyword leg was built for THIS QUERY ("empty" when it
+     *  found nothing, else the stage). Measured: it is a query-level property,
+     *  not per-hit membership — a hit with legs ["semantic"] still reports
+     *  keyword_stage "precision". Read it as "what the keyword leg did", never
+     *  as "did this hit come from the keyword leg" (that is `legs`). */
+    keyword_stage?: string;
   }[];
   /** §13-2: generated wiki pages — a separate section, never mixed
    * into knowledge, always conservative stubs. */
@@ -1059,6 +1065,42 @@ export const api = {
    *  matches rows whose source IS NULL (rows written before the column existed).
    *  Omit it for the whole log. The envelope and the per-row source/source_label
    *  fields are asserted, shaped from api.rs's recall_log handler. */
+  /** t290/t311: the knowledge-only search, WITH the per-leg evidence it now
+   *  carries. Measured live: its hit keys are the SAME 13 the recall knowledge
+   *  hit has (both now include keyword_stage), so the two endpoints agree on the
+   *  intersection — what differs is the SET (knowledge-only vs cross-class) and
+   *  `content` (chunk vs parent section), as the comment above says.
+   *
+   *  A missing leg is `null`, never 0: 0 is a valid rank and a plausible score,
+   *  so defaulting with `?? 0` would turn "this leg found nothing" into a number
+   *  that looks like a measurement — the exact opposite of `keyword_stage:
+   *  "empty"`. The types below say `number | null` and nothing may narrow that
+   *  with a fallback. */
+  knowledgeSearchLegs: (q: string, limit = 10) =>
+    getChecked<{
+      hits: {
+        kind: string;
+        chunk_id: number;
+        document: string;
+        content?: string;
+        excerpt?: string;
+        score?: number;
+        score_kind?: string;
+        legs?: string[];
+        semantic_rank?: number | null;
+        semantic_score?: number | null;
+        keyword_rank?: number | null;
+        keyword_score?: number | null;
+        keyword_stage?: string;
+      }[];
+      matched: number;
+      total: number;
+    }>(`/api/v1/knowledge/search?q=${encodeURIComponent(q)}&limit=${limit}`, {
+      hits: "arrayOfObjects",
+      matched: "number",
+      total: "number",
+    }),
+
   recallLog: (limit = 50, source?: string) =>
     getChecked<RecallLogPage>(
       `/api/v1/recall/log?limit=${limit}${source === undefined ? "" : `&source=${encodeURIComponent(source)}`}`,
@@ -1080,11 +1122,18 @@ export const api = {
       };
     }>(`/api/v1/recall/log?limit=1`, { log: "arrayOfObjects" }).then((r) => r.retention),
 
-  /** t250/t269: the knowledge hits WITH their per-leg evidence. There is no
-   *  separate legs endpoint — the daemon computes both legs inside the recall
-   *  handler and attaches them to each knowledge hit (api.rs:2437-2490), so
-   *  this reads them from there rather than inventing a route. Each hit says
-   *  which legs found it and each leg's own raw score. */
+  /** t250/t269/t311: the knowledge hits WITH their per-leg evidence, read from
+   *  the recall response. When t269 wrote this, the recall handler was the ONLY
+   *  place that attached legs (api.rs:2437-2490) and the comment said so; t290
+   *  has since given /api/v1/knowledge/search its own per-leg evidence, so both
+   *  endpoints carry legs now and the choice is a preference, not a constraint.
+   *
+   *  The two are NOT interchangeable. recall's knowledge section is a CROSS-CLASS
+   *  top-N (memories, wiki, entities compete for the same budget), search is
+   *  KNOWLEDGE-ONLY top-N, so the two hit sets differ by construction and only
+   *  the per-leg fields agree on the intersection. The `content` field differs
+   *  too: recall sends the PARENT SECTION (the hit's full context), search sends
+   *  the CHUNK itself. */
   recallKnowledgeLegs: async (q: string, conservative: boolean, topN = 5) => {
     const r = await get<RecallResult>(
       `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,
