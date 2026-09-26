@@ -839,8 +839,11 @@ export const api = {
     getChecked<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
       `/api/v1/graph/edges?limit=${limit}`,
       { edges: "arrayOfObjects", total: "number", limit: "number", offset: "number" },
-      // Graph.tsx reads id/src/dst/kind off each edge.
-      { id: "number", src: "string", dst: "string" },
+      // Graph.tsx reads id/src/dst off each edge. MEASURED, not assumed: all
+      // three are integers (they are entity ids). Declaring src/dst as strings
+      // made the real response fail - a false red that only showed up when the
+      // live bodies were replayed verbatim, which is why that control exists.
+      { id: "number", src: "number", dst: "number" },
     ),
   /** The whole entity list (graphEntities caps at the daemon default of 50). */
   graphEntitiesAll: (limit = 500) =>
