@@ -468,6 +468,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
    *  has nothing new to ask for. A failed read clears the key so a later run
    *  may retry. */
   const loadedKeyRef = useRef<string | null>(null);
+  /** t230: the fetch currently in flight, keyed by the (agent, engine) pair it
+   *  answers for. A same-pair re-run reuses it instead of cancelling it; a
+   *  different pair retires it. */
+  const inflightRef = useRef<{ key: string; alive: boolean } | null>(null);
   useEffect(() => {
     if (!agent) return;
     const a = agents?.find((x) => x.name === agent);
@@ -477,7 +481,6 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     lastAgentRef.current = agent;
     lastEngineRef.current = engine;
     setConfigModels(a?.models ?? []);
-    setOptions(null);
     if (agentChanged) {
       setModel(a?.model ?? "");
       setRuntime(a?.runtime ?? "");
@@ -486,10 +489,39 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       setModel("");
     }
     const key = agent + "|" + engine;
-    if (!agentChanged && !engineChanged && loadedKeyRef.current === key) return;
+    // t230: one (agent, engine) pair is one catalog, and this effect re-runs on
+    // its own setRuntime below. Two things must hold at once:
+    //   · a no-op re-run must not ask again (t171: the same URL went out twice)
+    //   · and it must not CANCEL the fetch the first run started either
+    // A cleanup-based `alive` flag broke the second: React runs the previous
+    // cleanup before the next effect body, so the fetch was killed and the
+    // re-run then returned early — nothing was left to ask and the picker sat on
+    // its loading (empty) Select forever. Measured on the real root: .ctl-model
+    // carried `ant-select-loading` with 0 options while
+    // GET /agents/approver/options?runtime=dsh had answered with the full
+    // 7-model catalog (the mock shape only looked healthy because a local
+    // catalog answers before a re-run can cancel it). A ticket keyed by the pair
+    // does both: a same-key re-run reuses it, a different key retires it.
+    const ticket = inflightRef.current;
+    if (ticket && ticket.key === key) return;
+    if (ticket) ticket.alive = false;
+    const mine = { key, alive: true };
+    inflightRef.current = mine;
     loadedKeyRef.current = key;
-    let alive = true;
+    // t230: the clear belongs HERE, below the guard — not above it.
+    //
+    // This effect runs TWICE on a normal load (the first run stores the agent's
+    // runtime, which re-runs the effect). The second run is a no-op and returns
+    // early at the line above, so a clear placed before it wiped the catalog the
+    // first run had just loaded and nothing ever refilled it: the picker stayed
+    // on its loading (empty) Select forever. Measured on the real root: the
+    // .ctl-model div carried `ant-select-loading`, had 0 options and an empty
+    // placeholder, while GET /agents/approver/options?runtime=dsh had returned
+    // the full 7-model catalog. Clearing below the guard keeps the loading state
+    // for a real refetch (agent/engine change) and leaves a no-op run alone.
+    setOptions(null);
     const apply = (list: SessionOptionInfo[]) => {
+      if (!mine.alive) return;
       setOptions(list);
       const m = list.find((o) => o.category === "model" || o.id === "model");
       // Configured default wins; otherwise the advertised current; otherwise
@@ -500,7 +532,7 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     api
       .agentOptions(agent, false, engine || undefined)
       .then((r) => {
-        if (!alive) return;
+        if (!mine.alive) return;
         // An EMPTY catalog is not an answer. The daemon persists the result
         // of the first probe, and on a fresh data root that persisted copy is
         // {"options":[],"cached":true} — so the picker stayed blank forever
@@ -510,24 +542,24 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
           api
             .agentOptions(agent, true, engine || undefined)
             .then((r2) => {
-              if (alive) apply(r2.options);
+              if (mine.alive) apply(r2.options);
             })
             .catch(() => {
-              if (alive) apply([]);
+              if (mine.alive) apply([]);
             });
           return;
         }
         apply(r.options);
       })
       .catch(() => {
-        if (alive) {
+        if (mine.alive) {
+          // A failed read retires the ticket so a later run may retry.
+          mine.alive = false;
+          inflightRef.current = null;
           loadedKeyRef.current = null;
           setOptions([]);
         }
       });
-    return () => {
-      alive = false;
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent, agents, runtime]);
 
