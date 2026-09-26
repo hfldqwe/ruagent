@@ -341,6 +341,23 @@ export interface RecallLogRow {
   source_label: string;
 }
 
+/** t297: the recall-log envelope. `log` is ONE PAGE (bounded by `limit`); the
+ *  whole log's size lives in `retention.rows`, and the daemon echoes the filter
+ *  it actually applied (trimmed, lowercased) in `source_filter`. A view that
+ *  counts `log` and calls it the total is reporting a page as the whole. */
+export interface RecallLogPage {
+  log: RecallLogRow[];
+  retention: {
+    policy: string;
+    max_rows: number;
+    rows: number;
+    oldest_ts: string | null;
+    newest_ts: string | null;
+    rows_without_source: number;
+  };
+  source_filter?: string | null;
+}
+
 /** A hit expanded into its parent section. */
 export interface KnowledgeExpansion {
   chunk_id: number;
@@ -945,10 +962,10 @@ export const api = {
    *  Omit it for the whole log. The envelope and the per-row source/source_label
    *  fields are asserted, shaped from api.rs's recall_log handler. */
   recallLog: (limit = 50, source?: string) =>
-    getChecked<{ log: RecallLogRow[] }>(
+    getChecked<RecallLogPage>(
       `/api/v1/recall/log?limit=${limit}${source === undefined ? "" : `&source=${encodeURIComponent(source)}`}`,
       { log: "arrayOfObjects" },
-    ).then((r) => r.log),
+    ),
 
   /** t251/t269: retention readout for the log (policy, max_rows, rows,
    *  oldest/newest ts, how many rows carry no source). Same envelope as above. */

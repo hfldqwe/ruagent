@@ -78,7 +78,14 @@ export function Memory() {
   const [namespace, setNamespace] = useState("user");
   const [memories, setMemories] = useState<MemoryRow[] | null>(null);
   const [memError, setMemError] = useState(false);
-  const [recallLog, setRecallLog] = useState<Awaited<ReturnType<typeof api.recallLog>> | null>(null);
+  const [recallLog, setRecallLog] = useState<
+    Awaited<ReturnType<typeof api.recallLog>>["log"] | null
+  >(null);
+  /** t297: the WHOLE log's row count. The page holds at most `limit` rows, so
+   *  counting them says nothing about the log — the daemon's envelope carries
+   *  the real total, and the view must read it instead of implying it. */
+  const [logTotal, setLogTotal] = useState<number | null>(null);
+  const [logFilter, setLogFilter] = useState<string | null>(null);
   const [writing, setWriting] = useState(false);
   const [tab, setTab] = useState<"browse" | "recall" | "audit">(readTab);
 
@@ -133,18 +140,33 @@ export function Memory() {
   // (api.recall is called only from this view), so #stats was a second
   // rendering point for data it did not own. Loaded once: it is a log, and a
   // second poll would spend the route's request budget for no new truth.
+  // t284: the source filter is SERVER-side. The daemon's WHERE is an exact-match
+  // inclusion filter (`?2 IS NULL OR (?2 = 'unknown' AND source IS NULL) OR
+  // source = ?2`, api.rs recall_log), so the panel can ask for one source and
+  // spend the page's limit on rows that match instead of filtering after the
+  // fact. "Hide probe" is therefore a selection, not a post-filter: picking a
+  // source other than probe is what keeps probe rows out of the page, and
+  // `unknown` selects exactly the rows written before the column existed.
+  const [srcFilter, setSrcFilter] = useState<string | undefined>(undefined);
+
   useEffect(() => {
     void api
-      .recallLog(20)
-      .then(setRecallLog)
-      .catch(() => setRecallLog([]));
-  }, []);
-  const [hideProbe, setHideProbe] = useState(true);
-  // Only rows whose source is exactly "probe" are hidden. NULL (unknown) rows
-  // are a fact about rows written before the column existed and stay visible.
-  const shownLog = (recallLog ?? []).filter(
-    (r) => !(hideProbe && (r as { source?: string | null }).source === "probe"),
-  );
+      .recallLog(20, srcFilter)
+      .then((page) => {
+        setRecallLog(page.log);
+        setLogTotal(page.retention.rows);
+        // The daemon echoes the filter it actually applied (trimmed and
+        // lowercased), which is worth showing: it is the server's answer, not
+        // the panel's assumption about what it asked for.
+        setLogFilter(page.source_filter ?? null);
+      })
+      .catch(() => {
+        setRecallLog([]);
+        setLogTotal(null);
+        setLogFilter(null);
+      });
+  }, [srcFilter]);
+
 
   const projectNamespaces = (counts ?? [])
     .filter(([s, ns]) => s === store && ns.startsWith("project:"))
@@ -287,30 +309,39 @@ export function Memory() {
       {recallLog && recallLog.length > 0 && (
         <Zone
           title={t("stats.recallLog")}
-          note={t("stats.rows", { n: recallLog.length })}
+          note={
+            logTotal === null
+              ? t("stats.rows", { n: recallLog.length })
+              : t("memory.recallShown", { n: recallLog.length, total: logTotal }) +
+                (logFilter ? " · " + t("memory.recallSource") + ": " + logFilter : "")
+          }
         >
           <div className="card">
-            {/* t263: probe rows (t252 makes doctor declare ?source=probe) are
-                filtered HERE, on the exact value only. A row whose source is
-                NULL — written before the column existed — is never matched by
-                this filter and never disappears because of it. */}
-            <label className="row tight muted micro">
-              <input
-                type="checkbox"
-                checked={hideProbe}
-                onChange={(e) => setHideProbe(e.target.checked)}
-                aria-label={t("memory.recallHideProbe")}
+            {/* t284: a server-side source filter (see the state comment above).
+                The request carries `source=`; rows with a NULL source are reached
+                by the special value `unknown` and are never dropped implicitly. */}
+            <div className="row tight muted micro">
+              <span>{t("memory.recallSource")}</span>
+              <Select
+                size="small"
+                aria-label={t("memory.recallSource")}
+                value={srcFilter ?? "__all__"}
+                onChange={(v) => setSrcFilter(v === "__all__" ? undefined : v)}
+                options={[
+                  { value: "__all__", label: t("memory.recallSourceAll") },
+                  { value: "unknown", label: t("memory.recallSourceUnknown") },
+                  ...["probe", "distill", "user"]
+                    .filter((s) => (recallLog ?? []).some((r) => (r as { source?: string | null }).source === s) || s === "probe")
+                    .map((s) => ({ value: s, label: s })),
+                ]}
+                style={{ minWidth: 120 }}
               />
-              {t("memory.recallHideProbe")}
               <span title={t("memory.recallProbeNote")} className="tag micro">
                 ?
               </span>
-              {t("memory.recallShown", {
-                n: shownLog.length,
-                total: recallLog.length,
-              })}
-            </label>
-            {shownLog.map((r, i) => {
+              <span>{t("stats.rows", { n: recallLog.length })}</span>
+            </div>
+            {recallLog.map((r, i) => {
               // t253: who produced the row. Rows written before the column
               // existed carry no source and read as unknown — never as
               // "user", never guessed from the query, never filtered out.
