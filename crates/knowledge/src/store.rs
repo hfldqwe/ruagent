@@ -497,9 +497,16 @@ impl Knowledge {
     ///
     /// Stage 2 is what reaches "autohotkey-v2" when the stored text spells it
     /// apart ("AutoHotkey" ... "v2.0.28"): the phrase form demands an
-    /// adjacency the text does not have, and t247 measured 0 hits for exactly
-    /// that query. Stage 3 is the only path to a substring of a Han run,
-    /// because unicode61 makes the whole run one term.
+    /// adjacency the text does not have. Stage 3 is the only path to a
+    /// substring of a Han run, because unicode61 makes the whole run one term.
+    ///
+    /// Both recall stages drop short ASCII terms (see
+    /// ruagent_store::fts::MIN_RECALL_ASCII) -- a two-letter fragment matches
+    /// whatever word happens to start with it, which is how a stray short word
+    /// in a query used to buy a hit on unrelated text. So a recall pattern can
+    /// come out empty even though the query has terms; an empty pattern is
+    /// skipped rather than handed to MATCH, and the degradation moves on.
+    /// Precision is never filtered: there a short term is exact evidence.
     async fn keyword_leg(
         &self,
         query: &str,
@@ -519,6 +526,9 @@ impl Knowledge {
                 ruagent_store::fts::match_any_prefix(&terms),
             ),
         ] {
+            if pattern.is_empty() {
+                continue;
+            }
             let rows = self.fts_match(&pattern, leg_k).await?;
             if !rows.is_empty() {
                 return Ok((rows, stage));
