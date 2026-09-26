@@ -775,6 +775,29 @@ struct WikiBuildRequest {
     confirm_plan: Option<i64>,
 }
 
+/// Query parameters on the wiki build endpoint. There are none: every field of
+/// `WikiBuildRequest` is a BODY field, and a parameter of that name in the query
+/// string is REFUSED rather than ignored (t300).
+///
+/// The failure this replaces is measured, not imagined: `POST
+/// /api/v1/knowledge/wiki/build?dry_run=true` with body `{}` answered 202 with a
+/// body describing a plan, while the row it wrote was `dry_run=0,
+/// status='done'` (build 6 in the live store) — a success code over a
+/// production build, from a caller that had asked for a plan. An ignored
+/// parameter is worse than a refused one: nothing in the response tells the
+/// caller that half of its request never arrived.
+#[derive(Deserialize)]
+struct WikiBuildQuery {
+    #[serde(default)]
+    dry_run: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    confirm_plan: Option<String>,
+}
+
 fn parse_wiki_scope(v: Option<serde_json::Value>) -> Result<crate::wiki::Scope, ApiError> {
     match v {
         None => Ok(crate::wiki::Scope::Changed),
@@ -806,13 +829,45 @@ fn parse_wiki_scope(v: Option<serde_json::Value>) -> Result<crate::wiki::Scope, 
     }
 }
 
-/// Compile source documents into wiki pages. `dry_run` plans and
-/// returns the page set for review (the plan-level human gate);
-/// `confirm_plan` executes a reviewed plan.
+/// Compile source documents into wiki pages.
+///
+/// BODY fields — all of them: `scope` (`"all"` | `"changed"` | `[names]`, default
+/// `"changed"`) · `dry_run` (plan and return the page set for review: the
+/// plan-level human gate) · `agent` · `confirm_plan` (execute a reviewed plan).
+///
+/// The QUERY string is not a second way to say any of those: a query parameter
+/// named `dry_run`/`scope`/`agent`/`confirm_plan` is a 400 that names it (t300). It used
+/// to be accepted and silently ignored, so `?dry_run=true` returned a success
+/// code and wrote a production row.
+///
+/// A body without `scope` is legal (it means "changed"), but a scope that
+/// selects no documents is not: the build fails with `no source documents in
+/// the knowledge base`, or `scope selects no source documents` when the scope
+/// itself names none.
 async fn wiki_build(
     State(state): State<AppState>,
+    Query(q): Query<WikiBuildQuery>,
     Json(req): Json<WikiBuildRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let mut ignored: Vec<&str> = Vec::new();
+    if q.dry_run.is_some() {
+        ignored.push("dry_run");
+    }
+    if q.scope.is_some() {
+        ignored.push("scope");
+    }
+    if q.agent.is_some() {
+        ignored.push("agent");
+    }
+    if q.confirm_plan.is_some() {
+        ignored.push("confirm_plan");
+    }
+    if !ignored.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "these query parameters are not read: {}. Send them as JSON body fields — the query string used to be accepted and silently ignored, which is how `?dry_run=true` returned a success code over a production build (t300)",
+            ignored.join(", ")
+        )));
+    }
     let scope = parse_wiki_scope(req.scope)?;
     let distiller = crate::distill::Distiller {
         db: state.mgr.db().clone(),
@@ -4195,6 +4250,47 @@ mod tests {
         println!(
             "READING legs=false: legs={} keyword_stage={}",
             v4["hits"][0]["legs"], v4["hits"][0]["keyword_stage"]
+        );
+    }
+
+    /// t300: `?dry_run=true` used to be accepted and ignored, so the caller got a
+    /// 202 and a production row. Now the query string is refused, and the body
+    /// is the only place those fields are read.
+    #[tokio::test]
+    async fn wiki_build_refuses_query_parameters_it_does_not_read() {
+        let (app, db, _root) = harness().await;
+        let before = count(&db, "select count(*) from wiki_builds").await;
+        let (st, _v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/knowledge/wiki/build?dry_run=true",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        println!("READING query form: HTTP {st} body={raw}");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+        assert!(raw.contains("dry_run"), "{raw}");
+        let after = count(&db, "select count(*) from wiki_builds").await;
+        println!("READING wiki_builds rows: before={before} after={after}");
+        assert_eq!(
+            before, after,
+            "a refused request must not write a build row"
+        );
+
+        // The body is the way to say it; a scope that selects nothing is the
+        // documented failure, not a silent empty build.
+        let (st2, _v2, raw2) = send_json(
+            &app,
+            "POST",
+            "/api/v1/knowledge/wiki/build",
+            Some(serde_json::json!({ "dry_run": true, "scope": "all" })),
+        )
+        .await;
+        println!("READING body form: HTTP {st2} body={raw2}");
+        assert_eq!(st2, StatusCode::BAD_REQUEST, "{raw2}");
+        assert!(
+            raw2.contains("no source documents") || raw2.contains("selects no source"),
+            "{raw2}"
         );
     }
 
