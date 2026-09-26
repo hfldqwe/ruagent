@@ -361,13 +361,19 @@ fn wiki_show(url: &str, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// The probe space `ruagent doctor` may write into. One list: the payloads
-/// above and `sweep_probe_artifacts` below read these constants, so a rename
-/// cannot leave orphaned junk behind (t252, single-source rule).
+/// The probe space `ruagent doctor` may write into. ONE list: the three
+/// payloads, the recall URL and `sweep_probe_artifacts` all read these
+/// constants, so a rename cannot orphan a class of artifact, and the sweep
+/// cannot drift from the writer (t252/t282, single-source rule).
 const PROBE_DOC_NAME: &str = "__probe__/doctor-probe";
 const PROBE_DOC_NAME_LEGACY: &str = "doctor-probe";
 const PROBE_ENTITY_NAME: &str = "__probe__doctor-node";
+const PROBE_ENTITY_NAME_LEGACY: &str = "doctor-node";
 const PROBE_MEMORY_NAMESPACE: &str = "agent:__probe__";
+/// The probe memory's content. Shared by the writer and the legacy sweep: the
+/// pre-t252 doctor wrote it into the `user` namespace, where the injection
+/// paths read it, so the sweep must recognise it by content.
+const PROBE_MEMORY_CONTENT: &str = "doctor probe: the kettle is chrome";
 
 /// The doctor's recall probe, declaring itself: a probe that does not say
 /// so is indistinguishable from a user query, and guessing from the query
@@ -375,28 +381,44 @@ const PROBE_MEMORY_NAMESPACE: &str = "agent:__probe__";
 const DOCTOR_RECALL_URL: &str =
     "/api/v1/recall?q=kettle%20material&strategy=aggressive&top_n=3&source=probe";
 
-/// Delete the probe documents this command (or an older build of it) left
-/// behind. Returns (nothing left behind, human-readable lines). The entity
-/// and the memory are ISOLATED by name/namespace — production readers
-/// filter them out — and reported here because no delete route exists yet.
+/// Keep the first occurrence of each id: the sweeps above can name the same
+/// row twice from different angles, and acting twice turns a successful cleanup
+/// into a reported failure (t282).
+fn dedupe_by_id(targets: &mut Vec<(i64, String)>) {
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|(id, _)| seen.insert(*id));
+}
+
+/// GET one JSON document; the error is a STRING the caller prints, because a
+/// sweep that cannot list must say so instead of looking clean.
+fn get_json(url: &str, path: &str) -> Result<serde_json::Value, String> {
+    client()
+        .get(format!("{url}{path}"))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json::<serde_json::Value>())
+        .map_err(|e| e.to_string())
+}
+
+/// Delete every artifact `ruagent doctor` (or an older build of it) left behind
+/// — documents, entities AND memories — printing each failure. All three
+/// classes are named by the constants above, so a rename cannot orphan one of
+/// them (t252/t282). Returns (nothing left behind, human-readable lines).
 fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>) {
     let mut lines = Vec::new();
-    let wanted: Vec<&str> = if include_legacy {
+    let mut left = 0usize;
+
+    // 1. Documents: the `.md` file goes with the row.
+    let doc_names: Vec<&str> = if include_legacy {
         vec![PROBE_DOC_NAME, PROBE_DOC_NAME_LEGACY]
     } else {
         vec![PROBE_DOC_NAME]
     };
-    let mut left = 0usize;
-    match client()
-        .get(format!("{url}/api/v1/knowledge/documents"))
-        .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json::<serde_json::Value>())
-    {
+    match get_json(url, "/api/v1/knowledge/documents") {
         Ok(v) => {
             for row in v["documents"].as_array().cloned().unwrap_or_default() {
                 let name = row["name"].as_str().unwrap_or_default().to_string();
-                if !wanted.contains(&name.as_str()) {
+                if !doc_names.contains(&name.as_str()) {
                     continue;
                 }
                 let id = row["id"].as_i64().unwrap_or(0);
@@ -410,13 +432,13 @@ fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>)
                     Ok(r) => {
                         left += 1;
                         lines.push(format!(
-                            "FAILED to remove {name} (#{id}): HTTP {}",
+                            "FAILED to remove document {name} (#{id}): HTTP {}",
                             r.status()
                         ))
                     }
                     Err(e) => {
                         left += 1;
-                        lines.push(format!("FAILED to remove {name} (#{id}): {e}"))
+                        lines.push(format!("FAILED to remove document {name} (#{id}): {e}"))
                     }
                 }
             }
@@ -426,12 +448,130 @@ fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>)
             lines.push(format!("could not list documents to sweep: {e}"));
         }
     }
-    if lines.is_empty() {
-        lines.push("no probe document present".into());
+
+    // 2. Entities: hard delete — the edges/facts go with the row (t276).
+    let entity_names: Vec<&str> = if include_legacy {
+        vec![PROBE_ENTITY_NAME, PROBE_ENTITY_NAME_LEGACY]
+    } else {
+        vec![PROBE_ENTITY_NAME]
+    };
+    let mut entity_targets: Vec<(i64, String)> = Vec::new();
+    for name in &entity_names {
+        let path = format!("/api/v1/graph/search?q={}", urlencoding::encode(name));
+        match get_json(url, &path) {
+            Ok(v) => {
+                for row in v["entities"].as_array().cloned().unwrap_or_default() {
+                    // Exact match only: the entity search leg is loose on
+                    // purpose, and deleting a near-match would be a bug.
+                    if row["name"].as_str() != Some(*name) {
+                        continue;
+                    }
+                    if let Some(id) = row["id"].as_i64() {
+                        entity_targets.push((id, (*name).to_string()));
+                    }
+                }
+            }
+            Err(e) => {
+                left += 1;
+                lines.push(format!("could not search entities to sweep: {e}"));
+            }
+        }
     }
-    lines.push(format!(
-        "isolated (no delete route yet): entity {PROBE_ENTITY_NAME}, memory {PROBE_MEMORY_NAMESPACE}"
-    ));
+    // One id can match twice (the search leg is run per name); a second
+    // DELETE would 404 and be reported as a failure of a sweep that in fact
+    // worked. Dedupe before acting (t282).
+    dedupe_by_id(&mut entity_targets);
+    for (id, name) in entity_targets {
+        match client()
+            .delete(format!("{url}/api/v1/graph/entity/{id}"))
+            .send()
+        {
+            Ok(r) if r.status().is_success() => {
+                lines.push(format!("removed probe entity {name} (#{id})"))
+            }
+            Ok(r) => {
+                left += 1;
+                lines.push(format!(
+                    "FAILED to remove entity {name} (#{id}): HTTP {}",
+                    r.status()
+                ))
+            }
+            Err(e) => {
+                left += 1;
+                lines.push(format!("FAILED to remove entity {name} (#{id}): {e}"))
+            }
+        }
+    }
+
+    // 3. Memories: hard PURGE — a tombstone would keep the content (t276).
+    let mut memory_targets: Vec<(i64, String)> = Vec::new();
+    let ns_path = format!(
+        "/api/v1/memory/list?namespace={}&limit=500",
+        urlencoding::encode(PROBE_MEMORY_NAMESPACE)
+    );
+    match get_json(url, &ns_path) {
+        Ok(v) => {
+            for row in v["memories"].as_array().cloned().unwrap_or_default() {
+                if let Some(id) = row["id"].as_i64() {
+                    memory_targets.push((id, format!("namespace {PROBE_MEMORY_NAMESPACE}")));
+                }
+            }
+        }
+        Err(e) => {
+            left += 1;
+            lines.push(format!("could not list probe-namespace memories: {e}"));
+        }
+    }
+    if include_legacy {
+        // The pre-t252 doctor wrote its probe into the `user` namespace, where
+        // the injection paths read it: sweep by CONTENT, from the same
+        // constant the payload is built from.
+        match get_json(url, "/api/v1/memory/list?limit=500") {
+            Ok(v) => {
+                for row in v["memories"].as_array().cloned().unwrap_or_default() {
+                    let content = row["content"].as_str().unwrap_or_default();
+                    if content.trim() != PROBE_MEMORY_CONTENT {
+                        continue;
+                    }
+                    if let Some(id) = row["id"].as_i64() {
+                        memory_targets.push((id, "legacy probe content".to_string()));
+                    }
+                }
+            }
+            Err(e) => {
+                left += 1;
+                lines.push(format!("could not list memories to sweep: {e}"));
+            }
+        }
+    }
+    // Same trap as the entities: #164 is listed by BOTH the namespace sweep
+    // and the legacy-content sweep, and purging it twice reports a bogus 404.
+    dedupe_by_id(&mut memory_targets);
+    for (id, why) in memory_targets {
+        match client()
+            .delete(format!("{url}/api/v1/memory/{id}?purge=true"))
+            .send()
+        {
+            Ok(r) if r.status().is_success() => {
+                lines.push(format!("purged probe memory #{id} ({why})"))
+            }
+            Ok(r) => {
+                left += 1;
+                lines.push(format!(
+                    "FAILED to purge memory #{id} ({why}): HTTP {}",
+                    r.status()
+                ))
+            }
+            Err(e) => {
+                left += 1;
+                lines.push(format!("FAILED to purge memory #{id} ({why}): {e}"))
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("no probe artifact present".into());
+    }
     (left == 0, lines)
 }
 
@@ -608,6 +748,8 @@ mod tests {
         assert!(PROBE_DOC_NAME.starts_with("__probe__/"));
         assert!(!PROBE_DOC_NAME_LEGACY.starts_with("__probe__/"));
         assert!(PROBE_ENTITY_NAME.starts_with("__probe__"));
+        assert!(!PROBE_ENTITY_NAME_LEGACY.starts_with("__probe__"));
+        assert!(PROBE_MEMORY_CONTENT.starts_with("doctor probe"));
         assert!(PROBE_MEMORY_NAMESPACE.starts_with("agent:"));
         assert!(
             DOCTOR_RECALL_URL.contains("source=probe"),
@@ -713,7 +855,9 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     // 2. semantic recall probe: distinct phrasings must hit the same doc.
     if let Some(doc) = post(
         "/api/v1/knowledge/ingest",
-        r##"{"name":"__probe__/doctor-probe","content":"# Doctor probe\n\nThe quarterly ritual involves lighting the braziers at dawn and sounding the bronze bell twice."}"##,
+        &format!(
+            r##"{{"name":"{PROBE_DOC_NAME}","content":"# Doctor probe\n\nThe quarterly ritual involves lighting the braziers at dawn and sounding the bronze bell twice."}}"##
+        ),
     ) {
         let _ = doc; // ingest ok
         let a = get("/api/v1/knowledge/search?q=what%20happens%20at%20sunrise%20every%20quarter");
@@ -741,7 +885,9 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     // 3. memory lifecycle: write → recall → supersede
     let mem = post(
         "/api/v1/memory/write",
-        r#"{"store":"observation","namespace":"agent:__probe__","content":"doctor probe: the kettle is chrome"}"#,
+        &format!(
+            r#"{{"store":"observation","namespace":"{PROBE_MEMORY_NAMESPACE}","content":"{PROBE_MEMORY_CONTENT}"}}"#
+        ),
     );
     checks.push(Check {
         name: "memory write".into(),
@@ -771,7 +917,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     // 4. graph: entity + fact + as-of
     if let Some(e1) = post(
         "/api/v1/graph/entity",
-        r#"{"name":"__probe__doctor-node","kind":"tool"}"#,
+        &format!(r#"{{"name":"{PROBE_ENTITY_NAME}","kind":"tool"}}"#),
     ) {
         let id = e1["id"].as_i64().unwrap_or(0);
         let facts = get(&format!("/api/v1/graph/entity/{id}"));
