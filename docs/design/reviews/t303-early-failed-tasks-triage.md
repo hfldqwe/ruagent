@@ -25,3 +25,20 @@
 ## 纪律
 
 只读 panel/src/（未改任何文件）· 运行 e2e 未武装写权限（`RUAGENT_E2E_ALLOW_WRITES` 未设 ⇒ registry.spec 自跳过）· 浏览器自建自 close（探针脚本在仓外 C:/tmp/t303）· 未启停守护进程 · 未调 /api/v1/recall · 只 add 本报告 · 未 push。切换窗口期间 daemon 不可用 ⇒ 行 39 的 board 专项读数未取到（如实标注，不猜）。
+
+
+---
+
+## 补记（切换窗口 2 之后，新 chunk `index-DQtMkr-V.js`）
+
+窗口 2 重建了面板 dist（captain 广播：`assets/index-DQtMkr-V.js` 服务中）⇒ 我上面那些审计行读数是在**旧 chunk** 上取的，按「重做产物证明」的要求在新 chunk 上复测：
+
+| 路由 | 行 | 复测（新 chunk） | 与 t303 正文的关系 |
+| --- | --- | --- | --- |
+| sessions | 18 | **PASS** | t70【已解决】不变 ✓ |
+| sessions | 27 | **PASS** | t57 ③ 不变 ✓ |
+| sessions | 52 | **FAIL** | t210【仍成立】不变 ✓ |
+| board | **39** | **PASS** | **补齐了正文里「未取到」的那条**：t57 ① 现在有直接读数（不再是只引用它自己的 output）✓ |
+| board | 27 | **PASS** | 同上 |
+
+⇒ **t303 的九条判定在新 chunk 上逐条不变**，且正文唯一标「未取到」的行 39 已补上（PASS）。命令：`node tools/design-audit.mjs --routes={sessions,board} --check`。
