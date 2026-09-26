@@ -2,7 +2,7 @@
 
 - 产物：`panel/dist` 服务中入口 chunk `assets/index-CF2TOUf5.js`（本轮 `npm run build` 后）
 - 改动：`panel/src/api.ts`（graphSearch 返回整个信封而不是只取 entities）· `panel/src/views/Graph.tsx`（新状态 searchMatch + 查询级标记）· `panel/src/i18n/graph.ts`（zh/en 两条键）
-- commit：`PLACEHOLDER`
+- commit：`3284d6f0658903ddac035a5098212c958d038964`
 
 ## 为什么在这里修
 t320 的回落把响应标成 `match ∈ exact | candidate | none`（三值：只有两值时「回落了但没找到」会被读成「有候选」）。
