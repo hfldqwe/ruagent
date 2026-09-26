@@ -61,48 +61,12 @@ function Test-Health {
   try { $r = Invoke-RestMethod -TimeoutSec 5 -Uri $health; return ($r.status -eq 'ok') } catch { return $false }
 }
 
-# ── ONE identity definition, shared by status / watch / stop (7.92) ─────────
-# Until t340 this function asked only "does the process named in the pid file
-# exist, and is it called ruagent?". On a PERSISTENT root that is a false
-# positive: the daemon dies, the pid file stays, and if Windows recycles that
-# pid to ANY other ruagent process (another root temp daemon, for instance)
-# the answer is "alive" -- so status prints a pid that is not ours, and
-# stop -Force would kill an innocent process. 7.86 needs the same identity to
-# decide what to clean up, so both read it from here instead of each keeping
-# its own spelling.
-function Get-NormalizedPath {
-  param([string]$Path)
-  if (-not $Path) { return '' }
-  # / and \ are the same separator to Windows, a trailing one is noise,
-  # and the comparison must not be case sensitive.
-  return $Path.Trim().Replace('/', '\').TrimEnd('\').ToLowerInvariant()
-}
-
-function Get-DaemonIdentity {
-  param([string]$Root, [string]$PidFile)
-  $id = [pscustomobject]@{
-    Pid = $null; ProcessExists = $false; NameMatches = $false; RootMatches = $false; Ours = $false
-  }
-  if (-not (Test-Path $PidFile)) { return $id }
-  # The file holds "pid timestamp" (two values): the first token is the pid.
-  $first = (Get-Content $PidFile -TotalCount 1).Trim().Split(' ')[0]
-  $p = 0
-  if (-not [int]::TryParse($first, [ref]$p)) { return $id }
-  $id.Pid = $p
-  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
-  if (-not $proc) { return $id }
-  $id.ProcessExists = $true
-  $id.NameMatches = ($proc.Name -eq 'ruagent.exe')
-  $cmd = ''; if ($proc.CommandLine) { $cmd = $proc.CommandLine }
-  # BOTH sides are normalized: the daemon was launched with the root as the
-  # caller spelled it (C:/... in this session, C:\... in another), and a
-  # one-sided comparison reads a real daemon as not-ours -- measured, and it
-  # is the false NEGATIVE direction of this check.
-  $id.RootMatches = (Get-NormalizedPath $cmd).Contains((Get-NormalizedPath $Root))
-  $id.Ours = $id.NameMatches -and $id.RootMatches
-  return $id
-}
-
+# ── ONE identity definition, shared with the canary (7.86 / 7.92 / t342) ────
+# The helpers moved to scripts/lib/daemon-identity.ps1 so that
+# scripts/ruagent-canary.ps1 can use the SAME definition instead of keeping its
+# own spelling of "ours". This file cannot be the shared home: it ends in a
+# switch ($Action), so sourcing it would execute an action (discipline 7.111).
+. (Join-Path $PSScriptRoot 'lib\daemon-identity.ps1')
 function Get-DaemonPid {
   $id = Get-DaemonIdentity -Root $Root -PidFile $pidRec
   if ($id.Ours) { return $id.Pid }

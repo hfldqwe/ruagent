@@ -28,6 +28,11 @@ $ErrorActionPreference = 'Stop'
 $rootPidFile = Join-Path $Root 'data\daemon.pid'
 $wrapperPidFile = Join-Path $env:TEMP 'ruagent-canary.wrapper.pid'
 
+# The identity of "this root's daemon" comes from the shared lib, not from a
+# local spelling: discipline 7.86 needs the name AND the root, 7.92 needs both
+# sides normalized, and the daemon script reads the same fields.
+. (Join-Path $PSScriptRoot 'lib\daemon-identity.ps1')
+
 function Read-Pid($path) {
   if (-not (Test-Path $path)) { return $null }
   $raw = (Get-Content $path -Raw).Trim() -split '\s+' | Select-Object -First 1
@@ -36,21 +41,24 @@ function Read-Pid($path) {
   return $null
 }
 
-# The only process this script may kill: its command line must mention this root.
+# The only process this script may kill: the pid file first token, and only if
+# that process IS this root's daemon -- name AND command line, both sides
+# normalized. Measured before t342: the bare substring test this replaces matched
+# any process whose command line MENTIONED the root, including a shell that had
+# merely received it as an argument, and -Stop then killed it.
 function Get-CanaryProcess {
-  $p = Read-Pid $rootPidFile
-  if (-not $p) { return $null }
-  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
-  if (-not $proc) { return $null }
-  if ($proc.CommandLine -and $proc.CommandLine -like "*$Root*") { return $proc }
-  return $null
+  $id = Get-DaemonIdentity -Root $Root -PidFile $rootPidFile
+  if (-not $id.Ours) { return $null }
+  return $id.Process
 }
 
 if ($Action -eq 'stop') {
-  $proc = Get-CanaryProcess
-  if ($proc) {
-    Stop-Process -Id $proc.ProcessId -Force
-    Write-Host "canary: stopped pid $($proc.ProcessId)"
+  $id = Get-DaemonIdentity -Root $Root -PidFile $rootPidFile
+  if ($id.Ours) {
+    Stop-Process -Id $id.Pid -Force
+    Write-Host "canary: stopped pid $($id.Pid)"
+  } elseif ($id.ProcessExists) {
+    Write-Host "canary: REFUSING to stop pid $($id.Pid): it is alive but not this root's daemon (name-match=$($id.NameMatches) root-match=$($id.RootMatches)); nothing was stopped."
   } else {
     Write-Host 'canary: no live canary daemon for this root'
   }
@@ -60,7 +68,11 @@ if ($Action -eq 'stop') {
 
 if ($Action -eq 'status') {
   $proc = Get-CanaryProcess
-  Write-Host "canary daemon pid: $(if ($proc) { $proc.ProcessId } else { 'none' })"
+  $sid = Get-DaemonIdentity -Root $Root -PidFile $rootPidFile
+  $shown = 'none'
+  if ($sid.Ours) { $shown = "$($sid.Pid) (ours)" }
+  elseif ($sid.ProcessExists) { $shown = "$($sid.Pid) NOT OURS (name-match=$($sid.NameMatches) root-match=$($sid.RootMatches))" }
+  Write-Host "canary daemon pid: $shown"
   try {
     $r = Invoke-WebRequest -Uri "http://$Addr/" -UseBasicParsing -TimeoutSec 5
     Write-Host "canary health: $($r.StatusCode)"
