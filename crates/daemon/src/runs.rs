@@ -1839,27 +1839,28 @@ async fn render_run_injection(
     task: &Task,
     knowledge: Option<&ruagent_knowledge::Knowledge>,
 ) -> String {
-    use ruagent_memory::MemoryStore;
     use ruagent_memory::inject::{
-        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, TAG_PROJECT_CONTEXT,
-        TAG_RELEVANT_MEMORIES, TAG_USER_PROFILE, WIKI_PAGES, knowledge_items, render_context,
+        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, WIKI_PAGES, knowledge_items,
+        render_context,
     };
-    use ruagent_memory::query::current_memories;
 
     let mut items: Vec<ContextItem> = Vec::new();
-    if let Ok(profile) = current_memories(db, MemoryStore::Profile, "user", 5).await {
-        items.extend(
-            profile
-                .into_iter()
-                .map(|m| ContextItem::dated(TAG_USER_PROFILE, m.content, &m.updated_at)),
-        );
+    // WHICH memories, and by what rule: the runs preset, executed by the SAME
+    // rule function the chat path uses (t278). This path has no query leg --
+    // see RUNS_SELECTION's own doc for why that difference is measured rather
+    // than closed -- so it passes no embedder.
+    for m in crate::memembed::select_injection_memories(
+        db,
+        None,
+        &run_query(task),
+        task.project.as_deref(),
+        &ruagent_memory::inject::RUNS_SELECTION,
+    )
+    .await
+    {
+        items.push(ContextItem::dated(m.tag, m.content, &m.updated_at));
     }
-    if let Ok(obs) = current_memories(db, MemoryStore::Observation, "user", 8).await {
-        items.extend(
-            obs.into_iter()
-                .map(|m| ContextItem::dated(TAG_RELEVANT_MEMORIES, m.content, &m.updated_at)),
-        );
-    }
+
     // Drop order (rationale with the tags in crates/memory/src/inject.rs):
     // user_profile > relevant_memories > knowledge > wiki > project_context.
     // Knowledge and wiki therefore sit BEFORE the project block -- evidence and
@@ -1879,23 +1880,17 @@ async fn render_run_injection(
             .collect();
         items.extend(knowledge_items(&hits, KNOWLEDGE_SOURCES, WIKI_PAGES));
     }
-    if let Some(project) = &task.project
-        && let Ok(obs) = current_memories(
-            db,
-            MemoryStore::Observation,
-            &format!("project:{project}"),
-            8,
-        )
-        .await
-    {
-        items.extend(
-            obs.into_iter()
-                .map(|m| ContextItem::dated(TAG_PROJECT_CONTEXT, m.content, &m.updated_at)),
-        );
-    }
+    // The project group is NOT read here any more: it is part of
+    // RUNS_SELECTION, so the preset is the only place that says this path
+    // reads project:<task.project> at all. The knowledge block stays
+    // between the two so the BLOCK order is unchanged (tag_rank sorts it
+    // anyway, and that rank -- not this file -- owns the drop order).
     if items.is_empty() {
         return String::new();
     }
+    // The BLOCK order is the contract drop order (see inject.rs::tag_rank),
+    // not the order these items were discovered in.
+    items.sort_by_key(|i| ruagent_memory::inject::tag_rank(i.tag));
     render_context(&items, &InjectionBudget::default())
 }
 

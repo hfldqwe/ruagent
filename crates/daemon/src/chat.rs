@@ -363,11 +363,6 @@ pub struct ChatManager {
     model_cache: Arc<Mutex<HashMap<String, CachedOptions>>>,
 }
 
-/// The chat path's query-side memory selection (unchanged by t260 -- it is a
-/// SELECTION choice, not a rendering rule, and moving it is a separate
-/// decision from routing the render through the contract).
-const CHAT_MEMORY_TOP_N: u32 = 4;
-const CHAT_MEMORY_MIN_SCORE: f32 = 0.34;
 /// Search wider than the block will keep: the contract then picks the top
 /// KNOWLEDGE_SOURCES + WIKI_PAGES by score, so a wiki page cannot crowd a
 /// source out before the selection rule ever sees it.
@@ -466,50 +461,31 @@ impl ChatManager {
         embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
         query: &str,
     ) -> Option<String> {
-        use ruagent_memory::MemoryStore;
         use ruagent_memory::inject::{
-            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, TAG_RELEVANT_MEMORIES,
-            TAG_USER_PROFILE, WIKI_PAGES, knowledge_items, render_context,
+            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, WIKI_PAGES,
+            knowledge_items, render_context,
         };
 
         let mut items: Vec<ContextItem> = Vec::new();
 
-        // 1. Who the user is, then the durable observations, then the
-        //    project/global procedure + lesson stores. Read through the memory
-        //    crate's own read path -- which is also what excludes superseded
-        //    and soft-deleted rows. The old chat path wrote its own SQL and
-        //    therefore honoured neither filter.
-        for (tag, store, ns, limit) in [
-            (TAG_USER_PROFILE, MemoryStore::Profile, "user", 5u32),
-            (TAG_RELEVANT_MEMORIES, MemoryStore::Observation, "user", 5),
-            (TAG_RELEVANT_MEMORIES, MemoryStore::Observation, "global", 3),
-            (TAG_RELEVANT_MEMORIES, MemoryStore::Procedure, "global", 3),
-            (TAG_RELEVANT_MEMORIES, MemoryStore::Lesson, "global", 3),
-        ] {
-            if let Ok(rows) = ruagent_memory::query::current_memories(db, store, ns, limit).await {
-                items.extend(
-                    rows.into_iter()
-                        .map(|m| ContextItem::dated(tag, m.content, &m.updated_at)),
-                );
-            }
-        }
-
-        // 2. What THIS conversation is about: the query's own memories (the
-        //    semantic leg). Same count and threshold as before; the rendering
-        //    is now the contract's, so these merge into the
-        //    relevant_memories block instead of a hand-built bullet list.
-        let hits = crate::memembed::semantic_search(
+        // 1 + 2. WHICH memories, and by what rule: the chat preset carries both
+        //        the groups and the query leg, and the rule itself lives in ONE
+        //        place (memembed::select_injection_memories). This file no
+        //        longer holds a single selection number -- before t278 it held
+        //        five group limits, a top-n and a threshold of its own.
+        //        A chat has no PROJECT NAME (it is pinned to a cwd), so the
+        //        project argument is None: see CHAT_SELECTION's groups.
+        for m in crate::memembed::select_injection_memories(
             db,
-            embedder,
+            Some(embedder),
             query,
-            CHAT_MEMORY_TOP_N,
-            CHAT_MEMORY_MIN_SCORE,
+            None,
+            &ruagent_memory::inject::CHAT_SELECTION,
         )
-        .await;
-        items.extend(
-            hits.into_iter()
-                .map(|(_, _, _, content, _)| ContextItem::undated(TAG_RELEVANT_MEMORIES, content)),
-        );
+        .await
+        {
+            items.push(ContextItem::dated(m.tag, m.content, &m.updated_at));
+        }
 
         // 3. What the knowledge base says about it. The selection rule lives in
         //    the contract (knowledge_items): top N sources and top M generated
@@ -529,6 +505,12 @@ impl ChatManager {
                 .collect();
             items.extend(knowledge_items(&hits, KNOWLEDGE_SOURCES, WIKI_PAGES));
         }
+
+        // The BLOCK order is the contract drop order, not the order these
+        // items happened to be discovered in (t278): one list, sorted by the
+        // rank the contract owns, so a caller cannot reorder blocks by
+        // accident and the drop order is the same on both paths.
+        items.sort_by_key(|i| ruagent_memory::inject::tag_rank(i.tag));
 
         if items.is_empty() {
             return None;

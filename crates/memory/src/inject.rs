@@ -100,6 +100,150 @@ pub const TAG_KNOWLEDGE: &str = "knowledge";
 pub const TAG_WIKI: &str = "wiki";
 pub const TAG_PROJECT_CONTEXT: &str = "project_context";
 
+/// Which namespace a memory group reads. Project is resolved by the CALLER
+/// (a chat is pinned to a directory, a run to its task's project), which is why
+/// the groups are DATA and not a hard-coded SQL string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    User,
+    Global,
+    Project,
+}
+
+/// One group of memories an injection path reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryGroup {
+    pub tag: &'static str,
+    pub store: crate::MemoryStore,
+    pub scope: MemoryScope,
+    /// Rows to read. The memory crate's read path orders by recency, so this is
+    /// "the N most recent" -- not "the N most relevant".
+    pub limit: u32,
+}
+
+/// The SELECTION half of the injection contract: which memories a path puts in
+/// front of an agent, and by what rule.
+///
+/// WHY THIS TYPE EXISTS (t278): the chat and runs paths each hard-coded their
+/// own numbers in their own file. A reader could not tell a deliberate
+/// difference from drift, and could not see either path's rule without reading
+/// two files. Both presets are now here, named, with the difference between
+/// them stated field by field.
+///
+/// THE RULE ITSELF IS ONE FUNCTION (crates/daemon/src/memembed.rs,
+/// select_injection_memories): the groups in order, then the optional query
+/// leg. These presets are its PARAMETERS -- deliberately NOT one shared
+/// default, because the two paths answer different questions.
+///
+/// The per-group limits below are AS FOUND (2026-09-26): no rationale for 5 vs
+/// 8, or for the 3s, exists in the tree or in the design docs. They are
+/// PRESERVED, not endorsed -- changing them changes what an agent sees, so it
+/// is a behaviour change and a separate decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InjectionSelection {
+    pub groups: &'static [MemoryGroup],
+    /// The query-side semantic leg: the N closest memories at or above
+    /// query_min_score (cosine). A query_top_n of 0 means this path has NO
+    /// query leg at all -- it injects the most RECENT memories and never asks
+    /// what the task is about.
+    pub query_top_n: u32,
+    pub query_min_score: f32,
+}
+
+/// The CHAT path's selection, as found (t278).
+pub const CHAT_SELECTION: InjectionSelection = InjectionSelection {
+    groups: &[
+        // Who the user is. The ONLY group the two paths agree on.
+        MemoryGroup {
+            tag: TAG_USER_PROFILE,
+            store: crate::MemoryStore::Profile,
+            scope: MemoryScope::User,
+            limit: 5,
+        },
+        MemoryGroup {
+            tag: TAG_RELEVANT_MEMORIES,
+            store: crate::MemoryStore::Observation,
+            scope: MemoryScope::User,
+            limit: 5,
+        },
+        // DEAD GROUP, kept as found: an Observation can never be WRITTEN in the
+        // global namespace (MemoryStore::allows_namespace), so this read can
+        // never match a row. It costs one query per injection and changes
+        // nothing. Deleting it is provably neutral -- and still a behaviour
+        // change, so it is flagged here and left for a separate decision.
+        MemoryGroup {
+            tag: TAG_RELEVANT_MEMORIES,
+            store: crate::MemoryStore::Observation,
+            scope: MemoryScope::Global,
+            limit: 3,
+        },
+        MemoryGroup {
+            tag: TAG_RELEVANT_MEMORIES,
+            store: crate::MemoryStore::Procedure,
+            scope: MemoryScope::Global,
+            limit: 3,
+        },
+        MemoryGroup {
+            tag: TAG_RELEVANT_MEMORIES,
+            store: crate::MemoryStore::Lesson,
+            scope: MemoryScope::Global,
+            limit: 3,
+        },
+    ],
+    // A chat's first message IS the query, so this path has a query leg.
+    query_top_n: 4,
+    query_min_score: 0.34,
+};
+
+/// The RUNS path's selection, as found (t278).
+pub const RUNS_SELECTION: InjectionSelection = InjectionSelection {
+    groups: &[
+        MemoryGroup {
+            tag: TAG_USER_PROFILE,
+            store: crate::MemoryStore::Profile,
+            scope: MemoryScope::User,
+            limit: 5,
+        },
+        MemoryGroup {
+            tag: TAG_RELEVANT_MEMORIES,
+            store: crate::MemoryStore::Observation,
+            scope: MemoryScope::User,
+            limit: 8,
+        },
+        // The run's own project scope. The CHAT path has no equivalent group: a
+        // chat is pinned to a DIRECTORY (cwd), not to a project name, so there
+        // is nothing to resolve Project from. That is a GAP, not a decision --
+        // registered in the t278 report, not silently closed.
+        MemoryGroup {
+            tag: TAG_PROJECT_CONTEXT,
+            store: crate::MemoryStore::Observation,
+            scope: MemoryScope::Project,
+            limit: 8,
+        },
+    ],
+    // NO QUERY LEG -- and this is the one difference that is NOT a parameter: a
+    // run HAS a query (its task's title + intent, runs.rs::run_query) and the
+    // chat path uses one. Giving runs a leg would change what an agent sees, so
+    // t278 measures the difference and does NOT close it.
+    query_top_n: 0,
+    query_min_score: 0.0,
+};
+
+/// The drop order as a sortable rank: a LOWER rank is an earlier block and is
+/// dropped LAST. Sorting items by this reproduces the documented block order no
+/// matter what order a caller discovered them in -- so the order lives HERE,
+/// not in the sequence of push calls in two files.
+pub fn tag_rank(tag: &str) -> u8 {
+    match tag {
+        TAG_USER_PROFILE => 0,
+        TAG_RELEVANT_MEMORIES => 1,
+        TAG_KNOWLEDGE => 2,
+        TAG_WIKI => 3,
+        TAG_PROJECT_CONTEXT => 4,
+        _ => 5,
+    }
+}
+
 /// How many retrieval hits reach the injection, per kind (t260).
 pub const KNOWLEDGE_SOURCES: usize = 3;
 pub const WIKI_PAGES: usize = 2;
@@ -505,5 +649,66 @@ mod tests {
             out.contains("chars truncated"),
             "per_block truncation must be visible"
         );
+    }
+
+    /// The difference between the two injection paths is DATA now, so it can be
+    /// ASSERTED instead of inferred from two files (t278). If someone unifies
+    /// these by accident, this test says which decision they overrode.
+    #[test]
+    fn the_two_presets_state_their_own_differences() {
+        assert_eq!(CHAT_SELECTION.query_top_n, 4);
+        assert_eq!(CHAT_SELECTION.query_min_score, 0.34);
+        assert_eq!(
+            RUNS_SELECTION.query_top_n, 0,
+            "runs has no query leg -- measured, not fixed"
+        );
+        assert!(
+            CHAT_SELECTION
+                .groups
+                .iter()
+                .any(|g| g.store == crate::MemoryStore::Procedure),
+            "chat reads the durable procedure store"
+        );
+        assert!(
+            RUNS_SELECTION
+                .groups
+                .iter()
+                .all(|g| g.store != crate::MemoryStore::Procedure),
+            "runs does NOT -- a whole store the other path cannot see"
+        );
+        assert!(
+            RUNS_SELECTION
+                .groups
+                .iter()
+                .any(|g| g.scope == MemoryScope::Project),
+            "runs reads the task's project scope"
+        );
+        assert!(
+            CHAT_SELECTION
+                .groups
+                .iter()
+                .all(|g| g.scope != MemoryScope::Project),
+            "chat cannot: it is pinned to a cwd, not a project name"
+        );
+
+        // The DEAD group is pinned to the rule that makes it dead: if an
+        // Observation ever becomes writable in the global namespace, this test
+        // fails and the group has to be re-read rather than silently kept.
+        let dead = CHAT_SELECTION
+            .groups
+            .iter()
+            .find(|g| g.scope == MemoryScope::Global && g.store == crate::MemoryStore::Observation)
+            .expect("the as-found chat groups include it");
+        assert_eq!(dead.limit, 3);
+        assert!(
+            !crate::MemoryStore::Observation.allows_namespace(&crate::Namespace::Global),
+            "the group above can never match ONLY while this holds"
+        );
+
+        // The drop order is a rank, and it is the documented order.
+        assert!(tag_rank(TAG_USER_PROFILE) < tag_rank(TAG_RELEVANT_MEMORIES));
+        assert!(tag_rank(TAG_RELEVANT_MEMORIES) < tag_rank(TAG_KNOWLEDGE));
+        assert!(tag_rank(TAG_KNOWLEDGE) < tag_rank(TAG_WIKI));
+        assert!(tag_rank(TAG_WIKI) < tag_rank(TAG_PROJECT_CONTEXT));
     }
 }

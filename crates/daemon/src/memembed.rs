@@ -201,6 +201,82 @@ fn keyword_pattern(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
 
+/// One memory selected for injection, WITH its id: the rendered text carries
+/// content, not identity, so without this a probe could only say "the marker
+/// text is in the context", never "row 42 is in the context".
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedMemory {
+    pub id: i64,
+    pub tag: &'static str,
+    pub content: String,
+    /// Empty for the query leg -- a semantic hit has no timestamp in the
+    /// render's shape, so it renders undated (unchanged since before t278).
+    pub updated_at: String,
+    /// The query leg's cosine, when this row came from that leg.
+    pub score: Option<f32>,
+}
+
+/// THE ONE memory-selection rule for injection (t278): the preset's groups in
+/// order -- each through the memory crate's OWN read path, so superseded and
+/// soft-deleted rows stay out -- then the preset's optional query leg.
+///
+/// The embedder argument is needed only when the preset HAS a query leg; a
+/// preset with query_top_n == 0 (the runs path) never embeds anything and works
+/// with None. That is what keeps "runs has no query leg" a PARAMETER rather
+/// than a second code path.
+pub async fn select_injection_memories(
+    db: &Db,
+    embedder: Option<Arc<dyn Embedder>>,
+    query: &str,
+    project: Option<&str>,
+    sel: &ruagent_memory::inject::InjectionSelection,
+) -> Vec<SelectedMemory> {
+    use ruagent_memory::inject::MemoryScope;
+    let mut out: Vec<SelectedMemory> = Vec::new();
+    for g in sel.groups {
+        let ns = match g.scope {
+            MemoryScope::User => "user".to_string(),
+            MemoryScope::Global => "global".to_string(),
+            // A group whose scope cannot be resolved is SKIPPED, never guessed
+            // at: a chat with no project has no project memories to read.
+            MemoryScope::Project => match project {
+                Some(p) => format!("project:{p}"),
+                None => continue,
+            },
+        };
+        if let Ok(rows) = ruagent_memory::query::current_memories(db, g.store, &ns, g.limit).await {
+            out.extend(rows.into_iter().map(|m| SelectedMemory {
+                id: m.id,
+                tag: g.tag,
+                content: m.content,
+                updated_at: m.updated_at,
+                score: None,
+            }));
+        }
+    }
+    if sel.query_top_n > 0
+        && let Some(embedder) = embedder
+    {
+        let tag = sel
+            .groups
+            .last()
+            .map(|g| g.tag)
+            .unwrap_or(ruagent_memory::inject::TAG_RELEVANT_MEMORIES);
+        for (id, _store, _ns, content, score) in
+            semantic_search(db, embedder, query, sel.query_top_n, sel.query_min_score).await
+        {
+            out.push(SelectedMemory {
+                id,
+                tag,
+                content,
+                updated_at: String::new(),
+                score: Some(score),
+            });
+        }
+    }
+    out
+}
+
 /// Recall memories across BOTH legs, fused on one scale and bounded by top_n.
 ///
 /// THE BUG THIS REPLACES (t246): the handler took the semantic leg, seeded a
