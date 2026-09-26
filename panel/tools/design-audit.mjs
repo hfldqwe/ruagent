@@ -42,7 +42,7 @@
 
 import { chromium } from "@playwright/test";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve, relative, isAbsolute } from "node:path";
+import { basename, dirname, join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { decodePng, pixelStats, relLuma, parseCssColor, composite, contrastRatio } from "./lib/png.mjs";
@@ -7778,7 +7778,44 @@ async function main() {
   // CWD silently wrote panel/docs/screenshots/... when the tool was run from
   // panel/ (which is how everyone runs it), and t8 lost an audit-run2/ that way.
   // An absolute path still wins, as resolve() requires.
-  const outDir = args.out ? resolve(REPO, args.out) : join(REPO, "docs", "screenshots", "audit-run");
+  // t345 (F-t343-01): --out takes a DIRECTORY. Two ways to get this wrong were both
+  // silent or late: (a) a file path (…/gate.md) resolved fine and only blew up at
+  // screenshot time with ENOENT …/true/stats_dark.png (exit 2, after a 12-minute run);
+  // (b) a bare relative value (true) created a directory AT THE REPO ROOT and filled
+  // it with 22 screenshots. Neither is refused up front, and the second is invisible
+  // to a read-only task that never expected to write inside the repo at all.
+  //
+  // The default is deliberately KEPT: the audit's own screenshots are a deliverable,
+  // so omitting --out must still produce docs/screenshots/audit-run. What changes is
+  // that an EXPLICIT --out is checked before anything is created: it must be a
+  // directory-shaped path outside the repo, and whatever is chosen is printed.
+  const looksLikeFile = (v) => /\.[A-Za-z0-9]{1,6}$/.test(basename(v.replace(/[\/]+$/, "")));
+  let outDir;
+  if (args.out) {
+    if (looksLikeFile(args.out)) {
+      console.error(
+        `[audit] --out takes a DIRECTORY, not a file: got "${args.out}".\n` +
+          `        It is used as the folder for this run's screenshots (stats_dark.png, …).\n` +
+          `        Pass a directory, e.g. --out=C:/tmp/audit-run  (an absolute path outside the repo).`,
+      );
+      process.exit(2);
+    }
+    outDir = resolve(REPO, args.out);
+    const insideRepo = relative(REPO, outDir) === "" || (!relative(REPO, outDir).startsWith("..") && !isAbsolute(relative(REPO, outDir)));
+    if (insideRepo) {
+      console.error(
+        `[audit] refusing --out=${args.out}: it resolves INSIDE the repo, to\n` +
+          `        ${outDir}\n` +
+          `        which would write screenshots into the working tree (today's "true/" incident: 22 files).\n` +
+          `        Pass an absolute directory outside the repo, e.g. --out=C:/tmp/audit-run.\n` +
+          `        (Omitting --out is still allowed and writes the deliverable to docs/screenshots/audit-run.)`,
+      );
+      process.exit(2);
+    }
+    log(`[audit] --out resolves to ${outDir} (outside the repo)`);
+  } else {
+    outDir = join(REPO, "docs", "screenshots", "audit-run");
+  }
   mkdirSync(outDir, { recursive: true });
   if (args.out && !isAbsolute(args.out)) {
     log(`[audit] --out=${args.out} 相对仓库根解析 → ${outDir}（CWD 是 ${process.cwd()}；如需按 CWD 解析请传绝对路径）`);
