@@ -29,6 +29,26 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # t324/t327: Db::call returns Result<Result<..>> whenever the closure
+      # returns a rusqlite result, so the two layers mean different things --
+      # the outer is "the writer thread is gone", the inner is "the SQL failed"
+      # -- and the outer is almost never the one that goes wrong. Judging only
+      # the outer (`.await.is_err()` / `.is_ok()`) therefore stays green while
+      # the statement failed: a check that can never fail. t324 found 0 such
+      # sites in the tree (and 17 places where the same nesting hid a failure);
+      # this step keeps the first kind from coming back. Use `Db::call_flat`,
+      # or `matches!(.., Ok(Err(_)))` when both layers matter.
+      - name: Guard against nested-Result misjudgement
+        run: |
+          set -eu
+          hits=$(grep -rn --include='*.rs' -A8 '\.call(' crates cli                  | grep -E '\.await[[:space:]]*\.(is_err|is_ok)\(\)' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Db::call(..).await.is_err()/.is_ok() judges only the OUTER layer of a nested Result (t324/t327). Use Db::call_flat, or match Ok(Err(_)) explicitly."
+            echo "$hits"
+            exit 1
+          fi
+          echo "no nested-Result misjudgement found"
+
       - name: Test
         run: cargo test --workspace
         env:
