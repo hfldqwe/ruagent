@@ -393,13 +393,14 @@ export function Knowledge() {
               <div className="card">
                 {/* t316: the keyword leg's STAGE is a property of the QUERY, not
                     of a hit — measured on the live daemon: a hit whose legs are
-                    ["semantic"] still reports keyword_stage "precision". It is
+                    ["semantic"] still reports query_keyword_stage "precision". It is
                     therefore rendered ONCE, above the hits, and never beside a
                     single hit as if it were that hit's source (that is what
                     「命中来源」/legs is for). The daemon repeats it on every hit;
                     the first one is the response's answer. */}
                 {(() => {
-                  const st = (hits[0] as { keyword_stage?: string }).keyword_stage;
+                  const st = (hits[0] as { query_keyword_stage?: string })
+                    .query_keyword_stage;
                   if (!st) return null;
                   return (
                     <div className="muted micro" title={t("knowledge.stageHint")}>
@@ -417,7 +418,7 @@ export function Knowledge() {
                     semantic_score?: number | null;
                     keyword_score?: number | null;
                   };
-                  // NOTE: keyword_stage is deliberately NOT read here — it is
+                  // NOTE: query_keyword_stage is deliberately NOT read here — it is
                   // query-level (see the block above the list), and a missing leg
                   // stays null: the two score lines below render only when the
                   // value is non-null, so "this leg found nothing" can never be

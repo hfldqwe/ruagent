@@ -212,9 +212,13 @@ export interface RecallResult {
     /** t290/t311: how the keyword leg was built for THIS QUERY ("empty" when it
      *  found nothing, else the stage). Measured: it is a query-level property,
      *  not per-hit membership — a hit with legs ["semantic"] still reports
-     *  keyword_stage "precision". Read it as "what the keyword leg did", never
-     *  as "did this hit come from the keyword leg" (that is `legs`). */
-    keyword_stage?: string;
+     *  query_keyword_stage "precision". Read it as "what the keyword leg did", never
+     *  as "did this hit come from the keyword leg" (that is `legs`).
+     *
+     *  t318 renamed it: it sits ON a hit but describes the QUERY, and the old
+     *  name made every reader assume otherwise (measured: records with
+     *  legs=['semantic'] and kw_rank=null still reported the stage). */
+    query_keyword_stage?: string;
   }[];
   /** §13-2: generated wiki pages — a separate section, never mixed
    * into knowledge, always conservative stubs. */
@@ -1067,13 +1071,13 @@ export const api = {
    *  fields are asserted, shaped from api.rs's recall_log handler. */
   /** t290/t311: the knowledge-only search, WITH the per-leg evidence it now
    *  carries. Measured live: its hit keys are the SAME 13 the recall knowledge
-   *  hit has (both now include keyword_stage), so the two endpoints agree on the
+   *  hit has (both now include query_keyword_stage), so the two endpoints agree on the
    *  intersection — what differs is the SET (knowledge-only vs cross-class) and
    *  `content` (chunk vs parent section), as the comment above says.
    *
    *  A missing leg is `null`, never 0: 0 is a valid rank and a plausible score,
    *  so defaulting with `?? 0` would turn "this leg found nothing" into a number
-   *  that looks like a measurement — the exact opposite of `keyword_stage:
+   *  that looks like a measurement — the exact opposite of `query_keyword_stage:
    *  "empty"`. The types below say `number | null` and nothing may narrow that
    *  with a fallback. */
   knowledgeSearchLegs: (q: string, limit = 10) =>
@@ -1091,7 +1095,7 @@ export const api = {
         semantic_score?: number | null;
         keyword_rank?: number | null;
         keyword_score?: number | null;
-        keyword_stage?: string;
+        query_keyword_stage?: string;
       }[];
       matched: number;
       total: number;
