@@ -502,7 +502,12 @@ type Shape =
   | "number"
   | "string";
 
-function expectShape<T>(endpoint: string, data: unknown, spec: Record<string, Shape>): T {
+function expectShape<T>(
+  endpoint: string,
+  data: unknown,
+  spec: Record<string, Shape>,
+  element?: Record<string, Shape>,
+): T {
   const obj = (data ?? {}) as Record<string, unknown>;
   const bad: string[] = [];
   for (const [f, kind] of Object.entries(spec)) {
@@ -534,6 +539,26 @@ function expectShape<T>(endpoint: string, data: unknown, spec: Record<string, Sh
         i = els.findIndex((e) => typeof e !== "string");
         if (i >= 0) bad.push(`"${f}[${i}]" is not a string`);
       }
+      // t298: the element's KIND is not the whole contract. t296 measured that
+      // a page with the right outer shape and a wrong field inside still
+      // blanked (wiki/pages [{slug:42,title:null}], memory/list rows without
+      // store/namespace/content). `element` lists ONLY the fields the views
+      // actually read — the guard stays in the data layer, where the contract
+      // is known once, instead of sprinkling undefined-checks over N views.
+      if (element && kind === "arrayOfObjects") {
+        for (let k = 0; k < els.length; k++) {
+          const e = els[k] as Record<string, unknown> | null;
+          if (e === null || typeof e !== "object") continue;
+          for (const [ef, ekind] of Object.entries(element)) {
+            const ev = (e as Record<string, unknown>)[ef];
+            const ok =
+              ev !== undefined &&
+              ev !== null &&
+              (ekind === "number" ? typeof ev === "number" : ekind === "string" ? typeof ev === "string" : Array.isArray(ev));
+            if (!ok) bad.push(`"${f}[${k}].${ef}" is not a ${ekind}`);
+          }
+        }
+      }
     } else if (kind === "number") {
       if (typeof v !== "number" || !Number.isFinite(v)) bad.push(`"${f}" is not a finite number`);
     } else if (kind === "string") {
@@ -545,8 +570,12 @@ function expectShape<T>(endpoint: string, data: unknown, spec: Record<string, Sh
 }
 
 /** GET, then validate the endpoint's contract shape before a view can consume it. */
-async function getChecked<T>(path: string, spec: Record<string, Shape>): Promise<T> {
-  return expectShape<T>(path, await get<unknown>(path), spec);
+async function getChecked<T>(
+  path: string,
+  spec: Record<string, Shape>,
+  element?: Record<string, Shape>,
+): Promise<T> {
+  return expectShape<T>(path, await get<unknown>(path), spec, element);
 }
 
 async function send(method: string, path: string, body?: unknown): Promise<Response> {
@@ -687,6 +716,8 @@ export const api = {
         ? `/api/v1/memory/list?store=${store}&namespace=${encodeURIComponent(namespace)}`
         : `/api/v1/memory/list?namespace=${encodeURIComponent(namespace)}`,
       { memories: "arrayOfObjects", counts: "array" },
+      // The fields Memory.tsx actually reads off a row.
+      { id: "number", store: "string", namespace: "string" },
     ),
   memorySearch: (q: string) =>
     get<{ hits: MemoryRow[] }>(`/api/v1/memory/search?q=${encodeURIComponent(q)}`).then(
@@ -723,6 +754,7 @@ export const api = {
     getChecked<{ documents: KnowledgeDocument[]; embedder: string }>(
       "/api/v1/knowledge/documents",
       { documents: "arrayOfObjects" },
+      { id: "number", name: "string" },
     ),
   knowledgeChunks: (id: number) =>
     get<{ chunks: [number, string][] }>(`/api/v1/knowledge/documents/${id}`).then(
@@ -767,7 +799,7 @@ export const api = {
   wikiPages: () =>
     getChecked<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages", {
       pages: "arrayOfObjects",
-    }).then(
+    }, { slug: "string" }).then(
       (r) => r.pages,
     ),
   wikiLinks: () =>
@@ -807,6 +839,8 @@ export const api = {
     getChecked<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
       `/api/v1/graph/edges?limit=${limit}`,
       { edges: "arrayOfObjects", total: "number", limit: "number", offset: "number" },
+      // Graph.tsx reads id/src/dst/kind off each edge.
+      { id: "number", src: "string", dst: "string" },
     ),
   /** The whole entity list (graphEntities caps at the daemon default of 50). */
   graphEntitiesAll: (limit = 500) =>
