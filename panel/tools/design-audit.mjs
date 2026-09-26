@@ -2851,7 +2851,7 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
         // opens on mousedown, so a DOM .click() here was a silent no-op on every route and left
         // hash2 === hash1. Comboboxes are handled by the dedicated branch below (step 3), which
         // opens them with mousedown and asserts the selection actually changed.
-        ...document.querySelectorAll("[role=tab], [role=radio], input[type=radio], button[aria-pressed], "),
+        ...document.querySelectorAll(URL_STATE_TOGGLE_SEL),
       ].filter(shown).length;
     });
     out.hash1 = await page.evaluate(() => location.hash);
@@ -2973,8 +2973,29 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
 
 // Row 58 verdict. Both halves are required: the hash must CHANGE on a view-
 // state switch, and reloading that hash must land on the SAME state.
+// t338 (F-331d): this selector used to be a literal built inline, and a trailing comma in it
+// (my own t337 edit) made querySelectorAll throw "SyntaxError: not a valid selector" BEFORE the
+// probe looked at a single element -- row 58 went from "always fails" to "never decidable", and
+// the exception text was swallowed into a generic reason. It is a constant now, and its shape is
+// validated by the self-test without needing a browser.
+const URL_STATE_TOGGLE_SEL = "[role=tab], [role=radio], input[type=radio], button[aria-pressed]";
+function validSelectorString(sel) {
+  if (typeof sel !== "string" || !sel.trim()) return false;
+  // Every comma-separated part must be non-empty: "[a], " has an empty last part and throws in
+  // querySelectorAll. That is the whole bug class this validator exists for.
+  return sel.split(",").every((part) => /^[^\s,]+(\s+[^\s,]+)*$/.test(part.trim()));
+}
+
 function urlStateVerdict(o) {
-  if (!o || o.error) return { measured: false, pass: null, why: "url-state probe failed" };
+  // t338 acceptance (2): NEVER swallow the exception text. A probe that died before it looked at
+  // anything must say WHY -- "not a valid selector" and "no view state on this route" are
+  // different facts, and the generic wording made them indistinguishable.
+  if (!o || o.error)
+    return {
+      measured: false,
+      pass: null,
+      why: "url-state probe failed: " + (o && o.error ? String(o.error) : "no error text captured"),
+    };
   if (!o.tabs)
     return {
       measured: false,
@@ -7217,6 +7238,10 @@ function runSelfTest() {
     })(), true);
   check("row58 must-FAIL: the probe DID change the selection but the URL did not move",
     urlStateVerdict({ tabs: 2, hash1: "#chat?agent=approver", hash2: "#chat?agent=approver", fp1: "a", fp2: "a", fp3: "a", pickNote: { picked: "probe", visible: 3, selectable: 2, alreadySelected: 1, before: "approver", after: "probe" } }).pass, false);
+  check("row58: the REAL toggle selector is well-formed (t338: a trailing comma in it made the probe throw before it saw any element)",
+    validSelectorString(URL_STATE_TOGGLE_SEL), true);
+  check("row58 must-not-PASS: the validator REJECTS the exact shape that shipped the bug (a trailing comma)",
+    validSelectorString("[role=tab], [role=radio], input[type=radio], button[aria-pressed], "), false);
   check("row58 must-FAIL: the hash does not change at all",
     urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions", fp1: "a", fp2: "b", fp3: "b" }).pass, false);
   check("row58 must-PASS: the hash changes and replays to the same state",
