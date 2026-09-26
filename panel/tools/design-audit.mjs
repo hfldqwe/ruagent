@@ -2661,8 +2661,10 @@ async function probeOrder(page, baseUrl) {
     }
     // ---- 50: the platform's own injected blocks must not name a row
     const sr = await fetch(baseUrl + "/api/v1/sessions", { signal: AbortSignal.timeout(8000) });
+    if (!sr.ok) throw new Error("row 50: GET /api/v1/sessions returned " + sr.status + " -- cannot measure the object set");
     const sb = await sr.json();
-    const rows = sb.sessions || [];
+    if (!Array.isArray(sb.sessions)) throw new Error("row 50: GET /api/v1/sessions returned no sessions array -- cannot measure the object set");
+    const rows = sb.sessions;
     // The literals WE emit. Not a guess about user content: a user is free to
     // type a bracket, and that must never be counted here.
     const HEADS = ["[memory context", "[role — you are"];
@@ -2672,6 +2674,15 @@ async function probeOrder(page, baseUrl) {
       return HEADS.some((h) => t.startsWith(h) || p.startsWith(h));
     });
     out.sessions = {
+      // WHICH object set this is, recorded by the probe itself. Row 50's object
+      // set is the sessions API's rows, NOT the DOM of whatever route is being
+      // captured: this probe navigates to #chat on its own and reads the API, so
+      // the value is the same on every route. Without this field the report
+      // labels the row with the CAPTURE's route (e.g. "graph/dark"), which reads
+      // as if the graph page had been measured -- t198: that mislabelling is
+      // what made a route mismatch look plausible.
+      source: "/api/v1/sessions",
+      routeIndependent: true,
       total: rows.length,
       bad: bad.length,
       samples: bad.slice(0, 3).map((r) => ({ title: (r.title || "").slice(0, 44), preview: (r.preview || "").slice(0, 44) })),
@@ -2704,9 +2715,14 @@ function anchorMoveVerdict(o, floor) {
   return { measured: true, pass: o.maxMovePx <= floor, maxMovePx: o.maxMovePx, changes: o.membershipChanges };
 }
 function sessionNameVerdict(o) {
-  if (!o || o.error || !o.sessions) return { measured: false, pass: null };
-  if (!o.sessions.total) return { measured: false, pass: null };
-  return { measured: true, pass: o.sessions.bad === 0, total: o.sessions.total, bad: o.sessions.bad, samples: o.sessions.samples };
+  // Every way of NOT measuring gets a NAME. An unnamed empty result is what the
+  // panel team keeps having to reject: it reads like a pass.
+  if (!o) return { measured: false, pass: null, reason: "the order probe produced no result on this capture" };
+  if (o.error) return { measured: false, pass: null, reason: "the order probe failed: " + o.error };
+  if (!o.sessions) return { measured: false, pass: null, reason: "the order probe recorded no sessions reading" };
+  if (o.sessions.error) return { measured: false, pass: null, reason: o.sessions.error };
+  if (!o.sessions.total) return { measured: false, pass: null, reason: "GET " + (o.sessions.source || "/api/v1/sessions") + " returned 0 rows -- nothing to judge" };
+  return { measured: true, pass: o.sessions.bad === 0, total: o.sessions.total, bad: o.sessions.bad, samples: o.sessions.samples, source: o.sessions.source, routeIndependent: o.sessions.routeIndependent };
 }
 
 // Routes that carry a navigation item. #task/<id> is parameterised: it has no
@@ -4595,9 +4611,14 @@ const CHECKS = [
     judge: (c, l) => {
       if (!c.order || c.order.error) return { display: "— (order probe failed)", pass: null };
       const v = sessionNameVerdict(c.order);
-      if (!v.measured) return { display: "— 无会话行（0 个对象）", pass: null };
+      if (!v.measured) return { display: "— not measured: " + v.reason, pass: null };
+      // Name the object set IN the evidence. It is the sessions API, read by a
+      // probe that navigates to #chat itself, so it is the same on every route
+      // -- and saying so is what stops the capture's route label from reading
+      // like the thing that was measured (t198).
+      const src = (v.routeIndependent ? "sessions API (route-independent, not this route's DOM): " : "");
       return {
-        display: "以注入块头开头的行 " + v.bad + " / " + v.total + " 行" + (v.pass ? " ✓" : " ✗ — " + v.samples.map((x) => JSON.stringify(x.title || x.preview)).join(", ")),
+        display: src + "以注入块头开头的行 " + v.bad + " / " + v.total + " 行" + (v.pass ? " ✓" : " ✗ — " + v.samples.map((x) => JSON.stringify(x.title || x.preview)).join(", ")),
         pass: v.pass,
         detail: { total: v.total, bad: v.bad, samples: v.samples },
       };
