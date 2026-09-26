@@ -523,6 +523,16 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
       {!superseded && (
         <div className="row tight">
           {/* Destructive: confirm first (audit P2). Quiet by colour — V4. */}
+          {/* t310: this entry is a TWO-STEP path, and the step order is what makes
+              it look like it does not open: clicking the trigger first shows a
+              Popconfirm (`.ant-popconfirm`, title `memory.supersede.confirm`, focus
+              stays on the trigger) and only its OK mounts the editor (`.ant-modal`,
+              title `memory.supersede.title`, a textarea, focus inside the dialog).
+              Looking for `.ant-modal` right after the click finds nothing; t284
+              measured exactly that and reported MODAL null. Usable selectors:
+              `.memory-card button:has-text(替代)` -> `.ant-popconfirm-buttons
+              button.ant-btn-primary` -> `.ant-modal textarea` +
+              `.ant-modal button.ant-btn-primary`. */}
           <Popconfirm
             title={t("memory.supersede.confirm")}
             okText={t("memory.supersede.btn")}
