@@ -1,6 +1,6 @@
 # 知识库与记忆的闭环优化 — 诊断与任务图（2026-09-26）
 
-> 修订 2：读数阶段（t245/t247/t248/t249/t259）全部完成后重写。§1.1 保留被推翻的前提，不删。
+> 修订 3（最新）：**§6 取代 §2 与 §3**，并补上 §1 缺的 t246/t250 读数。§1.1 保留被推翻的前提，不删。
 
 ## 0 一句话
 
@@ -126,3 +126,49 @@ t250 改派给 tools（它是唯一两次读进 crates/knowledge 内部的人）
 - 只杀自己记录过 PID 的进程；不许 taskkill/pkill/按端口批量杀；不许自己启停守护进程。
 - 提交多行 message 用 `git commit -F`；不要 `git add` 同伴在编辑的整文件；不要 push。
 - output 必须给「改前读数 → 改后读数」，不接受只写「已优化」。
+## 6 修订 3（t246 / t250 之后）—— 本节取代 §2 与 §3
+
+### 6.1 新增读数
+
+| 项 | 读数 | 来源 |
+| --- | --- | --- |
+| 记忆两腿合并 | 5 条只被 semantic 命中 + 2 条只被 FTS 命中的记忆 ⇒ 返回 **7 条 > top_n=5**（上界 2·top_n） | t246 |
+| 关键词条目的分数 | **不存在** —— aggressive 键 `[kind,id,store,namespace,content]`、conservative 键 `[kind,id,store,namespace,title,hint]` | t246 |
+| 真实语料 15/15 | sem 恒等于 top_n、fts 0~2、**new 恒为 0** ⇒ 当前语料把上面两条掩盖了 | t246 |
+| memory/list 未知 store | `store=bogus` → **200 + 13 行**（静默降级成 Observation） | t246 |
+| memory/list 的 namespace | 默认 `user` ⇒ `store=lesson` → **0 行**，而库里 lesson/global 有 **38 条**（同一响应的 counts 显示 38） | t246 |
+| chat 注入预算 | 700 **字节**（用的是 entry.len() 而非字符数）⇒ 符合条件 **115 行只发 4 条**，静默丢 111 行、渲染零提示 | t246 |
+| 注入截断 | 契约路径 24/25 有 [+N chars truncated]、**0/25 有丢块通知**；chat 路径 0/54 有截断标记 | t246 |
+| 实体腿 6 类矩阵 | autohotkey-v2 strict 0 → loose 1 · 潜艇 0 → 1 · 麒麟 0 → 1，其余 8 条无回归 | t250 |
+| 逐腿原始分数 | 现在可取（semantic = LanceDB 距离、keyword = bm25），且融合排名与 search() 逐条一致 | t250 |
+
+### 6.2 新被推翻的前提（接 §1.1）
+
+| 我/成员写的 | 实测 | 错在哪 |
+| --- | --- | --- |
+| 「semantic 满额即丢弃 FTS 腿」（我写进 t251 契约） | FTS 的独占命中会被追加（5+2 ⇒ 7 条） | 把「去重后新增 0」误读成「被丢弃」；当前语料恰好把它掩盖 |
+| 「前缀短语能命中 AutoHotkey」（tools 的机制判断） | 前缀化短语仍要求相邻同列 ⇒ 依然 0 命中 | 把「切词」的修复错记到「前缀」上，且是推断不是读数 |
+| 「strict 必须 miss autohotkey-v2」（我的第一版测试） | 我造的实体叫 `AutoHotkey v2` ⇒ strict 命中，断言当场变红 | 合成语料没照活库的形状造 —— **判据的结论取决于采样面** |
+| t245 前两次 / t250 前两次的形状 | 都是「不编译 + 一张错误清单，零读数」；直接机制是 python 锚点手术 | **问题在方法不在努力**：换精确单点替换后一次通过 |
+
+### 6.3 任务图（18 单）
+
+```
+读数（全部完成）  t245 我接管 · t246 我代收 · t247 我代收 · t248 · t249 · t259
+实现
+  t250 检索腿修复（我接管 attempt 3）        completed
+  t251 召回融合 + 生命周期 API + 日志溯源     claimed mem-core（契约按 t246 修正过）
+  t252 喂料闭环 + doctor 隔离 + wiki 状态     in_progress contract-lead
+  t260 知识/wiki 进入注入 + chat 回归契约     pending mem-core  ← 最高价值
+  t261 知识库 keyword 腿（11/15 真实查询 0 命中） pending retrieval
+  t253 前端：逐腿证据 / 纠正入口 / 日志归位    pending ui-work
+验证  t254 ui-audit · t255 ui-audit · t256 ui-audit(in_progress) · t257 tools · t258 ui-audit
+```
+
+### 6.4 纪律补充（写进后续每张单）
+
+- **改 Rust 一律精确单点替换 + 改完立刻 `cargo check --all-targets`，不要攒批**（三次失败都栽在这里）。
+- **schema 只有 `crates/store/src/migrations` 一个真相源**；需要新列就申请，不要在别的 crate 另起一套（第二套 schema = 第二个真相源）。
+- **执行会话可能没有 `agent_teams_*` 工具**：拿不到就立刻说，不要默默做完再交（t247 与 t246 各卡一次）。
+- **历史行的新列是 NULL，而 NULL 不是 user**：渲染成「unknown（早于该列）」，不许按内容猜、不许静默过滤掉。
+- 环境：`cargo` 需要 `protoc` 在 PATH 上（本机 `~/.protoc/bin`），`CARGO_TARGET_DIR=D:/rust_cache`。
