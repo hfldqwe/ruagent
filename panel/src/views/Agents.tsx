@@ -71,6 +71,8 @@ export function Agents() {
   const [mcpErr, setMcpErr] = useState<unknown>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<AgentInfo | null>(null);
+  /** The agent whose prompt is open in the dialog (null = closed). */
+  const [promptOf, setPromptOf] = useState<AgentInfo | null>(null);
   const toast = useToast();
 
   // One request window for agents + stats + mcp instead of two staggered
@@ -242,15 +244,33 @@ export function Agents() {
                   {a.description}
                 </p>
                 {a.prompt ? (
-                  <details className="prompt-view">
-                    <summary>
-                      {t("agents.promptView")} · {a.prompt.length}{" "}
-                      {t("chat.chars", { n: a.prompt.length }).split(" ")[1] ?? ""}
-                    </summary>
-                    <pre>{a.prompt}</pre>
-                  </details>
+                  <button
+                    type="button"
+                    className="prompt-open"
+                    onClick={() => setPromptOf(a)}
+                  >
+                    {/* t243: the prompt opens in a DIALOG, not by unfolding in
+                       the card: the cards share a grid row, so an in-card unfold
+                       stretched the whole row (measured: one card expanded took
+                       all three cards of the row from 339px to 600px, and pushed
+                       the next row down). The dialog leaves the row's heights
+                       alone and shows the whole prompt. */}
+                    {t("agents.promptView")} · {a.prompt.length}{" "}
+                    {t("chat.chars", { n: a.prompt.length }).split(" ")[1] ?? ""}
+                  </button>
                 ) : null}
-                {a.model ? <span className="tag mono">{a.model}</span> : null}
+                {a.model ? (
+                  <span className="tag mono">{a.model}</span>
+                ) : (
+                  // t243: an agent with no model of its own used to render
+                  // NOTHING here, which read as a missing field. Say it
+                  // instead of leaving a hole. Deliberately NOT a runtime
+                  // default: the runtime's current model is only knowable
+                  // per agent (GET /agents/{name}/options probes the
+                  // harness), so printing one would mean fabricating it or
+                  // one request per card.
+                  <span className="tag">{t("agents.modelUnset")}</span>
+                )}
                 {s && s.runs > 0 ? (
                   <div className="agent-stats">
                     <div className="stat-cell">
@@ -378,6 +398,18 @@ export function Agents() {
             ))}
           </div>
         </Zone>
+      ) : null}
+
+      {promptOf ? (
+        <Modal
+          title={`${t("agents.promptView")} · ${promptOf.name}`}
+          onClose={() => setPromptOf(null)}
+          wide
+        >
+          <div className="prompt-view">
+            <pre>{promptOf.prompt}</pre>
+          </div>
+        </Modal>
       ) : null}
 
       {(creating || editing) && (
