@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -58,7 +58,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/memory/write", post(memory_write))
         .route("/api/v1/memory/supersede", post(memory_supersede))
         .route("/api/v1/memory/diffs", get(memory_diffs))
-        .route("/api/v1/memory/{id}", get(memory_get))
+        .route("/api/v1/memory/{id}", get(memory_get).delete(memory_delete))
+        .route("/api/v1/memory/{id}/restore", post(memory_restore))
         .route("/api/v1/memory/search", get(memory_search))
         .route("/api/v1/memory/list", get(memory_list))
         .route("/api/v1/knowledge/ingest", post(knowledge_ingest))
@@ -2286,18 +2287,32 @@ struct RecallQuery {
     min_score: Option<f64>,
     #[serde(default)]
     top_n: Option<u32>,
+    /// WHO IS CALLING, declared by the caller (?source= wins, then the
+    /// x-ruagent-recall-source header). Omitted = unknown, recorded as NULL.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 async fn recall(
     State(state): State<AppState>,
     Query(q): Query<RecallQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let conservative = q.strategy.as_deref() == Some("conservative");
     let top_n = q.top_n.unwrap_or(5).clamp(1, 20);
 
-    // Memories — semantic leg first (same embedder as the knowledge
-    // base), FTS as the keyword fallback.
-    let semantic = crate::memembed::semantic_search(
+    // WHO CALLED THIS (t251). The caller declares its own source -- query
+    // parameter first, header second -- and a caller that declares nothing is
+    // recorded as NULL. The daemon never infers it: a guess from the query text
+    // would put a second, wrong answer into a column the writer can answer
+    // correctly, and "probe" would stop meaning anything.
+    let source = declared_source(&q.source, &headers)?;
+
+    // Memories: BOTH legs, fused on one scale, bounded by top_n. Before t251
+    // the handler took the semantic leg, seeded a seen-set from it and APPENDED
+    // keyword rows that were not in that set -- a concatenation, bounded by
+    // 2 * top_n, with no score at all on the keyword rows.
+    let mem_legs = crate::memembed::recall_memories(
         state.mgr.db(),
         state.knowledge.embedder(),
         &q.q,
@@ -2305,32 +2320,6 @@ async fn recall(
         if conservative { 0.30 } else { 0.25 },
     )
     .await;
-    let query_text = q.q.clone();
-    let memories: Vec<(i64, String, String, String)> = state
-        .mgr
-        .db()
-        .call(
-            move |conn| -> Result<Vec<(i64, String, String, String)>, ruagent_store::DbError> {
-                let pattern = format!("\"{}\"", query_text.replace('"', "\"\""));
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT m.id, m.store, m.namespace, m.content
-                       FROM memories_fts f JOIN memories m ON m.id = f.rowid
-                      WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL
-                      ORDER BY rank LIMIT ?2",
-                    )
-                    .map_err(ruagent_store::DbError::from)?;
-                let rows = stmt
-                    .query_map(rusqlite::params![pattern, top_n], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })
-                    .map_err(ruagent_store::DbError::from)?;
-                Ok(rows.filter_map(|r| r.ok()).collect())
-            },
-        )
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e}")))?
-        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
 
     // Knowledge chunks (hybrid semantic + keyword). Parent-child
     // retrieval (WeKnora): the hit is the precise unit, the aggressive
@@ -2404,62 +2393,100 @@ async fn recall(
     }
 
     let min_score = q.min_score.unwrap_or(0.0) as f32;
-    let mut seen_ids: std::collections::HashSet<i64> = semantic.iter().map(|m| m.0).collect();
+    // One entry per FUSED result: every row carries the same score scale and
+    // names the legs that found it, plus each leg's own raw score. The fused
+    // score is a RANK score (RRF), so it is labelled -- the panel showed the
+    // knowledge leg's RRF score next to the memory leg's cosine in one column
+    // and invited exactly that misreading (t247).
     let mut out_memories: Vec<serde_json::Value> = Vec::new();
-    for (id, store, ns, content, score) in &semantic {
+    for hit in &mem_legs.hits {
         out_memories.push(if conservative {
             serde_json::json!({
-                "kind": "memory", "id": id, "store": store, "namespace": ns,
-                "title": truncate_chars(content, 60),
-                "score": (score * 100.0).round() / 100.0,
+                "kind": "memory", "id": hit.id, "store": hit.store,
+                "namespace": hit.namespace,
+                "title": truncate_chars(&hit.content, 60),
+                "score": round_to(hit.score, 6),
+                "score_kind": "rrf_rank",
+                "legs": hit.legs,
+                "semantic_score": hit.semantic_score.map(|v| round_to(v, 4)),
+                "keyword_score": hit.keyword_score.map(|v| round_to(v, 4)),
                 "hint": "call memory_get(id) for full content",
             })
         } else {
             serde_json::json!({
-                "kind": "memory", "id": id, "store": store, "namespace": ns,
-                "content": content, "score": (score * 100.0).round() / 100.0,
+                "kind": "memory", "id": hit.id, "store": hit.store,
+                "namespace": hit.namespace,
+                "content": hit.content,
+                "score": round_to(hit.score, 6),
+                "score_kind": "rrf_rank",
+                "legs": hit.legs,
+                "semantic_score": hit.semantic_score.map(|v| round_to(v, 4)),
+                "keyword_score": hit.keyword_score.map(|v| round_to(v, 4)),
             })
         });
     }
-    for (id, store, ns, content) in memories {
-        if seen_ids.contains(&id) {
+    // t250's per-leg evidence, at the HTTP layer. The fused score alone cannot
+    // say WHICH leg found a chunk or how well it scored in that leg, so every
+    // knowledge hit carries its legs, ranks and raw scores (semantic: LanceDB
+    // distance, lower is closer; keyword: bm25, more negative is better).
+    //
+    // COST, stated rather than hidden: this is a second pass over the same two
+    // legs. crates/knowledge is frozen by t250, so search() and search_legs()
+    // cannot be merged into one call from here; both use the same leg_k, so the
+    // leg sets are identical by construction.
+    let legs = state.knowledge.search_legs(&q.q, search_n).await;
+    let leg_of = |v: &[ruagent_knowledge::store::LegHit], id: i64| -> Option<(usize, f64)> {
+        v.iter()
+            .find(|l| l.chunk_id == id)
+            .map(|l| (l.rank, l.raw_score as f64))
+    };
+    let (sem_legs, kw_legs) = match &legs {
+        Ok(l) => (l.semantic.as_slice(), l.keyword.as_slice()),
+        Err(_) => (&[][..], &[][..]),
+    };
+    let mut out_chunks: Vec<serde_json::Value> = Vec::new();
+    for hit in hits {
+        if (hit.score as f64) < min_score as f64 {
             continue;
         }
-        seen_ids.insert(id);
-        out_memories.push(if conservative {
-            serde_json::json!({
-                "kind": "memory", "id": id, "store": store, "namespace": ns,
-                "title": truncate_chars(&content, 60),
-                "hint": "call memory_get(id) for full content",
-            })
-        } else {
-            serde_json::json!({
-                "kind": "memory", "id": id, "store": store, "namespace": ns,
-                "content": content,
-            })
-        });
-    }
-    let mut out_chunks: Vec<serde_json::Value> = Vec::new();
-    for h in hits {
-        if (h.score as f64) < min_score as f64 {
-            continue;
+        let sem = leg_of(sem_legs, hit.chunk_id);
+        let kw = leg_of(kw_legs, hit.chunk_id);
+        let mut found_in: Vec<&str> = Vec::new();
+        if sem.is_some() {
+            found_in.push("semantic");
+        }
+        if kw.is_some() {
+            found_in.push("keyword");
         }
         out_chunks.push(if conservative {
             serde_json::json!({
-                "kind": "knowledge", "chunk_id": h.chunk_id, "document": h.document,
-                "excerpt": truncate_chars(&h.content, 80),
+                "kind": "knowledge", "chunk_id": hit.chunk_id, "document": hit.document,
+                "excerpt": truncate_chars(&hit.content, 80),
+                "score": hit.score,
+                "score_kind": "rrf_rank",
+                "legs": found_in,
+                "semantic_rank": sem.map(|(r, _)| r as i64),
+                "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
+                "keyword_rank": kw.map(|(r, _)| r as i64),
+                "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
                 "hint": "call knowledge_expand(chunk_id) for the full section",
             })
         } else {
             serde_json::json!({
-                "kind": "knowledge", "chunk_id": h.chunk_id, "document": h.document,
+                "kind": "knowledge", "chunk_id": hit.chunk_id, "document": hit.document,
                 // The parent section (capped): the hit's full context.
                 "content": parents
-                    .get(&h.chunk_id)
+                    .get(&hit.chunk_id)
                     .map(|p| truncate_chars(p, PARENT_CONTEXT_CAP))
-                    .unwrap_or_else(|| h.content.clone()),
-                "excerpt": truncate_chars(&h.content, 160),
-                "score": h.score,
+                    .unwrap_or_else(|| hit.content.clone()),
+                "excerpt": truncate_chars(&hit.content, 160),
+                "score": hit.score,
+                "score_kind": "rrf_rank",
+                "legs": found_in,
+                "semantic_rank": sem.map(|(r, _)| r as i64),
+                "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
+                "keyword_rank": kw.map(|(r, _)| r as i64),
+                "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
             })
         });
     }
@@ -2500,15 +2527,36 @@ async fn recall(
                 })
             })
             .collect::<Vec<_>>();
-        let related_memories: Vec<serde_json::Value> = semantic
+        // Two sources, one pool: the fused recall hits (both legs) plus the
+        // entity-name keyword leg. The fused hits replaced the old raw
+        // `semantic` vector; fts_related still searches by the ENTITY name,
+        // which the query-keyed hits cannot do.
+        let mut related_pool: Vec<(i64, String, String, String)> = mem_legs
+            .hits
             .iter()
-            .chain(fts_related(&state, &e.name).await.iter())
-            .filter(|(_, _, _, c, _)| c.contains(&e.name))
+            .map(|m| {
+                (
+                    m.id,
+                    m.store.clone(),
+                    m.namespace.clone(),
+                    m.content.clone(),
+                )
+            })
+            .collect();
+        related_pool.extend(
+            fts_related(&state, &e.name)
+                .await
+                .into_iter()
+                .map(|(id, store, ns, content, _)| (id, store, ns, content)),
+        );
+        let related_memories: Vec<serde_json::Value> = related_pool
+            .into_iter()
+            .filter(|(_, _, _, c)| c.contains(&e.name))
             .take(2)
-            .map(|(id, store, ns, content, _)| {
+            .map(|(id, store, ns, content)| {
                 serde_json::json!({
                     "id": id, "store": store, "namespace": ns,
-                    "title": truncate_chars(content, 60),
+                    "title": truncate_chars(&content, 60),
                 })
             })
             .collect();
@@ -2540,9 +2588,14 @@ async fn recall(
         });
     }
 
-    // M6: usage log for threshold tuning — one row per call with the
+    // M6: usage log for threshold tuning -- one row per call with the
     // per-section counts and raw top scores (what the filters kept vs
     // dropped). Fire-and-forget; local sqlite, sub-millisecond.
+    //
+    // source (t251) records WHO DECLARED this call: what the caller said, or
+    // NULL. NULL means unknown -- and it is what every row written before this
+    // column means, so a reader must render NULL as "unknown (pre-0018)"
+    // instead of defaulting it to a real caller.
     {
         let db = state.mgr.db().clone();
         let query: String = q.q.chars().take(200).collect();
@@ -2557,14 +2610,15 @@ async fn recall(
             out_wiki.len() as i64,
             out_entities.len() as i64,
         );
-        let tm = semantic.first().map(|m| m.4 as f64);
+        let tm = mem_legs.top_semantic_score;
+        let declared = source.clone();
         let _ = db
             .call(move |conn| -> Result<(), rusqlite::Error> {
                 conn.execute(
                     "INSERT INTO recall_log
                         (ts, query, strategy, top_n, memories, knowledge, wiki, entities,
-                         top_memory_score, top_knowledge_score)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                         top_memory_score, top_knowledge_score, source)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     rusqlite::params![
                         chrono::Utc::now().to_rfc3339(),
                         query,
@@ -2576,33 +2630,75 @@ async fn recall(
                         ne,
                         tm,
                         top_knowledge_score,
+                        declared,
                     ],
+                )?;
+                // Retention (t251): the log is a tuning SAMPLE, not a ledger.
+                // The self-check probes alone wrote 554 of the 574 live rows
+                // (t247), and unbounded growth turns "the recent calls" into
+                // "every call ever". Keep the newest RECALL_LOG_KEEP; a no-op
+                // while the table is smaller than that.
+                conn.execute(
+                    "DELETE FROM recall_log WHERE id <= (SELECT MAX(id) FROM recall_log) - ?1",
+                    [RECALL_LOG_KEEP],
                 )?;
                 Ok(())
             })
             .await;
     }
-
     Ok(Json(serde_json::json!({
         "strategy": if conservative { "conservative" } else { "aggressive" },
+        // The caller's declared source, echoed back: a caller can see that its
+        // declaration was recorded, and a caller that declared nothing sees
+        // null rather than a guessed label.
+        "source": source,
         "memories": out_memories,
+        // What each memory leg did. Before t251 the response could not
+        // distinguish "the keyword leg added nothing" from "the keyword leg was
+        // discarded" -- both looked like memories.len() == top_n.
+        "memory_legs": {
+            "semantic": mem_legs.semantic,
+            "keyword": mem_legs.keyword,
+            "keyword_new": mem_legs.keyword_new,
+            "returned": out_memories.len(),
+            "dropped_by_top_n": mem_legs.dropped_by_top_n,
+            "top_semantic_score": mem_legs.top_semantic_score,
+        },
         "knowledge": out_chunks,
-        // §13-2: wiki hits are a separate section — never merged into
-        // knowledge — so consumers can distinguish generated pages and
+        // SS13-2: wiki hits are a separate section -- never merged into
+        // knowledge -- so consumers can distinguish generated pages and
         // downweight or verify them.
         "wiki": out_wiki,
         "entities": out_entities,
     })))
 }
 
-/// Recent recall calls with per-section counts and raw top scores —
-/// the M6 tuning dataset (which sections came back empty, what the
-/// filters dropped).
+/// Recent recall calls with per-section counts and raw top scores -- the M6
+/// tuning dataset (which sections came back empty, what the filters dropped),
+/// plus the declared source and the retention state.
+#[derive(Deserialize)]
+struct RecallLogQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Optional source filter. The literal "unknown" selects the rows that
+    /// predate the column (source IS NULL) -- those rows are NOT filtered out
+    /// by default, because dropping 574 rows of history would look tidier than
+    /// it is.
+    #[serde(default)]
+    source: Option<String>,
+}
+
 async fn recall_log(
     State(state): State<AppState>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<RecallLogQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let filter = q
+        .source
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let filter_tx = filter.clone();
     let rows = state
         .mgr
         .db()
@@ -2610,11 +2706,16 @@ async fn recall_log(
             move |conn| -> Result<Vec<serde_json::Value>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT ts, query, strategy, top_n, memories, knowledge, wiki, entities,
-                            top_memory_score, top_knowledge_score
-                       FROM recall_log ORDER BY id DESC LIMIT ?1",
+                            top_memory_score, top_knowledge_score, source
+                       FROM recall_log
+                      WHERE (?2 IS NULL
+                             OR (?2 = 'unknown' AND source IS NULL)
+                             OR source = ?2)
+                      ORDER BY id DESC LIMIT ?1",
                 )?;
                 let rows = stmt
-                    .query_map([limit], |r| {
+                    .query_map(rusqlite::params![limit, filter_tx], |r| {
+                        let source: Option<String> = r.get(10)?;
                         Ok(serde_json::json!({
                             "ts": r.get::<_, String>(0)?,
                             "query": r.get::<_, String>(1)?,
@@ -2626,6 +2727,14 @@ async fn recall_log(
                             "entities": r.get::<_, i64>(7)?,
                             "top_memory_score": r.get::<_, Option<f64>>(8)?,
                             "top_knowledge_score": r.get::<_, Option<f64>>(9)?,
+                            // null is preserved as null: it is a fact about the
+                            // row (written before the column existed), not a
+                            // missing value to be papered over.
+                            "source": source,
+                            "source_label": match &source {
+                                Some(s) => s.clone(),
+                                None => "unknown (pre-0018)".to_string(),
+                            },
                         }))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2633,7 +2742,96 @@ async fn recall_log(
             },
         )
         .await??;
-    Ok(Json(serde_json::json!({ "log": rows })))
+    let retention = state
+        .mgr
+        .db()
+        .call(|conn| -> Result<serde_json::Value, rusqlite::Error> {
+            conn.query_row(
+                "SELECT COUNT(*), MIN(ts), MAX(ts), COALESCE(SUM(source IS NULL), 0)
+                   FROM recall_log",
+                [],
+                |r| {
+                    Ok(serde_json::json!({
+                        "policy": "keep the newest rows; older rows are pruned on write",
+                        "max_rows": RECALL_LOG_KEEP,
+                        "rows": r.get::<_, i64>(0)?,
+                        "oldest_ts": r.get::<_, Option<String>>(1)?,
+                        "newest_ts": r.get::<_, Option<String>>(2)?,
+                        "rows_without_source": r.get::<_, i64>(3)?,
+                    }))
+                },
+            )
+        })
+        .await??;
+    Ok(Json(serde_json::json!({
+        "log": rows,
+        "retention": retention,
+        "source_filter": filter,
+    })))
+}
+
+/// Rows kept in recall_log (t251). The log is a tuning SAMPLE, not a ledger:
+/// the self-check probes alone wrote 554 of the 574 live rows (t247), and
+/// unbounded growth turns "the recent calls" into "every call ever". 5000 is
+/// roughly a month of current usage and a no-op while the table is smaller.
+const RECALL_LOG_KEEP: i64 = 5000;
+
+/// The declared recall source: the query parameter wins, then the
+/// x-ruagent-recall-source header. None means the caller declared nothing,
+/// which is recorded as NULL -- never inferred from the request.
+///
+/// WHY NOT INFER IT: the only signal that separates the self-check probe from
+/// a real user is the query text ("kettle material"), and a column filled by
+/// pattern-matching query text is a second, wrong answer to a question the
+/// writer can answer correctly. The caller declares; the daemon records.
+fn declared_source(
+    param: &Option<String>,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let raw = param.clone().or_else(|| {
+        headers
+            .get("x-ruagent-recall-source")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
+    let Some(raw) = raw else { return Ok(None) };
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        // An explicitly empty value declares nothing; it is not an error.
+        return Ok(None);
+    }
+    if s.len() > 32
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ApiError::bad_request(
+            "source must be 1..=32 chars of [a-z0-9_-] (probe, user, distill, mcp, cli, ...)",
+        ));
+    }
+    Ok(Some(s))
+}
+
+/// Round for display without inventing precision: RRF scores live around 1/61,
+/// so two decimals would collapse every fused row onto the same number.
+fn round_to(v: f64, places: i32) -> f64 {
+    let f = 10f64.powi(places);
+    (v * f).round() / f
+}
+
+/// One of the four stores, or a 400 naming the valid set. The old handler
+/// mapped EVERY unknown value to Observation, so store=observations (plural),
+/// store=OBSERVATION and store=bogus all returned 200 with observation rows.
+fn parse_store(s: &str) -> Result<ruagent_memory::MemoryStore, ApiError> {
+    match s {
+        "profile" => Ok(ruagent_memory::MemoryStore::Profile),
+        "observation" => Ok(ruagent_memory::MemoryStore::Observation),
+        "procedure" => Ok(ruagent_memory::MemoryStore::Procedure),
+        "lesson" => Ok(ruagent_memory::MemoryStore::Lesson),
+        other => Err(ApiError::bad_request(format!(
+            "unknown store {other}: expected one of profile, observation, procedure, lesson"
+        ))),
+    }
 }
 
 /// FTS memories matching `term` (the keyword leg for entity navigation).
@@ -2650,6 +2848,7 @@ async fn fts_related(state: &AppState, term: &str) -> Vec<(i64, String, String, 
                     "SELECT m.id, m.store, m.namespace, m.content
                        FROM memories_fts f JOIN memories m ON m.id = f.rowid
                       WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL
+                        AND m.deleted_at IS NULL
                       ORDER BY rank LIMIT 3",
                 )
                 .map_err(ruagent_store::DbError::from)?;
@@ -3362,36 +3561,94 @@ async fn memory_search(
     Ok(Json(serde_json::json!({ "hits": hits })))
 }
 
+#[derive(Deserialize)]
+struct MemoryListQuery {
+    /// Omitted or empty = every store. An unknown value is a 400 naming the
+    /// valid set, not a silent fallback to observation (t251: store=bogus used
+    /// to return 200 with 13 observation rows).
+    #[serde(default)]
+    store: Option<String>,
+    /// Omitted or empty = every namespace. The old handler defaulted to
+    /// "user", so store=lesson returned 0 rows while the store held 38
+    /// (t246 measured exactly that).
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
 async fn memory_list(
     State(state): State<AppState>,
     Query(q): Query<MemoryListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = match q.store.as_str() {
-        "profile" => ruagent_memory::MemoryStore::Profile,
-        "procedure" => ruagent_memory::MemoryStore::Procedure,
-        "lesson" => ruagent_memory::MemoryStore::Lesson,
-        _ => ruagent_memory::MemoryStore::Observation,
+    let store = match q.store.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => Some(parse_store(s)?),
     };
-    let namespace = q.namespace.clone().unwrap_or_else(|| "user".into());
-    let hits = ruagent_memory::query::current_memories(
-        state.mgr.db(),
-        store,
-        &namespace,
-        q.limit.unwrap_or(50),
-    )
-    .await?;
+    let namespace = match q.namespace.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(ns) => Some(ns.to_string()),
+    };
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let memories =
+        ruagent_memory::query::all_memories(state.mgr.db(), store, namespace.clone(), limit)
+            .await?;
+    let matched = ruagent_memory::query::count_memories(state.mgr.db(), store, namespace).await?;
     let counts = ruagent_memory::query::store_counts(state.mgr.db()).await?;
-    Ok(Json(
-        serde_json::json!({ "memories": hits, "counts": counts }),
-    ))
+    Ok(Json(serde_json::json!({
+        "memories": memories,
+        // total = the rows IN THIS RESPONSE; matched = how many rows the filter
+        // matches before the limit. Both are reported because the response is a
+        // page: a caller that reads only one of them must not conclude the
+        // store is empty (the failure this replaces: store=lesson returned 0
+        // rows while counts reported 38).
+        "total": memories.len(),
+        "matched": matched,
+        "limit": limit,
+        "store": q.store,
+        "namespace": q.namespace,
+        "counts": counts,
+    })))
 }
 
-#[derive(Deserialize)]
-struct MemoryListQuery {
-    store: String,
-    namespace: Option<String>,
-    #[serde(default)]
-    limit: Option<u32>,
+/// Soft-delete one memory: DELETE /api/v1/memory/{id}. The row stays (with
+/// deleted_at set) and memory_diffs records the retraction, so the audit can
+/// still answer "what was removed, and when".
+async fn memory_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid memory id"))?;
+    match ruagent_memory::delete_memory(state.mgr.db(), id).await? {
+        ruagent_memory::DeleteOutcome::Deleted { id, deleted_at } => Ok(Json(serde_json::json!({
+            "outcome": "deleted", "id": id, "deleted_at": deleted_at, "soft": true,
+        }))),
+        ruagent_memory::DeleteOutcome::AlreadyDeleted { id, deleted_at } => Err(
+            ApiError::conflict(format!("memory {id} was already deleted at {deleted_at}")),
+        ),
+        ruagent_memory::DeleteOutcome::NotFound => Err(ApiError::not_found("memory not found")),
+    }
+}
+
+/// Undo a soft delete: POST /api/v1/memory/{id}/restore.
+async fn memory_restore(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid memory id"))?;
+    match ruagent_memory::restore_memory(state.mgr.db(), id).await? {
+        ruagent_memory::RestoreOutcome::Restored { id } => {
+            Ok(Json(serde_json::json!({ "outcome": "restored", "id": id })))
+        }
+        ruagent_memory::RestoreOutcome::NotDeleted { id } => {
+            Err(ApiError::conflict(format!("memory {id} is not deleted")))
+        }
+        ruagent_memory::RestoreOutcome::NotFound => Err(ApiError::not_found("memory not found")),
+    }
 }
 
 #[derive(Deserialize)]

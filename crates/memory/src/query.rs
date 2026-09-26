@@ -22,6 +22,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
         confidence: row.get("confidence")?,
         supersedes: row.get("supersedes")?,
         superseded_at: row.get("superseded_at")?,
+        deleted_at: row.get("deleted_at")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -40,9 +41,10 @@ pub async fn current_memories(
     db.call(move |conn| -> Result<Vec<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
-                    created_at, updated_at
+                    deleted_at, created_at, updated_at
              FROM memories
-             WHERE store = ?1 AND namespace = ?2 AND superseded_at IS NULL
+             WHERE store = ?1 AND namespace = ?2
+               AND superseded_at IS NULL AND deleted_at IS NULL
              ORDER BY updated_at DESC LIMIT ?3",
         )?;
         let rows = stmt
@@ -61,10 +63,10 @@ pub async fn search_fts(db: &Db, query: &str, limit: u32) -> Result<Vec<MemoryRo
     db.call(move |conn| -> Result<Vec<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.store, m.namespace, m.content, m.confidence, m.supersedes,
-                    m.superseded_at, m.created_at, m.updated_at
+                    m.superseded_at, m.deleted_at, m.created_at, m.updated_at
              FROM memories_fts f
              JOIN memories m ON m.id = f.rowid
-             WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL
+             WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL AND m.deleted_at IS NULL
              ORDER BY rank LIMIT ?2",
         )?;
         let rows = stmt
@@ -76,12 +78,50 @@ pub async fn search_fts(db: &Db, query: &str, limit: u32) -> Result<Vec<MemoryRo
     .map_err(DbError::from)
 }
 
-/// One memory by id (any state, superseded included).
+/// The keyword leg WITH its own score: SQLite FTS5 `bm25()`, where a more
+/// negative value is a better match. `search_fts` stays as the score-less
+/// form for callers that only want the rows.
+///
+/// WHY A SCORE AT ALL (t251): the recall merge used to append this leg's rows
+/// with no score, so the only ranked leg was the semantic one and the merged
+/// array was a concatenation, not a ranking. A leg that reports its own score
+/// can be fused on one scale and inspected afterwards.
+pub async fn search_fts_scored(
+    db: &Db,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<(MemoryRow, f64)>, DbError> {
+    let query = query.to_string();
+    db.call(
+        move |conn| -> Result<Vec<(MemoryRow, f64)>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.store, m.namespace, m.content, m.confidence, m.supersedes,
+                    m.superseded_at, m.deleted_at, m.created_at, m.updated_at,
+                    bm25(memories_fts)
+             FROM memories_fts f
+             JOIN memories m ON m.id = f.rowid
+             WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL AND m.deleted_at IS NULL
+             ORDER BY rank LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![query, limit], |r| {
+                    Ok((row_to_memory(r)?, r.get::<_, f64>(10)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        },
+    )
+    .await?
+    .map_err(DbError::from)
+}
+
+/// One memory by id (any state: superseded and soft-deleted included — this
+/// is the row the audit and the restore path need to see).
 pub async fn get_memory(db: &Db, id: i64) -> Result<Option<MemoryRow>, DbError> {
     db.call(move |conn| -> Result<Option<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
-                    created_at, updated_at
+                    deleted_at, created_at, updated_at
              FROM memories WHERE id = ?1",
         )?;
         let mut rows = stmt.query([id])?;
@@ -139,7 +179,8 @@ pub async fn store_counts(db: &Db) -> Result<Vec<(String, String, i64)>, DbError
         |conn| -> Result<Vec<(String, String, i64)>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT store, namespace, COUNT(*) FROM memories
-             WHERE superseded_at IS NULL GROUP BY store, namespace ORDER BY store, namespace",
+             WHERE superseded_at IS NULL AND deleted_at IS NULL
+             GROUP BY store, namespace ORDER BY store, namespace",
             )?;
             let rows = stmt
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -147,6 +188,60 @@ pub async fn store_counts(db: &Db) -> Result<Vec<(String, String, i64)>, DbError
             Ok(rows)
         },
     )
+    .await?
+    .map_err(DbError::from)
+}
+
+/// Every LIVE memory, optionally narrowed by store and/or namespace.
+///
+/// WHY THE `?1 IS NULL OR ...` SHAPE: the API has to express "all stores" and
+/// "all namespaces" without building SQL from strings, and a NULL parameter is
+/// the one form where the filter set and the statement cannot drift apart.
+pub async fn all_memories(
+    db: &Db,
+    store: Option<MemoryStore>,
+    namespace: Option<String>,
+    limit: u32,
+) -> Result<Vec<MemoryRow>, DbError> {
+    let store = store.map(|s| s.as_str().to_string());
+    db.call(move |conn| -> Result<Vec<MemoryRow>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
+                    deleted_at, created_at, updated_at
+             FROM memories
+             WHERE superseded_at IS NULL AND deleted_at IS NULL
+               AND (?1 IS NULL OR store = ?1)
+               AND (?2 IS NULL OR namespace = ?2)
+             ORDER BY store, namespace, updated_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![store, namespace, limit], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
+/// How many live memories match the same filter `all_memories` takes,
+/// IGNORING the limit — the number the caller gets back as `matched`.
+pub async fn count_memories(
+    db: &Db,
+    store: Option<MemoryStore>,
+    namespace: Option<String>,
+) -> Result<i64, DbError> {
+    let store = store.map(|s| s.as_str().to_string());
+    db.call(move |conn| -> Result<i64, rusqlite::Error> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE superseded_at IS NULL AND deleted_at IS NULL
+               AND (?1 IS NULL OR store = ?1)
+               AND (?2 IS NULL OR namespace = ?2)",
+            rusqlite::params![store, namespace],
+            |r| r.get(0),
+        )
+    })
     .await?
     .map_err(DbError::from)
 }

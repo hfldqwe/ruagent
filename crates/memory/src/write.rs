@@ -165,8 +165,10 @@ pub async fn write_memory(db: &Db, write: &MemoryWrite) -> Result<WriteOutcome, 
     Ok(result)
 }
 
-/// Append to the audit log.
-async fn audit(
+/// Append to the audit log. `pub(crate)` so the lifecycle path (t251)
+/// writes the same table through the same statement — one audit writer, not
+/// two that can drift.
+pub(crate) async fn audit(
     db: &Db,
     op: &str,
     mem_store: &str,

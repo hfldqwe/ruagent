@@ -60,7 +60,8 @@ pub async fn semantic_search(
                 .prepare(
                     "SELECT id, store, namespace, content, embedding
                        FROM memories
-                      WHERE embedding IS NOT NULL AND superseded_at IS NULL",
+                      WHERE embedding IS NOT NULL AND superseded_at IS NULL
+                        AND deleted_at IS NULL",
                 )
                 .map_err(ruagent_store::DbError::from)?;
             let rows = stmt
@@ -117,7 +118,8 @@ pub async fn reembed_stale(db: &Db, embedder: Arc<dyn Embedder>) -> usize {
         .call(move |conn| -> Result<Vec<(i64, String)>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT id, content FROM memories
-                  WHERE embedding IS NULL OR embedder IS NULL OR embedder != ?1",
+                  WHERE (embedding IS NULL OR embedder IS NULL OR embedder != ?1)
+                    AND deleted_at IS NULL",
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![active], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -134,6 +136,158 @@ pub async fn reembed_stale(db: &Db, embedder: Arc<dyn Embedder>) -> usize {
         embed_row(db, embedder.clone(), id, &content).await;
     }
     n
+}
+
+/// One memory recall result: the row, the ONE fused score both legs share,
+/// and each leg's own raw evidence.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MemoryHit {
+    pub id: i64,
+    pub store: String,
+    pub namespace: String,
+    pub content: String,
+    /// Fused rank score (RRF, k = 60): the single scale every returned row
+    /// shares, so a semantic row and a keyword-only row can be ordered against
+    /// each other. It is a RANK score, not a similarity -- the API labels it
+    /// (score_kind) and carries each leg's raw score beside it.
+    pub score: f64,
+    /// Which legs returned this row: "semantic", "keyword", or both.
+    pub legs: Vec<&'static str>,
+    /// This row's cosine from the semantic leg (None when that leg missed it).
+    pub semantic_score: Option<f64>,
+    /// This row's bm25 from the keyword leg -- more negative is better (None
+    /// when that leg missed it).
+    pub keyword_score: Option<f64>,
+}
+
+/// Both legs, and the fused result already bounded by top_n.
+#[derive(Debug, Clone, Default)]
+pub struct RecallLegs {
+    /// Rows the semantic leg returned (already thresholded and cut to top_n).
+    pub semantic: usize,
+    /// Rows the keyword leg returned (cut to top_n by rank).
+    pub keyword: usize,
+    /// Keyword rows the semantic leg did NOT have -- the keyword leg's actual
+    /// contribution. Before t251 nothing recorded this: the merged array was a
+    /// concatenation, so "the keyword leg added nothing" and "the keyword leg
+    /// was discarded" looked identical from outside.
+    pub keyword_new: usize,
+    /// Fused rows the top_n bound cut. The old merge had no bound at all: 5
+    /// semantic + 2 keyword-only rows returned 7 rows for top_n = 5.
+    pub dropped_by_top_n: usize,
+    /// The semantic leg's best cosine BEFORE the threshold -- what the log
+    /// records as top_memory_score.
+    pub top_semantic_score: Option<f64>,
+    pub hits: Vec<MemoryHit>,
+}
+
+/// RRF's k. The knowledge base fuses with 60 (crates/knowledge/src/rrf.rs);
+/// reusing the same constant here means the two subsystems do not invent
+/// different rank scales for the same kind of evidence.
+const RRF_K: u32 = 60;
+
+/// The keyword leg's FTS query: the WHOLE query as one quoted phrase.
+///
+/// DELIBERATELY UNCHANGED BY t251. The knowledge and entity legs split the
+/// query into tokens and AND them (crates/store/src/fts.rs, t250); this leg
+/// wraps the whole query in one phrase, so a multi-word query matches only when
+/// its tokens are adjacent (t247 measured 11/15 real queries at 0 keyword hits
+/// for exactly this reason). Consolidating it onto ruagent_store::fts::terms +
+/// match_all is a one-line change -- and it changes what recall RETURNS, not
+/// how the legs are fused, so it is left for a task whose acceptance covers it.
+/// t251 makes the leg's contribution VISIBLE (keyword_new) instead of changing
+/// it.
+fn keyword_pattern(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
+/// Recall memories across BOTH legs, fused on one scale and bounded by top_n.
+///
+/// THE BUG THIS REPLACES (t246): the handler took the semantic leg, seeded a
+/// seen-set from it, then APPENDED keyword rows that were not in the set. So
+/// (a) the result was a concatenation, not a ranking; (b) the total was bounded
+/// by 2 * top_n, not top_n; (c) keyword rows carried no score at all, so no
+/// consumer could compare or re-rank them; (d) recall_log could not tell a
+/// keyword contribution from a keyword discard.
+///
+/// The semantic leg keeps its cosine floor (the caller's threshold): that is
+/// the precision gate. The keyword leg is admitted by RANK (its top_n by
+/// bm25), because bm25 has no absolute scale to threshold on. The two ranked
+/// lists are then fused with RRF, which is the only scale that is honestly
+/// comparable across a cosine leg and a bm25 leg.
+pub async fn recall_memories(
+    db: &Db,
+    embedder: Arc<dyn Embedder>,
+    query: &str,
+    top_n: u32,
+    min_score: f32,
+) -> RecallLegs {
+    let semantic = semantic_search(db, embedder, query, top_n, min_score).await;
+    let keyword = ruagent_memory::query::search_fts_scored(db, &keyword_pattern(query), top_n)
+        .await
+        .unwrap_or_default();
+
+    let sem_ids: Vec<i64> = semantic.iter().map(|m| m.0).collect();
+    let kw_ids: Vec<i64> = keyword.iter().map(|(row, _)| row.id).collect();
+    let keyword_new = kw_ids.iter().filter(|id| !sem_ids.contains(id)).count();
+
+    let fused = ruagent_knowledge::rrf(&[sem_ids, kw_ids], RRF_K);
+    let dropped_by_top_n = fused.len().saturating_sub(top_n as usize);
+
+    // Row data from either leg: the semantic leg's tuple, the keyword leg's row.
+    let mut row_of: std::collections::HashMap<i64, (String, String, String)> =
+        std::collections::HashMap::new();
+    let mut sem_of: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    let mut kw_of: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for (id, store, ns, content, score) in &semantic {
+        row_of.insert(*id, (store.clone(), ns.clone(), content.clone()));
+        sem_of.insert(*id, *score as f64);
+    }
+    for (row, score) in &keyword {
+        row_of.insert(
+            row.id,
+            (
+                row.store.as_str().to_string(),
+                row.namespace.clone(),
+                row.content.clone(),
+            ),
+        );
+        kw_of.insert(row.id, *score);
+    }
+
+    let hits = fused
+        .into_iter()
+        .take(top_n as usize)
+        .filter_map(|(id, score)| {
+            let (store, namespace, content) = row_of.get(&id)?.clone();
+            let mut legs = Vec::new();
+            if sem_of.contains_key(&id) {
+                legs.push("semantic");
+            }
+            if kw_of.contains_key(&id) {
+                legs.push("keyword");
+            }
+            Some(MemoryHit {
+                id,
+                store,
+                namespace,
+                content,
+                score: score as f64,
+                legs,
+                semantic_score: sem_of.get(&id).copied(),
+                keyword_score: kw_of.get(&id).copied(),
+            })
+        })
+        .collect();
+
+    RecallLegs {
+        semantic: semantic.len(),
+        keyword: keyword.len(),
+        keyword_new,
+        dropped_by_top_n,
+        top_semantic_score: semantic.first().map(|m| m.4 as f64),
+        hits,
+    }
 }
 
 #[cfg(test)]

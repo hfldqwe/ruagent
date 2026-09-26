@@ -9,11 +9,13 @@
 
 pub mod episode;
 pub mod inject;
+pub mod lifecycle;
 pub mod namespace;
 pub mod query;
 pub mod write;
 
 pub use inject::{InjectionBudget, MemoryForInjection, render_injection};
+pub use lifecycle::{DeleteOutcome, RestoreOutcome, delete_memory, restore_memory};
 pub use namespace::Namespace;
 pub use write::{MemoryWrite, WriteOutcome, write_memory};
 
@@ -71,6 +73,10 @@ pub struct MemoryRow {
     pub confidence: f64,
     pub supersedes: Option<i64>,
     pub superseded_at: Option<String>,
+    /// Soft-delete tombstone (t251). `Some` = retracted by the user or by a
+    /// governance rule; the row and its audit trail stay. Every read path
+    /// filters `deleted_at IS NULL`.
+    pub deleted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
