@@ -10,6 +10,7 @@ repository.workspace = true
 ruagent-daemon.workspace = true
 ruagent-mcp.workspace = true
 ruagent-core.workspace = true
+ruagent-knowledge.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

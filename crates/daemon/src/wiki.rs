@@ -756,7 +756,7 @@ impl WikiBuilder {
             let build_id = insert_build(
                 &db,
                 &req.scope.as_str(),
-                "planned",
+                DRY_RUN_STATUS,
                 true,
                 &card.name,
                 plan.pages.len(),
@@ -764,6 +764,13 @@ impl WikiBuilder {
             )
             .await?;
             insert_build_pages(&db, build_id, &plan.pages).await?;
+            // A dry run is TERMINAL the moment the plan exists (t252):
+            // stamp `finished_at` so an "unfinished builds" query cannot read a
+            // reviewed plan as a stuck task, and store `planned_only` so the row
+            // no longer shares a value with the in-flight `running` state. The
+            // RESPONSE keeps `planned`: the plan-review contract the CLI preview
+            // and the mock-agent pipeline pin is about the plan, not the row.
+            finish_dry_run(&db, build_id).await;
             return Ok(BuildStarted {
                 build_id,
                 status: "planned",
@@ -1789,9 +1796,58 @@ fn parse_plan(raw: &str) -> Result<PlanOutput> {
 // in tests/wiki_pipeline.rs)
 // ---------------------------------------------------------------------------
 
+/// The stored status of a dry-run plan: TERMINAL, and distinct from the
+/// in-flight `running` / `done` / `failed` values, so an "unfinished builds"
+/// query cannot read a reviewed plan as a stuck task (t252).
+pub(crate) const DRY_RUN_STATUS: &str = "planned_only";
+
+/// Stamp a dry-run plan finished. Split out from the build entry point so
+/// the semantics are testable without an agent or a knowledge base.
+async fn finish_dry_run(db: &Db, build_id: i64) {
+    let _ = db
+        .call(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE wiki_builds SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![build_id, chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dry run is terminal and says so: its own stored status, and
+    /// `finished_at` set — the two things a reader needs to stop misreading a
+    /// reviewed plan as a stuck task (t252).
+    #[tokio::test]
+    async fn dry_run_row_is_terminal_and_distinct() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let plan = PlanOutput::default();
+        let id = insert_build(&db, "all", DRY_RUN_STATUS, true, "agent", 0, &plan)
+            .await
+            .expect("insert");
+        finish_dry_run(&db, id).await;
+        let (status, dry, finished): (String, i64, Option<String>) = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT status, dry_run, finished_at FROM wiki_builds WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+            .expect("call")
+            .expect("row");
+        assert_eq!(status, DRY_RUN_STATUS);
+        assert_eq!(dry, 1);
+        assert!(finished.is_some(), "a dry run is finished: {finished:?}");
+        for other in ["running", "done", "failed", "planned"] {
+            assert_ne!(DRY_RUN_STATUS, other, "dry-run status must not collide");
+        }
+    }
 
     fn meta() -> frontmatter::PageMeta {
         frontmatter::PageMeta {

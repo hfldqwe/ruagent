@@ -45,14 +45,25 @@ enum Cmd {
     SkillsSync,
     /// Platform self-check: embedder, semantic recall, memory lifecycle,
     /// graph traversal, session sync, distillation. Prints PASS/FAIL
-    /// per check with details; exit code 1 if anything failed.
-    Doctor,
+    /// per check with details; exit code 1 if anything failed. Every
+    /// probe artifact lives in a reserved probe space, and the removable
+    /// one is deleted before the report (t252).
+    Doctor {
+        /// Also sweep probe documents left behind by older doctor runs.
+        #[arg(long)]
+        cleanup: bool,
+    },
     /// Run a prompt as a one-off task and stream the result.
     Run {
         prompt: String,
         /// Agent name (default: first enabled agent).
         #[arg(long)]
         agent: Option<String>,
+    },
+    /// Knowledge base: ingest a directory of markdown into the index.
+    Knowledge {
+        #[command(subcommand)]
+        cmd: KnowledgeCmd,
     },
     /// Wiki mode: compile source documents into interlinked pages.
     Wiki {
@@ -87,6 +98,27 @@ enum WikiCmd {
     Show { slug: String },
 }
 
+#[derive(Subcommand)]
+enum KnowledgeCmd {
+    /// Ingest every `.md` under DIR as a searchable document (nested names
+    /// are preserved), printing bytes and chunk counts per file plus a
+    /// before/after total: the corpus stops being empty by accident.
+    Ingest {
+        /// Directory to walk recursively for `.md` files.
+        dir: std::path::PathBuf,
+        /// Document-name prefix (default: the directory's own name), so
+        /// `docs/design/MASTER.md` becomes `docs/design/MASTER`.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Print the plan; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after N files (0 = every file).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -103,7 +135,7 @@ fn main() -> Result<()> {
             runtime.block_on(ruagent_daemon::serve(root, addr))
         }
         Cmd::Agents => list_agents(&cli.url),
-        Cmd::Doctor => doctor(&cli.url),
+        Cmd::Doctor { cleanup } => doctor(&cli.url, cleanup),
         Cmd::Status => status(&cli.url),
         Cmd::Skills => skills_cmd(&cli.url, false),
         Cmd::SkillsSync => skills_cmd(&cli.url, true),
@@ -120,6 +152,7 @@ fn main() -> Result<()> {
         }
         Cmd::Run { prompt, agent } => run(&cli.url, &prompt, agent.as_deref()),
         Cmd::Wiki { cmd } => wiki_cmd(&cli.url, cmd),
+        Cmd::Knowledge { cmd } => knowledge_cmd(&cli.url, cmd),
     }
 }
 
@@ -328,6 +361,261 @@ fn wiki_show(url: &str, slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// The probe space `ruagent doctor` may write into. One list: the payloads
+/// above and `sweep_probe_artifacts` below read these constants, so a rename
+/// cannot leave orphaned junk behind (t252, single-source rule).
+const PROBE_DOC_NAME: &str = "__probe__/doctor-probe";
+const PROBE_DOC_NAME_LEGACY: &str = "doctor-probe";
+const PROBE_ENTITY_NAME: &str = "__probe__doctor-node";
+const PROBE_MEMORY_NAMESPACE: &str = "agent:__probe__";
+
+/// The doctor's recall probe, declaring itself: a probe that does not say
+/// so is indistinguishable from a user query, and guessing from the query
+/// text is not a reading (t251 / t252).
+const DOCTOR_RECALL_URL: &str =
+    "/api/v1/recall?q=kettle%20material&strategy=aggressive&top_n=3&source=probe";
+
+/// Delete the probe documents this command (or an older build of it) left
+/// behind. Returns (nothing left behind, human-readable lines). The entity
+/// and the memory are ISOLATED by name/namespace — production readers
+/// filter them out — and reported here because no delete route exists yet.
+fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>) {
+    let mut lines = Vec::new();
+    let wanted: Vec<&str> = if include_legacy {
+        vec![PROBE_DOC_NAME, PROBE_DOC_NAME_LEGACY]
+    } else {
+        vec![PROBE_DOC_NAME]
+    };
+    let mut left = 0usize;
+    match client()
+        .get(format!("{url}/api/v1/knowledge/documents"))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json::<serde_json::Value>())
+    {
+        Ok(v) => {
+            for row in v["documents"].as_array().cloned().unwrap_or_default() {
+                let name = row["name"].as_str().unwrap_or_default().to_string();
+                if !wanted.contains(&name.as_str()) {
+                    continue;
+                }
+                let id = row["id"].as_i64().unwrap_or(0);
+                match client()
+                    .delete(format!("{url}/api/v1/knowledge/documents/{id}"))
+                    .send()
+                {
+                    Ok(r) if r.status().is_success() => {
+                        lines.push(format!("removed probe document {name} (#{id})"))
+                    }
+                    Ok(r) => {
+                        left += 1;
+                        lines.push(format!(
+                            "FAILED to remove {name} (#{id}): HTTP {}",
+                            r.status()
+                        ))
+                    }
+                    Err(e) => {
+                        left += 1;
+                        lines.push(format!("FAILED to remove {name} (#{id}): {e}"))
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            left += 1;
+            lines.push(format!("could not list documents to sweep: {e}"));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("no probe document present".into());
+    }
+    lines.push(format!(
+        "isolated (no delete route yet): entity {PROBE_ENTITY_NAME}, memory {PROBE_MEMORY_NAMESPACE}"
+    ));
+    (left == 0, lines)
+}
+
+fn knowledge_cmd(url: &str, cmd: KnowledgeCmd) -> Result<()> {
+    match cmd {
+        KnowledgeCmd::Ingest {
+            dir,
+            prefix,
+            dry_run,
+            limit,
+        } => ingest_dir(url, &dir, prefix, dry_run, limit),
+    }
+}
+
+/// Ingest every `.md` under `dir` through the public API, printing bytes and
+/// chunk counts per file plus a before/after total: "the corpus is empty"
+/// stops being a guess (t252). Failures are counted and reported, never
+/// skipped silently.
+fn ingest_dir(
+    url: &str,
+    dir: &std::path::Path,
+    prefix: Option<String>,
+    dry_run: bool,
+    limit: usize,
+) -> Result<()> {
+    let prefix = prefix.unwrap_or_else(|| {
+        dir.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string()
+    });
+    let md = ruagent_knowledge::files::walk_markdown(dir);
+    if md.is_empty() {
+        bail!("no .md files under {}", dir.display());
+    }
+    let other = count_non_md(dir);
+    let files: Vec<&std::path::PathBuf> = if limit > 0 {
+        md.iter().take(limit).collect()
+    } else {
+        md.iter().collect()
+    };
+    let before = documents_snapshot(url);
+    let mut bytes = 0usize;
+    let mut chunks = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for f in &files {
+        let Some(name) = ruagent_knowledge::files::document_name_for(&prefix, dir, f) else {
+            failed.push((f.display().to_string(), "no document name".into()));
+            continue;
+        };
+        let body = match std::fs::read_to_string(f) {
+            Ok(b) => b,
+            Err(e) => {
+                failed.push((f.display().to_string(), format!("read failed: {e}")));
+                continue;
+            }
+        };
+        bytes += body.len();
+        if dry_run {
+            println!("  plan  {name}  {} B", body.len());
+            continue;
+        }
+        let resp = client()
+            .put(format!(
+                "{url}/api/v1/knowledge/raw/{}",
+                urlencoding::encode(&name)
+            ))
+            .json(&serde_json::json!({ "content": body }))
+            .send();
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let v: serde_json::Value = r.json().unwrap_or(serde_json::Value::Null);
+                let n = v["chunks"].as_u64().unwrap_or(0) as usize;
+                chunks += n;
+                println!("  ok    {name}  {} B -> {n} chunks", body.len());
+            }
+            Ok(r) => failed.push((f.display().to_string(), format!("HTTP {}", r.status()))),
+            Err(e) => failed.push((f.display().to_string(), format!("{e}"))),
+        }
+    }
+    let after = if dry_run {
+        before
+    } else {
+        documents_snapshot(url)
+    };
+    println!();
+    println!("dir        {}", dir.display());
+    println!("prefix     {prefix}");
+    println!(
+        "walked     {} md file(s){}",
+        md.len(),
+        if other > 0 {
+            format!(", {other} non-md file(s) not ingested")
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "ingested   {} file(s){}",
+        files.len() - failed.len(),
+        if dry_run {
+            " (dry run — nothing written)"
+        } else {
+            ""
+        }
+    );
+    println!("bytes      {bytes}");
+    println!("chunks     {chunks} (as reported by the ingest endpoint)");
+    match (before, after) {
+        (Some((db, cb)), Some((da, ca))) => {
+            println!("documents  {db} -> {da}");
+            println!("chunk rows {cb} -> {ca}");
+        }
+        _ => println!("documents  unreadable (daemon not reachable?)"),
+    }
+    if !failed.is_empty() {
+        println!();
+        for (f, why) in &failed {
+            println!("  FAIL  {f}  {why}");
+        }
+        bail!("{} file(s) failed to ingest", failed.len());
+    }
+    Ok(())
+}
+
+/// (documents, chunk rows) as the daemon reports them, or `None` when the list
+/// cannot be read — the caller prints that instead of a fake zero.
+fn documents_snapshot(url: &str) -> Option<(usize, usize)> {
+    let v: serde_json::Value = client()
+        .get(format!("{url}/api/v1/knowledge/documents"))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+    let rows = v["documents"].as_array().cloned().unwrap_or_default();
+    let chunks = rows
+        .iter()
+        .map(|r| r["chunk_count"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    Some((rows.len(), chunks))
+}
+
+/// Non-md files under `dir`, counted so the report can say what it left out.
+fn count_non_md(dir: &std::path::Path) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe space is one list, and the doctor's recall call says it is
+    /// a probe (t251/t252). If a rename splits these, this test is the only
+    /// thing standing between us and orphaned junk.
+    #[test]
+    fn probe_space_is_self_consistent() {
+        assert!(PROBE_DOC_NAME.starts_with("__probe__/"));
+        assert!(!PROBE_DOC_NAME_LEGACY.starts_with("__probe__/"));
+        assert!(PROBE_ENTITY_NAME.starts_with("__probe__"));
+        assert!(PROBE_MEMORY_NAMESPACE.starts_with("agent:"));
+        assert!(
+            DOCTOR_RECALL_URL.contains("source=probe"),
+            "a probe recall must declare itself: {DOCTOR_RECALL_URL}"
+        );
+    }
+}
+
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -361,7 +649,7 @@ fn self_has_cli_histories() -> bool {
     .any(|p| p.is_dir())
 }
 
-fn doctor(url: &str) -> Result<()> {
+fn doctor(url: &str, cleanup: bool) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
@@ -425,13 +713,13 @@ fn doctor(url: &str) -> Result<()> {
     // 2. semantic recall probe: distinct phrasings must hit the same doc.
     if let Some(doc) = post(
         "/api/v1/knowledge/ingest",
-        r##"{"name":"doctor-probe","content":"# Doctor probe\n\nThe quarterly ritual involves lighting the braziers at dawn and sounding the bronze bell twice."}"##,
+        r##"{"name":"__probe__/doctor-probe","content":"# Doctor probe\n\nThe quarterly ritual involves lighting the braziers at dawn and sounding the bronze bell twice."}"##,
     ) {
         let _ = doc; // ingest ok
         let a = get("/api/v1/knowledge/search?q=what%20happens%20at%20sunrise%20every%20quarter");
         let hit = a
             .and_then(|v| v["hits"].as_array().cloned())
-            .map(|h| !h.is_empty() && h[0]["document"] == "doctor-probe")
+            .map(|h| !h.is_empty() && h[0]["document"] == PROBE_DOC_NAME)
             .unwrap_or(false);
         checks.push(Check {
             name: "semantic recall".into(),
@@ -453,7 +741,7 @@ fn doctor(url: &str) -> Result<()> {
     // 3. memory lifecycle: write → recall → supersede
     let mem = post(
         "/api/v1/memory/write",
-        r#"{"store":"observation","namespace":"user","content":"doctor probe: the kettle is chrome"}"#,
+        r#"{"store":"observation","namespace":"agent:__probe__","content":"doctor probe: the kettle is chrome"}"#,
     );
     checks.push(Check {
         name: "memory write".into(),
@@ -462,7 +750,7 @@ fn doctor(url: &str) -> Result<()> {
             .map(|m| m["outcome"].as_str().unwrap_or("?").to_string())
             .unwrap_or_else(|| "failed".into()),
     });
-    let recall = get("/api/v1/recall?q=kettle%20material&strategy=aggressive&top_n=3");
+    let recall = get(DOCTOR_RECALL_URL);
     let mem_hit = recall
         .and_then(|v| v["memories"].as_array().cloned())
         .map(|m| {
@@ -483,7 +771,7 @@ fn doctor(url: &str) -> Result<()> {
     // 4. graph: entity + fact + as-of
     if let Some(e1) = post(
         "/api/v1/graph/entity",
-        r#"{"name":"doctor-node","kind":"tool"}"#,
+        r#"{"name":"__probe__doctor-node","kind":"tool"}"#,
     ) {
         let id = e1["id"].as_i64().unwrap_or(0);
         let facts = get(&format!("/api/v1/graph/entity/{id}"));
@@ -538,6 +826,18 @@ fn doctor(url: &str) -> Result<()> {
 
     // 6. distillation pipeline (dry signal): last distill_log entry age
     // (API has no distill_log endpoint yet — skip quietly when absent)
+
+    // Probe hygiene (t252): the removable probe document is deleted
+    // BEFORE the report, so cleanup is part of running the command and not
+    // something a human has to remember.
+    {
+        let (clean, lines) = sweep_probe_artifacts(url, cleanup);
+        checks.push(Check {
+            name: "probe hygiene".into(),
+            ok: clean,
+            detail: lines.join("; "),
+        });
+    }
 
     // report
     println!(

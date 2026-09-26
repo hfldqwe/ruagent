@@ -806,9 +806,152 @@ impl Knowledge {
     }
 }
 
+/// Every `.md` file under `dir`, sorted. Exposed so a caller (the CLI's
+/// `knowledge ingest`) walks the tree with the SAME rules the scanner uses
+/// — dot-directories skipped, symlinks not followed, depth capped — instead
+/// of growing a second walker that can disagree (t252).
+pub fn walk_markdown(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_md_files(dir, 0, &mut out);
+    out.sort();
+    out
+}
+
+/// Document name for one file: `<prefix>/<path relative to root, minus the
+/// .md suffix>`, POSIX separators. Pure, and the single source of the naming
+/// rule — the CLI builds names with it, and
+/// `document_name_for_pins_the_rule` below pins it (t252).
+pub fn document_name_for(
+    prefix: &str,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let stem = rel.strip_suffix(".md").unwrap_or(&rel);
+    if stem.is_empty() {
+        return None;
+    }
+    Some(if prefix.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{prefix}/{stem}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The naming rule, pinned: a second copy of it anywhere is the bug
+    /// this test exists to catch (t252).
+    #[test]
+    fn document_name_for_pins_the_rule() {
+        let root = std::path::Path::new("/kb");
+        let f = std::path::Path::new("/kb/design/MASTER.md");
+        assert_eq!(
+            document_name_for("docs", root, f).as_deref(),
+            Some("docs/design/MASTER")
+        );
+        assert_eq!(
+            document_name_for("", root, f).as_deref(),
+            Some("design/MASTER")
+        );
+        // A non-md file keeps its suffix (the walker never yields one, but
+        // the rule must not silently strip it).
+        assert_eq!(
+            document_name_for("docs", root, std::path::Path::new("/kb/a.txt")).as_deref(),
+            Some("docs/a.txt")
+        );
+        assert_eq!(document_name_for("docs", root, root), None);
+    }
+
+    /// End-to-end on a TEMP ROOT (no daemon, no real data): a directory of
+    /// markdown becomes searchable documents, with the counts the ingest
+    /// report claims. Object set = 3 temp files; sampling surface = a temp
+    /// root Knowledge; falsifier = a search hit whose `document` is not one of
+    /// the ingested names.
+    #[tokio::test]
+    async fn ingest_dir_round_trip_counts_and_search_hit() {
+        let (kb, root) = test_kb("ingest").await;
+        let corpus = std::env::temp_dir().join(format!(
+            "ruagent-kbcorpus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(corpus.join("nested")).unwrap();
+        let files = [
+            (
+                "alpha.md",
+                "# Alpha
+
+The quarterly ritual lights the braziers at dawn.
+",
+            ),
+            (
+                "nested/beta.md",
+                "# Beta
+
+The deploy pipeline runs on Tuesdays.
+",
+            ),
+            (
+                "gamma.md",
+                "# Gamma
+
+Nothing memorable here.
+",
+            ),
+        ];
+        let mut bytes = 0usize;
+        for (rel, body) in files {
+            std::fs::write(corpus.join(rel), body).unwrap();
+            bytes += body.len();
+        }
+        let (docs_before, chunks_before) = kb.stats().await.unwrap();
+        assert_eq!(
+            (docs_before, chunks_before),
+            (0, 0),
+            "temp root starts empty"
+        );
+
+        let walked = walk_markdown(&corpus);
+        assert_eq!(walked.len(), 3, "walker sees exactly the 3 md files");
+        let mut chunks_total = 0usize;
+        for f in &walked {
+            let name = document_name_for("corpus", &corpus, f).expect("name");
+            let body = std::fs::read_to_string(f).unwrap();
+            chunks_total += kb.save(&name, &body).await.unwrap() as usize;
+        }
+        let (docs_after, chunks_after) = kb.stats().await.unwrap();
+        assert_eq!(docs_after, 3, "three documents");
+        assert_eq!(chunks_after as usize, chunks_total);
+        assert!(bytes > 0 && chunks_total >= 3);
+        let hits = kb.search("braziers at dawn", 5).await.unwrap();
+        println!(
+            "ingest reading: files={} bytes={} chunks={} documents {}->{} chunk_rows {}->{}",
+            walked.len(),
+            bytes,
+            chunks_total,
+            docs_before,
+            docs_after,
+            chunks_before,
+            chunks_after
+        );
+        println!(
+            "search hit documents: {:?}",
+            hits.iter().map(|h| h.document.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.first().map(|h| h.document.as_str()) == Some("corpus/alpha"),
+            "the ingested doc must be the top hit: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&corpus);
+    }
 
     async fn test_kb(tag: &str) -> (Knowledge, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(

@@ -6303,6 +6303,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ruagent-core",
  "ruagent-daemon",
+ "ruagent-knowledge",
  "ruagent-mcp",
  "serde",
  "serde_json",
