@@ -1956,6 +1956,83 @@ mod tests {
             );
         }
     }
+
+    /// The head token of a block that formats itself as "head — rest".
+    fn head_of(block: &str) -> &str {
+        block.split(" — ").next().unwrap_or(block)
+    }
+
+    /// t326: the retry prefix is shared by CONSTRUCTION -- chat.rs owns
+    /// retry_head() and runs.rs calls it -- but nothing pinned its BYTES, so
+    /// replacing that call with a lookalike literal would have gone unnoticed.
+    /// This drives the real function and compares bytes, not shapes.
+    ///
+    /// It is the half t309 left open: t309 pinned the truncation MARKER with a
+    /// structural helper plus a byte assertion; the block PREFIXES had the
+    /// structure and lacked the assertion.
+    #[test]
+    fn retry_context_opens_with_the_shared_retry_prefix() {
+        use crate::chat::retry_head;
+        use ruagent_core::ContentBlock;
+
+        let dir = std::env::temp_dir().join(format!("ruagent-t326-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let task = Task::new("t326", "retry the dead run", TaskCreator::Human);
+
+        // Branch 1: died before saying anything (no agent speech at all).
+        let mut early = Run::new(
+            task.id,
+            RunParams::for_agent(ruagent_core::AgentId::generate()),
+        );
+        early.error = Some("the harness died".into());
+        let path = ruagent_store::transcript_path(&dir, &early.id);
+        std::fs::write(&path, "").unwrap();
+        let text =
+            retry_context(&dir, &early).expect("an errored run must produce a retry context");
+        println!("T326 retry_context(early) = {text:?}");
+        // BYTES, not shape: the head token is compared with ==, so a
+        // lookalike that differs by one byte (the t309 class) is red -- and
+        // so is a longer literal, because the head is taken up to the
+        // separator the format itself uses.
+        assert_eq!(
+            head_of(&text),
+            retry_head(),
+            "the retry prefix is not the shared bytes: {text:?}"
+        );
+
+        // Branch 2: died after speaking (the tail is kept behind the prefix).
+        let mut late = Run::new(
+            task.id,
+            RunParams::for_agent(ruagent_core::AgentId::generate()),
+        );
+        late.error = Some("the harness died".into());
+        let path2 = ruagent_store::transcript_path(&dir, &late.id);
+        let line = serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z",
+            "seq": 1,
+            "event": RunEvent::AgentMessageChunk {
+                content: vec![ContentBlock::Text { text: "the last thing it said".into() }],
+            },
+        });
+        std::fs::write(&path2, format!("{line}\n")).unwrap();
+        let text2 =
+            retry_context(&dir, &late).expect("a run that spoke must produce a retry context");
+        println!("T326 retry_context(late) = {text2:?}");
+        assert_eq!(
+            head_of(&text2),
+            retry_head(),
+            "the retry prefix is not the shared bytes: {text2:?}"
+        );
+        assert!(text2.contains("the last thing it said"), "{text2}");
+
+        // And the shared head is the bracketed block head, not a stand-in.
+        assert!(
+            retry_head().starts_with('[') && retry_head().ends_with("context"),
+            "retry_head is not the block head: {:?}",
+            retry_head()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     fn candidate(id: &str, result: &str) -> JudgeCandidate {
         JudgeCandidate {
             run_id: id.parse().unwrap(),

@@ -121,6 +121,13 @@ async fn boot(tag: &str, with_knowledge: bool) -> Option<TestDaemon> {
 harness = "mock"
 command = "{bin} --behavior echo"
 description = "t292"
+
+# t326: a run that DIES, so the retry path (and its crash snapshot in the
+# ContextInjected render) can be driven end to end.
+[agent.mockcrash]
+harness = "mock"
+command = "{bin} --behavior crash"
+description = "t326"
 "#
         ),
     )
@@ -678,4 +685,110 @@ async fn both_paths_emit_the_contract_truncation_marker() {
             "the render's marker is not what the contract's vocabulary produces"
         );
     }
+}
+
+/// t326, the render half: a REAL run retry. The crash snapshot rides as context
+/// (ContextInjected), so the retried run's own render must open with the SHARED
+/// retry prefix -- byte-equal to chat.rs's retry_head(), which runs.rs calls.
+#[tokio::test]
+async fn a_retried_run_carries_the_shared_retry_prefix() {
+    let Some(d) = boot("retry", false).await else {
+        skip_missing_mock();
+        return;
+    };
+    let http = reqwest::Client::new();
+
+    // 1. A run that DIES: the mock's crash behavior, as its own agent.
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "t326", "intent": "crash please" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let run: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/runs", d.url))
+        .json(&serde_json::json!({ "agent": "mockcrash", "prompt": "crash please" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let dead_id = run["id"].as_str().unwrap().to_string();
+
+    // 2. It must reach a terminal, retryable state.
+    let mut status = String::new();
+    for _ in 0..80 {
+        let r: serde_json::Value = http
+            .get(format!("{}/api/v1/runs/{dead_id}", d.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        status = r["status"].as_str().unwrap_or("").to_string();
+        if matches!(status.as_str(), "failed" | "cancelled" | "interrupted") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    println!("T326 the crashed run ended as {status:?}");
+    assert!(
+        matches!(status.as_str(), "failed" | "cancelled" | "interrupted"),
+        "the crash run must end retryable, got {status:?}"
+    );
+
+    // 3. Retry it -- the new run inherits the crash snapshot as CONTEXT.
+    let retried: serde_json::Value = http
+        .post(format!("{}/api/v1/runs/{dead_id}/retry", d.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let new_id = retried["id"].as_str().unwrap().to_string();
+
+    // 4. Its ContextInjected render must open with the shared prefix.
+    let path = d
+        .root
+        .join("data")
+        .join("transcripts")
+        .join(format!("run-{new_id}.jsonl"));
+    let mut render = None;
+    for _ in 0..80 {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if v["event"]["type"] == "context_injected" {
+                        render = v["event"]["render"].as_str().map(str::to_string);
+                    }
+                }
+            }
+        }
+        if render.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let render = render.expect("the retried run must emit context_injected");
+    let shown = &render[..render.len().min(200)];
+    println!("T326 retried run render starts: {shown:?}");
+    let head = render.split(" — ").next().unwrap_or("");
+    assert_eq!(
+        head,
+        ruagent_daemon::chat::retry_head(),
+        "the retried run's prefix is not the shared bytes: {render}"
+    );
 }
