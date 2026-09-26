@@ -1663,3 +1663,16 @@ mem-core 给 design-audit 加了一条静态检查（`evaluateContextGaps()`：�
 **而它同时把「抓不住什么」逐条写进了代码**（7.103 的用法）：camelCase 模块常量（本文件约定是 SCREAMING_SNAKE —— 用命名约定当过滤器，**代价写在注释里** ✓）· `cfg.SEL` 这类对象访问 · import 进来的 · `globalThis[name]` 动态查找 · 传了但值不对 · **按引用传的探针** `page.evaluate(PROBE, cfg)` · **文本检查不是解析器** ✓。
 
 **读数两条都硬**：F-t338-02 的活体构造让行 58 的原因格逐字变成 `— not_measured：url-state probe failed: page.evaluate: SyntaxError: … is not a valid selector.` ✓（通用句降为最后兜底 ✓）；F-t338-03 的反向是**在真实源码上删掉那个实参** ⇒ `--self-test` EXIT 1 / 479/480，失败条目逐字 `got="URL_STATE_TOGGLE_SEL:unsupplied-parameter" want=""` ✓。
+
+### 7.106 当一条判据的结论会驱动一个动作时，两个方向的误判都要有读数（2026-09-26，t340 的验收）
+
+`status` 的结论驱动两个动作：`watch` 决定**要不要拉起**、`install-task` 每 5 分钟跑一次 ⇒ 它的两个误判各有代价：
+
+```
+假阳（进程其实不是我们的，却报 alive）⇒ watch 不拉起 ⇒ 【守护进程真的死了却长期没人管】✗
+假阴（进程是我们的，却报 not-ours）⇒ 重复拉起 ⇒ 两个 daemon 抢同一个库 ✗
+```
+
+⇒ **规则：当一条判据的结论会驱动一个动作时，两个方向的误判都要有读数** —— 只给一个方向，等于只测了这条判据的一半。
+
+（这一条是 7.97/7.98 的同族：那两条管「判据变绿时覆盖有没有缩」，这条管「判据判错时动作会怎样」。**判据不只是给人看的，它还会驱动东西。**）
