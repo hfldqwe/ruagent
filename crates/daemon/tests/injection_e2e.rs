@@ -593,3 +593,89 @@ async fn chat_and_run_use_the_same_block_wording() {
         "the wording test is only meaningful while both paths actually carry the          knowledge blocks: {chat_headers:?}"
     );
 }
+
+/// Every visible-truncation marker in a render, verbatim. t302's drift check
+/// compared BLOCK HEADERS; this is the second half of the same idea -- the
+/// inline marker VOCABULARY, which is where "one concept, two byte sequences"
+/// actually lived (the contract rendered "… [+N chars truncated]" while the
+/// retry context rendered "…[+N chars truncated]").
+fn markers_of(render: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = render;
+    while let Some(i) = rest.find("… [+") {
+        let tail = &rest[i..];
+        match tail.find(']') {
+            Some(j) => {
+                out.push(tail[..=j].to_string());
+                rest = &tail[j..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Seed one long observation: without it the per_block bound never binds, and a
+/// test that only ever sees untruncated renders cannot tell WHICH bytes a
+/// producer would emit.
+async fn seed_long_observation(d: &TestDaemon, content: &str) {
+    let outcome = ruagent_memory::write_memory(
+        &d.db,
+        &ruagent_memory::MemoryWrite {
+            store: ruagent_memory::MemoryStore::Observation,
+            namespace: ruagent_memory::Namespace::parse("user").unwrap(),
+            content: content.into(),
+            confidence: 0.9,
+            source_episode: None,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ruagent_memory::WriteOutcome::Inserted(_)),
+        "seeding the long memory failed: {outcome:?}"
+    );
+}
+
+/// t309: the truncation marker is ONE vocabulary, so both producers must render
+/// the contract's exact bytes -- compared against the contract's own
+/// constructor, not against a shape that a lookalike could also satisfy.
+#[tokio::test]
+async fn both_paths_emit_the_contract_truncation_marker() {
+    let Some(d) = boot("markers", true).await else {
+        skip_missing_mock();
+        return;
+    };
+    seed_long_observation(&d, &"t309-long-memory ".repeat(90)).await;
+
+    let (chat_render, _) = drive_chat(&d, PROMPT).await;
+    let (run_render, _) = drive_run(&d, PROMPT).await;
+    let chat_markers = markers_of(&chat_render);
+    let run_markers = markers_of(&run_render);
+    println!("T309 chat_markers={chat_markers:?}");
+    println!("T309 run_markers={run_markers:?}");
+
+    assert!(
+        !chat_markers.is_empty() && !run_markers.is_empty(),
+        "no marker to compare -- the bound never bound: chat={} run={}",
+        chat_render.chars().count(),
+        run_render.chars().count()
+    );
+    assert_eq!(
+        chat_markers, run_markers,
+        "the two producers emit different truncation markers"
+    );
+    for m in chat_markers.iter().chain(run_markers.iter()) {
+        let n: usize = m
+            .trim_start_matches("… [+")
+            .trim_end_matches(" chars truncated]")
+            .parse()
+            .unwrap_or_else(|_| panic!("marker is not the vocabulary's shape: {m}"));
+        assert_eq!(
+            m,
+            &ruagent_memory::inject::tail_truncated(n),
+            "the render's marker is not what the contract's vocabulary produces"
+        );
+    }
+}

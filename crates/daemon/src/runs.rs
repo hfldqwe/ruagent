@@ -1549,9 +1549,12 @@ fn compose_handoff(intent: &str, upstream: &str) -> String {
     const MAX_UPSTREAM_CHARS: usize = 4000;
     let bounded: String = if upstream.chars().count() > MAX_UPSTREAM_CHARS {
         let cut: String = upstream.chars().take(MAX_UPSTREAM_CHARS).collect();
+        // The marker comes from the contract's vocabulary (t309): this site
+        // used to render a lookalike with different bytes, and nothing
+        // compared the two.
         format!(
-            "{cut}
-…[upstream result truncated at {MAX_UPSTREAM_CHARS} chars]"
+            "{cut}\n{}",
+            ruagent_memory::inject::cut_at("upstream result", MAX_UPSTREAM_CHARS)
         )
     } else {
         upstream.to_string()
@@ -1690,6 +1693,22 @@ async fn wait_terminal(db: &Db, run_id: RunId) -> Result<Run> {
 /// The crash snapshot for a retry (design §8.3): what the dead attempt
 /// last said, so the replacement run continues instead of restarting
 /// from zero. Bounded — the tail, not the whole transcript.
+/// The last N characters of a text, with the contract truncation marker in
+/// front when anything was dropped.
+///
+/// WHY A HELPER (t309): this used to inline its own marker while the contract
+/// rendered a different one. One concept, two byte sequences, and no test
+/// could see it because each site only asserted its own text. Now the marker
+/// cannot be written here without the vocabulary.
+fn bounded_tail(text: &str, bound: usize) -> String {
+    let total = text.chars().count();
+    if total <= bound {
+        return text.to_string();
+    }
+    let skipped = total - bound;
+    let kept: String = text.chars().skip(skipped).collect();
+    format!("{} {kept}", ruagent_memory::inject::tail_truncated(skipped))
+}
 fn retry_context(transcripts: &std::path::Path, old: &Run) -> Option<String> {
     let path = transcript_path(transcripts, &old.id);
     let lines = ruagent_store::read_transcript(&path).ok()?;
@@ -1730,14 +1749,7 @@ fn retry_context(transcripts: &std::path::Path, old: &Run) -> Option<String> {
     // CHARACTERS with a visible truncation marker — the repo's
     // injection convention (memory/inject.rs, compose_handoff, judge).
     const BOUND: usize = 1500;
-    let total = text.chars().count();
-    let tail = if total > BOUND {
-        let skipped = total - BOUND;
-        let kept: String = text.chars().skip(skipped).collect();
-        format!("…[+{skipped} chars truncated] {kept}")
-    } else {
-        text
-    };
+    let tail = bounded_tail(&text, BOUND);
     let tool = last_tool
         .map(|t| format!(" Last tool call: {t}."))
         .unwrap_or_default();
@@ -1909,6 +1921,41 @@ mod tests {
         assert!(p.contains("Upstream result"));
     }
 
+    /// t309: ONE truncation vocabulary. The contract owns the bytes; every
+    /// daemon-side producer of agent context must render exactly them. This
+    /// compares the producers against the contract itself, so changing either
+    /// producer's wording -- or the vocabulary -- turns it red.
+    #[test]
+    fn truncation_markers_come_from_the_contract_vocabulary() {
+        use ruagent_memory::inject::{cut_at, tail_truncated};
+
+        // The retry tail: the last thing the agent was doing before it died.
+        let retry = bounded_tail(&"x".repeat(2_000), 1_500);
+        // The handoff: the upstream result, bounded at a fixed constant.
+        let handoff = compose_handoff("do things", &"y".repeat(10_000));
+        println!("T309 contract_retry_marker={:?}", tail_truncated(500));
+        println!(
+            "T309 contract_handoff_marker={:?}",
+            cut_at("upstream result", 4_000)
+        );
+
+        assert!(
+            retry.contains(&tail_truncated(500)),
+            "the retry tail's marker is not the contract's: {retry}"
+        );
+        assert!(
+            handoff.contains(&cut_at("upstream result", 4_000)),
+            "the handoff's marker is not the contract's: {handoff}"
+        );
+        // The CONVENTION both share -- one byte, and it is the byte the two
+        // producers disagreed on before t309 ("… [+" vs "…[+").
+        for m in [tail_truncated(1), cut_at("x", 1)] {
+            assert!(
+                m.starts_with("… ["),
+                "the vocabulary's convention drifted: {m}"
+            );
+        }
+    }
     fn candidate(id: &str, result: &str) -> JudgeCandidate {
         JudgeCandidate {
             run_id: id.parse().unwrap(),

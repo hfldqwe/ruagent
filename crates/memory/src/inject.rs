@@ -23,6 +23,31 @@ impl Default for InjectionBudget {
     }
 }
 
+/// THE PLATFORM'S VISIBLE-TRUNCATION VOCABULARY -- one place, because "the same
+/// concept in two byte sequences" is the defect this exists to prevent.
+///
+/// MEASURED BEFORE t309 (three wordings for one idea, and no test could see it,
+/// because each site only ever asserted its own text):
+///   contract (this file)      "… [+N chars truncated]"
+///   retry context (runs.rs)   "…[+N chars truncated]"          <- no space
+///   handoff upstream (runs.rs) "…[upstream result truncated at N chars]"
+///
+/// Both daemon producers of agent context call these now, and a test in the
+/// daemon compares their rendered bytes against THIS function's output, so
+/// changing one side without the other turns red.
+///
+/// The convention is the space: every marker opens with an ellipsis and a SPACE
+/// before the bracket. That single byte is what the two producers disagreed on.
+pub fn tail_truncated(dropped_chars: usize) -> String {
+    format!("… [+{dropped_chars} chars truncated]")
+}
+
+/// A text cut at a FIXED bound, naming what was cut (the handoff's upstream
+/// result is bounded at a constant, not at "what is left after a tail").
+pub fn cut_at(what: &str, bound_chars: usize) -> String {
+    format!("… [{what} truncated at {bound_chars} chars]")
+}
+
 /// One memory selected for injection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryForInjection {
@@ -357,7 +382,7 @@ pub fn render_context(items: &[ContextItem], budget: &InjectionBudget) -> String
         let body = if body.chars().count() > budget.per_block {
             let cut: String = body.chars().take(budget.per_block).collect();
             let remaining = body.chars().count() - budget.per_block;
-            format!("{cut}\n… [+{remaining} chars truncated]\n")
+            format!("{cut}\n{}\n", tail_truncated(remaining))
         } else {
             body
         };
