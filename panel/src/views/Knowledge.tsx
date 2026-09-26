@@ -395,7 +395,14 @@ export function Knowledge() {
                   <div key={h.chunk_id} className="search-hit">
                     <div className="row tight">
                       <span className="tag">{h.document}</span>
-                      <span className="muted mono">score {h.score.toFixed(3)}</span>
+                      {/* t253: this number is an RRF rank score, not a similarity.
+                          It carried a hardcoded English "score" while the i18n key
+                          knowledge.score existed and was referenced nowhere (dead
+                          key). The label now comes from that key, and its value says
+                          what the number really is; the title carries the ceiling. */}
+                      <span className="muted mono" title={t("knowledge.scoreHint")}>
+                        {t("knowledge.score", { s: h.score.toFixed(3) })}
+                      </span>
                     </div>
                     <p className="hit-content">{h.content}</p>
                   </div>

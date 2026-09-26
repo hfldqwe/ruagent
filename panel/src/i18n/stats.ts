@@ -21,6 +21,7 @@ export const zh: Record<string, string> = {
   "stats.stale.hint": "显示的是上一次成功读取的账本，5 秒轮询正在重试。",
   "stats.topN": "前 {n}",
   "stats.rows": "{n} 条",
+  "stats.recallSourceUnknown": "unknown",
 };
 
 export const en: Record<string, string> = {
@@ -39,4 +40,5 @@ export const en: Record<string, string> = {
   "stats.stale.hint": "Showing the last successful ledger; the 5s poll is retrying.",
   "stats.topN": "top {n}",
   "stats.rows": "{n} rows",
+  "stats.recallSourceUnknown": "unknown",
 };

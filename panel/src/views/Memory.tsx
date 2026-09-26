@@ -78,6 +78,7 @@ export function Memory() {
   const [namespace, setNamespace] = useState("user");
   const [memories, setMemories] = useState<MemoryRow[] | null>(null);
   const [memError, setMemError] = useState(false);
+  const [recallLog, setRecallLog] = useState<Awaited<ReturnType<typeof api.recallLog>> | null>(null);
   const [writing, setWriting] = useState(false);
   const [tab, setTab] = useState<"browse" | "recall" | "audit">(readTab);
 
@@ -127,6 +128,17 @@ export function Memory() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // t253: the recall log moved here from #stats. It is produced by THIS page
+  // (api.recall is called only from this view), so #stats was a second
+  // rendering point for data it did not own. Loaded once: it is a log, and a
+  // second poll would spend the route's request budget for no new truth.
+  useEffect(() => {
+    void api
+      .recallLog(20)
+      .then(setRecallLog)
+      .catch(() => setRecallLog([]));
+  }, []);
 
   const projectNamespaces = (counts ?? [])
     .filter(([s, ns]) => s === store && ns.startsWith("project:"))
@@ -266,6 +278,63 @@ export function Memory() {
         </>
       )}
 
+      {recallLog && recallLog.length > 0 && (
+        <Zone
+          title={t("stats.recallLog")}
+          note={t("stats.rows", { n: recallLog.length })}
+        >
+          <div className="card">
+            {recallLog.map((r, i) => {
+              // t253: who produced the row. Rows written before the column
+              // existed carry no source and read as unknown — never as
+              // "user", never guessed from the query, never filtered out.
+              const src = (r as { source?: string | null }).source;
+              return (
+                <div key={`${r.ts}-${i}`} className="row">
+                  <span className="mono truncated">{r.query}</span>
+                  <span className="tag">
+                    {r.strategy === "conservative"
+                      ? t("memory.recallConservative")
+                      : t("memory.recallAggressive")}
+                  </span>
+                  <span className="micro muted">
+                    {t("stats.topN", { n: r.top_n })}
+                  </span>
+                  <span className="tag micro">
+                    {src ?? t("stats.recallSourceUnknown")}
+                  </span>
+                  <span className="mono muted">
+                    mem {r.memories}  know {r.knowledge}  wiki {r.wiki}  ent{" "}
+                    {r.entities}
+                  </span>
+                  {r.top_memory_score != null && (
+                    <span className="muted mono micro">
+                      m {r.top_memory_score.toFixed(2)}
+                    </span>
+                  )}
+                  {/* t253: 3 decimals, not 2. The live values are 0.0164 /
+                      0.0325 / 0.0323 — at 2 decimals two of the three collapse
+                      to the same "0.03" and the reading loses its information. */}
+                  {r.top_knowledge_score != null && (
+                    <span
+                      className="muted mono micro"
+                      title={t("knowledge.scoreHint")}
+                    >
+                      {t("knowledge.score", {
+                        s: r.top_knowledge_score.toFixed(3),
+                      })}
+                    </span>
+                  )}
+                  <span className="time">
+                    <RelTime iso={r.ts} />
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </Zone>
+      )}
+
       {writing && (
         <WriteModal
           store={store}
@@ -343,11 +412,18 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
           <span className="muted mono">{t("memory.replaces", { id: memory.supersedes })}</span>
         ) : null}
         <span className="grow" />
-        {memory.confidence < LOW_CONFIDENCE ? (
-          <span className="muted mono" title={t("memory.confidence")}>
-            {memory.confidence.toFixed(2)}
-          </span>
-        ) : null}
+        {/* t253: this number used to render ONLY when confidence < LOW_CONFIDENCE,
+            and no row in the live store is below 0.5 (measured distribution over
+            57 rows: 1.0 x19, 0.9 x9, 0.8 x22, 0.95 x3, 0.7 x1, 0.6 x1, 0.5 x2) —
+            so a reading the panel promised was never on screen at all. It is shown
+            always now, with its provenance: the writer supplies the value (default
+            0.9) and it is not a calibrated probability. */}
+        <span className="muted mono" title={t("memory.confidenceHint")}>
+          {memory.confidence.toFixed(2)}
+          {memory.confidence < LOW_CONFIDENCE
+            ? ` ${t("memory.confidenceLow")}`
+            : ""}
+        </span>
         <span className="time" title={memory.updated_at}>
           <RelTime iso={memory.updated_at} /> · #{memory.id}
         </span>

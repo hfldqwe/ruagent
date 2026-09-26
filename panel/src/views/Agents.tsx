@@ -19,7 +19,6 @@ import {
   type AgentStats,
   type McpRegistry,
   type PendingPermission,
-  type RecallLogRow,
   type SessionOptionInfo,
   isRoleAgent,
 } from "../api";
@@ -653,7 +652,6 @@ const num = (v: ReactNode) => <div className="row tight end">{v}</div>;
 export function Stats() {
   const { t } = useI18n();
   const [stats, setStats] = useState<AgentStats[] | null>(null);
-  const [recallLog, setRecallLog] = useState<RecallLogRow[] | null>(null);
   const [err, setErr] = useState<unknown>(null);
   // The bar length must not breathe: a shrinking max makes every bar jump
   // at once on each poll (§5 密集), so the scale is monotonic.
@@ -669,12 +667,11 @@ export function Stats() {
       })
       // 行 20 / S12: a failed poll keeps the ledger on screen.
       .catch((e) => setErr(e));
-    api
-      .recallLog(20)
-      .then(setRecallLog)
-      .catch(() => setRecallLog((prev) => prev));
+
   };
-  // 行 39: stats + recall/log is K = 2, budget `2K + 2 = 6`; a 5s timer
+  // 行 39: #stats loads ONE endpoint now (stats) — t253 moved the recall log
+  // to #memory, the page that produces it. K = 1, budget `2K + 2 = 4`; a 5s
+  // timer spends 3 (mount + 2 ticks x 1 endpoint), so 10s keeps a margin of 2.
   // spends exactly 6 (mount + 2 ticks × 2 endpoints), i.e. zero margin. 10s
   // leaves 4.
   usePoll(load, 10000);
@@ -790,36 +787,6 @@ export function Stats() {
       {/* M6: the recall tuning dataset — what each call returned and
           the raw top scores the filters kept/dropped. Read-only: these are
           rows of a log, not 20 buttons that do nothing when pressed (S9). */}
-      {recallLog && recallLog.length > 0 && (
-        <Zone title={t("stats.recallLog")} note={t("stats.rows", { n: recallLog.length })}>
-          <div className="card">
-            {recallLog.map((r, i) => (
-              <div key={`${r.ts}-${i}`} className="row">
-                <span className="mono truncated">{r.query}</span>
-                <span className="tag">
-                  {r.strategy === "conservative"
-                    ? t("memory.recallConservative")
-                    : t("memory.recallAggressive")}
-                </span>
-                <span className="micro muted">{t("stats.topN", { n: r.top_n })}</span>
-                <span className="mono muted">
-                  mem {r.memories} · know {r.knowledge} · wiki {r.wiki} · ent {r.entities}
-                </span>
-                <span className="grow" />
-                {r.top_memory_score != null && (
-                  <span className="muted mono micro">m {r.top_memory_score.toFixed(2)}</span>
-                )}
-                {r.top_knowledge_score != null && (
-                  <span className="muted mono micro">k {r.top_knowledge_score.toFixed(2)}</span>
-                )}
-                <span className="time">
-                  <RelTime iso={r.ts} />
-                </span>
-              </div>
-            ))}
-          </div>
-        </Zone>
-      )}
     </div>
   );
 }
