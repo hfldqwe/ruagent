@@ -2471,9 +2471,13 @@ async fn recall(
             .find(|l| l.chunk_id == id)
             .map(|l| (l.rank, l.raw_score as f64))
     };
-    let (sem_legs, kw_legs) = match &legs {
-        Ok(l) => (l.semantic.as_slice(), l.keyword.as_slice()),
-        Err(_) => (&[][..], &[][..]),
+    let (sem_legs, kw_legs, kw_stage) = match &legs {
+        Ok(l) => (
+            l.semantic.as_slice(),
+            l.keyword.as_slice(),
+            Some(keyword_stage_label(&l.keyword_stage)),
+        ),
+        Err(_) => (&[][..], &[][..], None),
     };
     let mut out_chunks: Vec<serde_json::Value> = Vec::new();
     for hit in hits {
@@ -2482,44 +2486,18 @@ async fn recall(
         }
         let sem = leg_of(sem_legs, hit.chunk_id);
         let kw = leg_of(kw_legs, hit.chunk_id);
-        let mut found_in: Vec<&str> = Vec::new();
-        if sem.is_some() {
-            found_in.push("semantic");
-        }
-        if kw.is_some() {
-            found_in.push("keyword");
-        }
-        out_chunks.push(if conservative {
-            serde_json::json!({
-                "kind": "knowledge", "chunk_id": hit.chunk_id, "document": hit.document,
-                "excerpt": truncate_chars(&hit.content, 80),
-                "score": hit.score,
-                "score_kind": "rrf_rank",
-                "legs": found_in,
-                "semantic_rank": sem.map(|(r, _)| r as i64),
-                "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
-                "keyword_rank": kw.map(|(r, _)| r as i64),
-                "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
-                "hint": "call knowledge_expand(chunk_id) for the full section",
-            })
-        } else {
-            serde_json::json!({
-                "kind": "knowledge", "chunk_id": hit.chunk_id, "document": hit.document,
-                // The parent section (capped): the hit's full context.
-                "content": parents
-                    .get(&hit.chunk_id)
-                    .map(|p| truncate_chars(p, PARENT_CONTEXT_CAP))
-                    .unwrap_or_else(|| hit.content.clone()),
-                "excerpt": truncate_chars(&hit.content, 160),
-                "score": hit.score,
-                "score_kind": "rrf_rank",
-                "legs": found_in,
-                "semantic_rank": sem.map(|(r, _)| r as i64),
-                "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
-                "keyword_rank": kw.map(|(r, _)| r as i64),
-                "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
-            })
-        });
+        let content = parents
+            .get(&hit.chunk_id)
+            .map(|p| truncate_chars(p, PARENT_CONTEXT_CAP))
+            .unwrap_or_else(|| hit.content.clone());
+        out_chunks.push(knowledge_hit_json(
+            &hit,
+            sem,
+            kw,
+            kw_stage.as_deref(),
+            conservative,
+            content,
+        ));
     }
     // §12-2: the entity→wiki soft link, computed once for all hits
     // (one pass over the wiki dir, not one per entity).
@@ -2845,6 +2823,62 @@ fn declared_source(
 
 /// Round for display without inventing precision: RRF scores live around 1/61,
 /// so two decimals would collapse every fused row onto the same number.
+/// The keyword leg's construction, as a stable lower-case label
+/// (t261: precision -> prefix -> substring; "empty" = nothing matched).
+fn keyword_stage_label(stage: &ruagent_knowledge::store::KeywordStage) -> String {
+    format!("{stage:?}").to_lowercase()
+}
+
+/// One knowledge hit as JSON. ONE constructor, because the recall endpoint and
+/// the knowledge-search endpoint must carry the SAME key names: a second copy
+/// is exactly how the two would drift (t290).
+///
+/// Per-leg evidence (t250/t261): `legs` names the legs that found the chunk;
+/// `semantic_rank` / `semantic_score` and `keyword_rank` / `keyword_score`
+/// carry that leg's OWN raw score (semantic: LanceDB distance, lower is closer;
+/// keyword: bm25, more negative is better — 0.0 in the substring stage, where
+/// FTS never matched and there is no bm25 to report); `keyword_stage` names
+/// the construction that produced the keyword leg. A leg that did NOT find the
+/// chunk is `null`, never 0: 0 is a legal score, `null` is "this leg missed"
+/// (t290 — the panel would otherwise read a miss as a perfect match).
+fn knowledge_hit_json(
+    hit: &ruagent_knowledge::store::SearchHit,
+    sem: Option<(usize, f64)>,
+    kw: Option<(usize, f64)>,
+    stage: Option<&str>,
+    conservative: bool,
+    content: String,
+) -> serde_json::Value {
+    let mut found_in: Vec<&str> = Vec::new();
+    if sem.is_some() {
+        found_in.push("semantic");
+    }
+    if kw.is_some() {
+        found_in.push("keyword");
+    }
+    let mut obj = serde_json::json!({
+        "kind": "knowledge",
+        "chunk_id": hit.chunk_id,
+        "document": hit.document,
+        "score": hit.score,
+        "score_kind": "rrf_rank",
+        "legs": found_in,
+        "semantic_rank": sem.map(|(r, _)| r as i64),
+        "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
+        "keyword_rank": kw.map(|(r, _)| r as i64),
+        "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
+        "keyword_stage": stage,
+    });
+    if conservative {
+        obj["excerpt"] = serde_json::json!(truncate_chars(&hit.content, 80));
+        obj["hint"] = serde_json::json!("call knowledge_expand(chunk_id) for the full section");
+    } else {
+        obj["content"] = serde_json::json!(content);
+        obj["excerpt"] = serde_json::json!(truncate_chars(&hit.content, 160));
+    }
+    obj
+}
+
 fn round_to(v: f64, places: i32) -> f64 {
     let f = 10f64.powi(places);
     (v * f).round() / f
@@ -3581,6 +3615,10 @@ struct SearchQuery {
     q: String,
     #[serde(default)]
     limit: Option<u32>,
+    /// `?legs=false` skips the per-leg evidence pass (t290). Absent = on:
+    /// the panel's #knowledge page needs the legs by default.
+    #[serde(default)]
+    legs: Option<bool>,
 }
 
 async fn memory_search(
@@ -3723,16 +3761,81 @@ async fn knowledge_ingest(
     ))
 }
 
+/// `GET /api/v1/knowledge/search?q=...&limit=N[&legs=false]`
+///
+/// Every hit carries the per-leg evidence (t290): `legs`, `semantic_rank`,
+/// `semantic_score`, `keyword_rank`, `keyword_score`, `keyword_stage` — the
+/// SAME keys `/api/v1/recall` emits for its knowledge hits, built by the same
+/// `knowledge_hit_json`, so the panel's #knowledge page can show the legs
+/// without intercepting a prompt (which is all t263 could do before this).
+///
+/// PAGINATION, stated because the two numbers are easy to conflate:
+/// `total` is how many hits are IN THIS RESPONSE (at most `limit`); `matched`
+/// is how many the query produced BEFORE the limit (the fused candidate set),
+/// so with `limit=5` on a 30-chunk corpus the response reads `total: 5`,
+/// `matched: 30` — equal only when the limit is not binding. `matched` is
+/// bounded by the retrieval's leg window, so on a corpus larger than that
+/// window it is a LOWER BOUND, and with `?legs=false` it falls back to
+/// `total` (no second pass, no candidate count).
+///
+/// COST, stated rather than hidden: the evidence is a second pass over the same
+/// two legs (ANN + bm25) — the same shape t251 documented for recall, and for
+/// the same reason: `crates/knowledge` offers `search` and `search_legs` as two
+/// calls, both using the same leg window, so the leg sets are identical by
+/// construction. `?legs=false` is the opt-out for hot callers (the panel
+/// refreshes this endpoint while the user types). A panel-side cache was
+/// rejected: the cost belongs to the caller's call pattern, not to a cache the
+/// daemon cannot invalidate.
 async fn knowledge_search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = q.limit.unwrap_or(8);
     let hits = state
         .knowledge
-        .search(&q.q, q.limit.unwrap_or(8))
+        .search(&q.q, limit)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    Ok(Json(serde_json::json!({ "hits": hits })))
+    let total = hits.len();
+    let want_legs = q.legs.unwrap_or(true);
+    let (sem_legs, kw_legs, kw_stage, matched) = if want_legs {
+        match state.knowledge.search_legs(&q.q, limit).await {
+            Ok(l) => (
+                l.semantic.clone(),
+                l.keyword.clone(),
+                Some(keyword_stage_label(&l.keyword_stage)),
+                l.fused.len(),
+            ),
+            // Best-effort: the hits are already in hand, and a failing leg
+            // listing must not turn a working search into a 400.
+            Err(_) => (Vec::new(), Vec::new(), None, total),
+        }
+    } else {
+        (Vec::new(), Vec::new(), None, total)
+    };
+    let leg_of = |v: &[ruagent_knowledge::store::LegHit], id: i64| -> Option<(usize, f64)> {
+        v.iter()
+            .find(|l| l.chunk_id == id)
+            .map(|l| (l.rank, l.raw_score as f64))
+    };
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for hit in &hits {
+        let sem = leg_of(&sem_legs, hit.chunk_id);
+        let kw = leg_of(&kw_legs, hit.chunk_id);
+        out.push(knowledge_hit_json(
+            hit,
+            sem,
+            kw,
+            kw_stage.as_deref(),
+            false,
+            hit.content.clone(),
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "hits": out,
+        "total": total,
+        "matched": matched,
+    })))
 }
 
 /// Resolve the routing file's agent NAMES into ids and run the cascade.
@@ -3929,6 +4032,170 @@ mod tests {
             .iter()
             .find(|s| s["key"] == key)
             .cloned()
+    }
+
+    /// POST/GET with a JSON body, for routes that take one.
+    async fn send_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value, String) {
+        let mut b = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                b.body(match &body {
+                    Some(v) => Body::from(v.to_string()),
+                    None => Body::empty(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        (status, json, text)
+    }
+
+    /// t290: knowledge/search must carry the SAME per-leg evidence as recall's
+    /// knowledge hits, hit for hit; and a leg that missed must be `null`, not 0.
+    #[tokio::test]
+    async fn knowledge_search_legs_match_recall_and_absent_legs_are_null() {
+        let (app, _db, _root) = harness().await;
+        let doc = "# Deploy guide\n\nThe deploy pipeline runs on Tuesdays from the release branch.\n\n# Tea notes\n\nEarl grey tastes best with a slice of lemon.\n";
+        let (st, _, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/knowledge/ingest",
+            Some(serde_json::json!({ "name": "t290-doc", "content": doc })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+
+        let q = "deploy%20pipeline%20tuesdays";
+        let (s1, v1, raw1) = send_json(
+            &app,
+            "GET",
+            &format!("/api/v1/knowledge/search?q={q}&limit=5"),
+            None,
+        )
+        .await;
+        assert_eq!(s1, StatusCode::OK, "{raw1}");
+        let hits = v1["hits"].as_array().cloned().unwrap_or_default();
+        assert!(!hits.is_empty(), "expected hits: {raw1}");
+        println!(
+            "READING knowledge/search: total={} matched={} first hit keys={:?}",
+            v1["total"],
+            v1["matched"],
+            hits[0]
+                .as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        );
+
+        let (s2, v2, raw2) = send_json(
+            &app,
+            "GET",
+            &format!("/api/v1/recall?q={q}&top_n=5&source=t290-test"),
+            None,
+        )
+        .await;
+        assert_eq!(s2, StatusCode::OK, "{raw2}");
+        let rec_knowledge = v2["knowledge"].as_array().cloned().unwrap_or_default();
+        assert!(!rec_knowledge.is_empty(), "recall knowledge empty: {raw2}");
+
+        // Hit for hit: the same chunk must carry the same leg fields.
+        for h in &hits {
+            let id = h["chunk_id"].as_i64().unwrap();
+            let other = rec_knowledge
+                .iter()
+                .find(|k| k["chunk_id"].as_i64() == Some(id))
+                .unwrap_or_else(|| panic!("chunk {id} missing from recall: {raw2}"));
+            for key in [
+                "legs",
+                "semantic_rank",
+                "semantic_score",
+                "keyword_rank",
+                "keyword_score",
+                "keyword_stage",
+            ] {
+                assert_eq!(h[key], other[key], "key {key} differs on chunk {id}");
+            }
+        }
+        // The null invariant, on whatever the corpus produced: a leg that did
+        // not find the chunk reports null, never 0.
+        let mut null_cases = 0;
+        for h in &hits {
+            let legs: Vec<String> = h["legs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if !legs.iter().any(|l| l == "keyword") {
+                assert!(h["keyword_score"].is_null(), "{h}");
+                assert!(h["keyword_rank"].is_null(), "{h}");
+                null_cases += 1;
+            }
+            if !legs.iter().any(|l| l == "semantic") {
+                assert!(h["semantic_score"].is_null(), "{h}");
+            }
+            assert!(h["keyword_stage"].is_string() || h["keyword_stage"].is_null());
+        }
+        println!("READING null-leg cases in this query: {null_cases}");
+
+        // total vs matched: equal while the limit is not binding, different
+        // once it bites (the acceptance's 5/161 shape).
+        let (s3, v3, raw3) = send_json(
+            &app,
+            "GET",
+            &format!("/api/v1/knowledge/search?q={q}&limit=1"),
+            None,
+        )
+        .await;
+        assert_eq!(s3, StatusCode::OK, "{raw3}");
+        println!(
+            "READING pagination: limit=1 -> total={} matched={} (hits={})",
+            v3["total"],
+            v3["matched"],
+            v3["hits"].as_array().map(|a| a.len()).unwrap_or(0)
+        );
+        assert_eq!(v3["total"], 1, "{raw3}");
+        assert!(
+            v3["matched"].as_u64().unwrap_or(0) > 1,
+            "matched must count before the limit: {raw3}"
+        );
+
+        // ?legs=false is the documented opt-out: no evidence pass, and the
+        // hits keep the same shape minus the leg fields' values.
+        let (s4, v4, raw4) = send_json(
+            &app,
+            "GET",
+            &format!("/api/v1/knowledge/search?q={q}&limit=1&legs=false"),
+            None,
+        )
+        .await;
+        assert_eq!(s4, StatusCode::OK, "{raw4}");
+        assert!(v4["hits"][0]["keyword_score"].is_null(), "{raw4}");
+        assert!(
+            v4["hits"][0]["legs"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "{raw4}"
+        );
+        println!(
+            "READING legs=false: legs={} keyword_stage={}",
+            v4["hits"][0]["legs"], v4["hits"][0]["keyword_stage"]
+        );
     }
 
     /// One integer out of one statement — the raw counts the readings quote.
