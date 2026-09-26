@@ -207,3 +207,18 @@ t252 的 verify 里有 `cargo fmt --all --check`，而它是**全 workspace** �
 1. **新任务的 verify 用限定范围的命令**：`cargo fmt -p <crate> -- --check`、`cargo test -p <crate>`，不要写 `--all` / `--workspace`。
 2. **全 workspace 的检查是队长的集成步骤**，不是单个成员任务的验收条件。
 3. **临时探针要么住在仓库外**（tools 在 t245 的先例：文件放 C:/tmp，仓库回到干净），**要么随时可编译**。住在 `tests/` 下的，先 `cargo check` 一次再往下写。
+
+### 7.4 验证单的派发前置：被测改动必须已经进二进制（t257 的裁决）
+
+t257（tools 独立验证 t252）的两个验收命令跑不了，而**两个阻塞是同一个**：
+
+```
+D:/rust_cache/debug/ruagent.exe  mtime 14:44（早于 t252）
+$ ruagent.exe knowledge --help  ⇒ error: unrecognized subcommand 'knowledge'
+```
+
+更严重的是第二个后果：这份二进制**也早于 t252 的探针隔离** ⇒ 跑两次 doctor 就是**拿旧版本往用户真实库里写探针行** ⇒ tools 拒绝执行，并写明「拒绝本身就是这条验收的正确执行」。
+
+**对策（已编码进平台，不是提醒）**：验证单的前置里加一条「重建二进制 + 切换」的任务（t273），验证单依赖它。
+
+**平台缺口（记账）**：`create_task` 的 assignee 必须是活跃成员，**captain 不是活跃成员** ⇒ 队长的任务创建时只能留空；而 `reassign_task(assignee="captain")` 会被**未完成的前置**挡住 ⇒ **一个还没到执行时机的队长任务无法预先指派给自己**，只能在依赖完成的那一刻再收回。这是「对策依赖人记得」的形状，目前只能靠队长自己盯。
