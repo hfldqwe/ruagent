@@ -7,6 +7,7 @@
 //! - [`inject`] — the injection contract: bounded tagged blocks, pure
 //!   rendering, property-tested and golden-tested (design §6.4).
 
+pub mod dedupe;
 pub mod episode;
 pub mod inject;
 pub mod lifecycle;
@@ -14,6 +15,7 @@ pub mod namespace;
 pub mod query;
 pub mod write;
 
+pub use dedupe::{Verdict, judge};
 pub use inject::{InjectionBudget, MemoryForInjection, render_injection};
 pub use lifecycle::{
     DeleteOutcome, PurgeOutcome, RestoreOutcome, delete_memory, purge_memory, restore_memory,

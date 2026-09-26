@@ -188,7 +188,9 @@ impl Distiller {
             .context("distillation agent run failed")?;
         let extraction = parse_extraction(&raw)?;
 
-        let (mem_w, mem_s) = self.write_memories(&extraction.memories).await?;
+        let (mem_w, mem_s) = self
+            .write_memories(&extraction.memories, Some((session_key, &transcript)))
+            .await?;
         // graph = false: memories only; entities/relations count 0 and
         // the log still records the run.
         let (ent_w, rel_w) = if self.graph {
@@ -368,7 +370,39 @@ impl Distiller {
 
     /// Insert memories with near-duplicate skip (cosine >= 0.90 against
     /// same store+namespace rows, via the shared embedder).
-    async fn write_memories(&self, memories: &[ExtractedMemory]) -> Result<(u32, u32)> {
+    /// Write the extracted memories, SUPERSEDING a near-duplicate instead of
+    /// skipping it (t329).
+    ///
+    /// `provenance` is the (session key, transcript) this run distilled: the raw
+    /// transcript is recorded as an episode and every memory written here points
+    /// at it. `record_episode` is idempotent by content hash, so re-distilling a
+    /// session reuses the same episode.
+    async fn write_memories(
+        &self,
+        memories: &[ExtractedMemory],
+        provenance: Option<(&str, &str)>,
+    ) -> Result<(u32, u32)> {
+        let episode = match provenance {
+            Some((key, transcript)) => match ruagent_memory::episode::record_episode(
+                &self.db,
+                ruagent_memory::episode::EpisodeKind::RunTurn,
+                transcript,
+                Some(key),
+            )
+            .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(
+                        session = %key,
+                        error = %e,
+                        "could not record the distillation episode"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         let mut written = 0u32;
         let mut skipped = 0u32;
         for m in memories {
@@ -379,30 +413,33 @@ impl Distiller {
                 m.namespace.clone()
             };
             let content = format!("[distilled] {}", m.content.trim());
-            // Near-duplicate check against existing rows in scope.
-            let dup = {
+            // Near-duplicate check against the live rows in scope. A hit is no
+            // longer a SKIP: t323 measured 8 of 44 `profile` rows saying the same
+            // thing in different words, because the check it had was word-based
+            // and therefore blind to Chinese. A hit now SUPERSEDES that row, so
+            // the store keeps one row per meaning instead of one per phrasing
+            // (t329).
+            let supersedes: Option<i64> = {
                 let db = self.db.clone();
                 let (store_c, ns_c) = (store.clone(), namespace.clone());
-                let existing: Vec<String> = db
-                    .call(move |conn| -> Result<Vec<String>, ruagent_store::DbError> {
-                        let mut stmt = conn
-                            .prepare(
-                                "SELECT content FROM memories
+                let existing: Vec<(i64, String)> = db
+                    .call(
+                        move |conn| -> Result<Vec<(i64, String)>, ruagent_store::DbError> {
+                            let mut stmt = conn
+                                .prepare(
+                                    "SELECT id, content FROM memories
                                   WHERE store = ?1 AND namespace = ?2 AND superseded_at IS NULL",
-                            )
-                            .map_err(ruagent_store::DbError::from)?;
-                        let rows = stmt
-                            .query_map([&store_c, &ns_c], |r| r.get::<_, String>(0))
-                            .map_err(ruagent_store::DbError::from)?;
-                        Ok(rows.filter_map(|r| r.ok()).collect())
-                    })
+                                )
+                                .map_err(ruagent_store::DbError::from)?;
+                            let rows = stmt
+                                .query_map([&store_c, &ns_c], |r| Ok((r.get(0)?, r.get(1)?)))
+                                .map_err(ruagent_store::DbError::from)?;
+                            Ok(rows.filter_map(|r| r.ok()).collect())
+                        },
+                    )
                     .await??;
-                is_near_duplicate(&content, &existing)
+                mergeable_target(&content, &existing)
             };
-            if dup {
-                skipped += 1;
-                continue;
-            }
             // The memory crate's write path handles the content hash,
             // exact-duplicate rejection and the audit trail.
             let (store_t, ns_t) = match (
@@ -422,8 +459,8 @@ impl Distiller {
                     namespace: ns_t,
                     content: content.clone(),
                     confidence: m.confidence.unwrap_or(0.8).clamp(0.5, 1.0),
-                    source_episode: None,
-                    supersedes: None,
+                    source_episode: episode,
+                    supersedes,
                 },
             )
             .await
@@ -557,33 +594,20 @@ fn extraction_prompt(language: Option<&str>, prompt_override: Option<&str>) -> S
     out
 }
 
-fn is_near_duplicate(content: &str, existing: &[String]) -> bool {
-    let norm = |s: &str| -> Vec<String> {
-        s.split_whitespace()
-            .map(|w| {
-                w.chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect::<String>()
-                    .to_lowercase()
-            })
-            .filter(|w| w.len() > 2)
-            .collect()
-    };
-    let target = norm(content);
-    if target.is_empty() {
-        return true;
-    }
-    for e in existing {
-        let cand = norm(e);
-        if cand.is_empty() {
-            continue;
-        }
-        let hits = target.iter().filter(|t| cand.contains(t)).count();
-        if hits as f64 / target.len() as f64 >= 0.7 {
-            return true;
-        }
-    }
-    false
+/// Which existing row this content should SUPERSEDE, if any (t329).
+///
+/// The criterion lives in the memory crate (`ruagent_memory::dedupe`): ONE source
+/// for the vocabulary and the fail-closed rule, so the write path and its tests
+/// cannot drift apart. It compares characters, which is what makes it able to
+/// see Chinese at all — the word-based check it replaces normalised a whole
+/// sentence to a single token.
+fn mergeable_target(content: &str, existing: &[(i64, String)]) -> Option<i64> {
+    existing.iter().find_map(
+        |(id, row)| match ruagent_memory::dedupe::judge(row, content) {
+            ruagent_memory::dedupe::Verdict::Mergeable => Some(*id),
+            _ => None,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -620,16 +644,176 @@ mod tests {
         assert!(ex.relations.is_empty());
     }
 
+    /// English, so both languages stay covered: a difference made of filler
+    /// merges, a difference that carries content does not.
+    ///
+    /// The second assertion is where the old rule and this one disagree, and
+    /// the disagreement is the point: the word-overlap rule called that pair a
+    /// duplicate (3 of its 4 long words matched), while dropping "timezone
+    /// UTC+8" plainly changes the fact. Fail-closed refuses (t329).
     #[test]
-    fn near_duplicate_detects_high_overlap() {
-        let existing = vec!["user prefers Rust and dislikes Java timezone UTC+8".to_string()];
-        assert!(is_near_duplicate(
-            "User prefers Rust; dislikes Java (UTC+8)",
-            &existing
+    fn near_duplicate_is_a_character_decision_now() {
+        let existing = vec![(
+            7i64,
+            "the user prefers Rust and dislikes Java timezone UTC+8".to_string(),
+        )];
+        assert_eq!(
+            mergeable_target(
+                "user prefers Rust and dislikes Java timezone UTC+8",
+                &existing
+            ),
+            Some(7),
+            "only the filler word `the` differs"
+        );
+        assert_eq!(
+            mergeable_target("User prefers Rust; dislikes Java (UTC+8)", &existing),
+            None,
+            "the timezone is content, so this must not merge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod t329_tests {
+    use super::*;
+
+    async fn count(db: &ruagent_store::Db, sql: &str) -> i64 {
+        let sql = sql.to_string();
+        db.call(move |conn| conn.query_row(&sql, [], |r| r.get::<_, i64>(0)))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn root(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("ruagent-t329-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    async fn distiller(root: &std::path::Path) -> Distiller {
+        Distiller {
+            db: ruagent_store::Db::open(root.join("ruagent.db")).unwrap(),
+            root: root.to_path_buf(),
+            embedder: None,
+            registry: crate::distill::AgentRegistry::default(),
+            language: None,
+            prompt_override: None,
+            graph: false,
+        }
+    }
+
+    fn mem(content: &str) -> ExtractedMemory {
+        ExtractedMemory {
+            store: "profile".to_string(),
+            namespace: "user".to_string(),
+            content: content.to_string(),
+            confidence: None,
+        }
+    }
+
+    /// t329 acceptance 3: four phrasings of ONE fact must leave one live row —
+    /// the earlier ones superseded — instead of the four rows t323 measured.
+    #[tokio::test]
+    async fn four_phrasings_leave_one_live_row() {
+        let root = root("phrasings");
+        let d = distiller(&root).await;
+        let phrasings = [
+            "用户偏好使用简体中文交流。",
+            "用户使用简体中文交流。",
+            "用户使用简体中文进行交流。",
+            "偏好使用简体中文交流。",
+        ];
+        for (i, p) in phrasings.iter().enumerate() {
+            let (w, s) = d
+                .write_memories(
+                    &[mem(p)],
+                    Some(("ruagent:t329-test", "[t329] the user's language preference")),
+                )
+                .await
+                .unwrap();
+            println!("READING write {i}: written={w} skipped={s}");
+        }
+        let live = count(
+            &d.db,
+            "SELECT count(*) FROM memories WHERE superseded_at IS NULL",
+        )
+        .await;
+        let dead = count(
+            &d.db,
+            "SELECT count(*) FROM memories WHERE superseded_at IS NOT NULL",
+        )
+        .await;
+        let episodes = count(&d.db, "SELECT count(*) FROM episodes").await;
+        let with_source = count(
+            &d.db,
+            "SELECT count(*) FROM memories WHERE source_episode IS NOT NULL",
+        )
+        .await;
+        println!(
+            "READING after four phrasings: live={live} superseded={dead} episodes={episodes} rows_with_source_episode={with_source}"
+        );
+        let rows: Vec<String> = d
+            .db
+            .call(|conn| {
+                let mut st = conn.prepare(
+                    "SELECT id, superseded_at IS NOT NULL, supersedes, content FROM memories ORDER BY id",
+                )?;
+                let v: Vec<String> = st
+                    .query_map([], |r| {
+                        Ok(format!(
+                            "#{} superseded={} supersedes={:?} {}",
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, String>(3)?
+                        ))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok::<_, rusqlite::Error>(v)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        for r in &rows {
+            println!("READING row: {r}");
+        }
+        assert_eq!(live, 1, "four phrasings of one fact leave one live row");
+        assert_eq!(
+            dead, 3,
+            "the three earlier rows are superseded, never deleted"
+        );
+        assert!(episodes >= 1, "the transcript is recorded as an episode");
+        assert_eq!(with_source, 4, "every row points at its episode");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// t329 acceptance 4: the polarity pair is refused — and it is refused even
+    /// though the two strings are near neighbours in vector space, which is why
+    /// the cosine cannot be the criterion.
+    #[tokio::test]
+    async fn a_polarity_pair_is_refused_even_though_the_cosine_is_high() {
+        let a = "[distilled] 用户偏好简体中文";
+        let b = "[distilled] 用户不使用简体中文";
+        let verdict = ruagent_memory::dedupe::judge(a, b);
+        let emb: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder> =
+            std::sync::Arc::new(ruagent_knowledge::embed::HashEmbedder::default());
+        let v = emb.embed(&[a, b]).unwrap();
+        let dot: f32 = v[0].iter().zip(&v[1]).map(|(x, y)| x * y).sum();
+        let na: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = v[1].iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos = dot / (na * nb);
+        println!(
+            "READING polarity pair: verdict={verdict:?} cosine({})={cos:.4}",
+            emb.name()
+        );
+        assert!(matches!(
+            verdict,
+            ruagent_memory::dedupe::Verdict::Refused(_)
         ));
-        assert!(!is_near_duplicate(
-            "deploy via docker compose on the weekend",
-            &existing
-        ));
+        assert!(cos > 0.5, "a neighbour in vector space, and still refused");
     }
 }
