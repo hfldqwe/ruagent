@@ -3507,7 +3507,11 @@ mod tests {
             if std::env::set_current_dir(&second).is_ok() {
                 let from_root = panel_dist_dir();
                 let _ = std::env::set_current_dir(&cwd);
-                eprintln!("cwd={} -> panel dist={}", second.display(), from_root.display());
+                eprintln!(
+                    "cwd={} -> panel dist={}",
+                    second.display(),
+                    from_root.display()
+                );
                 assert_eq!(
                     from_root, found,
                     "the panel resolved differently from a different working directory"
