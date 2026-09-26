@@ -9,6 +9,8 @@
 #
 #   start   launch it (WMI; survives the calling shell; appends the log)
 #   stop    stop the daemon recorded in <root>/data/daemon.pid (never by name/port)
+#           -- and only if it IS that root daemon: see Get-DaemonIdentity below,
+#           which status/watch/stop all share (t340, discipline 7.92)
 #   status  health check + pid + log tail
 #   watch   start it only if the health check fails (this is what the task runs)
 #   install-task  register a scheduled task: at logon, and every 5 minutes
@@ -59,14 +61,51 @@ function Test-Health {
   try { $r = Invoke-RestMethod -TimeoutSec 5 -Uri $health; return ($r.status -eq 'ok') } catch { return $false }
 }
 
-function Get-DaemonPid {
-  if (-not (Test-Path $pidRec)) { return $null }
-  $first = (Get-Content $pidRec -TotalCount 1).Trim().Split(' ')[0]
-  $p = $null
-  if ([int]::TryParse($first, [ref]$p)) {
-    $proc = Get-Process -Id $p -ErrorAction SilentlyContinue
-    if ($proc -and $proc.ProcessName -eq 'ruagent') { return $p }
+# ── ONE identity definition, shared by status / watch / stop (7.92) ─────────
+# Until t340 this function asked only "does the process named in the pid file
+# exist, and is it called ruagent?". On a PERSISTENT root that is a false
+# positive: the daemon dies, the pid file stays, and if Windows recycles that
+# pid to ANY other ruagent process (another root temp daemon, for instance)
+# the answer is "alive" -- so status prints a pid that is not ours, and
+# stop -Force would kill an innocent process. 7.86 needs the same identity to
+# decide what to clean up, so both read it from here instead of each keeping
+# its own spelling.
+function Get-NormalizedPath {
+  param([string]$Path)
+  if (-not $Path) { return '' }
+  # / and \ are the same separator to Windows, a trailing one is noise,
+  # and the comparison must not be case sensitive.
+  return $Path.Trim().Replace('/', '\').TrimEnd('\').ToLowerInvariant()
+}
+
+function Get-DaemonIdentity {
+  param([string]$Root, [string]$PidFile)
+  $id = [pscustomobject]@{
+    Pid = $null; ProcessExists = $false; NameMatches = $false; RootMatches = $false; Ours = $false
   }
+  if (-not (Test-Path $PidFile)) { return $id }
+  # The file holds "pid timestamp" (two values): the first token is the pid.
+  $first = (Get-Content $PidFile -TotalCount 1).Trim().Split(' ')[0]
+  $p = 0
+  if (-not [int]::TryParse($first, [ref]$p)) { return $id }
+  $id.Pid = $p
+  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
+  if (-not $proc) { return $id }
+  $id.ProcessExists = $true
+  $id.NameMatches = ($proc.Name -eq 'ruagent.exe')
+  $cmd = ''; if ($proc.CommandLine) { $cmd = $proc.CommandLine }
+  # BOTH sides are normalized: the daemon was launched with the root as the
+  # caller spelled it (C:/... in this session, C:\... in another), and a
+  # one-sided comparison reads a real daemon as not-ours -- measured, and it
+  # is the false NEGATIVE direction of this check.
+  $id.RootMatches = (Get-NormalizedPath $cmd).Contains((Get-NormalizedPath $Root))
+  $id.Ours = $id.NameMatches -and $id.RootMatches
+  return $id
+}
+
+function Get-DaemonPid {
+  $id = Get-DaemonIdentity -Root $Root -PidFile $pidRec
+  if ($id.Ours) { return $id.Pid }
   return $null
 }
 
@@ -92,8 +131,19 @@ switch ($Action) {
   }
   'stop' {
     # Only the pid recorded by the daemon itself: never a name or port sweep.
-    $p = Get-DaemonPid
-    if (-not $p) { Write-Output 'no recorded daemon pid (nothing to stop)'; break }
+    # 7.92: a stale pid file can name a LIVE process that is not ours. Stopping
+    # on the pid alone would kill an innocent process -- so the identity decides,
+    # and a refusal says which half failed.
+    $id = Get-DaemonIdentity -Root $Root -PidFile $pidRec
+    if (-not $id.Ours) {
+      if ($id.ProcessExists) {
+        Write-Output ("REFUSING to stop pid $($id.Pid): it is alive but not this root's daemon (name-match=$($id.NameMatches) root-match=$($id.RootMatches)); nothing was stopped.")
+      } else {
+        Write-Output 'no recorded daemon pid (nothing to stop)'
+      }
+      break
+    }
+    $p = $id.Pid
     # Posting to the team channel is the one step a script cannot do. What it CAN
     # do is refuse to be silent: without -Force it stops nothing and prints what
     # stopping would break, plus the text a human should send. -Force is what the
@@ -116,11 +166,17 @@ switch ($Action) {
     Write-Output ('notice appended: ' + $noticePath)
   }
   'status' {
-    $p = Get-DaemonPid
+    # The recorded pid is reported with its IDENTITY, not just as a number: a
+    # recycled pid is the case this line exists to make visible (t340).
+    $id = Get-DaemonIdentity -Root $Root -PidFile $pidRec
     $healthText = 'DOWN'
     if (Test-Health) { $healthText = 'ok' }
     $pidText = 'none'
-    if ($p) { $pidText = "$p" }
+    if ($id.Ours) {
+      $pidText = "$($id.Pid) (ours)"
+    } elseif ($id.ProcessExists) {
+      $pidText = "$($id.Pid) NOT OURS (alive, but name-match=$($id.NameMatches) root-match=$($id.RootMatches): the pid was recycled or the file is stale)"
+    }
     Write-Output "health: $healthText"
     Write-Output "pid:    $pidText"
     if (Test-Path $log) { Write-Output 'log tail:'; Get-Content $log -Tail 8 }
@@ -136,7 +192,10 @@ switch ($Action) {
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $stamp = (Get-Date).ToString('s')
     if (Test-Health) {
-      Add-Content -Path (Join-Path $logDir 'watchdog.log') -Value "$stamp ok pid=$(Get-DaemonPid)"
+      $id = Get-DaemonIdentity -Root $Root -PidFile $pidRec
+      $ours = 'none'
+      if ($id.Ours) { $ours = "$($id.Pid)" } elseif ($id.ProcessExists) { $ours = "$($id.Pid)!not-ours" }
+      Add-Content -Path (Join-Path $logDir 'watchdog.log') -Value "$stamp ok pid=$ours"
       Write-Output 'ok (no action)'
     } else {
       $dead = Get-DaemonPid
