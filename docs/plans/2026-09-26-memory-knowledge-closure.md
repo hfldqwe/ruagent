@@ -172,3 +172,24 @@ t250 改派给 tools（它是唯一两次读进 crates/knowledge 内部的人）
 - **执行会话可能没有 `agent_teams_*` 工具**：拿不到就立刻说，不要默默做完再交（t247 与 t246 各卡一次）。
 - **历史行的新列是 NULL，而 NULL 不是 user**：渲染成「unknown（早于该列）」，不许按内容猜、不许静默过滤掉。
 - 环境：`cargo` 需要 `protoc` 在 PATH 上（本机 `~/.protoc/bin`），`CARGO_TARGET_DIR=D:/rust_cache`。
+
+## 7 环境危害（2026-09-26 实测，会制造假读数与假错误）
+
+### 7.1 共享 CARGO_TARGET_DIR 的跨树产物串扰
+
+同一个 `CARGO_TARGET_DIR` 下用**两棵不同的树**跑同一个包，cargo 会把**另一棵树**的产物交给测试：
+
+- t256 实测：改后树的 `retrieval-legs` 报 `no method named search_legs`，`-v` 显示它链接的 rlib 里该符号计数 **0**（另一棵树的库）。给每棵树不同包版本后：改前链接 `c03582ee…`（计数 0）、改后链接 `223f9d34…`（计数 6）。
+- t254 实测：`cargo test -p ruagent-knowledge` 报 `E0433 cannot find fts in ruagent_store` ×4 + `E0277 str` ×2，链接的是 `libruagent_store-d7f32265aa2a6468.rmeta`（mtime 19:20:29，正是两棵临时树的构建窗口），而更新的 rmeta（19:52:47）就在旁边；`cargo build -p ruagent-store` 单独跑无错。
+
+**后果**：这组假错误把 contract-lead 的 t252 打成了 failed —— 一个**已完成、4/5 条有读数**的任务因为环境串扰被记成失败。
+
+**对策**：① 任何「两棵树对比」的读数必须附**链接证明**（让读者能判断你链接的是哪棵树）；② 对比实验用**各自独立的 target dir**，不要共用；③ 已经污染时 `cargo clean -p <crate>`（不要整仓 clean）。
+
+### 7.2 活库在自变
+
+运行中的守护进程自己在写库（蒸馏）：复核期间实测 `recall_log 574 → 582`、`memories 154 → 164`。
+
+**后果**：旧读数的**数值**会过期，**口径与取值集合不变**（t254 复核 t247 的取值集合仍是同 3 个值 301/278/3）。
+
+**对策**：读数必须自带时间窗；引用旧数值时说明它是哪个时间点的。
