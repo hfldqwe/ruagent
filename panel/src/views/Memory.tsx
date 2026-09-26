@@ -139,6 +139,12 @@ export function Memory() {
       .then(setRecallLog)
       .catch(() => setRecallLog([]));
   }, []);
+  const [hideProbe, setHideProbe] = useState(true);
+  // Only rows whose source is exactly "probe" are hidden. NULL (unknown) rows
+  // are a fact about rows written before the column existed and stay visible.
+  const shownLog = (recallLog ?? []).filter(
+    (r) => !(hideProbe && (r as { source?: string | null }).source === "probe"),
+  );
 
   const projectNamespaces = (counts ?? [])
     .filter(([s, ns]) => s === store && ns.startsWith("project:"))
@@ -284,7 +290,27 @@ export function Memory() {
           note={t("stats.rows", { n: recallLog.length })}
         >
           <div className="card">
-            {recallLog.map((r, i) => {
+            {/* t263: probe rows (t252 makes doctor declare ?source=probe) are
+                filtered HERE, on the exact value only. A row whose source is
+                NULL — written before the column existed — is never matched by
+                this filter and never disappears because of it. */}
+            <label className="row tight muted micro">
+              <input
+                type="checkbox"
+                checked={hideProbe}
+                onChange={(e) => setHideProbe(e.target.checked)}
+                aria-label={t("memory.recallHideProbe")}
+              />
+              {t("memory.recallHideProbe")}
+              <span title={t("memory.recallProbeNote")} className="tag micro">
+                ?
+              </span>
+              {t("memory.recallShown", {
+                n: shownLog.length,
+                total: recallLog.length,
+              })}
+            </label>
+            {shownLog.map((r, i) => {
               // t253: who produced the row. Rows written before the column
               // existed carry no source and read as unknown — never as
               // "user", never guessed from the query, never filtered out.
@@ -394,6 +420,8 @@ function NewNamespaceInput({ store, onCreated }: { store: Store; onCreated: (ns:
 function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () => void }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
   const superseded = memory.superseded_at != null;
 
   return (
@@ -429,6 +457,38 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
         </span>
       </div>
       <p className={superseded ? "memory-content old" : "memory-content"}>{memory.content}</p>
+      {/* t263: the correction path (supersede) already existed; this adds the
+          other half of t251's lifecycle API. Soft delete: the row stays in the
+          store with a tombstone and leaves the default view. */}
+      {!superseded && (
+        <div className="row tight">
+          <Popconfirm
+            title={t("memory.deleteConfirm.title", { id: memory.id })}
+            description={t("memory.deleteConfirm.hint")}
+            okText={t("memory.delete")}
+            cancelText={t("common.cancel")}
+            onConfirm={async () => {
+              setBusy(true);
+              setFailed(false);
+              try {
+                await api.memoryDelete(memory.id);
+                onChanged();
+              } catch {
+                setFailed(true);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            <Button danger type="text" loading={busy}>
+              {t("memory.delete")}
+            </Button>
+          </Popconfirm>
+          {failed ? (
+            <span className="muted micro">{t("memory.deleteFailed")}</span>
+          ) : null}
+        </div>
+      )}
       {!superseded && (
         <div className="row tight">
           {/* Destructive: confirm first (audit P2). Quiet by colour — V4. */}
@@ -769,7 +829,39 @@ function MemoryStub({
       <StubHead open={open} onToggle={onToggle}>
         <span className="tag">#{stub.id}</span>
         <span className="tag">{stub.store}</span>
-        {stub.score != null && <span className="muted mono">{stub.score.toFixed(2)}</span>}
+        {stub.score != null && (
+          <span className="muted mono" title={t("knowledge.scoreHint")}>
+            {t("knowledge.score", { s: stub.score.toFixed(3) })}
+          </span>
+        )}
+        {/* t263: the same leg evidence as the knowledge hits. The panel type
+            for recall memories is behind the response (t251 added these
+            fields), so they are read through a narrow cast — absent on an
+            older daemon, in which case nothing renders. */}
+        {(() => {
+          const m = stub as {
+            legs?: string[];
+            semantic_score?: number | null;
+            keyword_score?: number | null;
+          };
+          return (
+            <>
+              {m.legs?.length ? (
+                <span className="tag micro">{t("knowledge.legs")} {m.legs.join(" · ")}</span>
+              ) : null}
+              {m.semantic_score != null ? (
+                <span className="muted mono micro" title={t("knowledge.semanticHint")}>
+                  {t("knowledge.semanticScore", { s: m.semantic_score.toFixed(4) })}
+                </span>
+              ) : null}
+              {m.keyword_score != null ? (
+                <span className="muted mono micro" title={t("knowledge.keywordHint")}>
+                  {t("knowledge.keywordScore", { s: m.keyword_score.toFixed(4) })}
+                </span>
+              ) : null}
+            </>
+          );
+        })()}
         <span className="stub-text">{stub.title}</span>
         {!open && <span className="stub-afford">{t("memory.recallExpand")}</span>}
       </StubHead>
@@ -839,7 +931,26 @@ function KnowledgeStub({
     <div className="recall-hit">
       <StubHead open={open} onToggle={onToggle}>
         <span className="tag">{stub.document}</span>
-        {stub.score != null && <span className="muted mono">{stub.score.toFixed(2)}</span>}
+        {stub.score != null && (
+          <span className="muted mono" title={t("knowledge.scoreHint")}>
+            {t("knowledge.score", { s: stub.score.toFixed(3) })}
+          </span>
+        )}
+        {stub.legs?.length ? (
+          <span className="tag micro">
+            {t("knowledge.legs")} {stub.legs.join(" · ")}
+          </span>
+        ) : null}
+        {stub.semantic_score != null ? (
+          <span className="muted mono micro" title={t("knowledge.semanticHint")}>
+            {t("knowledge.semanticScore", { s: stub.semantic_score.toFixed(4) })}
+          </span>
+        ) : null}
+        {stub.keyword_score != null ? (
+          <span className="muted mono micro" title={t("knowledge.keywordHint")}>
+            {t("knowledge.keywordScore", { s: stub.keyword_score.toFixed(4) })}
+          </span>
+        ) : null}
         <span className="stub-text">{stub.excerpt}</span>
         {!open && <span className="stub-afford">{t("memory.recallExpand")}</span>}
       </StubHead>

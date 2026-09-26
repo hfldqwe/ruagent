@@ -133,29 +133,31 @@ pub enum EntityDeleteOutcome {
 /// success (t276): "nothing was there" and "it is gone now" are different
 /// facts. The FTS index follows via the `entities_ad` trigger.
 pub async fn delete_entity(db: &Db, id: i64) -> Result<EntityDeleteOutcome, DbError> {
-    db.call(move |conn| -> Result<EntityDeleteOutcome, rusqlite::Error> {
-        let exists: i64 =
-            conn.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |r| {
-                r.get(0)
-            })?;
-        if exists == 0 {
-            return Ok(EntityDeleteOutcome::NotFound);
-        }
-        let facts_removed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entity_edges
+    db.call(
+        move |conn| -> Result<EntityDeleteOutcome, rusqlite::Error> {
+            let exists: i64 =
+                conn.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+            if exists == 0 {
+                return Ok(EntityDeleteOutcome::NotFound);
+            }
+            let facts_removed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM entity_edges
               WHERE (src = ?1 OR dst = ?1) AND invalid_at IS NULL",
-            [id],
-            |r| r.get(0),
-        )?;
-        let edges_removed =
-            conn.execute("DELETE FROM entity_edges WHERE src = ?1 OR dst = ?1", [id])? as i64;
-        conn.execute("DELETE FROM entities WHERE id = ?1", [id])?;
-        Ok(EntityDeleteOutcome::Deleted {
-            id,
-            edges_removed,
-            facts_removed,
-        })
-    })
+                [id],
+                |r| r.get(0),
+            )?;
+            let edges_removed =
+                conn.execute("DELETE FROM entity_edges WHERE src = ?1 OR dst = ?1", [id])? as i64;
+            conn.execute("DELETE FROM entities WHERE id = ?1", [id])?;
+            Ok(EntityDeleteOutcome::Deleted {
+                id,
+                edges_removed,
+                facts_removed,
+            })
+        },
+    )
     .await?
     .map_err(DbError::from)
 }

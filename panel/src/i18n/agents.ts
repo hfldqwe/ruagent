@@ -42,7 +42,7 @@ export const zh: Record<string, string> = {
   "agents.promptView": "提示词",
   "agents.modelUnset": "未指定",
   "agents.err": "无法读取智能体与统计",
-  "agents.err.hint": "daemon 不可达。统计缺失（—）与「跑了 0 次」是两件事，这里不做混淆。",
+  "agents.err.hint": "读不到统计：daemon 不可达，或者它返回的响应不符合契约。统计缺失（—）与「跑了 0 次」是两件事，这里不做混淆。",
   "agents.stale.hint": "显示的是上一次成功读取的结果，轮询正在重试。",
   "agents.enable": "启用",
 };
@@ -84,7 +84,7 @@ export const en: Record<string, string> = {
   "agents.promptView": "Prompt",
   "agents.modelUnset": "Not set",
   "agents.err": "Cannot read agents or stats",
-  "agents.err.hint": "The daemon is unreachable. A missing statistic (—) and “ran 0 times” are two different things and are not conflated here.",
+  "agents.err.hint": "Cannot read the stats: the daemon is unreachable, or the response it returned does not match the contract. A missing statistic (—) and “ran 0 times” are two different things and are not conflated here.",
   "agents.stale.hint": "Showing the last successful read; the poll is retrying.",
   "agents.enable": "Enable",
 };

@@ -391,7 +391,17 @@ export function Knowledge() {
               <Empty icon="search" title={t("knowledge.noResults")} />
             ) : (
               <div className="card">
-                {hits.slice(0, HIT_CAP).map((h) => (
+                {hits.slice(0, HIT_CAP).map((h) => {
+                  // t263: the search wrapper's SearchHit type predates t251's
+                  // leg evidence (api.ts is out of scope for this task), so the
+                  // fields are read through a narrow cast: absent on an older
+                  // daemon, in which case nothing extra renders.
+                  const hit = h as typeof h & {
+                    legs?: string[];
+                    semantic_score?: number | null;
+                    keyword_score?: number | null;
+                  };
+                  return (
                   <div key={h.chunk_id} className="search-hit">
                     <div className="row tight">
                       <span className="tag">{h.document}</span>
@@ -401,12 +411,46 @@ export function Knowledge() {
                           key). The label now comes from that key, and its value says
                           what the number really is; the title carries the ceiling. */}
                       <span className="muted mono" title={t("knowledge.scoreHint")}>
-                        {t("knowledge.score", { s: h.score.toFixed(3) })}
+                        {t("knowledge.score", { s: h.score.toFixed(3) })
+                        }
                       </span>
                     </div>
+                    {/* t263: which legs found this hit, and each leg's OWN raw
+                        score. They are deliberately NOT shown side by side as two
+                        comparable numbers: the semantic leg is a LanceDB distance
+                        (lower = closer) and the keyword leg is FTS5 bm25 (more
+                        negative = better). Each gets its own line, unit and
+                        direction word, so nobody reads them as one kind of number. */}
+                    {hit.legs?.length ? (
+                      <div className="hit-legs">
+                        <span className="muted micro">{t("knowledge.legs")}</span>
+                        {hit.legs.map((l) => (
+                          <span key={l} className="tag micro">
+                            {l === "semantic"
+                              ? t("knowledge.legSemantic")
+                              : l === "keyword"
+                                ? t("knowledge.legKeyword")
+                                : l}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                    {hit.semantic_score != null ? (
+                      <div className="muted mono micro" title={t("knowledge.semanticHint")}>
+                        {t("knowledge.semanticScore", {
+                          s: hit.semantic_score.toFixed(4),
+                        })}
+                      </div>
+                    ) : null}
+                    {hit.keyword_score != null ? (
+                      <div className="muted mono micro" title={t("knowledge.keywordHint")}>
+                        {t("knowledge.keywordScore", { s: hit.keyword_score.toFixed(4) })}
+                      </div>
+                    ) : null}
                     <p className="hit-content">{h.content}</p>
                   </div>
-                ))}
+                  );
+                })}
                 {hits.length > HIT_CAP && (
                   <p className="muted micro">{t("knowledge.hitCap", { n: HIT_CAP })}</p>
                 )}
