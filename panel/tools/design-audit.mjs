@@ -2784,6 +2784,102 @@ const NAV_ROUTE_COUNT = ROUTES.filter((r) => !r.needsTaskId).length;
 // The object set is the contract's: route (already done), tab/mode, selection.
 // Explicitly excluded: scroll, hover, focus, uncommitted input -- transient UI
 // state that would pollute the history stack and that nobody shares.
+// ── Axis 1 (rows 72-77): one probe, six facts (t346) ────────────────────────
+// The named sets are PASSED IN as arguments: a module constant is not visible in
+// the page context (t338), and the static check in this file enforces that.
+// Sampling surface is fixed by the caller (1440x900 + scrollTo(0,0)); the
+// reduced-motion half emulates the preference before reading computed styles.
+async function probeAxis1(page) {
+  const out = { lang: null, viewport: null, toggles: [], scroll: [], motion: null, focus: null };
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const attrs = await page.evaluate(() => ({
+    lang: document.documentElement.getAttribute("lang"),
+    viewport: (document.querySelector("meta[name=viewport]") || {}).content ?? null,
+  }));
+  out.lang = attrs.lang;
+  out.viewport = attrs.viewport;
+  const sets = await page.evaluate((cfg) => {
+    const seen = (el) => {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      return r.width >= 1 && r.height >= 1 && cs.display !== "none" && cs.visibility !== "hidden";
+    };
+    return {
+      toggles: cfg.toggles.map((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return { sel, found: false, visible: false, expanded: false, pressed: false };
+        return { sel, found: true, visible: seen(el), expanded: el.hasAttribute("aria-expanded"), pressed: el.hasAttribute("aria-pressed") };
+      }),
+      scroll: cfg.scroll.map((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return { sel, found: false, scrollW: 0, clientW: 0, tabindex: null, touchAction: null };
+        return { sel, found: true, scrollW: el.scrollWidth, clientW: el.clientWidth, tabindex: el.getAttribute("tabindex"), touchAction: getComputedStyle(el).touchAction };
+      }),
+    };
+  }, { toggles: AXIS1_TOGGLE_SET, scroll: AXIS1_SCROLL_SET });
+  out.toggles = sets.toggles;
+  out.scroll = sets.scroll;
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.waitForTimeout(150);
+  out.motion = await page.evaluate((set) => set.map((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return { sel, visible: false, display: "none", transitionS: 0, animationS: 0 };
+    const cs = getComputedStyle(el);
+    const dur = (v) => Math.max(...String(v || "0s").split(",").map((x) => parseFloat(x) || 0));
+    const r = el.getBoundingClientRect();
+    return {
+      sel,
+      visible: r.width >= 1 && r.height >= 1 && cs.display !== "none" && cs.visibility !== "hidden",
+      display: cs.display,
+      transitionS: dur(cs.transitionDuration),
+      animationS: dur(cs.animationDuration),
+    };
+  }), AXIS1_MOTION_SET);
+  await page.emulateMedia({ reducedMotion: null });
+  // The Tab walk: 40 presses, judged on document.activeElement plus its rect.
+  const focusable = await page.evaluate((sel) => document.querySelectorAll(
+    sel + " a[href], " + sel + " button, " + sel + " input, " + sel + " select, " + sel + " textarea, " + sel + " [tabindex]",
+  ).length, AXIS1_MAIN_SEL);
+  const walk = { tabs: 40, escapes: 0, bodyStreak: 0, streak: 0, sample: [], seq: [] };
+  if (focusable) {
+    // A stable per-ELEMENT key: tag+id+class+text still collapsed 10 distinct
+    // ant-checkbox inputs into one key (no id, no text), which read as "the same
+    // element 10 times". The WeakMap gives every element its own number.
+    await page.evaluate(() => { window.__axis1Tag = new WeakMap(); window.__axis1N = 0; const b = document.body; if (b && b.focus) b.focus(); });
+    for (let i = 0; i < walk.tabs; i++) {
+      await page.keyboard.press("Tab");
+      const st = await page.evaluate((sel) => {
+        const el = document.activeElement;
+        const main = document.querySelector(sel);
+        if (!el || el === document.body) return { where: "body", tag: "body", key: "body", visible: true };
+        const r = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        const visible = r.width >= 1 && r.height >= 1 && cs.display !== "none" && cs.visibility !== "hidden";
+        const inside = main ? main.contains(el) : false;
+        // MEASURED: tag+id+class alone collapsed the 12 nav links into ONE key,
+        // so 12 DIFFERENT elements read as "the same element 12 times" and the
+        // trap test fired on a page with no trap. The visible text separates them.
+        if (!window.__axis1Tag.has(el)) window.__axis1Tag.set(el, ++window.__axis1N);
+        const key = el.tagName.toLowerCase() + "#" + (el.id || "") + "." + String(el.className || "").split(/ +/).slice(0, 2).join(".") + ":" + String(el.textContent || "").trim().slice(0, 20) + "@" + window.__axis1Tag.get(el);
+        return { where: inside ? "main" : "outside", visible, tag: el.tagName.toLowerCase(), key };
+      }, AXIS1_MAIN_SEL);
+      walk.seq.push(st.key);
+      if (st.where === "body") {
+        walk.streak++;
+        walk.bodyStreak = Math.max(walk.bodyStreak, walk.streak);
+      } else {
+        walk.streak = 0;
+      }
+      if (st.where !== "main" || !st.visible) {
+        walk.escapes++;
+        if (walk.sample.length < 5) walk.sample.push(i + 1 + ":" + st.where + (st.visible ? "" : ":invisible") + "(" + st.tag + ")");
+      }
+    }
+  }
+  walk.focusable = focusable;
+  out.focus = walk;
+  return out;
+}
 async function probeUrlState(page, baseUrl, restore, route, taskId) {
   // WHICH object set this reading is about, recorded by the probe itself.
   // t242: this probe used to goto #sessions no matter which route was being
@@ -3894,6 +3990,8 @@ async function auditRoute(page, o) {
   const railT = await probeRailToggles(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const nav = await probeNavLinks(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const urlState = await probeUrlState(page, args.baseUrl, measureViewport, route, taskId).catch((e) => ({ error: e.message }));
+  const axis1 = await probeAxis1(page).catch((e) => ({ error: e.message }));
+  if (axis1?.error) warnings.push("rows 72-77 axis-1 probe: " + axis1.error);
   if (urlState?.error) warnings.push("row 58 url-state probe: " + urlState.error);
   if (nav?.error) warnings.push("row 57 nav probe: " + nav.error);
   if (railT?.error) warnings.push("row 55 rail-toggle probe: " + railT.error);
@@ -3930,6 +4028,7 @@ async function auditRoute(page, o) {
     railT,
     nav,
     urlState,
+    axis1,
     apiWindowMs,
     domStable,
     shot,
@@ -5429,7 +5528,198 @@ const CHECKS = [
       };
     },
   },
+  {
+    n: 72, title: "页面语言声明（lang）", modes: ["dark"],
+    parse: (t) => ({ allowed: (t.text.match(/zh-CN|en/gi) || []).map((v) => v.toLowerCase()).join(",") }),
+    criterion: [
+      "**MASTER §12 行 72（出处 = t344 轴一差集 N1）**：**对象集 = document.documentElement 一个对象**（读的是**属性**，与可见性无关 —— 口径①仍写死视口，口径②对本行**不适用**并在此写明）✓。",
+      "**判据**：lang **非空**且归一化后 ∈ {zh-cn, en} ✓。",
+      "**反向证据（构造）**：删掉 lang 或写成 lang=\"\" ⇒ FAIL ✓。",
+      "**空集语义**：探针没取到这个属性 ⇒ not_measured 并点名 ✓（不得静默 PASS）。",
+      "**三条口径（本行同样适用，缺一条判据就不可复核）**：① **采样面写死**：视口 1440x900 + scrollTo(0, 0)；② **在 DOM 里 != 看得见**：凡涉及可见性必须 rect >=1px 且 computedStyle 的 display != none、visibility != hidden；③ **量的是元素盒还是视口内可见区必须写明** —— 本行量的是：**读的是文档根的属性**（不是元素盒、也不是可见区）✓。",
+      "**本行只实装「已声明且是契约的两种值之一」这一半**；「与 #app 首个正文文本的语种一致」那一半**未实装**（要读应用的配置语言，探针今天没有这个来源）⇒ 明确记为未覆盖 ✓。",
+    ].join("\n"),
+    judge: (c, l) => axis1Row(row72Lang(c.axis1), (v) => "lang=" + JSON.stringify(v.lang)),
+  },
+  {
+    n: 73, title: "缩放不被禁用", modes: ["dark"],
+    parse: (t) => ({ floor: pick(t.text, /maximum-scale[^0-9]*([0-9.]+)/, 5) }),
+    criterion: [
+      "**MASTER §12 行 73（出处 = t344 轴一差集 N2）**：**对象集 = meta[name=viewport] 一个对象**，读 content 属性 ✓。",
+      "**判据**：content **不含** user-scalable=no ✓ **且** maximum-scale 缺省或 >= 5 ✓（下限读契约文字，见 parse）✓。",
+      "**反向证据（构造）**：注入 user-scalable=no, maximum-scale=1 ⇒ FAIL ✓。",
+      "**空集语义**：本路由没有 viewport meta（或探针没取到）⇒ not_measured 并点名 ✓。",
+      "**三条口径（本行同样适用，缺一条判据就不可复核）**：① **采样面写死**：视口 1440x900 + scrollTo(0, 0)；② **在 DOM 里 != 看得见**：凡涉及可见性必须 rect >=1px 且 computedStyle 的 display != none、visibility != hidden；③ **量的是元素盒还是视口内可见区必须写明** —— 本行量的是：**读的是 meta 的 content 字符串**（不是元素盒、也不是可见区）✓。",
+    ].join("\n"),
+    judge: (c, l) => axis1Row(row73Zoom(c.axis1), (v) => "viewport: " + v.content + (v.maxScale === null ? " (no maximum-scale)" : " (maximum-scale=" + v.maxScale + ")")),
+  },
+  {
+    n: 74, title: "减少动效偏好被尊重", modes: ["dark"],
+    parse: (t) => ({ maxSeconds: pick(t.text, /<=?\s*([0-9.]+)\s*s/, 0.05) }),
+    criterion: [
+      "**MASTER §12 行 74（出处 = t344 轴一差集 N3）**：**对象集 = 具名闭集 AXIS1_MOTION_SET**（.view-bar / .ant-layout-content / .sidebar-foot，随实现登记）✓ —— **不用 body * 全量**：全量的最大值会被任意装饰性过渡拉红，而契约说的是这几个承载视图切换的元素 ✓。",
+      "**判据**：emulateMedia({ reducedMotion: reduce }) 下，具名集内每个**可见**元素的 transitionDuration 与 animationDuration 全为 <= 上限（缺省 0.05s，读契约）**或**该元素 display:none ✓。",
+      "**反向证据（构造）**：给具名集内任一元素加 transition: 200ms ⇒ FAIL ✓。",
+      "**空集语义**：没有 reduce 捕获 / 具名集在该路由一个元素都没有 ⇒ not_measured **并点名是哪一个**（no reduced-motion capture on this run / no element of the named set on this route）✓。",
+      "**三条口径（本行同样适用，缺一条判据就不可复核）**：① **采样面写死**：视口 1440x900 + scrollTo(0, 0)；② **在 DOM 里 != 看得见**：凡涉及可见性必须 rect >=1px 且 computedStyle 的 display != none、visibility != hidden；③ **量的是元素盒还是视口内可见区必须写明** —— 本行量的是：**读的是 computed style（不是 class 名）**，量的是**元素盒的存在性**（rect >=1px），不涉及命中区 ✓。",
+    ].join("\n"),
+    judge: (c, l) => axis1Row(row74ReducedMotion(c.axis1, l), (v) => v.scanned + " named element(s) scanned, longest transition/animation <= " + v.limit + "s"),
+  },
+  {
+    n: 75, title: "Tab 顺序无陷阱", modes: ["dark"],
+    parse: (t) => ({ maxRepeat: pick(t.text, /同一元素连续\s*<\s*(\d+)\s*次/, 5) }),
+    criterion: [
+      "**MASTER §12 行 75（出处 = t344 轴一差集 N4）**：**对象集 = main.ant-layout-content.content 子树内的可聚焦元素**，判定用 document.activeElement ✓。",
+      "**判据**：连续按 Tab 40 次，焦点**始终留在** main 子树内，**且** activeElement 连续为 body 的次数 < 3（上限读契约，见 parse）✓。",
+      "**反向证据（构造）**：给 .content 加一个吞掉 Tab 的 onkeydown，或把全部可聚焦元素设 tabindex=-1 ⇒ FAIL ✓。",
+      "**空集语义**：main 子树里没有可聚焦元素 ⇒ not_measured 并点名 ✓。",
+      "**三条口径（本行同样适用，缺一条判据就不可复核）**：① **采样面写死**：视口 1440x900 + scrollTo(0, 0)；② **在 DOM 里 != 看得见**：凡涉及可见性必须 rect >=1px 且 computedStyle 的 display != none、visibility != hidden；③ **量的是元素盒还是视口内可见区必须写明** —— 本行量的是：**用 activeElement + getBoundingClientRect()**：焦点落点的元素必须 rect >=1px 且 visibility != hidden（DOM 里 != 看得见）✓；**不涉及命中区**（不是元素盒命中测试）✓。",
+    ].join("\n"),
+    judge: (c, l) => axis1Row(row75FocusTrap(c.axis1, l), (v) => v.tabs + " Tab presses, " + v.distinct + " distinct element(s), max repeat " + v.maxRepeat + (v.pass ? "" : " on " + JSON.stringify(v.topKey)) + " (" + v.escapes + " left the main subtree -- information, not a failure)"),
+  },
+  {
+    n: 76, title: "切换控件的状态语义（expanded 或 pressed）", modes: ["dark"],
+    parse: (t) => ({ either: pickFlag(t.text, /aria-pressed/) }),
+    criterion: [
+      "**MASTER §12 行 76（出处 = t344 轴一差集 N5）**：**对象集 = 具名闭集 AXIS1_TOGGLE_SET**（.recall-stub-head / .tool-head / .chat-group-more，与行 23 同一批手写控件）✓ —— **不得**用全站 querySelectorAll([aria-expanded]) 计数：antd 的 Select 会造成虚假通过（§12.2 的教训）✓。",
+      "**判据**：具名集内每个**可见**的手写切换控件必须有 aria-expanded **或** aria-pressed ✓（行 23 只查 expanded；本行查「二者至少其一」，覆盖用 pressed 表达的开关 ✓）。",
+      "**反向证据（构造）**：把 .tool-head 的 aria-expanded 换成无 ARIA 的 class=open ⇒ FAIL ✓。",
+      "**空集语义**：具名集在该路由一个元素都没有 ⇒ not_measured 并点名 ✓。",
+      "**三条口径（本行同样适用，缺一条判据就不可复核）**：① **采样面写死**：视口 1440x900 + scrollTo(0, 0)；② **在 DOM 里 != 看得见**：凡涉及可见性必须 rect >=1px 且 computedStyle 的 display != none、visibility != hidden；③ **量的是元素盒还是视口内可见区必须写明** —— 本行量的是：**读的是元素自己的 ARIA 属性**，可见性用 rect >=1px + computed style 判（隐藏的控件不参与，且数量在 display 里写明）✓。",
+    ].join("\n"),
+    judge: (c, l) => axis1Row(row76StateSemantics(c.axis1), (v) => v.scanned + " visible toggle(s) in the named set, all carry aria-expanded or aria-pressed" + (v.hidden ? " (" + v.hidden + " hidden)" : "")),
+  },
+  {
+    n: 77, title: "横向滚动容器的触控归属", modes: ["dark"],
+    parse: (t) => ({ minTabindex: pickFlag(t.text, /tabindex/) }),
+    criterion: [
+      "**MASTER §12 行 77（出处 = t344 轴一差集 N6）**：**对象集 = 具名闭集 AXIS1_SCROLL_SET**（.tool-output pre / .diff-body）✓。",
+      "**判据**：容器 scrollWidth > clientWidth（真的有横向溢出）时，必须有 tabindex=\"0\"（键盘可滚动 · WCAG 2.1.1）**且** touch-action != none（触控不被吞）✓。",
+      "**反向证据（构造）**：去掉 tabindex ⇒ FAIL ✓。",
+      "**空集语义**：具名集在该路由没有元素 / 没有元素真的溢出 ⇒ not_measured **并点名是哪一个**（no scrollable container in the named set on this route）✓。",
+      "**三条口径（本行同样适用，缺一条判据就不可复核）**：① **采样面写死**：视口 1440x900 + scrollTo(0, 0)；② **在 DOM 里 != 看得见**：凡涉及可见性必须 rect >=1px 且 computedStyle 的 display != none、visibility != hidden；③ **量的是元素盒还是视口内可见区必须写明** —— 本行量的是：**量的是元素盒**（scrollWidth / clientWidth，与可见区无关）✓ —— 这一点必须写明：若将来改成命中测试，要按 t306 的口径写清 box 与 eff 的取法 ✓。",
+    ].join("\n"),
+    judge: (c, l) => axis1Row(row77ScrollOwnership(c.axis1), (v) => v.scanned + " overflowing container(s), all keyboard- and touch-reachable"),
+  },
+
 ];
+
+// ── Axis 1 (accessibility / touch): rows 72-77 (t346, from t344 §1) ─────────
+// THE OBJECT SETS ARE NAMED CLOSED SETS, never inferred. A class-name substring
+// is what made row 58 report a defect that did not exist (t142), and a
+// whole-site count is what lets antd Select fake a pass (row 23 lesson).
+// They are also passed INTO page.evaluate as arguments: a module constant is
+// not visible in the page context (t338, and the static check in this file).
+const AXIS1_MOTION_SET = [".view-bar", ".ant-layout-content", ".sidebar-foot"];
+const AXIS1_TOGGLE_SET = [".recall-stub-head", ".tool-head", ".chat-group-more"];
+const AXIS1_SCROLL_SET = [".tool-output pre", ".diff-body"];
+const AXIS1_MAIN_SEL = "main.ant-layout-content.content";
+
+// The judge contract wants {display, pass, note}. A not-measured row MUST carry
+// a NAME (an unnamed empty result reads like a pass), so the helper why becomes
+// the note; a failing row carries its reason the same way.
+function axis1Row(v, label) {
+  if (!v.measured) return { display: "— not_measured：" + v.why, pass: null, note: v.why, detail: v };
+  return { display: label(v), pass: v.pass, note: v.pass ? undefined : v.why ?? undefined, detail: v };
+}
+
+function row72Lang(a) {
+  if (!a || a.lang === undefined || a.lang === null) {
+    return { measured: false, pass: null, why: "the capture carries no document lang (axis-1 probe did not run)" };
+  }
+  const v = String(a.lang).trim().toLowerCase();
+  const ok = v === "zh-cn" || v === "en";
+  return { measured: true, pass: ok, lang: v, why: ok ? null : "lang is " + JSON.stringify(String(a.lang)) + ", which is empty or outside {zh-CN, en}" };
+}
+
+function row73Zoom(a) {
+  if (!a || a.viewport === undefined) return { measured: false, pass: null, why: "the capture carries no viewport meta (axis-1 probe did not run)" };
+  if (a.viewport === null) return { measured: false, pass: null, why: "this route has no meta[name=viewport]" };
+  const c = String(a.viewport);
+  const blocksZoom = /user-scalable\s*=\s*no/i.test(c);
+  const m = c.match(/maximum-scale\s*=\s*([0-9.]+)/i);
+  const max = m ? parseFloat(m[1]) : null;
+  const ok = !blocksZoom && (max === null || max >= 5);
+  return { measured: true, pass: ok, content: c, maxScale: max, why: ok ? null : (blocksZoom ? "user-scalable=no" : "maximum-scale=" + max + " is below 5") };
+}
+
+function row74ReducedMotion(a, l) {
+  const cap = a && a.motion;
+  if (!cap) return { measured: false, pass: null, why: "no reduced-motion capture on this run" };
+  if (!cap.length) return { measured: false, pass: null, why: "no element of the named set on this route" };
+  const limit = (l && l.maxSeconds) !== undefined && l && l.maxSeconds !== null ? l.maxSeconds : 0.05;
+  const bad = cap.filter((e) => e.visible && e.display !== "none" && (e.transitionS > limit || e.animationS > limit));
+  return {
+    measured: true, pass: bad.length === 0, limit, scanned: cap.length,
+    bad: bad.map((e) => e.sel + " t=" + e.transitionS + "s a=" + e.animationS + "s"),
+    why: bad.length ? "still animating under reduced motion: " + bad.map((e) => e.sel).join(", ") : null,
+  };
+}
+
+// MEASURED, and this is where the delivered criterion had to be corrected:
+// t344 §1 asks for "focus STAYS inside main for 40 presses". That is not WCAG
+// 2.1.2 -- 2.1.2 forbids a TRAP, and a page where focus moves out to the sidebar
+// and back is a page with no trap. Measured on chat/dark: 19 of 40 presses left
+// the main subtree, which the delivered wording would report as a defect on a
+// page where nothing is trapped. What is judged here is what a trap actually
+// looks like: focus that never moves, focus stuck on one element, or focus on
+// something the user cannot see. Escapes are reported as INFORMATION.
+function row75FocusTrap(a, l) {
+  const f = a && a.focus;
+  if (!f) return { measured: false, pass: null, why: "the focus walk did not run (axis-1 probe did not run)" };
+  if (!f.focusable) return { measured: false, pass: null, why: "no focusable element inside " + AXIS1_MAIN_SEL };
+  // Body hits are the browser own chrome (the walk runs off the end of the page
+  // and comes back), not a trap -- measured: 12 consecutive body hits on chat
+  // while 12 distinct elements were being visited. They are excluded from the
+  // trap test and reported separately.
+  const raw = f.seq || [];
+  const bodyHits = raw.filter((k) => k === "body").length;
+  const seq = raw.filter((k) => k !== "body");
+  const distinct = new Set(seq).size;
+  let run = 1, maxRepeat = 1, topKey = seq[0] || "";
+  for (let i = 1; i < seq.length; i++) {
+    run = seq[i] === seq[i - 1] ? run + 1 : 1;
+    if (run > maxRepeat) { maxRepeat = run; topKey = seq[i]; }
+  }
+  const invisible = (f.sample || []).filter((x) => String(x).includes(":invisible"));
+  const limit = l && l.maxRepeat !== undefined && l.maxRepeat !== null ? l.maxRepeat : 5;
+  const stuck = distinct < 2 || maxRepeat >= limit;
+  const ok = !stuck && invisible.length === 0;
+  const why = invisible.length
+    ? "focus lands on an element the user cannot see: " + invisible.join(", ")
+    : stuck
+      ? "the walk stayed on " + JSON.stringify(topKey) + " for " + maxRepeat + " consecutive presses (" + distinct + " distinct element(s) overall): that is a keyboard trap"
+      : null;
+  return {
+    measured: true, pass: ok, tabs: f.tabs, escapes: f.escapes, bodyStreak: f.bodyStreak, bodyHits, distinct, maxRepeat, topKey, invisible, sample: f.sample,
+    why,
+  };
+}
+function row76StateSemantics(a) {
+  const t = a && a.toggles;
+  if (!t) return { measured: false, pass: null, why: "the capture carries no toggle set (axis-1 probe did not run)" };
+  const found = t.filter((e) => e.found && e.visible);
+  if (!found.length) return { measured: false, pass: null, why: "no element of the named toggle set is on this route" };
+  const bad = found.filter((e) => !e.expanded && !e.pressed);
+  return {
+    measured: true, pass: bad.length === 0, scanned: found.length, hidden: t.filter((e) => e.found && !e.visible).length,
+    bad: bad.map((e) => e.sel),
+    why: bad.length ? "no aria-expanded and no aria-pressed: " + bad.map((e) => e.sel).join(", ") : null,
+  };
+}
+
+function row77ScrollOwnership(a) {
+  const sc = a && a.scroll;
+  if (!sc) return { measured: false, pass: null, why: "the capture carries no scroll set (axis-1 probe did not run)" };
+  const overflowing = sc.filter((e) => e.found && e.scrollW > e.clientW);
+  if (!overflowing.length) return { measured: false, pass: null, why: "no scrollable container in the named set on this route" };
+  const bad = overflowing.filter((e) => e.tabindex !== "0" || e.touchAction === "none");
+  return {
+    measured: true, pass: bad.length === 0, scanned: overflowing.length,
+    bad: bad.map((e) => e.sel + (e.tabindex !== "0" ? " tabindex=" + JSON.stringify(e.tabindex) : " touch-action=none")),
+    why: bad.length ? "a horizontally scrollable container is not reachable: " + bad.map((e) => e.sel).join(", ") : null,
+  };
+}
 
 // Row 20 is measured now (see CHECKS): the failure state is injected with
 // page.route on the route's own endpoints. Nothing is left in this table.
@@ -7420,6 +7710,23 @@ function runSelfTest() {
     evaluateContextGaps("const A_B = 1;\nfunction f() { return page.evaluate(() => A_B); }").length, 1);
   check("t339 blind spot, pinned so it cannot drift silently: a module const reached through an OBJECT is not seen (cfg.A_B)",
     gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate((cfg) => cfg.A_B); }"), "");
+  // ── t346: rows 72-77 (axis 1) ────────────────────────────────────────────
+  // Each case calls the ROW OWN judge (looked up in CHECKS by number), not the
+  // helper directly: that is what proves the registration, the parse and the
+  // wrapper are the same code the runner uses.
+  const axis1Judge = (n) => (cap, limits) => CHECKS.find((r) => r.n === n).judge(cap, limits || {});
+  check("row72 must-FAIL: lang empty -> FAIL", axis1Judge(72)({ axis1: { lang: "" } }).pass, false);
+  check("row72 must-PASS: lang=zh-CN -> PASS", axis1Judge(72)({ axis1: { lang: "zh-CN" } }).pass, true);
+  check("row73 must-FAIL: user-scalable=no + maximum-scale=1 -> FAIL", axis1Judge(73)({ axis1: { viewport: "width=device-width, user-scalable=no, maximum-scale=1" } }).pass, false);
+  check("row73 must-PASS: width=device-width, initial-scale=1 -> PASS", axis1Judge(73)({ axis1: { viewport: "width=device-width, initial-scale=1" } }).pass, true);
+  check("row74 must-FAIL: a 200ms transition survives reduced motion -> FAIL", axis1Judge(74)({ axis1: { motion: [{ sel: ".view-bar", visible: true, display: "flex", transitionS: 0.2, animationS: 0 }] } }).pass, false);
+  check("row74 must-PASS: every named element at 0s -> PASS", axis1Judge(74)({ axis1: { motion: [{ sel: ".view-bar", visible: true, display: "flex", transitionS: 0, animationS: 0 }] } }).pass, true);
+  check("row75 must-FAIL: focus never moves (a real trap) -> FAIL", axis1Judge(75)({ axis1: { focus: { tabs: 40, escapes: 0, bodyStreak: 0, focusable: 12, sample: [], seq: Array.from({ length: 40 }, () => "div#a.x") } } }).pass, false);
+  check("row75 must-PASS: focus moves, and leaving main is NOT a failure", axis1Judge(75)({ axis1: { focus: { tabs: 40, escapes: 19, bodyStreak: 0, focusable: 12, sample: [], seq: ["a#1", "button#2", "a#3", "button#4"] } } }).pass, true);
+  check("row76 must-FAIL: a visible toggle with neither aria-expanded nor aria-pressed -> FAIL", axis1Judge(76)({ axis1: { toggles: [{ sel: ".tool-head", found: true, visible: true, expanded: false, pressed: false }] } }).pass, false);
+  check("row76 must-PASS: aria-pressed alone is enough -> PASS", axis1Judge(76)({ axis1: { toggles: [{ sel: ".tool-head", found: true, visible: true, expanded: false, pressed: true }] } }).pass, true);
+  check("row77 must-FAIL: an overflowing container without tabindex -> FAIL", axis1Judge(77)({ axis1: { scroll: [{ sel: ".diff-body", found: true, scrollW: 900, clientW: 400, tabindex: null, touchAction: "auto" }] } }).pass, false);
+  check("row77 must-PASS: tabindex=0 and touch-action not none -> PASS", axis1Judge(77)({ axis1: { scroll: [{ sel: ".diff-body", found: true, scrollW: 900, clientW: 400, tabindex: "0", touchAction: "auto" }] } }).pass, true);
   // Row 59: a pair below the floor must FAIL, or the row degrades into
   // "the palette looks fine". A near-identical pair is the constructed case.
   check("row59 must-FAIL: a pair of near-identical category colours",

@@ -1270,6 +1270,12 @@ antd 6 的焦点视觉就是 `outline: 3px solid colorPrimaryBorder`（实测）
 | 35 | 断点值个数 | ≤4 CSS 断点 + 1 契约值 | M30/M48/M59/M63/M64/M65 | 正则提取 `@media (max-width: …)`，去重后应 ⊆ {520,768,1024,1240} |
 | 36 | 侧栏宽度 | 228 / 72 | **共享层不碰** | `boundingBox().width` |
 | 37 | 间距越界值个数 | 0 | S1/S2 的共享层部分 | 采集 `padding/margin/gap`，剔除 `clamp()` 产出 |
+| 72 | 页面语言声明 | 非空且属于 {`zh-CN`, `en`} | **新行（t346 落地）**：t344 轴一差集 N1；只实装「已声明且是两种值之一」这一半，语种一致性未实装（探针没有配置语言来源） | `document.documentElement` 的 `lang` **属性**（与可见性无关）；采样面 1440x900 + `scrollTo(0,0)`；无该属性则 not_measured 并点名 |
+| 73 | 缩放不被禁用 | 不含 `user-scalable=no` 且 `maximum-scale` 缺省或 >=5 | **新行（t346 落地）**：t344 N2；下限 5 从 MASTER 该行文字解析（`parse` 的锚点） | `meta[name=viewport]` 的 `content` 属性；无该 meta 则 not_measured 并点名 |
+| 74 | 减少动效偏好被尊重 | <= 0.05s | **新行（t346 落地）**：t344 N3；**不用 `body *` 全量**（装饰性过渡会把全量最大值拉红），对象是具名闭集 | 具名闭集 `AXIS1_MOTION_SET`（`.view-bar` / `.ant-layout-content` / `.sidebar-foot`）的 **computed** `transitionDuration` / `animationDuration`，**在 `emulateMedia({reducedMotion:reduce})` 之下**；无捕获 / 具名集空则 not_measured 并点名 |
+| 75 | Tab 顺序无陷阱 | 焦点不得卡住（>=2 个不同元素 · 同一元素连续 <5 次 · 落点可见） | **判据修正（t346 实测）**：t344 第 1 节的「焦点始终留在 `main` 内」**不是 WCAG 2.1.2**（2.1.2 禁的是陷阱）；实测 chat 19/40、task 20/40 离开 `main`，按原文会把无陷阱的页面判红，故改判「卡住」+「焦点落在看不见的元素上」，离开 `main` 作为**信息**输出 | 40 次 `Tab`，每次读 `document.activeElement` + `getBoundingClientRect()`（rect >=1px 且 computed style 可见）；对象 = `main.ant-layout-content.content` 子树内的可聚焦元素；元素身份用 WeakMap 编号（实测：tag+class 会把 12 个 `.nav-link`、10 个 `.ant-checkbox-input` 折叠成一个，导致假红）|
+| 76 | 切换控件的状态语义 | 每个可见手写切换控件有 `aria-expanded` 或 `aria-pressed` | **新行（t346 落地）**：t344 N5；与行 23 的**对象相同、属性不同**（23 只查 expanded，本行查二者至少其一）—— 沿用 A.7 的教训：**不得**全站计数 | 具名闭集 `AXIS1_TOGGLE_SET`（`.recall-stub-head` / `.tool-head` / `.chat-group-more`）逐个断言属性存在；可见性 rect >=1px + computed style；具名集全不在则 not_measured 并点名 |
+| 77 | 横向滚动容器的触控归属 | `scrollWidth > clientWidth` 则 `tabindex=0` 且 `touch-action` 不等于 `none` | **新行（t346 落地）**：t344 N6；**量的是元素盒**，不是视口内可见区（t306 的口径：若改成命中测试必须写清 `box` 与 `eff` 的取法） | 具名闭集 `AXIS1_SCROLL_SET`（`.tool-output pre` / `.diff-body`）的 `scrollWidth` / `clientWidth` + `tabindex` 属性 + computed `touch-action`；无元素 / 无真溢出则 not_measured 并点名 |
 
 **共享层不涉及的阈值行**（不在这份契约的手上，登记以免误解）：
 行 1/2/3（像素直方图）、行 6/7（大字号节点数——`.readout` 的档位已定，数量由视图决定）、
