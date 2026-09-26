@@ -964,20 +964,9 @@ async fn execute_build_inner(
         tracing::warn!(error = %e, "wiki index regeneration failed");
     }
 
-    let done = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "UPDATE wiki_builds SET status = 'done', pages_written = ?2,
-                        pages_failed = ?3, finished_at = ?4 WHERE id = ?1",
-                rusqlite::params![build_id, written, failed, chrono::Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await;
-    if let Err(e) = done {
-        tracing::error!(error = %e, "wiki build finalization failed");
+    if finish_build(&db, build_id, written, failed).await {
+        tracing::info!(build = build_id, written, failed, "wiki build finished");
     }
-    tracing::info!(build = build_id, written, failed, "wiki build finished");
 }
 
 enum PageLanded {
@@ -1688,46 +1677,95 @@ async fn insert_build_pages(db: &Db, build_id: i64, pages: &[PagePlan]) -> Resul
     Ok(())
 }
 
+/// Run a wiki write and make a failure LOUD.
+///
+/// `Db::call` returns a nested `Result` whenever the closure returns a
+/// rusqlite result: the outer layer only says "the writer thread is gone", the
+/// inner one says "the SQL failed" -- and the inner one is what actually
+/// happens. t324 measured that judging the outer half alone (`let _ =`, or
+/// `if let Err(e) = x` on the outer only) sees nothing at all. For the writes
+/// below that is not acceptable: a build whose "failed" marker never lands keeps
+/// reading as `running`. `Db::call_flat` collapses both layers, so this one
+/// match covers everything, and the failure is logged rather than swallowed.
+async fn run_write<T, F>(db: &Db, what: &'static str, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+{
+    match db.call_flat(f).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::error!(what, error = %e, "wiki write did not land");
+            None
+        }
+    }
+}
+
+/// Turn a build from `running` into `done`; true when the write landed.
+///
+/// Split out from the pipeline so that a write which does not land is
+/// observable (and testable) without an agent or a knowledge base. Before t327
+/// this block judged only the OUTER layer of the nested `Result`: a failed
+/// UPDATE logged nothing at all, and the build read as finished while its row
+/// still said `running`. The error line lives here, next to the write it
+/// describes.
+async fn finish_build(db: &Db, build_id: i64, written: i64, failed: i64) -> bool {
+    match db
+        .call_flat(move |conn| {
+            conn.execute(
+                "UPDATE wiki_builds SET status = 'done', pages_written = ?2,
+                        pages_failed = ?3, finished_at = ?4 WHERE id = ?1",
+                rusqlite::params![build_id, written, failed, chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(build = build_id, error = %e, "wiki build finalization failed");
+            false
+        }
+    }
+}
+
 async fn set_page_status(db: &Db, build_id: i64, slug: &str, status: &str, error: Option<&str>) {
     let (slug, status, error) = (
         slug.to_string(),
         status.to_string(),
         error.map(str::to_string),
     );
-    let _ = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "UPDATE wiki_build_pages SET status = ?3, error = ?4
-                  WHERE build_id = ?1 AND slug = ?2",
-                rusqlite::params![build_id, slug, status, error],
-            )?;
-            Ok(())
-        })
-        .await;
+    run_write(db, "set_page_status", move |conn| {
+        conn.execute(
+            "UPDATE wiki_build_pages SET status = ?3, error = ?4
+              WHERE build_id = ?1 AND slug = ?2",
+            rusqlite::params![build_id, slug, status, error],
+        )?;
+        Ok(())
+    })
+    .await;
 }
 
 async fn update_build(db: &Db, build_id: i64, field: &str, value: i64) {
     let sql = format!("UPDATE wiki_builds SET {field} = ?2 WHERE id = ?1");
-    let _ = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(&sql, rusqlite::params![build_id, value])?;
-            Ok(())
-        })
-        .await;
+    run_write(db, "update_build", move |conn| {
+        conn.execute(&sql, rusqlite::params![build_id, value])?;
+        Ok(())
+    })
+    .await;
 }
 
 async fn fail_build(db: &Db, build_id: i64, error: &str) {
     let error = error.to_string();
-    let _ = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "UPDATE wiki_builds SET status = 'failed', error = ?2, finished_at = ?3
-                  WHERE id = ?1",
-                rusqlite::params![build_id, error, chrono::Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await;
+    run_write(db, "fail_build", move |conn| {
+        conn.execute(
+            "UPDATE wiki_builds SET status = 'failed', error = ?2, finished_at = ?3
+              WHERE id = ?1",
+            rusqlite::params![build_id, error, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })
+    .await;
 }
 
 /// The recorded build-written hash of a page (§13-3).
@@ -1755,26 +1793,24 @@ async fn page_hash(db: &Db, slug: &str) -> Option<String> {
 
 async fn set_page_hash(db: &Db, slug: &str, hash: &str, build_id: i64) {
     let (slug, hash) = (slug.to_string(), hash.to_string());
-    let _ = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT OR REPLACE INTO wiki_page_hashes (slug, hash, build_id)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![slug, hash, build_id],
-            )?;
-            Ok(())
-        })
-        .await;
+    run_write(db, "set_page_hash", move |conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO wiki_page_hashes (slug, hash, build_id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![slug, hash, build_id],
+        )?;
+        Ok(())
+    })
+    .await;
 }
 
 async fn clear_page_hash(db: &Db, slug: &str) {
     let slug = slug.to_string();
-    let _ = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute("DELETE FROM wiki_page_hashes WHERE slug = ?1", [&slug])?;
-            Ok(())
-        })
-        .await;
+    run_write(db, "clear_page_hash", move |conn| {
+        conn.execute("DELETE FROM wiki_page_hashes WHERE slug = ?1", [&slug])?;
+        Ok(())
+    })
+    .await;
 }
 
 /// Tolerant JSON extraction (same treatment as distillation).
@@ -1804,20 +1840,49 @@ pub(crate) const DRY_RUN_STATUS: &str = "planned_only";
 /// Stamp a dry-run plan finished. Split out from the build entry point so
 /// the semantics are testable without an agent or a knowledge base.
 async fn finish_dry_run(db: &Db, build_id: i64) {
-    let _ = db
-        .call(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "UPDATE wiki_builds SET finished_at = ?2 WHERE id = ?1",
-                rusqlite::params![build_id, chrono::Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await;
+    run_write(db, "finish_dry_run", move |conn| {
+        conn.execute(
+            "UPDATE wiki_builds SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![build_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Capture `tracing` output so a test can assert that a failure was LOUD
+    /// rather than only that a value came back wrong.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
 
     /// A dry run is terminal and says so: its own stored status, and
     /// `finished_at` set — the two things a reader needs to stop misreading a
@@ -1847,6 +1912,99 @@ mod tests {
         for other in ["running", "done", "failed", "planned"] {
             assert_ne!(DRY_RUN_STATUS, other, "dry-run status must not collide");
         }
+    }
+
+    /// t327: a wiki write that does not land must be LOUD.
+    ///
+    /// The failure is constructed in the INNER layer -- the SQL itself, with
+    /// triggers that ABORT the two status writes while the row stays readable.
+    /// That is the layer that fails in practice: the outer layer only reports a
+    /// dead writer thread, which t324 measured is not what goes wrong. Both
+    /// halves of the reading are here: the old shape run side by side on the
+    /// same failing statement (its judgement says "fine"), then the new one.
+    #[tokio::test]
+    async fn a_status_write_that_does_not_land_is_logged_and_leaves_the_build_running() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let plan = PlanOutput::default();
+        let id = insert_build(&db, "all", "running", false, "agent", 0, &plan)
+            .await
+            .expect("insert");
+        db.call(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER t327_no_done BEFORE UPDATE ON wiki_builds
+                   WHEN NEW.status = 'done' BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+                 CREATE TRIGGER t327_no_fail BEFORE UPDATE ON wiki_builds
+                   WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+        })
+        .await
+        .expect("the writer is alive")
+        .expect("triggers");
+
+        // BEFORE, on the same statement: this is exactly what the old
+        // `if let Err(e) = done` / `let _ =` looked at, and it is Ok.
+        let old_shape = db
+            .call(move |conn| {
+                conn.execute("UPDATE wiki_builds SET status = 'failed' WHERE id = ?1", [id])
+            })
+            .await;
+        assert!(
+            old_shape.is_ok(),
+            "the outer layer reports the writer thread, not the SQL"
+        );
+        assert!(
+            old_shape.unwrap().is_err(),
+            "the SQL failure lives in the inner layer"
+        );
+
+        // AFTER: both writes report, and both are logged with the real error.
+        let cap = Capture::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(cap.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            assert!(
+                !finish_build(&db, id, 1, 0).await,
+                "a finalization that did not land must report false"
+            );
+            fail_build(&db, id, "boom").await;
+        }
+
+        let logs = cap.text();
+        assert!(
+            logs.contains("wiki build finalization failed"),
+            "the lost finalization must be logged: {logs}"
+        );
+        assert!(
+            logs.contains("wiki write did not land") && logs.contains("fail_build"),
+            "the lost failed-marker write must be logged with its site: {logs}"
+        );
+        assert!(
+            logs.contains("disk full"),
+            "the log must carry the SQL error, not just that something failed: {logs}"
+        );
+
+        // The consequence, as a reading rather than a claim: the row keeps the
+        // status it had, and nothing in the build path repairs it. That is the
+        // build that stays `running` for ever.
+        let (status, finished): (String, Option<String>) = db
+            .call_flat(move |conn| {
+                conn.query_row(
+                    "SELECT status, finished_at FROM wiki_builds WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .expect("read the row back");
+        assert_eq!(
+            status, "running",
+            "a lost status write leaves the build reading as running"
+        );
+        assert!(finished.is_none(), "and with no finish time either");
     }
 
     fn meta() -> frontmatter::PageMeta {

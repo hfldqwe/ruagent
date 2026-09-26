@@ -67,6 +67,16 @@ impl Db {
 
     /// Run a closure with the connection on the writer thread and await
     /// its result.
+    ///
+    /// NOTE the shape: `T` is unconstrained, so a closure returning a
+    /// `rusqlite::Result<X>` (nearly every real query) makes this return
+    /// `Result<Result<X, rusqlite::Error>, DbError>`. The two layers mean
+    /// different things -- the outer is "the writer thread is gone", the inner
+    /// is "the SQL failed" -- and the outer is almost never the one that goes
+    /// wrong. A caller that judges only the outer (`if let Err(e) = call(..)`,
+    /// `.await.is_err()`, `let _ = call(..)`) cannot see a failed statement.
+    /// Prefer `Db::call_flat`, which makes that mistake unrepresentable
+    /// (t324/t327).
     pub async fn call<T, F>(&self, f: F) -> Result<T, DbError>
     where
         T: Send + 'static,
@@ -79,6 +89,23 @@ impl Db {
             }))
             .map_err(|_| DbError::Closed)?;
         rx.await.map_err(|_| DbError::Closed)
+    }
+
+    /// Run a SQL closure and return ONE error type: both layers collapsed.
+    ///
+    /// Use this for anything that reads or writes through the product's SQL.
+    /// `call` hands back a nested `Result` whose outer half only reports a
+    /// dead writer, and t324 found 17 places where that nesting made a failure
+    /// invisible (a build whose "failed" marker never lands stays `running`
+    /// for ever; a failed read becomes an empty map). With this entry point the
+    /// nested misjudgement cannot be written at all: there is nothing to judge
+    /// but the real error.
+    pub async fn call_flat<T, F>(&self, f: F) -> Result<T, DbError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+    {
+        self.call(f).await?.map_err(DbError::from)
     }
 }
 
@@ -130,5 +157,37 @@ mod tests {
             assert_eq!(all.len(), 1);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// t327: the two entry points side by side on the SAME failing statement.
+    /// `call` keeps the SQL error in the inner layer -- where judging the
+    /// outer half reports success (t324 measured exactly that) -- while
+    /// `call_flat` surfaces it, which is why new code should use it.
+    #[tokio::test]
+    async fn call_flat_surfaces_a_failed_statement() {
+        let db = Db::open_in_memory().unwrap();
+        let nested = db
+            .call(|conn| {
+                conn.query_row("SELECT nope FROM no_such_table", [], |r| r.get::<_, i64>(0))
+            })
+            .await;
+        assert!(
+            nested.is_ok(),
+            "the outer layer reports the writer thread, not the SQL"
+        );
+        assert!(
+            nested.unwrap().is_err(),
+            "the SQL failure lives in the inner layer"
+        );
+
+        let flat = db
+            .call_flat(|conn| {
+                conn.query_row("SELECT nope FROM no_such_table", [], |r| r.get::<_, i64>(0))
+            })
+            .await;
+        assert!(
+            matches!(flat, Err(DbError::Sqlite(_))),
+            "call_flat must surface the SQL failure, got {flat:?}"
+        );
     }
 }
