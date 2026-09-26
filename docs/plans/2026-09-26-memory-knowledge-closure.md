@@ -247,3 +247,14 @@ $ ruagent.exe knowledge --help  ⇒ error: unrecognized subcommand 'knowledge'
 2. **commit 失败就先 `git reset`**（清索引，不丢工作区改动），不要把一个脏索引留给下一个提交者。
 
 **判据**：`git show --stat <commit>` 的文件数 == 你 add 的文件数；不等就是被继承的脏索引。
+
+### 7.7 平台机制三条（2026-09-26，都是实测踩出来的）
+
+1. **队长的「收回」不跨轮存活**：`reassign_task(assignee="captain")` 的说明写着「未完成的收回会在队长空闲时回到成员池」——实测如此。队长**不能把一个任务停在自己名下跨轮**。后果：t273（重建）被收回后，下一个空闲成员就认领它、读到前置未满足、如实 failed，两次都是这样。
+   ⇒ **前置必须写成【依赖】，不能写成验收里的一句话。** 写进验收的那版（「【前置】t276 必须已落地」）挡不住任何人，只是让每次认领都多一条 failed 记录。
+
+2. **取消的依赖会把依赖方变成僵尸**：t273 被取消后，t274/t275/t277 报 `blocked by unfinished dependencies: t273` ⇒ **既不可认领、也不可收回**（收回被同一个依赖挡住）⇒ 它们永久占用 inScope（t275 占着 `cli/`，直接挡住了新单的创建）。
+
+3. **队长可以直接取消【pending】的任务，但取消不了【已认领】的**：`update_task(status=cancelled)` 对 pending 单直接成功（t274/t275/t277）；对已认领的（t271/t272，in_progress）报 `owned by member X; call reassign_task with assignee=captain before takeover`。⇒ 清僵尸要在它们被认领之前做。
+
+**共同教训**：平台的依赖图是唯一可靠的排序机制；凡是「应该等某件事」的地方，要么写成依赖，要么就会以「有人白跑一趟」的形式付账。
