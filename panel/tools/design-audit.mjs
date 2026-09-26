@@ -415,6 +415,7 @@ function parseArgs(argv) {
       case "--check": o.check = true; break;
       case "--table": o.table = true; break;
       case "--self-test": o.selfTest = true; break;
+      case "--evaluate-context-gaps": o.contextGaps = true; break;
       case "--quiet": o.quiet = true; break;
       case "--no-focus": o.focus = false; break;
       case "--no-shots": o.shots = false; break;
@@ -6144,6 +6145,25 @@ function evaluateContextGaps(src) {
   }
   return gaps;
 }
+// t341: the same check, run over the whole directory. t338's defect (a Node-side
+// module const used inside page.evaluate, invisible to the page) is a CLASS, not an
+// incident: every other tool in panel/tools/ can ship it the same way, and no Node
+// assertion in that tool would notice. Scope and the seven blind spots are inherited
+// unchanged from evaluateContextGaps -- this only changes WHICH SOURCES are read.
+function evaluateContextGapsInDir(dir) {
+  const out = [];
+  for (const name of readdirSync(dir).filter((f) => f.endsWith(".mjs")).sort()) {
+    let src;
+    try {
+      src = readFileSync(join(dir, name), "utf8");
+    } catch {
+      continue; // unreadable file is not a verdict
+    }
+    out.push({ file: name, gaps: evaluateContextGaps(src) });
+  }
+  return out;
+}
+
 function runSelfTest() {
   const cases = [];
   const check = (name, got, want) => cases.push({ name, got, want, pass: got === want });
@@ -7389,6 +7409,15 @@ function runSelfTest() {
     gapNames(auditSrc.replace(", URL_STATE_TOGGLE_SEL)", ")")), "URL_STATE_TOGGLE_SEL:unsupplied-parameter");
   check("t339 must-not-PASS: a body that declares the name itself is fine (no false positive on a local of the same name)",
     gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate(() => { const A_B = 2; return A_B; }); }"), "");
+  // t341: the check runs over the DIRECTORY, not just this file. Two assertions:
+  // the walk really walks (it finds the other tools), and the real sources are clean.
+  const dirRows = evaluateContextGapsInDir(dirname(fileURLToPath(import.meta.url)));
+  check("t341: the by-directory walk reads every panel/tools/*.mjs (not just this file)",
+    dirRows.length >= 5 && dirRows.some((r) => r.file === "design-audit.mjs"), true);
+  check("t341: every REAL panel/tools/*.mjs hands its page.evaluate bodies what they use",
+    dirRows.map((r) => r.file + ":" + r.gaps.length).join(","), dirRows.map((r) => r.file + ":0").join(","));
+  check("t341 must-not-PASS: the walk reports a file that DOES carry the defect (synthetic, via the same reader)",
+    evaluateContextGaps("const A_B = 1;\nfunction f() { return page.evaluate(() => A_B); }").length, 1);
   check("t339 blind spot, pinned so it cannot drift silently: a module const reached through an OBJECT is not seen (cfg.A_B)",
     gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate((cfg) => cfg.A_B); }"), "");
   // Row 59: a pair below the floor must FAIL, or the row degrades into
@@ -7732,6 +7761,19 @@ async function main() {
     return 0;
   }
   if (args.selfTest) return runSelfTest();
+  if (args.contextGaps) {
+    // Read-only: report every panel/tools/*.mjs and its gap count. Non-zero exit
+    // when a real cross-context reference is found, so it can be used as a gate.
+    const rows = evaluateContextGapsInDir(dirname(fileURLToPath(import.meta.url)));
+    let bad = 0;
+    for (const r of rows) {
+      const detail = r.gaps.map((g) => g.name + ":" + g.kind + "@" + g.line).join(", ");
+      if (r.gaps.length) bad++;
+      console.log("  " + r.file + ": " + r.gaps.length + " gap(s)" + (detail ? " -- " + detail : ""));
+    }
+    console.log("  files scanned: " + rows.length + ", files with gaps: " + bad);
+    process.exit(bad ? 1 : 0);
+  }
   // --out is resolved against the REPO ROOT, not the CWD. Resolving against the
   // CWD silently wrote panel/docs/screenshots/... when the tool was run from
   // panel/ (which is how everyone runs it), and t8 lost an audit-run2/ that way.
