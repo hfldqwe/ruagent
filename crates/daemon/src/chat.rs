@@ -1066,16 +1066,51 @@ impl ChatManager {
             }
         };
         let updated_at = Utc::now().timestamp_millis();
+        Ok(self.record_probe(runtime, &state, updated_at))
+    }
+
+    /// Record what a probe reported.
+    ///
+    /// t192: an empty probe is NOT evidence that the runtime advertises no
+    /// options. `wait_options` turns its own timeout into an empty Vec, so a slow
+    /// (cold start) or mis-registered first probe used to be cached AND persisted
+    /// as "this runtime has no options" -- after which every picker stayed empty,
+    /// including across a restart via `load_option_cache`, and nothing retried
+    /// it. Keep the last good catalog instead: only a probe that actually
+    /// reported options may replace what we know, and an empty one is not even
+    /// remembered (so the next open probes again).
+    ///
+    /// Split out of `probe_options` so the rule can be tested without an agent
+    /// that fails to advertise: the decision is the contract here, the spawn is
+    /// not.
+    fn record_probe(
+        &self,
+        runtime: &str,
+        state: &[SessionOptionState],
+        updated_at: i64,
+    ) -> CachedOptions {
+        if state.is_empty() {
+            let previous = self
+                .model_cache
+                .lock()
+                .expect("model cache lock")
+                .get(runtime)
+                .cloned();
+            return previous.unwrap_or(CachedOptions {
+                options: Vec::new(),
+                updated_at,
+            });
+        }
         let entry = CachedOptions {
-            options: state.clone(),
+            options: state.to_vec(),
             updated_at,
         };
         self.model_cache
             .lock()
             .expect("model cache lock")
             .insert(runtime.to_string(), entry.clone());
-        persist_options(&self.db, runtime, &state, updated_at);
-        Ok(entry)
+        persist_options(&self.db, runtime, state, updated_at);
+        entry
     }
 
     /// Seed the option cache from the `agent_options` table at boot —
@@ -1477,6 +1512,128 @@ mod generating_tests {
         };
         let p = dir.join(name);
         p.is_file().then_some(p)
+    }
+
+    /// t192: a probe that reports NOTHING must not become what we know.
+    ///
+    /// `wait_options` turns its own timeout into an empty Vec, so before this
+    /// rule a slow (cold start) or mis-registered first probe was cached AND
+    /// persisted as "this runtime advertises no options" -- after which every
+    /// picker stayed empty, including across a restart via `load_option_cache`,
+    /// and nothing retried it. Three halves are pinned here:
+    ///   * an empty report leaves the last good catalog alone (cache AND db);
+    ///   * an empty report on a COLD runtime is not remembered either, so the
+    ///     next open probes again instead of trusting the emptiness;
+    ///   * a report that does carry options still replaces what we know.
+    #[tokio::test]
+    async fn an_empty_probe_neither_overwrites_nor_persists_the_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-opts-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let option = |value: &str| -> SessionOptionState {
+            serde_json::from_value(serde_json::json!({
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "choices": [{ "value": value, "name": value }],
+                "current": value,
+            }))
+            .expect("session option")
+        };
+        let cached = |runtime: &str| -> Option<CachedOptions> {
+            chats
+                .model_cache
+                .lock()
+                .expect("model cache lock")
+                .get(runtime)
+                .cloned()
+        };
+        async fn persisted(db: &ruagent_store::Db, runtime: &str) -> Option<i64> {
+            let runtime = runtime.to_string();
+            let res = db
+                .call(move |conn| -> Result<Option<i64>, ruagent_store::DbError> {
+                    Ok(conn
+                        .query_row(
+                            "SELECT updated_at FROM agent_options WHERE runtime = ?1",
+                            [runtime],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .ok())
+                })
+                .await;
+            res.ok().and_then(|inner| inner.ok()).flatten()
+        }
+
+        // 1. A good probe is recorded, in the cache and in the table. The cache
+        //    write is synchronous; the table write is spawned, so wait for the
+        //    row instead of racing it.
+        let good = chats.record_probe("mock", &[option("mock-pro")], 1);
+        assert_eq!(good.options.len(), 1);
+        assert_eq!(cached("mock").map(|c| c.options.len()), Some(1));
+        let mut stored = None;
+        for _ in 0..100 {
+            stored = persisted(&db, "mock").await;
+            if stored.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(stored, Some(1), "a real probe must be persisted");
+
+        // 2. An empty probe must not touch either one. Its table write would be
+        //    spawned too, so give that window a chance to (not) happen before
+        //    asserting the row is still the one from step 1.
+        let after_empty = chats.record_probe("mock", &[], 2);
+        assert_eq!(
+            after_empty.options.len(),
+            1,
+            "an empty probe must hand back the last good catalog"
+        );
+        assert_eq!(
+            cached("mock").map(|c| c.updated_at),
+            Some(1),
+            "an empty probe must not overwrite the cached catalog"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            persisted(&db, "mock").await,
+            Some(1),
+            "an empty probe must not persist over the stored catalog"
+        );
+
+        // 3. Cold + empty is not remembered as knowledge: nothing cached, so the
+        //    next open probes again.
+        let cold = chats.record_probe("cold-runtime", &[], 3);
+        assert!(cold.options.is_empty());
+        assert!(
+            cached("cold-runtime").is_none(),
+            "an empty probe on a cold runtime must not be cached as a catalog"
+        );
+
+        // 4. The rule is not "never update": a real report still replaces it.
+        let after_real = chats.record_probe("mock", &[option("mock-max")], 4);
+        assert_eq!(
+            after_real.options.first().map(|o| o.current.clone()),
+            Some(Some("mock-max".to_string()))
+        );
+        assert_eq!(cached("mock").map(|c| c.updated_at), Some(4));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Delete removes the HISTORY ROW, and does it without disturbing
