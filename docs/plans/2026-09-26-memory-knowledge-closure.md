@@ -1922,3 +1922,21 @@ contract-lead 引了 `design-audit.mjs:2768` 的原文：
 它给了六条新行的**逐行预期落格表**（N3/N6 预期为 named not_measured），并**明确标注这是待核对的预期、不是读数** ✓ —— 同时它没有为六条伪造逐行读数 ✗（那是工具行的活）✓。
 
 ⇒ **规则：一份交付里，「我量到的」与「我预计的」必须能被一眼分开** ✓（7.45 的同族，但这次的对象是**交付物本身**而不是前提）。
+
+### 7.124 【待派单】工具行（轴一六条）的三个锚点 —— 侦察已经做完，省下接单人的一次侦察（2026-09-26，contract-lead）
+
+**锚点 1 · 行号是怎么进工具的**：工具**按契约行号硬编码** ——
+
+```
+row5ExcludeSelectors      design-audit.mjs:97 / :333 / :655
+row32CriterionLanded      design-audit.mjs:4056 / :5310 / :5492（判定处还带 row.n === 32）
+⇒ 新行照这个模式: 加一个 row<N> 判据函数 + 在行表里登记
+```
+
+**锚点 2 · 自检入口**：`--self-test`（`:316` 注释说明它同时被 main() 与自检调用 · `:417` 解析 · `:454` 用法说明）；用例写法见 `:6183-6215` —— `check("row16: … -> FAIL", judge(...), want)` ⇒ **六条各写一对 must-FAIL / must-PASS** ✓。
+
+**锚点 3 · primitives §11 的同步点**：现有行 23 的写法是「判据定义见 primitives.md §11 行 23」⇒ **72–77 需要在 §11 各加一条同构条目**；定位方式：`grep -n '行 23' docs/design/primitives.md` 一次 ✓。
+
+**要派的内容（等 panel/tools/ 空出来）**：六条（N1 `lang` · N2 缩放不被禁用 · N3 `prefers-reduced-motion` · N4 Tab 无陷阱 · N5 切换控件状态语义 · N6 横向滚动触控归属）各一对 `check("row<N> must-FAIL…")` + 行号 **72–77 连续**（`缺口 []` 要求连续）+ 同步 `primitives.md §11` + 三条口径（采样面写死 1440×900/`scrollTo(0,0)`、N3 要 `emulateMedia(reducedMotion:'reduce')` · 「在 DOM 里≠看得见」rect ≥1px + computed style · **量元素盒还是视口内可见区写清楚**：N6 明写量元素盒 `scrollWidth/clientWidth`、N4 用 `activeElement`+rect、将来改命中测试须按 t306 的 `reachW/reachH = allHit===true ? box : eff`）✓。
+
+**规格来源**：`docs/design/reviews/t344-axis1-a11y-touch-diff.md` §1 的四列表（选择器 / 判据 / 反向 / 预期落格）✓。
