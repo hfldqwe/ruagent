@@ -462,20 +462,42 @@ async function get<T>(path: string): Promise<T> {
  *  the views already handle for a 5xx — t264 measured 5/5 sources rendering
  *  their error state on a 500, so this adds no UI. One shape per endpoint, and
  *  every field list below was read back from the running daemon. */
-function expectShape<T>(endpoint: string, data: unknown, fields: string[]): T {
+type Shape = "array" | "arrayOfObjects" | "number" | "string";
+
+function expectShape<T>(endpoint: string, data: unknown, spec: Record<string, Shape>): T {
   const obj = (data ?? {}) as Record<string, unknown>;
-  const missing = fields.filter((f) => obj[f] === undefined || obj[f] === null);
-  if (missing.length) {
-    throw new Error(
-      `${endpoint}: malformed response, missing ${missing.map((m) => `"${m}"`).join(", ")}`,
-    );
+  const bad: string[] = [];
+  for (const [f, kind] of Object.entries(spec)) {
+    const v = obj[f];
+    if (v === undefined || v === null) {
+      bad.push(`missing "${f}"`);
+      continue;
+    }
+    if (kind === "array" || kind === "arrayOfObjects") {
+      if (!Array.isArray(v)) {
+        bad.push(`"${f}" is not an array`);
+        continue;
+      }
+      if (kind === "arrayOfObjects") {
+        // An element must be an object. Arrays are allowed on purpose: the
+        // graph endpoints answer with [entity, count] tuples, and rejecting
+        // them would fail a response that is exactly right.
+        const i = (v as unknown[]).findIndex((e) => e === null || typeof e !== "object");
+        if (i >= 0) bad.push(`"${f}[${i}]" is not an object`);
+      }
+    } else if (kind === "number") {
+      if (typeof v !== "number" || !Number.isFinite(v)) bad.push(`"${f}" is not a finite number`);
+    } else if (kind === "string") {
+      if (typeof v !== "string") bad.push(`"${f}" is not a string`);
+    }
   }
+  if (bad.length) throw new Error(`${endpoint}: malformed response, ${bad.join("; ")}`);
   return data as T;
 }
 
 /** GET, then validate the endpoint's contract shape before a view can consume it. */
-async function getChecked<T>(path: string, fields: string[]): Promise<T> {
-  return expectShape<T>(path, await get<unknown>(path), fields);
+async function getChecked<T>(path: string, spec: Record<string, Shape>): Promise<T> {
+  return expectShape<T>(path, await get<unknown>(path), spec);
 }
 
 async function send(method: string, path: string, body?: unknown): Promise<Response> {
@@ -615,7 +637,7 @@ export const api = {
       store
         ? `/api/v1/memory/list?store=${store}&namespace=${encodeURIComponent(namespace)}`
         : `/api/v1/memory/list?namespace=${encodeURIComponent(namespace)}`,
-      ["memories", "counts"],
+      { memories: "arrayOfObjects", counts: "array" },
     ),
   memorySearch: (q: string) =>
     get<{ hits: MemoryRow[] }>(`/api/v1/memory/search?q=${encodeURIComponent(q)}`).then(
@@ -651,7 +673,7 @@ export const api = {
   knowledgeDocs: () =>
     getChecked<{ documents: KnowledgeDocument[]; embedder: string }>(
       "/api/v1/knowledge/documents",
-      ["documents"],
+      { documents: "arrayOfObjects" },
     ),
   knowledgeChunks: (id: number) =>
     get<{ chunks: [number, string][] }>(`/api/v1/knowledge/documents/${id}`).then(
@@ -694,11 +716,18 @@ export const api = {
 
   // wiki — M2 read APIs + builds
   wikiPages: () =>
-    getChecked<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages", ["pages"]).then(
+    getChecked<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages", {
+      pages: "arrayOfObjects",
+    }).then(
       (r) => r.pages,
     ),
   wikiLinks: () =>
-    getChecked<WikiLinks>("/api/v1/knowledge/wiki/links", ["nodes", "edges", "broken", "orphans"]),
+    getChecked<WikiLinks>("/api/v1/knowledge/wiki/links", {
+      nodes: "array",
+      edges: "array",
+      broken: "array",
+      orphans: "array",
+    }),
   wikiBuilds: (limit = 20) =>
     get<{ builds: WikiBuild[] }>(`/api/v1/knowledge/wiki/builds?limit=${limit}`).then(
       (r) => r.builds,
@@ -713,9 +742,9 @@ export const api = {
 
   // graph
   graphEntities: () =>
-    getChecked<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities", [
-      "entities",
-    ]).then((r) => r.entities),
+    getChecked<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities", {
+      entities: "arrayOfObjects",
+    }).then((r) => r.entities),
   /** t191: every live edge in ONE request, so the default graph is a graph
    * and not a point cloud. `limit` is deliberately pinned to the contract's
    * density ceiling (views/view-graph.md: ≤600 edges) rather than the
@@ -725,13 +754,13 @@ export const api = {
   graphEdges: (limit = 600) =>
     getChecked<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
       `/api/v1/graph/edges?limit=${limit}`,
-      ["edges", "total", "limit", "offset"],
+      { edges: "arrayOfObjects", total: "number", limit: "number", offset: "number" },
     ),
   /** The whole entity list (graphEntities caps at the daemon default of 50). */
   graphEntitiesAll: (limit = 500) =>
     getChecked<{ entities: [GraphEntity, number][] }>(
       `/api/v1/graph/entities?limit=${limit}`,
-      ["entities"],
+      { entities: "arrayOfObjects" },
     ).then((r) => r.entities),
   graphSearch: (q: string) =>
     get<{ entities: GraphEntity[] }>(`/api/v1/graph/search?q=${encodeURIComponent(q)}`).then(
@@ -880,7 +909,9 @@ export const api = {
    *  field the backend does not send is how a guard becomes a lie. Add it to the
    *  row check below in the same commit that lands the backend. */
   recallLog: (limit = 50) =>
-    getChecked<{ log: RecallLogRow[] }>(`/api/v1/recall/log?limit=${limit}`, ["log"]).then(
+    getChecked<{ log: RecallLogRow[] }>(`/api/v1/recall/log?limit=${limit}`, {
+      log: "arrayOfObjects",
+    }).then(
       (r) => r.log,
     ),
 
