@@ -193,3 +193,17 @@ t250 改派给 tools（它是唯一两次读进 crates/knowledge 内部的人）
 **后果**：旧读数的**数值**会过期，**口径与取值集合不变**（t254 复核 t247 的取值集合仍是同 3 个值 301/278/3）。
 
 **对策**：读数必须自带时间窗；引用旧数值时说明它是哪个时间点的。
+
+### 7.3 全 workspace 的 verify 命令会把一个任务绑架给另一个任务（2026-09-26，t252 栽了两次）
+
+t252 的 verify 里有 `cargo fmt --all --check`，而它是**全 workspace** 的：
+
+- 第一次：`crates/knowledge/src/store.rs` 被 t261 在途编辑留下半成品（14 个未定义名字）⇒ t252 的第 5 条 verify 红 ⇒ 它只能如实报 failed。
+- 第二次：mem-core 的临时探针 `crates/daemon/tests/t260_probe.rs` 有语法错误 ⇒ fmt exit 1 ⇒ 又一次把 t252 打红。
+
+两次都不是 t252 的代码问题，两次都要靠**别人**去修。
+
+**对策**：
+1. **新任务的 verify 用限定范围的命令**：`cargo fmt -p <crate> -- --check`、`cargo test -p <crate>`，不要写 `--all` / `--workspace`。
+2. **全 workspace 的检查是队长的集成步骤**，不是单个成员任务的验收条件。
+3. **临时探针要么住在仓库外**（tools 在 t245 的先例：文件放 C:/tmp，仓库回到干净），**要么随时可编译**。住在 `tests/` 下的，先 `cargo check` 一次再往下写。
