@@ -446,6 +446,25 @@ function Launcher({
 }) {
   const { t } = useI18n();
   const [mode, setMode] = useState<Mode>("single");
+  // t331 (MASTER row 58): the launcher mode changes WHAT you are looking at
+  // (one run vs a fan-out comparison vs a pipeline), so it belongs in the URL.
+  // Read once on mount, then keep the hash in step with the state.
+  useEffect(() => {
+    const h = window.location.hash.replace(/^#/, "");
+    const q = new URLSearchParams(h.includes("?") ? h.slice(h.indexOf("?") + 1) : "");
+    const m = q.get("mode");
+    if (m === "single" || m === "fanout" || m === "pipeline") setMode(m);
+  }, []);
+  useEffect(() => {
+    const h = window.location.hash.replace(/^#/, "");
+    const path = h.split("?")[0];
+    const q = new URLSearchParams(h.includes("?") ? h.slice(h.indexOf("?") + 1) : "");
+    if ((q.get("mode") ?? "single") === mode) return;
+    if (mode === "single") q.delete("mode");
+    else q.set("mode", mode);
+    const qs = q.toString();
+    window.location.hash = `${path}${qs ? `?${qs}` : ""}`;
+  }, [mode]);
   const [agent, setAgent] = useState(agents[0]?.name ?? "");
   const [prompt, setPrompt] = useState("");
   const [picked, setPicked] = useState<string[]>([]);

@@ -252,6 +252,19 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   /** A failed send: shown persistently above the composer, with a retry. */
   const [sendError, setSendError] = useState<unknown>(null);
   const [agent, setAgent] = useState(initialAgent ?? "");
+  // t331 (MASTER row 58): WHICH agent you are talking to is a view state, so it
+  // belongs in the URL. App.tsx already reads ?agent= into initialAgent; the
+  // WRITE side was missing, so switching agents left the hash at #chat and the
+  // audit saw a view-state switch that did not change the URL.
+  useEffect(() => {
+    const h = window.location.hash.replace(/^#/, "");
+    const q = new URLSearchParams(h.includes("?") ? h.slice(h.indexOf("?") + 1) : "");
+    if ((q.get("agent") ?? "") === agent) return;
+    if (agent) q.set("agent", agent);
+    else q.delete("agent");
+    const qs = q.toString();
+    window.location.hash = `chat${qs ? `?${qs}` : ""}`;
+  }, [agent]);
   const [model, setModel] = useState("");
   /** The engine the chat currently runs on (roles can switch). */
   const [runtime, setRuntime] = useState("");
