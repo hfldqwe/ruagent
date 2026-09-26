@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "i18n:check": "node e2e/i18n-check.mjs",
-    "build": "node e2e/i18n-check.mjs && tsc -b && tsc -p e2e/tsconfig.json --noEmit && vite build",
+    "build": "node scripts/build-panel.mjs",
     "check": "tsc -b --noEmit && tsc -p e2e/tsconfig.json --noEmit",
     "test:e2e": "node e2e/run-e2e.mjs"
   },

@@ -6,6 +6,10 @@ Cargo.lock.orig
 # Node / panel
 node_modules/
 dist/
+# t319: the staging directory the panel build writes before the atomic swap
+# (dist is not tracked either -- see panel/.gitignore)
+dist-staging/
+panel/dist-staging/
 *.tsbuildinfo
 panel/npm-debug.log*
 
