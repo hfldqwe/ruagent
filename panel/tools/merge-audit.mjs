@@ -34,7 +34,7 @@ for (const f of files) {
   const caps = (m.captures || []).map((c) => ({ route: c.route, mode: c.mode }));
   batches.push({
     file: f,
-    mtime: new Date(st.mtimeMs).toISOString().slice(11, 19),
+    mtime: new Date(st.mtimeMs).toLocaleTimeString([], { hour12: false }),
     ms: st.mtimeMs,
     captures: caps,
     ms_total: (m.captures || []).reduce((a, c) => a + (c.ms || 0), 0),
@@ -71,7 +71,7 @@ for (const r of [...rows.values()].sort((a, b) => a.n - b.n)) {
 }
 const win = batches.map((b) => b.mtime).sort();
 console.log("merged from " + batches.length + " batches: " + batches.map((b) => b.mtime + " (" + b.captures.length + " captures, " + b.file + ")").join(" | "));
-console.log("TIME WINDOW: " + win[0] + " - " + win[win.length - 1] + "  -- this is a CONCATENATION ACROSS TIME, not one snapshot");
+console.log("TIME WINDOW: " + win[0] + " - " + win[win.length - 1] + " LOCAL TIME  -- this is a CONCATENATION ACROSS TIME, not one snapshot");
 console.log("captures: " + keys.length + " distinct (route/mode) of " + batches.reduce((a, b) => a + b.captures.length, 0) + " seen");
 console.log("checks: " + pass + " pass / " + fail + " fail / " + nm + " not measured");
 console.log("failing rows: " + (failingRows.length ? failingRows.join(",") : "(none)"));

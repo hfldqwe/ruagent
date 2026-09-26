@@ -2613,8 +2613,9 @@ function touchTargetVerdict(w, floor) {
 // Row 49 carries the empty-set guard this team adopted after t99: a criterion
 // that needs an EVENT must prove the event happened. If no membership change
 // is observed in the window, the row reports not_measured -- never PASS.
-async function probeOrder(page, baseUrl) {
-  const out = { error: null, click: null, ticks: 0, membershipChanges: 0, pureReorder: 0, maxMovePx: null, samples: [], sessions: null };
+async function probeOrder(page, baseUrl, reqCounter) {
+  const out = { error: null, click: null, ticks: 0, membershipChanges: 0, pureReorder: 0, maxMovePx: null, samples: [], sessions: null, nonGetDuringWindow: 0 };
+  const nonGet = () => (reqCounter && reqCounter.nonGet) || 0;
   try {
     await page.goto(baseUrl + "/?mode=dark#chat", { waitUntil: "load", timeout: 60_000 });
     await awaitReady(page, "probeOrder");
@@ -2661,6 +2662,7 @@ async function probeOrder(page, baseUrl) {
     // conclude below two reads, so a shorter window cannot silently pass.
     let prev = apiAfter;
     let prevTops = await domTops();
+    const nonGetAtWindowStart = nonGet();
     for (let i = 0; i < 2; i++) {
       await page.waitForTimeout(1000);
       const now = await ids();
@@ -2686,6 +2688,7 @@ async function probeOrder(page, baseUrl) {
       }
       prev = now;
     }
+    out.nonGetDuringWindow = nonGet() - nonGetAtWindowStart;
     // ---- 50: the platform's own injected blocks must not name a row
     const sr = await fetch(baseUrl + "/api/v1/sessions", { signal: AbortSignal.timeout(8000) });
     if (!sr.ok) throw new Error("row 50: GET /api/v1/sessions returned " + sr.status + " -- cannot measure the object set");
@@ -2730,6 +2733,12 @@ function pollOrderVerdict(o) {
   // Two ticks is the minimum that can show a DIFFERENCE; below that there is
   // nothing to compare and a PASS would be an empty-set green.
   if (o.ticks < 2) return { measured: false, pass: null };
+  // t239: a reorder WITH a concurrent write is not this row object. The row asks
+  // whether the ORDER is stable on its own; if someone else wrote to the list in
+  // the same window, the write explains the reorder and judging it would be a
+  // false red. Decline, and name why. A reorder with NO write is the real thing.
+  if (o.pureReorder > 0 && o.nonGetDuringWindow > 0)
+    return { measured: false, pass: null, pureReorder: o.pureReorder, ticks: o.ticks, reason: "a reorder was observed AND " + o.nonGetDuringWindow + " non-GET request(s) landed in the same window -- cannot tell the list own reorder from someone else write" };
   return { measured: true, pass: o.pureReorder === 0, pureReorder: o.pureReorder, ticks: o.ticks };
 }
 function anchorMoveVerdict(o, floor) {
@@ -3782,7 +3791,7 @@ async function auditRoute(page, o) {
   // measurement viewport back, so the screenshot pass is unaffected.
   const sessionTitle = await probeSessionTitle(page, measureViewport, args.injectCss).catch((e) => ({ error: e.message }));
   const wig = await probeWig(page, measureViewport).catch((e) => ({ error: e.message }));
-  const order = await probeOrder(page, args.baseUrl).catch((e) => ({ error: e.message }));
+  const order = await probeOrder(page, args.baseUrl, reqCounter).catch((e) => ({ error: e.message }));
   const rail = await probeSessionRail(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const railT = await probeRailToggles(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const nav = await probeNavLinks(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
@@ -7554,11 +7563,16 @@ async function main() {
     } catch {}
   });
   const page = await context.newPage();
-  const reqCounter = { n: 0, urls: [] };
+  const reqCounter = { n: 0, urls: [], nonGet: 0 };
   page.on("request", (r) => {
     if (r.url().includes("/api/")) {
       reqCounter.n++;
       reqCounter.urls.push(r.url());
+      // t239: row 48 must tell a list that reordered ITSELF from a list someone
+      // else WROTE to. The observable difference is whether a non-GET request
+      // landed in the same window: a write is the only thing that can change the
+      // sequence while the page itself did nothing.
+      if (!["GET", "HEAD"].includes(r.method())) reqCounter.nonGet++;
     }
   });
 
