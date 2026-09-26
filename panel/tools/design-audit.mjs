@@ -2489,6 +2489,17 @@ async function probeWig(page, restore) {
           hits, samples,
           effW: Math.round(maxX - minX + stepX),
           effH: Math.round(maxY - minY + stepY),
+          // WHAT those two numbers are. When every sample hits, the effective box IS
+          // the clamped sampling region (x1-x0 by y1-y0), NOT the element's box. t232:
+          // a 44x44 target 93% on screen reported '44x41' beside 'box 44x44' and the pair
+          // read as a contradiction. The 3px is below the fold -- a fact about the SCROLL
+          // POSITION, not about whether a finger can reach the target.
+          clampedW: Math.round(x1 - x0),
+          clampedH: Math.round(y1 - y0),
+          boxW: Math.round(b.width),
+          boxH: Math.round(b.height),
+          visPct: Math.round(visFrac * 100),
+          allHit: hits === samples,
         };
       };
       let skipped = 0;
@@ -4478,7 +4489,7 @@ const CHECKS = [
     n: 53, title: "prefers-reduced-motion 被尊重", modes: ["dark"],
     parse: (t) => ({ max: pick(t.text, /(\d+)\s*处/, 0) }),
     criterion: [
-      "**MASTER §12 行 50（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:55 与 :272「Honor prefers-reduced-motion. Provide a reduced-motion variant.」）**：模拟 `prefers-reduced-motion: reduce` 后，页面上**仍在过渡/动画**的元素数，**每 capture ≤0**。",
+      "**MASTER §12 行 53（待 design-lead 补；出处 docs/research/web-interface-guidelines.md:55 与 :272「Honor prefers-reduced-motion. Provide a reduced-motion variant.」）**：模拟 `prefers-reduced-motion: reduce` 后，页面上**仍在过渡/动画**的元素数，**每 capture ≤0**。",
       "**对象**：body * 中计算样式 transitionDuration 或（animationName != none 时的）animationDuration **> 0.05s** 的元素。**判定式**：在 emulateMedia({reducedMotion: reduce}) 下计数。",
       "**阈值 0 处 —— 依据：裁决**（标准原文要求提供 reduced 变体；本项目未提供）。",
       "**与既有行不重叠**：行 42 判 transition: all 的**属性写法**，本行判**媒体偏好下是否仍在动**，两者量的是不同的东西。",
@@ -4536,7 +4547,7 @@ const CHECKS = [
       return {
         display:
           "窄屏可点 " + v.samples + " 个 · 最小有效 " + v.smallest.effW + "×" + v.smallest.effH + "px（" + v.smallest.sel +
-          "，元素盒 " + v.smallest.boxW + "×" + v.smallest.boxH + "，命中 " + v.smallest.hits + "/" + v.smallest.samples + "）· 有效区低于 " + l.min + "px 的 " + v.bad.length + " 个" +
+          "，元素盒 " + v.smallest.boxW + "×" + v.smallest.boxH + "，命中 " + v.smallest.hits + "/" + v.smallest.samples + "）" + (v.smallest.allHit && v.smallest.clampedH && v.smallest.clampedH !== v.smallest.boxH ? "【有效区=在视口内的采样区 " + v.smallest.clampedW + "×" + v.smallest.clampedH + "，可见 " + v.smallest.visPct + "% ⇒ 差的 " + (v.smallest.boxH - v.smallest.clampedH) + "px 在视口外，不是点不到】" : "") + " · 有效区低于 " + l.min + "px 的 " + v.bad.length + " 个" +
           (v.boxOnlyWouldPass && v.boxOnlyWouldPass.length ? " · 其中 " + v.boxOnlyWouldPass.length + " 个「元素盒达标而有效区不达标」（这正是 t158 的形态 ✗）" : "") +
           (v.skipped ? " · 跳过 " + v.skipped + " 个（不在视口内或只部分在视口内，量不准不算违例：" + v.skippedWhy.slice(0, 2).join("; ") + "）" : "") +
           (v.pass ? " ✓" : " — " + v.bad.slice(0, 3).map((b) => b.sel + "@" + b.viewport + "=有效 " + b.effW + "×" + b.effH + " / 盒 " + b.boxW + "×" + b.boxH).join(", ")),
@@ -4937,7 +4948,7 @@ const CHECKS = [
     n: 27, title: "首屏入口 JS 体积（地板 + 预算两段）", modes: ["dark", "light"], global: true,
     criterion: [
       "MASTER §12 行 27（§12.10.2 落槌）：从单一门槛改为**地板 + 预算**两段 + 两条结构断言。",
-      "**地板（登记，不判 PASS/FAIL）= 框架层 980KB（gzip ≈305KB）**：随技术栈变更重测、不写死；每次审计打印。",
+      "**地板（登记，不判 PASS/FAIL）= 框架层 1020KB（gzip ≈324.2KB）**：随技术栈变更重测、不写死；每次审计打印。",
       "**预算（判定）= 应用层首屏 ≤150KB（gzip ≤48KB）**：推导 = 应用层实测 426KB − markdown 栈 229KB（应懒加载）− 重页路由级分割 ~119KB = 78KB，预算取 ≈2×。",
       "**结构断言 ①** markdown 栈不得在入口（必须是独立 chunk）；**②** 必须存在路由级分割 chunk。",
       "**归类未落地前判 not_measured 并打印「地板 / 应用层 / 总量」三个数** —— 实施前提是 vite.config.ts 的 manualChunks（vendor/app/markdown 三块）+ 工具按 chunk 读 dist。**不硬判 FAIL**（拿总量比旧门槛是无效判定），**也不改成 PASS**（那是粉饰）。原「≤350KB（gzip ≤120KB）」保留为历史记录。",
@@ -4950,8 +4961,8 @@ const CHECKS = [
         return m ? Number(m[1]) : d;
       };
       return {
-        floorKb: num(/框架层\s*(\d+)\s*KB/, 980),
-        floorGzipKb: num(/地板[^；]*?gzip\s*≈?\s*(\d+)\s*KB/, 305),
+        floorKb: num(/框架层\s*([\d.]+)\s*KB/, 1020),
+        floorGzipKb: num(/地板[^；]*?gzip\s*≈?\s*([\d.]+)\s*KB/, 324.2),
         budgetKb: num(/应用层首屏\s*≤\s*(\d+)\s*KB/, 150),
         budgetGzipKb: num(/应用层首屏\s*≤\s*\d+\s*KB（gzip\s*≤\s*(\d+)\s*KB）/, 48),
         legacyKb: num(/原「≤\s*(\d+)\s*KB/, 350),
@@ -6388,7 +6399,10 @@ function runSelfTest() {
       // the declaration that kept the gap visible while they did not: the check
       // below failed the moment the contract and the list disagreed, which is
       // exactly how row 59 announced itself mid-flight.
-      const PENDING_TOOL = [];
+      // t216 grew the contract to 71 rows; 60-71 have no judge yet. Declaring them
+      // here is what makes the reconcile assertion mean 'every OTHER promise has a
+      // judge' again. The list shrinks as each row is implemented.
+      const PENDING_TOOL = [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71];
       check("reconcile: no contract row is left unjudged (every promise has a judge)",
         onlyContract.join(","), PENDING_TOOL.join(","));
 
@@ -6575,20 +6589,20 @@ function runSelfTest() {
 
   // ---- row 27: floor + budget + two structural assertions ------------------
   const row27 = CHECKS.find((r) => r.n === 27);
-  const MASTER27 = "**地板（登记，不判 PASS/FAIL）= 框架层 980KB（gzip ≈305KB）**；**预算（判定）= 应用层首屏 ≤150KB（gzip ≤48KB）**；**两条结构断言**：① markdown 栈不得在入口（必须是独立 chunk）② 必须存在路由级分割 chunk。**原「≤350KB（gzip ≤120KB）」保留为历史记录**";
+  const MASTER27 = "**地板（登记，不判 PASS/FAIL）= 框架层 1020KB（gzip ≈324.2KB）**；**预算（判定）= 应用层首屏 ≤150KB（gzip ≤48KB）**；**两条结构断言**：① markdown 栈不得在入口（必须是独立 chunk）② 必须存在路由级分割 chunk。**原「≤350KB（gzip ≤120KB）」保留为历史记录**";
   const l27 = row27.parse({ text: MASTER27, nums: [350, 120] });
   const j27 = (bundle) => row27.judge({}, l27, { global: { bundle } });
   const classifiedFatOf = (fn) => j27(fn(260));
   const entryChunk = { file: "index-abc.js", bytes: 1406 * 1024, gzip: 436 * 1024 };
   check("row27: the parse reads floor/budget from MASTER's phrases, not by position",
-    l27.floorKb === 980 && l27.floorGzipKb === 305 && l27.budgetKb === 150 && l27.budgetGzipKb === 48, true);
+    l27.floorKb === 1020 && l27.floorGzipKb === 324.2 && l27.budgetKb === 150 && l27.budgetGzipKb === 48, true);
   check("row27: the superseded ≤350KB is kept only as history",
     l27.legacyKb === 350 && l27.legacyGzipKb === 120, true);
   const unclassified = j27({ entry: entryChunk, js: [entryChunk, { file: "Graph-def.js", bytes: 120 * 1024, gzip: 40 * 1024 }] });
   check("row27: before manualChunks lands the row is not_measured, NOT failed",
     unclassified.pass === null, true);
   check("row27: before the split only 总量 and 地板 are printed (no app-layer claim)",
-    unclassified.display.includes("总量 1526KB") && unclassified.display.includes("地板 980KB") &&
+    unclassified.display.includes("总量 1526KB") && unclassified.display.includes("地板 1020KB") &&
       !unclassified.display.includes("应用层"), true);
   check("row27: the not_measured note names the missing prerequisite",
     unclassified.note.includes("manualChunks") && unclassified.note.includes("not_measured"), true);
