@@ -164,6 +164,11 @@ pub enum PurgeOutcome {
     Purged {
         id: i64,
         was_deleted: bool,
+        /// How many rows pointed at this one through their supersedes column
+        /// and had that link detached so the hard delete could proceed (t317).
+        /// Zero is the common case; a non-zero count is the operation SAYING it
+        /// also cleared a pointer instead of failing with a 500.
+        links_cleared: usize,
     },
     NotFound,
 }
@@ -175,32 +180,54 @@ pub enum PurgeOutcome {
 /// retracted secret stops being stored at all. An absent id reports NotFound
 /// instead of a silent 200.
 pub async fn purge_memory(db: &Db, id: i64) -> Result<PurgeOutcome, DbError> {
-    let found: Option<(String, String, Option<String>)> = db
-        .call(
-            move |conn| -> Result<Option<(String, String, Option<String>)>, rusqlite::Error> {
-                let mut stmt = conn
-                    .prepare("SELECT store, namespace, deleted_at FROM memories WHERE id = ?1")?;
-                let mut rows = stmt.query([id])?;
-                let Some(row) = rows.next()? else {
-                    return Ok(None);
-                };
-                let store: String = row.get(0)?;
-                let ns: String = row.get(1)?;
-                let was_deleted: Option<String> = row.get(2)?;
-                conn.execute("DELETE FROM memories WHERE id = ?1", [id])?;
-                Ok(Some((store, ns, was_deleted)))
-            },
-        )
-        .await??;
-    let Some((store, namespace, was_deleted)) = found else {
+    let found: Option<(String, String, Option<String>, usize)> =
+        db
+            .call(
+                move |conn| -> Result<
+                    Option<(String, String, Option<String>, usize)>,
+                    rusqlite::Error,
+                > {
+                    let mut stmt = conn.prepare(
+                        "SELECT store, namespace, deleted_at FROM memories WHERE id = ?1",
+                    )?;
+                    let mut rows = stmt.query([id])?;
+                    let Some(row) = rows.next()? else {
+                        return Ok(None);
+                    };
+                    let store: String = row.get(0)?;
+                    let ns: String = row.get(1)?;
+                    let was_deleted: Option<String> = row.get(2)?;
+                    // t317 (F-310a): supersedes is a SELF-REFERENCING foreign key,
+                    // so a hard delete used to depend on the order of the purges:
+                    // the row a live child still pointed at came back as
+                    // "FOREIGN KEY constraint failed" (SQLite 787) and the daemon
+                    // turned that into a 500. The link is internal bookkeeping, not
+                    // a user-level precondition -- detach it first, and REPORT how
+                    // many were detached rather than doing it silently.
+                    let links_cleared = conn.execute(
+                        "UPDATE memories SET supersedes = NULL WHERE supersedes = ?1",
+                        [id],
+                    )?;
+                    conn.execute("DELETE FROM memories WHERE id = ?1", [id])?;
+                    Ok(Some((store, ns, was_deleted, links_cleared)))
+                },
+            )
+            .await??;
+    let Some((store, namespace, was_deleted, links_cleared)) = found else {
         return Ok(PurgeOutcome::NotFound);
     };
     // Same audit channel as delete/restore (write::audit): the op set gains
     // "purge" beside insert/supersede/skip_dedupe/reject/delete/restore.
-    let reason = if was_deleted.is_some() {
+    // The audit says what the row WAS and what the purge also had to do.
+    let what = if was_deleted.is_some() {
         "purged a tombstone (hard delete)"
     } else {
         "purged a live row (hard delete)"
+    };
+    let reason = if links_cleared == 0 {
+        what.to_string()
+    } else {
+        format!("{what}; detached {links_cleared} supersede link(s)")
     };
     audit(
         db,
@@ -209,12 +236,13 @@ pub async fn purge_memory(db: &Db, id: i64) -> Result<PurgeOutcome, DbError> {
         &namespace,
         Some(&format!("id={}", id)),
         None,
-        Some(reason.to_string()),
+        Some(reason),
     )
     .await?;
     Ok(PurgeOutcome::Purged {
         id,
         was_deleted: was_deleted.is_some(),
+        links_cleared,
     })
 }
 
@@ -247,6 +275,140 @@ mod tests {
         id
     }
 
+    /// t317 (F-310a): supersedes is a SELF-REFERENCING foreign key, so a hard
+    /// delete used to depend on the ORDER of the purges -- the row a live child
+    /// still pointed at could not be purged at all (SQLite 787, "FOREIGN KEY
+    /// constraint failed"), which the daemon turns into a 500.
+    ///
+    /// MEASURED BEFORE THE FIX, crate level (in-memory DB):
+    ///   Err(Sqlite(SqliteFailure(Error { code: ConstraintViolation,
+    ///       extended_code: 787 }, Some("FOREIGN KEY constraint failed"))))
+    /// and on the live daemon the same call answered
+    ///   HTTP 500  "sqlite error: FOREIGN KEY constraint failed".
+    #[tokio::test]
+    async fn purge_detaches_the_supersede_links_instead_of_failing() {
+        let db = Db::open_in_memory().unwrap();
+        let a = seed(&db, "t317 A the superseded parent").await;
+        let mut w = obs("t317 B the superseding child", "user");
+        w.supersedes = Some(a);
+        let b = match write_memory(&db, &w).await.unwrap() {
+            WriteOutcome::Superseded { old, new } => {
+                assert_eq!(old, a, "the child must supersede the parent we named");
+                new
+            }
+            other => panic!("expected Superseded, got {other:?}"),
+        };
+        assert!(
+            get_memory(&db, a)
+                .await
+                .unwrap()
+                .unwrap()
+                .superseded_at
+                .is_some(),
+            "the parent must be marked superseded, or this is not the t317 case"
+        );
+
+        // THE ORDER THAT USED TO 500: the parent first, its child still alive.
+        let parent = purge_memory(&db, a).await;
+        println!("T317 purge parent={a} while child={b} is alive: {parent:?}");
+        match parent.unwrap() {
+            PurgeOutcome::Purged {
+                id,
+                was_deleted,
+                links_cleared,
+            } => {
+                assert_eq!(id, a);
+                assert!(!was_deleted, "it was live, not a tombstone");
+                assert_eq!(
+                    links_cleared, 1,
+                    "the detached link must be REPORTED, not done silently"
+                );
+            }
+            other => panic!("expected Purged, got {other:?}"),
+        }
+        // The child is still purgeable afterwards, with nothing left dangling.
+        assert!(purge_memory(&db, b).await.is_ok());
+
+        // The order that always worked, on a fresh pair (it must keep working).
+        let c = seed(&db, "t317 C the parent").await;
+        let mut w2 = obs("t317 D the child", "user");
+        w2.supersedes = Some(c);
+        let d = match write_memory(&db, &w2).await.unwrap() {
+            WriteOutcome::Superseded { new, .. } => new,
+            other => panic!("expected Superseded, got {other:?}"),
+        };
+        assert!(purge_memory(&db, d).await.is_ok());
+        let second = purge_memory(&db, c).await.unwrap();
+        match second {
+            PurgeOutcome::Purged { links_cleared, .. } => {
+                assert_eq!(
+                    links_cleared, 0,
+                    "the child is gone, so there is no link to detach"
+                )
+            }
+            other => panic!("expected Purged, got {other:?}"),
+        }
+    }
+
+    /// The OTHER reading of F-310a: a LEGACY row whose supersedes already points
+    /// at a row that is gone. Reachable when the FK was off (an older build, or
+    /// a restore that inserted the child first), and the task title names this
+    /// shape -- so it is measured rather than assumed. Measured live too: the
+    /// child answered 200 while the parent was the one that 500'd.
+    #[tokio::test]
+    async fn purge_a_row_whose_supersedes_already_dangles() {
+        let db = Db::open_in_memory().unwrap();
+        let orphan = db
+            .call(|conn| -> Result<i64, rusqlite::Error> {
+                conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+                conn.execute(
+                    "INSERT INTO memories (store, namespace, content, content_hash, confidence,
+                                           supersedes, created_at, updated_at)
+                     VALUES ('observation','user','t317 legacy orphan','t317-legacy-hash',0.5,
+                             999999,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                let id = conn.last_insert_rowid();
+                conn.execute_batch("PRAGMA foreign_keys=ON")?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let out = purge_memory(&db, orphan).await;
+        println!("T317 purge a row whose supersedes points at 999999 (gone): {out:?}");
+        assert!(
+            out.is_ok(),
+            "a dangling supersedes must not block the purge: {out:?}"
+        );
+        match out.unwrap() {
+            PurgeOutcome::Purged { links_cleared, .. } => assert_eq!(links_cleared, 0),
+            other => panic!("expected Purged, got {other:?}"),
+        }
+    }
+
+    /// The reverse of the fix: a REAL internal failure must still be an error.
+    /// The daemon maps this error class to 500 (measured live for the FK case
+    /// before the fix: "sqlite error: FOREIGN KEY constraint failed" with status
+    /// 500), so swallowing it here would hide a genuine fault behind a 200.
+    #[tokio::test]
+    async fn a_real_internal_failure_is_still_an_error() {
+        let db = Db::open_in_memory().unwrap();
+        let id = seed(&db, "t317 E a row whose audit table is missing").await;
+        db.call(|conn| -> Result<(), rusqlite::Error> {
+            conn.execute_batch("DROP TABLE memory_diffs")?;
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let out = purge_memory(&db, id).await;
+        println!("T317 purge with the audit table dropped: {out:?}");
+        assert!(
+            out.is_err(),
+            "a genuine internal failure must not be reported as success: {out:?}"
+        );
+    }
     /// The whole contract in one test: the row survives, the audit records it,
     /// and every read path stops returning it.
     #[tokio::test]
