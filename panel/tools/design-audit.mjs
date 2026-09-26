@@ -2839,7 +2839,7 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
     // a 0x0 or clipped input whose LABEL is the visible control, so filtering on
     // the input box discards every Segmented switch. MEASURED on #sessions:
     // input[type=radio] has no box at all while its label is about 40x28.
-    out.tabs = await page.evaluate(() => {
+    out.tabs = await page.evaluate((URL_STATE_TOGGLE_SEL) => {
       const shown = (el) => {
         const box = el.tagName === "INPUT" && el.closest("label") ? el.closest("label") : el;
         const r = box.getBoundingClientRect();
@@ -2853,7 +2853,7 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
         // opens them with mousedown and asserts the selection actually changed.
         ...document.querySelectorAll(URL_STATE_TOGGLE_SEL),
       ].filter(shown).length;
-    });
+    }, URL_STATE_TOGGLE_SEL);
     out.hash1 = await page.evaluate(() => location.hash);
     out.fp1 = await fp();
     const clicked = await page.evaluate(() => {
