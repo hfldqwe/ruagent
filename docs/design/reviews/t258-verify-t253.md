@@ -87,3 +87,15 @@
 | ④ `npm run build` 退出码 + e2e 前后失败数 | **passed**（exit 0；e2e 0 failed → 0 failed） |
 
 **顺带登记（不是 t253 的验收项）**：① 服务中的 dist 一度是 t253 的半成品构建（21:24 < 21:28 提交，缺删除入口与探针工具条）——我按验收跑了构建才补齐；② 删除确认框按 Escape 不关闭。
+
+## 附：本次验证过程中我自己造成并已修复的一次共享状态损坏（如实登记）
+
+* **发生了什么**：为取「改前」面板，我用 `git worktree add --detach C:/tmp/t258/before 29129d6~1` 建了一棵临时工作树，
+  并把 `panel/node_modules` 以 **junction（目录联接）** 指向仓库的 node_modules（`New-Item -ItemType Junction`）。
+  收尾时 `git worktree remove --force C:/tmp/t258/before` **跟随了 junction**，把**仓库自己的 `panel/node_modules` 一并删空**（`ls | wc -l` = 0）。
+* **影响面**：面板构建 / e2e / tsc 在这段时间内对所有人不可用（`npm run build` 会报 `tsc is not recognized`）。
+* **修复**：`cd panel && npm ci --offline`（用本机 npm 缓存 + package-lock.json）⇒ `NPM_EXIT=0`，顶层条目 149（原 155；npm ci 按 lockfile 精确装树）。
+* **修复后功能验证（不是「看起来好了」）**：`npm run build` **exit 0 / ✓ built in 5.84s**（tsc + vite 都跑通）·
+  `@playwright/test` 与 `esbuild`+`@esbuild/win32-x64` 存在 · `node node_modules/@playwright/test/cli.js test --list` = **Total: 41 tests in 11 files**（与损坏前一致）。
+* **教训（给全队）**：临时工作树里**不要**用 junction/symlink 指向共享目录；要装依赖就用 `npm ci --offline`，
+  或者构建时用 `--outDir` 指向临时目录。删除含 junction 的目录必须用 `rmdir`（只删链接），**不能**用会递归跟随的删除（`git worktree remove`、`rm -rf`）。
