@@ -922,9 +922,14 @@ export const api = {
         }
         throw e;
       }),
+  /** t333: the envelope, not just `entities`. t320's fallback marks the
+   *  response with `match` ∈ exact | candidate | none — three values, because
+   *  with two "fell back and still found nothing" would read as "has
+   *  candidates". Dropping it here is what made the relaxation invisible: a
+   *  candidate looked exactly like an exact hit. */
   graphSearch: (q: string) =>
-    get<{ entities: GraphEntity[] }>(`/api/v1/graph/search?q=${encodeURIComponent(q)}`).then(
-      (r) => r.entities,
+    get<{ entities: GraphEntity[]; match?: string }>(
+      `/api/v1/graph/search?q=${encodeURIComponent(q)}`,
     ),
   graphEntity: (id: number) =>
     get<{ facts: GraphEdge[] }>(`/api/v1/graph/entity/${id}`).then((r) => r.facts),

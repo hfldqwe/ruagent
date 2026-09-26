@@ -300,6 +300,10 @@ export function Graph() {
   const [focusFacts, setFocusFacts] = useState<GraphEdge[]>([]);
   const [query, setQuery] = useState("");
   const [hitIds, setHitIds] = useState<Set<number> | null>(null);
+  /** t333: the response's `match` (exact | candidate | none). Query-level, so
+   *  it is shown once above the results — never per row, which would attribute
+   *  the whole query's relaxation to individual entities. */
+  const [searchMatch, setSearchMatch] = useState<string | null>(null);
   const [selected, setSelected] = useState<GraphEntity | null>(null);
   const [creating, setCreating] = useState(false);
   /** The inspector's own dialog (「添加事实」), reported up by EntityDetail —
@@ -415,11 +419,14 @@ export function Graph() {
   const search = async () => {
     if (!query.trim()) {
       setHitIds(null);
+      setSearchMatch(null);
       refresh();
       return;
     }
     try {
-      const hits = await api.graphSearch(query.trim());
+      const res = await api.graphSearch(query.trim());
+      const hits = res.entities;
+      setSearchMatch(res.match ?? null);
       if (mode === "graph") {
         setHitIds(new Set(hits.map((h) => h.id)));
       } else {
@@ -529,6 +536,18 @@ export function Graph() {
         <Empty icon="search" title={t("graph.noHits")} hint={t("graph.noHits.hint")} />
       ) : (
         <div className="graph-layout">
+          {/* t333: visible, not decorative — the marker exists so a relaxed hit
+              can never be read as an exact one. It renders only for
+              match === "candidate"; "exact" and "none" show nothing. */}
+          {searchMatch === "candidate" ? (
+            <div
+              className="search-match-candidate"
+              role="status"
+              title={t("graph.match.candidateHint")}
+            >
+              {t("graph.match.candidate")}
+            </div>
+          ) : null}
           <div className="graph-main">
             {mode === "graph" ? (
               <>

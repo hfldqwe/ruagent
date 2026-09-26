@@ -7,6 +7,8 @@
 
 export const zh: Record<string, string> = {
   "graph.searchPh": "搜索实体（名称、摘要）…",
+  "graph.match.candidate": "候选：放宽匹配（非精确命中）",
+  "graph.match.candidateHint": "精确匹配没有结果，后端放宽了查询——这些是候选，不是精确命中。",
   "graph.view.graph": "图",
   "graph.view.list": "列表",
   "graph.hint": "拖拽固定 · 双击释放 · 点击查看详情",
@@ -89,6 +91,8 @@ export const zh: Record<string, string> = {
 
 export const en: Record<string, string> = {
   "graph.searchPh": "Search entities (name, summary)…",
+  "graph.match.candidate": "Candidate: relaxed match (not an exact hit)",
+  "graph.match.candidateHint": "Nothing matched exactly, so the backend relaxed the query — these are candidates, not exact hits.",
   "graph.view.graph": "Graph",
   "graph.view.list": "List",
   "graph.hint": "Drag to pin · double-click to release · click for details",
