@@ -612,3 +612,41 @@ WARN ruagent_daemon::chat: auto-distill failed session=… error=Query returned 
 **而更实际的代价是**：**一个只有假红的日志会训练读者忽略红** —— 真失败出现时没人会看。这与「更严的判据自己会变成假红来源」是同一族，只是发生在日志层。（已立单。）
 
 **顺带（同一轮健康检查的其余读数）**：8787 = 200 ✓ · `mcp health ok server=ruagent tools=9 latency_ms=120` ✓ · 端口只有 8787 LISTENING（**没有 8791 的孤儿** ✓ —— canary 脚本修好之后这一点可验证了）。
+
+### 7.28 的收口（同日）：第三层现在有活体证据了（t307）
+
+mem-core 交了 `scripts/ruagent-post-switch-check.mjs`（只读），并在 8787 上做了一次真实使用后给出读数：
+
+```
+transcripts_after_since=1 (scanned=147, since=2026-09-26T14:28:45Z)
+context_injected_events=1
+render_assertions=knowledge:1 wiki:1 marker(XButton2):1 of 1 events
+PASS … EXIT=0
+```
+
+那条真 render 里逐字有：`<user_profile>`（5 条真实 distilled 记忆）· `<relevant_memories>`（末尾 `… [+841 chars truncated]`）· `<knowledge>` = `ahk-notes: … XButton2::F6 remaps the forward side button …` · `<wiki>` = `wiki/autohotkey-v2: …`。
+
+⇒ **「新二进制真的把知识块发进了 agent 的上下文」现在有活体证据** —— 7.28 指出的那个缺口关掉了。
+
+**而它把「0 事件不是绿」做成了可证伪的负例**：`--since 2099-…` ⇒ 打印 `NO EVIDENCE …` + `FAIL no events`，**exit 1**；退出码三分（0 = 有证据且断言全过 · 1 = 无证据或断言失败（可当门）· 2 = 用法错误）。
+
+**它还把自己的边界打印在 `--help` 里而不是埋起来**：只看写入**这个** transcripts 目录的实例（canary 的临时 root 不留痕迹）· 不能证明别的实例收到了 · 它检查**渲染**，所以「渲染之后、模型之前」的截断它看不见（**送达靠回显，而回显是 mock agent 的性质，不是真 harness 的**）· **mtime 是文件的，不是事件的**。
+
+### 7.34 负例演示不是 verify 命令（2026-09-26，t307 提交时被校验器挡下）
+
+mem-core 第一版把那条**故意的负例**（`--since 2099-…` 必须 exit 1）放进 `commandsRun` 并标 `status=failed` ⇒ 校验器拒绝：**「verify failure must fail the task」**。
+
+**校验器是对的**：负例演示不是 verify 命令；把它标成 failed 会让整单看起来该失败。它把负例移进 output 作为证据、verify 三条全绿 ⇒ 收单。
+
+**规则**：**「我证明了它会失败」属于证据，不属于 verify 命令。** 两者混在一张表里，会让「有一条命令是红的」与「这一单是坏的」变成同一件事。
+
+### 7.35 提交的四条可机械判定步骤，与两种不同性质（2026-09-26，tools）
+
+tools 提交两份报告时给了四条：**显式路径 add（不用 -A）· `-F` 多行 message · 给出 hash · 提交后 porcelain 为空** —— 并指出这两种文件在 7.22 下**性质不同**：
+
+- `docs/design/reviews/t304-clean-env-t112-t120.md` = **从未入库的新文件**（一个 `git clean` 会抹掉）
+- `docs/design/reviews/t294-t252-wiki-dryrun.md` = **已入库后又被改**（丢失的只是那次修改）
+
+⇒ **性质不同，处理动作相同** —— 而那四条是**可机械判定的**，**「我记得我提交了」不是**。
+
+**而它做对的一件小事**：它发现 `t299-fingerprint-replay-assertion-surface.md` 未入库、**而作者不是它** ⇒ 它没有 add、也没有替作者去提醒 ⇒ **不越界，但把事实留在记录里**。
