@@ -365,6 +365,12 @@ fn wiki_show(url: &str, slug: &str) -> Result<()> {
 /// payloads, the recall URL and `sweep_probe_artifacts` all read these
 /// constants, so a rename cannot orphan a class of artifact, and the sweep
 /// cannot drift from the writer (t252/t282, single-source rule).
+/// The probe space is a PREFIX, not a name table (t295): another task's probe
+/// (`agent:__probe__t263`, `__probe__t263-node`, `__probe__/t263-x`) lives in the
+/// same space and must be swept by the same rule. The names below are what
+/// THIS command writes; the sweeps match on the prefixes.
+const PROBE_PREFIX: &str = "__probe__";
+const PROBE_MEMORY_NAMESPACE_PREFIX: &str = "agent:__probe__";
 const PROBE_DOC_NAME: &str = "__probe__/doctor-probe";
 const PROBE_DOC_NAME_LEGACY: &str = "doctor-probe";
 const PROBE_ENTITY_NAME: &str = "__probe__doctor-node";
@@ -418,7 +424,7 @@ fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>)
         Ok(v) => {
             for row in v["documents"].as_array().cloned().unwrap_or_default() {
                 let name = row["name"].as_str().unwrap_or_default().to_string();
-                if !doc_names.contains(&name.as_str()) {
+                if !name.starts_with(PROBE_PREFIX) && !doc_names.contains(&name.as_str()) {
                     continue;
                 }
                 let id = row["id"].as_i64().unwrap_or(0);
@@ -477,6 +483,36 @@ fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>)
             }
         }
     }
+    // ...and everything else in the same PREFIX space, whoever wrote it: the
+    // probe space is a prefix, not a name table (t295). /graph/entities returns
+    // [entity, edge_count] pairs, so the entity object is row[0].
+    match get_json(url, "/api/v1/graph/entities?limit=500") {
+        Ok(v) => {
+            let rows = v["entities"].as_array().cloned().unwrap_or_default();
+            if rows.len() >= 500 {
+                left += 1;
+                lines.push(
+                    "entity listing hit its page bound (500) — some probe entities may be missed"
+                        .into(),
+                );
+            }
+            for row in rows {
+                let e = row.get(0).cloned().unwrap_or(serde_json::Value::Null);
+                let name = e["name"].as_str().unwrap_or_default().to_string();
+                if !name.starts_with(PROBE_PREFIX) {
+                    continue;
+                }
+                if let Some(id) = e["id"].as_i64() {
+                    entity_targets.push((id, name));
+                }
+            }
+        }
+        Err(e) => {
+            left += 1;
+            lines.push(format!("could not list entities to sweep: {e}"));
+        }
+    }
+
     // One id can match twice (the search leg is run per name); a second
     // DELETE would 404 and be reported as a failure of a sweep that in fact
     // worked. Dedupe before acting (t282).
@@ -522,6 +558,39 @@ fn sweep_probe_artifacts(url: &str, include_legacy: bool) -> (bool, Vec<String>)
             lines.push(format!("could not list probe-namespace memories: {e}"));
         }
     }
+    // The probe NAMESPACE is a prefix too (t295). memory/list's namespace
+    // parameter matches EXACTLY, so list the space and filter here; a
+    // truncated listing is reported, never treated as "nothing to sweep".
+    match get_json(url, "/api/v1/memory/list?limit=5000") {
+        Ok(v) => {
+            let rows = v["memories"].as_array().cloned().unwrap_or_default();
+            let matched = v["matched"].as_u64().unwrap_or(rows.len() as u64);
+            if matched > rows.len() as u64 {
+                left += 1;
+                lines.push(format!(
+                    "memory listing truncated: {} of {matched} rows — not every probe memory could be swept",
+                    rows.len()
+                ));
+            }
+            for row in rows {
+                let ns = row["namespace"].as_str().unwrap_or_default().to_string();
+                if !ns.starts_with(PROBE_MEMORY_NAMESPACE_PREFIX) {
+                    continue;
+                }
+                if let Some(id) = row["id"].as_i64() {
+                    memory_targets.push((
+                        id,
+                        format!("namespace prefix {PROBE_MEMORY_NAMESPACE_PREFIX} ({ns})"),
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            left += 1;
+            lines.push(format!("could not list memories to sweep: {e}"));
+        }
+    }
+
     if include_legacy {
         // The pre-t252 doctor wrote its probe into the `user` namespace, where
         // the injection paths read it: sweep by CONTENT, from the same
@@ -750,6 +819,33 @@ mod tests {
         assert!(PROBE_ENTITY_NAME.starts_with("__probe__"));
         assert!(!PROBE_ENTITY_NAME_LEGACY.starts_with("__probe__"));
         assert!(PROBE_MEMORY_CONTENT.starts_with("doctor probe"));
+        // The probe space is a prefix, and the exact names live inside it
+        // (t295): a rename that leaves the space is the bug this pins.
+        assert!(PROBE_DOC_NAME.starts_with(PROBE_PREFIX));
+        assert!(PROBE_ENTITY_NAME.starts_with(PROBE_PREFIX));
+        assert!(PROBE_MEMORY_NAMESPACE.starts_with(PROBE_MEMORY_NAMESPACE_PREFIX));
+        // The legacy names are deliberately NOT in the prefix space: they are
+        // only swept by --cleanup.
+        assert!(!PROBE_DOC_NAME_LEGACY.starts_with(PROBE_PREFIX));
+        assert!(!PROBE_ENTITY_NAME_LEGACY.starts_with(PROBE_PREFIX));
+    }
+
+    /// t295: a sweep that cannot even LIST must fail loudly. Pointed at a dead
+    /// port the listing fails, so the hygiene check must come back not-clean
+    /// and say why — the alternative (a clean-looking no-op) is the failure
+    /// mode this report line exists to prevent.
+    #[test]
+    fn sweep_reports_a_listing_that_cannot_be_read() {
+        let (clean, lines) = sweep_probe_artifacts("http://127.0.0.1:1", false);
+        let joined = lines.join("; ");
+        assert!(
+            !clean,
+            "a dead daemon must not read as a clean sweep: {joined}"
+        );
+        assert!(
+            joined.contains("could not list"),
+            "the reason must be printed, not skipped: {joined}"
+        );
         assert!(PROBE_MEMORY_NAMESPACE.starts_with("agent:"));
         assert!(
             DOCTOR_RECALL_URL.contains("source=probe"),
