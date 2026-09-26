@@ -288,6 +288,95 @@ pub async fn search_entities(db: &Db, query: &str, limit: u32) -> Result<Vec<Ent
     .map_err(DbError::from)
 }
 
+/// Entity search for the RECALL leg (t250): a query shaped like what a user
+/// types, not like what is stored.
+///
+/// search_entities is unchanged (frozen interface): it quotes each whitespace
+/// token into a phrase and ANDs them. Measured against the live graph (t247)
+/// that misses two whole classes -- a hyphenated model whose parts are not
+/// adjacent in the stored text, and any substring of a Han run. This entry
+/// point degrades instead of failing:
+///
+///   1. precision: every term (split the way the tokenizer splits) ANDed;
+///   2. recall:    the same terms as prefixes, ORed -- only if step 1 was empty;
+///   3. LIKE:      the one path FTS5 cannot express, for substrings of a term.
+///
+/// It is a recall leg, not a ranker: FTS rank order first, then the LIKE hits
+/// FTS missed, de-duplicated by id.
+pub async fn search_entities_loose(
+    db: &Db,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<Entity>, DbError> {
+    let terms = ruagent_store::fts::terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = ruagent_store::fts::match_all(&terms);
+    let any = ruagent_store::fts::match_any_prefix(&terms);
+    let likes = ruagent_store::fts::like_patterns(&terms);
+    db.call(move |conn| -> Result<Vec<Entity>, rusqlite::Error> {
+        let mut out: Vec<Entity> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let fts = |expr: &str,
+                   out: &mut Vec<Entity>,
+                   seen: &mut std::collections::HashSet<i64>|
+         -> Result<(), rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.name, e.kind, e.summary
+                     FROM entities_fts f JOIN entities e ON e.id = f.rowid
+                     WHERE entities_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![expr, limit], |row| {
+                Ok(Entity {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    summary: row.get(3)?,
+                })
+            })?;
+            for r in rows {
+                let e = r?;
+                if seen.insert(e.id) {
+                    out.push(e);
+                }
+            }
+            Ok(())
+        };
+        fts(&all, &mut out, &mut seen)?;
+        if out.is_empty() {
+            fts(&any, &mut out, &mut seen)?;
+        }
+        for pat in likes {
+            if out.len() >= limit as usize {
+                break;
+            }
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, summary FROM entities
+                 WHERE name LIKE ?1 ESCAPE '\\' OR summary LIKE ?1 ESCAPE '\\'
+                 ORDER BY id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![pat, limit], |row| {
+                Ok(Entity {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    summary: row.get(3)?,
+                })
+            })?;
+            for r in rows {
+                let e = r?;
+                if seen.insert(e.id) {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
 fn edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Edge> {
     Ok(Edge {
         id: row.get(0)?,

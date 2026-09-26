@@ -5,6 +5,7 @@
 //! transcripts; vectors (M3) go to embedded LanceDB. Postgres is a
 //! productization-time swap behind these traits.
 
+pub mod fts;
 pub mod migrations;
 pub mod sqlite;
 pub mod transcript;

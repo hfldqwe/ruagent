@@ -18,7 +18,7 @@ pub use embed::{Embedder, HashEmbedder};
 pub use fast::FastEmbedder;
 pub use files::{ChunkRevision, EditOutcome, Expansion, ScanReport};
 pub use rrf::rrf;
-pub use store::{Knowledge, KnowledgeError, SearchHit};
+pub use store::{Knowledge, KnowledgeError, LegHit, SearchHit, SearchLegs};
 
 /// Deterministic hashing for the offline embedder / dedup.
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {

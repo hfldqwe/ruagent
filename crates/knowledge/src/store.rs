@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use lancedb::arrow::arrow_array::types::Float32Type;
-use lancedb::arrow::arrow_array::{FixedSizeListArray, Int64Array, RecordBatch};
+use lancedb::arrow::arrow_array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -50,6 +50,32 @@ pub struct SearchHit {
 }
 
 /// One ingested document (panel listing).
+/// One leg's result for a query, with that leg's OWN score (t250).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegHit {
+    pub chunk_id: i64,
+    /// 0-based position within this leg.
+    pub rank: usize,
+    /// semantic: LanceDB distance (lower is closer);
+    /// keyword: SQLite FTS5 bm25() (more negative is better).
+    pub raw_score: f32,
+}
+
+/// Both legs plus the fused ranking (t250).
+///
+/// WHY THIS EXISTS: the store computed two legs all along and then dropped
+/// their raw scores inside rrf(), which keeps only ranks. So the only score the
+/// platform could show was the fused rank score, whose upper bound is legs/61
+/// -- measured at 3 distinct values across 574 live rows and IDENTICAL for a
+/// 1-word and a 7-word query (t247). A caller that can see the legs can say
+/// where a hit came from and how well it scored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchLegs {
+    pub semantic: Vec<LegHit>,
+    pub keyword: Vec<LegHit>,
+    pub fused: Vec<(i64, f32)>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct KnowledgeDocument {
     pub id: i64,
@@ -399,12 +425,17 @@ impl Knowledge {
 
     /// Hybrid search: LanceDB ANN + SQLite FTS, fused with RRF.
     /// Zero LLM at query time (design §6.6 #3).
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, KnowledgeError> {
-        let leg_k = limit.max(10) as usize;
-
-        // Leg 1: semantic ANN.
+    /// The two retrieval legs, each with its own raw score. Single source: both
+    /// search() and search_legs() call this, so the fused ranking cannot drift
+    /// away from the legs a caller inspects.
+    async fn compute_legs(
+        &self,
+        query: &str,
+        leg_k: usize,
+    ) -> Result<(Vec<(i64, f32)>, Vec<(i64, f32)>), KnowledgeError> {
+        // Leg 1: semantic ANN. LanceDB reports its own distance column.
         let qvec = self.embedder.embed_query(query)?;
-        let mut ann_ids: Vec<i64> = Vec::new();
+        let mut ann: Vec<(i64, f32)> = Vec::new();
         let table = self.lance.open_table(TABLE).execute().await?;
         let batches = table
             .query()
@@ -413,40 +444,57 @@ impl Knowledge {
             .execute()
             .await?;
         for batch in batches.try_collect::<Vec<_>>().await? {
-            if let Some(ids) = batch.column_by_name("id")
-                && let Some(ids) = ids.as_any().downcast_ref::<Int64Array>()
-            {
-                ann_ids.extend(ids.iter().flatten());
+            let ids = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+            let dist = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let Some(ids) = ids else { continue };
+            for (i, id) in ids.iter().enumerate() {
+                if let Some(id) = id {
+                    // NAN if LanceDB stops reporting the column: a caller can
+                    // test for that, where a silent 0.0 would hide it.
+                    let d = dist.map(|d| d.value(i)).unwrap_or(f32::NAN);
+                    ann.push((id, d));
+                }
             }
         }
 
-        // Leg 2: keyword FTS. Punctuated tokens (deploy.sh, scripts/*)
-        // are FTS5 syntax errors as raw input — quote each token into a
-        // literal phrase (the same treatment memory recall uses).
+        // Leg 2: keyword FTS. Punctuated tokens (deploy.sh, scripts/*) are FTS5
+        // syntax errors as raw input -- quote each token into a literal phrase
+        // (the same treatment memory recall uses).
         let fts_query = query
             .split_whitespace()
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ");
-        let fts_ids: Vec<i64> = if fts_query.is_empty() {
+        let fts: Vec<(i64, f32)> = if fts_query.is_empty() {
             Vec::new()
         } else {
             self.db
-                .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+                .call(move |conn| -> Result<Vec<(i64, f32)>, rusqlite::Error> {
                     let mut stmt = conn.prepare(
-                        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1
-                         ORDER BY rank LIMIT ?2",
+                        "SELECT rowid, bm25(chunks_fts) FROM chunks_fts
+                         WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
                     )?;
-                    let ids = stmt
-                        .query_map(rusqlite::params![fts_query, leg_k as i64], |r| r.get(0))?
-                        .collect::<Result<Vec<i64>, _>>()?;
-                    Ok(ids)
+                    let rows = stmt.query_map(rusqlite::params![fts_query, leg_k as i64], |r| {
+                        Ok((r.get(0)?, r.get::<_, f64>(1)? as f32))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()
                 })
                 .await?
                 .map_err(ruagent_store::DbError::from)?
         };
+        Ok((ann, fts))
+    }
 
-        // Fuse.
+    /// Fused hybrid search (behaviour unchanged by t250).
+    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, KnowledgeError> {
+        let leg_k = limit.max(10) as usize;
+        let (ann, fts) = self.compute_legs(query, leg_k).await?;
+        let ann_ids: Vec<i64> = ann.iter().map(|(id, _)| *id).collect();
+        let fts_ids: Vec<i64> = fts.iter().map(|(id, _)| *id).collect();
         let fused = rrf(&[ann_ids, fts_ids], 60);
         let top: Vec<i64> = fused
             .iter()
@@ -470,20 +518,15 @@ impl Knowledge {
                      WHERE c.id IN ({placeholders})"
                 );
                 let mut stmt = conn.prepare(&sql)?;
-                let mut hits = stmt
-                    .query_map(rusqlite::params_from_iter(top_clone.iter()), |row| {
-                        Ok(SearchHit {
-                            chunk_id: row.get(0)?,
-                            document: row.get(1)?,
-                            content: row.get(2)?,
-                            score: 0.0,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                for hit in &mut hits {
-                    hit.score = 0.0; // filled below
-                }
-                Ok(hits)
+                stmt.query_map(rusqlite::params_from_iter(top_clone.iter()), |row| {
+                    Ok(SearchHit {
+                        chunk_id: row.get(0)?,
+                        document: row.get(1)?,
+                        content: row.get(2)?,
+                        score: 0.0,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
             })
             .await?
             .map_err(ruagent_store::DbError::from)?;
@@ -493,6 +536,30 @@ impl Knowledge {
         }
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         Ok(hits)
+    }
+
+    /// Both legs with their raw scores, plus the fused ranking (t250).
+    pub async fn search_legs(&self, query: &str, limit: u32) -> Result<SearchLegs, KnowledgeError> {
+        let leg_k = limit.max(10) as usize;
+        let (ann, fts) = self.compute_legs(query, leg_k).await?;
+        let ann_ids: Vec<i64> = ann.iter().map(|(id, _)| *id).collect();
+        let fts_ids: Vec<i64> = fts.iter().map(|(id, _)| *id).collect();
+        let fused = rrf(&[ann_ids, fts_ids], 60);
+        let mk = |v: &[(i64, f32)]| -> Vec<LegHit> {
+            v.iter()
+                .enumerate()
+                .map(|(i, (id, s))| LegHit {
+                    chunk_id: *id,
+                    rank: i,
+                    raw_score: *s,
+                })
+                .collect()
+        };
+        Ok(SearchLegs {
+            semantic: mk(&ann),
+            keyword: mk(&fts),
+            fused,
+        })
     }
 
     /// List all documents (panel knowledge manager).
