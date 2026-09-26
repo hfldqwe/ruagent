@@ -2600,10 +2600,23 @@ function touchTargetVerdict(w, floor) {
         ") -- the effective box is not measurable there",
     };
   }
-  const bad = all.filter((t) => t.effW < floor || t.effH < floor);
-  const smallest = all.reduce((a, b) => (a.effW * a.effH <= b.effW * b.effH ? a : b));
+  // t306 RULING: this row measures the TARGET'S OWN SIZE (WCAG 2.5.8), not how
+  // much of it happens to be inside the viewport. A target that is 3px below the
+  // fold is a fact about the SCROLL POSITION: t306 measured the same route at two
+  // scroll positions and got 2 offenders / 0 offenders, i.e. judging the clamped
+  // region here made the row a flake. So the BOX decides -- EXCEPT when the box is
+  // not what a finger can reach: allHit === false means samples inside the box miss
+  // the element (an ancestor clips it or something covers it), and that is t158's
+  // shape (box 44x44, hit region 13x36), which must keep failing. The old
+  // eff-vs-box pair is still reported, and viewportClipped carries the
+  // 'partly outside the viewport' count so a future row can own that fact.
+  const reachW = (t) => (t.allHit === true ? t.boxW : t.effW);
+  const reachH = (t) => (t.allHit === true ? t.boxH : t.effH);
+  const bad = all.filter((t) => reachW(t) < floor || reachH(t) < floor);
+  const smallest = all.reduce((a, b) => (reachW(a) * reachH(a) <= reachW(b) * reachH(b) ? a : b));
   const boxOnlyWouldPass = bad.filter((t) => t.boxW >= floor && t.boxH >= floor);
-  return { measured: true, samples: all.length, bad, smallest, boxOnlyWouldPass, skipped, skippedWhy, pass: bad.length === 0 };
+  const viewportClipped = all.filter((t) => t.allHit === true && (t.effW < floor || t.effH < floor));
+  return { measured: true, samples: all.length, bad, smallest, boxOnlyWouldPass, viewportClipped, skipped, skippedWhy, pass: bad.length === 0 };
 }
 
 // Rows 47/48/49: list-order stability. The instruments were built in t99
