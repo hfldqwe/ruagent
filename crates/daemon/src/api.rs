@@ -2907,7 +2907,7 @@ fn keyword_stage_label(stage: &ruagent_knowledge::store::KeywordStage) -> String
 /// `semantic_rank` / `semantic_score` and `keyword_rank` / `keyword_score`
 /// carry that leg's OWN raw score (semantic: LanceDB distance, lower is closer;
 /// keyword: bm25, more negative is better — 0.0 in the substring stage, where
-/// FTS never matched and there is no bm25 to report); `keyword_stage` names
+/// FTS never matched and there is no bm25 to report); query_keyword_stage names
 /// the construction that produced the keyword leg. A leg that did NOT find the
 /// chunk is `null`, never 0: 0 is a legal score, `null` is "this leg missed"
 /// (t290 — the panel would otherwise read a miss as a perfect match).
@@ -2937,7 +2937,7 @@ fn knowledge_hit_json(
         "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
         "keyword_rank": kw.map(|(r, _)| r as i64),
         "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
-        "keyword_stage": stage,
+        "query_keyword_stage": stage,
     });
     if conservative {
         obj["excerpt"] = serde_json::json!(truncate_chars(&hit.content, 80));
@@ -3834,7 +3834,7 @@ async fn knowledge_ingest(
 /// `GET /api/v1/knowledge/search?q=...&limit=N[&legs=false]`
 ///
 /// Every hit carries the per-leg evidence (t290): `legs`, `semantic_rank`,
-/// `semantic_score`, `keyword_rank`, `keyword_score`, `keyword_stage` — the
+/// `semantic_score`, `keyword_rank`, `keyword_score`, `query_keyword_stage` — the
 /// SAME keys `/api/v1/recall` emits for its knowledge hits, built by the same
 /// `knowledge_hit_json`, so the panel's #knowledge page can show the legs
 /// without intercepting a prompt (which is all t263 could do before this).
@@ -4021,15 +4021,29 @@ mod tests {
     /// process. A second *process* would either collide with the running
     /// daemon's port or, worse, open the user's data root — so the session
     /// lifecycle is exercised in-process instead.
-    async fn harness() -> (Router, ruagent_store::Db, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "ruagent-api-test-{}-{}",
+    /// A root no other test can pick. The clock alone is not enough: two
+    /// parallel tests can read the same `SystemTime::now()`, land on the same
+    /// path, and then fight over one SQLite file — which is how this suite
+    /// produced `Sqlite(DatabaseBusy("database is locked"))` in a test that had
+    /// done nothing wrong (t313). The counter cannot repeat inside a process,
+    /// the pid separates processes, and the timestamp separates two processes
+    /// that started in the same tick.
+    fn harness_root() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "ruagent-api-test-{}-{}-{}",
             std::process::id(),
+            n,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    async fn harness() -> (Router, ruagent_store::Db, std::path::PathBuf) {
+        let root = harness_root();
         std::fs::create_dir_all(&root).unwrap();
         let cfg = DaemonConfig::load(&root).unwrap();
         let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
@@ -4204,7 +4218,7 @@ mod tests {
                 "semantic_score",
                 "keyword_rank",
                 "keyword_score",
-                "keyword_stage",
+                "query_keyword_stage",
             ] {
                 assert_eq!(h[key], other[key], "key {key} differs on chunk {id}");
             }
@@ -4228,7 +4242,7 @@ mod tests {
             if !legs.iter().any(|l| l == "semantic") {
                 assert!(h["semantic_score"].is_null(), "{h}");
             }
-            assert!(h["keyword_stage"].is_string() || h["keyword_stage"].is_null());
+            assert!(h["query_keyword_stage"].is_string() || h["query_keyword_stage"].is_null());
         }
         println!("READING null-leg cases in this query: {null_cases}");
 
@@ -4273,8 +4287,8 @@ mod tests {
             "{raw4}"
         );
         println!(
-            "READING legs=false: legs={} keyword_stage={}",
-            v4["hits"][0]["legs"], v4["hits"][0]["keyword_stage"]
+            "READING legs=false: legs={} query_keyword_stage={}",
+            v4["hits"][0]["legs"], v4["hits"][0]["query_keyword_stage"]
         );
     }
 
