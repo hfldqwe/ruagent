@@ -49,7 +49,6 @@ pub struct SearchHit {
     pub score: f32,
 }
 
-/// One ingested document (panel listing).
 /// One leg's result for a query, with that leg's OWN score (t250).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LegHit {
@@ -57,8 +56,28 @@ pub struct LegHit {
     /// 0-based position within this leg.
     pub rank: usize,
     /// semantic: LanceDB distance (lower is closer);
-    /// keyword: SQLite FTS5 bm25() (more negative is better).
+    /// keyword: SQLite FTS5 bm25() (more negative is better) for the
+    /// Precision/Prefix stages, 0.0 for the Substring stage (see
+    /// KeywordStage -- there is no bm25 for a row FTS never matched).
     pub raw_score: f32,
+}
+
+/// Which construction produced the keyword leg (t261).
+///
+/// The first two stages are real FTS5 matches and carry bm25. The third is a
+/// LIKE scan: those rows are NOT FTS matches, so no bm25 exists for them --
+/// saying so in the type is better than a fabricated number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeywordStage {
+    /// No term survived tokenisation, or no stage found anything.
+    Empty,
+    /// Every term as a literal phrase, implicitly ANDed.
+    Precision,
+    /// Every term as a prefix, ORed. Runs only when Precision was empty.
+    Prefix,
+    /// LIKE substring scan. Runs only when both FTS stages were empty; the
+    /// only path that can find a substring of a Han run.
+    Substring,
 }
 
 /// Both legs plus the fused ranking (t250).
@@ -73,6 +92,10 @@ pub struct LegHit {
 pub struct SearchLegs {
     pub semantic: Vec<LegHit>,
     pub keyword: Vec<LegHit>,
+    /// Which keyword construction ran (t261). The raw_score of a keyword hit
+    /// is bm25 for Precision/Prefix and 0.0 for Substring (no bm25 exists
+    /// there, so a number would be invented).
+    pub keyword_stage: KeywordStage,
     pub fused: Vec<(i64, f32)>,
 }
 
@@ -432,7 +455,7 @@ impl Knowledge {
         &self,
         query: &str,
         leg_k: usize,
-    ) -> Result<(Vec<(i64, f32)>, Vec<(i64, f32)>), KnowledgeError> {
+    ) -> Result<(Vec<(i64, f32)>, Vec<(i64, f32)>, KeywordStage), KnowledgeError> {
         // Leg 1: semantic ANN. LanceDB reports its own distance column.
         let qvec = self.embedder.embed_query(query)?;
         let mut ann: Vec<(i64, f32)> = Vec::new();
@@ -461,38 +484,121 @@ impl Knowledge {
             }
         }
 
-        // Leg 2: keyword FTS. Punctuated tokens (deploy.sh, scripts/*) are FTS5
-        // syntax errors as raw input -- quote each token into a literal phrase
-        // (the same treatment memory recall uses).
-        let fts_query = query
-            .split_whitespace()
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let fts: Vec<(i64, f32)> = if fts_query.is_empty() {
-            Vec::new()
-        } else {
-            self.db
-                .call(move |conn| -> Result<Vec<(i64, f32)>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(
-                        "SELECT rowid, bm25(chunks_fts) FROM chunks_fts
-                         WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-                    )?;
-                    let rows = stmt.query_map(rusqlite::params![fts_query, leg_k as i64], |r| {
-                        Ok((r.get(0)?, r.get::<_, f64>(1)? as f32))
-                    })?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                })
-                .await?
-                .map_err(ruagent_store::DbError::from)?
-        };
-        Ok((ann, fts))
+        // Leg 2: keyword FTS, three stages (t261). The construction lives in
+        // ruagent_store::fts so this crate and the graph crate cannot drift
+        // apart again: t247 measured two copies of it plus a third variant.
+        let (fts, keyword_stage) = self.keyword_leg(query, leg_k).await?;
+        Ok((ann, fts, keyword_stage))
     }
 
-    /// Fused hybrid search (behaviour unchanged by t250).
+    /// The keyword leg, degrading the same way the entity leg does (t261):
+    /// precision (every term ANDed) -> recall (every term a prefix, ORed) ->
+    /// substring (LIKE).
+    ///
+    /// Stage 2 is what reaches "autohotkey-v2" when the stored text spells it
+    /// apart ("AutoHotkey" ... "v2.0.28"): the phrase form demands an
+    /// adjacency the text does not have, and t247 measured 0 hits for exactly
+    /// that query. Stage 3 is the only path to a substring of a Han run,
+    /// because unicode61 makes the whole run one term.
+    async fn keyword_leg(
+        &self,
+        query: &str,
+        leg_k: usize,
+    ) -> Result<(Vec<(i64, f32)>, KeywordStage), KnowledgeError> {
+        let terms = ruagent_store::fts::terms(query);
+        if terms.is_empty() {
+            return Ok((Vec::new(), KeywordStage::Empty));
+        }
+        for (stage, pattern) in [
+            (
+                KeywordStage::Precision,
+                ruagent_store::fts::match_all(&terms),
+            ),
+            (
+                KeywordStage::Prefix,
+                ruagent_store::fts::match_any_prefix(&terms),
+            ),
+        ] {
+            let rows = self.fts_match(&pattern, leg_k).await?;
+            if !rows.is_empty() {
+                return Ok((rows, stage));
+            }
+        }
+        let patterns = ruagent_store::fts::like_patterns(&terms);
+        let rows = self.fts_like(&patterns, leg_k).await?;
+        if rows.is_empty() {
+            return Ok((Vec::new(), KeywordStage::Empty));
+        }
+        Ok((rows, KeywordStage::Substring))
+    }
+
+    /// One FTS5 MATCH over chunks_fts, scored by bm25 (unchanged semantics).
+    async fn fts_match(
+        &self,
+        pattern: &str,
+        leg_k: usize,
+    ) -> Result<Vec<(i64, f32)>, KnowledgeError> {
+        let pattern = pattern.to_string();
+        Ok(self
+            .db
+            .call(move |conn| -> Result<Vec<(i64, f32)>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid, bm25(chunks_fts) FROM chunks_fts
+                     WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![pattern, leg_k as i64], |r| {
+                    Ok((r.get(0)?, r.get::<_, f64>(1)? as f32))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await?
+            .map_err(ruagent_store::DbError::from)?)
+    }
+
+    /// The substring fallback: LIKE over chunks.content, the terms ORed.
+    ///
+    /// raw_score is 0.0 for every row of this stage: these rows are not FTS
+    /// matches, so there is no bm25 to report (KeywordStage::Substring says
+    /// which stage ran, so a reader cannot mistake the 0.0 for a bm25). The
+    /// rank order inside the stage is chunk id order -- arbitrary, stable, and
+    /// deliberately NOT a relevance claim.
+    async fn fts_like(
+        &self,
+        patterns: &[String],
+        leg_k: usize,
+    ) -> Result<Vec<(i64, f32)>, KnowledgeError> {
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let patterns = patterns.to_vec();
+        Ok(self
+            .db
+            .call(move |conn| -> Result<Vec<(i64, f32)>, rusqlite::Error> {
+                let clause = vec!["content LIKE ? ESCAPE '\\'"; patterns.len()].join(" OR ");
+                let sql = format!(
+                    "SELECT id FROM chunks WHERE {clause} ORDER BY id LIMIT ?{}",
+                    patterns.len() + 1
+                );
+                let mut args: Vec<rusqlite::types::Value> = patterns
+                    .iter()
+                    .map(|p| rusqlite::types::Value::Text(format!("%{p}%")))
+                    .collect();
+                args.push(rusqlite::types::Value::Integer(leg_k as i64));
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+                    Ok((r.get(0)?, 0.0f32))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await?
+            .map_err(ruagent_store::DbError::from)?)
+    }
+
+    /// Fused hybrid search. t250 left the ranking untouched; t261 changes what
+    /// the keyword leg can find (see keyword_leg), so the fused order can move.
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, KnowledgeError> {
         let leg_k = limit.max(10) as usize;
-        let (ann, fts) = self.compute_legs(query, leg_k).await?;
+        let (ann, fts, _stage) = self.compute_legs(query, leg_k).await?;
         let ann_ids: Vec<i64> = ann.iter().map(|(id, _)| *id).collect();
         let fts_ids: Vec<i64> = fts.iter().map(|(id, _)| *id).collect();
         let fused = rrf(&[ann_ids, fts_ids], 60);
@@ -541,7 +647,7 @@ impl Knowledge {
     /// Both legs with their raw scores, plus the fused ranking (t250).
     pub async fn search_legs(&self, query: &str, limit: u32) -> Result<SearchLegs, KnowledgeError> {
         let leg_k = limit.max(10) as usize;
-        let (ann, fts) = self.compute_legs(query, leg_k).await?;
+        let (ann, fts, keyword_stage) = self.compute_legs(query, leg_k).await?;
         let ann_ids: Vec<i64> = ann.iter().map(|(id, _)| *id).collect();
         let fts_ids: Vec<i64> = fts.iter().map(|(id, _)| *id).collect();
         let fused = rrf(&[ann_ids, fts_ids], 60);
@@ -558,6 +664,7 @@ impl Knowledge {
         Ok(SearchLegs {
             semantic: mk(&ann),
             keyword: mk(&fts),
+            keyword_stage,
             fused,
         })
     }

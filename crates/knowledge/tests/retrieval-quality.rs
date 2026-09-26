@@ -313,10 +313,42 @@ async fn run_once(tag: &str, real: bool) -> String {
     let mut ranks: Vec<Option<usize>> = Vec::new();
     let mut no_answer: Vec<(String, f32, usize)> = Vec::new();
     let mut missing_gold: Vec<String> = Vec::new();
+    // t261: the keyword leg's own reading. t250 exposed the legs through
+    // Knowledge::search_legs, so these numbers come from the store itself --
+    // not from a reconstruction (which is why t245 had to report them ABSENT).
+    let mut kw_rows: Vec<String> = Vec::new();
+    let mut kw_nonempty = 0usize;
+    let mut sem_nonempty = 0usize;
+    // Deliberately stage-agnostic: this file must compile against BOTH the
+    // pre-t261 store and the post-t261 store, so the before/after pair is taken
+    // from two runs of one harness rather than from a second copy of the old
+    // construction living here. The stage behaviour itself is pinned by
+    // retrieval-legs.rs.
 
     for (query, class, gold_name, answerable) in QUERIES {
         let hits = kb.search(query, 5).await.unwrap();
         let hit_ids: Vec<i64> = hits.iter().map(|h| h.chunk_id).collect();
+
+        // t261: the two legs exactly as the store computed them.
+        let legs = kb.search_legs(query, 5).await.unwrap();
+        if !legs.keyword.is_empty() {
+            kw_nonempty += 1;
+        }
+        if !legs.semantic.is_empty() {
+            sem_nonempty += 1;
+        }
+        kw_rows.push(format!(
+            "    {{ \"query\": {}, \"class\": {}, \"keyword_hits\": {}, \"keyword_raw_scores\": [{}], \"semantic_top_chunk\": {} }}",
+            q(query),
+            q(class),
+            arr(&legs.keyword.iter().map(|h| h.chunk_id).collect::<Vec<i64>>()),
+            legs.keyword
+                .iter()
+                .map(|h| format!("{:.6}", h.raw_score))
+                .collect::<Vec<String>>()
+                .join(", "),
+            legs.semantic.first().map(|h| h.chunk_id).unwrap_or(-1)
+        ));
         let top = hits.first().map(|h| h.score).unwrap_or(0.0);
         let hit_docs: Vec<i64> = hit_ids
             .iter()
@@ -389,16 +421,24 @@ async fn run_once(tag: &str, real: bool) -> String {
         4,
         "\"timing\": \"printed to stdout, deliberately NOT written here: a wall-clock field would make the byte-equality judge fail on every run\",",
     );
+    // The t245 shape, kept so a reader that knows it is not surprised. Two of
+    // the three entries changed status in t250: the knowledge legs ARE exposed
+    // now, and t261 reads them here instead of reconstructing them.
+    line(
+        &mut out,
+        4,
+        "\"leg_status_note\": \"t245 shape kept for stability; t250 exposed both knowledge legs, so semantic and keyword now report PRESENT and only the entity leg is absent\",",
+    );
     line(&mut out, 4, "\"absent_legs\": {");
     line(
         &mut out,
         6,
-        "\"semantic\": \"ABSENT -- crates/knowledge does not expose per-leg rankings; rebuilding it in the test would make the instrument measure its own copy\",",
+        "\"semantic\": \"PRESENT since t250 -- read from Knowledge::search_legs, never reconstructed\",",
     );
     line(
         &mut out,
         6,
-        "\"keyword\": \"ABSENT -- same reason; the store lexical leg is LanceDB FTS and is not exposed\",",
+        "\"keyword\": \"PRESENT since t250 -- read from Knowledge::search_legs; the per-query hits are in keyword_leg_rows\",",
     );
     line(
         &mut out,
@@ -424,8 +464,24 @@ async fn run_once(tag: &str, real: bool) -> String {
             ranks.len()
         ),
     );
-    line(&mut out, 4, "\"semantic\": null,");
-    line(&mut out, 4, "\"keyword\": null,");
+    line(
+        &mut out,
+        4,
+        &format!(
+            "\"semantic\": {{ \"nonempty_queries\": {}, \"n\": {} }},",
+            sem_nonempty,
+            QUERIES.len()
+        ),
+    );
+    line(
+        &mut out,
+        4,
+        &format!(
+            "\"keyword\": {{ \"nonempty_queries\": {}, \"n\": {} }},",
+            kw_nonempty,
+            QUERIES.len()
+        ),
+    );
     line(&mut out, 4, "\"entity\": null");
     line(&mut out, 2, "},");
     line(&mut out, 2, "\"missing_gold_documents\": [");
@@ -451,6 +507,10 @@ async fn run_once(tag: &str, real: bool) -> String {
     out.push_str(&na.join(","));
     out.push(NL);
     line(&mut out, 2, "],");
+    line(&mut out, 2, "\"keyword_leg_rows\": [");
+    out.push_str(&kw_rows.join(","));
+    out.push(NL);
+    line(&mut out, 2, "],");
     line(&mut out, 2, "\"rows\": [");
     out.push_str(&rows.join(","));
     out.push(NL);
@@ -459,7 +519,7 @@ async fn run_once(tag: &str, real: bool) -> String {
     out.push(NL);
 
     println!(
-        "[t245/{}] embedder={} docs={} queries={} answerable={} fused recall@1={:.4} recall@5={:.4} mrr={:.4} elapsed={}ms",
+        "[t245/{}] embedder={} docs={} queries={} answerable={} fused recall@1={:.4} recall@5={:.4} mrr={:.4} keyword_nonempty={}/{} semantic_nonempty={} elapsed={}ms",
         tag,
         embedder_note,
         docs.len(),
@@ -468,6 +528,9 @@ async fn run_once(tag: &str, real: bool) -> String {
         f1,
         f5,
         fm,
+        kw_nonempty,
+        QUERIES.len(),
+        sem_nonempty,
         started.elapsed().as_millis()
     );
 
