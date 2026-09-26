@@ -42,3 +42,34 @@
 ## 纪律
 
 只改 `panel/tools/design-audit.mjs`（显式路径提交）· 未碰 `panel/src/` · 未 push · 未启停 daemon · 未调 `/api/v1/recall` · 探针脚本在仓外 `C:/tmp/t337` · `node --check` 通过、`--self-test` 全绿（工具未留在坏状态）。
+
+---
+
+## 收尾读数：分离的全量分段跑完了（13/13）
+
+`node tools/audit-shards.mjs --segments=routes --reset --detach`（WMI 分离，`ShowWindow=0`）跑完：
+
+```
+('agents', 0, 2, 51, 0, 8, [])
+('board', 0, 2, 51, 0, 8, [])
+('chat', 0, 2, 53, 0, 6, [])
+('graph', 0, 2, 54, 0, 5, [])
+('home', 0, 2, 52, 0, 7, [])
+('inbox', 0, 2, 50, 0, 9, [])
+('knowledge', 0, 2, 53, 0, 6, [])
+('memory', 0, 2, 52, 0, 7, [])
+('runtimes', 0, 2, 51, 0, 8, [])
+('sessions', 0, 2, 53, 0, 6, [])
+('settings', 0, 2, 52, 0, 7, [])
+('stats', 0, 2, 51, 0, 8, [])
+('task', 0, 2, 53, 0, 6, [])
+UNION []
+CAPTURES 26 DONE 13 / 13
+```
+
+| | captures | 失败行 | 未测 |
+| --- | --- | --- | --- |
+| **改前**（t332 的分段全量，行58 假红） | 26 | **[58]** | 逐段 4-9 |
+| **改后**（本单，行58 探针三层修完） | **26** | **[]** | 逐段 4-9（可见、不相加） |
+
+⇒ **失败行并集 [58] → []** ✓（验收 ② 达成），captures 仍是 26（**没有少测**：段数、capture 数、逐段未测项都与改前一致）· 每段 exit=0（改前 chat/settings 两段 exit=1）。
