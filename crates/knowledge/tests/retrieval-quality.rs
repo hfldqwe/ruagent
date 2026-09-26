@@ -16,11 +16,20 @@
 //!             Comparing a chunk id against a document id is what the first two
 //!             attempts did; the self-test below pins that defect shut.
 //!   fused  -- Knowledge::search, the store's own RRF fusion.
-//!   semantic / keyword / entity -- ABSENT, with the reason recorded in the JSON.
-//!             The store does not expose per-leg rankings and the entity leg
-//!             lives in crates/graph. Reconstructing a leg inside the test would
-//!             make the instrument measure its own copy of the retrieval logic.
+//!   semantic / keyword -- READ FROM THE STORE since t250, through
+//!             Knowledge::search_legs. t245 had to report them ABSENT because the
+//!             store exposed no per-leg ranking; reconstructing a leg inside the
+//!             test would have made the instrument measure its own copy of the
+//!             retrieval logic, and that is still forbidden.
+//!   entity  -- still ABSENT, with the reason recorded in the JSON: the entity
+//!             leg lives in crates/graph, which this crate cannot read.
 //!             Absent and named, never silently skipped, never a second copy.
+//!
+//! This file is deliberately AGNOSTIC about the keyword construction (t261): it
+//! reads the legs the store produced and never builds a match string, so the
+//! same harness compiles against the pre-t261 store and the post-t261 store.
+//! That is how the before/after pair is taken -- by running one instrument
+//! against two committed states, not by replaying the retired construction here.
 //!
 //! Determinism: hash embedder, tie-broken sorts, fixed key order, and NO timing
 //! inside the JSON -- a wall-clock field would make the byte-equality judge fail
