@@ -286,10 +286,22 @@ export interface MemoryRow {
   superseded_at: string | null;
   /**
    * WHICH EPISODE THIS CAME FROM (t347). Distillation used to say so by writing
-   * "[distilled] " into the content; the marker moved to this field, and the
-   * view reads it to show the 蒸馏 badge. null = no recorded source.
+   * "[distilled] " into the content; the marker moved to this field. The view
+   * does NOT badge on this any more -- after the migration backfilled 156 rows
+   * it marked 162 of 163 rows (t350).
    */
   source_episode: number | null;
+  /**
+   * DID THIS COME OUT OF A SESSION DISTILLATION (t350)? Derived by the daemon
+   * from the episode's kind (distillation records run_turn; the migrated rows
+   * point at a manual episode whose text says the session is unknown), so the
+   * panel never has to join or interpret an episode id.
+   *
+   * OPTIONAL ON PURPOSE: a daemon built before this field does not send it, and
+   * the badge tests === true, so an older daemon shows no badge instead of
+   * rendering "undefined".
+   */
+  distilled?: boolean;
   created_at: string;
   updated_at: string;
 }

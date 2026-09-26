@@ -3766,6 +3766,10 @@ async fn memory_search(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let hits =
         ruagent_memory::query::search_fts(state.mgr.db(), &q.q, q.limit.unwrap_or(8)).await?;
+    // Same derivation as the list: the recall tab renders the same rows.
+    let ids: Vec<i64> = hits.iter().map(|m| m.id).collect();
+    let distilled = distilled_ids(state.mgr.db(), &ids).await?;
+    let hits = with_distilled(&hits, &distilled)?;
     Ok(Json(serde_json::json!({ "hits": hits })))
 }
 
@@ -3783,6 +3787,68 @@ struct MemoryListQuery {
     namespace: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+}
+
+/// The episode kind a session distillation records. The panel's distilled badge
+/// is derived from THIS, not from "source_episode is set" (t350).
+const DISTILLED_EPISODE_KIND: &str = "run_turn";
+
+/// Which of these memory ids came out of a session distillation.
+///
+/// WHY THE JOIN IS HERE AND NOT IN THE BROWSER: the rule is a fact about our
+/// schema (which episode kind distillation writes), and t347 measured what a
+/// coarser rule does. The prefix migration backfilled 156 rows, so
+/// "source_episode is not null" marked 162 of 163 rows -- a badge on every row
+/// says nothing, which is the same failure t347 removed from the body text. One
+/// place owns the rule, and the panel renders a boolean.
+async fn distilled_ids(
+    db: &ruagent_store::Db,
+    ids: &[i64],
+) -> Result<std::collections::HashSet<i64>, ApiError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let ids: Vec<i64> = ids.to_vec();
+    let found = db
+        .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+            let marks = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT m.id FROM memories m
+                 JOIN episodes e ON e.id = m.source_episode
+                 WHERE e.kind = ?1 AND m.id IN ({marks})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+            params.push(&DISTILLED_EPISODE_KIND);
+            for id in &ids {
+                params.push(id);
+            }
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| r.get(0))?;
+            rows.collect()
+        })
+        .await??;
+    Ok(found.into_iter().collect())
+}
+
+/// The rows as the panel receives them: the stored row PLUS the derived
+/// boolean. The panel never sees the join, and it never sees a raw episode id
+/// it would have to interpret.
+fn with_distilled(
+    rows: &[ruagent_memory::MemoryRow],
+    distilled: &std::collections::HashSet<i64>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut v = serde_json::to_value(r).map_err(anyhow::Error::from)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "distilled".to_string(),
+                serde_json::Value::Bool(distilled.contains(&r.id)),
+            );
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 async fn memory_list(
@@ -3803,6 +3869,10 @@ async fn memory_list(
             .await?;
     let matched = ruagent_memory::query::count_memories(state.mgr.db(), store, namespace).await?;
     let counts = ruagent_memory::query::store_counts(state.mgr.db()).await?;
+    // The marker is DERIVED HERE (see distilled_ids): the panel gets a boolean.
+    let ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
+    let distilled = distilled_ids(state.mgr.db(), &ids).await?;
+    let memories = with_distilled(&memories, &distilled)?;
     Ok(Json(serde_json::json!({
         "memories": memories,
         // total = the rows IN THIS RESPONSE; matched = how many rows the filter
@@ -4042,6 +4112,92 @@ fn sse_end(status: RunStatus) -> Result<Event, Infallible> {
 
 #[cfg(test)]
 mod tests {
+    /// t350: the badge is derived from the episode KIND. The two kinds that
+    /// exist on this machine are the two that matter: a session distillation
+    /// (RunTurn) and the episode the t347 prefix migration created (Manual,
+    /// whose text says the session is unknown). Marking both is what made the
+    /// badge meaningless.
+    #[tokio::test]
+    async fn the_distilled_marker_comes_from_the_episode_kind() {
+        let db = ruagent_store::Db::open_in_memory().unwrap();
+        let turn = ruagent_memory::episode::record_episode(
+            &db,
+            ruagent_memory::episode::EpisodeKind::RunTurn,
+            "a distilled session transcript",
+            Some("session:1"),
+        )
+        .await
+        .unwrap();
+        let manual = ruagent_memory::episode::record_episode(
+            &db,
+            ruagent_memory::episode::EpisodeKind::Manual,
+            "the t347 migration episode",
+            Some("ruagent:legacy-distilled-prefix"),
+        )
+        .await
+        .unwrap();
+        let w = |content: &str, ep: i64| ruagent_memory::write::MemoryWrite {
+            store: ruagent_memory::MemoryStore::Profile,
+            namespace: ruagent_memory::namespace::Namespace::parse("user").unwrap(),
+            content: content.to_string(),
+            confidence: 0.9,
+            source_episode: Some(ep),
+            supersedes: None,
+        };
+        let distilled_row = match ruagent_memory::write::write_memory(
+            &db,
+            &w("came out of a session distillation", turn),
+        )
+        .await
+        .unwrap()
+        {
+            ruagent_memory::write::WriteOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let migrated_row = match ruagent_memory::write::write_memory(
+            &db,
+            &w("backfilled by the prefix migration", manual),
+        )
+        .await
+        .unwrap()
+        {
+            ruagent_memory::write::WriteOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        // ApiError has no Debug impl (it is a status + message), so unwrap is not
+        // available here; the test module can read the private message.
+        let marks = match distilled_ids(&db, &[distilled_row, migrated_row]).await {
+            Ok(m) => m,
+            Err(e) => panic!("distilled_ids failed: {}", e.message),
+        };
+        println!(
+            "READING t350: run_turn row {distilled_row} marked={} | manual row {migrated_row} marked={}",
+            marks.contains(&distilled_row),
+            marks.contains(&migrated_row)
+        );
+        assert!(
+            marks.contains(&distilled_row),
+            "a run_turn (session distillation) row MUST be marked"
+        );
+        assert!(
+            !marks.contains(&migrated_row),
+            "a manual (migrated, session unknown) row must NOT be marked"
+        );
+        // And what the panel actually receives is a BOOLEAN, present on every
+        // row -- false, not missing, for the migrated one.
+        let rows = ruagent_memory::query::all_memories(&db, None, None, 50)
+            .await
+            .unwrap();
+        let json = match with_distilled(&rows, &marks) {
+            Ok(v) => v,
+            Err(e) => panic!("with_distilled failed: {}", e.message),
+        };
+        let migrated_json = json.iter().find(|v| v["id"] == migrated_row).unwrap();
+        assert_eq!(migrated_json["distilled"], serde_json::Value::Bool(false));
+        let distilled_json = json.iter().find(|v| v["id"] == distilled_row).unwrap();
+        assert_eq!(distilled_json["distilled"], serde_json::Value::Bool(true));
+    }
+
     /// t188: the panel directory must not be resolved against the working
     /// directory. `cargo test` runs with the CWD set to this package's root
     /// (`crates/daemon`), where a bare `panel/dist` does not exist — so a

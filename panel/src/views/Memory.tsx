@@ -470,12 +470,14 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
         {memory.supersedes != null ? (
           <span className="muted mono">{t("memory.replaces", { id: memory.supersedes })}</span>
         ) : null}
-        {/* t347: WHERE THIS CAME FROM IS A FIELD NOW, NOT A PREFIX IN THE TEXT.
-            Distillation used to write "[distilled] " into the content, which every
-            reader then had to strip again; the fact lives in source_episode and the
-            badge reads it here. A row with no recorded episode shows nothing --
-            that is a fact about the row, not a missing badge. */}
-        {memory.source_episode != null ? (
+        {/* t350: THE BADGE READS THE DERIVED BOOLEAN, NOT source_episode.
+            t347 moved the marker out of the body text and into source_episode, but
+            the migration backfilled 156 rows, so "source_episode is not null" then
+            marked 162 of 163 rows -- a badge on everything says nothing, which is
+            the failure t347 had just removed. The precise fact is the EPISODE'S
+            KIND, the daemon derives it, and this renders the boolean. A daemon too
+            old to send the field shows no badge (=== true is false for undefined). */}
+        {memory.distilled === true ? (
           <span className="tag" title={t("memory.distilledHint")}>
             {t("memory.distilled")}
           </span>
