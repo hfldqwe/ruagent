@@ -267,7 +267,16 @@ function Shell() {
   // switching the language re-titles the tab too. The dependency is `lang` and
   // not `t`: `t` is rebuilt on every render and would re-run this each time.
   useEffect(() => {
-    document.title = `${t(ROUTE_TITLE_KEY[view.kind])} · ruagent`;
+    // Row 56: every route's title must identify the route, and the label alone
+    // does that for the 12 routes that carry a nav item (「知识库 · ruagent」…).
+    // #task is the exception: it has NO nav item, and the measured title was
+    // 「任务详情 · ruagent」 — naming neither the route nor any nav label, so the
+    // audit could not tell that tab apart (row 56: 「不含自身标识：task」). The
+    // hash route is the identity that is always available, so it is appended
+    // where the label cannot carry it; the shape stays `<label> · ruagent`
+    // everywhere else, which is why this is a named branch and not a rewrite.
+    const label = t(ROUTE_TITLE_KEY[view.kind]);
+    document.title = view.kind === "task" ? `${label} · #task · ruagent` : `${label} · ruagent`;
   }, [view.kind, lang]);
 
   // t169: a route change is not urgent, and as a TRANSITION a view that is
