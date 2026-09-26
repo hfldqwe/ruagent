@@ -199,6 +199,16 @@ export interface RecallResult {
     excerpt?: string;
     score?: number;
     hint?: string;
+    /** t250/t251: the fused score is an RRF rank score, and the response now
+     *  says so — plus which legs found this hit and each leg's OWN raw score.
+     *  semantic = LanceDB distance (lower is closer); keyword = FTS5 bm25
+     *  (more negative is better). Absent on a daemon older than t251. */
+    score_kind?: string;
+    legs?: string[];
+    semantic_rank?: number | null;
+    semantic_score?: number | null;
+    keyword_rank?: number | null;
+    keyword_score?: number | null;
   }[];
   /** §13-2: generated wiki pages — a separate section, never mixed
    * into knowledge, always conservative stubs. */
@@ -324,6 +334,11 @@ export interface RecallLogRow {
   entities: number;
   top_memory_score: number | null;
   top_knowledge_score: number | null;
+  /** t251: which producer wrote the row. null is a FACT about rows written
+   *  before the column existed, not a missing value — the daemon preserves it. */
+  source: string | null;
+  /** The label to show: the source, or "unknown (pre-0018)" when source is null. */
+  source_label: string;
 }
 
 /** A hit expanded into its parent section. */
@@ -904,16 +919,43 @@ export const api = {
     get<RecallResult>(
       `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,
     ),
-  /** t265: the envelope is asserted here. The per-row `source` field t251 adds
-   *  is NOT asserted yet — the running daemon does not serve it, and inventing a
-   *  field the backend does not send is how a guard becomes a lie. Add it to the
-   *  row check below in the same commit that lands the backend. */
-  recallLog: (limit = 50) =>
-    getChecked<{ log: RecallLogRow[] }>(`/api/v1/recall/log?limit=${limit}`, {
-      log: "arrayOfObjects",
-    }).then(
-      (r) => r.log,
-    ),
+  /** t251/t269: `source` filters the log the way the daemon does — the value is
+   *  trimmed and lowercased server-side, and the special value `unknown`
+   *  matches rows whose source IS NULL (rows written before the column existed).
+   *  Omit it for the whole log. The envelope and the per-row source/source_label
+   *  fields are asserted, shaped from api.rs's recall_log handler. */
+  recallLog: (limit = 50, source?: string) =>
+    getChecked<{ log: RecallLogRow[] }>(
+      `/api/v1/recall/log?limit=${limit}${source === undefined ? "" : `&source=${encodeURIComponent(source)}`}`,
+      { log: "arrayOfObjects" },
+    ).then((r) => r.log),
+
+  /** t251/t269: retention readout for the log (policy, max_rows, rows,
+   *  oldest/newest ts, how many rows carry no source). Same envelope as above. */
+  recallLogRetention: () =>
+    getChecked<{
+      log: RecallLogRow[];
+      retention: {
+        policy: string;
+        max_rows: number;
+        rows: number;
+        oldest_ts: string | null;
+        newest_ts: string | null;
+        rows_without_source: number;
+      };
+    }>(`/api/v1/recall/log?limit=1`, { log: "arrayOfObjects" }).then((r) => r.retention),
+
+  /** t250/t269: the knowledge hits WITH their per-leg evidence. There is no
+   *  separate legs endpoint — the daemon computes both legs inside the recall
+   *  handler and attaches them to each knowledge hit (api.rs:2437-2490), so
+   *  this reads them from there rather than inventing a route. Each hit says
+   *  which legs found it and each leg's own raw score. */
+  recallKnowledgeLegs: async (q: string, conservative: boolean, topN = 5) => {
+    const r = await get<RecallResult>(
+      `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,
+    );
+    return r.knowledge;
+  },
 
   // skills
   skills: () =>
