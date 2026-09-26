@@ -2529,6 +2529,15 @@ async function probeWig(page, restore) {
           effH: e.effH,
           hits: e.hits,
           samples: e.samples,
+          // The sampling region and the box it came from. When every sample hits,
+          // the effective box IS the clamped region, so a 44x44 target 93% on screen
+          // reports 44x41. Carrying these four fields is what lets the evidence say
+          // that instead of leaving '44x41' beside 'box 44x44' to read as a defect
+          // (t232/t233: the 3px is below the fold, not unreachable).
+          clampedW: e.clampedW,
+          clampedH: e.clampedH,
+          visPct: e.visPct,
+          allHit: e.allHit,
           why: e.why || null,
           // kept so older consumers/tests that read w/h still see the
           // EFFECTIVE box -- the thing the threshold is about.
