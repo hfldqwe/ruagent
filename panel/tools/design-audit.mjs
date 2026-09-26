@@ -2893,21 +2893,60 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
     });
     if (clicked === "picker-opened") {
       // antd Select renders its choices in a portal with role=option.
-      await page.waitForTimeout(400);
+      // t337 MEASURED: antd opens the dropdown on MOUSEDOWN. The probe opened it with a DOM
+      // .click(), which does not open it, so [role=option] was EMPTY (visible 0 options) and
+      // the pick below was a silent no-op on every route. Dispatch the mousedown it listens for.
+      await page.evaluate(() => {
+        const vis = (el) => { const r = el.getBoundingClientRect(); return r.width >= 1 && r.height >= 1; };
+        const p = [...document.querySelectorAll("[role=combobox], select")].filter(vis)[0];
+        if (p) { p.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); p.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); }
+      });
+      await page.waitForTimeout(500);
       await page
         .evaluate(() => {
-          const opt = [...document.querySelectorAll("[role=option]")].filter((el) => {
+          // t337 (F-331a): clicking the option that is ALREADY SELECTED cannot change
+          // the view state, so hash2 === hash1 and row 58 failed forever -- on every
+          // route, whatever the view did. The probe was picking opts[0], and on #chat
+          // that is the current agent (approver). Pick an option that is NOT selected,
+          // the same discipline step (1) uses for radios, and report what was picked so
+          // the reason text can say "there was nothing to switch to" instead of leaving
+          // a silent no-op behind a red row.
+          const opts = [...document.querySelectorAll("[role=option]")].filter((el) => {
             const r = el.getBoundingClientRect();
             return r.width >= 1 && r.height >= 1;
-          })[0];
-          if (opt) opt.click();
-          return !!opt;
+          });
+          const usable = opts.filter((el) =>
+            el.getAttribute("aria-selected") !== "true" &&
+            el.getAttribute("aria-disabled") !== "true" &&
+            !el.classList.contains("ant-select-item-option-disabled"));
+          const selText = () => {
+            const p = [...document.querySelectorAll("[role=combobox], select")].filter((el) => { const r = el.getBoundingClientRect(); return r.width >= 1 && r.height >= 1; })[0];
+            if (!p) return null;
+            const box = p.closest(".ant-select");
+            const item = box && box.querySelector(".ant-select-selection-item");
+            return ((item ? item.textContent : "") || p.value || "").trim().slice(0, 24);
+          };
+          const pick = usable[0] || null;
+          const before = selText();
+          if (pick) pick.click();
+          return { picked: pick ? (pick.textContent || "").trim().slice(0, 24) : null, visible: opts.length, selectable: usable.length, alreadySelected: opts.length - usable.length, before };
         })
+        .then((note) => { out.pickNote = note; })
         .catch(() => false);
     }
     if (clicked) {
       await page.waitForTimeout(700);
       out.hash2 = await page.evaluate(() => location.hash);
+      out.pickNote = out.pickNote
+        ? { ...out.pickNote, after: await page.evaluate(() => {
+            const vis = (el) => { const r = el.getBoundingClientRect(); return r.width >= 1 && r.height >= 1; };
+            const p = [...document.querySelectorAll("[role=combobox], select")].filter(vis)[0];
+            if (!p) return null;
+            const box = p.closest(".ant-select");
+            const item = box && box.querySelector(".ant-select-selection-item");
+            return ((item ? item.textContent : "") || p.value || "").trim().slice(0, 24);
+          }) }
+        : null;
       out.fp2 = await fp();
       // REPLAY: reload with the URL the switch produced and see whether the
       // same view state comes back. A hash that changes but does not restore
@@ -2942,9 +2981,21 @@ function urlStateVerdict(o) {
         "no view-state switch found on this route: looked for [role=tab], a radio inside a visible label, button[aria-pressed], select and [role=combobox], and none was visible",
     };
   if (o.hash2 == null) return { measured: false, pass: null, why: "could not switch a tab/mode to observe the URL" };
+  // t337: name the pick so a red row says WHY it could not change the state.
+  const pick = o.pickNote ? (o.pickNote.picked ? "picked option  + o.pickNote.picked + " : "no selectable option (visible " + o.pickNote.visible + ", already-selected " + o.pickNote.alreadySelected + ")") : null;
   const changed = o.hash2 !== o.hash1;
+  // t337 acceptance (2)/(5): a probe that could not change the selection has NOT measured
+  // this criterion. Say so -- a red row must never be how a probe no-op hides.
+  if (!changed && o.pickNote && o.pickNote.before === o.pickNote.after)
+    return {
+      measured: false,
+      pass: null,
+      pick,
+      why:
+        "no option changed the selection (visible " + o.pickNote.visible + ", selectable " + o.pickNote.selectable + ", picked " + (o.pickNote.picked || "nothing") + ") -- the probe failed to construct a state change, which is not a view that ignores the URL",
+    };
   const replayed = o.fp3 === o.fp2;
-  return { measured: true, changed, replayed, hash1: o.hash1, hash2: o.hash2, fp2: o.fp2, fp3: o.fp3, pass: changed && replayed };
+  return { measured: true, changed, replayed, pick, hash1: o.hash1, hash2: o.hash2, fp2: o.fp2, fp3: o.fp3, pass: changed && replayed };
 }
 
 // Row 59: the nine graph category colours PER MODE, read out of index.css.
@@ -7148,6 +7199,18 @@ function runSelfTest() {
     urlStateVerdict({ tabs: 0, hash1: "#a", hash2: null }).pass === null, true);
   check("row58 must-FAIL: hash changed but replay lands on a DIFFERENT state",
     urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions?src=x", fp1: "全部", fp2: "我发的", fp3: "全部" }).pass, false);
+  // t337: the probe used to click the ALREADY-SELECTED option, so row 58 was red
+  // forever. These two cases pin both directions of that pick, so a future edit that
+  // goes back to opts[0] (or that makes the row pass no matter what) fails here first.
+  check("row58 must-PASS: clicking a DIFFERENT option changes the hash and replay restores the state",
+    urlStateVerdict({ tabs: 2, hash1: "#chat?agent=approver", hash2: "#chat?agent=probe", fp1: "a", fp2: "b", fp3: "b" }).pass, true);
+  check("row58 must-not-PASS (F-331a shape): the probe clicked the CURRENTLY SELECTED option, so nothing changed -> not_measured with a reason, never a pass and never a silent FAIL",
+    (() => {
+      const v = urlStateVerdict({ tabs: 2, hash1: "#chat?agent=approver", hash2: "#chat?agent=approver", fp1: "a", fp2: "a", fp3: "a", pickNote: { picked: "approver", visible: 3, selectable: 2, alreadySelected: 1, before: "approver", after: "approver" } });
+      return v.pass === null && v.measured === false && /no option changed the selection/.test(v.why || "") && /approver/.test(v.why || "");
+    })(), true);
+  check("row58 must-FAIL: the probe DID change the selection but the URL did not move",
+    urlStateVerdict({ tabs: 2, hash1: "#chat?agent=approver", hash2: "#chat?agent=approver", fp1: "a", fp2: "a", fp3: "a", pickNote: { picked: "probe", visible: 3, selectable: 2, alreadySelected: 1, before: "approver", after: "probe" } }).pass, false);
   check("row58 must-FAIL: the hash does not change at all",
     urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions", fp1: "a", fp2: "b", fp3: "b" }).pass, false);
   check("row58 must-PASS: the hash changes and replays to the same state",
