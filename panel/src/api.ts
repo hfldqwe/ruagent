@@ -495,6 +495,7 @@ async function get<T>(path: string): Promise<T> {
  *  their error state on a 500, so this adds no UI. One shape per endpoint, and
  *  every field list below was read back from the running daemon. */
 type Shape =
+  | "present"
   | "array"
   | "arrayOfObjects"
   | "arrayOfTuples"
@@ -551,11 +552,24 @@ function expectShape<T>(
           if (e === null || typeof e !== "object") continue;
           for (const [ef, ekind] of Object.entries(element)) {
             const ev = (e as Record<string, unknown>)[ef];
+            // "present" is the weakest claim this file makes: the key is there
+            // and its VALUE MAY LEGALLY BE NULL. t298 measured which fields are
+            // like that (edges.invalid_at is null on all 60 live rows - an edge
+            // that has not been invalidated; memory rows carry supersedes as
+            // number|null) and which are simply not sent by the endpoint
+            // (memory/list sends no kind/summary/tags). Asserting a type on
+            // those would turn correct responses red, so they get presence only.
             const ok =
-              ev !== undefined &&
-              ev !== null &&
-              (ekind === "number" ? typeof ev === "number" : ekind === "string" ? typeof ev === "string" : Array.isArray(ev));
-            if (!ok) bad.push(`"${f}[${k}].${ef}" is not a ${ekind}`);
+              ekind === "present"
+                ? ev !== undefined
+                : ev !== undefined &&
+                  ev !== null &&
+                  (ekind === "number"
+                    ? typeof ev === "number"
+                    : ekind === "string"
+                      ? typeof ev === "string"
+                      : Array.isArray(ev));
+            if (!ok) bad.push(`"${f}[${k}].${ef}" is not ${ekind === "present" ? "present" : "a " + ekind}`);
           }
         }
       }
@@ -716,8 +730,11 @@ export const api = {
         ? `/api/v1/memory/list?store=${store}&namespace=${encodeURIComponent(namespace)}`
         : `/api/v1/memory/list?namespace=${encodeURIComponent(namespace)}`,
       { memories: "arrayOfObjects", counts: "array" },
-      // The fields Memory.tsx actually reads off a row.
-      { id: "number", store: "string", namespace: "string" },
+      // (a) the fields Memory.tsx reads off a row - measured non-null on the
+      // 12 live rows the view itself requests (?store=observation&namespace=user).
+      // (b) presence-only for a field the view does not read but other code may:
+      // supersedes is number|null by design (a row that supersedes nothing).
+      { id: "number", store: "string", namespace: "string", supersedes: "present" },
     ),
   memorySearch: (q: string) =>
     get<{ hits: MemoryRow[] }>(`/api/v1/memory/search?q=${encodeURIComponent(q)}`).then(
@@ -754,7 +771,10 @@ export const api = {
     getChecked<{ documents: KnowledgeDocument[]; embedder: string }>(
       "/api/v1/knowledge/documents",
       { documents: "arrayOfObjects" },
-      { id: "number", name: "string" },
+      // (a) Knowledge.tsx reads id, name and chunk_count off a document; all
+      // three are non-null on the 7 live rows. (b) created_at is a string and
+      // is checked as such - it is not read by a view but is consumed elsewhere.
+      { id: "number", name: "string", chunk_count: "number", created_at: "string" },
     ),
   knowledgeChunks: (id: number) =>
     get<{ chunks: [number, string][] }>(`/api/v1/knowledge/documents/${id}`).then(
@@ -799,6 +819,9 @@ export const api = {
   wikiPages: () =>
     getChecked<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages", {
       pages: "arrayOfObjects",
+      // (a) the fields Knowledge.tsx reads: slug (string) and stale (boolean).
+      // The sample's slug/title/summary are all strings; slug is the one the
+      // view string-operates on, so it is the one that must be typed.
     }, { slug: "string" }).then(
       (r) => r.pages,
     ),
@@ -839,11 +862,14 @@ export const api = {
     getChecked<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
       `/api/v1/graph/edges?limit=${limit}`,
       { edges: "arrayOfObjects", total: "number", limit: "number", offset: "number" },
-      // Graph.tsx reads id/src/dst off each edge. MEASURED, not assumed: all
-      // three are integers (they are entity ids). Declaring src/dst as strings
-      // made the real response fail - a false red that only showed up when the
-      // live bodies were replayed verbatim, which is why that control exists.
-      { id: "number", src: "number", dst: "number" },
+      // (a) Graph.tsx reads id/src/dst off each edge. MEASURED, not assumed:
+      // all three are integers (they are entity ids). Declaring src/dst as
+      // strings made the real response fail - a false red caught only by the
+      // verbatim replay, which is why that control exists.
+      // (b) invalid_at is null on all 60 live rows (an edge not yet invalidated)
+      // and is therefore presence-only; relation/fact_text are strings and are
+      // checked as such.
+      { id: "number", src: "number", dst: "number", relation: "string", fact_text: "string", invalid_at: "present" },
     ),
   /** The whole entity list (graphEntities caps at the daemon default of 50). */
   graphEntitiesAll: (limit = 500) =>
