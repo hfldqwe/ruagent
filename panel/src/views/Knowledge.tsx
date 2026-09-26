@@ -391,6 +391,22 @@ export function Knowledge() {
               <Empty icon="search" title={t("knowledge.noResults")} />
             ) : (
               <div className="card">
+                {/* t316: the keyword leg's STAGE is a property of the QUERY, not
+                    of a hit — measured on the live daemon: a hit whose legs are
+                    ["semantic"] still reports keyword_stage "precision". It is
+                    therefore rendered ONCE, above the hits, and never beside a
+                    single hit as if it were that hit's source (that is what
+                    「命中来源」/legs is for). The daemon repeats it on every hit;
+                    the first one is the response's answer. */}
+                {(() => {
+                  const st = (hits[0] as { keyword_stage?: string }).keyword_stage;
+                  if (!st) return null;
+                  return (
+                    <div className="muted micro" title={t("knowledge.stageHint")}>
+                      {t("knowledge.stage", { s: t(`knowledge.stage.${st}`) })}
+                    </div>
+                  );
+                })()}
                 {hits.slice(0, HIT_CAP).map((h) => {
                   // t263: the search wrapper's SearchHit type predates t251's
                   // leg evidence (api.ts is out of scope for this task), so the
@@ -401,6 +417,11 @@ export function Knowledge() {
                     semantic_score?: number | null;
                     keyword_score?: number | null;
                   };
+                  // NOTE: keyword_stage is deliberately NOT read here — it is
+                  // query-level (see the block above the list), and a missing leg
+                  // stays null: the two score lines below render only when the
+                  // value is non-null, so "this leg found nothing" can never be
+                  // shown as 0 or as any number that looks like a measurement.
                   return (
                   <div key={h.chunk_id} className="search-hit">
                     <div className="row tight">
