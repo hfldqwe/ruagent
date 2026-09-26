@@ -2379,6 +2379,21 @@ struct RecallQuery {
     source: Option<String>,
 }
 
+/// `GET /api/v1/recall?q=...&top_n=N[&strategy=...][&min_score=...][&source=...]`
+///
+/// The knowledge hits in this response are the CROSS-KIND fused top-N: memories,
+/// knowledge and entities compete for the same `top_n` slots, so a query whose
+/// memories fill the budget returns no knowledge hits at all.
+/// `/api/v1/knowledge/search` answers the narrower question (knowledge-only
+/// top-N), so the two hit SETS differ by design — do not read them as the same
+/// list (t308).
+///
+/// The per-leg fields of a knowledge hit are identical on the INTERSECTION of
+/// the two responses: the same `compute_legs`, the same leg window, and both
+/// endpoints build the object with the same `knowledge_hit_json`. Measured
+/// live: `q='deploy'` — this endpoint [43,41] vs knowledge/search
+/// [43,62,58,64,70], intersection [43], differing leg keys NONE; `q='wiki'` —
+/// this endpoint returned no knowledge hit (nothing to compare).
 async fn recall(
     State(state): State<AppState>,
     Query(q): Query<RecallQuery>,
@@ -3823,6 +3838,16 @@ async fn knowledge_ingest(
 /// SAME keys `/api/v1/recall` emits for its knowledge hits, built by the same
 /// `knowledge_hit_json`, so the panel's #knowledge page can show the legs
 /// without intercepting a prompt (which is all t263 could do before this).
+///
+/// SET vs SET, stated because a reader — and my own first probe — got this
+/// wrong (t308): this endpoint returns the KNOWLEDGE-ONLY top-N, while recall's
+/// knowledge hits are the CROSS-KIND fused top-N — memories, knowledge and
+/// entities compete for the same `top_n` slots, so a query whose memories fill
+/// the budget returns NO knowledge hits at all. The two sets therefore differ
+/// by design; the per-leg fields agree key for key ON THE INTERSECTION (same
+/// `compute_legs`, same leg window). Measured live: `q='deploy'` — this endpoint
+/// [43,62,58,64,70] vs recall [43,41], intersection [43], differing leg keys
+/// NONE; `q='wiki'` — recall's knowledge hits were [] (nothing to compare).
 ///
 /// PAGINATION, stated because the two numbers are easy to conflate:
 /// `total` is how many hits are IN THIS RESPONSE (at most `limit`); `matched`
