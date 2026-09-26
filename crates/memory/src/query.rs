@@ -25,6 +25,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
         deleted_at: row.get("deleted_at")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        source_episode: row.get("source_episode")?,
     })
 }
 
@@ -41,7 +42,7 @@ pub async fn current_memories(
     db.call(move |conn| -> Result<Vec<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
-                    deleted_at, created_at, updated_at
+                    deleted_at, created_at, updated_at, source_episode
              FROM memories
              WHERE store = ?1 AND namespace = ?2
                AND superseded_at IS NULL AND deleted_at IS NULL
@@ -63,7 +64,7 @@ pub async fn search_fts(db: &Db, query: &str, limit: u32) -> Result<Vec<MemoryRo
     db.call(move |conn| -> Result<Vec<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.store, m.namespace, m.content, m.confidence, m.supersedes,
-                    m.superseded_at, m.deleted_at, m.created_at, m.updated_at
+                    m.superseded_at, m.deleted_at, m.created_at, m.updated_at, m.source_episode
              FROM memories_fts f
              JOIN memories m ON m.id = f.rowid
              WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL AND m.deleted_at IS NULL
@@ -96,7 +97,7 @@ pub async fn search_fts_scored(
         move |conn| -> Result<Vec<(MemoryRow, f64)>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT m.id, m.store, m.namespace, m.content, m.confidence, m.supersedes,
-                    m.superseded_at, m.deleted_at, m.created_at, m.updated_at,
+                    m.superseded_at, m.deleted_at, m.created_at, m.updated_at, m.source_episode,
                     bm25(memories_fts)
              FROM memories_fts f
              JOIN memories m ON m.id = f.rowid
@@ -121,7 +122,7 @@ pub async fn get_memory(db: &Db, id: i64) -> Result<Option<MemoryRow>, DbError> 
     db.call(move |conn| -> Result<Option<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
-                    deleted_at, created_at, updated_at
+                    deleted_at, created_at, updated_at, source_episode
              FROM memories WHERE id = ?1",
         )?;
         let mut rows = stmt.query([id])?;
@@ -207,7 +208,7 @@ pub async fn all_memories(
     db.call(move |conn| -> Result<Vec<MemoryRow>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, store, namespace, content, confidence, supersedes, superseded_at,
-                    deleted_at, created_at, updated_at
+                    deleted_at, created_at, updated_at, source_episode
              FROM memories
              WHERE superseded_at IS NULL AND deleted_at IS NULL
                AND (?1 IS NULL OR store = ?1)

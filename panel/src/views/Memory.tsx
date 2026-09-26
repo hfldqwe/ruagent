@@ -470,6 +470,16 @@ function MemoryCard({ memory, onChanged }: { memory: MemoryRow; onChanged: () =>
         {memory.supersedes != null ? (
           <span className="muted mono">{t("memory.replaces", { id: memory.supersedes })}</span>
         ) : null}
+        {/* t347: WHERE THIS CAME FROM IS A FIELD NOW, NOT A PREFIX IN THE TEXT.
+            Distillation used to write "[distilled] " into the content, which every
+            reader then had to strip again; the fact lives in source_episode and the
+            badge reads it here. A row with no recorded episode shows nothing --
+            that is a fact about the row, not a missing badge. */}
+        {memory.source_episode != null ? (
+          <span className="tag" title={t("memory.distilledHint")}>
+            {t("memory.distilled")}
+          </span>
+        ) : null}
         <span className="grow" />
         {/* t253: this number used to render ONLY when confidence < LOW_CONFIDENCE,
             and no row in the live store is below 0.5 (measured distribution over

@@ -83,4 +83,10 @@ pub struct MemoryRow {
     pub deleted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// WHICH EPISODE THIS CAME FROM (t347). Distillation used to say so by
+    /// writing "`[distilled] `" into the body; provenance belongs in a
+    /// field, so the row carries it here and the body carries only the memory.
+    /// `Some(LEGACY_DISTILLED_EPISODE)` = "distilled, episode never
+    /// recorded" (the rows the prefix migration found without one).
+    pub source_episode: Option<i64>,
 }

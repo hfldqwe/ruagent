@@ -246,6 +246,174 @@ pub async fn purge_memory(db: &Db, id: i64) -> Result<PurgeOutcome, DbError> {
     })
 }
 
+// ── t347: the "[distilled] " prefix migration ───────────────────────────────
+
+/// The marker distillation used to write into the body.
+pub const DISTILLED_PREFIX: &str = "[distilled] ";
+
+/// The episode the migrated rows are pointed at, for the rows whose body said
+/// "distilled" but whose session was never recorded.
+///
+/// A REAL episode row, not a sentinel number: `source_episode` carries a
+/// FOREIGN KEY to `episodes(id)`, and -1 is rejected by SQLite (MEASURED on
+/// this migration's first version: SqliteFailure extended_code 787). The
+/// episode's own text says what it is, so a reader who follows the reference
+/// learns "distilled, session not recorded" instead of a magic number whose
+/// meaning lives in a comment.
+pub const LEGACY_EPISODE_TEXT: &str =
+    "legacy distilled memories: the [distilled] body prefix was removed by the t347 migration;      the session these came from was not recorded when they were written";
+pub const LEGACY_EPISODE_KEY: &str = "ruagent:legacy-distilled-prefix";
+
+/// One row, before and after. Returned so the caller can show the change
+/// verbatim instead of trusting a count.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PrefixSample {
+    pub id: i64,
+    pub before: String,
+    pub after: String,
+}
+
+/// What the migration did. Every field is a count a reader can check.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PrefixMigrationOutcome {
+    /// Rows whose body started with the marker (the ones this rewrites).
+    pub scanned: usize,
+    /// Rows actually rewritten (== scanned on the first run, 0 afterwards).
+    pub stripped: usize,
+    /// Rows whose body CONTAINS the marker somewhere else: counted, NOT
+    /// touched. This is the reverse case, and the reason the operation is a
+    /// prefix strip and not a replace.
+    pub marker_inside_only: usize,
+    /// Rows that had no episode id and got `LEGACY_DISTILLED_EPISODE`.
+    pub backfilled: usize,
+    /// Where the BEFORE contents were written (length-prefixed: id + byte length + bytes).
+    pub backup: String,
+    pub samples: Vec<PrefixSample>,
+}
+
+/// Strip the leading `[distilled] ` from every row that has it, once.
+///
+/// WHY A MIGRATION AND NOT A READ-SIDE TRIM: the prefix lives in the STORED
+/// bytes, so every reader -- injection, recall, near-duplicate detection, the
+/// panel -- had to know about it. Trimming on read leaves that knowledge in five
+/// places; rewriting the row leaves it in none.
+///
+/// WHAT IT TOUCHES, EXACTLY: `content.strip_prefix(DISTILLED_PREFIX)` and
+/// nothing else. A row whose body mentions the marker anywhere but the start is
+/// counted in `marker_inside_only` and left byte-identical.
+///
+/// WHY A BACKUP FILE: 156 rows change. The file holds id + the BEFORE content,
+/// so the rollback is mechanical:
+/// `UPDATE memories SET content = <before> WHERE id = <id>;`
+/// It is also this rewrite's audit trail: `memory_diffs` records semantic
+/// changes and this is not one -- the memory means the same thing afterwards.
+///
+/// NOT BUMPED: `updated_at`. The row did not change meaning, and bumping it
+/// would move 156 rows to the top of every "recently updated" list.
+/// BUMPED: `content_hash`, because the bytes changed and the exact-duplicate
+/// check reads that column.
+pub async fn strip_distilled_prefix(
+    db: &Db,
+    backup_dir: &std::path::Path,
+) -> Result<PrefixMigrationOutcome, DbError> {
+    let all: Vec<(i64, String, Option<i64>)> = db
+        .call(|conn| -> Result<Vec<(i64, String, Option<i64>)>, rusqlite::Error> {
+            let mut stmt = conn.prepare("SELECT id, content, source_episode FROM memories ORDER BY id")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+        .map_err(DbError::from)?;
+
+    let mut candidates: Vec<(i64, String, Option<i64>, String)> = Vec::new();
+    let mut marker_inside_only = 0usize;
+    for (id, content, episode) in &all {
+        match content.strip_prefix(DISTILLED_PREFIX) {
+            Some(rest) => candidates.push((*id, content.clone(), *episode, rest.to_string())),
+            None => {
+                if content.contains("[distilled]") {
+                    marker_inside_only += 1;
+                }
+            }
+        }
+    }
+
+    std::fs::create_dir_all(backup_dir)?;
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let backup = backup_dir.join(format!("memories-distilled-prefix-{stamp}.txt"));
+    // LENGTH-PREFIXED, not JSON: memory content can contain quotes and newlines,
+    // and this crate has no JSON dependency. One record = "<id> <byte_len>" then
+    // exactly that many bytes of the BEFORE content then a newline, so the file
+    // round-trips byte for byte and the rollback is mechanical.
+    let mut lines: Vec<u8> = Vec::new();
+    for (id, before, _, _) in &candidates {
+        lines.extend_from_slice(format!("{id} {}", before.len()).as_bytes());
+        lines.push(b'\n');
+        lines.extend_from_slice(before.as_bytes());
+        lines.push(b'\n');
+    }
+    std::fs::write(&backup, lines)?;
+
+    // A row that never recorded its session still needs a reference the FOREIGN
+    // KEY accepts, so the migration records ONE episode that says what it is
+    // (idempotent by content hash, so a second run reuses it).
+    let needs_backfill = candidates.iter().any(|(_, _, ep, _)| ep.is_none());
+    let legacy_episode: i64 = if needs_backfill {
+        crate::episode::record_episode(
+            db,
+            crate::episode::EpisodeKind::Manual,
+            LEGACY_EPISODE_TEXT,
+            Some(LEGACY_EPISODE_KEY),
+        )
+        .await?
+    } else {
+        // Never used: with no legacy episode there is no candidate whose
+        // source_episode is NULL, so COALESCE keeps the value it finds. If that
+        // ever stopped being true, the FOREIGN KEY would reject 0 loudly.
+        0
+    };
+
+    let mut stripped = 0usize;
+    let mut backfilled = 0usize;
+    let mut samples: Vec<PrefixSample> = Vec::new();
+    for (id, before, episode, after) in &candidates {
+        let hash = crate::write::content_hash(after);
+        let set_episode = episode.is_none();
+        // Owned copies: the writer closure must be 'static (Db::call).
+        let after_owned = after.clone();
+        let id_owned = *id;
+        db.call(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE memories SET content = ?1, content_hash = ?2,
+                        source_episode = COALESCE(source_episode, ?3)
+                 WHERE id = ?4",
+                rusqlite::params![after_owned, hash, legacy_episode, id_owned],
+            )?;
+            Ok(())
+        })
+        .await?
+        .map_err(DbError::from)?;
+        stripped += 1;
+        if set_episode {
+            backfilled += 1;
+        }
+        if samples.len() < 5 {
+            samples.push(PrefixSample { id: *id, before: before.clone(), after: after.clone() });
+        }
+    }
+
+    Ok(PrefixMigrationOutcome {
+        scanned: candidates.len(),
+        stripped,
+        marker_inside_only,
+        backfilled,
+        backup: backup.display().to_string(),
+        samples,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +576,61 @@ mod tests {
             out.is_err(),
             "a genuine internal failure must not be reported as success: {out:?}"
         );
+    }    /// t347 acceptance 2 + 5: the migration strips ONLY the leading marker, and a
+    /// row whose body mentions the marker somewhere else is left byte-identical.
+    /// The control row (never had the marker) is asserted too, so a migration that
+    /// rewrote everything would fail here.
+    #[tokio::test]
+    async fn the_prefix_migration_strips_only_the_leading_marker() {
+        let db = Db::open_in_memory().unwrap();
+        let legacy = seed(&db, "[distilled] 用户偏好使用简体中文交流。").await;
+        let control = seed(&db, "the deploy script lives in scripts/deploy.sh").await;
+        let inside = seed(&db, "the agent said [distilled] in its own words").await;
+        let dir = std::env::temp_dir().join(format!("ruagent-t347-{}", std::process::id()));
+        let out = strip_distilled_prefix(&db, &dir).await.unwrap();
+        println!("READING t347 migration: {out:?}");
+        assert_eq!(out.scanned, 1, "only the row that STARTS with the marker");
+        assert_eq!(out.stripped, 1);
+        assert_eq!(out.marker_inside_only, 1);
+        assert_eq!(out.backfilled, 1, "the legacy row had no episode id");
+
+        let a = get_memory(&db, legacy).await.unwrap().unwrap();
+        assert_eq!(a.content, "用户偏好使用简体中文交流。");
+        let legacy_id = a.source_episode.expect("a real episode id, not a sentinel");
+        let kind: String = db
+            .call(move |conn| {
+                conn.query_row("SELECT kind FROM episodes WHERE id = ?1", [legacy_id], |r| r.get(0))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, "manual", "the migration episode says what it is");
+
+        let b = get_memory(&db, control).await.unwrap().unwrap();
+        assert_eq!(b.content, "the deploy script lives in scripts/deploy.sh");
+        assert_eq!(b.source_episode, None, "a row without the marker gains nothing");
+
+        let c = get_memory(&db, inside).await.unwrap().unwrap();
+        assert_eq!(
+            c.content, "the agent said [distilled] in its own words",
+            "the marker INSIDE the body is not provenance and must not be touched"
+        );
+
+        // The backup holds the BEFORE bytes, so the rewrite is reversible.
+        let backup = std::fs::read_to_string(&out.backup).unwrap();
+        assert!(
+            backup.contains("[distilled] 用户偏好使用简体中文交流。"),
+            "backup must carry the before content: {backup:?}"
+        );
+
+        // Idempotent: a second run changes nothing, and says so.
+        let again = strip_distilled_prefix(&db, &dir).await.unwrap();
+        assert_eq!(again.scanned, 0);
+        assert_eq!(again.stripped, 0);
+        assert_eq!(again.marker_inside_only, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
+
     /// The whole contract in one test: the row survives, the audit records it,
     /// and every read path stops returning it.
     #[tokio::test]

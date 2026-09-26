@@ -153,6 +153,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/memory/backfill-embeddings",
             post(memory_backfill_embeddings),
         )
+        .route(
+            "/api/v1/memory/migrate-distilled-prefix",
+            post(memory_migrate_distilled_prefix),
+        )
         .route("/api/v1/permissions", get(list_permissions))
         .route("/api/v1/permissions/{key}", post(resolve_permission))
         .with_state(state)
@@ -2243,6 +2247,37 @@ async fn sessions_messages(
 
 /// Backfill embeddings for existing memory rows (after an embedder
 /// change, or rows written before the semantic leg existed).
+/// POST /api/v1/memory/migrate-distilled-prefix
+///
+/// One-time data migration (t347). Distillation used to write "`[distilled] `"
+/// into the memory BODY; the marker is provenance, and provenance belongs in
+/// `source_episode`, so the prefix is stripped from the stored bytes once and the
+/// field carries the fact from then on.
+///
+/// WHY AN ENDPOINT AND NOT A STARTUP STEP: this rewrites user data (156 rows on
+/// this machine). A daemon that silently rewrites memories on boot is a
+/// surprise; a named, idempotent, callable migration that leaves a backup file
+/// is auditable, and a second call is a measured no-op.
+///
+/// SINGLE WRITER: the rewrite goes through `state.mgr.db()` -- the store's
+/// writer actor the daemon already owns. No second write connection is opened
+/// for this, which is the whole reason it is an endpoint rather than a script.
+async fn memory_migrate_distilled_prefix(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let backup_dir = state.mgr.root().join("data").join("backups");
+    let out = ruagent_memory::lifecycle::strip_distilled_prefix(state.mgr.db(), &backup_dir)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "scanned": out.scanned,
+        "stripped": out.stripped,
+        "marker_inside_only": out.marker_inside_only,
+        "backfilled": out.backfilled,
+        "backup": out.backup,
+        "samples": out.samples,
+    })))
+}
+
 async fn memory_backfill_embeddings(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

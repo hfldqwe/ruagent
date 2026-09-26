@@ -412,7 +412,13 @@ impl Distiller {
             } else {
                 m.namespace.clone()
             };
-            let content = format!("[distilled] {}", m.content.trim());
+            // PROVENANCE IS A FIELD, NOT TEXT (t347). This used to be
+            // format!("`[distilled] {}`", ...) -- a marker written into the body, which
+            // every later reader had to strip again: 156 of 163 rows (96%) carried
+            // it, no production reader depended on it, and crates/memory/src/dedupe.rs
+            // had to treat the word as noise. The write below passes source_episode,
+            // which is where a reader can find the same fact now.
+            let content = m.content.trim().to_string();
             // Near-duplicate check against the live rows in scope. A hit is no
             // longer a SKIP: t323 measured 8 of 44 `profile` rows saying the same
             // thing in different words, because the check it had was word-based
@@ -712,6 +718,48 @@ mod t329_tests {
             content: content.to_string(),
             confidence: None,
         }
+    }
+
+    /// t347 acceptance 1: what a distillation WRITES must not carry the
+    /// provenance marker in the body any more. The fact it used to encode is
+    /// read from the row's source_episode instead -- asserted here too, because
+    /// removing the marker without moving the fact would lose it.
+    #[tokio::test]
+    async fn a_distilled_body_carries_no_provenance_marker() {
+        let root = root("t347-prefix");
+        let d = distiller(&root).await;
+        let (w, _s) = d
+            .write_memories(
+                &[mem("用户偏好使用简体中文交流。")],
+                Some(("ruagent:t347-test", "[t347] the marker moved to a field")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(w, 1, "the write must land, or the assertion below is vacuous");
+        let rows: Vec<(i64, String, Option<i64>)> = d
+            .db
+            .call(|conn| -> Result<Vec<(i64, String, Option<i64>)>, rusqlite::Error> {
+                let mut st =
+                    conn.prepare("SELECT id, content, source_episode FROM memories ORDER BY id")?;
+                let v: Vec<(i64, String, Option<i64>)> = st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (id, content, episode) = rows.first().expect("one row").clone();
+        println!("READING t347 write path: id={id} content={content:?} source_episode={episode:?}");
+        assert!(
+            !content.starts_with("[distilled] "),
+            "the body still carries the provenance marker: {content:?}"
+        );
+        assert_eq!(content, "用户偏好使用简体中文交流。");
+        assert!(
+            episode.is_some(),
+            "provenance must be in the field instead of the text"
+        );
     }
 
     /// t329 acceptance 3: four phrasings of ONE fact must leave one live row —

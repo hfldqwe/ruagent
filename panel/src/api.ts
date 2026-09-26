@@ -284,6 +284,12 @@ export interface MemoryRow {
   confidence: number;
   supersedes: number | null;
   superseded_at: string | null;
+  /**
+   * WHICH EPISODE THIS CAME FROM (t347). Distillation used to say so by writing
+   * "[distilled] " into the content; the marker moved to this field, and the
+   * view reads it to show the 蒸馏 badge. null = no recorded source.
+   */
+  source_episode: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -756,6 +762,11 @@ export const api = {
       // (b) presence-only for a field the view does not read but other code may:
       // supersedes is number|null by design (a row that supersedes nothing).
       { id: "number", store: "string", namespace: "string", supersedes: "present" },
+      // source_episode is DELIBERATELY not required here (t347): a daemon built
+      // before the field existed does not send it, and the memory view must keep
+      // working against one (the badge tests != null, which is false for both null
+      // and undefined). Requiring it would turn an old daemon into a client-side
+      // error.
     ),
   memorySearch: (q: string) =>
     get<{ hits: MemoryRow[] }>(`/api/v1/memory/search?q=${encodeURIComponent(q)}`).then(
