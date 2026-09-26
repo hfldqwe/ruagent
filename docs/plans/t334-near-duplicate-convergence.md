@@ -61,6 +61,19 @@ executed: 6 row(s) marked superseded (none deleted), 2 group(s) converged
 
 （活库现有 4 条带 `source_episode` 的活行来自产品自己的摄取路径，不是本次收敛产生的。）
 
+## 一个计数必须带着它的【范围】
+
+同一件事有两个都对的数字，队长的独立只读 SQL 与本次读数对上了：
+
+- `source_episode is not null` 的**全部行** = **6**；
+- 其中**活行**里带 episode 的 = **4** ⇒ 6 = 4 活 + 2 已 superseded（都来自产品自己的摄取路径）。
+
+⇒ 记成一条：**一个计数必须带着它的范围，就像一次读数必须带着它的时刻**。
+
+## 提交记录（如实）
+
+`b7da7ce` 的提交信息在写入时被截断（heredoc 传 `-F -` 时写坏），落成「主题行 + 空行 + 一个占位词」。**没有 amend、没有 squash**（多写者仓库里不改写历史）：内容一字未少（本报告即全部实质），另补一条说明性提交把该提交实际做了什么写进 `git log`。
+
 ## 只做 UPDATE，不删任何行
 
 `--execute` 只有两条 `UPDATE`（`superseded_at`/`supersedes`），没有任何 `DELETE`；单一事务（`BEGIN IMMEDIATE` … `COMMIT`，出错 `ROLLBACK`）。`memories` 总行数 163 → 163。
