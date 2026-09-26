@@ -813,3 +813,18 @@ error: pathspec 'panel/scripts/build-panel.mjs' did not match any file(s) known 
 ⇒ **显式路径形式不会把未跟踪的新文件纳入提交**；正确顺序是 **先 `git add <自己的路径>` → 再 `git commit -F <msg> -- <同样的路径集>` → 再跑三条判定**。
 
 **而 §7.17 的第 ① 条（`git log -1 --format=%H -- <路径>` 必须是一个【新】hash）当场就把它抓住了** —— 它读到的是**空 hash**，而不是以为提交成功 ✓。**这是那条纪律今天第二次证明自己有用**（第一次是 t284 的「已提交」而没有提交）。
+
+### 7.50 「钉住一个已修缺陷」的四层结构（2026-09-26，t321）
+
+retrieval 给「空 recall pattern 交给 MATCH」这条已修缺陷写的常驻测试，结构值得当模板：
+
+1. **前提断言（不是假设）**：对 `A2/go/11/v2` 逐个断言 `terms` 非空、`match_any_prefix` **是空串**、`like_patterns` 也空 —— **空串正是当年被交给 MATCH 的那个东西** ⇒ 谁动了下限，这条先说话；
+2. **牙齿（执行而不是叙述）**：原样跑 `SELECT count(*) FROM entities_fts WHERE entities_fts MATCH ''` ⇒ 今天仍报 `fts5: syntax error near ""` ⇒ **它证明这个危险是真的，而不是描述它**；
+3. **回归**：那四条必须 `Ok` 且两腿都空；
+4. **对照**：`a` ⇒ 1/1（**尽管它的前缀形态是空串** ⇒ 守卫必须「跳过那一段」而不是「清空整个答案」）· `submarine` ⇒ 1/1 · `茶` ⇒ strict 0 / loose 1 · `t301probe` ⇒ strict 2（顺带把「F-301b 不是连字符问题」也钉进去）。
+
+**它红在哪**：改前那条腿必然把空串交给 MATCH（t312 实测 `Err`）⇒ 第 3 条的 panic 立刻触发 —— **逻辑链自足**。
+
+**而它自曝了一个坑**：第一版牙齿断言写成 `db.call(...).await.is_err()` **恒假** —— `Db::call` 返回 `Result<Result<T, rusqlite::Error>, DbError>`，外层 `Ok` 包内层 `Err`；取内层再判才对。
+
+⇒ **这与 7.11 的后续是同一句话**：**一条永远不会失败的检查，与一条写死的断言没有区别** —— 只不过这次它出现在**测试自己的断言**里，而且**是作者自己抓到的**。
