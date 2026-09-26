@@ -534,8 +534,19 @@ function expectShape<T>(
         i = els.findIndex((e) => e === null || typeof e !== "object" || Array.isArray(e));
         if (i >= 0) bad.push(`"${f}[${i}]" is not a plain object`);
       } else if (kind === "arrayOfTuples") {
-        i = els.findIndex((e) => !Array.isArray(e));
-        if (i >= 0) bad.push(`"${f}[${i}]" is not a tuple`);
+        // A tuple is [entity, count]: an ARRAY of exactly 2 whose first item is
+        // an object and whose second is a number. "is an array" alone let
+        // entities=[[]] through and the page blanked on it (t298 measured it),
+        // so the contents are part of the shape too.
+        i = els.findIndex(
+          (e) =>
+            !Array.isArray(e) ||
+            e.length !== 2 ||
+            e[0] === null ||
+            typeof e[0] !== "object" ||
+            typeof e[1] !== "number",
+        );
+        if (i >= 0) bad.push(`"${f}[${i}]" is not a [entity, count] tuple`);
       } else if (kind === "arrayOfStrings") {
         i = els.findIndex((e) => typeof e !== "string");
         if (i >= 0) bad.push(`"${f}[${i}]" is not a string`);
