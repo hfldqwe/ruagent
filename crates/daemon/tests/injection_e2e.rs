@@ -1,0 +1,369 @@
+//! End-to-end: what an AGENT actually receives (t292).
+//!
+//! WHY THIS FILE EXISTS: t260 put knowledge and wiki hits into the injection and
+//! proved it with a temporary probe. After the probe was deleted, the only
+//! remaining guard was a unit test on the renderer (crates/memory/src/inject.rs)
+//! plus one e2e that asserted the MEMORY block alone -- so the user-visible half
+//! ("the knowledge base now reaches the agent") had nothing watching it.
+//!
+//! WHAT IT DRIVES: a real in-process daemon over a real TCP socket, a real
+//! RunManager, a real SQLite + knowledge base in a throwaway root, and the real
+//! mock-agent binary over real ACP. The assertion is on the run's FIRST-CLASS
+//! transcript event (context_injected), which is what the daemon itself
+//! records -- never on /api/v1/recall, which would append a recall_log row and
+//! make the test a producer of the data it inspects.
+//!
+//! BOTH DIRECTIONS ARE ASSERTED, and that is the point: a test that only checks
+//! "the knowledge block is there when documents exist" cannot tell "the block is
+//! correctly empty" from "the block was never wired up". So the same drive runs
+//! twice -- with documents and without.
+//!
+//! PRECONDITION: the mock agent binary. cargo test --workspace builds it; a bare
+//! cargo test -p ruagent-daemon may not, and then this test PRINTS a skip and
+//! returns -- it never passes silently.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ruagent_daemon::api::AppState;
+use ruagent_daemon::config::DaemonConfig;
+use ruagent_daemon::runs::RunManager;
+use ruagent_store::Db;
+
+/// The memory that must reach the agent in BOTH directions: without it the
+/// "no knowledge block" case could pass by having no blocks at all.
+const MEMORY: &str = "t292-memory-the-user-prefers-concise-answers";
+const PROMPT: &str = "where does the deploy script live";
+const SOURCE_TEXT: &str = "t292-source-the-deploy-script-lives-in-scripts-release-sh";
+const WIKI_TEXT: &str = "t292-wiki-generated-summary-of-the-release-process";
+
+const SOURCE_DOC: &str = r#"# Deploy guide
+
+t292-source-the-deploy-script-lives-in-scripts-release-sh and it runs from the repository root.
+"#;
+const WIKI_DOC: &str = r#"# Deploy notes
+
+t292-wiki-generated-summary-of-the-release-process, to be verified against the deploy guide.
+"#;
+
+/// The mock binary, derived from THIS test binary's own location:
+/// target/profile/deps/test.exe -> target/profile/ruagent-mock-agent[.exe].
+/// CARGO_BIN_EXE_ruagent-mock-agent is only defined for the mock-agent package's
+/// own tests, so an in-scope daemon test cannot use it.
+fn mock_bin() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let name = if cfg!(windows) {
+        "ruagent-mock-agent.exe"
+    } else {
+        "ruagent-mock-agent"
+    };
+    let path = profile_dir.join(name);
+    path.is_file().then(|| {
+        path.display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+    })
+}
+
+/// A precondition this test cannot satisfy from the inside.
+///
+/// PRINTED, never silent -- and that matters more than it looks: an early return
+/// is a PASS in cargo's summary, so a skipped run and a real run both print
+/// "test result: ok". The printed line is the only difference, which is exactly
+/// the ambiguity the repo's write-guard specs avoid the same way.
+///
+/// An unattended run can refuse the ambiguity instead of reading it:
+/// RUAGENT_REQUIRE_MOCK=1 turns the missing binary into a FAILURE.
+fn skip_missing_mock() {
+    let msg = "no ruagent-mock-agent binary next to this test binary.                Build it (cargo build -p ruagent-mock-agent) or run cargo test --workspace.";
+    if std::env::var("RUAGENT_REQUIRE_MOCK").is_ok() {
+        panic!("RUAGENT_REQUIRE_MOCK is set and there is {msg}");
+    }
+    println!("SKIP t292: {msg} THIS TEST DID NOT RUN.");
+}
+
+struct TestDaemon {
+    url: String,
+    root: PathBuf,
+    #[allow(dead_code)]
+    db: Db,
+}
+
+async fn boot(tag: &str, with_knowledge: bool) -> Option<TestDaemon> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let bin = mock_bin()?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root =
+        std::env::temp_dir().join(format!("ruagent-t292-{tag}-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let config_dir = root.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    // Forward slashes in the command: TOML basic strings treat a backslash as an
+    // escape, and a Windows path would silently corrupt.
+    std::fs::write(
+        config_dir.join("agents.toml"),
+        format!(
+            r#"[agent.mock]
+harness = "mock"
+command = "{bin} --behavior echo"
+description = "t292"
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("mcp.toml"),
+        r#"[profile.default]
+servers = []
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        r#"[permissions]
+default = "ask"
+"#,
+    )
+    .unwrap();
+
+    let cfg = DaemonConfig::load(&root).unwrap();
+    let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
+    let mut agents = cfg.agents.clone();
+    for card in &mut agents {
+        if let Some(id) = db.agent_id_by_name(&card.name).await.unwrap() {
+            card.id = id;
+        }
+        db.upsert_agent(card).await.unwrap();
+    }
+    let knowledge = Arc::new(
+        ruagent_knowledge::Knowledge::open(&root, db.clone())
+            .await
+            .unwrap(),
+    );
+    // A memory in BOTH directions, so "no knowledge block" cannot pass by having
+    // no context at all.
+    let outcome = ruagent_memory::write_memory(
+        &db,
+        &ruagent_memory::MemoryWrite {
+            store: ruagent_memory::MemoryStore::Observation,
+            namespace: ruagent_memory::Namespace::parse("user").unwrap(),
+            content: MEMORY.into(),
+            confidence: 0.9,
+            source_episode: None,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ruagent_memory::WriteOutcome::Inserted(_)),
+        "seeding the memory failed: {outcome:?}"
+    );
+    if with_knowledge {
+        knowledge.save("t292-runbook", SOURCE_DOC).await.unwrap();
+        knowledge.save("wiki/t292-notes", WIKI_DOC).await.unwrap();
+    }
+
+    let chats = ruagent_daemon::chat::ChatManager::new(
+        db.clone(),
+        root.clone(),
+        Arc::new(|_, _| {}),
+        cfg.mcp.clone(),
+        ruagent_daemon::distill::AutoDistill::default(),
+        Some(knowledge.embedder()),
+        ruagent_daemon::distill::AgentRegistry::default(),
+    );
+    let mgr = Arc::new(RunManager::new(
+        db.clone(),
+        root.clone(),
+        agents,
+        cfg.policy.to_policy(),
+        cfg.mcp.clone(),
+    ));
+    // The wiring the daemon does at boot (lib.rs). Without it the run path has no
+    // knowledge handle and this test would be asserting the unwired shape.
+    chats.set_knowledge(Arc::clone(&knowledge));
+    mgr.set_knowledge(Arc::clone(&knowledge));
+
+    let app = ruagent_daemon::api::router(AppState {
+        mgr,
+        config: Arc::new(cfg),
+        knowledge: Arc::clone(&knowledge),
+        chats,
+        sessions: Arc::new(ruagent_daemon::sessions::SessionIndexer::new(
+            db.clone(),
+            std::env::temp_dir(),
+        )),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    Some(TestDaemon {
+        url: format!("http://{addr}"),
+        root,
+        db,
+    })
+}
+
+/// Drive one real run and return (the context_injected render, the agent's own
+/// view of its prompt). The mock agent echoes its full prompt, so the second
+/// value is the strongest available statement of "the agent RECEIVED this" --
+/// the event alone only says the daemon emitted it.
+async fn drive_run(d: &TestDaemon, prompt: &str) -> (String, String) {
+    let http = reqwest::Client::new();
+    let task: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks", d.url))
+        .json(&serde_json::json!({ "title": "t292", "intent": prompt }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let run: serde_json::Value = http
+        .post(format!("{}/api/v1/tasks/{task_id}/runs", d.url))
+        .json(&serde_json::json!({ "agent": "mock", "prompt": prompt }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    let path = d
+        .root
+        .join("data")
+        .join("transcripts")
+        .join(format!("run-{run_id}.jsonl"));
+
+    // Poll the transcript for the first-class event, then for the agent's echo.
+    // Never /api/v1/recall: that would write a recall_log row and make this test
+    // a producer of the data it inspects.
+    let mut render = None;
+    let mut echoed = String::new();
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                match v["event"]["type"].as_str() {
+                    Some("context_injected") => {
+                        render = v["event"]["render"].as_str().map(|s| s.to_string());
+                    }
+                    Some("agent_message_chunk") => {
+                        if let Some(t) = v["event"]["content"][0]["text"].as_str() {
+                            echoed.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if render.is_some() && !echoed.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let render = render.unwrap_or_else(|| {
+        panic!(
+            "no context_injected event in {} (the run produced no injection at all)",
+            path.display()
+        )
+    });
+    assert!(
+        !echoed.is_empty(),
+        "the agent echoed nothing -- the run never reached the model, so this test          would be asserting a prompt that was never sent: {}",
+        path.display()
+    );
+    (render, echoed)
+}
+
+/// DIRECTION 1: with a source document and a wiki page, a real run's injected
+/// context carries memory AND knowledge AND wiki -- and the agent received them.
+#[tokio::test]
+async fn run_injects_memory_knowledge_and_wiki() {
+    let Some(d) = boot("withkb", true).await else {
+        skip_missing_mock();
+        return;
+    };
+    let (render, echoed) = drive_run(&d, PROMPT).await;
+    println!("T292 WITH render>>>{render}<<<");
+
+    // The memory half (the only half the pre-existing e2e asserted).
+    assert!(
+        render.contains("<relevant_memories>"),
+        "no memory block: {render}"
+    );
+    assert!(
+        render.contains(MEMORY),
+        "the seeded memory is missing: {render}"
+    );
+    // The half that had NO test before this one.
+    assert!(
+        render.contains("<knowledge>"),
+        "a real run's context has no knowledge block: {render}"
+    );
+    assert!(
+        render.contains(SOURCE_TEXT),
+        "the source document did not reach the context: {render}"
+    );
+    assert!(
+        render.contains("<wiki>"),
+        "a real run's context has no wiki block: {render}"
+    );
+    assert!(
+        render.contains(WIKI_TEXT),
+        "the wiki page did not reach the context: {render}"
+    );
+    // And the user-visible end of the chain: the agent's own prompt carried it.
+    assert!(
+        echoed.contains(SOURCE_TEXT) && echoed.contains(WIKI_TEXT),
+        "the agent's echoed prompt does not contain the knowledge: {echoed}"
+    );
+    assert!(
+        echoed.contains(MEMORY),
+        "the agent's echoed prompt does not contain the memory: {echoed}"
+    );
+}
+
+/// DIRECTION 2: the same drive with NO documents in the knowledge base. The
+/// knowledge and wiki blocks must be ABSENT -- not empty, not a placeholder.
+/// Without this direction, direction 1 could pass on a renderer that emits the
+/// tags unconditionally and the test would never notice.
+#[tokio::test]
+async fn run_without_knowledge_documents_has_no_knowledge_block() {
+    let Some(d) = boot("nokb", false).await else {
+        skip_missing_mock();
+        return;
+    };
+    let (render, echoed) = drive_run(&d, PROMPT).await;
+    println!("T292 WITHOUT render>>>{render}<<<");
+
+    // The memory block is STILL there: this is what makes the absence below
+    // meaningful rather than "nothing was injected at all".
+    assert!(
+        render.contains("<relevant_memories>"),
+        "the memory block must survive the missing knowledge base: {render}"
+    );
+    assert!(render.contains(MEMORY), "{render}");
+    assert!(
+        !render.contains("<knowledge>"),
+        "an empty knowledge base must produce NO knowledge block (never a          placeholder): {render}"
+    );
+    assert!(
+        !render.contains("<wiki>"),
+        "an empty knowledge base must produce NO wiki block: {render}"
+    );
+    assert!(
+        !echoed.contains("<knowledge>"),
+        "the agent saw a knowledge block that should not exist: {echoed}"
+    );
+}

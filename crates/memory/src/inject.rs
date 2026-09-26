@@ -394,8 +394,30 @@ fn date_of(ts: &str) -> String {
     ts.split('T').next().unwrap_or("").to_string()
 }
 
-/// Memory-only wrapper over render_context -- the shape the runs path used
-/// before t260, and the shape the property/golden tests pin.
+/// Memory-only wrapper over render_context.
+///
+/// RETAINED DELIBERATELY -- this is the answer to F-t281-02 (t281 found its
+/// production callers to be ZERO, with all five references inside #[cfg(test)]).
+/// Both daemon injection paths call render_context directly now, because both
+/// carry knowledge items too, so this function is not on the hot path.
+///
+/// The reasons it is kept rather than deleted, in the order they weigh:
+/// 1. It is the memory-only ENTRY POINT of this crate's published surface
+///    (lib.rs re-exports it), and it owns the one mapping from
+///    MemoryForInjection to ContextItem. A future memory-only consumer -- an MCP
+///    tool, a distill path, a CLI -- should call this, not re-derive that
+///    mapping to reach render_context.
+/// 2. The property and golden tests that pin the injection contract's BYTE
+///    SHAPES run through exactly this signature. They are the regression net for
+///    the shapes the daemon's two paths must keep producing.
+///
+/// HONESTLY: those tests are also its only callers today, so reason 2 is close
+/// to circular -- the real argument is reason 1. Deleting it is a mechanical
+/// change (this function, MemoryForInjection, the lib.rs re-export, and moving
+/// the tests onto ContextItem), and it is NOT taken here because
+/// crates/memory/src/lib.rs is outside this task's scope. If the sweep decides a
+/// public-but-uncalled function is worse than a one-line re-export edit, take
+/// that follow-up; this comment is the decision record either way.
 pub fn render_injection(memories: &[MemoryForInjection], budget: &InjectionBudget) -> String {
     let items: Vec<ContextItem> = memories
         .iter()
