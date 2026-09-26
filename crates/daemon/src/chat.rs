@@ -363,6 +363,69 @@ pub struct ChatManager {
     model_cache: Arc<Mutex<HashMap<String, CachedOptions>>>,
 }
 
+/// How many turns this chat's transcript holds. ZERO IS NORMAL: a chat opened
+/// and closed without a conversation leaves one to three JSONL lines and no
+/// turns, and the sessions index deliberately holds no row for such a
+/// transcript (56 of the 147 live transcripts are exactly this shape).
+///
+/// Asking the distiller about one of those came back as
+/// `Query returned no rows` — rusqlite's error for the missing index row — and
+/// was logged as `WARN auto-distill failed`. That is the failure this fixes: 21
+/// such WARNs in one window, with 0 real ERRORs. A log that only ever shows
+/// false red teaches its reader to ignore red, and then a real failure is
+/// invisible (t313).
+fn transcript_turns(path: &std::path::Path) -> usize {
+    crate::sessions::parse_file_messages("ruagent", path).len()
+}
+
+/// What one background distill attempt did, so a test can assert the outcome
+/// without parsing logs (t313).
+#[derive(Debug, PartialEq)]
+enum DistillAttempt {
+    /// The chat had no turns: there was nothing to distill.
+    NothingToDistill,
+    Distilled {
+        memories: u32,
+        entities: u32,
+    },
+    /// A real failure — this is the one that must stay visible.
+    Failed,
+}
+
+/// The background half of `maybe_auto_distill`, split out so a test can drive it
+/// without a live ChatManager (t313).
+async fn auto_distill_now(
+    distiller: &crate::distill::Distiller,
+    key: &str,
+    agent: Option<&str>,
+    turns: usize,
+) -> DistillAttempt {
+    if turns == 0 {
+        // debug, not warn: nothing went wrong, and the caller asked for
+        // nothing (a chat with no turns has nothing to extract).
+        tracing::debug!(session = %key, "nothing to distill (this chat has no turns)");
+        return DistillAttempt::NothingToDistill;
+    }
+    match crate::distill::distill_with_agent(distiller, key, agent).await {
+        Ok(o) => {
+            tracing::info!(
+                session = %key,
+                memories = o.memories_written,
+                entities = o.entities_written,
+                "auto-distilled"
+            );
+            DistillAttempt::Distilled {
+                memories: o.memories_written,
+                entities: o.entities_written,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(session = %key, error = %e, "auto-distill failed");
+            DistillAttempt::Failed
+        }
+    }
+}
+
 /// Search wider than the block will keep: the contract then picks the top
 /// KNOWLEDGE_SOURCES + WIKI_PAGES by score, so a wiki page cannot crowd a
 /// source out before the selection rule ever sees it.
@@ -951,16 +1014,12 @@ impl ChatManager {
             .expect("distill policy")
             .agent
             .clone();
+        // Read the turn count HERE, before the spawn: a chat with no turns has
+        // nothing to distill, and asking the distiller about it anyway is what
+        // produced the false WARNs (t313).
+        let turns = transcript_turns(&self.transcript_path(id));
         tokio::spawn(async move {
-            match crate::distill::distill_with_agent(&distiller, &key, agent.as_deref()).await {
-                Ok(o) => tracing::info!(
-                    session = %key,
-                    memories = o.memories_written,
-                    entities = o.entities_written,
-                    "auto-distilled"
-                ),
-                Err(e) => tracing::warn!(session = %key, error = %e, "auto-distill failed"),
-            }
+            auto_distill_now(&distiller, &key, agent.as_deref(), turns).await;
         });
     }
 
@@ -1996,5 +2055,124 @@ mod generating_tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(seen, Some(1), "the count must be real at once");
+    }
+}
+
+#[cfg(test)]
+mod t313_tests {
+    use super::*;
+
+    async fn distiller_without_agents() -> crate::distill::Distiller {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-t313-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        crate::distill::Distiller {
+            db: ruagent_store::Db::open(root.join("ruagent.db")).unwrap(),
+            root,
+            embedder: None,
+            // Empty on purpose: the "real failure" side of this test is a
+            // distiller with no agent to extract with.
+            registry: crate::distill::AgentRegistry::default(),
+            language: None,
+            prompt_override: None,
+            graph: false,
+        }
+    }
+
+    /// The transcript shapes that reach auto-distill, measured rather than
+    /// assumed: the live store holds 147 transcripts, 56 of them 1-3 lines and
+    /// absent from the sessions index.
+    #[test]
+    fn a_chat_without_turns_has_nothing_to_distill() {
+        let dir = std::env::temp_dir().join(format!("ruagent-t313-turns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let closed = dir.join("run-closed.jsonl");
+        std::fs::write(
+            &closed,
+            "{\"ts\":\"2026-09-26T14:00:00Z\",\"seq\":0,\"event\":{\"type\":\"session_start\"}}\n",
+        )
+        .unwrap();
+        let missing = dir.join("run-missing.jsonl");
+        let real = dir.join("run-real.jsonl");
+        std::fs::write(
+            &real,
+            "{\"ts\":\"2026-09-26T14:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"hello\"}}\n{\"ts\":\"2026-09-26T14:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"text\":\"hi\"}}\n",
+        )
+        .unwrap();
+        println!(
+            "READING turns: session-start-only={} missing-file={} real-chat={}",
+            transcript_turns(&closed),
+            transcript_turns(&missing),
+            transcript_turns(&real)
+        );
+        assert_eq!(transcript_turns(&closed), 0);
+        assert_eq!(transcript_turns(&missing), 0);
+        assert!(transcript_turns(&real) > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both directions of the decision: the no-op is not a failure, and a real
+    /// failure still takes the visible path.
+    #[tokio::test]
+    async fn a_no_op_is_not_a_failure_and_a_real_one_still_fails() {
+        let distiller = distiller_without_agents().await;
+        let quiet = auto_distill_now(&distiller, "ruagent:t313-empty", None, 0).await;
+        println!("READING turns=0 => {quiet:?}");
+        assert_eq!(quiet, DistillAttempt::NothingToDistill);
+        let real = auto_distill_now(&distiller, "ruagent:t313-real", None, 3).await;
+        println!("READING turns=3 with no enabled agent => {real:?}");
+        assert_eq!(real, DistillAttempt::Failed);
+    }
+
+    /// The log lines themselves, captured: which LEVEL a no-op is reported at
+    /// is the whole point of t313.
+    #[derive(Clone, Default)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_no_op_is_debug_and_a_real_failure_is_still_a_warn() {
+        let buf = BufWriter::default();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buf.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        let distiller = distiller_without_agents().await;
+
+        auto_distill_now(&distiller, "ruagent:t313-empty", None, 0).await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        println!("READING (a) no turns =>\n{logged}");
+        assert!(logged.contains("nothing to distill"), "{logged}");
+        assert!(!logged.contains("auto-distill failed"), "{logged}");
+
+        buf.0.lock().unwrap().clear();
+        auto_distill_now(&distiller, "ruagent:t313-real", None, 3).await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        println!("READING (b) turns=3, no enabled agent =>\n{logged}");
+        assert!(logged.contains("auto-distill failed"), "{logged}");
+        assert!(logged.contains("no enabled agent"), "{logged}");
     }
 }
