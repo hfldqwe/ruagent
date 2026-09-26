@@ -258,3 +258,17 @@ $ ruagent.exe knowledge --help  ⇒ error: unrecognized subcommand 'knowledge'
 3. **队长可以直接取消【pending】的任务，但取消不了【已认领】的**：`update_task(status=cancelled)` 对 pending 单直接成功（t274/t275/t277）；对已认领的（t271/t272，in_progress）报 `owned by member X; call reassign_task with assignee=captain before takeover`。⇒ 清僵尸要在它们被认领之前做。
 
 **共同教训**：平台的依赖图是唯一可靠的排序机制；凡是「应该等某件事」的地方，要么写成依赖，要么就会以「有人白跑一趟」的形式付账。
+
+### 7.8 两条共享仓库事故（2026-09-26，都由当事人主动披露并修复）
+
+**① `git commit --amend` 落在别人的提交上**：contract-lead 想把自己的 `crates/graph/src/lib.rs` fmt 修正补进**自己**的 commit `a33663d`，跑了 `git commit --amend --no-edit`；而这段时间里有人提交了，HEAD 已经是 t263 的提交 ⇒ 它的修正被并进 t263 的提交，**t263 的 hash 被改写成 `7daccd5`**（内容没丢，8 files / +219 / −34，message 保留）。它没有 push，并如实披露。
+
+**为什么这次没造成损失**：那两个提交都还没 push（`origin/main..HEAD` 只有它们两条）⇒ 被改写的是一段还没公开的历史。**如果已经 push，改写就会伤到所有拉过它的人。**
+
+**规则**：多写者仓库里【不要 amend】，也不要 rebase 已 push 的提交。要动历史之前先 `git log -1` 确认 HEAD 是谁的；`--amend` 只对「仍是 HEAD 且是你自己的、且未 push 的」提交安全 —— 而这个条件在并发提交下**随时会失效**。
+
+**② `git worktree remove --force` 跟随 junction，删空了仓库自己的 `panel/node_modules`**：ui-audit 建临时工作树取「改前」面板读数，把 `panel/node_modules` 以 junction 指向仓库的 node_modules；收尾 `git worktree remove --force` 递归跟随了那个链接，把仓库的 `panel/node_modules` 删空（顶层 0 项）。它用 `npm ci --offline` 修复并**做了功能验证**（`npm run build` exit 0 · playwright/esbuild 在位 · `--list` = 41 tests in 11 files，与损坏前一致），影响窗口约 3 分钟。
+
+**规则**：临时工作树里不要用 junction/symlink 指向共享目录；删除含 junction 的目录只能用 `rmdir`（只删链接），**不能**用 `git worktree remove` / `rm -rf`（会递归跟随）。
+
+**共同点**：两条都是「一个看起来局部、实际全局」的动作（改 HEAD 的历史 / 删一个共享目录）。两次都由当事人**主动披露并给出修复后的功能验证**，而不是等别人发现 —— 这是它们没有变成事故的原因。
