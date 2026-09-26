@@ -2770,8 +2770,14 @@ const NAV_ROUTE_COUNT = ROUTES.filter((r) => !r.needsTaskId).length;
 // The object set is the contract's: route (already done), tab/mode, selection.
 // Explicitly excluded: scroll, hover, focus, uncommitted input -- transient UI
 // state that would pollute the history stack and that nobody shares.
-async function probeUrlState(page, baseUrl, restore) {
-  const out = { error: null, tabs: 0, hash1: null, hash2: null, fp1: null, fp2: null, fp3: null };
+async function probeUrlState(page, baseUrl, restore, route, taskId) {
+  // WHICH object set this reading is about, recorded by the probe itself.
+  // t242: this probe used to goto #sessions no matter which route was being
+  // captured, so its evidence was labelled with the capture route while the
+  // objects came from the sessions page. Rows 50 and 47 taught the same lesson;
+  // the fix is the same shape: name the object set and self-declare.
+  const routeHash = (route && route.hash ? route.hash.replace("<id>", taskId || "") : "#sessions");
+  const out = { error: null, tabs: 0, hash1: null, hash2: null, fp1: null, fp2: null, fp3: null, source: routeHash, routeIndependent: false };
   // THE FINGERPRINT OF "WHAT AM I LOOKING AT", read from ARIA STATE, not from
   // class names. t142 taught this the hard way: [class*=resizer] matched an
   // unrelated element and the judge reported a defect that did not exist.
@@ -2803,7 +2809,7 @@ async function probeUrlState(page, baseUrl, restore) {
         .join("|");
     });
   try {
-    await page.goto(baseUrl + "/?mode=dark#sessions", { waitUntil: "load", timeout: 60_000 });
+    await page.goto(baseUrl + "/?mode=dark" + routeHash, { waitUntil: "load", timeout: 60_000 });
     await awaitReady(page, "probeUrlState");
     // THE OBJECT SET OF "A VIEW-STATE SWITCH", defined POSITIVELY by the role
     // the control plays -- never by a class name substring. The four shapes are
@@ -3795,7 +3801,7 @@ async function auditRoute(page, o) {
   const rail = await probeSessionRail(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const railT = await probeRailToggles(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
   const nav = await probeNavLinks(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
-  const urlState = await probeUrlState(page, args.baseUrl, measureViewport).catch((e) => ({ error: e.message }));
+  const urlState = await probeUrlState(page, args.baseUrl, measureViewport, route, taskId).catch((e) => ({ error: e.message }));
   if (urlState?.error) warnings.push("row 58 url-state probe: " + urlState.error);
   if (nav?.error) warnings.push("row 57 nav probe: " + nav.error);
   if (railT?.error) warnings.push("row 55 rail-toggle probe: " + railT.error);
