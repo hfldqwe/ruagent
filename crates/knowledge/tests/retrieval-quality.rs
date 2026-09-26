@@ -31,6 +31,37 @@
 //! That is how the before/after pair is taken -- by running one instrument
 //! against two committed states, not by replaying the retired construction here.
 //!
+//! t293 changed two things about that, both recorded here rather than left to a
+//! reader to discover:
+//!   1. The per-query table now carries keyword_stage. Reading the stage is what
+//!      makes a raw_score of 0.0 legible (the substring stage has no bm25 at
+//!      all) -- but it also means this file no longer compiles against a
+//!      pre-t261 store. A before/after pair against that store must use this
+//!      file as of commit 23add4e, which is in history for exactly that reason.
+//!   2. The query set gained 研磨度 (class cjk-substring), whose ONLY reachable
+//!      path is LIKE: unicode61 makes 咖啡研磨度决定萃取速度 one token, so the
+//!      term is neither a token nor a token prefix. Before t293 no row in this
+//!      table had raw_score 0.0, so the substring stage was exercised only by
+//!      retrieval-legs' unit tests (F-286c).
+//!
+//! THE CRITERION'S SEMANTICS (t293). "A query whose term exists in the corpus
+//! must have a non-empty keyword leg" is not falsifiable until "exists" is
+//! defined; the two available readings disagree, and a third qualifier comes
+//! from the product's own design rule:
+//!   TOKEN-OR-PREFIX -- the term IS a corpus token, or a corpus token starts
+//!     with it: what the precision and prefix legs can reach.
+//!   SUBSTRING -- the term also merely occurs inside a corpus token: what LIKE
+//!     can reach, strictly weaker evidence.
+//!   THE FLOOR -- the product refuses to build a recall pattern from a
+//!     sub-floor ASCII fragment (fts::MIN_RECALL_ASCII), so a query can be
+//!     reachable under either reading and still, by design, come back empty.
+//! The JSON therefore reports both readings and splits violations into
+//! "floor only" (every reachable term is such a fragment -- by design) and
+//! "unexplained" (anything else). The assertion in this file is that
+//! UNEXPLAINED is empty; without the split the criterion would forbid the guard
+//! that t270 added. The two readings are not decoration: 研磨度 is reachable
+//! under SUBSTRING only, which is precisely why the LIKE leg exists.
+//!
 //! Determinism: hash embedder, tie-broken sorts, fixed key order, and NO timing
 //! inside the JSON -- a wall-clock field would make the byte-equality judge fail
 //! on every run. Timing is printed, never written.
@@ -44,7 +75,10 @@ use ruagent_knowledge::{Embedder, HashEmbedder, Knowledge};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const QUERY_SET_VERSION: &str = "t245-v1";
+/// Bumped whenever QUERIES changes: a recall number is only comparable with
+/// another taken over the same query set. t245-v1 -> t293-v2 adds one CJK
+/// substring query and one counter-example query (both described in the header).
+const QUERY_SET_VERSION: &str = "t293-v2";
 
 /// (name, body). Near-miss pairs are deliberate: documents sharing most words
 /// but whose ANSWER differs, so a surface-matching leg is caught.
@@ -177,6 +211,11 @@ const QUERIES: &[(&str, &str, &str, bool)] = &[
         "kettle",
         true,
     ),
+    // t293: a query whose ONLY reachable path is the substring stage. unicode61
+    // makes 咖啡研磨度决定萃取速度 one token, so 研磨度 is neither a token nor a
+    // token prefix -- precision and prefix both miss by construction, and LIKE
+    // is the only leg that can reach it. Gold is the document containing it.
+    ("研磨度", "cjk-substring", "chinese-coffee", true),
     ("what is the capital of Peru", "no-answer", "", false),
     ("how do I change a bicycle tyre", "no-answer", "", false),
     ("best time to see migrating whales", "no-answer", "", false),
@@ -255,6 +294,57 @@ fn metrics(ranks: &[Option<usize>]) -> (f64, f64, f64) {
     (r1 / n, r5 / n, mrr / n)
 }
 
+/// t293: what "the term exists in the corpus" MEANS, under the two readings
+/// that are actually available, plus the third qualifier the product imposes.
+///
+/// The criterion "a query whose term exists in the corpus must have a non-empty
+/// keyword leg" is not falsifiable until "exists" is defined, and the two
+/// natural readings disagree. Both are built on ruagent_store::fts::terms (the
+/// single source for the tokenizer) -- never on a second tokenizer written here:
+///
+///   TOKEN-OR-PREFIX : the term IS a corpus token, or a corpus token starts
+///                     with it. This is exactly what the FTS legs (precision,
+///                     then prefix) can reach.
+///   SUBSTRING       : the term additionally merely OCCURS INSIDE a corpus
+///                     token. This is what the LIKE leg can reach, and it is
+///                     strictly weaker evidence than the two above.
+///
+/// A third qualifier is not a reading but a design rule: the product refuses to
+/// build a recall pattern out of a sub-floor ASCII fragment (see
+/// ruagent_store::fts::MIN_RECALL_ASCII). So a query can be "reachable" under
+/// either reading and still, by design, come back empty -- and such a violation
+/// must be COUNTED SEPARATELY from one that has no explanation, or the criterion
+/// would silently forbid the guard. Violations are therefore split into
+/// "floor only" (every term that made it reachable is a sub-floor ASCII
+/// fragment) and "unexplained" (at least one reachable term is not).
+#[derive(Default, Clone)]
+struct ReadingCounts {
+    token_or_prefix_reachable: usize,
+    token_or_prefix_nonempty: usize,
+    token_or_prefix_floor_only: Vec<String>,
+    token_or_prefix_unexplained: Vec<String>,
+    substring_reachable: usize,
+    substring_nonempty: usize,
+    substring_floor_only: Vec<String>,
+    substring_unexplained: Vec<String>,
+    substring_stage_rows: usize,
+}
+
+impl ReadingCounts {
+    fn unexplained(&self) -> Vec<String> {
+        let mut v = self.token_or_prefix_unexplained.clone();
+        v.extend(self.substring_unexplained.clone());
+        v
+    }
+}
+
+/// A term the recall forms are not allowed to be built from: an ASCII fragment
+/// shorter than the floor. Han is never below the floor (a short Han term IS a
+/// word, see fts.rs).
+fn below_recall_floor(t: &str) -> bool {
+    t.chars().count() < 3 && t.is_ascii()
+}
+
 fn arr(v: &[i64]) -> String {
     let mut o = String::from("[");
     for (i, x) in v.iter().enumerate() {
@@ -275,7 +365,7 @@ fn line(out: &mut String, indent: usize, s: &str) {
     out.push(NL);
 }
 
-async fn run_once(tag: &str, real: bool) -> String {
+async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
     let started = std::time::Instant::now();
     let root = std::env::temp_dir().join(format!("ruagent-t245-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -307,6 +397,14 @@ async fn run_once(tag: &str, real: bool) -> String {
     for (name, body) in CORPUS {
         kb.ingest(name, body).await.unwrap();
     }
+    // t293: the corpus vocabulary, from the single-source tokenizer.
+    let mut corpus_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_name, body) in CORPUS {
+        for t in ruagent_store::fts::terms(body) {
+            corpus_tokens.insert(t);
+        }
+    }
+    let mut counts = ReadingCounts::default();
     let docs = kb.list_documents().await.unwrap();
 
     let mut doc_of: HashMap<i64, i64> = HashMap::new();
@@ -346,10 +444,57 @@ async fn run_once(tag: &str, real: bool) -> String {
         if !legs.semantic.is_empty() {
             sem_nonempty += 1;
         }
+        // t293: the STAGE is reported too. Without it a row with raw_score 0.0
+        // is indistinguishable from a bm25 that happens to be zero, and the
+        // substring stage -- the only stage with no bm25 at all -- stayed
+        // invisible in this table (F-286c).
+        let stage = format!("{:?}", legs.keyword_stage);
+        if legs.keyword_stage == ruagent_knowledge::store::KeywordStage::Substring {
+            counts.substring_stage_rows += 1;
+        }
+        // t293: classify this query under both readings of "the term exists".
+        {
+            let terms = ruagent_store::fts::terms(query);
+            let mut reach_a: Vec<String> = Vec::new();
+            let mut reach_b: Vec<String> = Vec::new();
+            for t in &terms {
+                let is_token = corpus_tokens.contains(t);
+                let is_prefix = corpus_tokens.iter().any(|c| c.starts_with(t.as_str()));
+                let is_sub = corpus_tokens.iter().any(|c| c.contains(t.as_str()));
+                if is_token || is_prefix {
+                    reach_a.push(t.clone());
+                }
+                if is_sub {
+                    reach_b.push(t.clone());
+                }
+            }
+            let nonempty = !legs.keyword.is_empty();
+            if !reach_a.is_empty() {
+                counts.token_or_prefix_reachable += 1;
+                if nonempty {
+                    counts.token_or_prefix_nonempty += 1;
+                } else if reach_a.iter().all(|t| below_recall_floor(t)) {
+                    counts.token_or_prefix_floor_only.push(query.to_string());
+                } else {
+                    counts.token_or_prefix_unexplained.push(query.to_string());
+                }
+            }
+            if !reach_b.is_empty() {
+                counts.substring_reachable += 1;
+                if nonempty {
+                    counts.substring_nonempty += 1;
+                } else if reach_b.iter().all(|t| below_recall_floor(t)) {
+                    counts.substring_floor_only.push(query.to_string());
+                } else {
+                    counts.substring_unexplained.push(query.to_string());
+                }
+            }
+        }
         kw_rows.push(format!(
-            "    {{ \"query\": {}, \"class\": {}, \"keyword_hits\": {}, \"keyword_raw_scores\": [{}], \"semantic_top_chunk\": {} }}",
+            "    {{ \"query\": {}, \"class\": {}, \"keyword_stage\": {}, \"keyword_hits\": {}, \"keyword_raw_scores\": [{}], \"semantic_top_chunk\": {} }}",
             q(query),
             q(class),
+            q(&stage),
             arr(&legs.keyword.iter().map(|h| h.chunk_id).collect::<Vec<i64>>()),
             legs.keyword
                 .iter()
@@ -493,6 +638,61 @@ async fn run_once(tag: &str, real: bool) -> String {
     );
     line(&mut out, 4, "\"entity\": null");
     line(&mut out, 2, "},");
+    // t293: the criterion's semantics, measured rather than assumed. See
+    // ReadingCounts for what the two readings are and why violations are split.
+    line(&mut out, 2, "\"term_reachability\": {");
+    line(
+        &mut out,
+        4,
+        "\"why\": \"the criterion 'a query whose term exists in the corpus must have a non-empty keyword leg' is not falsifiable until 'exists' is defined; both readings below use ruagent_store::fts::terms, the single source for the tokenizer\",",
+    );
+    line(
+        &mut out,
+        4,
+        "\"floor_rule\": \"the product refuses to build a recall pattern from a sub-floor ASCII fragment (fts::MIN_RECALL_ASCII); a violation whose every reachable term is such a fragment is therefore BY DESIGN and is listed separately from an unexplained one\",",
+    );
+    for (key, definition, reachable, nonempty, floor_only, unexplained) in [
+        (
+            "token_or_prefix",
+            "the term IS a corpus token, or a corpus token starts with it -- what the precision and prefix legs can reach",
+            counts.token_or_prefix_reachable,
+            counts.token_or_prefix_nonempty,
+            &counts.token_or_prefix_floor_only,
+            &counts.token_or_prefix_unexplained,
+        ),
+        (
+            "substring",
+            "the term also merely OCCURS INSIDE a corpus token -- what the LIKE leg can reach, strictly weaker evidence",
+            counts.substring_reachable,
+            counts.substring_nonempty,
+            &counts.substring_floor_only,
+            &counts.substring_unexplained,
+        ),
+    ] {
+        let fo: Vec<String> = floor_only.iter().map(|s| q(s)).collect();
+        let un: Vec<String> = unexplained.iter().map(|s| q(s)).collect();
+        line(&mut out, 4, &format!("\"{key}\": {{"));
+        line(&mut out, 6, &format!("\"definition\": {},", q(definition)));
+        line(&mut out, 6, &format!("\"reachable\": {reachable},"));
+        line(&mut out, 6, &format!("\"keyword_nonempty\": {nonempty},"));
+        line(
+            &mut out,
+            6,
+            &format!("\"floor_only_violations\": [{}],", fo.join(", ")),
+        );
+        line(
+            &mut out,
+            6,
+            &format!("\"unexplained_violations\": [{}]", un.join(", ")),
+        );
+        line(&mut out, 4, "},");
+    }
+    line(
+        &mut out,
+        4,
+        &format!("\"substring_stage_rows\": {}", counts.substring_stage_rows),
+    );
+    line(&mut out, 2, "},");
     line(&mut out, 2, "\"missing_gold_documents\": [");
     let mg: Vec<String> = missing_gold
         .iter()
@@ -528,7 +728,7 @@ async fn run_once(tag: &str, real: bool) -> String {
     out.push(NL);
 
     println!(
-        "[t245/{}] embedder={} docs={} queries={} answerable={} fused recall@1={:.4} recall@5={:.4} mrr={:.4} keyword_nonempty={}/{} semantic_nonempty={} elapsed={}ms",
+        "[t245/{}] embedder={} docs={} queries={} answerable={} fused recall@1={:.4} recall@5={:.4} mrr={:.4} keyword_nonempty={}/{} semantic_nonempty={} substring_rows={} elapsed={}ms",
         tag,
         embedder_note,
         docs.len(),
@@ -540,11 +740,24 @@ async fn run_once(tag: &str, real: bool) -> String {
         kw_nonempty,
         QUERIES.len(),
         sem_nonempty,
+        counts.substring_stage_rows,
         started.elapsed().as_millis()
+    );
+    println!(
+        "[t293/{}] term_reachability token_or_prefix reachable={} nonempty={} floor_only={} unexplained={} | substring reachable={} nonempty={} floor_only={} unexplained={}",
+        tag,
+        counts.token_or_prefix_reachable,
+        counts.token_or_prefix_nonempty,
+        counts.token_or_prefix_floor_only.len(),
+        counts.token_or_prefix_unexplained.len(),
+        counts.substring_reachable,
+        counts.substring_nonempty,
+        counts.substring_floor_only.len(),
+        counts.substring_unexplained.len()
     );
 
     let _ = std::fs::remove_dir_all(&root);
-    out
+    (out, counts)
 }
 
 #[test]
@@ -572,11 +785,74 @@ fn judge_is_falsifiable() {
     assert_eq!((r1, r5b, mrr), (0.0, 0.0, 0.0));
 }
 
+/// t293: the two halves of the recall floor's design rule, at the STORE level
+/// (not only in fts.rs' unit tests), on this harness' own corpus.
+///
+/// A single ASCII character is never used to build a recall pattern: LIKE
+/// '%q%' would match almost every row (here: "quarterly"), and token equality
+/// in the precision form already covers the exact case. So a one-character
+/// ASCII query comes back EMPTY even though the corpus does contain its
+/// character -- and the fixture check below proves that is the floor's doing
+/// rather than a missing fixture.
+///
+/// A single HAN character is the opposite case: unicode61 makes a whole Han run
+/// ONE term, so LIKE is the only path to a part of it, and the floor must not
+/// touch it. Both halves are pinned here so neither can be "fixed" into the
+/// other without turning this red.
+#[tokio::test]
+async fn single_char_ascii_never_reaches_like() {
+    let root = std::env::temp_dir().join(format!("ruagent-t293-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+    let kb = Knowledge::with_embedder(root.as_path(), db, embedder)
+        .await
+        .unwrap();
+    for (name, body) in CORPUS {
+        kb.ingest(name, body).await.unwrap();
+    }
+    let tokens: Vec<String> = CORPUS
+        .iter()
+        .flat_map(|(_, body)| ruagent_store::fts::terms(body))
+        .collect();
+    assert!(
+        tokens.iter().any(|t| t.contains('q')),
+        "fixture must contain a token with q, or the empty leg below proves nothing"
+    );
+    assert!(
+        !tokens.iter().any(|t| t == "q"),
+        "q must not BE a token, or the precision leg would answer it"
+    );
+
+    for (query, want_stage, want_empty) in [
+        ("q", ruagent_knowledge::store::KeywordStage::Empty, true),
+        (
+            "茶",
+            ruagent_knowledge::store::KeywordStage::Substring,
+            false,
+        ),
+    ] {
+        let legs = kb.search_legs(query, 5).await.unwrap();
+        assert_eq!(legs.keyword_stage, want_stage, "stage for query {query:?}");
+        assert_eq!(
+            legs.keyword.is_empty(),
+            want_empty,
+            "hits for query {query:?}"
+        );
+        assert!(
+            !legs.semantic.is_empty(),
+            "the semantic leg is not affected by the keyword floor ({query:?})"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn retrieval_quality() {
     let real = std::env::var("RUAGENT_T245_REAL").as_deref() == Ok("1");
-    let a = run_once("a", real).await;
-    let b = run_once("b", real).await;
+    let (a, counts) = run_once("a", real).await;
+    let (b, _) = run_once("b", real).await;
     println!("{}", a);
     // Write the reading where build artefacts live, not into the package
     // directory: a bare relative "target" would litter crates/knowledge.
@@ -593,5 +869,32 @@ async fn retrieval_quality() {
     assert_eq!(
         a, b,
         "two runs must be byte-identical (no timing inside the JSON)"
+    );
+
+    // t293: the substring stage must actually APPEAR in this quality harness.
+    // Until t293 no row here had raw_score 0.0, so the one stage with no bm25
+    // was covered only by retrieval-legs' unit tests (F-286c).
+    assert!(
+        counts.substring_stage_rows >= 1,
+        "at least one query must reach the substring stage, or this harness never exercises LIKE"
+    );
+    assert!(
+        a.contains("\"keyword_stage\": \"Substring\""),
+        "the per-query table must name the stage; a row with raw_score 0.0 is otherwise indistinguishable from a bm25 of zero"
+    );
+    assert!(
+        a.contains("\"keyword_stage\": \"Substring\", \"keyword_hits\": [")
+            && a.contains("0.000000"),
+        "the substring row must be present with its raw score"
+    );
+
+    // t293: the criterion's own content, now that its semantics are written
+    // down. Under EITHER reading of "the term exists", no query that is
+    // reachable may come back empty for a reason other than the ASCII recall
+    // floor -- otherwise the leg has a hole the guard does not explain.
+    assert!(
+        counts.unexplained().is_empty(),
+        "reachable queries with an empty keyword leg and no floor explanation: {:?}",
+        counts.unexplained()
     );
 }
