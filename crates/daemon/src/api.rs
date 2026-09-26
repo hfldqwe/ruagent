@@ -740,12 +740,46 @@ struct EdgeQuery {
     offset: Option<u32>,
 }
 
+/// Entity search for the panel and the CLI: two passes, and the answer says
+/// which one produced it.
+///
+/// The strict pass is the phrase pass (`search_entities`, the interface t250
+/// froze): it quotes the whole query into FTS5 phrases, and a phrase requires
+/// its tokens to be adjacent IN ONE COLUMN. `autohotkey-v2` therefore cannot
+/// reach the entity `AutoHotkey` whose summary says `v2.0.28` -- name and
+/// summary are different columns -- so the panel answered "no such entity" for
+/// an entity that was right there (t312 measured it; t320 fixes it here).
+///
+/// When the strict pass finds nothing, the loose pass runs, and its results are
+/// reported as `candidate` rather than as hits: loose is a WIDENING pass (AND
+/// over tokens, then a single-token prefix OR, then LIKE), so it also answers
+/// for a name that does not exist at all (`zzz-not-a-real-name` matches on
+/// `"name"*`). Presenting those as plain hits would trade a silent miss for
+/// a silent false positive; `match` says which leg spoke.
 async fn graph_search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let hits = ruagent_graph::search_entities(state.mgr.db(), &q.q, 10).await?;
-    Ok(Json(serde_json::json!({ "entities": hits })))
+    let db = state.mgr.db();
+    let strict = ruagent_graph::search_entities(db, &q.q, 10).await?;
+    let (entities, matched) = if !strict.is_empty() {
+        (strict, "exact")
+    } else {
+        // An empty query has nothing to widen to: it is "none", not a fallback.
+        let loose = if q.q.trim().is_empty() {
+            Vec::new()
+        } else {
+            ruagent_graph::search_entities_loose(db, &q.q, 10).await?
+        };
+        if loose.is_empty() {
+            (loose, "none")
+        } else {
+            (loose, "candidate")
+        }
+    };
+    Ok(Json(
+        serde_json::json!({ "entities": entities, "match": matched }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -4330,6 +4364,112 @@ mod tests {
         assert!(
             raw2.contains("no source documents") || raw2.contains("selects no source"),
             "{raw2}"
+        );
+    }
+
+    /// t320: the panel's entity search must not answer "nothing" for an entity
+    /// that is there, and must not pass a widened guess off as a hit.
+    ///
+    /// Object set: one entity whose NAME is `AutoHotkey` and whose SUMMARY says
+    /// `v2.0.28` (the cross-column shape) and nothing else. Sampling surface:
+    /// the real router over a throwaway root. Falsifiers: (a) `q=autohotkey-v2`
+    /// returning nothing, or returning it unmarked; (b) an exact query being
+    /// marked `candidate`; (c) `q=zzz-not-a-real-name` returning an UNMARKED
+    /// entity.
+    #[tokio::test]
+    async fn entity_search_falls_back_across_columns_and_marks_the_fallback() {
+        let (app, db, _root) = harness().await;
+        // Name and summary copied from the live row (id 4) that t312 read: the
+        // name carries `AutoHotkey`, the summary carries `v2` -- different
+        // columns, which is exactly why the phrase pass cannot see them
+        // together. (My first fixture wrote "AutoHotkey v2.0.28" in the summary
+        // and the premise assertion FAILED: both tokens were adjacent in ONE
+        // column, so the phrase matched. The shape has to be the real one.)
+        let id = ruagent_graph::upsert_entity(
+            &db,
+            "AutoHotkey",
+            Some("tool"),
+            Some("Windows 键盘/鼠标热键自动化工具，v1 与 v2 语法不兼容；本机为 v2.0.28 解压版。"),
+        )
+        .await
+        .unwrap();
+        // A second entity that has NOTHING to do with the query but DOES carry
+        // the token `name` -- the live store has one too, which is why
+        // `zzz-not-a-real-name` came back with 1 loose hit (t312). Without it
+        // the control would pass vacuously, by finding nothing at all.
+        ruagent_graph::upsert_entity(
+            &db,
+            "SKILL.md",
+            Some("doc"),
+            Some("Agent Skills：每个 skill 有一个 name 字段和一段 description。"),
+        )
+        .await
+        .unwrap();
+
+        // BEFORE, on the same tree: the strict pass alone -- what this endpoint
+        // used to call, and therefore what the panel used to get.
+        let strict = ruagent_graph::search_entities(&db, "autohotkey-v2", 10)
+            .await
+            .unwrap();
+        println!(
+            "READING t320 strict(autohotkey-v2) = {} hit(s)  [before: the panel answered nothing]",
+            strict.len()
+        );
+        assert!(
+            strict.is_empty(),
+            "the strict phrase pass must miss across columns: {strict:?}"
+        );
+
+        // AFTER: the endpoint falls back, and says so.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/graph/search?q=autohotkey-v2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t320 search(autohotkey-v2) -> HTTP {} match={} entities={}  {raw}",
+            st.as_u16(),
+            v["match"],
+            v["entities"].as_array().map(|a| a.len()).unwrap_or(0)
+        );
+        assert_eq!(v["match"], "candidate", "{v}");
+        let ents = v["entities"].as_array().expect("entities array");
+        assert!(
+            ents.iter()
+                .any(|e| e["id"] == id && e["name"] == "AutoHotkey"),
+            "the fallback must reach the entity that was there: {v}"
+        );
+
+        // The fallback is not simply always on: an exact query stays exact.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/graph/search?q=AutoHotkey").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["match"], "exact", "{v}");
+        assert!(!v["entities"].as_array().unwrap().is_empty(), "{v}");
+
+        // The control: a name that does not exist. Loose widens, so a hit is
+        // allowed -- an UNMARKED hit is not.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/graph/search?q=zzz-not-a-real-name").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let n = v["entities"].as_array().map(|a| a.len()).unwrap_or(0);
+        println!(
+            "READING t320 search(zzz-not-a-real-name) -> HTTP {} match={} entities={}  {raw}",
+            st.as_u16(),
+            v["match"],
+            n
+        );
+        assert!(
+            n > 0,
+            "the control must actually widen (the `name` token is in the store), \
+             otherwise this branch proves nothing: {v}"
+        );
+        assert_eq!(
+            v["match"], "candidate",
+            "a widened hit must never be presented as a hit: {v}"
+        );
+        assert!(
+            v["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["name"] != "zzz-not-a-real-name"),
+            "and it is not an entity that exists: {v}"
         );
     }
 
