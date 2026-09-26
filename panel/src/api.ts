@@ -477,7 +477,13 @@ async function get<T>(path: string): Promise<T> {
  *  the views already handle for a 5xx — t264 measured 5/5 sources rendering
  *  their error state on a 500, so this adds no UI. One shape per endpoint, and
  *  every field list below was read back from the running daemon. */
-type Shape = "array" | "arrayOfObjects" | "number" | "string";
+type Shape =
+  | "array"
+  | "arrayOfObjects"
+  | "arrayOfTuples"
+  | "arrayOfStrings"
+  | "number"
+  | "string";
 
 function expectShape<T>(endpoint: string, data: unknown, spec: Record<string, Shape>): T {
   const obj = (data ?? {}) as Record<string, unknown>;
@@ -488,17 +494,28 @@ function expectShape<T>(endpoint: string, data: unknown, spec: Record<string, Sh
       bad.push(`missing "${f}"`);
       continue;
     }
-    if (kind === "array" || kind === "arrayOfObjects") {
+    if (kind === "array" || kind === "arrayOfObjects" || kind === "arrayOfTuples" || kind === "arrayOfStrings") {
       if (!Array.isArray(v)) {
         bad.push(`"${f}" is not an array`);
         continue;
       }
+      const els = v as unknown[];
+      // t287: the element check is per KIND, not one global exemption. t268
+      // allowed arrays as elements everywhere so graph/entities' [entity,
+      // count] tuples would pass; t285 then showed the cost — wiki/pages with
+      // [[{}]] still blanked the page and knowledge/documents with [[{id:1}]]
+      // failed silently. So only the endpoint that really answers with tuples
+      // declares arrayOfTuples; everything else declares what it really is.
+      let i = -1;
       if (kind === "arrayOfObjects") {
-        // An element must be an object. Arrays are allowed on purpose: the
-        // graph endpoints answer with [entity, count] tuples, and rejecting
-        // them would fail a response that is exactly right.
-        const i = (v as unknown[]).findIndex((e) => e === null || typeof e !== "object");
-        if (i >= 0) bad.push(`"${f}[${i}]" is not an object`);
+        i = els.findIndex((e) => e === null || typeof e !== "object" || Array.isArray(e));
+        if (i >= 0) bad.push(`"${f}[${i}]" is not a plain object`);
+      } else if (kind === "arrayOfTuples") {
+        i = els.findIndex((e) => !Array.isArray(e));
+        if (i >= 0) bad.push(`"${f}[${i}]" is not a tuple`);
+      } else if (kind === "arrayOfStrings") {
+        i = els.findIndex((e) => typeof e !== "string");
+        if (i >= 0) bad.push(`"${f}[${i}]" is not a string`);
       }
     } else if (kind === "number") {
       if (typeof v !== "number" || !Number.isFinite(v)) bad.push(`"${f}" is not a finite number`);
@@ -738,9 +755,12 @@ export const api = {
     ),
   wikiLinks: () =>
     getChecked<WikiLinks>("/api/v1/knowledge/wiki/links", {
-      nodes: "array",
+      // Measured: nodes and broken are string arrays, so arrayOfObjects would
+      // kill a correct response. edges/orphans were empty in the live sample,
+      // so they stay "array" rather than claiming a shape I have not seen.
+      nodes: "arrayOfStrings",
       edges: "array",
-      broken: "array",
+      broken: "arrayOfStrings",
       orphans: "array",
     }),
   wikiBuilds: (limit = 20) =>
@@ -758,7 +778,7 @@ export const api = {
   // graph
   graphEntities: () =>
     getChecked<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities", {
-      entities: "arrayOfObjects",
+      entities: "arrayOfTuples",
     }).then((r) => r.entities),
   /** t191: every live edge in ONE request, so the default graph is a graph
    * and not a point cloud. `limit` is deliberately pinned to the contract's
@@ -775,7 +795,7 @@ export const api = {
   graphEntitiesAll: (limit = 500) =>
     getChecked<{ entities: [GraphEntity, number][] }>(
       `/api/v1/graph/entities?limit=${limit}`,
-      { entities: "arrayOfObjects" },
+      { entities: "arrayOfTuples" },
     ).then((r) => r.entities),
   graphSearch: (q: string) =>
     get<{ entities: GraphEntity[] }>(`/api/v1/graph/search?q=${encodeURIComponent(q)}`).then(
