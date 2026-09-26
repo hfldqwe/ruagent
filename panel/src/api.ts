@@ -453,6 +453,31 @@ async function get<T>(path: string): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
+/** t265: `get<T>`'s T is a compile-time assertion — the runtime checked
+ *  nothing. A 200 whose body has the wrong shape therefore reached the view and
+ *  threw during render: t264 measured 10 of 24 payload mutations blanking the
+ *  whole page (no error state, no empty state, h1 gone; console "Cannot read
+ *  properties of undefined (reading 'length')"). Each wrapper now validates its
+ *  OWN endpoint's contract shape here, so a malformed 200 travels the same path
+ *  the views already handle for a 5xx — t264 measured 5/5 sources rendering
+ *  their error state on a 500, so this adds no UI. One shape per endpoint, and
+ *  every field list below was read back from the running daemon. */
+function expectShape<T>(endpoint: string, data: unknown, fields: string[]): T {
+  const obj = (data ?? {}) as Record<string, unknown>;
+  const missing = fields.filter((f) => obj[f] === undefined || obj[f] === null);
+  if (missing.length) {
+    throw new Error(
+      `${endpoint}: malformed response, missing ${missing.map((m) => `"${m}"`).join(", ")}`,
+    );
+  }
+  return data as T;
+}
+
+/** GET, then validate the endpoint's contract shape before a view can consume it. */
+async function getChecked<T>(path: string, fields: string[]): Promise<T> {
+  return expectShape<T>(path, await get<unknown>(path), fields);
+}
+
 async function send(method: string, path: string, body?: unknown): Promise<Response> {
   const resp = await fetch(`${BASE}${path}`, {
     method,
@@ -582,9 +607,15 @@ export const api = {
     language: string;
     prompt: string;
   }) => send("PUT", "/api/v1/distill", body),
-  memoryList: (store: string, namespace: string) =>
-    get<{ memories: MemoryRow[]; counts: [string, string, number][] }>(
-      `/api/v1/memory/list?store=${store}&namespace=${encodeURIComponent(namespace)}`,
+  /** t265: `store` is optional so the t251 shape (memory/list without a store,
+   *  every store at once) can be asked for without a second wrapper; the
+   *  namespace stays required because the endpoint keys on it. */
+  memoryList: (store: string | undefined, namespace: string) =>
+    getChecked<{ memories: MemoryRow[]; counts: [string, string, number][] }>(
+      store
+        ? `/api/v1/memory/list?store=${store}&namespace=${encodeURIComponent(namespace)}`
+        : `/api/v1/memory/list?namespace=${encodeURIComponent(namespace)}`,
+      ["memories", "counts"],
     ),
   memorySearch: (q: string) =>
     get<{ hits: MemoryRow[] }>(`/api/v1/memory/search?q=${encodeURIComponent(q)}`).then(
@@ -600,12 +631,28 @@ export const api = {
     ),
   memoryGet: (id: number) =>
     get<{ memory: MemoryRow }>(`/api/v1/memory/${id}`).then((r) => r.memory),
+  /** t265: the delete/restore pair api.rs already routes (memory/{id} DELETE,
+   *  memory/{id}/restore POST). Shapes are read from the handlers, not guessed:
+   *  {outcome:"deleted", id, deleted_at, soft} and {outcome:"restored", id}; an
+   *  already-deleted / not-deleted id arrives as an HttpError 409. */
+  memoryDelete: (id: number) =>
+    send("DELETE", `/api/v1/memory/${id}`).then(
+      (r) =>
+        r.json() as Promise<{ outcome: string; id: number; deleted_at: string; soft: boolean }>,
+    ),
+  memoryRestore: (id: number) =>
+    post(`/api/v1/memory/${id}/restore`).then(
+      (r) => r.json() as Promise<{ outcome: string; id: number }>,
+    ),
   memoryDiffs: (limit = 100) =>
     get<{ diffs: MemoryDiff[] }>(`/api/v1/memory/diffs?limit=${limit}`).then((r) => r.diffs),
 
   // knowledge
   knowledgeDocs: () =>
-    get<{ documents: KnowledgeDocument[]; embedder: string }>("/api/v1/knowledge/documents"),
+    getChecked<{ documents: KnowledgeDocument[]; embedder: string }>(
+      "/api/v1/knowledge/documents",
+      ["documents"],
+    ),
   knowledgeChunks: (id: number) =>
     get<{ chunks: [number, string][] }>(`/api/v1/knowledge/documents/${id}`).then(
       (r) => r.chunks,
@@ -647,8 +694,11 @@ export const api = {
 
   // wiki — M2 read APIs + builds
   wikiPages: () =>
-    get<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages").then((r) => r.pages),
-  wikiLinks: () => get<WikiLinks>("/api/v1/knowledge/wiki/links"),
+    getChecked<{ pages: WikiPageInfo[] }>("/api/v1/knowledge/wiki/pages", ["pages"]).then(
+      (r) => r.pages,
+    ),
+  wikiLinks: () =>
+    getChecked<WikiLinks>("/api/v1/knowledge/wiki/links", ["nodes", "edges", "broken", "orphans"]),
   wikiBuilds: (limit = 20) =>
     get<{ builds: WikiBuild[] }>(`/api/v1/knowledge/wiki/builds?limit=${limit}`).then(
       (r) => r.builds,
@@ -663,7 +713,9 @@ export const api = {
 
   // graph
   graphEntities: () =>
-    get<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities").then((r) => r.entities),
+    getChecked<{ entities: [GraphEntity, number][] }>("/api/v1/graph/entities", [
+      "entities",
+    ]).then((r) => r.entities),
   /** t191: every live edge in ONE request, so the default graph is a graph
    * and not a point cloud. `limit` is deliberately pinned to the contract's
    * density ceiling (views/view-graph.md: ≤600 edges) rather than the
@@ -671,14 +723,16 @@ export const api = {
    * reason to draw more, and past the ceiling the contract's remedy is to
    * narrow to the valid_at window, not to widen the request. */
   graphEdges: (limit = 600) =>
-    get<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
+    getChecked<{ edges: GraphEdge[]; total: number; limit: number; offset: number }>(
       `/api/v1/graph/edges?limit=${limit}`,
+      ["edges", "total", "limit", "offset"],
     ),
   /** The whole entity list (graphEntities caps at the daemon default of 50). */
   graphEntitiesAll: (limit = 500) =>
-    get<{ entities: [GraphEntity, number][] }>(`/api/v1/graph/entities?limit=${limit}`).then(
-      (r) => r.entities,
-    ),
+    getChecked<{ entities: [GraphEntity, number][] }>(
+      `/api/v1/graph/entities?limit=${limit}`,
+      ["entities"],
+    ).then((r) => r.entities),
   graphSearch: (q: string) =>
     get<{ entities: GraphEntity[] }>(`/api/v1/graph/search?q=${encodeURIComponent(q)}`).then(
       (r) => r.entities,
@@ -821,8 +875,12 @@ export const api = {
     get<RecallResult>(
       `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,
     ),
+  /** t265: the envelope is asserted here. The per-row `source` field t251 adds
+   *  is NOT asserted yet — the running daemon does not serve it, and inventing a
+   *  field the backend does not send is how a guard becomes a lie. Add it to the
+   *  row check below in the same commit that lands the backend. */
   recallLog: (limit = 50) =>
-    get<{ log: RecallLogRow[] }>(`/api/v1/recall/log?limit=${limit}`).then(
+    getChecked<{ log: RecallLogRow[] }>(`/api/v1/recall/log?limit=${limit}`, ["log"]).then(
       (r) => r.log,
     ),
 
