@@ -85,7 +85,7 @@ state.segments = state.segments || {};
 state.plan = plan.map((p) => p.name);
 
 if (flag("detach", false) === true) {
-  const log = join(PANEL, "tools", ".audit-shards-detached.log");
+  const log = join(homedir(), ".ruagent", "audit-shards-detached.log"); // out of the repo, like the state file
   const inner = "node tools/audit-shards.mjs " + argv.filter((a) => a !== "--detach").join(" ") + " > " + log.replace(/\//g, "\\") + " 2>&1";
   const cmd = 'cmd.exe /c cd /d ' + PANEL.replace(/\//g, "\\") + " && " + inner;
 const ps = "$cmd = '" + cmd.replace(/'/g, "''") + "'; $s = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $s.ShowWindow = 0; $r = ([wmiclass]'Win32_Process').Create($cmd, '" + PANEL.replace(/\//g, "\\") + "', $s); Write-Output ('pid=' + $r.ProcessId + ' rc=' + $r.ReturnValue)";

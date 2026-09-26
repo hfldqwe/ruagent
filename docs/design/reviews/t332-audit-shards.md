@@ -90,3 +90,23 @@ plan: 13 done: ['graph']
 ## 纪律
 
 改动文件：`panel/tools/audit-shards.mjs`（新）+ 本报告（`docs/design/reviews/` 由任务 inScope 覆盖）· **未改 design-audit.mjs 的 CLI**（`--help` 原样）· 未碰 `panel/src/` · 状态文件在仓库外（仓内那份已删，`panel/tools/` 无 state 文件）· 提交用**显式路径**（不 `git add panel/tools/`）· 未 push · 未启停 daemon · 未调 `/api/v1/recall`。
+
+---
+
+## 补记：`--detach` 的第一次演示**失败**了，已修好并重测（如实记录）
+
+第一版 `--detach` 打印的是 `detached (ShowWindow=0, WMI):  · log=…` —— **pid 为空、日志没生成、状态里 `home` 是 null** ⇒ WMI 那一跳根本没发生。原因：给 PowerShell 的 one-liner 用了 bash 风格的 `\$cmd`/`\$s`/`\$r` 转义，而 PowerShell 里反斜杠不是转义符 ⇒ 变量名变成 `\$cmd` ⇒ 赋值与 `Win32_Process.Create` 都没执行。
+
+**修法（两处）**：① 去掉反斜杠转义；② **把 Create 的失败变成硬错误**（F-331b 的同一精神：仪器失效要自报）—— 输出带 `rc=<ReturnValue>`，且没有 `pid=\d+` 时直接 `DETACH FAILED (no pid from WMI)` + `exit 2`，不再打印空 pid 让人以为成功。
+
+**重测读数**：
+```
+$ node tools/audit-shards.mjs --segments=routes --only=home --detach
+[shards] detached (ShowWindow=0, WMI): pid=54072 rc=0 · log=~/.ruagent/audit-shards-detached.log
+
+# 80s 后（分离的子进程在我这次调用结束后继续跑）
+状态: {"status":"done","exitCode":0,"ms":52956,"pass":52,"fail":0,"notMeasured":7,"captures":2,"measuredS":49.3}
+```
+⇒ 分离启动现在真的通：pid 有值、`rc=0`、日志在写、段在 shell 之外跑完并落进状态文件 ✓。`ShowWindow = 0` 的窗口约束、以及「裸 `&` 的子进程会随 shell 一起死（实测只跑完一条路由）」，都写在 `audit-shards.mjs` 的文件头注释里。
+
+**另**：分离日志的默认路径也一并挪出仓库（`~/.ruagent/audit-shards-detached.log`）—— 与状态文件同理，运行期产物不该躺在 `panel/tools/` 里等着被 `git add panel/tools/` 带走。
