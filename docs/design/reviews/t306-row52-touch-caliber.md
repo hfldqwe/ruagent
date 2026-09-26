@@ -120,3 +120,21 @@ design-audit failed: page.waitForTimeout: Page crashed
 ## 纪律
 
 改动文件：`panel/tools/design-audit.mjs`（仅 `touchTargetVerdict` 一处）+ 本报告 · 未碰 `panel/src/` · 未启停守护进程 · 未调 `/api/v1/recall` · node 直调不用 npx · 探针 `C:/tmp/t306` 已删 · 提交用显式路径 · 未 push。
+
+
+## 补：契约 verify 命令的全量读数（分离式跑完，702.2s）
+
+`cd panel && node tools/design-audit.mjs --check` —— 单次调用跑不完（>600s 上限），改用**WMI 分离启动**（`Win32_Process.Create` + `ShowWindow=0`，日志落 `C:/tmp/t306/check.log`）后跑完：
+
+```
+[audit] 26 captures in 702.2s · checks 56 pass / 1 fail / 2 not measured
+[audit] failing rows: 58
+        #58 URL 反映视图状态（可回放） — chat/dark=hash 未变化 ✗（#chat → #chat）· 回放 落到同一状态 ✓ ✗; task/dark=hash 未变化 ✗…
+[audit] warning: §12 rows with neither a check nor a stated reason: 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
+[audit] warning: .nav-badge 本轮未渲染（inboxCount = 0）…
+```
+
+**行 52 = PASS** ✓（全量 26 captures 下确认，不只是单路由）。⇒ 本次判据变更在契约闸门下成立。
+
+**但闸门整体 exit 1**：唯一失败行是 **58（URL 反映视图状态/可回放）**，与本单无关 —— 我改的是 `touchTargetVerdict`（行 52），行 58 走 `urlStateVerdict`（`tools/design-audit.mjs:2918`），两处不相交。已登记 F-t306-04：这条失败需要单独分诊（可能是别人的在途改动或既有回归）。
+两条 warning（行 60-71 无 check 也无理由、`.nav-badge` 本轮未渲染）也是既有状态，登记为背景信息。
