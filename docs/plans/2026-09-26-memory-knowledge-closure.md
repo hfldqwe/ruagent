@@ -429,3 +429,42 @@ handler 读的是 `Json(req).dry_run`，**查询串被静默忽略**。
 **7.18 的落点说明（tools 的收尾）**：t294 的任务记录会**永久**停在 `failed` + `needs_revision` + G1，而更正写在 `docs/design/reviews/t294-t252-wiki-dryrun.md` 顶部的 CORRECTION 块里。**顺序反了，就会看到一个已经被证伪的 high finding 挂在 t252 名下。**
 
 ⇒ 这条风险是有界的，因为 **t294 自己的 output 就写着那份产物的路径** —— 顺着指针走会先落到 CORRECTION 块。**这是「终态不可变的记录」与「可更正的产物」之间的唯一桥**：记录指向产物，产物承载更正。
+
+### 7.21 第二次 amend 事故：这次改写了一条【已推送】的提交（2026-09-26，t298）
+
+时序（reflog 是决定性的）：
+
+```
+8a1f54a HEAD@{0}: commit: docs(memory): 7.18 落点说明 …
+41cbbe8 HEAD@{1}: commit (amend): t298: assert the element fields the views actually read   ← amend
+c619139 HEAD@{2}: commit: docs(memory): 7.18 报错的 finding …                              ← 我的提交，已推送
+7bb844b HEAD@{3}: commit: t298: assert …
+```
+
+ui-chat 为了修一个被「真实响应逐字回放」抓到的假红（`edges.src/dst` 写成 string，实测三个都是整数）跑了 `git commit --amend` —— **而当时 HEAD 是我刚推送的 `c619139`** ⇒ amend 把**我的 docs 提交折进了它的 t298 提交**（`41cbbe8` 的信息是 t298 的，内容含我的 26 行 docs），本地与远端分叉，`git push` 被拒（non-fast-forward）。
+
+**恢复做法（不改写已推送的提交）**：
+1. `git reset -q origin/main`（mixed：HEAD 回到已推送的 `c619139`，工作区不动）；
+2. 把**内容**按显式路径重新提交在它之上 —— `b77b524`（t298 的迟到修复）+ `3ec7b15`（我的 docs）；
+3. push（快进）⇒ `origin/main` 是 HEAD 的祖先 ✓。
+
+**规则（在 7.8/7.17 之上收紧）**：amend 只在**两个条件同时成立**时安全 —— **(a) HEAD 是你自己的提交；(b) 它没有被推送**。两条都要在 amend 之前用 `git log -1` 与 `git log origin/main..HEAD` 查，而不是凭印象。
+
+### 7.22 一个未被提交的产物不是记录（同日，同一轮恢复里发现）
+
+恢复过程中 `git status` 露出：**八份验证报告在盘上但从未提交**（t257 · t280 · t283 · t283-addendum · t285 · t288 · t294 · t296）。
+
+⇒ **一次 `git clean` 就会抹掉那些结论的全部证据。** 已由队长以显式路径提交（`c50812e`），信息里写明是成员自己的产物、只是没入库。
+
+**规则**：验证单的产物如果只活在**工作区**里，那份验证就等于没有留档 —— 而工作区是全体写者共享的、随时被清理的地方。
+
+### 7.23 契约的修订会改变完成载荷的形状（2026-09-26，t298 的闸门连拒三次）
+
+闸门原话：`repair completion requires passed acceptanceResults for every acceptance item` —— 而它交的每一条都是 `passed`。
+
+**原因**：我在它**已经读到契约之后**改了 t298 的验收（systems 提了「不可判定」，我加了 ground truth 与三值判据）⇒ 契约从 5 条变成 8 条，而它按旧条数提交 ⇒ 条数对不上。**闸门只说「每一条都要 passed」，没有说「你少交了」。**
+
+**三条规则**：
+1. 能改就**在成员开工前**改；开工后改，必须**明确告诉它重读**（平台文档说实施者会在下一次质量门之前重读被修订的契约 —— 但它不会自己知道条数变了）。
+2. **契约条目内部不要出现列表分隔符**（这里怀疑是「；」）：一条含「；」的验收会被数成两条。
+3. 闸门的报错说的是**形状**，不是**内容** —— 它拒绝时先数条数，再去怀疑值。
