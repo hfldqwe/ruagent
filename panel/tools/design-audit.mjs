@@ -2652,9 +2652,16 @@ async function probeOrder(page, baseUrl) {
       apiChanged: apiBefore.join("|") !== apiAfter.join("|"),
     };
     // ---- 48 / 49: tick once a second and watch for a membership change
+    // t234: TWO reads, not ten. Rows 47-49 ask whether the CLICK changes the order and
+    // whether the order is stable between two adjacent reads -- a before/after pair
+    // answers both. Ten one-second reads widened the window to ten seconds of the
+    // GLOBAL chat list, so any unrelated conversation anywhere (another agent, a
+    // distillation run, the user typing elsewhere) could flip the reading to FAIL.
+    // The window is now about one second, and reorderVerdict already declines to
+    // conclude below two reads, so a shorter window cannot silently pass.
     let prev = apiAfter;
     let prevTops = await domTops();
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 2; i++) {
       await page.waitForTimeout(1000);
       const now = await ids();
       out.ticks++;
