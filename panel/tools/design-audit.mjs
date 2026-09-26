@@ -5477,6 +5477,12 @@ function runChecks(ctx) {
     // ones up. Otherwise the §12 table shows a blank verdict line for a row
     // nobody actually measured, which reads exactly like "nothing to report".
     const why = [...new Set(evidence.map((e) => e.note).filter(Boolean))];
+    // it. Until this fix the hoist read only the note field, so a judge that
+    // explains itself in display (row 58 returns "— not_measured：" + v.why) fell
+    // through to the generic sentence below. MEASURED: the §12 table said "no
+    // capture produced a judgeable value" while the Warnings column carried the
+    // actual exception -- the reason existed, the table just did not look at it.
+    const unjudged = [...new Set(evidence.filter((e) => e.pass === null).map((e) => e.display).filter(Boolean))];
     let verdict = !judged.length ? "not_measured" : fails.length ? "fail" : "pass";
     // Row 32 until MASTER's own cell carries the §12.3 correction: the original
     // check set counted accent, which primitives §2.4 C6 / §2.6 REQUIRE to equal
@@ -5500,7 +5506,7 @@ function runChecks(ctx) {
         : verdict === "pending"
           ? `判据待 t14 修订（MASTER §12 行 32 原文把 accent 计入唯一性检查集，与 primitives §2.4 C6 / §2.6 要求 accent === --signal 冲突，该行永不可能 PASS）；当前按 §12.3 修正读法判定：${why.slice(0, 1).join("")}`
           : !judged.length
-            ? why.slice(0, 2).join(" · ") || "no capture produced a judgeable value"
+            ? why.slice(0, 2).join(" · ") || unjudged.slice(0, 2).join(" · ") || "no capture produced a judgeable value"
             : "",
       evidence,
     });
@@ -6019,6 +6025,125 @@ function buildDetails(doc) {
 // cases pin the criterion itself: each is a shape the defective wording scored
 // PASS and the corrected one must score FAIL (and the contract shapes the
 // other way round). Pure: no daemon, no browser, no filesystem.
+// ── Static check: a page.evaluate body may only use what it is handed ───────
+// t338 defect: URL_STATE_TOGGLE_SEL is a MODULE-LEVEL const used inside
+// page.evaluate(() => ...) without being passed as an argument. Node never
+// evaluates that body, so no Node-side assertion can see the ReferenceError the
+// page throws before it looks at a single element -- and row 58 tab count had
+// never worked since the selector was extracted. validSelectorString cannot
+// catch it either: that validates the STRING, while this is a cross-context
+// VISIBILITY bug.
+//
+// WHAT IT CATCHES: a name declared at module scope (const/let/var at column 0)
+// referenced inside a page.evaluate body that is neither a parameter of that
+// function, nor declared inside it, nor present in the call argument list.
+// WHAT IT CANNOT: names reached through an object (cfg.SEL), imports from
+// another module, dynamic lookups (globalThis[name]), a value that IS passed but
+// is the wrong one, and any probe that is not an inline function at the call
+// site (a serialized probe string, say). It is a text check, not a parser.
+function splitTopLevel(s) {
+  const out = [];
+  let depth = 0, quote = null, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+    if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) depth--;
+    else if (ch === "," && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+// Comments and string literals are not code: a word like DEFECT or CJK inside a
+// comment, or an English word inside a string, is not a reference. Measured:
+// without this strip the check reported those words as unbound constants.
+function stripNoise(t) {
+  let out = "", i = 0;
+  while (i < t.length) {
+    const c = t[i];
+    if (c === "/" && t[i + 1] === "/") { while (i < t.length && t[i] !== "\n") i++; continue; }
+    if (c === "/" && t[i + 1] === "*") { i += 2; while (i < t.length && !(t[i] === "*" && t[i + 1] === "/")) i++; i += 2; continue; }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c;
+      i++;
+      while (i < t.length && t[i] !== q) { if (t[i] === "\\") i++; i++; }
+      i++;
+      out += '""';
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+function evaluateContextGaps(src) {
+  // The naming convention is the filter: module-level constants in this file are
+  // SCREAMING_SNAKE (URL_STATE_TOGGLE_SEL, CHECKS, NOT_MEASURED). Restricting the
+  // check to that shape is what makes it precise -- a looser "any name declared
+  // at column 0" rule also matches the PROBE source, which lives inside a
+  // template literal at column 0, and then reports single letters (measured: 200+
+  // false gaps on this very file). The cost is stated under WHAT IT CANNOT above.
+  const SHOUTY = /^[A-Z][A-Z0-9_]{2,}$/;
+  const idents = (t) => [...t.matchAll(/(?<![.\w$])([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
+  const gaps = [];
+  const needle = "page.evaluate(";
+  const code = stripNoise(src);
+  const moduleScoped = new Set([...code.matchAll(/^(?:const|let|var)\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]));
+  for (let at = code.indexOf(needle); at !== -1; at = code.indexOf(needle, at + 1)) {
+    const open = at + needle.length - 1;
+    let depth = 0, end = -1, quote = null;
+    for (let j = open; j < code.length; j++) {
+      const ch = code[j];
+      if (quote) {
+        if (ch === '\\') { j++; continue; }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+      if (ch === "(") depth++;
+      else if (ch === ")") { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end < 0) continue;
+    const parts = splitTopLevel(code.slice(open + 1, end));
+    const fnText = parts[0] ?? "";
+    const arrow = fnText.indexOf("=>");
+    // page.evaluate(PROBE, cfg) passes the function BY REFERENCE; its body lives
+    // in PROBE declaration, which receives cfg as a parameter (the object-property
+    // blind spot below). Only inline bodies can be checked here -- measured:
+    // without this guard the reference itself was reported as an unbound constant.
+    if (arrow < 0 && !/function/.test(fnText)) continue;
+    const paramSrc = arrow >= 0 ? fnText.slice(0, arrow) : "";
+    const paramList = idents(paramSrc);
+    const paramCount = paramSrc.split(",").filter((x) => x.trim()).length;
+    const argCount = parts.length - 1;
+    const params = new Set(paramList);
+    const locals = new Set([...stripNoise(fnText).matchAll(/(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));
+    const given = new Set(idents(parts.slice(1).join(" ")));
+    const line = src.slice(0, at).split("\n").length;
+    for (const name of new Set(idents(stripNoise(fnText)))) {
+      if (!SHOUTY.test(name) || !moduleScoped.has(name) || params.has(name) || locals.has(name) || given.has(name)) continue;
+      gaps.push({ name, line, kind: "unbound-in-body" });
+    }
+    // A parameter that SHADOWS a module-level constant but receives no argument
+    // hands the page undefined -- the same silence t338 shipped, one edit later
+    // (its fix named the parameter after the constant, so only the trailing
+    // argument keeps it alive). Positional only; destructuring and defaults are
+    // outside this text check.
+    if (argCount < paramCount) {
+      const supplied = new Set(paramList.slice(0, argCount));
+      for (const name of paramList) {
+        if (SHOUTY.test(name) && !supplied.has(name)) gaps.push({ name, line, kind: "unsupplied-parameter" });
+      }
+    }
+  }
+  return gaps;
+}
 function runSelfTest() {
   const cases = [];
   const check = (name, got, want) => cases.push({ name, got, want, pass: got === want });
@@ -7248,6 +7373,24 @@ function runSelfTest() {
     urlStateVerdict({ tabs: 2, hash1: "#sessions", hash2: "#sessions?src=mine", fp1: "全部", fp2: "我发的", fp3: "我发的" }).pass, true);
   check("row58: no view-state switch on the route is not_measured, never pass",
     urlStateVerdict({ tabs: 0 }).pass === null, true);
+  // t339 / F-t338-03: the defect class no Node-side assertion can see -- a module
+  // const used inside a page.evaluate body without being handed to it. t338
+  // ReferenceError lived exactly there, and row 58 had been silently broken ever
+  // since the selector was extracted. This reads the audit own source file.
+  const auditSrc = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const gapNames = (src) => evaluateContextGaps(src).map((g) => g.name + ":" + g.kind).join(",");
+  check("t339: the REAL audit source hands every SCREAMING_SNAKE module const its page.evaluate bodies use (no cross-context ReferenceError left)",
+    gapNames(auditSrc), "");
+  check("t339 must-FAIL: the ORIGINAL t338 shape -- the body uses the module const with NO parameter and NO argument -- is REPORTED",
+    gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate(() => A_B + 1); }"), "A_B:unbound-in-body");
+  check("t339 must-FAIL: a parameter that SHADOWS the constant but receives no argument (the trailing argument deleted) is REPORTED",
+    gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate((A_B) => A_B); }"), "A_B:unsupplied-parameter");
+  check("t339 must-FAIL: deleting the REAL call trailing argument is reported on the real source, not just on a synthetic one",
+    gapNames(auditSrc.replace(", URL_STATE_TOGGLE_SEL)", ")")), "URL_STATE_TOGGLE_SEL:unsupplied-parameter");
+  check("t339 must-not-PASS: a body that declares the name itself is fine (no false positive on a local of the same name)",
+    gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate(() => { const A_B = 2; return A_B; }); }"), "");
+  check("t339 blind spot, pinned so it cannot drift silently: a module const reached through an OBJECT is not seen (cfg.A_B)",
+    gapNames("const A_B = 1;" + "\n" + "async function f(p) { return await page.evaluate((cfg) => cfg.A_B); }"), "");
   // Row 59: a pair below the floor must FAIL, or the row degrades into
   // "the palette looks fine". A near-identical pair is the constructed case.
   check("row59 must-FAIL: a pair of near-identical category colours",
