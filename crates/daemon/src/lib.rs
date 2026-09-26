@@ -190,6 +190,14 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         });
     }
 
+    // ONE handle, shared (t260): the knowledge base is opened once and every
+    // consumer -- the API, the background scanner, and BOTH injection producers
+    // (chat and runs) -- holds a clone of this Arc. Before t260 the injection
+    // paths had no handle at all, so injecting knowledge would have meant
+    // deciding an embedder a second time; the vectors would then have had two
+    // sources of truth.
+    let knowledge = std::sync::Arc::new(knowledge);
+
     // Knowledge markdown sync (design-study memsearch/EverOS): the
     // `.md` files under <root>/knowledge are the source of truth, the
     // SQLite+LanceDB index a derived shadow. This scan — boot + every
@@ -245,10 +253,15 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
         chats.set_ask_dropper(Arc::new(move |id| mgr.drop_pending_for(id)));
     }
 
+    // t260: both injection producers get the same handle, so the knowledge
+    // block is produced from the same vectors the API answers from.
+    chats.set_knowledge(std::sync::Arc::clone(&knowledge));
+    mgr.set_knowledge(std::sync::Arc::clone(&knowledge));
+
     let state = api::AppState {
         mgr,
         config: Arc::new(config),
-        knowledge: Arc::new(knowledge),
+        knowledge: std::sync::Arc::clone(&knowledge),
         chats,
         sessions: indexer,
     };

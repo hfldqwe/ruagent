@@ -146,6 +146,10 @@ pub struct Chat {
     /// rides the first prompt's context, ahead of the memory context —
     /// the new agent takes over mid-conversation.
     handoff: Option<String>,
+    /// The daemon's knowledge handle (t260), if the manager was given one.
+    /// The chat path needs it to put knowledge/wiki hits into the FIRST
+    /// prompt's context; without it there is simply no knowledge block.
+    knowledge: Option<Arc<ruagent_knowledge::Knowledge>>,
 }
 
 impl Chat {
@@ -168,7 +172,9 @@ impl Chat {
         {
             None
         } else {
-            let mut ctx = ChatManager::memory_context_for(db, &text).await;
+            let mut ctx =
+                ChatManager::injection_context(db, self.knowledge.as_deref(), embedder, &text)
+                    .await;
             // A handoff tail rides first: the conversation the new
             // agent is taking over.
             if let Some(h) = &self.handoff {
@@ -193,36 +199,9 @@ impl Chat {
                     None => role_block,
                 });
             }
-            // semantic leg: the first message is the query
-            let hits = crate::memembed::semantic_search(db, embedder, &text, 4, 0.34).await;
-            if !hits.is_empty() {
-                let sem = hits
-                    .iter()
-                    .map(|(_, _, _, c, _)| format!("- {}", truncate_chars(c, 180)))
-                    .collect::<Vec<_>>()
-                    .join(
-                        "
-",
-                    );
-                match &mut ctx {
-                    Some(c) => {
-                        c.push_str(
-                            "
-[relevant memories for this conversation]
-",
-                        );
-                        c.push_str(&sem);
-                    }
-                    None => {
-                        ctx = Some(memory_block(&format!(
-                            "[relevant memories for this conversation]
-{sem}"
-                        )))
-                    }
-                }
-            }
             ctx
         };
+
         // History: the first prompt becomes the title, every prompt
         // refreshes updated_at (chat ordering in the history drawer).
         {
@@ -364,6 +343,10 @@ pub struct ChatManager {
     /// `RunManager::drop_pending_for` once both exist (chats are built
     /// before the RunManager). Optional so tests can omit it.
     drop_asks: Mutex<Option<AskDropper>>,
+    /// The daemon's ONE knowledge handle (t260). Set by lib.rs at boot; None
+    /// in tests that do not need retrieval, which yields no knowledge block
+    /// rather than a second embedder decision.
+    knowledge: Mutex<Option<Arc<ruagent_knowledge::Knowledge>>>,
     mcp: crate::config::McpConfig,
     /// Session → memory distillation policy (auto on close). Behind a
     /// RwLock: the panel's settings card swaps it at runtime (the file
@@ -379,6 +362,16 @@ pub struct ChatManager {
     /// what the panel pickers show, with no probe spawn on cold start.
     model_cache: Arc<Mutex<HashMap<String, CachedOptions>>>,
 }
+
+/// The chat path's query-side memory selection (unchanged by t260 -- it is a
+/// SELECTION choice, not a rendering rule, and moving it is a separate
+/// decision from routing the render through the contract).
+const CHAT_MEMORY_TOP_N: u32 = 4;
+const CHAT_MEMORY_MIN_SCORE: f32 = 0.34;
+/// Search wider than the block will keep: the contract then picks the top
+/// KNOWLEDGE_SOURCES + WIKI_PAGES by score, so a wiki page cannot crowd a
+/// source out before the selection rule ever sees it.
+const CHAT_KNOWLEDGE_SEARCH_N: u32 = 12;
 
 /// Idle reaping: a chat untouched for this long closes (and
 /// auto-distills). 60 minutes — sessions belong to projects now
@@ -406,6 +399,7 @@ impl ChatManager {
             chats: Arc::new(Mutex::new(HashMap::new())),
             park_ask,
             drop_asks: Mutex::new(None),
+            knowledge: Mutex::new(None),
             mcp,
             distill_policy: std::sync::RwLock::new(distill_policy),
             registry,
@@ -447,60 +441,100 @@ impl ChatManager {
             .collect()
     }
 
-    /// The cross-session memory digest (L3 of the unified memory layer):
-    /// compact profile + durable observations, capped hard. Injected
-    /// ahead of a chat's first prompt so a fresh session "remembers"
-    /// the user without any recall call.
-    /// The cross-session memory context for a chat's FIRST prompt:
-    /// (a) a stable, small profile block (who the user is — always
-    /// relevant). The semantic leg (recall on the first message) is
-    /// attached by `Chat::send_prompt`.
-    pub async fn memory_context_for(db: &ruagent_store::Db, _query: &str) -> Option<String> {
-        let rows: Vec<(String, String, String)> = db
-            .call(|conn| -> Result<_, ruagent_store::DbError> {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT store, namespace, content FROM memories
-                          WHERE superseded_at IS NULL
-                            AND ((store = 'profile' AND namespace = 'user')
-                              OR (store = 'observation' AND namespace IN ('user','global'))
-                              OR (store IN ('procedure','lesson') AND namespace = 'global'))
-                          ORDER BY updated_at DESC LIMIT 12",
-                    )
-                    .map_err(ruagent_store::DbError::from)?;
-                let rows = stmt
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                    .map_err(ruagent_store::DbError::from)?;
-                Ok(rows.filter_map(|r| r.ok()).collect())
-            })
-            .await
-            .ok()?
-            .ok()?;
-        if rows.is_empty() {
+    /// The FIRST-prompt context for a chat, through the ONE injection contract
+    /// (crates/memory/src/inject.rs).
+    ///
+    /// WHY THIS REPLACED memory_context_for (t260): that function wrote its own
+    /// SQL, its own block header, its own 700-BYTE budget and its own
+    /// per-entry cut with no visible marker. So the chat path had no tag
+    /// blocks, no visible truncation, no dropped-item count -- and the two
+    /// paths had already drifted once (the header wording changed in a097c5e
+    /// and the old transcripts kept the old wording).
+    ///
+    /// BLOCK PRIORITY (drop order, and WHY -- the full rationale lives with the
+    /// tags in crates/memory/src/inject.rs): user_profile > relevant_memories >
+    /// knowledge > wiki > project_context. Tag order is first-seen and the
+    /// total budget drops the LAST blocks first, so the caller pushes in that
+    /// order: facts about the user, then evidence, then leads, then the
+    /// narrowest scope. Every drop is counted in the render.
+    ///
+    /// Returns None when nothing was found: no context is better than a
+    /// placeholder that costs tokens and says nothing.
+    pub async fn injection_context(
+        db: &ruagent_store::Db,
+        knowledge: Option<&ruagent_knowledge::Knowledge>,
+        embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
+        query: &str,
+    ) -> Option<String> {
+        use ruagent_memory::MemoryStore;
+        use ruagent_memory::inject::{
+            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, TAG_RELEVANT_MEMORIES,
+            TAG_USER_PROFILE, WIKI_PAGES, knowledge_items, render_context,
+        };
+
+        let mut items: Vec<ContextItem> = Vec::new();
+
+        // 1. Who the user is, then the durable observations, then the
+        //    project/global procedure + lesson stores. Read through the memory
+        //    crate's own read path -- which is also what excludes superseded
+        //    and soft-deleted rows. The old chat path wrote its own SQL and
+        //    therefore honoured neither filter.
+        for (tag, store, ns, limit) in [
+            (TAG_USER_PROFILE, MemoryStore::Profile, "user", 5u32),
+            (TAG_RELEVANT_MEMORIES, MemoryStore::Observation, "user", 5),
+            (TAG_RELEVANT_MEMORIES, MemoryStore::Observation, "global", 3),
+            (TAG_RELEVANT_MEMORIES, MemoryStore::Procedure, "global", 3),
+            (TAG_RELEVANT_MEMORIES, MemoryStore::Lesson, "global", 3),
+        ] {
+            if let Ok(rows) = ruagent_memory::query::current_memories(db, store, ns, limit).await {
+                items.extend(
+                    rows.into_iter()
+                        .map(|m| ContextItem::dated(tag, m.content, &m.updated_at)),
+                );
+            }
+        }
+
+        // 2. What THIS conversation is about: the query's own memories (the
+        //    semantic leg). Same count and threshold as before; the rendering
+        //    is now the contract's, so these merge into the
+        //    relevant_memories block instead of a hand-built bullet list.
+        let hits = crate::memembed::semantic_search(
+            db,
+            embedder,
+            query,
+            CHAT_MEMORY_TOP_N,
+            CHAT_MEMORY_MIN_SCORE,
+        )
+        .await;
+        items.extend(
+            hits.into_iter()
+                .map(|(_, _, _, content, _)| ContextItem::undated(TAG_RELEVANT_MEMORIES, content)),
+        );
+
+        // 3. What the knowledge base says about it. The selection rule lives in
+        //    the contract (knowledge_items): top N sources and top M generated
+        //    pages, by the retrieval's own score, sources first. No hits means
+        //    no block -- never an invented placeholder.
+        if let Some(k) = knowledge
+            && let Ok(found) = k.search(query, CHAT_KNOWLEDGE_SEARCH_N).await
+        {
+            let hits: Vec<RetrievalHit> = found
+                .into_iter()
+                .map(|h| RetrievalHit {
+                    wiki: h.document.starts_with("wiki/"),
+                    document: h.document,
+                    content: h.content,
+                    score: h.score,
+                })
+                .collect();
+            items.extend(knowledge_items(&hits, KNOWLEDGE_SOURCES, WIKI_PAGES));
+        }
+
+        if items.is_empty() {
             return None;
         }
-        let mut out = memory_block("") + "\n";
-        let mut budget = 700usize;
-        for (store, ns, content) in &rows {
-            let content = content.trim();
-            let cut = content
-                .char_indices()
-                .nth(160)
-                .map_or(content.len(), |(i, _)| i);
-            let line = if cut < content.len() {
-                format!("{}…", &content[..cut])
-            } else {
-                content.to_string()
-            };
-            let entry = format!("- ({store}/{ns}) {line}");
-            if budget < entry.len() {
-                break;
-            }
-            budget -= entry.len();
-            out.push_str(&entry);
-            out.push('\n');
-        }
-        Some(out)
+        let out = render_context(&items, &InjectionBudget::default());
+        (!out.trim().is_empty()).then_some(out)
     }
 
     /// Start a new chat on the given agent (optionally with a model).
@@ -760,6 +794,7 @@ impl ChatManager {
             memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_prompt: card.prompt.clone(),
             handoff,
+            knowledge: self.knowledge_handle(),
         };
 
         // Run-state watcher: generating is cleared by the session own
@@ -838,6 +873,23 @@ impl ChatManager {
     /// at boot, after both managers exist.
     pub fn set_ask_dropper(&self, f: AskDropper) {
         *self.drop_asks.lock().expect("drop_asks lock") = Some(f);
+    }
+
+    /// Hand the manager the ONE knowledge handle the daemon built at boot.
+    ///
+    /// WHY A SETTER AND NOT A new() PARAMETER: ChatManager::new is called from
+    /// the api test harness, seven mock-agent tests and lib.rs; widening its
+    /// signature would edit five files to deliver one handle. Optional by
+    /// construction, so a caller that does not set it gets NO knowledge block
+    /// (honest) instead of a second embedder decision -- which would be a
+    /// second source of truth for what the vectors mean.
+    pub fn set_knowledge(&self, k: Arc<ruagent_knowledge::Knowledge>) {
+        *self.knowledge.lock().expect("knowledge lock") = Some(k);
+    }
+
+    /// The handle, if one was set.
+    fn knowledge_handle(&self) -> Option<Arc<ruagent_knowledge::Knowledge>> {
+        self.knowledge.lock().expect("knowledge lock").clone()
     }
 
     /// Close one chat: shut the session down, drop its parked asks

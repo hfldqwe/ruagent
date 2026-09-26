@@ -223,6 +223,10 @@ pub struct RunManager {
     /// agents on one runtime queues them instead of spawning N
     /// children at once.
     gates: HashMap<ruagent_core::HarnessKind, std::sync::Arc<HarnessGate>>,
+    /// The daemon's ONE knowledge handle (t260). Set by lib.rs at boot; None
+    /// in tests that do not need retrieval, which yields no knowledge block
+    /// rather than a second embedder decision.
+    knowledge: Mutex<Option<Arc<ruagent_knowledge::Knowledge>>>,
 }
 
 impl RunManager {
@@ -279,6 +283,7 @@ impl RunManager {
                     )
                 })
                 .collect(),
+            knowledge: Mutex::new(None),
         }
     }
 
@@ -289,6 +294,22 @@ impl RunManager {
             .get(&kind)
             .expect("every harness kind has a gate")
             .clone()
+    }
+
+    /// Hand the manager the ONE knowledge handle the daemon built at boot.
+    ///
+    /// WHY A SETTER AND NOT A new() PARAMETER: RunManager::new is called from
+    /// lib.rs, the api test harness and nine mock-agent tests; widening its
+    /// signature would edit eleven files to deliver one handle. Optional by
+    /// construction: a caller that does not set it gets NO knowledge block
+    /// (honest) instead of a second embedder decision.
+    pub fn set_knowledge(&self, k: Arc<ruagent_knowledge::Knowledge>) {
+        *self.knowledge.lock().expect("knowledge lock") = Some(k);
+    }
+
+    /// The handle, if one was set.
+    fn knowledge_handle(&self) -> Option<Arc<ruagent_knowledge::Knowledge>> {
+        self.knowledge.lock().expect("knowledge lock").clone()
     }
 
     /// The agents.toml editor (registry write API).
@@ -686,6 +707,9 @@ impl RunManager {
         let task = task.clone();
 
         let returned = run.clone();
+        // Resolved OUTSIDE the spawned task: the supervisor is a 'static task,
+        // so it cannot borrow self. One Arc clone, captured by the closure.
+        let knowledge = self.knowledge_handle();
         // The gate permit rides the supervisor: it releases when the
         // run reaches any terminal state (design §8.3). A queued run
         // waits for the gate here — cancellable — before it consumes
@@ -744,7 +768,7 @@ impl RunManager {
             };
             run.workspace = Some(cwd.to_string_lossy().into_owned());
 
-            let mut injection = render_run_injection(&db, &task).await;
+            let mut injection = render_run_injection(&db, &task, knowledge.as_deref()).await;
             // Attempt-history context (a retry's crash snapshot) rides
             // as context — visible in the ContextInjected render, never
             // as user speech.
@@ -1782,25 +1806,78 @@ fn create_workspace(root: &std::path::Path, spec: WorkspaceSpec, run_id: RunId) 
     })
 }
 
-/// Assemble the push-path injection for a run (design SS6.4): user
-/// profile + user observations, bounded by the default budget.
-async fn render_run_injection(db: &Db, task: &Task) -> String {
+/// The run's retrieval query: a run has no user message -- the task IS the ask.
+/// Capped so an enormous intent cannot dominate the embedding.
+fn run_query(task: &Task) -> String {
+    let mut q = format!("{} {}", task.title, task.intent);
+    if q.chars().count() > 500 {
+        q = q.chars().take(500).collect();
+    }
+    q
+}
+
+/// Search wider than the block keeps, so a wiki page cannot crowd a source out
+/// before the contract's selection rule sees it.
+const RUN_KNOWLEDGE_SEARCH_N: u32 = 12;
+
+/// Assemble the push-path injection for a run (design SS6.4): user profile +
+/// user observations + the project's observations + what the knowledge base
+/// says about the task, all through the ONE injection contract
+/// (crates/memory/src/inject.rs).
+///
+/// WHY THE KNOWLEDGE LEG IS HERE AT ALL (t260): recall returned knowledge hits
+/// in 99.3% of queries and wiki hits in 100%, and NOT ONE of the 79
+/// context_injected events in the transcripts carried a knowledge block -- the
+/// retrieval was built and nothing injected it. This is the injection half.
+///
+/// The knowledge argument is None when the daemon never handed the manager a
+/// handle (tests, or a boot with no knowledge base). Then the render has no
+/// knowledge block, which is honest -- the alternative would be a second
+/// embedder decision, i.e. a second source of truth for what the vectors mean.
+async fn render_run_injection(
+    db: &Db,
+    task: &Task,
+    knowledge: Option<&ruagent_knowledge::Knowledge>,
+) -> String {
+    use ruagent_memory::MemoryStore;
+    use ruagent_memory::inject::{
+        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, TAG_PROJECT_CONTEXT,
+        TAG_RELEVANT_MEMORIES, TAG_USER_PROFILE, WIKI_PAGES, knowledge_items, render_context,
+    };
     use ruagent_memory::query::current_memories;
-    use ruagent_memory::{InjectionBudget, MemoryForInjection, MemoryStore, render_injection};
-    let mut mems: Vec<MemoryForInjection> = Vec::new();
+
+    let mut items: Vec<ContextItem> = Vec::new();
     if let Ok(profile) = current_memories(db, MemoryStore::Profile, "user", 5).await {
-        mems.extend(profile.into_iter().map(|m| MemoryForInjection {
-            tag: "user_profile",
-            content: m.content,
-            updated_at: m.updated_at,
-        }));
+        items.extend(
+            profile
+                .into_iter()
+                .map(|m| ContextItem::dated(TAG_USER_PROFILE, m.content, &m.updated_at)),
+        );
     }
     if let Ok(obs) = current_memories(db, MemoryStore::Observation, "user", 8).await {
-        mems.extend(obs.into_iter().map(|m| MemoryForInjection {
-            tag: "relevant_memories",
-            content: m.content,
-            updated_at: m.updated_at,
-        }));
+        items.extend(
+            obs.into_iter()
+                .map(|m| ContextItem::dated(TAG_RELEVANT_MEMORIES, m.content, &m.updated_at)),
+        );
+    }
+    // Drop order (rationale with the tags in crates/memory/src/inject.rs):
+    // user_profile > relevant_memories > knowledge > wiki > project_context.
+    // Knowledge and wiki therefore sit BEFORE the project block -- evidence and
+    // leads outlive one project's notes -- and the total budget drops the LAST
+    // blocks first, visibly.
+    if let Some(k) = knowledge
+        && let Ok(found) = k.search(&run_query(task), RUN_KNOWLEDGE_SEARCH_N).await
+    {
+        let hits: Vec<RetrievalHit> = found
+            .into_iter()
+            .map(|h| RetrievalHit {
+                wiki: h.document.starts_with("wiki/"),
+                document: h.document,
+                content: h.content,
+                score: h.score,
+            })
+            .collect();
+        items.extend(knowledge_items(&hits, KNOWLEDGE_SOURCES, WIKI_PAGES));
     }
     if let Some(project) = &task.project
         && let Ok(obs) = current_memories(
@@ -1811,16 +1888,15 @@ async fn render_run_injection(db: &Db, task: &Task) -> String {
         )
         .await
     {
-        mems.extend(obs.into_iter().map(|m| MemoryForInjection {
-            tag: "project_context",
-            content: m.content,
-            updated_at: m.updated_at,
-        }));
+        items.extend(
+            obs.into_iter()
+                .map(|m| ContextItem::dated(TAG_PROJECT_CONTEXT, m.content, &m.updated_at)),
+        );
     }
-    if mems.is_empty() {
+    if items.is_empty() {
         return String::new();
     }
-    render_injection(&mems, &InjectionBudget::default())
+    render_context(&items, &InjectionBudget::default())
 }
 
 #[cfg(test)]
