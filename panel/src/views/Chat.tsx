@@ -85,10 +85,26 @@ const GROUP_CAP = 5;
 
 /** Density caps (view-chat.md §4.2). `#task` measured 153k nodes from an
  * unbounded log (MASTER §12 row 25); a full session is the same risk surface,
- * so the same two bounds apply here: at most 400 mounted turns, and a single
- * body over 2,000 characters collapses behind its own summary. */
+ * so the same two bounds apply here: at most 400 mounted turns (MSG_CAP), and
+ * a body big enough to be a paste rather than an answer collapses behind its
+ * own summary (LONG_MSG).
+ *
+ * t244: LONG_MSG was 2,000 and it collapsed the FORMAL REPLY — the user's
+ * words: 「你好像把正式回复也改成折叠了，默认需要点开才可以看到对话」. Two
+ * things were wrong with that bound:
+ *   · It buys no nodes. A `<details>` still renders its children into the DOM;
+ *     the browser only hides them (measured below on this app's own thought
+ *     folds). What bounds the node count is MSG_CAP — the number of turns — not
+ *     the length of one body.
+ *   · It charges the reader for a risk it does not pay for: 2,000 characters is
+ *     an ordinary long answer, and hiding it behind a character count means
+ *     clicking before you can read what you asked for.
+ * So the bound stays (a 20k body is a log dump, and collapsing THAT is a
+ * reading affordance) and the ordinary answer is visible again. Thought blocks
+ * keep their own fold — they are a separate branch, and they stay open while
+ * streaming. */
 const MSG_CAP = 400;
-const LONG_MSG = 2000;
+const LONG_MSG = 20000;
 
 /** Known option ids get translated labels; others show the agent's name. */
 function optionLabel(opt: SessionOptionInfo, t: (k: string) => string): string {
