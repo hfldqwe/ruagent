@@ -1940,3 +1940,13 @@ row32CriterionLanded      design-audit.mjs:4056 / :5310 / :5492（判定处还�
 **要派的内容（等 panel/tools/ 空出来）**：六条（N1 `lang` · N2 缩放不被禁用 · N3 `prefers-reduced-motion` · N4 Tab 无陷阱 · N5 切换控件状态语义 · N6 横向滚动触控归属）各一对 `check("row<N> must-FAIL…")` + 行号 **72–77 连续**（`缺口 []` 要求连续）+ 同步 `primitives.md §11` + 三条口径（采样面写死 1440×900/`scrollTo(0,0)`、N3 要 `emulateMedia(reducedMotion:'reduce')` · 「在 DOM 里≠看得见」rect ≥1px + computed style · **量元素盒还是视口内可见区写清楚**：N6 明写量元素盒 `scrollWidth/clientWidth`、N4 用 `activeElement`+rect、将来改命中测试须按 t306 的 `reachW/reachH = allHit===true ? box : eff`）✓。
 
 **规格来源**：`docs/design/reviews/t344-axis1-a11y-touch-diff.md` §1 的四列表（选择器 / 判据 / 反向 / 预期落格）✓。
+
+**7.124 的精确补充（contract-lead 补的行号）**：
+
+```
+docs/design/primitives.md:1265  ← §11 表里【行 23】的那一行
+   列序: | 行号 | 名称 | 阈值 | 判据修正 | 对象集/判据 |  ⇒ 72–77 照这个同构写法各加一行
+同一条判据的散文出处: :727-730（「阈值行 23 不能用全站计数」）
+附录 A.7（:1321）: 记录「全站计数会虚假通过」的实测
+⇒ 工具行契约里把这两处一起写上，接单人不必再找 ✓
+```
