@@ -1513,6 +1513,11 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
   const [kind, setKind] = useState("");
   const [summary, setSummary] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  // t229: this dialog had no pending state at all — during a slow create the
+  // button read loading=false / disabled=false, so the same submit could be
+  // fired again from the window. Same shape as Board's CreateTaskModal (busy
+  // drives loading, busy also holds disabled) and as AddFactModal above.
+  const [busy, setBusy] = useState(false);
   const { t } = useI18n();
   const toast = useToast();
   return (
@@ -1533,8 +1538,11 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
       <div className="row end">
         <Button
           type="primary"
-          disabled={!name.trim()}
+          loading={busy}
+          disabled={busy || !name.trim()}
           onClick={async () => {
+            setBusy(true);
+            setErr(null);
             try {
               await api.graphCreateEntity(name.trim(), kind.trim() || undefined, summary.trim() || undefined);
               toast("ok", t("toast.entityCreated"));
@@ -1542,6 +1550,8 @@ function CreateEntityModal({ onClose, onCreated }: { onClose: () => void; onCrea
             } catch (e) {
               // §5 error ③: a line that stays, and every field keeps its value.
               setErr(String(e));
+            } finally {
+              setBusy(false);
             }
           }}
         >

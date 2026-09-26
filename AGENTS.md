@@ -65,6 +65,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ruagent-daemon.ps1 s
   task (at logon + every 5 minutes) so nobody has to remember to restart it.
 * `stop` stops the pid recorded in `~/.ruagent/data/daemon.pid` — never a sweep by process
   name or port.
+* `stop` **refuses to run without `-Force`**. A script cannot post to the team channel, so
+  rather than pretend to announce it refuses to be silent: without `-Force` it stops nothing,
+  prints what the stop would break, and prints the text a human should send. With `-Force` it
+  first **appends** a notice to `<root>/logs/daemon-stop-notice.log` (rotated to `.1` at 256 KB,
+  never overwritten) and then stops the recorded pid; the notice holds the timestamp, the pid,
+  the reason (`-Reason`) and that broadcast text. **The notice is for looking back after the
+  fact, not for members watching in real time -- and seeing it does not mean anyone knew:** only
+  the human step puts it in the team channel. `watch` and `install-task` never stop anything,
+  so the unattended path cannot be blocked by that gate.
 
 `cargo run -p ruagent -- serve` still works for a foreground run (it resolves the panel the
 same way); it simply dies with the terminal.

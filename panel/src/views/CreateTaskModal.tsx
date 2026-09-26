@@ -10,7 +10,7 @@ import { useState } from "react";
 import { Button, Input } from "antd";
 import { api } from "../api";
 import { useI18n } from "../i18n";
-import { Modal, useToast } from "../ui";
+import { ErrorState, Modal, useToast } from "../ui";
 
 export function CreateTaskModal({
   onClose,
@@ -24,10 +24,16 @@ export function CreateTaskModal({
   const [intent, setIntent] = useState("");
   const [project, setProject] = useState("");
   const [busy, setBusy] = useState(false);
+  // t229: the failure used to appear ONLY as a toast — measured at [720,28],
+  // 637px from the trigger and outside the dialog, while the dialog itself
+  // stayed open and silent. The toast stays; the dialog now also shows the
+  // line, which is the shape Memory's write dialog already had.
+  const [err, setErr] = useState<string | null>(null);
   const toast = useToast();
   const create = async () => {
     if (!title.trim() || busy) return;
     setBusy(true);
+    setErr(null);
     try {
       const task = await api.createTask(
         title.trim(),
@@ -37,6 +43,7 @@ export function CreateTaskModal({
       toast("ok", t("newtask.created"));
       onCreated(task.id);
     } catch (e) {
+      setErr(String(e));
       toast("err", String(e));
       setBusy(false);
     }
@@ -70,8 +77,9 @@ export function CreateTaskModal({
           placeholder="ruagent…"
         />
       </label>
+      {err ? <ErrorState title={err} /> : null}
       <div className="row end">
-        <Button type="primary" loading={busy} disabled={!title.trim()} onClick={create}>
+        <Button type="primary" loading={busy} disabled={busy || !title.trim()} onClick={create}>
           {t("common.create")}
         </Button>
       </div>

@@ -14,17 +14,25 @@
 #   install-task  register a scheduled task: at logon, and every 5 minutes
 #
 # Logging: <root>/logs/daemon.log, appended, rotated to daemon.log.1 at 5 MB.
+# Stop:    refuses to run without -Force (a script cannot post to the team channel, so
+#          it refuses to be silent instead); with -Force it first APPENDS a notice to
+#          <root>/logs/daemon-stop-notice.log (rotated to .1 at 256 KB) and then stops
+#          the recorded pid.
 param(
   [Parameter(Position=0)][ValidateSet('start','stop','status','watch','install-task')][string]$Action = 'status',
   [string]$Root = (Join-Path $env:USERPROFILE '.ruagent'),
   [string]$Exe  = 'D:\rust_cache\debug\ruagent.exe',
   [string]$Addr = '127.0.0.1:8787',
-  [int]$MaxLogBytes = 5MB
+  [int]$MaxLogBytes = 5MB,
+  [int]$MaxNoticeBytes = 256KB,
+  [string]$Reason = '',
+  [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
 $logDir = Join-Path $Root 'logs'
 $log    = Join-Path $logDir 'daemon.log'
 $pidRec = Join-Path $Root 'data\daemon.pid'
+$notice = Join-Path $logDir 'daemon-stop-notice.log'
 $health = "http://$Addr/api/v1/health"
 
 function Get-LogPath {
@@ -33,6 +41,18 @@ function Get-LogPath {
     Move-Item -Force $log (Join-Path $logDir 'daemon.log.1')
   }
   return $log
+}
+
+# Same shape as Get-LogPath: APPEND, rotate at a size cap. Appending is what
+# keeps an earlier stop record alive (t188 lost a death record to a '>' that
+# truncated the log); the cap is what keeps the record from becoming
+# unreadable - neither alone is enough.
+function Get-NoticePath {
+  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+  if ((Test-Path $notice) -and (Get-Item $notice).Length -gt $MaxNoticeBytes) {
+    Move-Item -Force $notice (Join-Path $logDir 'daemon-stop-notice.log.1')
+  }
+  return $notice
 }
 
 function Test-Health {
@@ -74,8 +94,26 @@ switch ($Action) {
     # Only the pid recorded by the daemon itself: never a name or port sweep.
     $p = Get-DaemonPid
     if (-not $p) { Write-Output 'no recorded daemon pid (nothing to stop)'; break }
+    # Posting to the team channel is the one step a script cannot do. What it CAN
+    # do is refuse to be silent: without -Force it stops nothing and prints what
+    # stopping would break, plus the text a human should send. -Force is what the
+    # unattended paths use, so they are unaffected.
+    $announce = 'daemon stop: root=' + $Root + ' pid=' + $p + ' addr=' + $Addr + ' - verification against ' + $Addr + ' fails until it is back'
+    if (-not $Force) {
+      Write-Output 'REFUSING to stop without -Force.'
+      Write-Output ('impact:   stopping it interrupts anyone verifying against ' + $Addr + ' for the length of the restart')
+      Write-Output ('announce: ' + $announce)
+      Write-Output 'nothing was stopped: the process and the pid file are untouched.'
+      break
+    }
+    $noticePath = Get-NoticePath
+    $stamp = (Get-Date).ToString('s')
+    $reasonText = 'unspecified'
+    if ($Reason) { $reasonText = $Reason }
+    Add-Content -Path $noticePath -Value ('[' + $stamp + '] pid=' + $p + ' root=' + $Root + ' reason=' + $reasonText + ' announce=' + $announce)
     Stop-Process -Id $p -ErrorAction SilentlyContinue
     Write-Output "stopped pid=$p"
+    Write-Output ('notice appended: ' + $noticePath)
   }
   'status' {
     $p = Get-DaemonPid
@@ -88,6 +126,9 @@ switch ($Action) {
     if (Test-Path $log) { Write-Output 'log tail:'; Get-Content $log -Tail 8 }
   }
   'watch' {
+    # This path never calls 'stop': it only starts. So the -Force gate above
+    # cannot block the unattended restart. (If it ever needs to stop first, it
+    # must pass -Force - that is the point of the gate.)
     # Every decision is appended to watchdog.log: that file plus the daemon
     # log's start banner is how a death becomes visible after the fact. The
     # daemon's own log cannot record a hard kill, so the *absence* of lines
