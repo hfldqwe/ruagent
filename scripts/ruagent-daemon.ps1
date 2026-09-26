@@ -59,7 +59,13 @@ switch ($Action) {
     # survives the caller. `cmd /c` does the append redirection (WMI itself
     # cannot redirect - and Start-Process' redirect is the shape that hung).
     $cmd = 'cmd.exe /c ""' + $Exe + '" serve --addr ' + $Addr + ' --root "' + $Root + '" >> "' + $logPath + '" 2>&1"'
-    $res = ([wmiclass]'Win32_Process').Create($cmd)
+    # ShowWindow 0: a daemon that opens a console window is a window the user
+    # did not ask for and has to close. WMI hands the child a console unless
+    # the startup information says otherwise; `cmd /c` stays because it is the
+    # redirection shape that appends instead of truncating the log.
+    $startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()
+    $startup.ShowWindow = 0
+    $res = ([wmiclass]'Win32_Process').Create($cmd, $null, $startup)
     if ($res.ReturnValue -ne 0) { throw "Win32_Process.Create failed: $($res.ReturnValue)" }
     Write-Output "started pid=$($res.ProcessId) log=$logPath"
     for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Test-Health) { Write-Output 'health ok'; break } }
