@@ -24,7 +24,9 @@
 - 审计工具是**按契约行号硬编码**的：`panel/tools/design-audit.mjs` 里出现 `row5ExcludeSelectors`（:97/:333/:655）、`row32CriterionLanded`（:4056/:5310/:5492）、`row.n === 32`（:5492）等；其自检也是按行号写的：`--self-test`（:417）的用例形如 `check("row16: outline-style:auto + shadow ring -> FAIL", …)`（:6183-6215）。
 - ⇒ **新增行（例如 72+）在工具里没有任何对应检查** ⇒ 「每一行必须能被现有审计工具量出来」在**不改 `panel/tools/`** 的前提下**无法满足** ✗。
 - 本单 inScope = `docs/design/`，**out of scope 明确含 `panel/tools/`** ✗ ⇒ ②③④ 不可执行。
-- **建议**：二选一 —— (a) 放宽 inScope 到 `panel/tools/design-audit.mjs`（每个新行加一个 `row<N>` 检查 + 一条 `--self-test` 反向用例 ✓，正好对上 ③④）；或 (b) 保留 inScope，把②改成「给出判据 + 写明需要工具新增哪个检查」，③④ 改为下一单执行。
+- **队长已 amend 验收②**：允许两条路 —— (a) 用工具**现有**行种类表达；或 (b) 需要新行种类时**写出测量规格（选择器 + 判据 + 反向）并标注【需要工具行】**，工具行另行派单（panel/tools/ 由 t345 占用，不重叠）。**本清单六条全部属于 (b)** —— 逐条已给选择器 + 可判定判据 + 反向构造 ⇒ ②按 (b) 满足；**本单未改工具** ✓。
+
+- **原建议**：二选一 —— (a) 放宽 inScope 到 `panel/tools/design-audit.mjs`（每个新行加一个 `row<N>` 检查 + 一条 `--self-test` 反向用例 ✓，正好对上 ③④）；或 (b) 保留 inScope，把②改成「给出判据 + 写明需要工具新增哪个检查」，③④ 改为下一单执行。
 
 ## §3 三条口径（本单的每条候选行都按它们写判据）
 
@@ -35,3 +37,50 @@
 ## §4 未执行的部分（如实）
 
 ③ 反向读数、④ 覆盖守恒（pass/fail/not_measured 对账）、⑤ 的新行号一致性 —— 全部**依赖工具侧改动**（§2）⇒ 本单未执行，也未向 §12 添加任何行 ⇒ `check-contract.mjs` 读数保持不变（`§12 表：71 行，最大 71，缺口 []` · `CONTRACT SELF-CHECK: PASS`）。
+
+
+## §5 ③ 反向与 ④ 覆盖守恒：机制读数（本单未加行，故给的是机制证据 + 逐行规格）
+
+### ③ 反向（每条候选行的反向构造已在 §1 表里逐条给出）+ 机制读数
+
+审计工具的 `--self-test` 就是「构造违规 ⇒ 必须变红」的现成机制，**同一条判据函数同时供自检与该行使用**（自检输出里有一句直接这么说）：
+
+```
+$ node panel/tools/design-audit.mjs --self-test
+  ok  row35 must-FAIL: 5 CSS breakpoints FAIL (the <=4 budget is NOT relaxed)   got=false want=false
+  ok  row35 must-PASS again once the injected 700 is removed (the removal direction)  got=true want=true
+  ok  row35: the judge is single-sourced (the self-test and the row share one function)  got=true want=true
+  ...
+self-test: 483/483 pass      exit=0
+```
+
+⇒ **机制证据**：483 条自检里每一对都是 must-FAIL + must-PASS 两个方向（`--self-test` 的用途见 `panel/tools/design-audit.mjs:316/417/454`）✓。**每一条新行的反向**（§1 表第 5 列）落地方式 = 给该行写一条 `check("row<N> must-FAIL: …", judge(...), want)` 用例 + 一条 must-PASS ✓ —— **这正是工具行（t345 名下）要做的第一件事** ✓。
+
+### ④ 覆盖守恒（7.98）：新行的三格账怎么写
+
+工具自己已经定下规矩（`panel/tools/design-audit.mjs:2768` 注释原文）：
+
+> Every way of NOT measuring gets a NAME. An unnamed empty result is what the panel team keeps having to reject: it reads like a pass.
+
+⇒ 六条新行各自必须落在 **pass / fail / not_measured 之一**，且 `not_measured` **必须带名字**（例如「该路由没有可聚焦元素」「本捕获没有 meta 标签」）✓。对每一条的**预期落格**（工具行落地后应逐条对上账）：
+
+| 行 | 预期格（当前实现下） | 名字（not_measured 时） |
+| --- | --- | --- |
+| N1 lang | pass（`lang` 已声明） | —— |
+| N2 缩放 | pass（viewport 未禁用缩放） | —— |
+| N3 减少动效 | **not_measured** 直到工具 `emulateMedia({reducedMotion:'reduce'})` 落地 | `no reduced-motion capture on this run` |
+| N4 Tab 陷阱 | pass | —— |
+| N5 状态语义 | pass（三个手写控件都有 `aria-expanded`） | —— |
+| N6 横向滚动容器 | **not_measured** 直到具名集在该路由存在 | `no scrollable container in the named set on this route` |
+
+（这些是**待核对的预期**，不是读数 —— 真正的三计数要等工具行落地后跑一次才有 ✓。本单不伪造它们 ✗。）
+
+## §6 ⑤ check-contract 读数（未加行 ⇒ 计数保持一致）
+
+```
+$ node docs/design/check-contract.mjs
+§12 表：71 行，最大 71，缺口 []
+CONTRACT SELF-CHECK: PASS
+```
+
+⇒ 本单**未向 §12 添加行**（六条都属于 (b)【需要工具行】）⇒ 行数与表一致 ✓、自检 PASS ✓。**工具行落地时**，六条应以**连续行号 72–77** 加入 §12（`缺口 []` 要求连续 ✓），并同步 `primitives.md §11` 的判据条目（现有行 23 的写法即为此模式：「判据定义见 primitives.md §11 行 23」）✓。
