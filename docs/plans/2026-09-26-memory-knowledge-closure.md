@@ -1696,3 +1696,43 @@ systems 的第一次补丁**根本没落** ✗：它把 Python 的备份路径�
 它加的 import 行与文件里已有的重复 ✗（`readdirSync` / `join` / `dirname` 早在 `:44`/`:45` 导入 ✓）⇒ `SyntaxError: Identifier 'readdirSync' has already been declared` ⇒ 删掉那两行即可 ✓。**它是先加后撞的** ✓。
 
 ⇒ **规则：往一个文件里加东西之前，先看那个文件里已经有什么** —— 而这条规则的成本是**一次 grep**，收益是**不被编译器当众纠正** ✓。
+
+### 7.109 一个判据写错的代价，要以「它会驱动什么动作」来量（2026-09-26，t340）
+
+7.92 把 `status` 假阳的代价记成「守护进程死了却不再被拉起」。**mem-core 把它测出来了，而真实代价更重**：
+
+```
+假持久 root 的 pid 文件指向【另一个 root 的活 daemon】（pid 91340，命令行 --root "C:/tmp/t340/other"）
+改前（HEAD 的脚本）: health: ok / pid: 91340          ← 把别人的 daemon 认成自己的
+改后（身份 helper）: … pid: 91340 NOT OURS (name-match=True root-match=False: pid recycled or file stale)
+
+而改前的 stop 真的杀了无关进程:
+  old-daemon.ps1 stop -Force -Root <假 root> -Addr 127.0.0.1:8793
+  ⇒ stopped pid=504  → 那【是另一个 root 的 daemon】: GONE · 8793 unreachable ✗
+  改后: REFUSING to stop pid 91340 … nothing was stopped.  → ALIVE · 8793 = 200 ✓
+```
+
+⇒ **记下来的代价是「不再被拉起」，实测的代价是「stop 杀掉别人的 daemon」** —— 后者更重，且与 `watch` 无关 ✓。
+
+**⇒ 规则：一个判据写错的代价，要以「它会驱动什么动作」来量，而不是以「它看起来会怎样」来量。**
+
+**而 `name-match=True / root-match=False` 这个组合是有价值的**：它把「pid 被复用」与「根本没有进程」**分开**了 ✓ —— 两种情形需要两种处置（前者清 pid 文件、后者才是真死了）✓。
+
+### 7.110 它同时更正了【我契约里的前提】（2026-09-26，t340）
+
+我在 t340 的描述里写「status 是 watch 的判据 ⇒ 假阳会让重启被抑制」。**实测不是**：
+
+```
+watch 的分支条件是 Test-Health（:138），不是身份
+  健康地址 + pid 文件里是被复用的 pid ⇒ ok (no action)（日志记 pid=91340!not-ours）
+  死地址                              ⇒ health DOWN - restarting 并真起了 daemon（8797=200）✓
+⇒ pid 复用【不会】抑制重启
+```
+
+**⇒ 这是今天第四次「我写进契约的前提错了」，而这一次是成员用读数更正的** ✓（前三次：t294 的请求形状 · t298 的验收条数 · F-301b 的连字符假设）—— 而它更正的方式正是 7.45 要求的那种：**先量，再改口** ✓。
+
+**而假阴方向也被它构造出来了**：命令行 root 拼 `C:/…`、参数拼 `C:\…` ⇒ **只规范化一侧**时，一个**真 daemon 被判 not-ours** ⇒ `stop` 会**拒绝停掉操作者要求停的那个 daemon** ✗（实测 `REFUSING to stop pid 91340`，而那确实是它的真 daemon）⇒ 两侧都规范化后同一命令变 `(ours)` ✓。**两个方向各一次构造**（7.106）✓。
+
+**身份定义一处、三处共用**：`Get-DaemonIdentity` 返回 `Pid/ProcessExists/NameMatches/RootMatches/Ours` ⇒ `status` 打印它（并说明为什么不是 ours）· `stop` 用它拒绝 · `watch` 用它写日志 ✓ —— 与 7.86 的清理是同一份身份 ✓。
+
+（**已知未共用的一处**：`scripts/ruagent-canary.ps1` 有它自己的一套 root 匹配 ✓ —— 那条是我早先重写过的、当时是对的，但它现在**不是**从 `Get-DaemonIdentity` 来的 ⇒ 记在这里，免得下一个人以为「一份身份」已经覆盖全仓 ✓。）
