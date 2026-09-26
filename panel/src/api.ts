@@ -888,6 +888,30 @@ export const api = {
       `/api/v1/graph/entities?limit=${limit}`,
       { entities: "arrayOfTuples" },
     ).then((r) => r.entities),
+  /** t301: t276's hard delete (DELETE /api/v1/graph/entity/{id}). When the id
+   *  is unknown the daemon writes nothing and answers 404 `entity not found` —
+   *  which is an ANSWER here (someone already deleted it), not a request
+   *  failure, so the return type tells the two apart instead of throwing.
+   *  Success carries t276's counts: edges_removed is every associated edge row
+   *  (including superseded history), facts_removed is the still-valid subset. */
+  graphEntityDelete: (id: number) =>
+    send("DELETE", `/api/v1/graph/entity/${id}`)
+      .then(
+        (r) =>
+          r.json() as Promise<{
+            outcome: string;
+            id: number;
+            edges_removed: number;
+            facts_removed: number;
+          }>,
+      )
+      .then((r) => ({ ok: true as const, ...r }))
+      .catch((e: unknown) => {
+        if (e instanceof HttpError && e.status === 404) {
+          return { ok: false as const, notFound: true as const };
+        }
+        throw e;
+      }),
   graphSearch: (q: string) =>
     get<{ entities: GraphEntity[] }>(`/api/v1/graph/search?q=${encodeURIComponent(q)}`).then(
       (r) => r.entities,

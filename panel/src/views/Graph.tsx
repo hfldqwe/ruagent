@@ -3,7 +3,7 @@
 // as-of queries, neighbors). A plain list mode stays one toggle away.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Input, Segmented, Table } from "antd";
+import { Button, Input, Popconfirm, Segmented, Table } from "antd";
 import { Icon, type IconName } from "../icons";
 import { api, type GraphEdge, type GraphEntity } from "../api";
 import { Empty, ErrorState, Modal, ReadoutStrip, Spinner, useToast } from "../ui";
@@ -1353,6 +1353,9 @@ function EntityDetail({
   const [neighbors, setNeighbors] = useState<[GraphEntity, number][] | null>(null);
   const [at, setAt] = useState("");
   const [addingFact, setAddingFact] = useState(false);
+  // t301: the entity's hard-delete entry (t276's DELETE route had no consumer).
+  const [deleting, setDeleting] = useState(false);
+  const [deleteMsg, setDeleteMsg] = useState<string | null>(null);
   // Publish the dialog's open state upward; the cleanup also clears it on
   // unmount, so a stale `true` can never disable Escape for good.
   useEffect(() => {
@@ -1397,6 +1400,49 @@ function EntityDetail({
         <Button type="primary" onClick={() => setAddingFact(true)}>
           + {t("graph.addFact")}
         </Button>
+        <Popconfirm
+          title={t("graph.delete.title", { name: entity.name })}
+          description={t("graph.delete.hint", {
+            facts: (facts ?? []).filter((f) => f.invalid_at == null).length,
+            neighbors: neighbors?.length ?? 0,
+          })}
+          okText={t("graph.delete.btn")}
+          cancelText={t("common.cancel")}
+          onConfirm={async () => {
+            setDeleting(true);
+            setDeleteMsg(null);
+            try {
+              const r = await api.graphEntityDelete(entity.id);
+              if (r.ok) {
+                toast(
+                  "ok",
+                  t("graph.delete.done", {
+                    edges: r.edges_removed,
+                    facts: r.facts_removed,
+                  }),
+                );
+                onGraphChanged();
+                onClose();
+              } else {
+                // 404 is an answer, not a failure: say so and refresh, so the
+                // canvas stops showing a node the store no longer has.
+                setDeleteMsg(t("graph.delete.notFound"));
+                onGraphChanged();
+              }
+            } catch (e) {
+              setDeleteMsg(
+                `${t("graph.delete.failed")} ${String((e as Error)?.message ?? e).slice(0, 80)}`,
+              );
+            } finally {
+              setDeleting(false);
+            }
+          }}
+        >
+          <Button danger type="text" loading={deleting}>
+            {t("graph.delete.btn")}
+          </Button>
+        </Popconfirm>
+        {deleteMsg ? <span className="muted micro">{deleteMsg}</span> : null}
         <Button type="text" onClick={onClose} aria-label={t("common.close")}>
           <Icon name="x" size={14} />
         </Button>
