@@ -113,3 +113,27 @@ cd panel && npm run test:e2e -- --output=/tmp/pw
 ## Testing philosophy
 
 The mock ACP agent (`crates/mock-agent`) is the backbone of CI: every orchestration/policy/memory behavior must be testable without real harnesses or API keys. Property tests guard the injection contract (bounded, tagged, visible truncation).
+
+### Processes this repo starts must not put a window on screen
+
+Two shapes have cost real time, and both are about the window rather than the work.
+
+**A WMI launch hands its child a console unless told otherwise.** The start action builds
+the command as `cmd.exe /c ...` (that is the redirection shape that appends to the log
+instead of truncating it) and creates it through `Win32_Process.Create`. Pass the startup
+information with `ShowWindow = 0`, or every start -- and every restart `watch` performs --
+puts a console window in front of whoever is using the machine:
+
+```powershell
+$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()
+$startup.ShowWindow = 0
+$res = ([wmiclass]'Win32_Process').Create($cmd, $cwd, $startup)
+```
+
+**A killed tool call does not necessarily kill its descendants.** When a long probe is
+cancelled at a wall-clock ceiling, the `cmd.exe`, `node` and browser processes it started
+can survive it as orphans. So: wrap anything that starts a child in `-WindowStyle Hidden`,
+run Playwright through the repo entry point (`node e2e/run-e2e.mjs`) rather than
+`npx playwright test` (which goes through a `cmd.exe` shim), have a probe close its own
+browser, and at the start of the next call look for orphans **by command line matching
+your own temporary path** -- never by process name or by port.
