@@ -796,3 +796,20 @@ t290 的 COST 注释说「a second pass over the same two legs」—— 现在�
 **规则**：**一条读数要先问它在哪个面上才重要**，再决定要不要动手。（同族：判据的结论取决于采样面。）
 
 **顺带一组端点延迟读数（活体，各一次）**：`memory/list` 默认 500 行 12.6ms / 74KB · `memory/list?limit=20` 4.1ms · `recall/log?limit=20` 3.5ms · `knowledge/documents` 3.1ms · `graph/entities?limit=500` 3.7ms · `graph/edges?limit=600` 4.0ms · `sessions` 25.3ms / 105KB · `index.html` 2.4ms。**唯一慢的是 `knowledge/search`（99ms，即上面那条逐腿代价）。**
+
+**7.43 的收口（同日，t319）**：复现 `samples=23 non200=2 window_ms=264` ⇒ 改成「**构建到暂存目录 + 原子替换**」（vite 输出到 `dist-staging`，只把新 assets **复制进** `dist/assets`，再写 `index.html.tmp` 并 `rename` 覆盖，**最后**才清理不再被引用的旧文件）⇒ 改后 `samples=51 non200=0 window_ms=0` ✓；失败注入 `exit=1` 且 `dist/index.html` 的 md5 **前后完全相同**、assets 55→55、`curl /` 仍 200 ✓。
+
+**它没有选 `emptyOutDir:false`，理由值得记**：那也能消掉窗口，但会**永久留下陈旧文件**且没有安全的清理时机；暂存 + rename 让清理发生在**新 index 生效之后**。
+
+### 7.49 §7.17 的增补：显式路径提交对【新文件】不成立（2026-09-26，t319）
+
+ui-work 第一次提交报的 hash 是 `(unknown)` —— 因为它**失败了**：
+
+```
+git commit -F <msg> -- panel/scripts/build-panel.mjs panel/package.json .gitignore
+error: pathspec 'panel/scripts/build-panel.mjs' did not match any file(s) known to git
+```
+
+⇒ **显式路径形式不会把未跟踪的新文件纳入提交**；正确顺序是 **先 `git add <自己的路径>` → 再 `git commit -F <msg> -- <同样的路径集>` → 再跑三条判定**。
+
+**而 §7.17 的第 ① 条（`git log -1 --format=%H -- <路径>` 必须是一个【新】hash）当场就把它抓住了** —— 它读到的是**空 hash**，而不是以为提交成功 ✓。**这是那条纪律今天第二次证明自己有用**（第一次是 t284 的「已提交」而没有提交）。
