@@ -88,8 +88,9 @@ if (flag("detach", false) === true) {
   const log = join(PANEL, "tools", ".audit-shards-detached.log");
   const inner = "node tools/audit-shards.mjs " + argv.filter((a) => a !== "--detach").join(" ") + " > " + log.replace(/\//g, "\\") + " 2>&1";
   const cmd = 'cmd.exe /c cd /d ' + PANEL.replace(/\//g, "\\") + " && " + inner;
-  const ps = "\\$cmd = '" + cmd.replace(/'/g, "''") + "'; \\$s = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); \\$s.ShowWindow = 0; \\$r = ([wmiclass]'Win32_Process').Create(\\$cmd, '" + PANEL.replace(/\//g, "\\") + "', \\$s); Write-Output ('pid=' + \\$r.ProcessId)";
+const ps = "$cmd = '" + cmd.replace(/'/g, "''") + "'; $s = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $s.ShowWindow = 0; $r = ([wmiclass]'Win32_Process').Create($cmd, '" + PANEL.replace(/\//g, "\\") + "', $s); Write-Output ('pid=' + $r.ProcessId + ' rc=' + $r.ReturnValue)";
   const res = spawnSync("powershell", ["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], { encoding: "utf8" });
+  if (!/pid=\d+/.test(res.stdout || "")) { console.error("[shards] DETACH FAILED (no pid from WMI): " + (res.stdout || "") + (res.stderr || "")); process.exit(2); }
   console.log("[shards] detached (ShowWindow=0, WMI): " + (res.stdout || "").trim() + " · log=" + log);
   console.log("[shards] the child outlives this shell; poll the log, then re-run without --detach to read the aggregate.");
   process.exit(0);
