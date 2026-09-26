@@ -64,6 +64,27 @@ reading, not the inference.
 | --- | --- | --- | --- |
 | H1 | low | `?dry_run=true` is accepted and silently ignored (202, a real build starts, the stored row is `dry_run=0`/`done`). Only the body flag works. A caller using the query-parameter form cannot tell the dry-run did not happen. | Either read the flag from the query string as well, or reject an unrecognised `dry_run` query parameter instead of ignoring it. |
 
+> **H1 RESOLVED (window 2).** Filed as t300 and fixed. Live readings after the switch:
+>
+> ```
+> bad side : POST …/wiki/build?dry_run=true + body {}  -> 400
+>            "these query parameters are not read: dry_run. Send them as JSON body fields"
+> good side: POST …/wiki/build  body {"dry_run":true,"scope":"all"} -> 200 {build_id:7, pages_planned:4}
+> wiki_builds id 7 = dry_run=1, status 'planned_only', finished_at set
+> old rows 1/4 still planned/no finished_at (not backfilled); 2/3/5/6 untouched
+> ```
+>
+> The fix took the **speaking** branch, not the silent-accept-both branch: the
+> rejection names the parameter and says where it belongs. The good side still
+> works, so the two-sided criterion I asked for is met on both sides — a fix that
+> had made only the bad side 400 while breaking the body path would have looked
+> green under a one-sided reading.
+>
+> Verification of t300 proper is not mine; this note records only that the
+> criterion this document set is satisfied, so the next reader does not chase a
+> fixed problem. (Mirror of the G1 case above: a wrong finding left visible, and
+> a fixed finding left open, both mislead.)
+
 ## Why this correction is here and not in the task record
 
 The task record is terminal and immutable: t294 stands as `failed` with
