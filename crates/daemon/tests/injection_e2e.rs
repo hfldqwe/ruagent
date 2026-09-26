@@ -8,7 +8,16 @@
 //!
 //! WHAT IT DRIVES: a real in-process daemon over a real TCP socket, a real
 //! RunManager, a real SQLite + knowledge base in a throwaway root, and the real
-//! mock-agent binary over real ACP. The assertion is on the run's FIRST-CLASS
+//! mock-agent binary over real ACP. BOTH producers are covered -- the run path
+//! (t292) and the chat path (t302), which had no test touching its injection at
+//! all until then, even though t259 called it the MAIN path.
+//!
+//! THREE LEVELS, in the order they can fail: the render proves the CONSTRUCTION,
+//! the context_injected event proves it was SENT, and the mock agent's echoed
+//! prompt proves it was RECEIVED. A test that stops at the first level stays
+//! green while the send is truncated.
+//!
+//! The assertion is on the run's FIRST-CLASS
 //! transcript event (context_injected), which is what the daemon itself
 //! records -- never on /api/v1/recall, which would append a recall_log row and
 //! make the test a producer of the data it inspects.
@@ -34,6 +43,9 @@ use ruagent_store::Db;
 /// The memory that must reach the agent in BOTH directions: without it the
 /// "no knowledge block" case could pass by having no blocks at all.
 const MEMORY: &str = "t292-memory-the-user-prefers-concise-answers";
+/// A profile memory, so the two paths emit the same block SET and their block
+/// headers can be compared directly (the drift check).
+const PROFILE: &str = "t302-profile-the-user-is-a-rust-developer";
 const PROMPT: &str = "where does the deploy script live";
 const SOURCE_TEXT: &str = "t292-source-the-deploy-script-lives-in-scripts-release-sh";
 const WIKI_TEXT: &str = "t292-wiki-generated-summary-of-the-release-process";
@@ -160,6 +172,25 @@ default = "ask"
     assert!(
         matches!(outcome, ruagent_memory::WriteOutcome::Inserted(_)),
         "seeding the memory failed: {outcome:?}"
+    );
+    // A profile memory too: both paths read profile/user, so this makes their
+    // block sets comparable in the wording test.
+    let profile = ruagent_memory::write_memory(
+        &db,
+        &ruagent_memory::MemoryWrite {
+            store: ruagent_memory::MemoryStore::Profile,
+            namespace: ruagent_memory::Namespace::parse("user").unwrap(),
+            content: PROFILE.into(),
+            confidence: 0.9,
+            source_episode: None,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(profile, ruagent_memory::WriteOutcome::Inserted(_)),
+        "seeding the profile failed: {profile:?}"
     );
     if with_knowledge {
         knowledge.save("t292-runbook", SOURCE_DOC).await.unwrap();
@@ -365,5 +396,200 @@ async fn run_without_knowledge_documents_has_no_knowledge_block() {
     assert!(
         !echoed.contains("<knowledge>"),
         "the agent saw a knowledge block that should not exist: {echoed}"
+    );
+}
+
+/// Drive one real CHAT and return (the context_injected render, the agent's own
+/// view of its prompt). Same three-level reading as drive_run: the render proves
+/// the construction, the event proves it was sent, the echo proves the agent
+/// received it.
+async fn drive_chat(d: &TestDaemon, prompt: &str) -> (String, String) {
+    let http = reqwest::Client::new();
+    let chat: serde_json::Value = http
+        .post(format!("{}/api/v1/chat", d.url))
+        .json(&serde_json::json!({ "agent": "mock" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let chat_id = chat["id"].as_str().unwrap().to_string();
+    http.post(format!("{}/api/v1/chat/{chat_id}/messages", d.url))
+        .json(&serde_json::json!({ "text": prompt }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let path = d
+        .root
+        .join("data")
+        .join("transcripts")
+        .join(format!("run-{chat_id}.jsonl"));
+
+    let mut render = None;
+    let mut echoed = String::new();
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                match v["event"]["type"].as_str() {
+                    Some("context_injected") => {
+                        render = v["event"]["render"].as_str().map(|s| s.to_string());
+                    }
+                    Some("agent_message_chunk") => {
+                        if let Some(t) = v["event"]["content"][0]["text"].as_str() {
+                            echoed.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if render.is_some() && !echoed.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let render = render.unwrap_or_else(|| {
+        panic!(
+            "no context_injected event in the chat transcript {} -- the first prompt              carried no context at all",
+            path.display()
+        )
+    });
+    assert!(
+        !echoed.is_empty(),
+        "the agent echoed nothing, so this test would be asserting a prompt that          was never sent: {}",
+        path.display()
+    );
+    (render, echoed)
+}
+
+/// The block headers of a render, in the order they appear. This is the thing
+/// that DRIFTED once (a097c5e): the wording a producer wraps its blocks in.
+fn headers_of(render: &str) -> Vec<String> {
+    render
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with('<') && l.ends_with('>') && !l.starts_with("</"))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// THE CHAT PATH, three levels deep. t292 covered the run path; this is the path
+/// t259 called the MAIN one and the one that had already drifted once, and until
+/// now it had no test touching its injection at all (injection_context had two
+/// references: its definition and its one call site).
+#[tokio::test]
+async fn chat_injects_memory_knowledge_and_wiki() {
+    let Some(d) = boot("chatwithkb", true).await else {
+        skip_missing_mock();
+        return;
+    };
+    let (render, echoed) = drive_chat(&d, PROMPT).await;
+    println!("T302 CHAT WITH render>>>{render}<<<");
+
+    assert!(
+        render.contains("<relevant_memories>"),
+        "the chat path injects no memory block: {render}"
+    );
+    assert!(render.contains(MEMORY), "{render}");
+    assert!(
+        render.contains("<knowledge>"),
+        "a real chat's first prompt carries no knowledge block: {render}"
+    );
+    assert!(
+        render.contains(SOURCE_TEXT),
+        "the source document did not reach the chat context: {render}"
+    );
+    assert!(
+        render.contains("<wiki>"),
+        "a real chat's first prompt carries no wiki block: {render}"
+    );
+    assert!(
+        render.contains(WIKI_TEXT),
+        "the wiki page did not reach the chat context: {render}"
+    );
+    // Level 3: the agent RECEIVED it (the mock echoes its prompt).
+    assert!(
+        echoed.contains(SOURCE_TEXT) && echoed.contains(WIKI_TEXT) && echoed.contains(MEMORY),
+        "the agent's echoed prompt does not contain the injected context: {echoed}"
+    );
+}
+
+/// The same drive with an empty knowledge base: the knowledge and wiki blocks
+/// must be ABSENT, and the memory block must still be there -- otherwise this
+/// test cannot tell "correctly empty" from "never wired up".
+#[tokio::test]
+async fn chat_without_knowledge_documents_has_no_knowledge_block() {
+    let Some(d) = boot("chatnokb", false).await else {
+        skip_missing_mock();
+        return;
+    };
+    let (render, echoed) = drive_chat(&d, PROMPT).await;
+    println!("T302 CHAT WITHOUT render>>>{render}<<<");
+
+    assert!(
+        render.contains("<relevant_memories>") && render.contains(MEMORY),
+        "the memory block must survive the missing knowledge base: {render}"
+    );
+    assert!(
+        !render.contains("<knowledge>"),
+        "an empty knowledge base must produce NO knowledge block in a chat: {render}"
+    );
+    assert!(
+        !render.contains("<wiki>"),
+        "an empty knowledge base must produce NO wiki block in a chat: {render}"
+    );
+    assert!(
+        !echoed.contains("<knowledge>"),
+        "the agent saw a knowledge block that should not exist: {echoed}"
+    );
+}
+
+/// THE DRIFT CHECK (the direct answer to "the two paths have drifted once
+/// already", a097c5e). Both producers now render through the same contract, so
+/// their block headers must be IDENTICAL -- and the old chat-only header must be
+/// gone from both.
+#[tokio::test]
+async fn chat_and_run_use_the_same_block_wording() {
+    let Some(d) = boot("wording", true).await else {
+        skip_missing_mock();
+        return;
+    };
+    let (chat_render, _) = drive_chat(&d, PROMPT).await;
+    let (run_render, _) = drive_run(&d, PROMPT).await;
+
+    let chat_headers = headers_of(&chat_render);
+    let run_headers = headers_of(&run_render);
+    let old_header = ruagent_daemon::chat::HDR_MEMORY;
+    println!("T302 chat_headers={chat_headers:?}");
+    println!("T302 run_headers={run_headers:?}");
+    println!("T302 old_chat_only_header={old_header:?}");
+    println!(
+        "T302 old_header_present chat={} run={}",
+        chat_render.contains(old_header),
+        run_render.contains(old_header)
+    );
+
+    assert_eq!(
+        chat_headers, run_headers,
+        "the two injection producers emit different block headers -- that is the          drift a097c5e recorded, and this is the test that would catch it again"
+    );
+    assert!(
+        !chat_render.contains(old_header) && !run_render.contains(old_header),
+        "the retired chat-only header is back: chat={} run={}",
+        chat_render.contains(old_header),
+        run_render.contains(old_header)
+    );
+    assert!(
+        chat_headers.contains(&"<knowledge>".to_string())
+            && chat_headers.contains(&"<wiki>".to_string()),
+        "the wording test is only meaningful while both paths actually carry the          knowledge blocks: {chat_headers:?}"
     );
 }
