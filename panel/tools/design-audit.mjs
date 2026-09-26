@@ -2847,7 +2847,11 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
         return r.width >= 1 && r.height >= 1 && cs.display !== "none" && cs.visibility !== "hidden";
       };
       return [
-        ...document.querySelectorAll("[role=tab], [role=radio], input[type=radio], button[aria-pressed], select, [role=combobox]"),
+        // t337 MEASURED: a combobox/select is NOT a switch this step can click open -- antd
+        // opens on mousedown, so a DOM .click() here was a silent no-op on every route and left
+        // hash2 === hash1. Comboboxes are handled by the dedicated branch below (step 3), which
+        // opens them with mousedown and asserts the selection actually changed.
+        ...document.querySelectorAll("[role=tab], [role=radio], input[type=radio], button[aria-pressed], "),
       ].filter(shown).length;
     });
     out.hash1 = await page.evaluate(() => location.hash);
@@ -2886,7 +2890,9 @@ async function probeUrlState(page, baseUrl, restore, route, taskId) {
       // 2) a Select: open it here, the option is picked in the next step
       const picker = [...document.querySelectorAll("[role=combobox], select")].filter(vis)[0];
       if (picker) {
-        picker.click();
+        // t337: do NOT click it here -- antd opens on mousedown and the picker branch below opens
+        // it with a real mousedown, then picks a NON-selected option and asserts the change.
+        // (A DOM .click() here was the silent no-op that kept row 58 red on every route.)
         return "picker-opened";
       }
       return false;
