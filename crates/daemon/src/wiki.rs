@@ -1945,7 +1945,10 @@ mod tests {
         // `if let Err(e) = done` / `let _ =` looked at, and it is Ok.
         let old_shape = db
             .call(move |conn| {
-                conn.execute("UPDATE wiki_builds SET status = 'failed' WHERE id = ?1", [id])
+                conn.execute(
+                    "UPDATE wiki_builds SET status = 'failed' WHERE id = ?1",
+                    [id],
+                )
             })
             .await;
         assert!(
