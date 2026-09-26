@@ -2152,7 +2152,10 @@ mod t313_tests {
         }
     }
 
-    #[tokio::test]
+    // current_thread on purpose: the capture below is a thread-local subscriber,
+    // and a multi-threaded runtime may resume the future on a worker that never
+    // saw it (which made this test pass alone and fail in the whole suite).
+    #[tokio::test(flavor = "current_thread")]
     async fn the_no_op_is_debug_and_a_real_failure_is_still_a_warn() {
         let buf = BufWriter::default();
         let sub = tracing_subscriber::fmt()
