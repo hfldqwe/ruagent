@@ -2168,7 +2168,12 @@ mod t313_tests {
         auto_distill_now(&distiller, "ruagent:t313-empty", None, 0).await;
         let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         println!("READING (a) no turns =>\n{logged}");
-        assert!(logged.contains("nothing to distill"), "{logged}");
+        // Level-independent on purpose. A sibling test can install the process
+        // default at INFO, and then the DEBUG line never reaches any subscriber
+        // -- asserting on it made this test pass alone and fail in the suite,
+        // which is the same false red t313 is about. The no-op is pinned by the
+        // DistillAttempt it returns (above); what is asserted here is that it
+        // does NOT warn.
         assert!(!logged.contains("auto-distill failed"), "{logged}");
 
         buf.0.lock().unwrap().clear();
