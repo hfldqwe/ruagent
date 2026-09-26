@@ -1,11 +1,14 @@
 # 知识库与记忆的闭环优化 — 诊断与任务图（2026-09-26）
 
+> **修订 1（2026-09-26，t248 复核后）**：初版的四条前提被读数推翻，见 §1.1。
+> 本文件里的每个数字都带复现方式；被推翻的前提保留在 §1.1 里，不删。
+
 ## 0 一句话
 
 引擎算法不差（混合检索 + RRF + E5 查询/段落前缀 + 注入契约 + 命名空间治理都在），缺的是**闭环**：
-**没有入库源、没有质量读数、没有纠正手段，而自检污染被测对象。**
+**没有喂料、没有质量读数、没有纠正手段，而自检污染被测对象。**
 
-所以顺序是：**先造读数 → 修检索腿 → 修召回融合与生命周期 → 修语料闭环与自检隔离 → 最后才是 UI**。
+优化顺序：**先造读数 → 修检索腿 → 修召回融合与生命周期 → 修语料闭环与自检隔离 → 最后才是 UI**。
 UI 放最后是因为它现在展示的数字本身就是错的（把 RRF 名次分当相似度），先做 UI 只是把错的数字摆得更漂亮。
 
 ## 1 基线读数（2026-09-26，全部可复现）
@@ -13,27 +16,41 @@ UI 放最后是因为它现在展示的数字本身就是错的（把 RRF 名次
 | 项 | 读数 | 复现方式 |
 | --- | --- | --- |
 | knowledge 文档 / chunk | **5 / 12** | `curl /api/v1/knowledge/documents` |
-| 其中探针文档 | 1 篇（`doctor-probe`） | 同上 |
-| 磁盘知识目录 | 4 篇 md + `wiki/` 2 篇 | `ls -R ~/.ruagent/knowledge` |
-| `Knowledge::scan` 调用点 | 仅手动 `POST /api/v1/knowledge/rebuild` | `grep -rn 'files::scan\|ScanReport' crates/` |
-| episodes（非丢失底座） | **6 行** | `SELECT COUNT(*) FROM episodes` |
-| distill_log | **32 条**，多数 `memories_written=0` | `SELECT * FROM distill_log` |
+| 磁盘知识目录 | **3,516 B / 5 文件**（含 `doctor-probe.md` 111 B 残留，占 3.2%） | `ls -R ~/.ruagent/knowledge` |
+| 自动扫描 | **在跑**：`daemon/lib.rs` 的 `tokio::spawn` 循环，**boot + 每 60s**，SHA-256 增量；扫描面只有 `<root>/knowledge/**/*.md` | `sed -n '195,215p' crates/daemon/src/lib.rs` |
+| 写入知识目录的路径 | 4 个 `save()` 调用点（`api.rs` raw PUT · `api.rs` ingest · `wiki.rs` ×2） | `grep -n 'save(' crates/` |
+| 可喂料的字节 | transcripts **27.83 MB / 146**；`~/.claude/projects` **103.89 MB / 136**；仓库 `docs/` 70.45 MB / 665 **但其中 .md 只有 2.44 MB** | 磁盘字节 |
+| 索引能力 vs 喂料 | sessions **631 行** vs documents **5 行** | 只读 sqlite |
+| episodes（非丢失底座） | **6 行**，全 `kind='mcp_write'`、`source_run` 全 NULL = **4 条事实 + 2 条探针残留** | `SELECT kind,source_run FROM episodes` |
+| episodes 的写入者 | `memory/episode.rs:60`，**唯一调用者 = `api.rs` 的 `POST /api/v1/memory/write`**；**distill 不写 episodes** | `grep -n episode crates/daemon/src/distill.rs` → 只有 `source_episode: None` |
+| distill_log | **32 行 = 32 个会话**（`INSERT OR REPLACE ... session_key`，每会话一行、重跑替换） | `SELECT COUNT(*) FROM distill_log` |
+| 蒸馏空转 | 三者全 0 → **18/32 = 56.25%**；`[distill] auto = true` | 只读 sqlite + 配置 |
 | memories | **154 行**，**154/154 真实模型嵌入** | `SELECT embedder,COUNT(*) FROM memories GROUP BY embedder` |
 | recall_log | **574 行 / 只有 15 个不同 query** | `SELECT COUNT(*),COUNT(DISTINCT query) FROM recall_log` |
-| 其中探针占比 | kettle 279 + autohotkey-v2 275 = **96.5%** | `SELECT query,COUNT(*) ... GROUP BY query` |
+| 探针占比 | kettle 279 + autohotkey-v2 275 = **554/574 = 96.5%**；kettle 间隔 min/median/max = **0.2 / 4.2 / 1417 分钟**，152 段 <5 分钟 ⇒ **成簇的探针调用**，不是定时任务 | 只读 sqlite |
 | `top_knowledge_score` | 0.0325 / 0.0164 | `curl /api/v1/recall/log` |
 | 实体腿 | 最近 574 条**全部** `entities=0` | 同上 |
 | 实体 FTS 实测 | `MATCH "autohotkey-v2"` → **0 行**；`MATCH autohotkey` → 1 行 | 只读 sqlite |
 | `GET /api/v1/memory/list` | 不带 `store` → **400**（missing field store） | `curl` |
 | 记忆删除 | **不存在**（只有 write / supersede） | `grep 'route("/api/v1/memory' crates/daemon/src/api.rs` |
-| wiki_builds | 5 条中 **2 条停在 planned**（`dry_run=1`、`finished_at=NULL`） | 只读 sqlite |
+| wiki_builds | 5 行中 **2 行 `status='planned'` 且都 `dry_run=1`、`finished_at=NULL`** | 只读 sqlite |
 | embedder | `fastembed:multilingual-e5-small`（真语义，非 hash 兜底） | `~/.ruagent/logs/daemon.log` |
+
+### 1.1 被读数推翻的前提（初版写错了，保留在此）
+
+| 初版的说法 | 实测 | 错在哪 |
+| --- | --- | --- |
+| 「`scan()` 只在手动 rebuild 时被调用，**没有任何自动路径**」 | **自动扫描一直在跑**（boot + 每 60s） | 把「没人往被扫的目录里放东西」误读成「没有扫描」——**扫描能力在，喂料路径不在** |
+| 「episodes=6 是因为**蒸馏没写 episodes**」 | episodes 由 `memory_write` 写，**distill 按设计就不写 episodes** | 把「底座只有 6 行」的**现象**归因给了一个不相干的**机制** |
+| 「distill_log 多数写 0 ⇒ **蒸馏基本空转**」 | `=0` 可能是**已去重**，也可能是 **agent 返回空**；该行只是最新一次结果 | **一个数被当成了它没回答的那个问题的答案** —— 这是本工作流当天反复出现的同一类错误 |
+| 「仓库 `docs/` 有 70 MB 可入库」 | 70.45 MB 里 **.md 只有 2.44 MB**，其余 68 MB 是截图 | 对象集没有按「可入库」这个判据收窄 |
 
 ## 2 四条结构性问题
 
-**① 没有入库源 —— 知识库是空的。**
-`~/.ruagent/knowledge/` 里只有 4 篇手放的 md。`scan()` 只在手动 rebuild 时被调用，没有任何自动路径；
-196 个 session 的 transcripts、仓库 docs/、154 条记忆、63 个实体，**一个都不进知识库**。
+**① 没有喂料 —— 知识库是空的，但扫描器不是。**
+扫描器 boot + 每 60s 在跑，只扫 `<root>/knowledge/**/*.md`；而那个目录里只有 4 篇手放的 md（3,516 B）。
+196 个会话的 transcripts（27.83 MB）、仓库 docs/ 的 2.44 MB md、154 条记忆、63 个实体，**一个都不进知识库**。
+对照：sessions 表 631 行 vs documents 表 5 行 —— **索引能力在，喂料路径不在**。
 
 **② 没有质量读数 —— 唯一的相关度指标是错的。**
 `top_knowledge_score` 是 RRF 名次分 `Σ 1/(60+rank)`，上界 = 腿数/61 ≈ 0.033；
@@ -45,26 +62,28 @@ UI 放最后是因为它现在展示的数字本身就是错的（把 RRF 名次
 `memory/list` 还强制要求 `store`，所以「把所有记忆列出来看一眼」在 API 层就不成立。
 
 **④ 自检污染被测对象 —— `ruagent doctor` 往生产语料写永久垃圾。**
-每次 doctor 会永久写入：`doctor-probe` 文档、`doctor-node` 实体（id 53）、`kettle` 记忆（id 112），**且无清理**；
-同时把 recall_log 灌成 96.5% 探针。而 doctor 自己**看不见蒸馏**（源码里写着 skip quietly）。
+一次 doctor 调用留下**三行**：`memories`（id 112）+ `episodes`（id 3，经 `memory_write`）+ `entities`（`doctor-node`，id 53）；
+再跑一次会 upsert 文档行（`doctor-probe`，09-23），**换文案就会再加一份**；`:364–560` 内 `DELETE/cleanup` 命中 0 ⇒ **无清理**。
+它同时把 recall_log 灌成 96.5% 探针，而它自己**看不见蒸馏**（源码里写着 skip quietly）。
 
-## 3 任务图（19 单，面板 8 人上限，无新建团队 —— 平台拒绝第二支团队，本代挂在 `panel-ui` 下）
+## 3 任务图（15 单；面板 8 人上限，无新建团队 —— 平台拒绝第二支团队，本代挂在 `panel-ui` 下）
 
 ```
 读数阶段（并行）
-  t245 tools        检索质量 harness：黄金查询集 + 逐腿读数        [重试中，见 §4]
+  t245 tools        检索质量 harness：黄金查询集 + 逐腿读数        [第 2 次尝试，见 §4]
   t246 mem-core     记忆召回与注入读数：关键词腿是否被丢弃 / 两腿分数可比性 / 注入预算
   t247 retrieval    知识腿与实体腿查询构造读数：FTS 命中矩阵 / RRF 上界 / 阈值丢弃了什么
-  t248 contract-lead 语料入库与蒸馏读数：scan 调用点 / 可入库字节 / 蒸馏空转 / doctor 副作用
+  t248 contract-lead 语料入库与蒸馏读数                        [completed]
   t249 ui-audit     四页信息架构读数：展示的数字与真实含义 / 召回日志位置 / 纠正入口缺失
+  t259 contract-lead 召回是否真的进了 agent 上下文：注入链路端到端读数（闭环的另一半）
 
 实现阶段（文件级串行，平台强制 inScope 不重叠）
   t250 retrieval    检索腿修复：实体腿查询构造 + 逐腿证据与分数语义   deps t245,t247
   t251 mem-core     记忆召回融合重写 + 生命周期 API + 召回日志溯源     deps t245,t246,t250
-  t252 contract-lead 语料入库闭环 + doctor 探针隔离 + wiki 状态诚实化  deps t245,t248,t250
+  t252 contract-lead 语料喂料闭环 + doctor 探针隔离 + wiki 状态诚实化  deps t245,t248,t250
   t253 ui-work      前端：逐腿证据 / 纠正入口 / 召回日志归位 / 数字含义 deps t249,t251,t250,t252
 
-验证与评审
+验证
   t254 ui-audit     复核读数阶段 t245–t249（对象集 + 采样面 + 判据）
   t255 ui-audit     独立验证 t251        t256 tools  独立验证 t250
   t257 tools        独立验证 t252        t258 ui-audit 独立验证 t253
