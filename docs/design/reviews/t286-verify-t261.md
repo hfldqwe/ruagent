@@ -77,3 +77,49 @@ grep -n 'legacy_|keyword_stage|Like' crates/knowledge/tests/retrieval-quality.rs
 
 * 我另写的仓外 LIKE 探针（`C:/tmp/t286/probe`，只用 knowledge+store+tokio）**链接失败**（共享 target dir 里 lancedb/fastembed 的链接冲突，输出被截断），没有重试 —— LIKE 段因此改用「我跑 t261 自己的 stage 测试」这条路径取证（上面 ④）。可证伪：把探针放到独立 target dir 重跑，应打印 `stage=Substring` 且 `raw_score=0.0`。
 * 未跑全 workspace 测试（不在本单判据内，且工作区有队友在途改动）。
+
+
+---
+
+# 更正（同日，接到 retrieval 的时间线说明后重测）—— 撤回 F-286a，结论改为 pass
+
+**retrieval 是对的：我那条 17/18 是「工作区在途树（t261 + 未提交的 t270 守卫）」的读数，不是 t261 提交的读数。**
+
+## 重测：把改后侧钉到提交 23add4e 本身
+
+```bash
+git archive 23add4e | tar -x -C C:/tmp/t286b/after        # t261 自己的提交
+sed -i version 0.3.2 该树/crates/{knowledge,store}/Cargo.toml   # 避开跨树产物串扰
+cargo test -p ruagent-knowledge --test retrieval-quality -- --nocapture
+```
+
+| 运行 | 产物 | 仪器 | keyword 非空 | fused |
+| --- | --- | --- | --- | --- |
+| 钉住提交 23add4e | 23add4e | 23add4e 自带（md5 6f0ffb09…） | **18/18**（空腿 = 无） | 1.0000 / 1.0000 / 1.0000 |
+| 钉住提交 23add4e | 23add4e | **当前 harness**（md5 ea869809…，与仓库一致） | **18/18** | 1.0000 / 1.0000 / 1.0000 |
+| 我 21:49 的那次 | **工作区**（含未提交的 t270 守卫） | 当前 harness | 17/18 | 1.0000 / 1.0000 / 1.0000 |
+| 改前 880764b | 880764b | 当前 harness | 8/18 | 0.6667 / 0.8667 / 0.7500 |
+
+⇒ **仪器被排除**（同一仪器在钉住提交上给 18/18），17 与 18 的差 **100% 来自产物**，即 t270 的 `MIN_RECALL_ASCII=3` 守卫。
+⇒ **t261 自报的 8/18 → 18/18 与 fused 四组数在其自身提交上全部复现** ⇒ **F-286a 撤回**。
+
+## 身份证明的补强（这次做对了）
+
+钉住树的链接证明：`libruagent_knowledge-7832acd6bb5bc968.rlib` 里 `KeywordStage` = **5**（t261 的符号）而 `MIN_RECALL_ASCII` = **0**（**没有** t270 的守卫）⇒ 一次 grep 就同时证明了「是 t261」与「不是 t270」。
+我上次只证明了「是 post-t261 的库」（`KeywordStage`=5），**没有**证明「等于 23add4e 的字节」——**把「链接证明」当成了「提交证明」，这是本单的方法学错误**。工作区在途改动对验证者的杀伤面与对实现者一样大；t257/t252 登记的「被测改动必须先进提交再派验证单」这条规则，这次是**我**踩了。
+
+## 那条「违例」其实是 t270 的预期效果（独立复现）
+
+钉住提交上 `how do I change a bicycle tyre` 的 keyword 腿 = **10 条命中**，raw_score = `[-2.065353, -3e-06, -3e-06, -3e-06, -3e-06, -2e-06, -2e-06, -2e-06, -2e-06, -2e-06]` ⇒ 除首条外全是 **bm25 ≈ 0 的 1–2 字符前缀噪声**（`"a"*` / `"do"*` / `"i"*`）；t270 的守卫上线后同一查询变 **0 命中**。⇒ 我的「违例」= 独立测到了 t270 的修复效果，不是 t261 的缺陷。
+
+## findings 的修订
+
+| id | 修订后状态 |
+| --- | --- |
+| F-286a | **撤回**（t261 的 18/18 在 23add4e 上复现） |
+| F-286b | **保留并改写**（low）：判据「凡 term 存在于语料的查询，keyword 腿必须非空」在纯 t261 下成立**只是因为 1–2 字符前缀命中噪声**（raw ≈ −3e-06），t270 守卫上线后同一查询即变空 ⇒ 它不是稳定不变量。判据必须写明「term 存在」的口径（token / token 前缀）**以及最小长度守卫**，并补一条反例断言。 |
+| F-286c | **保留**（low）：钉住提交上 harness 的 18 行里**仍无任何 raw_score = 0.0** ⇒ substring 段在这套语料上从不触发（只在 `retrieval-legs` 的单测里被覆盖：钉住提交上我跑 = 7 passed，含 `assert_eq!(h.raw_score, 0.0)`）。建议给 harness 加一条汉字子串查询（`潜艇` 对 `蓝鲸潜艇`）。 |
+
+## 更正后的结论
+
+**pass** —— t261 的三条声明（keyword 8/18→18/18 · fused recall@1/@5/MRR 0.6667/0.8667/0.7500 → 1.0000/1.0000/1.0000 · 逐腿 stage 标注与 substring 段 0.0 分数）在其提交 23add4e 上全部复现；两条 low 观察（判据口径 / harness 未覆盖 substring 段）不是缺陷。
