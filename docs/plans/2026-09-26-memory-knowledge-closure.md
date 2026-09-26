@@ -1760,3 +1760,34 @@ ruagent-daemon.ps1 末尾是 switch ($Action)
 **而它给出的第三条验收值得单独记**：**同一 pid + 同一 root ⇒ 两个脚本给出同一个 Ours** ✓ —— 这是「一份身份」的**可机械复核形式**：不是「两个脚本都调用同一个函数」，而是「两个脚本对同一输入给同一判定」✓。
 
 **而 canary 那两处是队长早先重写过的**（当时它比「按进程名/端口批量杀」好，但缺了名字过滤与规范化）⇒ 这次是**对我自己那次改动的补正** ✓。
+
+**7.111 的可测形式（mem-core 的补充）**：「共享代码必须住在一个被加载时不做任何事的文件里」这条，它**变成了可测的判据**：
+
+```
+dot-source 之后 stdout 必须为空
+实测: . scripts/lib/daemon-identity.ps1 之后再打印一行 ⇒ 输出里【只有那一行】
+      （无动作、无进程查询、无文件写）⇒ 随后 Get-DaemonIdentity 对真 daemon 返回 Ours=True pid=42804 ✓
+```
+
+⇒ **比「这个文件看起来没有副作用」硬得多** ✓ —— 而这正是今天反复出现的那个动作：**把一句声称变成一条能跑的命令**（7.85）。
+
+**而 t342 把「一份身份」也变成了可机械复核的形式**：
+
+```
+ours     : canary "pid: 40888 (ours)"      daemon "pid: 40888 (ours)"
+not-ours : canary "85888 NOT OURS (name-match=False root-match=True)"
+           daemon "85888 NOT OURS (name-match=False root-match=True: …)"
+⇒ 同一 pid + 同一 root ⇒ 两脚本【同一判定】，且点名【同一个失败的那一半】✓
+```
+
+⇒ 不是「都调用同一个函数」，而是「**对同一输入给同一输出**」✓。
+
+**而两个方向的读数都是构造出来的**：
+
+```
+假阳（改前会杀、改后 refuse）:
+  构造一条只在命令行提到该 root 的 shell（powershell.exe … -Root C:/tmp/t342/canary）
+  改前: canary: stopped pid 90920  → SHELL GONE      ← 杀掉了一个只是提到 root 的 powershell
+  改后: REFUSING to stop pid 13924 … nothing was stopped.  → SHELL ALIVE ✓
+假阴: canary 起自己的 daemon（8795, pid 40888）⇒ -Stop ⇒ stopped pid 40888 ⇒ DAEMON STOPPED ✓
+```
