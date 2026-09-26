@@ -15,7 +15,9 @@ pub mod query;
 pub mod write;
 
 pub use inject::{InjectionBudget, MemoryForInjection, render_injection};
-pub use lifecycle::{DeleteOutcome, RestoreOutcome, delete_memory, restore_memory};
+pub use lifecycle::{
+    DeleteOutcome, PurgeOutcome, RestoreOutcome, delete_memory, purge_memory, restore_memory,
+};
 pub use namespace::Namespace;
 pub use write::{MemoryWrite, WriteOutcome, write_memory};
 

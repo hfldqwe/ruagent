@@ -155,6 +155,69 @@ pub async fn restore_memory(db: &Db, id: i64) -> Result<RestoreOutcome, DbError>
     Ok(outcome)
 }
 
+/// What a purge did. Deliberately NOT a DeleteOutcome: a purge leaves no
+/// tombstone to report, and "there was nothing there" must not read as
+/// success (t276).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PurgeOutcome {
+    /// The row is GONE. `was_deleted` says whether it had been tombstoned.
+    Purged {
+        id: i64,
+        was_deleted: bool,
+    },
+    NotFound,
+}
+
+/// Hard-delete one memory: the row leaves `memories` (the FTS index follows
+/// via `memories_ad`). This is the ONLY path that removes a secret someone
+/// pasted into a memory — a soft delete keeps the content on the row for the
+/// audit log. Purging a tombstone is allowed on purpose: that is how a
+/// retracted secret stops being stored at all. An absent id reports NotFound
+/// instead of a silent 200.
+pub async fn purge_memory(db: &Db, id: i64) -> Result<PurgeOutcome, DbError> {
+    let found: Option<(String, String, Option<String>)> = db
+        .call(
+            move |conn| -> Result<Option<(String, String, Option<String>)>, rusqlite::Error> {
+                let mut stmt = conn
+                    .prepare("SELECT store, namespace, deleted_at FROM memories WHERE id = ?1")?;
+                let mut rows = stmt.query([id])?;
+                let Some(row) = rows.next()? else {
+                    return Ok(None);
+                };
+                let store: String = row.get(0)?;
+                let ns: String = row.get(1)?;
+                let was_deleted: Option<String> = row.get(2)?;
+                conn.execute("DELETE FROM memories WHERE id = ?1", [id])?;
+                Ok(Some((store, ns, was_deleted)))
+            },
+        )
+        .await??;
+    let Some((store, namespace, was_deleted)) = found else {
+        return Ok(PurgeOutcome::NotFound);
+    };
+    // Same audit channel as delete/restore (write::audit): the op set gains
+    // "purge" beside insert/supersede/skip_dedupe/reject/delete/restore.
+    let reason = if was_deleted.is_some() {
+        "purged a tombstone (hard delete)"
+    } else {
+        "purged a live row (hard delete)"
+    };
+    audit(
+        db,
+        "purge",
+        &store,
+        &namespace,
+        Some(&format!("id={}", id)),
+        None,
+        Some(reason.to_string()),
+    )
+    .await?;
+    Ok(PurgeOutcome::Purged {
+        id,
+        was_deleted: was_deleted.is_some(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -113,6 +113,53 @@ pub async fn add_fact(
     .map_err(DbError::from)
 }
 
+/// What a hard entity delete did. `edges_removed` counts EVERY incident
+/// `entity_edges` row (either direction, current or superseded);
+/// `facts_removed` counts the currently-valid ones (`invalid_at IS NULL`) —
+/// the facts the graph page renders. Both are reported because a row-only
+/// delete leaves the page drawing dangling edges (t276).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntityDeleteOutcome {
+    Deleted {
+        id: i64,
+        edges_removed: i64,
+        facts_removed: i64,
+    },
+    NotFound,
+}
+
+/// Hard-delete an entity together with every edge and fact that touches it,
+/// in either direction. An absent id reports NotFound instead of a silent
+/// success (t276): "nothing was there" and "it is gone now" are different
+/// facts. The FTS index follows via the `entities_ad` trigger.
+pub async fn delete_entity(db: &Db, id: i64) -> Result<EntityDeleteOutcome, DbError> {
+    db.call(move |conn| -> Result<EntityDeleteOutcome, rusqlite::Error> {
+        let exists: i64 =
+            conn.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?;
+        if exists == 0 {
+            return Ok(EntityDeleteOutcome::NotFound);
+        }
+        let facts_removed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entity_edges
+              WHERE (src = ?1 OR dst = ?1) AND invalid_at IS NULL",
+            [id],
+            |r| r.get(0),
+        )?;
+        let edges_removed =
+            conn.execute("DELETE FROM entity_edges WHERE src = ?1 OR dst = ?1", [id])? as i64;
+        conn.execute("DELETE FROM entities WHERE id = ?1", [id])?;
+        Ok(EntityDeleteOutcome::Deleted {
+            id,
+            edges_removed,
+            facts_removed,
+        })
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
 /// Currently-valid facts about an entity (either direction).
 pub async fn current_facts(db: &Db, entity: i64) -> Result<Vec<Edge>, DbError> {
     db.call(move |conn| -> Result<Vec<Edge>, rusqlite::Error> {

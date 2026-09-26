@@ -52,7 +52,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/graph/search", get(graph_search))
         .route("/api/v1/graph/entity", post(graph_create_entity))
         .route("/api/v1/graph/fact", post(graph_add_fact))
-        .route("/api/v1/graph/entity/{id}", get(graph_entity))
+        .route(
+            "/api/v1/graph/entity/{id}",
+            get(graph_entity).delete(graph_entity_delete),
+        )
         .route("/api/v1/graph/entity/{id}/neighbors", get(graph_neighbors))
         .route("/api/v1/graph/entity/{id}/facts", get(graph_facts))
         .route("/api/v1/memory/write", post(memory_write))
@@ -1018,6 +1021,34 @@ async fn graph_entity(
         .map_err(|_| ApiError::bad_request("invalid entity id"))?;
     let facts = ruagent_graph::current_facts(state.mgr.db(), id).await?;
     Ok(Json(serde_json::json!({ "facts": facts })))
+}
+
+/// Hard-delete an entity, its edges and its facts (t276). The graph page has
+/// no other way to correct a wrong entity, and a row-only delete would leave
+/// it drawing dangling edges. 404 for an id that is not there — never a
+/// silent 200.
+async fn graph_entity_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid entity id"))?;
+    match ruagent_graph::delete_entity(state.mgr.db(), id).await? {
+        ruagent_graph::EntityDeleteOutcome::Deleted {
+            id,
+            edges_removed,
+            facts_removed,
+        } => Ok(Json(serde_json::json!({
+            "outcome": "deleted",
+            "id": id,
+            "edges_removed": edges_removed,
+            "facts_removed": facts_removed,
+        }))),
+        ruagent_graph::EntityDeleteOutcome::NotFound => {
+            Err(ApiError::not_found("entity not found"))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3614,13 +3645,32 @@ async fn memory_list(
 /// Soft-delete one memory: DELETE /api/v1/memory/{id}. The row stays (with
 /// deleted_at set) and memory_diffs records the retraction, so the audit can
 /// still answer "what was removed, and when".
+#[derive(Deserialize)]
+struct MemoryDeleteQuery {
+    /// `?purge=true` hard-deletes the row instead of tombstoning it (t276):
+    /// the only path that removes a secret pasted into a memory. Absent keeps
+    /// the t251 contract untouched — a soft delete, row still there.
+    #[serde(default)]
+    purge: bool,
+}
+
 async fn memory_delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<MemoryDeleteQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id: i64 = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid memory id"))?;
+    if q.purge {
+        return match ruagent_memory::purge_memory(state.mgr.db(), id).await? {
+            ruagent_memory::PurgeOutcome::Purged { id, .. } => Ok(Json(serde_json::json!({
+                "outcome": "purged",
+                "id": id,
+            }))),
+            ruagent_memory::PurgeOutcome::NotFound => Err(ApiError::not_found("memory not found")),
+        };
+    }
     match ruagent_memory::delete_memory(state.mgr.db(), id).await? {
         ruagent_memory::DeleteOutcome::Deleted { id, deleted_at } => Ok(Json(serde_json::json!({
             "outcome": "deleted", "id": id, "deleted_at": deleted_at, "soft": true,
@@ -3879,6 +3929,168 @@ mod tests {
             .iter()
             .find(|s| s["key"] == key)
             .cloned()
+    }
+
+    /// One integer out of one statement — the raw counts the readings quote.
+    async fn count(db: &ruagent_store::Db, sql: &str) -> i64 {
+        let sql = sql.to_string();
+        db.call(move |conn| conn.query_row(&sql, [], |r| r.get::<_, i64>(0)))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// t276: a hard entity delete takes its edges and facts with it (both
+    /// directions), reports how many, and 404s on an id that is not there.
+    /// Object set = one probe entity + one other entity + 2 facts; sampling
+    /// surface = the real router over a throwaway root; falsifier = any edge
+    /// row left behind, or a 200 for the second delete.
+    #[tokio::test]
+    async fn entity_delete_removes_edges_and_facts_and_404s_missing() {
+        let (app, db, _root) = harness().await;
+        let probe = ruagent_graph::upsert_entity(&db, "__probe__doctor-node", Some("tool"), None)
+            .await
+            .unwrap();
+        let other = ruagent_graph::upsert_entity(&db, "t276-other", Some("tool"), None)
+            .await
+            .unwrap();
+        ruagent_graph::add_fact(&db, probe, other, "touches", "probe fact", None, None)
+            .await
+            .unwrap();
+        ruagent_graph::add_fact(&db, other, probe, "touched-by", "reverse fact", None, None)
+            .await
+            .unwrap();
+        let before_edges = count(&db, "SELECT COUNT(*) FROM entity_edges").await;
+        let before_probe_entities = count(
+            &db,
+            "SELECT COUNT(*) FROM entities WHERE name LIKE '__probe__%'",
+        )
+        .await;
+        assert_eq!(before_edges, 2);
+        assert_eq!(before_probe_entities, 1);
+        let (st, v, raw) = hit(&app, "DELETE", &format!("/api/v1/graph/entity/{probe}")).await;
+        println!(
+            "READING entity delete: before entities(probe)={} edges={} | DELETE -> HTTP {} {}",
+            before_probe_entities,
+            before_edges,
+            st.as_u16(),
+            raw.trim()
+        );
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["outcome"], "deleted", "{raw}");
+        assert_eq!(v["id"], probe, "{raw}");
+        assert_eq!(v["edges_removed"], 2, "{raw}");
+        assert_eq!(v["facts_removed"], 2, "{raw}");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM entities WHERE name LIKE '__probe__%'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM entity_edges").await, 0);
+        let (lst, lv, lraw) = hit(&app, "GET", "/api/v1/graph/entities?limit=50").await;
+        assert_eq!(lst, StatusCode::OK, "{lraw}");
+        assert!(!lv.to_string().contains("__probe__doctor-node"), "{lv}");
+        let (sst, sv, sraw) = hit(&app, "GET", "/api/v1/graph/search?q=__probe__doctor-node").await;
+        assert_eq!(sst, StatusCode::OK, "{sraw}");
+        assert!(!sv.to_string().contains("__probe__doctor-node"), "{sv}");
+        let (st2, _, raw2) = hit(&app, "DELETE", &format!("/api/v1/graph/entity/{probe}")).await;
+        println!(
+            "READING entity negative: second DELETE -> HTTP {} {}",
+            st2.as_u16(),
+            raw2.trim()
+        );
+        println!(
+            "READING entity after: entities(probe)={} edges={} list/search contain it = {} / {}",
+            count(
+                &db,
+                "SELECT COUNT(*) FROM entities WHERE name LIKE '__probe__%'"
+            )
+            .await,
+            count(&db, "SELECT COUNT(*) FROM entity_edges").await,
+            lv.to_string().contains("__probe__doctor-node"),
+            sv.to_string().contains("__probe__doctor-node")
+        );
+        assert_eq!(st2, StatusCode::NOT_FOUND, "{raw2}");
+    }
+
+    /// t276: `?purge=true` really removes the row; the default stays the t251
+    /// soft delete (row still there, second plain DELETE 409).
+    #[tokio::test]
+    async fn memory_purge_removes_the_row_and_keeps_the_soft_default() {
+        let (app, db, _root) = harness().await;
+        let outcome = ruagent_memory::write_memory(
+            &db,
+            &ruagent_memory::MemoryWrite {
+                store: ruagent_memory::MemoryStore::Observation,
+                namespace: ruagent_memory::Namespace::Agent("__probe__".to_string()),
+                content: "t276 probe secret".to_string(),
+                confidence: 1.0,
+                source_episode: None,
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+        let id = match outcome {
+            ruagent_memory::WriteOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let probe_rows = "SELECT COUNT(*) FROM memories WHERE namespace LIKE 'agent:__probe__%'";
+        let before_rows = count(&db, probe_rows).await;
+        assert_eq!(before_rows, 1);
+
+        // Default semantics unchanged: soft delete, row still there.
+        let (st, v, raw) = hit(&app, "DELETE", &format!("/api/v1/memory/{id}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["outcome"], "deleted", "{raw}");
+        assert_eq!(v["soft"], true, "{raw}");
+        let rows_after_soft = count(&db, probe_rows).await;
+        assert_eq!(rows_after_soft, 1, "soft delete keeps the row");
+        // Second plain DELETE is 409, not a silent 200.
+        let (st2, _, raw2) = hit(&app, "DELETE", &format!("/api/v1/memory/{id}")).await;
+        assert_eq!(st2, StatusCode::CONFLICT, "{raw2}");
+
+        // Purge removes the row (and with it the only copy of the secret).
+        let (st3, v3, raw3) = hit(&app, "DELETE", &format!("/api/v1/memory/{id}?purge=true")).await;
+        assert_eq!(st3, StatusCode::OK, "{raw3}");
+        assert_eq!(v3["outcome"], "purged", "{raw3}");
+        assert_eq!(v3["id"], id, "{raw3}");
+        println!(
+            "READING memory: before rows={} | soft DELETE -> HTTP {} {} | rows after soft={} | second plain DELETE -> HTTP {} | purge -> HTTP {} {} | rows after purge={}",
+            before_rows,
+            st.as_u16(),
+            raw.trim(),
+            rows_after_soft,
+            st2.as_u16(),
+            st3.as_u16(),
+            raw3.trim(),
+            count(&db, probe_rows).await
+        );
+        assert_eq!(count(&db, probe_rows).await, 0);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memories WHERE content LIKE '%t276 probe secret%'"
+            )
+            .await,
+            0
+        );
+        // Read paths: list, search and recall no longer see it.
+        for uri in [
+            "/api/v1/memory/list?store=observation&limit=50",
+            "/api/v1/memory/search?q=t276%20probe",
+            "/api/v1/recall?q=t276%20probe&top_n=5",
+        ] {
+            let (s, _, body) = hit(&app, "GET", uri).await;
+            assert_eq!(s, StatusCode::OK, "{uri}: {body}");
+            assert!(!body.contains("t276 probe secret"), "{uri}: {body}");
+        }
+        // Negative: purging an id that is gone is 404, not a silent 200.
+        let (st4, _, raw4) = hit(&app, "DELETE", &format!("/api/v1/memory/{id}?purge=true")).await;
+        assert_eq!(st4, StatusCode::NOT_FOUND, "{raw4}");
     }
 
     /// The whole lifecycle through the real router: the routes, the query
