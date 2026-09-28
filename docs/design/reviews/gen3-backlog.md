@@ -246,6 +246,40 @@ Build | error: could not compile `ruagent-memory` (lib) due to 1 previous error
 
 **仍然成立的旁证发现（与本次红因无关，但要记账）**：`crates/daemon/src/orphans.rs` 有 **6 处 `#[cfg(unix)]` + 6 处 `#[cfg(windows)]`** ⇒ 这是仓库里第一个真正的**平台分叉**文件，本地 Windows 的 clippy **从不编译** cfg(unix) 的那些区块 —— 一条真实的**门禁覆盖**缺口（第 19 条：门禁必须声明「哪一侧被 lint 过」）。
 
+## B15. 推送第二、三批与 CI 红因逐层剥开
+
+**推送账**：`0da0cb6`（首批，159 文件/+45,177/−914）→ **红因 `E0425 backup_surface`（memory 定格半成品，captain 自犯，见 §B14）** → `cb55073`（只带 memory 修复 + 总账，**刻意不含** graph 在途且编译不过的文件）→ **红因①：memory 4 条 rustc 警告被 `clippy -D warnings` 拒绝（我的过滤口径漏掉，见 C25a）** → `877a909`（memory 警告收干净 + graph `facts_as_of` 时刻解析 30/30/30 + `panel/e2e/failure-visibility.spec.ts` + 四份报告）。
+
+**④ 类红因（假红）：`e2e.yml:148` 的判定表达式恒为 1**
+```
+rc=${{ job.status == 'success' && 0 || 1 }}
+```
+GitHub 表达式里 **`0` 是 falsy** ⇒ `true && 0` ⇒ `0`（falsy）⇒ `|| 1` ⇒ **恒等于 1**。**铁证**：run `36480566583` 中证据步之前**每一步都 success**（含 `Panel E2E (Playwright)` = **44 passed / 1 skipped**），证据步仍打出 `| exit code | 1 |` 并走 `::error::Playwright run failed (exit 1)` 分支 ⇒ **只要这步在，E2E 永不可能绿**。⇒ **一条永远为红的判定步比没有判定步更坏：它把真实红淹没**（C21/C24 同族）。已派 recall（t99）修 + 给能红的负控 + 打印被 skip 的 spec 名。
+
+**recall 的 YAML 发现（高价值）**：t65 加的守卫步 `- name: Guard: workflow-referenced paths must be tracked` 里**未加引号的 `: `** 会让 PyYAML 报 `mapping values are not allowed here (line 62, column 20)` ⇒ **GitHub 会在跑任何一步之前拒掉整个文件**（一个「防 CI 指向不存在的东西」的守卫，差点让流水线**无法启动**）。已修并入库；`check-workflow-refs.sh` 现做「未加引号 `: ` 检测 + PyYAML 完整解析」并有负控。**建议：提交前的固定一步 = workflow 本地可解析 + 引用已跟踪**（交给 t99）。
+
+**recall 自报的两处 CI 代码形状**：① `Test attempt 1` 步**吞掉 cargo 退出码**（`set +e; cargo …; echo $? > rc; set -e` 但步本身恒 0）⇒ `attempt 2` **永不触发**（本轮 windows 实测 skipped）；② `if: always()` 的 evidence/manifest 步在上游短路时产生**派生红**（三红步、读者需自行推断唯一根因）⇒ 根因应指向上游步。
+
+**t87 交单（integ）**：四情形绑定探针（`127.0.0.1` 起 / `0.0.0.0` 无同意 **exit 1** + 逐字 WARN / `RUAGENT_ALLOW_REMOTE=1` 与 `--allow-remote` 各起且 WARN 逐字一致）· 私有构建产物两件证据（**325,455,872 B / mtime 04:35:58**）· **`test --workspace` = TEST_EXIT 0，`Running` 45 / `test result:` 56 / ok 56 / FAILED 0 / panicked 0，且 `ruagent-graph` error 行 = 0**（这是把 CI `Test` 推向绿的最强本地读数）· 迁移行数一手读数：**今天一次 POST 重写 0 行**（只在只读副本上跑）⇒ 审计的「156+」是历史规模、WARN 文本保持**定性**；附带事实：存记忆的表名是 **`memories`**。
+
+## B16. t101 的 CI 红史取证（wiki，只读）与 t104 的立单
+
+**全量口径（303 run，比 captain 的 100-run 窗口更完整）**：success **97** / cancelled **137** / failure **68**；最后绿 = `ed472e4a` @ **09-26T11:09:39Z**；其后 110 run（17 failure + 93 cancelled + **0 success**）。captain 早前引用的「success=0 / 其余 87」只是 **09-26 14:06:59Z→21:16:08Z 那 100 次窗口**（已按 sha+时间更正）。
+
+**⚠️ 方法学发现（最有价值）：只看 `conclusion==failure` 会系统性低估** —— `ci.yml:29-31` 的工作流级 `concurrency` + `cancel-in-progress: true` 让后续推送顶掉前一次，**136 个 cancelled 里有 59 个（43.4%）已经有步骤判过 `failure`**。按「失败步」重算：**Clippy 35→77 · Format 18→29 · Test 26→33**。（好消息：**没有**只出现在 cancelled 里的新类别，类别集合与 failure run 完全一致。）⇒ **纪律**：统计 CI 失败类别必须**把 cancelled 里的失败步一起算**，否则「红过多少次」被腰斩。
+
+**全量失败步分类（首→末）**：`Clippy` 35（09-11→09-26T19:19:43Z，**全 ubuntu**）· `Test` 26（windows 15 / ubuntu 11）· **`Format` 18（09-25 才出现）** · `Audit self-test` 10（09-24 起）· `Install protoc` 3（仅 09-11）。红串第一枪 = 11:29:23Z 的 ubuntu `Test`。
+
+**级联：1 个缺陷被放大成 4 个红步**（读红日志必须按 `skipped` 还原）：`Clippy` 红 ⇒ 同 job `Test` **skipped**（该步没有 `if: always()`）⇒ `Test evidence`「日志读不到」红 ⇒ `Manifest`「found 0≠15」红；windows 同理。**正面读数**：证据步**确实拒绝**把「0 targets / 日志读不到」当绿（t65 的静默跳过被挡住），且 `Panel (node)` **两次真跑都 success**。
+
+**当字节现状（收尾 `877a909`）**：脚本已入库 ⇒ `check-workflow-refs.sh` **exit 0**、`ci.yml` 375 行已提交、**clippy 0**；历史阻塞全部消解；开工字节上 `test --workspace --no-fail-fast` = **0（205.8s）**、`injection_e2e --include-ignored` 7 passed、ignored **15==15**、audit self-test 0、panel build 0、`e2e_daemon` 23 passed。**未取到 1 条 + 原因**：`Test evidence` 的 per-target 计数（需要一条编译成功的 run 的 `$RUNNER_TEMP/t65/*.log`）。
+
+**§8 未覆盖 8 条**（不预测未来 run · 不验证 GitHub 端设置 · 不改文件 · 不验证推送本身 · **不覆盖 `ci.yml` 的 `uses:` 仍浮动**（t100 只做了 `release.yml` ⇒ 值得单独立单）· 不覆盖 macOS/runner 镜像 · 不分类 `e2e.yml` 的 15 次红 · 不覆盖「绿之外的质量」）。
+
+**§9 方法学三条（都是真踩到的）**：① **移动靶** —— 它自己上一轮报的「CI 从未绿过」与开工时的「唯一阻塞 = Guard 的 6 条引用」都因团队自己的推送**秒过时** ⇒ **读数必须带 sha + 时间**（报告分 A/B 两段）；② 第一次 PyYAML 解析 `ci.yml` 报错是 **t66 正在改该文件的中途读取**，差一点把并发写当成文件缺陷；③ **绕过团队 wrapper 直接用 `cargo` 打共享 target dir 得到 `os error 2` 假红**，走 wrapper 正常（⇒ wrapper 不只是限流器，还是**正确性**的一部分）。
+
+**t104 立单**（recall，deps=[]）：`t99` 的依赖边**平台没清掉**（仍记 `deps: t66`，而 `t66` 是终态 failed ⇒ claim 被拒）⇒ 按 recall 的请求单开小单：两处恒 1 的 rc 表达式、派生红指向上游、`attempt 1` 的退出码、**跳过点名**（`--reporter=list`，不动 `panel/**`）、workflow 本地可解析成固定一步，+ **三条能红的负控**。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
@@ -289,6 +323,8 @@ Build | error: could not compile `ruagent-memory` (lib) due to 1 previous error
 
 | C25 | **提交/推送前必须查「最近被写过的文件」，并对已提交字节跑编译面**（t66 首次推送事故，**captain 自犯**） | 在 `lifecycle.rs` 被写后 38 秒提交、且跳过推送前的编译面 ⇒ 推上去的提交**编译不过**（`E0425 backup_surface`），两个工作流同因变红。**判据**：① 提交前查 `git status` 中是否有文件 mtime 落在最近 ~60 秒内，有则**等**；② **推送前**对已提交字节跑 `check --workspace --all-targets`（本地绿 ≠ CI 绿，但**本地红一定 CI 红**）；③「安静窗口」不是奢侈品，是提交的**必要条件**；④ 诊断顺序：**先取 CI 原文，再怀疑环境**（我这次先怀疑了工具链漂移与平台分叉，两者都不是） | captain（沿用） |
 | **C25a** | **编译面必须在 CI 的口径下取**（同上，**第二次犯**） | 我的推送前 `check` 打印了 `Finished` 我就读成绿 —— 但**我自己的过滤器**（只找 `error` 与 `warning: unused`）把 **4 条真实 rustc 警告滤掉了**，而 CI 是 `clippy --workspace --all-targets -- -D warnings` ⇒ **警告即错误**。**判据**：推送前的编译面要么直接跑 **`clippy … -- -D warnings`**（与 CI 同命令），要么**必须报出 warning 行数**并在非 0 时停；**「Finished」不等于「没有警告」**。与 C21/C24 同族：**测量口径的默认值本身就是缺陷来源** | captain（沿用） |
+
+| **C25b** | **推送前的固定面 = fmt + clippy(`-D warnings`)，每次都要重跑**（第三次推送，captain 自犯的缺口） | 我只在**首次**推送前跑过 fmt；第二、三次推送前跑了 clippy 却**没有重跑 fmt** ⇒ `877a909` 的 ubuntu **红在 `Format`**（唯一站点 = `crates/graph/src/lib.rs:1845`，graph 的 t82 改动留下的一个长元组；成员各自的「fmt 0 改动」都是**对它自己的文件、在它自己的时刻**成立，**树是累积的**）。**判据**：每次推送前在**同一份字节**上依次跑 ① `cargo fmt --all --check` ② `clippy --workspace --all-targets -- -D warnings` ③ 并报出 warning 行数；**推送者负责最终那次检查**（作者各自的 clean 不能替代它）。修复：`rustfmt --edition 2024 crates/graph/src/lib.rs`（5 增 1 删，纯规范） | captain（沿用） |
 
 ## D. 纪律账
 

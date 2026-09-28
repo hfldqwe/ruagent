@@ -58,8 +58,15 @@ function useModelCounts(names: string[]) {
     try {
       const o = await api.agentOptions(name, true);
       setCounts((c) => ({ ...c, [name]: modelOption(o.options)?.choices.length ?? 0 }));
+      // t103 (F2): the flag must not latch. A successful sync IS the recovery
+      // path a user takes after a failed mount probe, and it used to leave the
+      // card saying "probe failed" forever -- the mount probe only re-runs when
+      // the name key changes, so nothing cleared it afterwards.
+      setProbeFailed((f) => (f[name] ? { ...f, [name]: false } : f));
       return true;
     } catch {
+      // ...and a failed sync is a failure like any other, so the chip may say so.
+      setProbeFailed((f) => (f[name] ? f : { ...f, [name]: true }));
       return false;
     } finally {
       setSyncing(null);
@@ -199,9 +206,19 @@ export function Runtimes() {
             {
               key: "models",
               label: t("metric.models"),
-              value: Object.entries(counts)
-      .filter(([n]) => !probeFailed[n])
-      .reduce((s, [, n]) => s + n, 0),
+              // t103 (F1): "every probe failed" and "there really are 0 models"
+              // are different situations and must not print the same number. Sum
+              // only the probes that ANSWERED; when nothing answered, the strip
+              // carries the third state instead of a 0 that looks measured.
+              // (All-success is byte-identical to the old expression: no
+              // failures means the filter removed nothing.)
+              value:
+                Object.keys(probeFailed).filter((n) => probeFailed[n]).length > 0 &&
+                Object.entries(counts).filter(([n]) => !probeFailed[n]).length === 0
+                  ? t("runtimes.probeFailed")
+                  : Object.entries(counts)
+                      .filter(([n]) => !probeFailed[n])
+                      .reduce((s, [, n]) => s + n, 0),
             },
           ]}
         />
@@ -281,7 +298,19 @@ export function Runtimes() {
                 ) : null}
                 <div className="row">
                   {probeFailed[r.name] ? (
-                    <span className="tag">{t("runtimes.probeFailed")}</span>
+                    // t103 (F2b): the label promises a retry, so it has to BE one.
+                    // This was a bare <span> -- an action it did not offer (the
+                    // same argument this file already makes below for the R11
+                    // alert). Still no `role="alert"` and no `err` class: those
+                    // belong to the sync path, and the t102 spec asserts the mount
+                    // probe never takes that path.
+                    <button
+                      type="button"
+                      className="tag"
+                      onClick={() => probe(r.name)}
+                    >
+                      {t("runtimes.probeFailed")}
+                    </button>
                   ) : counts[r.name] ? (
                     <span className="tag">{t("runtimes.models", { n: counts[r.name] })}</span>
                   ) : (

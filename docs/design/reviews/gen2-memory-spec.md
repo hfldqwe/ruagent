@@ -396,6 +396,7 @@ live 行的 store × namespace 分布（同一命令，`GROUP BY store, namespac
 | 标定读数 | 今天 `deleted_at IS NOT NULL = 0` 且 `purge=23` ⇒ 「软删/真删两条路都通、且今天没有悬挂 tombstone」；审计 op 词表完整（7 种，A.6） |
 | 失败判据 | 若 purge 后 FTS 仍命中，或审计里出现被删内容，或 `forget_report` 在**存在**派生面时返回空 ⇒ 未达成 |
 | 残余面形状（R-6） | `target ②` 的**接口形状**写在 **`## C5-D`（non-landing）**：类型与语义已定，实现/schema 未定；**本节的验收不依赖它**（`target ①/③` 今天就能判）。U-3（knowledge 五面 + `ResidualHit.origin/path`）已按 recall 回信收敛；U-4（wiki 面）待回信 |
+| **〔2026-09-29 修订（t75）：`target` 的 (c) 范围必须包含「被遗忘字节的明文副本」——`ResidualSurface::BackupFile` 已落地。旧文字一字未删（上表三行原样保留），修订记录见文末 `### t75 遗忘残余面：备份类（C5 修订，2026-09-29）`〕** | 见文末 |
 
 ### C6 注入面：每条 render 都有「截断/丢块」的可读账目
 
@@ -1361,3 +1362,37 @@ pub fn render_context(items: &[ContextItem], budget: &InjectionBudget) -> String
 ### 5 一处诚实的限制（建议 §3.2 补一个字段，路由给 INT）
 
 `blocks[]` 只列**发出去的**块（否则 A-2 的「tag 集合与渲染一致」在读侧会被判失败）。代价是：**丢的是哪个 tag**（§3.3 问题 2）在冻结字段里答不出来 —— 只能从渲染文本的 `<context_budget>` 通知看「丢了几条」。若 §6.1 A-2 / §3.3 Q2 要保留「哪个 tag 被丢」，§3.2 需要加一个 `dropped_tags: [tag]`（或把丢块以 `chars=0` 也列进 `blocks[]` 并明确 tag 集合的语义是「⊇」）。**本单不改契约**（不在 inScope），只登记这个二选一。
+
+---
+
+## t75 遗忘残余面：备份类（C5 修订，2026-09-29）
+
+**修订人**：mem-core（t75，attempt `a8674d4c-4f77-4f76-8c21-439ca4adfead`）· **触发**：t71 的 A-1（verify2 报「本轮最重要的一条」）+ captain 的规格裁决（2026-09-29，写入 t75 任务单：**备份属于遗忘的结论面**）
+
+### 1 旧文字逐字引用（**不删、不改**；本节之前的正文一字未动）
+
+`### C5 遗忘与可审计（内容真消失 + 审计可证明 + 残余面可回答）` 的 `metric` 行原文：
+
+> | metric | (a) `purge` 后内容在所有 memory 侧面上是否消失（`memories` / `memories_fts` / `embedding`）；(b) 审计是否只留 id+时间+reason（不留内容）；(c) 是否存在一个**残余面清点**读数（为一条内容列出全部派生面：episodes / knowledge / wiki） |
+
+`target` 行原文：
+
+> | target | ① 判据：purge 一条内容后，`SELECT COUNT(*) FROM memories WHERE content_hash=<h>` = 0、`memories_fts MATCH <term>` = 0（同一 SQL 事务外读）；② 新增 `forget_report(content_or_id)` 只读读数：列出 `episodes`/knowledge/wiki 侧仍含该内容的对象（**只报，不自动删**）；③ 审计自述：`purge` 的 reason 里若清了 supersede 链，必须带上数量（今天已做，`lifecycle.rs:227-231`，保留） |
+
+`失败判据` 行原文：
+
+> | 失败判据 | 若 purge 后 FTS 仍命中，或审计里出现被删内容，或 `forget_report` 在**存在**派生面时返回空 ⇒ 未达成 |
+
+### 2 修订（2026-09-29）
+
+1. **`target` 的 (c) 范围扩大**：残余面清点必须覆盖**「被遗忘字节的明文副本」**，即数据库**之外**的文件类载体。理由（captain 裁决 + 本机反例）：只覆盖活库与派生物时，`forget` 会在**本机就有反例**的情况下读成「可证明」—— 这正是本代反复抓到的「未经检验的真」。**本机反例（2026-09-29 只读读数）**：活库 `memories` 行 163、仍带 `[distilled]` 标记 0 行、tombstone 0（活库已清干净），而 `data/backups/memories-distilled-prefix-20260926T210910Z.txt`（**35,843 B / 312 行**）与 `data/ruagent.db.before-t229-cleanup-20260926-150802`（**1,359,872 B**）仍带着清理前的字节。
+2. **新增面**：`ResidualSurface::BackupFile` —— 一类（不是两个特例）：`data/backups/*` 的转储 + `data/*.before-*` 的整库副本。文件**种类按字节嗅探**判定（SQLite 头 vs 本 crate 的长度前缀转储），**不按扩展名**（本机的副本名以 `-150802` 结尾，不是 `.db`）。
+3. **判据形态（三条状态，沿用 C5-D 的 `ResidualCount` 语义）**：
+   - 有 root 且所有候选都可读 ⇒ `Readout{hits, total: Some(hits)}`（`0` 是**读数**）；
+   - 有 root 但**至少一个候选读不出来** ⇒ `Readout{hits(已确认载体), total: None}` —— `None` 表示**未测**，**不许**读成「里面没有」。样本里会给出读不出来的文件名与原因；
+   - **没有 root** ⇒ `NotAvailable("… call forget_report_at(db, Some(root), hash)")`，面**必须出现**（本代通则：不可判定 ≠ 不存在）。
+4. **只读约束（硬）**：这一面**不得写它正在报告的那个目录**。代价读数：一次朴素的 `SQLITE_OPEN_READ_ONLY` 打开 WAL 模式的副本，会在用户数据目录里**生成** `-shm`/`-wal`（本机实测：32768 B 的 `-shm` + 0 B 的 `-wal`）⇒ 实现改为 `immutable=1` 打开，并把 `-shm`/`-wal` 从候选里排除（它们是副本的边车、不是独立备份）；**若副本旁边有非空 `-wal`，该副本判为「未测」**（`immutable` 读不到它），而不是按主文件读出一个可能偏低的零。
+5. **本代不做处置**：删除/加密/保留策略是另一个决定（涉及用户数据），**不在本单**。C5 的验收在本代**只要求「检测并报告」**。
+6. **同族但不同 owner（登记，不实现）**：wiki 的写前副本 `wiki-backups/{slug}.md`（写点 `crates/daemon/src/wiki.rs:2317-2323`）属于**同一个面**，但不在 `crates/memory` 的可达范围；报告里以 `ExternalResidual{surface: BackupFile, owner: "daemon/wiki", source: "crates/daemon/src/wiki.rs:2317-2323"}` **请求**它，等待其 owner 给出读数。
+7. **已知未覆盖面（登记，不静默）**：枚举里 `KnowledgeChunkFts` / `KnowledgeVectors` / `WikiBuildPage` 三个面无任何报告提及（与 A-1 同形）；本单只在测试里点名它们并路由，**未**擅自加进报告（它们的 owner 查询不存在，加了就是编读数）。
+

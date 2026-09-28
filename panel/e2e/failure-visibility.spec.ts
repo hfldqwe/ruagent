@@ -233,3 +233,38 @@ test("P3 success control: a real 0 models is 'not probed', not an error, and byt
   console.log(`SNAP-BEGIN runtimes-success|${snap}|SNAP-END`);
   console.log(`SNAP-ONLYCARD runtimes-success|${text}|SNAP-END`);
 });
+
+// ── t103: the two findings this task fixes (F1 aggregate third state, F2 latch) ──
+test("F2 (t103): a successful retry after a failed mount probe CLEARS the failure", async ({
+  page,
+}) => {
+  await page.route(AGENT_OPTIONS, (r) => r.fulfill(err500));
+  await page.goto("/#runtimes");
+  const card = cardOf(page, "claude");
+  await expect(card).toBeVisible({ timeout: 15_000 });
+  await expect(card).toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
+  console.log(`DOM READING F2-before-retry card: ${await cardText(page, "claude")}`);
+
+  await page.unroute(AGENT_OPTIONS);
+  await page.route(AGENT_OPTIONS, (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: THREE_MODELS }),
+  );
+  await card.locator("button[aria-label]").first().click();
+  await expect(card).not.toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
+  const modelsAfter = await norm(await readoutOf(page, "模型"));
+  console.log(`DOM READING F2-after-retry card: ${await cardText(page, "claude")}`);
+  console.log(`DOM READING F2-after-retry models readout: ${modelsAfter}`);
+  expect(modelsAfter, "the recovered count must reach the aggregate").toMatch(/3/);
+});
+
+test("F1 (t103): with EVERY probe failed the models readout carries no number", async ({
+  page,
+}) => {
+  await page.route(AGENT_OPTIONS, (r) => r.fulfill(err500));
+  await page.goto("/#runtimes");
+  await expect(cardOf(page, "claude")).toBeVisible({ timeout: 15_000 });
+  await expect(cardOf(page, "claude")).toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
+  const models = await norm(await readoutOf(page, "模型"));
+  console.log(`DOM READING F1-models-readout-all-failed: ${models}`);
+  expect(models, "an all-failed readout must not present a measured number").not.toMatch(/\d/);
+});

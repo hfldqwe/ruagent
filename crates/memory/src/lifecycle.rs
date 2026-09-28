@@ -684,7 +684,12 @@ fn scan_backups(root: &std::path::Path, content_hash: &str) -> BackupScan {
             // have to END in `.db` (the machine this was written on has
             // `ruagent.db.before-t229-cleanup-20260926-150802`), so the file KIND
             // is decided by sniffing its bytes, not by its extension.
-            if path.is_file() && name.contains(".before-") {
+            //
+            // `-shm`/`-wal` are SKIPPED: they are SQLite's sidecars of a copy, not
+            // independent backups, and a scan that listed them would report two
+            // "unreadable candidates" per copy. A non-empty `-wal` is instead
+            // reported by the copy itself (see `check_db_copy`).
+            if path.is_file() && name.contains(".before-") && !is_sqlite_sidecar(&name) {
                 candidates.push(path);
             }
         }
@@ -747,11 +752,17 @@ fn push_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
+            if path.is_file() && !is_sqlite_sidecar(&file_name_of(&path)) {
                 out.push(path);
             }
         }
     }
+}
+
+/// SQLite's own scratch files. Never a backup of its own, and (see
+/// `check_db_copy`) never something this scan may create.
+fn is_sqlite_sidecar(name: &str) -> bool {
+    name.ends_with("-shm") || name.ends_with("-wal")
 }
 
 fn file_name_of(path: &std::path::Path) -> String {
@@ -806,12 +817,31 @@ fn sniff_kind(path: &std::path::Path) -> Result<BackupKind, String> {
     }
 }
 
-/// A whole-database copy: ask it the same question the live database answers,
-/// through a READ-ONLY connection.
+/// A whole-database copy: ask it the same question the live database answers.
+///
+/// OPENED `immutable=1`, and that is a correctness requirement, not a nicety: a
+/// plain `SQLITE_OPEN_READ_ONLY` open of a WAL-mode database CREATES `-shm`/`-wal`
+/// beside it (measured: opening the copy on this machine left a 32768 B `-shm` and
+/// a 0 B `-wal` in the user's data directory). A forget report may not write to the
+/// directory it is reporting on. The cost of `immutable` is that a `-wal` beside
+/// the copy is ignored — so a copy with a NON-EMPTY `-wal` is reported as not
+/// measured instead of being read as if the `-wal` did not exist.
 fn check_db_copy(path: &std::path::Path, content_hash: &str) -> Result<usize, String> {
+    if let Some(wal) = nonempty_wal_beside(path) {
+        return Err(format!(
+            "a non-empty -wal sits beside this copy ({wal} bytes): an immutable read \
+             would miss it, so this copy is NOT measured"
+        ));
+    }
+    let uri = format!(
+        "file:///{}?immutable=1",
+        path.to_string_lossy().replace('\\', "/")
+    );
     let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("cannot open read-only: {e}"))?;
     conn.query_row(
@@ -821,6 +851,13 @@ fn check_db_copy(path: &std::path::Path, content_hash: &str) -> Result<usize, St
     )
     .map(|n| n as usize)
     .map_err(|e| format!("not a memories database: {e}"))
+}
+
+/// `-wal` sidecar of a database copy, when it exists and has content.
+fn nonempty_wal_beside(path: &std::path::Path) -> Option<u64> {
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    let len = std::fs::metadata(wal).ok()?.len();
+    (len > 0).then_some(len)
 }
 
 /// The dump `strip_distilled_prefix` writes: `"<id> <byte_len>\n"`, then exactly

@@ -1845,7 +1845,11 @@ mod tests {
             // (relation, valid_at, invalid_at) — R = 2026-09-13T18:38:15Z
             ("starts_before", "2026-09-13T10:00:00+00:00", None),
             ("starts_exactly_at_R", at, None),
-            ("starts_one_second_after_R", "2026-09-14T02:38:16+08:00", None),
+            (
+                "starts_one_second_after_R",
+                "2026-09-14T02:38:16+08:00",
+                None,
+            ),
             ("date_only_midnight", "2026-09-13", None),
             (
                 "ends_exactly_at_R",
