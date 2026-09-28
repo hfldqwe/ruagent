@@ -7,7 +7,7 @@
 //! between the same entity pair + relation invalidate the old edge at the
 //! new edge's valid_at; nothing is ever deleted.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use ruagent_store::Db;
 
@@ -248,24 +248,82 @@ pub async fn list_edges(db: &Db, limit: u32, offset: u32) -> Result<(Vec<Edge>, 
 }
 
 /// "What was true as of X" — the bi-temporal payoff (design §6.6 #1).
+///
+/// t82 (audit #3, RVC-1's mirror image): the instant is **parsed**, never
+/// compared as text. Until this, `at` and the two time columns met inside SQL
+/// with `<=`/`>`, so ONE instant written three ways answered differently on the
+/// live table — `…18:38:15Z` → 38 edges, `…18:38:15+00:00` → 30,
+/// `…02:38:15+08:00` → 43 (the parse-correct answer is 30, i.e. 16/0/21 wrong),
+/// with 6 of 63 entities getting a different count per spelling. The HTTP side
+/// looked fine only because `api.rs:1290` pre-canonicalises with
+/// `parse_ts`+`to_rfc3339` — and this is a PUBLIC API, so the bug belonged here,
+/// not in the endpoint. RVC-1 fixed exactly this on the *retrieval* side and the
+/// write/API side kept it; that is the "same problem, fixed in one place" trap.
+///
+/// A text that is not an instant is refused loudly (the same shape
+/// `retrieve::retrieve`'s `as_of` uses, retrieve.rs:737-751) rather than being
+/// silently string-compared. A *stored* value that is not an instant still falls
+/// back to a raw-text compare against the instant's **canonical** form, so an
+/// unparsable row cannot vanish from the answer and the fallback itself is
+/// spelling-independent.
 pub async fn facts_as_of(db: &Db, entity: i64, at: &str) -> Result<Vec<Edge>, DbError> {
-    let at = at.to_string();
-    db.call(move |conn| -> Result<Vec<Edge>, rusqlite::Error> {
+    let at = parse_ts(at).ok_or_else(|| {
+        DbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "at is not an instant: {at:?} (accepted: RFC3339 with Z or an offset, \
+                 with or without nanoseconds; YYYY-MM-DD; %Y-%m-%d %H:%M:%S)"
+            ),
+        ))
+    })?;
+    db.call_flat(move |conn| -> Result<Vec<Edge>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, src, dst, relation, fact_text, valid_at, invalid_at, source_episode
              FROM entity_edges
-             WHERE (src = ?1 OR dst = ?1)
-               AND valid_at <= ?2
-               AND (invalid_at IS NULL OR invalid_at > ?2)
-             ORDER BY valid_at DESC",
+             WHERE (src = ?1 OR dst = ?1)",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![entity, at], edge_from_row)?
+        // Filter in Rust: SQLite's text comparison cannot see that
+        // `…18:38:15Z` and `…02:38:15+08:00` are the same moment, and that is
+        // the whole defect.
+        let mut rows = stmt
+            .query_map([entity], edge_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
+        rows.retain(|e| in_force_at(&e.valid_at, e.invalid_at.as_deref(), at));
+        // Order by INSTANT, not by text, and break ties on `id` so the order is
+        // total rather than plan-dependent (RVC-4's lesson). An unparsable
+        // `valid_at` sorts last instead of shuffling the visible answer.
+        rows.sort_by(|a, b| {
+            parse_ts(&b.valid_at)
+                .cmp(&parse_ts(&a.valid_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(rows)
     })
-    .await?
-    .map_err(DbError::from)
+    .await
+}
+
+/// Is this edge in force at `at`? — instants, not text.
+///
+/// Same rule as the retrieval side's `true_then_at` (`retrieve.rs:670`, RVC-1);
+/// it lives here as well because `retrieve.rs` is outside t82's scope, so the
+/// two copies must not drift (a follow-up should make that one `pub(crate)` and
+/// delete this — see the report's finding).
+fn in_force_at(valid_at: &str, invalid_at: Option<&str>, at: DateTime<Utc>) -> bool {
+    let at_raw = at.to_rfc3339();
+    let starts = match parse_ts(valid_at) {
+        Some(v) => v <= at, // inclusive start
+        None => valid_at.trim() <= at_raw.as_str(),
+    };
+    if !starts {
+        return false;
+    }
+    match invalid_at {
+        None => true,
+        Some(inv) => match parse_ts(inv) {
+            Some(i) => i > at, // exclusive end
+            None => inv.trim() > at_raw.as_str(),
+        },
+    }
 }
 
 /// Multi-hop neighborhood via a recursive CTE (design §6.6 #3's graph
@@ -1769,5 +1827,154 @@ mod tests {
             (2, 1, 2),
             "both entities, their aliases and the edge landed"
         );
+    }
+
+    /// t82 / audit #3: one instant, three spellings, one answer — ROW FOR ROW.
+    ///
+    /// The fixture holds the shapes the live table actually has: `Z`, a `+00:00`
+    /// offset, a tenant offset (`+08:00`), 9-digit nanoseconds, and a date-only
+    /// row (1 of 67 live edges). Two rows are chosen so that the OLD string
+    /// comparison had to answer differently for the same moment.
+    #[tokio::test]
+    async fn facts_as_of_answers_the_same_for_one_instant_written_three_ways() {
+        let db = Db::open_in_memory().unwrap();
+        let a = upsert_entity(&db, "ruagent", None, None).await.unwrap();
+        let b = upsert_entity(&db, "麒麟 V10", None, None).await.unwrap();
+        let at = "2026-09-13T18:38:15Z";
+        let rows = [
+            // (relation, valid_at, invalid_at) — R = 2026-09-13T18:38:15Z
+            ("starts_before", "2026-09-13T10:00:00+00:00", None),
+            ("starts_exactly_at_R", at, None),
+            ("starts_one_second_after_R", "2026-09-14T02:38:16+08:00", None),
+            ("date_only_midnight", "2026-09-13", None),
+            (
+                "ends_exactly_at_R",
+                "2026-09-13T10:00:00+00:00",
+                Some("2026-09-14T02:38:15+08:00"),
+            ),
+            (
+                "ends_after_R",
+                "2026-09-13T10:00:00+00:00",
+                Some("2026-09-13T20:00:00Z"),
+            ),
+        ];
+        for (rel, v, iv) in rows {
+            let id = add_fact_with_source(
+                &db,
+                a,
+                b,
+                rel,
+                "fixture fact",
+                Some(v),
+                EventTimeSource::Extracted,
+                None,
+            )
+            .await
+            .unwrap();
+            if let Some(iv) = iv {
+                db.call(move |conn| {
+                    conn.execute(
+                        "UPDATE entity_edges SET invalid_at = ?1 WHERE id = ?2",
+                        rusqlite::params![iv, id],
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
+        }
+
+        // The SAME instant, three spellings (R == 2026-09-14T02:38:15+08:00).
+        let spellings = [
+            "2026-09-13T18:38:15Z",
+            "2026-09-13T18:38:15+00:00",
+            "2026-09-14T02:38:15+08:00",
+        ];
+        let mut answers = Vec::new();
+        for s in spellings {
+            let got: Vec<String> = facts_as_of(&db, a, s)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| format!("{}#{}", e.id, e.relation))
+                .collect();
+            answers.push((s, got));
+        }
+        println!(
+            "READING t82: one instant written three ways -> {}",
+            answers
+                .iter()
+                .map(|(s, v)| format!("{s} = {} edges {v:?}", v.len()))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        assert_eq!(
+            answers[0].1, answers[1].1,
+            "Z and +00:00 must be row-for-row identical"
+        );
+        assert_eq!(
+            answers[1].1, answers[2].1,
+            "+00:00 and +08:00 must be row-for-row identical"
+        );
+        assert_eq!(
+            answers[0].1.len(),
+            4,
+            "in force at R: starts_before, starts_exactly_at_R, date_only_midnight, ends_after_R \
+             (the one that starts after R and the one that ends exactly at R are out): {:?}",
+            answers[0].1
+        );
+        // Instant order, not text order: an instant built from a +08:00 wall clock
+        // must NOT land "later" than a Z one that is the same moment.
+        assert_eq!(
+            answers[0].1,
+            vec![
+                "2#starts_exactly_at_R".to_string(),
+                "1#starts_before".to_string(),
+                "6#ends_after_R".to_string(),
+                "4#date_only_midnight".to_string(),
+            ],
+            "descending by instant, ties by id"
+        );
+
+        // NEGATIVE CONTROL: a DIFFERENT instant must give a DIFFERENT answer --
+        // this is what proves the comparison was not switched off, shortened to a
+        // constant, or turned into "everything".
+        let earlier: Vec<String> = facts_as_of(&db, a, "2026-09-13T05:00:00Z")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| format!("{}#{}", e.id, e.relation))
+            .collect();
+        println!(
+            "READING t82 (control): a different instant -> {} edges {earlier:?} vs {} edges at R",
+            earlier.len(),
+            answers[0].1.len()
+        );
+        assert_ne!(
+            earlier, answers[0].1,
+            "a different instant must not answer the same"
+        );
+        assert_eq!(
+            earlier,
+            vec!["4#date_only_midnight".to_string()],
+            "only the date-only (midnight) row has started by 05:00"
+        );
+    }
+
+    /// t82: a text that is not an instant is REFUSED, not string-compared. The
+    /// old code answered `AND valid_at <= 'not-a-time'`, i.e. an empty list that
+    /// is indistinguishable from a legitimate "nothing was true then".
+    #[tokio::test]
+    async fn facts_as_of_refuses_a_text_that_is_not_an_instant() {
+        let db = Db::open_in_memory().unwrap();
+        let a = upsert_entity(&db, "ruagent", None, None).await.unwrap();
+        for bad in ["not-a-time", "", "2026-13-45T99:99:99Z", "now"] {
+            let err = facts_as_of(&db, a, bad).await.expect_err("must refuse");
+            println!("READING t82 (refusal): {bad:?} -> {err}");
+            assert!(
+                err.to_string().contains("is not an instant"),
+                "the refusal must say why: {err}"
+            );
+        }
     }
 }

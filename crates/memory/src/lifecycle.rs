@@ -602,7 +602,6 @@ pub async fn forget_report_at(
 /// One candidate file the backup scan examined.
 struct BackupFileReading {
     name: String,
-    path: String,
     bytes: u64,
     /// `Some(n)` = checked, and it holds `n` records with this hash; `None` = the
     /// file could not be checked, with the reason.
@@ -635,6 +634,17 @@ fn backup_surface(root: Option<&std::path::Path>, content_hash: &str) -> LocalRe
         };
     };
     let scan = scan_backups(root, content_hash);
+    // The per-file inventory (name, size, verdict) is evidence, not a per-hash
+    // reading, so it goes to the log where an operator can see WHICH files were
+    // examined and which were unreadable — the same text the tests print.
+    if !scan.inventory.is_empty() {
+        tracing::debug!(
+            target: "ruagent_memory::forget",
+            files = scan.inventory.len(),
+            inventory = ?scan.inventory,
+            "backup surface inventory (read-only)"
+        );
+    }
     let hits = scan.hits.len();
     // `total: None` = "not fully measured" (the crate's existing three-state
     // convention), and it is set when a candidate could not be read: the byte
@@ -670,8 +680,11 @@ fn scan_backups(root: &std::path::Path, content_hash: &str) -> BackupScan {
         for entry in dir.flatten() {
             let path = entry.path();
             let name = file_name_of(&path);
-            // Whole-database copies: `data/*.before-*.db`.
-            if path.is_file() && name.contains(".before-") && name.ends_with(".db") {
+            // Whole-database copies: `data/*.before-*` — note the name does NOT
+            // have to END in `.db` (the machine this was written on has
+            // `ruagent.db.before-t229-cleanup-20260926-150802`), so the file KIND
+            // is decided by sniffing its bytes, not by its extension.
+            if path.is_file() && name.contains(".before-") {
                 candidates.push(path);
             }
         }
@@ -747,20 +760,49 @@ fn file_name_of(path: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// Check ONE candidate for this hash, read-only.
+/// Check ONE candidate for this hash, read-only. The KIND of file is decided by
+/// its first bytes (a SQLite header vs this crate's length-prefixed dump), not by
+/// its name: the machine's own database copy ends in `-150802`, not `.db`.
 fn read_backup_candidate(path: &std::path::Path, content_hash: &str) -> BackupFileReading {
     let name = file_name_of(path);
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let verdict = if name.ends_with(".db") {
-        check_db_copy(path, content_hash)
-    } else {
-        check_dump(path, content_hash)
-    };
+    let verdict = sniff_kind(path).and_then(|kind| match kind {
+        BackupKind::Sqlite => check_db_copy(path, content_hash),
+        BackupKind::Dump => check_dump(path, content_hash),
+        BackupKind::Unknown => {
+            Err("neither a SQLite database nor a length-prefixed dump".to_string())
+        }
+    });
     BackupFileReading {
         name,
-        path: path.to_string_lossy().to_string(),
         bytes,
         verdict,
+    }
+}
+
+enum BackupKind {
+    Sqlite,
+    Dump,
+    Unknown,
+}
+
+const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
+
+fn sniff_kind(path: &std::path::Path) -> Result<BackupKind, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot open read-only: {e}"))?;
+    let mut head = [0u8; 16];
+    let n = file
+        .read(&mut head)
+        .map_err(|e| format!("cannot read the first bytes: {e}"))?;
+    if n >= SQLITE_HEADER.len() && &head[..SQLITE_HEADER.len()] == SQLITE_HEADER {
+        return Ok(BackupKind::Sqlite);
+    }
+    // A dump starts with "<id> <byte_len>\n"; anything else is not checkable HERE
+    // (it may still hold the bytes — that is what `total: None` says).
+    match std::str::from_utf8(&head[..n]) {
+        Ok(text) if text.starts_with(|c: char| c.is_ascii_digit()) => Ok(BackupKind::Dump),
+        _ => Ok(BackupKind::Unknown),
     }
 }
 
@@ -1694,6 +1736,19 @@ mod tests {
         format!("{name}: {bytes} B, {verdict}")
     }
 
+    /// Flush a temp database into its main file BEFORE copying it. Without this
+    /// the copy is a database whose schema still sits in the `-wal` file, and the
+    /// detector says so ("could not be checked: no such table: memories") — which
+    /// is why a database copy is reported with `total: None` rather than a false
+    /// zero when it cannot be read. Both layers are unwrapped on purpose: a
+    /// checkpoint that fails must be a visible test failure, never a silent no-op.
+    async fn flush_for_copy(db: &Db) {
+        db.call(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
+            .await
+            .expect("the single-writer actor is open")
+            .expect("PRAGMA wal_checkpoint must succeed on a temp database");
+    }
+
     /// t75 / A-1, the whole scenario in one test: a row that carried the
     /// `[distilled]` prefix is cleaned from the live database, and the PRE-CLEANUP
     /// bytes are still readable on disk. `forget_report_at` must say so — both for
@@ -1723,6 +1778,7 @@ mod tests {
         .unwrap();
 
         // a whole-database copy, taken the way the machine has one
+        flush_for_copy(&db).await;
         std::fs::copy(&db_path, dir.join("data/ruagent.db.before-t75.db")).unwrap();
 
         // the cleanup, which writes its own dump first
@@ -1806,6 +1862,7 @@ mod tests {
         )
         .await
         .unwrap();
+        flush_for_copy(&db).await;
         std::fs::copy(
             dir.join("data/ruagent.db"),
             dir.join("data/ruagent.db.before-t75-neg.db"),

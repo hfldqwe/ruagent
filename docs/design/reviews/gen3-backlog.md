@@ -288,6 +288,7 @@ Build | error: could not compile `ruagent-memory` (lib) due to 1 previous error
 | C24 | **`Select-String 'FAILED'` 默认大小写不敏感 ⇒ 把 `0 failed` 数成假红**（t81 自报） | 成员第一遍统计测试行时，把 **12 行 `0 failed`** 计成 FAILED ⇒ **假红**（与假绿同族、方向相反，同属「测量口径的默认值本身就是缺陷来源」）。**判据**：统计一律 `-CaseSensitive` 并**锚定 `test result: FAILED`**；`test-evidence.sh` 的口径正是如此（按 `test result:` 行分类 + 大小写敏感）。与第 17/20 条、C21（跨 WSL 的 `$?` 永远是 0）同族 | 全员 |
 
 | C25 | **提交/推送前必须查「最近被写过的文件」，并对已提交字节跑编译面**（t66 首次推送事故，**captain 自犯**） | 在 `lifecycle.rs` 被写后 38 秒提交、且跳过推送前的编译面 ⇒ 推上去的提交**编译不过**（`E0425 backup_surface`），两个工作流同因变红。**判据**：① 提交前查 `git status` 中是否有文件 mtime 落在最近 ~60 秒内，有则**等**；② **推送前**对已提交字节跑 `check --workspace --all-targets`（本地绿 ≠ CI 绿，但**本地红一定 CI 红**）；③「安静窗口」不是奢侈品，是提交的**必要条件**；④ 诊断顺序：**先取 CI 原文，再怀疑环境**（我这次先怀疑了工具链漂移与平台分叉，两者都不是） | captain（沿用） |
+| **C25a** | **编译面必须在 CI 的口径下取**（同上，**第二次犯**） | 我的推送前 `check` 打印了 `Finished` 我就读成绿 —— 但**我自己的过滤器**（只找 `error` 与 `warning: unused`）把 **4 条真实 rustc 警告滤掉了**，而 CI 是 `clippy --workspace --all-targets -- -D warnings` ⇒ **警告即错误**。**判据**：推送前的编译面要么直接跑 **`clippy … -- -D warnings`**（与 CI 同命令），要么**必须报出 warning 行数**并在非 0 时停；**「Finished」不等于「没有警告」**。与 C21/C24 同族：**测量口径的默认值本身就是缺陷来源** | captain（沿用） |
 
 ## D. 纪律账
 
