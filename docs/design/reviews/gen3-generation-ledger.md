@@ -10,11 +10,11 @@
 
 | 目标 | 状态 | 依据 |
 |---|---|---|
-| ① 提交并推送到 `main` | **未完成** | `HEAD 0a39e5b` / `origin/main 5db881d`；本代 150 条变更仍在工作树（50 modified / 100 untracked）；`t66` 正在跑最后一条门禁（`cargo test --workspace --no-fail-fast`，pid 75120/72416） |
-| ② `main` 上 CI 转绿 | **未完成**（但有明确红基线） | 最近一次 run `36272344732`：ubuntu **`Format` 红** ⇒ 同 job `Clippy`/`Guard`/`Test` **全 skipped**；windows **`Test` 红**；Panel 绿。两处红因在工作树里**已修**（fmt 已 CLEAN；过期期望已改），待推送后由 CI 判定 |
-| ③ 持续发掘 → 实现 → 验证 → 评审 → 集成 | **在运转** | 101 张单；八轮只读审计产出的 finding 已全部登记（`gen3-backlog.md`），本代闭合见 §3 |
+| ① 提交并推送到 `main` | **✅ 已完成** | **四次推送**：`0da0cb6`（159 文件/+45,177/−914，含两个原先未跟踪的守卫脚本与 `ci.yml`/`e2e.yml`）→ `cb55073`（memory 编译修复）→ `877a909`（memory 无警告 + graph as-of）→ `cfb52b1`（fmt 漂移修复 + t75 备份面 + t103 面板第三态/闩锁）。**全程未 force-push、未推 tag**（仍只有 `v0.1.0`） |
+| ② `main` 上 CI 转绿 | **未完成（在收敛）** | 首个真跑 `0da0cb6`：`Panel (node)` **✅ 30s**；ubuntu ❌ `Clippy`（首次真跑）+ 派生红；windows ❌（同一条 `E0425`，**无任何测试失败**）；E2E ❌ `Build`（同一条）。随后逐层剥开：**编译错误 → 警告即错误 → fmt 漂移 → 判定步恒红（假红）**；`cfb52b1` 正在验证前三层已消解 |
+| ③ 持续发掘 → 实现 → 验证 → 评审 → 集成 | **在运转** | **105 张单**；八轮只读审计的 finding 全部登记；`t104`（判定步假红）、`t105`（守卫脚本独立审计）在办 |
 
-**一句话**：这一代把「**读数可不可信**」当成一等目标来打 —— 每一处「绿」都要求能被负控打红、每一处「未测」都要求写成未测。代价是本代**尚未推送**、CI **尚未绿**，且有三张单被平台的依赖规则永久冻结（§5）。
+**一句话**：这一代把「**读数可不可信**」当成一等目标来打 —— 每一处「绿」都要求能被负控打红、每一处「未测」都要求写成未测。**目标①已达成**；**目标②正在收敛**，且收敛过程本身产出了本代最贵的一批发现：**一条永远为红的判定步会把真红淹没**（`rc = … && 0 || 1` 在 GitHub 表达式里恒为 1）、**warning 即错误**（CI 用 `clippy -D warnings`，本地 `check` 的 `Finished` 不是绿）、**fmt 漂移是累积的**（成员各自的 clean 不能替代推送者那一刻的整树检查）、**「跳过」必须点名**（CI 用 github reporter，只给数字不给名字）。
 
 ---
 
@@ -80,7 +80,7 @@ cd panel && node tools/design-audit.mjs --self-test         # 495/495
 
 ## 7. 未取到 / 未验证（诚实登记）
 
-- **本代尚未推送**，因此：CI 是否第一次绿、windows `Test` 是否真的转绿、`evidence` 步计数是否非空、windows job 是否 skipped —— **全部未知**。
+- **已推送四次**（`0da0cb6` → `cb55073` → `877a909` → `cfb52b1`）。**已确认的判定**：`Panel (node)` 真跑 **success**（两次）；ubuntu 的 `Format`/`Clippy` **已真正执行过**（不再被短路），且首次真跑就分别暴露了编译错误、警告即错误、fmt 漂移；windows 的红**全部**归因于那条 `E0425` 编译错误（**无任何测试失败**：`test result: FAILED` 行 = 0）；`E2E evidence` 与 `Test evidence` 的红是**判定步恒红的假红**（`t104` 在修）。**仍未取得**：`cfb52b1` 的最终逐 job 判定（尤其 ubuntu `Test` 与 `Test evidence` 的**逐 target 计数**是否非空）、E2E 的 Playwright 在 CI 上是否复现 `consumption.spec.ts` 的 Wiki 覆盖率失败（本机仓库入口整条 = `48 passed / 1 failed / 2 skipped`，已请 wiki 区分「断言过期 vs 实现回归」）。
 - `design-audit --check` 的**四计数**未取到（t97 只给 ≈6.5 min 估算）；t99 要补。
 - `release.yml` 的**六个 SHA 固定尚未被任何真实运行验证**；上一次真实发布（09-17）在 `Create release` 失败（`<!DOCTYPE html>`）⇒ 加固只保证「红的不会被发」。
 - 人工 gold（实体家族、真实蒸馏批次）与 `wiki_citations`/`episode_count`/`GRAPH_PATHS=3` 的依据仍在遗留清单。

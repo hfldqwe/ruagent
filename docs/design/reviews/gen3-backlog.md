@@ -280,6 +280,50 @@ GitHub 表达式里 **`0` 是 falsy** ⇒ `true && 0` ⇒ `0`（falsy）⇒ `|| 
 
 **t104 立单**（recall，deps=[]）：`t99` 的依赖边**平台没清掉**（仍记 `deps: t66`，而 `t66` 是终态 failed ⇒ claim 被拒）⇒ 按 recall 的请求单开小单：两处恒 1 的 rc 表达式、派生红指向上游、`attempt 1` 的退出码、**跳过点名**（`--reporter=list`，不动 `panel/**`）、workflow 本地可解析成固定一步，+ **三条能红的负控**。
 
+## B17. 第四次推送（`cfb52b1`）与待解的两个红点
+
+**第四次推送**（10 文件）：graph 的 fmt 修复（唯一站点 `crates/graph/src/lib.rs:1845`，5 增 1 删）· memory 的 4 条警告真修 + **t75 本体**（`ResidualSurface` 13→**14** 加 `BackupFile`，`forget_report` 签名不变、该面**总是出现**，真实 root 只读读数 **2 个候选都被检出** 而负控 `Some(0)`、A-1 场景复现）· **t103**（F1 第三态 + F2 闩锁 + 可点 retry，聚焦 e2e 6 passed/exit 0）· 四份报告 + 总账。**刻意排除**：`scripts/spec-anchors.ps1`（review 在途）、`.github/workflows/ci.yml`（recall 的 t104 在途）。
+
+**t75 交回的路由**：**A-4**（`api.rs:3326-3340` 的 `GET /api/v1/forget-report` 应改调 `forget_report_at(db, Some(root), hash)`，否则 HTTP/MCP 永远看不到本机备份）⇒ **R-10，冻结中**（`api.rs` 归 `t96`，而 `t96` 是 repair 类且依赖已失败的 `t84` ⇒ 平台拒改、inScope 冻结）· **A-2**（`KnowledgeChunkFts`/`KnowledgeVectors`/`WikiBuildPage` 三面无任何报告提及）已登记 · **A-3**（`wiki.rs:2317-2323` 写前副本）只以 `ExternalResidual` 请求、**未改文件** · **A-5**（备份保留/加密策略）另立单 · **A-6**（探针在活库数据目录留下的 `…-shm` 32,768 B / `…-wal` 0 B）captain 裁决 **保留不删**（本会话活库只读；修复版已把二者排除出候选集，不影响任何读数）。
+
+**⚠️ 预判的下一个红点（还没证实）**：integ 在 t103 收尾跑了**仓库入口整条 e2e** = `48 passed / **1 failed** / 2 skipped / exit 1`，唯一红点 = **`consumption.spec.ts` 的 Wiki 覆盖率用例**（`consumption-Wiki-page-…-shows-coverage-unknown`，产物 `test-results/run-74076-…/test-failed-1.png`）。它按第 10 条**只报坐标不改**；captain 已把「区分断言过期 vs 实现回归」的取证单转给 wiki（含它自己的 `cite_coverage` 负控是否仍能红）。**若该失败在 CI 上复现，则 E2E 即使修掉 rc 恒 1 也仍会红。**
+
+**t104**（recall，deps=[]）：判定步假红修复（两处 rc 表达式 + 派生红指向上游 + attempt 退出码 + **跳过点名** + workflow 本地可解析 + 三条能红的负控）—— **recall 已开始改 `ci.yml`**。
+**t105**（mem-core，deps=[]）：只读审计 CI 证据链里两个**从未被复核的守卫脚本**（`test-evidence.sh` / `check-workflow-refs.sh`），要求每条判据都有能红的负控、并找**假红/假绿面**。
+
+## B18. t104 的落地形状（captain 独立预验）
+
+**恒 1 的表达式已从代码里消失**：`Select-String "&&\s*0\s*\|\|\s*1"` 现在只命中 **2 处解释性注释**（`ci.yml:130`、`e2e.yml:148`，都在写「GitHub 表达式里 `0` 是 falsy ⇒ 恒为 1」）⇒ 读者不会再踩同一个坑。
+**五种新形状都在位**：`PIPESTATUS` **4 处**（状态来自命令自身）· `reporter=list` **2 处**（跳过要**名字**）· 上游归因措辞 **15 处**（`was skipped / does not compile / no reading / upstream`）· 文件体量 `ci.yml` 20,251→**25,508 B**、`e2e.yml` 9,341→**11,438 B**。
+
+**最重要的一条：`⑤` 变成了**可跑的提交前命令**（captain 在 WSL 里独立跑通，exit 0）**：
+```
+workflow path references checked: 15, not tracked/missing: 0
+  .github/workflows/{ci,e2e,release}.yml: parses as YAML (PyYAML)
+every executed path a workflow references is tracked
+PRE-SUBMIT COMMAND (t104): bash .github/workflows/scripts/check-workflow-refs.sh
+```
+⇒ 两个守卫脚本现在**同时**承担「引用已跟踪」与「三份 workflow 本地可解析」，并且**自己把该跑的命令打印出来** —— 这是「**CI 的第一个真裁判不应该是 GitHub，而应该是本地能解析我们自己的 workflow**」那条发现的落地。WSL 里 PyYAML 5.4.1 可用；**yaml 不可用时必须写「跳过 + 原因」，不许写成通过**（已写进 t104 验收）。
+
+**同时救回被 t66 封锁的依赖者**：`t77`（恒真断言修复：迁移测试里的自比较换成真 before/after + 能红的负控）`deps → []` ⇒ 它解锁 `t98`（迁移账本可重放，high）。`t99` 的依赖边**平台未清掉**（仍记 `deps: t66`），故按 recall 的请求单开 `t104`。
+
+## B19. ubuntu 的第一条真实测试面红（`cfb52b1`）
+
+**判定**：`cfb52b1` 的 ubuntu 步骤链 `Format ✅ Clippy ✅ nested-Result 守卫 ✅` ⇒ **`Test` 首次真正执行**（本仓近期历史上第一次）⇒ **`Test` 失败**。CI 原文（annotations）：
+```
+[failure] Rust (ubuntu) -- default run: exit code 1 with 1 failing target(s)
+```
+⇒ **只有 1 个测试 target 失败**；`Test evidence` 随后也红（派生 + rc 恒 1 的假红），`Ignored instruments` 被 skip（级联）。
+
+**取证技巧（captain 发现，建议全员用）**：**run 未完成时 job 日志被 GitHub gate 住，但 `check-run annotations` 可读** ——
+```powershell
+gh api "repos/<owner>/<repo>/commits/<sha>/check-runs" | ConvertFrom-Json   # 每个 check-run 的 conclusion + output.annotations_count
+gh api <output.annotations_url> | ConvertFrom-Json                           # ::error:: / ::notice 原文与计数
+```
+本轮就靠它先拿到了「**1 failing target**」这个关键读数，不必干等 run 结束。
+
+**嫌疑面（按证据排序）**：`crates/daemon/src/orphans.rs` 是仓库里**唯一的**平台分叉源文件（**6 处 `#[cfg(unix)]` + 6 处 `#[cfg(windows)]`**：`unix_children` 扫 `/proc` 按 ppid 匹配、`unix_process_start` 读 `/proc/<pid>/stat` 第 22 字段 + `/proc/stat` 的 `btime`、`read_stat_field` 用 `rsplit(')')` 取 comm 之后的字段）—— 这些 Unix 分支**在这台 Windows 开发机上从未被编译或执行**，今天第一次在 ubuntu 上跑。**captain 逐行读过，未发现明显缺陷**（字段偏移与 `/proc` 语义对得上）⇒ 嫌疑**不能**停在这里，需日志定位。`crates/knowledge/src/files.rs` 的 2 处命中**只是文档注释**（提到 symlink），**已排除**；`crates/acp/src/fs_tools.rs` 1 处待查。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
@@ -325,6 +369,9 @@ GitHub 表达式里 **`0` 是 falsy** ⇒ `true && 0` ⇒ `0`（falsy）⇒ `|| 
 | **C25a** | **编译面必须在 CI 的口径下取**（同上，**第二次犯**） | 我的推送前 `check` 打印了 `Finished` 我就读成绿 —— 但**我自己的过滤器**（只找 `error` 与 `warning: unused`）把 **4 条真实 rustc 警告滤掉了**，而 CI 是 `clippy --workspace --all-targets -- -D warnings` ⇒ **警告即错误**。**判据**：推送前的编译面要么直接跑 **`clippy … -- -D warnings`**（与 CI 同命令），要么**必须报出 warning 行数**并在非 0 时停；**「Finished」不等于「没有警告」**。与 C21/C24 同族：**测量口径的默认值本身就是缺陷来源** | captain（沿用） |
 
 | **C25b** | **推送前的固定面 = fmt + clippy(`-D warnings`)，每次都要重跑**（第三次推送，captain 自犯的缺口） | 我只在**首次**推送前跑过 fmt；第二、三次推送前跑了 clippy 却**没有重跑 fmt** ⇒ `877a909` 的 ubuntu **红在 `Format`**（唯一站点 = `crates/graph/src/lib.rs:1845`，graph 的 t82 改动留下的一个长元组；成员各自的「fmt 0 改动」都是**对它自己的文件、在它自己的时刻**成立，**树是累积的**）。**判据**：每次推送前在**同一份字节**上依次跑 ① `cargo fmt --all --check` ② `clippy --workspace --all-targets -- -D warnings` ③ 并报出 warning 行数；**推送者负责最终那次检查**（作者各自的 clean 不能替代它）。修复：`rustfmt --edition 2024 crates/graph/src/lib.rs`（5 增 1 删，纯规范） | captain（沿用） |
+
+| C26 | **改了源码但没重建产物 ⇒ 假绿**（t103，integ 自曝） | 面板行为验证时，它改了 `Runtimes.tsx` 却**没有重建 `dist`** 就重跑 e2e ⇒ 服务的是**旧 bundle** ⇒ 负控「通过」了，但那是**旧行为**。它自己判定该次负控**无效**并重跑（删掉 F2 的清标记行 + `npm run build` ⇒ `expect(locator).not.toHaveText` 在 `failure-visibility.spec.ts:253` 红、1 failed/5 passed/exit 1；恢复后重建 ⇒ 6 passed/exit 0）。**判据**：**面板的任何行为读数（绿或红）都必须在 `npm run build` 之后取**；「上次构建的产物」是本代第 15 条（陈旧产物）的实例 | 全员 |
+| C27 | **`immutable=1` 是正确性，不是优化**（t75，mem-core 实测） | 朴素 `SQLITE_OPEN_READ_ONLY` 打开一份 WAL 副本，会**在用户数据目录里生成** `-shm`/`-wal`（实测生成 32,768 B 的 `-shm` 与 0 B 的 `-wal`，**而一个「遗忘报告」不许写它正在报告的那个目录**）。⇒ 判据：读副本必须 `immutable=1`；候选集排除 `-shm`/`-wal`；**带非空 `-wal` 的副本判为未测**。同族的两条：**读不出来的候选 ⇒ 该面 `total: None`（未测）而不是 0**；**文件种类必须按字节嗅探而不是按扩展名**（`-150802` 结尾的副本被 `.db` 过滤器漏掉 ⇒ 候选 1 vs 2） | 全员 |
 
 ## D. 纪律账
 

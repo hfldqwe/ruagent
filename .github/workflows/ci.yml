@@ -117,17 +117,62 @@ jobs:
       # cannot see what never ran. Measured: an unfixed workspace run reported 7
       # targets and stopped, while the workspace has 21+.
       - name: Test (default run -- skips stay countable)
+        id: linux_test
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/t65"
+          set +e
           cargo test --workspace --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/t65/linux-default.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          # THE STATE COMES FROM THE COMMAND, NOT FROM AN EXPRESSION (t104). The
+          # earlier shape judged this run with a job.status-based ternary
+          # (`job.status == 'success' && 0 || 1`), and in GitHub expressions `0` is
+          # FALSY: `true && 0` evaluates to `0`, so the `|| 1` branch takes over and
+          # the value is ALWAYS 1. That made the evidence step red on every run --
+          # including runs where every earlier step succeeded (E2E run 36480566583:
+          # all steps green, Playwright 44 passed / 1 skipped, evidence still printed
+          # `| exit code | 1 |`). A judgement step that can never be green is worse
+          # than none: it drowns the real red. Here the recorded code IS this step's
+          # exit code, so the numbers and the step conclusion cannot disagree.
+          echo "$rc" > "$RUNNER_TEMP/t65/linux-default.rc"
+          echo "default run exit code: $rc"
+          exit "$rc"
 
       - name: Test evidence (per-target counts + exit code)
         if: always()
         run: |
-          rc=${{ job.status == 'success' && 0 || 1 }}
+          log="$RUNNER_TEMP/t65/linux-default.log"; rcfile="$RUNNER_TEMP/t65/linux-default.rc"
+          upstream="Test (default run -- skips stay countable)"
+          if [ ! -r "$log" ] || [ ! -r "$rcfile" ]; then
+            {
+              echo "### Rust (ubuntu) -- default run: NO READING"
+              echo ""
+              echo "There is no log and no exit code, because \`$upstream\` did not run: a"
+              echo "step before it failed (usually \`Clippy\` -- every later step is skipped"
+              echo "unless it is \`if: always()\`). Nothing was measured here, so there is"
+              echo "nothing to count. **This is a derivative notice, not a test failure**;"
+              echo "the red is the earlier step."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # A tree that does not compile produces a log with a compiler error and 0
+          # reporting targets. That is the COMPILE face's red, not a test result, so
+          # it is reported as a notice instead of a second red -- while a genuinely
+          # empty run (no compiler error, still nothing reported) keeps failing
+          # below, which is what this step is for.
+          if [ "$(grep -c '^test result:' "$log" || true)" = "0" ] && grep -qE '^error(\[|:)|could not compile' "$log"; then
+            {
+              echo "### Rust (ubuntu) -- default run: NO READING (the tree does not compile)"
+              echo ""
+              echo "\`cargo test\` stopped at the compiler, so no test ran. See the failing"
+              echo "build/\`Clippy\` step above. **Derivative notice, not a test failure.**"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -E '^error(\[|:)|could not compile' "$log" | head -5 || true
+            exit 0
+          fi
           bash .github/workflows/scripts/test-evidence.sh \
-            "Rust (ubuntu) -- default run" "$RUNNER_TEMP/t65/linux-default.log" "$rc"
+            "Rust (ubuntu) -- default run" "$log" "$(cat "$rcfile")"
 
       # ------------------------------------------- the ignored instruments
       # THE SATISFIABLE ONE. The seven daemon instruments in
@@ -144,11 +189,16 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/t65"
+          set +e
           cargo test -p ruagent-daemon --test injection_e2e -- --include-ignored \
             2>&1 | tee "$RUNNER_TEMP/t65/linux-daemon-ignored.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > "$RUNNER_TEMP/t65/linux-daemon-ignored.rc"
+          echo "daemon instrumentation exit code: $rc"
           bash .github/workflows/scripts/test-evidence.sh \
             "Rust (ubuntu) -- daemon instrumentation (--include-ignored)" \
-            "$RUNNER_TEMP/t65/linux-daemon-ignored.log" 0 \
+            "$RUNNER_TEMP/t65/linux-daemon-ignored.log" "$rc" \
             run_injects_memory_knowledge_and_wiki \
             run_without_knowledge_documents_has_no_knowledge_block \
             chat_injects_memory_knowledge_and_wiki \
@@ -156,6 +206,7 @@ jobs:
             chat_and_run_use_the_same_block_wording \
             both_paths_emit_the_contract_truncation_marker \
             a_retried_run_carries_the_shared_retry_prefix
+          exit "$rc"
 
       # ------------------------------------------- the manifest of the rest
       # Visible skip accounting. `--ignored --list` is the source of truth for
@@ -165,8 +216,26 @@ jobs:
       - name: Ignored-instrument manifest (what does NOT run here, and why)
         if: always()
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          set +e
           cargo test --workspace -- --ignored --list > "$RUNNER_TEMP/t65/ignored-list.txt" 2>&1
+          list_rc=$?
+          set -e
+          # t104: `--list` cannot even build the test binaries when the tree does not
+          # compile. That is the compile face's red, not a skip-accounting mismatch,
+          # so it becomes a notice pointing upstream instead of a second red.
+          if [ "$list_rc" -ne 0 ]; then
+            {
+              echo "### Ignored-instrument manifest: NO READING"
+              echo ""
+              echo "\`cargo test --workspace -- --ignored --list\` could not run (exit"
+              echo "\`$list_rc\`): the tree does not compile, or a build step above failed."
+              echo "No skip accounting is possible. **Derivative notice, not a count"
+              echo "mismatch.** The red is the failing build step."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            tail -20 "$RUNNER_TEMP/t65/ignored-list.txt" || true
+            exit 0
+          fi
           found=$(grep -cE ': test$' "$RUNNER_TEMP/t65/ignored-list.txt" || true)
 
           # RUN by the step above (7). Their names are demanded there.
@@ -247,10 +316,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/t65"
           set +e
           cargo test --workspace --no-fail-fast > "$RUNNER_TEMP/t65/win-attempt1.log" 2>&1
-          echo $? > "$RUNNER_TEMP/t65/win-attempt1.rc"
+          rc=$?
           set -e
+          echo "$rc" > "$RUNNER_TEMP/t65/win-attempt1.rc"
           tail -40 "$RUNNER_TEMP/t65/win-attempt1.log"
-          echo "attempt 1 exit code: $(cat "$RUNNER_TEMP/t65/win-attempt1.rc")"
+          echo "attempt 1 exit code: $rc"
+          # t104: the step's OWN exit code must be the command's. Before this, the
+          # step ended with `echo` (always 0), so `steps.attempt1.outcome` never said
+          # "failure" -- and attempt 2, guarded by exactly that, could never fire
+          # (measured: skipped on 0da0cb6). Same root as the always-1 `rc` expression.
+          exit "$rc"
         env:
           CARGO_BUILD_JOBS: "2"
 
@@ -258,10 +333,29 @@ jobs:
         if: always()
         shell: bash
         run: |
+          log="$RUNNER_TEMP/t65/win-attempt1.log"; rcfile="$RUNNER_TEMP/t65/win-attempt1.rc"
+          if [ ! -r "$log" ] || [ ! -r "$rcfile" ]; then
+            {
+              echo "### Rust (windows) -- attempt 1: NO READING"
+              echo ""
+              echo "No log/exit code, because \`Test attempt 1\` did not run (an earlier step"
+              echo "failed, or the job was cancelled). **Derivative notice, not a test"
+              echo "failure.** The red is the earlier step."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$(grep -c '^test result:' "$log" || true)" = "0" ] && grep -qE '^error(\[|:)|could not compile' "$log"; then
+            {
+              echo "### Rust (windows) -- attempt 1: NO READING (the tree does not compile)"
+              echo ""
+              echo "\`cargo test\` stopped at the compiler. **Derivative notice, not a test"
+              echo "failure.**"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -E '^error(\[|:)|could not compile' "$log" | head -5 || true
+            exit 0
+          fi
           bash .github/workflows/scripts/test-evidence.sh \
-            "Rust (windows) -- attempt 1" "$RUNNER_TEMP/t65/win-attempt1.log" \
-            "$(cat "$RUNNER_TEMP/t65/win-attempt1.rc")" \
-          && exit 0 || exit 1
+            "Rust (windows) -- attempt 1" "$log" "$(cat "$rcfile")"
 
       - name: Test attempt 2 (only for the known build race)
         if: failure() && steps.attempt1.outcome == 'failure'
@@ -288,12 +382,13 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [ -f "$RUNNER_TEMP/t65/win-attempt2.log" ]; then
-            bash .github/workflows/scripts/test-evidence.sh \
-              "Rust (windows) -- attempt 2" "$RUNNER_TEMP/t65/win-attempt2.log" \
-              "$(cat "$RUNNER_TEMP/t65/win-attempt2.rc")"
-          else
+          log="$RUNNER_TEMP/t65/win-attempt2.log"; rcfile="$RUNNER_TEMP/t65/win-attempt2.rc"
+          if [ ! -r "$log" ] || [ ! -r "$rcfile" ]; then
             echo "attempt 2 did not run (attempt 1 was clean, or its failure was test-level)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (windows) -- attempt 2" "$log" "$(cat "$rcfile")"
           fi
 
   panel:

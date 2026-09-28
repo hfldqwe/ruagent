@@ -202,6 +202,17 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&
       bad=$((bad + 1))
     fi
   done
+else
+  # t104: an unstated skip reads as a pass. Say which half of the check did not
+  # run, and why; the unquoted-`:` scan above always ran (no dependency).
+  if command -v python3 >/dev/null 2>&1; then
+    reason="python3 is present but has no PyYAML module"
+  else
+    reason="no python3 on PATH"
+  fi
+  echo "  PARSE CHECK SKIPPED ($reason): the full-YAML half of this guard did NOT run."
+  echo "  It does run in CI (ubuntu-latest has PyYAML). Locally: \`pip install pyyaml\`."
+  echo "  The unquoted-':' scan above is not affected -- it needs no dependency."
 fi
 
 if [ "$bad" -gt 0 ]; then
@@ -209,3 +220,4 @@ if [ "$bad" -gt 0 ]; then
   exit 1
 fi
 echo "every executed path a workflow references is tracked"
+echo "PRE-SUBMIT COMMAND (t104): bash .github/workflows/scripts/check-workflow-refs.sh   # refs tracked + workflows parse"

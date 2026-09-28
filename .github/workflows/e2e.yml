@@ -129,28 +129,58 @@ jobs:
         # write guard. Change it to `npx playwright test` and registry.spec.ts
         # skips itself -- which the Entry-point guard and the counting step below
         # both exist to make impossible to miss.
+        #
+        # t104: `--reporter=list` is not decoration. The CI default comes from
+        # panel/playwright.config.ts (`github` + `html`), whose log holds only
+        # "1 skipped" -- a count with no NAME, i.e. an undecidable reading (rule
+        # 19). `list` prints every spec with its status; `html` keeps feeding the
+        # upload-artifact step. No `panel/**` file is touched for this.
         run: |
           set -o pipefail
           npx playwright install chromium --with-deps
           mkdir -p "$RUNNER_TEMP/t65"
-          npm run test:e2e 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
+          set +e
+          npm run test:e2e -- --reporter=list --reporter=html 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          # t104: the state comes from the command (`PIPESTATUS[0]`, since `tee`
+          # would otherwise hide it), never from a `${{ ... }}` expression: in
+          # GitHub expressions `0` is falsy, so `success && 0 || 1` is ALWAYS 1.
+          echo "$rc" > "$RUNNER_TEMP/t65/playwright.rc"
+          echo "playwright exit code: $rc"
+          exit "$rc"
         working-directory: panel
 
-      # Skipped specs are the silent-success shape of this suite (t65). Print them
-      # as line counts + the exit code, and treat a skipped registry.spec.ts as an
-      # error: that spec runs only when the write guard is armed, so its absence
-      # from the run means the daemon's real config path was never exercised.
+      # Skipped specs are the silent-success shape of this suite. The names are
+      # printed, not just the count (rule 19), and only a skipped registry.spec.ts
+      # is an error: that spec runs only when the write guard is armed, so its
+      # absence from the run means the daemon's real config path was never
+      # exercised.
       - name: E2E evidence (spec counts + exit code, skips visible)
         if: always()
         shell: bash
         run: |
-          log="$RUNNER_TEMP/t65/playwright.log"
-          rc=${{ job.status == 'success' && 0 || 1 }}
+          log="$RUNNER_TEMP/t65/playwright.log"; rcfile="$RUNNER_TEMP/t65/playwright.rc"
+          upstream="Panel E2E (Playwright)"
+          if [ ! -r "$log" ] || [ ! -r "$rcfile" ]; then
+            {
+              echo "### E2E smoke -- Playwright evidence: NO READING"
+              echo ""
+              echo "No log/exit code, because \`$upstream\` did not run: an earlier step"
+              echo "failed (\`Build\`, \`Boot daemon\`, \`Doctor\`, ...). **Derivative notice,"
+              echo "not a Playwright failure.** The red is the earlier step."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          rc=$(cat "$rcfile")
           passed=$(grep -cE '^ *[0-9]+ passed' "$log" || true)
           failed=$(grep -cE '^ *[0-9]+ failed' "$log" || true)
           flaky=$(grep -cE '^ *[0-9]+ flaky' "$log" || true)
           skipped=$(grep -cE '^ *[0-9]+ skipped' "$log" || true)
-          skip_marks=$(grep -cE '^ *- .*\.spec\.ts' "$log" || true)
+          # Names, from the `list` reporter's skip markers (`  -  [chromium] ›
+          # path/to/x.spec.ts:12:3 › title`).
+          skipped_names=$(grep -E '^ *- .*\.spec\.ts' "$log" || true)
+          skipped_specs=$(printf '%s\n' "$skipped_names" | grep -oE '[A-Za-z0-9_./-]+\.spec\.ts' | sort -u || true)
           {
             echo "### E2E smoke -- Playwright evidence"
             echo ""
@@ -160,12 +190,17 @@ jobs:
             echo "| summary \`N failed\` lines | $failed |"
             echo "| summary \`N flaky\` lines | $flaky |"
             echo "| summary \`N skipped\` lines | $skipped |"
-            echo "| skipped-spec markers (\`- …spec.ts\`) | $skip_marks |"
+            echo "| skip markers with a spec name | $(printf '%s\n' "$skipped_names" | grep -c . || true) |"
+            echo "| distinct skipped SPECS (named) | $(printf '%s\n' "$skipped_specs" | grep -c . || true) |"
             echo "| exit code | $rc |"
             echo ""
-            echo "skipped lines as printed:"; grep -E '^ *[0-9]+ (skipped|did not run)|^ *- .*\.spec\.ts' "$log" || echo "(none printed)"
+            echo "skipped specs, by NAME:"
+            if [ -n "$skipped_specs" ]; then printf '%s\n' "$skipped_specs"; else echo "(none: no spec was skipped)"; fi
+            echo ""
+            echo "raw skip lines:"
+            if [ -n "$skipped_names" ]; then printf '%s\n' "$skipped_names"; else grep -E '^ *[0-9]+ (skipped|did not run)' "$log" || echo "(no skip line printed)"; fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          if grep -qE '^ *- .*registry\.spec\.ts' "$log"; then
+          if printf '%s\n' "$skipped_specs" | grep -qx 'registry\.spec\.ts'; then
             echo "::error::registry.spec.ts was SKIPPED: that spec writes the daemon's real agents.toml and only runs when RUAGENT_E2E_ALLOW_WRITES=1, i.e. through npm run test:e2e. A skip here means the write path was not exercised (t65)."
             exit 1
           fi
