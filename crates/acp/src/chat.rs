@@ -493,8 +493,17 @@ async fn supervise_chat(
                         // separate event, prepended to what the agent sees.
                         let outgoing = match context {
                             Some(d) if !d.trim().is_empty() => {
-                                let _ =
-                                    events.send(RunEvent::ContextInjected { render: d.clone() });
+                                let _ = events.send(RunEvent::ContextInjected {
+                                    render: d.clone(),
+                                    // DEP-INT-1 (t19): the CHAT producer. This
+                                    // adapter does not build the block and holds
+                                    // no budget report, so `budget` is `None` --
+                                    // "not collected" -- never an all-zero object
+                                    // that would read as a measured empty
+                                    // injection.
+                                    path: Some("chat".to_string()),
+                                    budget: None,
+                                });
                                 format!(
                                     "{d}
 

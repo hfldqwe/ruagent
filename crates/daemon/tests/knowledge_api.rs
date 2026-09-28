@@ -422,7 +422,9 @@ async fn markdown_truth_chunk_edits_and_parent_recall() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-const WIKI_PAGE_A: &str = "---\ntitle: Deploy pipeline\nsummary: \"一条命令走完全部发布\"\naliases: [deploy]\nentities: [Kubernetes]\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Deploy pipeline\n\nThe deploy script lives in scripts/release.sh. See [[tea-notes]] and [[k8s]].\n";
+// The self-link (`[[deploy-pipeline]]`) is the D.2/D.3 narrowing's falsifier: if
+// `links_out` still counted self-edges, its value below would be 3, not 2.
+const WIKI_PAGE_A: &str = "---\ntitle: Deploy pipeline\nsummary: \"一条命令走完全部发布\"\naliases: [deploy]\nentities: [Kubernetes]\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Deploy pipeline\n\nThe deploy script lives in scripts/release.sh. See [[tea-notes]], [[k8s]] and [[deploy-pipeline]].\n";
 const WIKI_PAGE_B: &str = "---\ntitle: Tea notes\nsummary: \"伯爵茶加柠檬\"\naliases: []\nentities: []\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Tea notes\n\nEarl grey tastes best with a slice of lemon.\n";
 const WIKI_ORPHAN: &str = "---\ntitle: Orphan\nsummary: \"\"\naliases: []\nentities: []\nsources: [deploy-guide]\nsource_hashes:\n  deploy-guide: deadbeef\nstatus: generated\ngenerated_at: \"2026-09-16T00:00:00+00:00\"\ngenerator: mock\nbuild: 1\n---\n# Orphan\n\nNobody links here, I link nowhere.\n";
 
@@ -477,6 +479,53 @@ async fn wiki_pages_and_links_inventory() {
     assert_eq!(a["edited"], serde_json::json!(false));
     assert_eq!(a["links_out"], serde_json::json!(2)); // tea-notes + k8s
     assert_eq!(a["links_in"], serde_json::json!(0));
+
+    // ---- D.2/D.3: field by field, including the narrowing ------------------
+    // `links_out` = distinct NON-SELF targets, broken ones INCLUDED. The page
+    // links to itself, and that edge must exist in `self_links` while staying
+    // OUT of `links_out` — otherwise this number would be 3.
+    assert_eq!(a["self_links"], serde_json::json!(1), "{a:?}");
+    assert_eq!(
+        a["links_out_broken"],
+        serde_json::json!(1),
+        "k8s is linked and missing, and it IS counted in links_out: {a:?}"
+    );
+    // The third state, on a page no build ever wrote: the KEY is present and the
+    // value is `null` (unknown) — never 0.00/1.00, and never omitted.
+    assert!(
+        a.get("cite_coverage").is_some(),
+        "the key must not be omitted: {a:?}"
+    );
+    assert!(
+        a["cite_coverage"].is_null(),
+        "a hand-written page has no recorded build reading → unknown: {a:?}"
+    );
+    assert_eq!(a["freshness"], "stale", "{a:?}");
+    assert_eq!(a["stale_sources"], serde_json::json!(["deploy-guide"]));
+    let reasons: Vec<&str> = a["stale_reasons"]
+        .as_array()
+        .expect("stale_reasons is always an array")
+        .iter()
+        .filter_map(|r| r.as_str())
+        .collect();
+    assert!(reasons.contains(&"source hash drift"), "{a:?}");
+    assert!(a["unknown_cause"].is_null(), "{a:?}");
+    // `built_at` comes from the page's OWN `generated_at` (one source, not a
+    // second one derived from the DB) — this fixture pages carries that stamp.
+    assert_eq!(
+        a["built_at"], "2026-09-16T00:00:00+00:00",
+        "the page's own generated_at: {a:?}"
+    );
+    assert_eq!(a["citations"], serde_json::json!(0), "{a:?}");
+    assert_eq!(a["uncited_sections"], serde_json::json!([]), "{a:?}");
+    assert!(a["frozen_by"].is_null(), "{a:?}");
+    // The frozen invariant from R-D D.2.
+    assert_eq!(
+        a["stale"] == serde_json::json!(true),
+        a["freshness"] == serde_json::json!("stale"),
+        "stale == (freshness == \"stale\"): {a:?}"
+    );
+
     let b = find("tea-notes");
     assert_eq!(b["stale"], serde_json::json!(true));
     assert_eq!(b["links_in"], serde_json::json!(1));
@@ -504,6 +553,61 @@ async fn wiki_pages_and_links_inventory() {
     // k8s is linked but missing — the wanted-pages loop
     assert_eq!(links["broken"], serde_json::json!(["k8s"]), "{links:?}");
     assert_eq!(links["orphans"], serde_json::json!(["orphan-page"]));
+
+    // ---- D.3: the graph's own readings, and the two surfaces cannot disagree
+    // A self-edge is a node property, not an edge: the graph must not contain it.
+    assert_eq!(edges.len(), 1, "a self-link is not an edge: {links:?}");
+    assert_eq!(
+        links["self_links"],
+        serde_json::json!([{ "src": "deploy-pipeline", "dst": "deploy-pipeline" }]),
+        "{links:?}"
+    );
+    assert_eq!(
+        links["wanted"],
+        serde_json::json!([{ "slug": "k8s", "demanders": ["deploy-pipeline"], "demand_count": 1 }]),
+        "{links:?}"
+    );
+    // The single-source criterion: what one endpoint says about a page, the other
+    // must say about the same page. (`degrees` is an ARRAY of per-node readings —
+    // one row per node, the same four numbers `WikiPageInfo` carries.)
+    let degs = links["degrees"].as_array().expect("degrees is an array");
+    let deg = degs
+        .iter()
+        .find(|d| d["slug"] == "deploy-pipeline")
+        .unwrap_or_else(|| panic!("no degree row for deploy-pipeline: {links:?}"));
+    assert_eq!(deg["links_out"], a["links_out"], "{links:?}");
+    assert_eq!(deg["links_out_broken"], a["links_out_broken"], "{links:?}");
+    assert_eq!(deg["links_in"], a["links_in"], "{links:?}");
+    // `links_out` is exactly "resolved out-edges + broken ones", with self-edges
+    // in neither term: the fixture has one resolved edge (tea-notes), one broken
+    // (k8s) and one self-link, so the number is 1 + 1 = 2 and not 3.
+    let resolved_out = edges
+        .iter()
+        .filter(|e| e["src"] == "deploy-pipeline")
+        .count() as i64;
+    assert_eq!(
+        resolved_out, 1,
+        "tea-notes is the only resolved target: {links:?}"
+    );
+    assert_eq!(
+        deg["links_out"].as_i64().unwrap_or(-1),
+        resolved_out + deg["links_out_broken"].as_i64().unwrap_or(0),
+        "links_out == resolved out-edges + links_out_broken: {links:?}"
+    );
+    assert_eq!(
+        links["unreachable"],
+        serde_json::json!(["deploy-pipeline", "orphan-page"]),
+        "no page links into either of them: {links:?}"
+    );
+    assert!(
+        links["unreachable"].is_array(),
+        "unreachable is always an array: {links:?}"
+    );
+    let readings_at = links["readings_at"].as_str().unwrap_or_default();
+    assert!(
+        readings_at.contains('T'),
+        "RFC3339 read stamp: {readings_at}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

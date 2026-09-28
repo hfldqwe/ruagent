@@ -184,8 +184,27 @@ export function WikiTab({ openEditor }: { openEditor: (name: string) => void }) 
                 </span>
                 <span className="title">{p.title || p.slug}</span>
                 {p.stale && <span className="tag warn">{t("wiki.staleTag")}</span>}
+                {p.freshness === "unknown" && (
+                  <span className="tag warn">{t("wiki.freshUnknown")}</span>
+                )}
                 {p.edited && <span className="tag">{t("wiki.editedTag")}</span>}
                 {orphans.includes(p.slug) && <span className="tag">{t("wiki.orphanTag")}</span>}
+                {/* Coverage's THIRD state. A hand-written page has no build
+                    reading at all, and the key must never be omitted: rendering
+                    `null` as 0.00 or 1.00 would invent a measurement (RV-D-1). */}
+                <span
+                  className="tag mono"
+                  title={t("wiki.coverageHint")}
+                  aria-label={
+                    p.cite_coverage == null
+                      ? t("wiki.coverageUnknown")
+                      : t("wiki.coverage", { s: p.cite_coverage.toFixed(2) })
+                  }
+                >
+                  {p.cite_coverage == null
+                    ? t("wiki.coverageUnknown")
+                    : t("wiki.coverage", { s: p.cite_coverage.toFixed(2) })}
+                </span>
                 <span className="muted mono">{p.slug}</span>
                 <span className="grow" />
                 <span className="muted">

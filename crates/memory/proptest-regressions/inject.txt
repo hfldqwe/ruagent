@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f8bb677f87bfa1a3ed005ad4ae4f516f02c631a247730d9d428305d9de6fc60d # shrinks to n = 2, contents = ["aaa aa  aa  a aa  aaaaa   a a  aaaa aaaaaaaa   a a", "aa a a aaaaa aaaa aa  a    aa"], per_block = 36, total = 50
+cc a23c472e809a4259e61f6221c4a09ceaeda680896522367ffdec78da1d9fa58d # shrinks to contents = ["a a aaaaa    a aa a", "a a aa  aa aaaa aaa", "a aa  a  a a    a    aa a  a aa aaaa      aaa aaa aaaa aa aaaaa a  a aa aaaaaaaa a   a a  aaa     aadr p rs   go d n w"], per_block = 32, total = 82

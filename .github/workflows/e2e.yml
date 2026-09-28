@@ -2,6 +2,16 @@ name: E2E
 
 # End-to-end smoke against a real daemon: boot, doctor (7 checks),
 # panel serving. Runs on main pushes after CI, cheap addition.
+#
+# EVIDENCE DISCIPLINE (t65, report §5): the Playwright suite has ONE entry point,
+# `panel/e2e/run-e2e.mjs` (npm run test:e2e), and the reason is a data-loss-shaped
+# one: `registry.spec.ts` writes the daemon's real agents.toml and is guarded by
+# `writeAccess()`, which is true only when RUAGENT_E2E_ALLOW_WRITES=1 -- a flag
+# that only run-e2e.mjs sets. A bare `npx playwright test` therefore SKIPS that
+# spec, silently, and the run looks green with the write path unmeasured. The
+# `Entry-point guard` step below makes that a continuously checked property of the
+# repo instead of a fact someone read once; the counting step makes every skipped
+# spec visible.
 on:
   push:
     branches: [main]
@@ -23,6 +33,48 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Coverage declaration (what a green here does NOT mean)
+        run: |
+          {
+            echo "### E2E smoke -- NOT covered by this job"
+            echo ""
+            echo "* **the Rust test suite**: this job builds binaries, it runs no"
+            echo "  \`cargo test\`, so a failing Rust test is invisible here (the \`CI\`"
+            echo "  workflow's jobs are the ones that run them)."
+            echo "* **the panel type check**: \`npm run build\` runs here, so a TS error"
+            echo "  would fail the job, but the dedicated \`panel\` job is the declared"
+            echo "  gate for it."
+            echo "* **Windows**: this job is ubuntu only."
+            echo "* **the 8 live-COPY instruments** (store 3, graph 3, knowledge 2): no"
+            echo "  real \`~/.ruagent\` on a runner; they are named in the \`CI\` workflow's"
+            echo "  ignored-instrument manifest."
+            echo ""
+            echo "Counting unit here: no Rust test targets run (this job only builds"
+            echo "them), so the evidence is the exit code plus the Playwright summary"
+            echo "line counts (passed / failed / flaky / skipped) and the skipped-test"
+            echo "markers."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The entry point is a GATE, not a habit (AGENTS.md, t65). If package.json
+      # stops routing test:e2e through run-e2e.mjs, or run-e2e.mjs stops arming
+      # the write flag, the suite would silently skip its only writing spec -- so
+      # this step reads both files and fails loudly instead.
+      - name: Entry-point guard (test:e2e must go through run-e2e.mjs)
+        run: |
+          set -euo pipefail
+          script=$(node -e "console.log(require('./panel/package.json').scripts['test:e2e'])")
+          echo "panel/package.json scripts.test:e2e = $script"
+          if [ "$script" != "node e2e/run-e2e.mjs" ]; then
+            echo "::error::panel test:e2e is '$script', not 'node e2e/run-e2e.mjs'. The write-guarded spec (registry.spec.ts) only runs through the repo entry point; a bare 'npx playwright test' skips it silently (AGENTS.md, t65)."
+            exit 1
+          fi
+          grep -q 'RUAGENT_E2E_ALLOW_WRITES' panel/e2e/run-e2e.mjs || {
+            echo "::error::panel/e2e/run-e2e.mjs no longer sets RUAGENT_E2E_ALLOW_WRITES: every write-guarded spec would skip itself."
+            exit 1
+          }
+          echo "entry point OK: npm run test:e2e -> node e2e/run-e2e.mjs, which arms writes"
+
       - name: Build
         run: cargo build -p ruagent -p ruagent-mock-agent
       - name: Build panel
@@ -73,10 +125,56 @@ jobs:
           echo "$html" | grep -q 'id="root"'
           curl -sf http://127.0.0.1:8787/ | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1 | grep -q .
       - name: Panel E2E (Playwright)
+        # through the repo entry point on purpose: this is the line that arms the
+        # write guard. Change it to `npx playwright test` and registry.spec.ts
+        # skips itself -- which the Entry-point guard and the counting step below
+        # both exist to make impossible to miss.
         run: |
+          set -o pipefail
           npx playwright install chromium --with-deps
-          npm run test:e2e
+          mkdir -p "$RUNNER_TEMP/t65"
+          npm run test:e2e 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
         working-directory: panel
+
+      # Skipped specs are the silent-success shape of this suite (t65). Print them
+      # as line counts + the exit code, and treat a skipped registry.spec.ts as an
+      # error: that spec runs only when the write guard is armed, so its absence
+      # from the run means the daemon's real config path was never exercised.
+      - name: E2E evidence (spec counts + exit code, skips visible)
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/t65/playwright.log"
+          rc=${{ job.status == 'success' && 0 || 1 }}
+          passed=$(grep -cE '^ *[0-9]+ passed' "$log" || true)
+          failed=$(grep -cE '^ *[0-9]+ failed' "$log" || true)
+          flaky=$(grep -cE '^ *[0-9]+ flaky' "$log" || true)
+          skipped=$(grep -cE '^ *[0-9]+ skipped' "$log" || true)
+          skip_marks=$(grep -cE '^ *- .*\.spec\.ts' "$log" || true)
+          {
+            echo "### E2E smoke -- Playwright evidence"
+            echo ""
+            echo "| line class | count |"
+            echo "| --- | --- |"
+            echo "| summary \`N passed\` lines | $passed |"
+            echo "| summary \`N failed\` lines | $failed |"
+            echo "| summary \`N flaky\` lines | $flaky |"
+            echo "| summary \`N skipped\` lines | $skipped |"
+            echo "| skipped-spec markers (\`- …spec.ts\`) | $skip_marks |"
+            echo "| exit code | $rc |"
+            echo ""
+            echo "skipped lines as printed:"; grep -E '^ *[0-9]+ (skipped|did not run)|^ *- .*\.spec\.ts' "$log" || echo "(none printed)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if grep -qE '^ *- .*registry\.spec\.ts' "$log"; then
+            echo "::error::registry.spec.ts was SKIPPED: that spec writes the daemon's real agents.toml and only runs when RUAGENT_E2E_ALLOW_WRITES=1, i.e. through npm run test:e2e. A skip here means the write path was not exercised (t65)."
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Playwright run failed (exit $rc)"
+            exit 1
+          fi
+          echo "playwright: exit 0, no skipped registry.spec.ts"
+
       - name: Upload Playwright artefacts
         # An E2E red must be readable from the run itself. An E2E failure once
         # came back with a 403 on the job log, so the failing assertion was

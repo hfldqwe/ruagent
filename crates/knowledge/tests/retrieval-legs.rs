@@ -176,25 +176,38 @@ async fn keyword_leg_stage_is_prefix_only_when_precision_found_nothing() {
 }
 
 /// unicode61 makes the whole Han run "泡茶的水温很重要" ONE term, so no FTS query
-/// can find "水温" inside it -- neither the phrase form nor a prefix. LIKE is
-/// the only path, and it is reached only because both FTS stages returned
-/// nothing. raw_score is 0.0 by construction: there is no bm25 for a row FTS
-/// never matched, and the stage label says which stage ran.
+/// can find "水温" inside it -- neither the phrase form nor a prefix. Since t7 a
+/// bigram index reaches it WITHOUT scanning the table; before t7 the ONLY path
+/// was LIKE.
+///
+/// This test is deliberately version-agnostic about WHICH index does the work:
+/// it asserts the stage is NOT the full-table scan, which is the property the
+/// spec's C4 is about. Pre-t7 this is red (the stage there is `Substring`);
+/// naming `KeywordStage::Bigram` here would make the pre-t7 run a compile error
+/// instead of a measured failure, which is why the exact variant is pinned in
+/// retrieval-cjk.rs.
 #[tokio::test]
-async fn keyword_leg_stage_is_substring_for_a_han_substring() {
+async fn han_substring_is_not_served_by_the_full_table_scan() {
     let (k, root) = kb("stage-substring").await;
     let legs = k.search_legs("水温", 5).await.unwrap();
-    assert_eq!(legs.keyword_stage, KeywordStage::Substring);
+    assert_ne!(
+        legs.keyword_stage,
+        KeywordStage::Substring,
+        "a 2-character Han substring must be indexed, not scanned"
+    );
     assert!(
         !legs.keyword.is_empty(),
-        "LIKE must find 水温 inside 泡茶的水温很重要"
+        "the index must find 水温 inside 泡茶的水温很重要"
     );
     for h in &legs.keyword {
-        assert_eq!(h.raw_score, 0.0, "the substring stage has no bm25: {:?}", h);
+        // Both the indexed stage (bm25 <= 0) and the scan stage (0.0 by
+        // construction) satisfy this; asserting 0.0 exactly would ratify the
+        // scan, and asserting < 0 would ratify only the bm25 path.
+        assert!(h.raw_score.is_finite() && h.raw_score <= 0.0, "{:?}", h);
     }
     // The hit really is the tea chunk (the only document with that run), and
     // the query term is a strict substring of the stored term -- which is
-    // exactly the case FTS5 cannot express.
+    // exactly the case FTS5's plain tokenizer cannot express.
     let hits = k.search("水温", 5).await.unwrap();
     assert!(
         hits.iter().any(|h| h.document == "chinese-tea"),
@@ -203,6 +216,105 @@ async fn keyword_leg_stage_is_substring_for_a_han_substring() {
     );
     let terms = ruagent_store::fts::terms("水温");
     assert_eq!(terms, vec!["水温".to_string()]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// t7: the leg window must not follow the caller's page size (R-A C5).
+// ---------------------------------------------------------------------------
+
+/// C5's MECHANISM, asserted where it is decidable rather than where it happens
+/// to be observable: with `leg_k = limit.max(10)`, the leg LENGTHS change with
+/// the page size, so the fused score of a document depends on how many results
+/// the caller asked for. The live measurement (R-A A4) saw that surface as 2 of
+/// 13 queries changing their top-1 between limit 10 and 20 — an occasional
+/// symptom of a guaranteed cause.
+///
+/// The fixture needs the limits to BIND: 12 documents sharing one token, so the
+/// keyword leg has more candidates than the small limit allows.
+///
+/// Pre-t7 this is red on the first assertion (10 vs 12 rows); post-t7 both calls
+/// read LEG_WINDOW and agree.
+#[tokio::test]
+async fn the_leg_window_does_not_follow_the_page_size() {
+    let root = std::env::temp_dir().join(format!("ruagent-t7-window-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+    let k = Knowledge::with_embedder(root.as_path(), db, embedder)
+        .await
+        .unwrap();
+    for i in 0..12 {
+        k.ingest(
+            &format!("kettle-{i}"),
+            &format!(
+                "Kettle note {i}: the kettle boils water for batch {i}. Kettle descaling follows."
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    for query in ["kettle", "kettle descaling", "kettle water boil"] {
+        let small = k.search_legs(query, 5).await.unwrap();
+        let large = k.search_legs(query, 60).await.unwrap();
+        assert!(
+            large.keyword.len() > 10,
+            "the fixture must exceed the pre-t7 small-limit window (10), or nothing here binds \
+             ({query:?}: {})",
+            large.keyword.len()
+        );
+        assert_eq!(
+            small.keyword.len(),
+            large.keyword.len(),
+            "the keyword leg's size depends on the page size for {query:?}"
+        );
+        assert_eq!(
+            small.semantic.len(),
+            large.semantic.len(),
+            "the semantic leg's size depends on the page size for {query:?}"
+        );
+        assert_eq!(
+            small.fused, large.fused,
+            "the fused ranking depends on the page size for {query:?}"
+        );
+        // The user-visible form of the same property: page 1 must not move
+        // when the caller asks for a longer page.
+        let a = k.search(query, 5).await.unwrap();
+        let b = k.search(query, 60).await.unwrap();
+        assert_eq!(
+            (a[0].document.clone(), a[0].score),
+            (b[0].document.clone(), b[0].score),
+            "top-1 changed with the page size for {query:?}"
+        );
+        assert_eq!(
+            a.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            b.iter()
+                .take(a.len())
+                .map(|h| h.chunk_id)
+                .collect::<Vec<_>>(),
+            "the first page must be a prefix of the longer page for {query:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pre-t7 behaviour check that is now vacuous must not silently disappear:
+/// `search_legs`'s second argument no longer affects anything (the window is
+/// constant), so 5 and 500 must return the SAME legs. Stated with the old
+/// surface only (`.semantic` / `.keyword` / `.fused`), because this file has to
+/// compile against the pre-t7 revision; the new fields are pinned in
+/// retrieval-cjk.rs.
+#[tokio::test]
+async fn the_page_argument_no_longer_changes_the_legs() {
+    let (k, root) = kb("ignored-arg").await;
+    let a = k.search_legs("kettle descaling", 1).await.unwrap();
+    let b = k.search_legs("kettle descaling", 500).await.unwrap();
+    assert_eq!(
+        a, b,
+        "the leg window is a constant, whatever the caller says"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

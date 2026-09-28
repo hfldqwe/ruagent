@@ -1,0 +1,485 @@
+{
+ "criterion": "does the fact text state this relation between these endpoints",
+ "edges": {
+  "1": {
+   "relation": "uses_protocol",
+   "src": 1,
+   "dst": 2,
+   "fact": "ruagent speaks ACP to all agents",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "2": {
+   "relation": "uses",
+   "src": 3,
+   "dst": 6,
+   "fact": "用户在一台无 root、无外网的 arm64 银河麒麟 V10 上部署 Python 3.10.9。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "3": {
+   "relation": "shares_kernel_with",
+   "src": 6,
+   "dst": 8,
+   "fact": "用户的麒麟机器与 WSL/ podman machine 场景共享同一套 arm64 模拟测试思路。",
+   "label": "mislabeled",
+   "why": "shares_kernel_with: the text says the two share a TESTING APPROACH, not a kernel"
+  },
+  "4": {
+   "relation": "uses",
+   "src": 3,
+   "dst": 4,
+   "fact": "用户用 AutoHotkey v2 把鼠标侧键映射为 F6 与回车。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "5": {
+   "relation": "uses",
+   "src": 3,
+   "dst": 17,
+   "fact": "用户通过微信/QQ 验证鼠标后退键映射为回车发送。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "6": {
+   "relation": "provides",
+   "src": 10,
+   "dst": 5,
+   "fact": "该项目的 aarch64 预编译包是麒麟机上零编译离线 Python 3.10.9 的来源。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "7": {
+   "relation": "depends_on",
+   "src": 5,
+   "dst": 11,
+   "fact": "离线 Excel 能力依赖 pandas 等库的预编译 wheel。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "8": {
+   "relation": "depends_on",
+   "src": 11,
+   "dst": 12,
+   "fact": "pandas 依赖 numpy，二者都需选带预编译 wheel 的版本。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "9": {
+   "relation": "uses",
+   "src": 7,
+   "dst": 9,
+   "fact": "Podman 机器自带 QEMU，可运行 arm64 容器。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "10": {
+   "relation": "uses",
+   "src": 8,
+   "dst": 9,
+   "fact": "在 WSL 内安装 qemu-user-static 并注册 binfmt 以获得 arm64 执行能力。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "11": {
+   "relation": "uses",
+   "src": 3,
+   "dst": 18,
+   "fact": "用户以 C:\\Users\\19410\\Documents\\ai\\dsh 作为 Claude Code 工作目录。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "12": {
+   "relation": "built_on",
+   "src": 1,
+   "dst": 21,
+   "fact": "ruagent acts as an ACP client to drive coding-agent runtimes over stdio JSON-RPC.",
+   "label": "mislabeled",
+   "why": "built_on: the text says ruagent IS an ACP client, not that it is built on ACP"
+  },
+  "13": {
+   "relation": "exposes",
+   "src": 1,
+   "dst": 22,
+   "fact": "The ruagent daemon hosts an MCP server and injects the same MCP config into every spawned agent via ACP session/new.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "14": {
+   "relation": "integrates_runtime",
+   "src": 1,
+   "dst": 18,
+   "fact": "ruagent drives Claude Code through the npx @agentclientprotocol/claude-agent-acp adapter.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "15": {
+   "relation": "integrates_runtime",
+   "src": 1,
+   "dst": 28,
+   "fact": "ruagent drives opencode natively via `opencode acp`.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "16": {
+   "relation": "integrates_runtime",
+   "src": 1,
+   "dst": 27,
+   "fact": "ruagent drives dsh natively via `dsh --profile acp`.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "17": {
+   "relation": "borrows_design_from",
+   "src": 1,
+   "dst": 23,
+   "fact": "ruagent borrows OpenViking's file-URI navigation, tiered summaries and audited memory writes, but cannot copy its AGPL-3.0 code.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "21": {
+   "relation": "benchmarked_against",
+   "src": 1,
+   "dst": 24,
+   "fact": "The user demanded the panel and backend match Multica's maturity (board, execution log, inbox).",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "22": {
+   "relation": "borrows_design_from",
+   "src": 1,
+   "dst": 26,
+   "fact": "ruagent's six memory stores derive from Agno's memory taxonomy.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "23": {
+   "relation": "borrows_design_from",
+   "src": 1,
+   "dst": 35,
+   "fact": "ruagent's entity graph uses bi-temporal validity inspired by Graphiti/Zep.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "24": {
+   "relation": "references",
+   "src": 1,
+   "dst": 37,
+   "fact": "ruagent's session-history sync follows the approach of the dsh-import-agents plugin for codex/claude-code/opencode.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "25": {
+   "relation": "implements",
+   "src": 27,
+   "dst": 21,
+   "fact": "dsh ships an official ACP server mode (`--profile acp`) and an ACP client subagent package.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "26": {
+   "relation": "supported_via_adapter",
+   "src": 18,
+   "dst": 21,
+   "fact": "Claude Code gains ACP through the @agentclientprotocol/claude-agent-acp adapter, replacing the deprecated @zed-industries package.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "27": {
+   "relation": "conceptually_related",
+   "src": 23,
+   "dst": 38,
+   "fact": "OpenViking's file-URI memory model shares the design family of Karpathy's agent-written tagged Markdown notes.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "29": {
+   "relation": "uses",
+   "src": 24,
+   "dst": 21,
+   "fact": "Multica drives ~10 agent CLIs with a shared ACP JSON-RPC client and stream-JSON spawns for the rest.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "30": {
+   "relation": "distributes",
+   "src": 32,
+   "dst": 33,
+   "fact": "skills.sh installs SKILL.md-format skills into each harness's skill directories.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "31": {
+   "relation": "uses",
+   "src": 1,
+   "dst": 43,
+   "fact": "ruagent 以 ACP client 身份统一接入多种 coding agent CLI。",
+   "label": "duplicate",
+   "why": "same fact as 61 (ruagent uses/uses_protocol ACP)"
+  },
+  "32": {
+   "relation": "uses",
+   "src": 1,
+   "dst": 44,
+   "fact": "ruagent 既是 MCP 客户端（管理外部 server）又是 MCP server 宿主（向 agent 暴露记忆/知识/任务工具）。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "34": {
+   "relation": "uses",
+   "src": 1,
+   "dst": 31,
+   "fact": "ruagent 用 fastembed + bge-small-en-v1.5 做本地语义嵌入。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "35": {
+   "relation": "uses",
+   "src": 1,
+   "dst": 29,
+   "fact": "ruagent Web 面板整体迁移到 Ant Design 6 组件库。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "36": {
+   "relation": "owns",
+   "src": 39,
+   "dst": 1,
+   "fact": "hfldqwe 是 ruagent 私有 GitHub 仓库的所有者。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "37": {
+   "relation": "inspires",
+   "src": 23,
+   "dst": 1,
+   "fact": "ruagent 的记忆/知识设计借鉴 OpenViking 的文件式记忆与分层摘要，但因 AGPL-3.0 只借设计不抄代码。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "38": {
+   "relation": "supports",
+   "src": 1,
+   "dst": 42,
+   "fact": "ruagent 通过 dsh --profile acp 原生接入 DeepSeek Harness。",
+   "label": "duplicate",
+   "why": "same fact as 16 (ruagent supports/integrates dsh via --profile acp)"
+  },
+  "39": {
+   "relation": "supports",
+   "src": 1,
+   "dst": 18,
+   "fact": "ruagent 经 @agentclientprotocol/claude-agent-acp 适配器接入 Claude Code。",
+   "label": "duplicate",
+   "why": "same fact as 14 (Claude Code through the claude-agent-acp adapter)"
+  },
+  "40": {
+   "relation": "supports",
+   "src": 1,
+   "dst": 28,
+   "fact": "ruagent 经 opencode acp 原生接入 OpenCode。",
+   "label": "duplicate",
+   "why": "same fact as 15 (OpenCode via `opencode acp`)"
+  },
+  "41": {
+   "relation": "supports",
+   "src": 24,
+   "dst": 42,
+   "fact": "Multica 的 26 个受支持 agent CLI 中包含 DeepSeek Harness。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "42": {
+   "relation": "influences",
+   "src": 38,
+   "dst": 1,
+   "fact": "ruagent 的统一记忆层借鉴 Karpathy 的 context engineering 与 LLM OS 隐喻。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "43": {
+   "relation": "uses_as_production_database",
+   "src": 52,
+   "dst": 46,
+   "fact": "distill runs Postgres 16 in production on port 6543.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "44": {
+   "relation": "manages_migrations_with",
+   "src": 52,
+   "dst": 47,
+   "fact": "distill manages database migrations using sqlx.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "45": {
+   "relation": "must_never_drop",
+   "src": 52,
+   "dst": 50,
+   "fact": "The audit_log table in distill's production database must never be dropped.",
+   "label": "mislabeled",
+   "why": "must_never_drop: a constraint, not a relation the fact states"
+  },
+  "46": {
+   "relation": "uses_for_vector_storage",
+   "src": 52,
+   "dst": 30,
+   "fact": "distill's recorded storage plan uses LanceDB for vector storage.",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "47": {
+   "relation": "planned_queryable_store",
+   "src": 52,
+   "dst": 51,
+   "fact": "distill's recorded plan uses SQLite (WAL, single-writer actor, group commit) as the queryable store.",
+   "label": "mislabeled",
+   "why": "planned_queryable_store: the text reports a plan, not a present relation"
+  },
+  "49": {
+   "relation": "drives_model",
+   "src": 42,
+   "dst": 55,
+   "fact": "DeepSeek Harness 驱动 deepseek-v4-flash 模型运行。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "50": {
+   "relation": "uses_model_for_permission_gatekeeping",
+   "src": 1,
+   "dst": 55,
+   "fact": "ruagent 的权限守门人角色由 deepseek-v4-flash 承担，仅回复 ALLOW 或 REJECT。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "51": {
+   "relation": "powered_by",
+   "src": 1,
+   "dst": 42,
+   "fact": "ruagent 会话由 DeepSeek Harness 驱动。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "52": {
+   "relation": "runs_model",
+   "src": 42,
+   "dst": 55,
+   "fact": "DeepSeek Harness 在该会话中运行 deepseek-v4-flash 模型。",
+   "label": "duplicate",
+   "why": "same fact as 49 (DeepSeek Harness runs deepseek-v4-flash)"
+  },
+  "53": {
+   "relation": "powers",
+   "src": 42,
+   "dst": 55,
+   "fact": "DeepSeek Harness 驱动 deepseek-v4-flash 模型运行。",
+   "label": "duplicate",
+   "why": "same fact as 49 (powers vs drives_model)"
+  },
+  "54": {
+   "relation": "uses_as_permission_gatekeeper",
+   "src": 1,
+   "dst": 55,
+   "fact": "ruagent 使用由 deepseek-v4-flash 驱动的 agent 作为权限守门人，仅回复 ALLOW 或 REJECT。",
+   "label": "duplicate",
+   "why": "same fact as 50 (the permission gatekeeper is deepseek-v4-flash)"
+  },
+  "55": {
+   "relation": "powered_by",
+   "src": 55,
+   "dst": 42,
+   "fact": "deepseek-v4-flash 模型由 DeepSeek Harness 驱动运行。",
+   "label": "duplicate",
+   "why": "inverse of 49: the same fact in the other direction"
+  },
+  "56": {
+   "relation": "hosts",
+   "src": 1,
+   "dst": 55,
+   "fact": "ruagent 会话中可由 deepseek-v4-flash 担任权限守门人，仅回复 ALLOW 或 REJECT。",
+   "label": "duplicate",
+   "why": "same fact as 50 (hosts vs uses_model_for_permission_gatekeeping)"
+  },
+  "57": {
+   "relation": "searches",
+   "src": 61,
+   "dst": 32,
+   "fact": "find-skills 技能通过 Skills CLI 在 skills.sh 市场检索可安装的技能。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "58": {
+   "relation": "installs_from",
+   "src": 62,
+   "dst": 32,
+   "fact": "Skills CLI 用 `npx skills find` 搜索、`npx skills add` 从 skills.sh 安装技能。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "60": {
+   "relation": "runs_on",
+   "src": 1,
+   "dst": 54,
+   "fact": "ruagent 运行在 Windows 11 上。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "61": {
+   "relation": "uses_protocol",
+   "src": 1,
+   "dst": 43,
+   "fact": "ruagent 基于 Agent Client Protocol 接入并编排多个编码智能体 CLI。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "62": {
+   "relation": "orchestrates",
+   "src": 1,
+   "dst": 18,
+   "fact": "ruagent 可把 Claude Code 作为运行时拉起并纳入统一记忆。",
+   "label": "duplicate",
+   "why": "same fact as 14 (ruagent drives Claude Code)"
+  },
+  "63": {
+   "relation": "orchestrates",
+   "src": 1,
+   "dst": 28,
+   "fact": "ruagent 支持将 OpenCode 作为执行引擎。",
+   "label": "duplicate",
+   "why": "same fact as 15 (ruagent drives OpenCode)"
+  },
+  "64": {
+   "relation": "orchestrates",
+   "src": 1,
+   "dst": 42,
+   "fact": "ruagent 支持 dsh（DeepSeek Harness）作为执行引擎，并同步其会话历史。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "65": {
+   "relation": "orchestrates",
+   "src": 1,
+   "dst": 64,
+   "fact": "ruagent 支持将 Codex 作为执行引擎。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "66": {
+   "relation": "uses",
+   "src": 1,
+   "dst": 30,
+   "fact": "ruagent 知识库使用 LanceDB 做向量检索，构建时需要 protoc。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  },
+  "67": {
+   "relation": "provides",
+   "src": 1,
+   "dst": 44,
+   "fact": "ruagent 为每个拉起的智能体注入同一个平台 MCP 服务器以共享记忆与知识工具。",
+   "label": "supported",
+   "why": "the text states this relation between these endpoints"
+  }
+ }
+}

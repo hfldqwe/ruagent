@@ -118,8 +118,24 @@ pub enum RunEvent {
     },
     /// Context blocks injected at run start (design §6.4) — rendered form
     /// as the agent received it, for context observability (§8.1).
+    ///
+    /// `path`/`budget` are DEP-INT-1 (t19). They are `Option` on purpose and the
+    /// distinction matters: `budget: null` means **this call did not collect a
+    /// budget report**, which is NOT the same as "the budget was 0" -- an
+    /// all-zero object would read as a measured, empty injection. `path` says
+    /// which producer built the block ("run" | "chat"); the two producers differ
+    /// by PARAMETERS, not by drift, and without the label a reader cannot tell
+    /// which set of parameters produced a given render.
+    ///
+    /// `#[serde(default)]` keeps every transcript written before t19 readable:
+    /// those events simply have no path/budget (unknown), rather than a guessed
+    /// one.
     ContextInjected {
         render: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<serde_json::Value>,
     },
     /// ACP `agent_message_chunk`.
     AgentMessageChunk {

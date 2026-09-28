@@ -30,12 +30,21 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    /// Whether the run is still moving (not in a terminal state).
+    /// Whether the run is still moving — **the exact complement of
+    /// [`Self::is_terminal`]**, never a second hand-kept list.
+    ///
+    /// REVISION 2026-09-29 (t88, adjudicated from the t78 C-2 audit): this used
+    /// to be its own `matches!` list, `!matches!(self, Completed | Failed |
+    /// Cancelled)`, which reported `Interrupted` as *still moving* while
+    /// [`Self::is_terminal`] — on the same type — reported it as *ended*. An
+    /// `Interrupted` run is produced by the restart sweep (`crates/daemon`
+    /// marks every non-terminal row interrupted at boot) and nothing ever
+    /// revives it, so it did terminate: `is_active == false`,
+    /// `is_terminal == true`. Defining one side as the negation of the other
+    /// makes "both true" unrepresentable rather than merely untested, which is
+    /// the fix a third list would not have given.
     pub fn is_active(self) -> bool {
-        !matches!(
-            self,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
-        )
+        !self.is_terminal()
     }
 
     /// Lowercase status name (API/panel friendly).
@@ -53,6 +62,10 @@ impl RunStatus {
     }
 
     /// Whether the run ended (any terminal state, including interrupted).
+    ///
+    /// The **single source of truth** for the active/terminal partition:
+    /// [`Self::is_active`] is defined as this predicate's negation, so the two
+    /// cannot disagree. `status_predicates` below reads one row per variant.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -182,14 +195,69 @@ impl Run {
 mod tests {
     use super::*;
 
+    /// The active/terminal partition, read one variant at a time.
+    ///
+    /// REVISION 2026-09-29 (t88; adjudicated from the t78 C-2 audit). The old
+    /// assertions — kept here verbatim so the change is auditable — were:
+    ///
+    /// ```text
+    /// assert!(RunStatus::Interrupted.is_active());   // old: contradictory
+    /// assert!(RunStatus::Interrupted.is_terminal());
+    /// ```
+    ///
+    /// They described a state that is simultaneously "still moving" and
+    /// "ended". `Interrupted` is *produced* by the restart sweep
+    /// (`crates/daemon` marks every non-terminal row interrupted at boot) and
+    /// nothing revives it, so it is terminal and not active; `is_active()` is
+    /// now derived as `!is_terminal()`. The matrix below states an expected
+    /// value for every variant, so flipping either predicate (or adding a
+    /// variant without listing it) fails here instead of shipping.
     #[test]
     fn status_predicates() {
-        assert!(RunStatus::Running.is_active());
-        assert!(!RunStatus::Running.is_terminal());
-        assert!(RunStatus::Interrupted.is_active());
-        assert!(RunStatus::Interrupted.is_terminal());
-        assert!(!RunStatus::Completed.is_active());
-        assert!(RunStatus::Failed.is_terminal());
+        // (status, expected is_active, expected is_terminal)
+        let matrix = [
+            (RunStatus::Queued, true, false),
+            (RunStatus::Spawning, true, false),
+            (RunStatus::Running, true, false),
+            (RunStatus::WaitingPermission, true, false),
+            (RunStatus::Completed, false, true),
+            (RunStatus::Failed, false, true),
+            (RunStatus::Cancelled, false, true),
+            // The row this test used to get wrong: was (active, terminal) => (true, true).
+            (RunStatus::Interrupted, false, true),
+        ];
+        for (status, active, terminal) in matrix {
+            // Exhaustive WITHOUT a wildcard arm on purpose: a variant added to
+            // `RunStatus` stops this test compiling (non-exhaustive match) until
+            // it is listed here — and whoever hits that error must add its row
+            // to `matrix` above, which no wildcard arm would have forced.
+            let name = match status {
+                RunStatus::Queued => "queued",
+                RunStatus::Spawning => "spawning",
+                RunStatus::Running => "running",
+                RunStatus::WaitingPermission => "waiting_permission",
+                RunStatus::Completed => "completed",
+                RunStatus::Failed => "failed",
+                RunStatus::Cancelled => "cancelled",
+                RunStatus::Interrupted => "interrupted",
+            };
+            assert_eq!(status.is_active(), active, "{name}: is_active");
+            assert_eq!(status.is_terminal(), terminal, "{name}: is_terminal");
+            // Mutually exclusive AND exhaustive: exactly one side is true.
+            assert_eq!(
+                status.is_active(),
+                !status.is_terminal(),
+                "{name}: is_active must be the complement of is_terminal"
+            );
+        }
+        // Retryability asks a different question (dead-but-not-delivered), so it
+        // is not the partition: `Completed` is re-runnable, not retryable.
+        assert!(RunStatus::Failed.is_retryable());
+        assert!(RunStatus::Interrupted.is_retryable());
+        assert!(RunStatus::Cancelled.is_retryable());
+        assert!(!RunStatus::Completed.is_retryable());
+        assert!(!RunStatus::Running.is_retryable());
+        assert!(!RunStatus::Queued.is_retryable());
     }
 
     #[test]

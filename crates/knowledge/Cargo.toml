@@ -23,3 +23,6 @@ fastembed = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# t7: the residual-origin drift pin serializes the enum to check its wire
+# literals against the value set `crates/memory` re-declares independently.
+serde_json = "1"

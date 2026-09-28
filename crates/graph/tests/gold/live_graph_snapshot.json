@@ -1,0 +1,1056 @@
+{
+ "source": "live ~/.ruagent/data/ruagent.db",
+ "captured": "2026-09-27T13:58Z",
+ "entities": [
+  {
+   "id": 1,
+   "name": "ruagent",
+   "kind": "project",
+   "summary": "本地优先、单用户的智能体工程平台，用 ACP 统一编排多个编码智能体 CLI，并提供统一记忆、知识库与可观测。"
+  },
+  {
+   "id": 2,
+   "name": "ACP",
+   "kind": "protocol",
+   "summary": null
+  },
+  {
+   "id": 3,
+   "name": "用户19410",
+   "kind": "person",
+   "summary": "中文使用者，Windows 11 + 银河麒麟 V10 arm64 双平台，需离线安装、无 root 权限。"
+  },
+  {
+   "id": 4,
+   "name": "AutoHotkey",
+   "kind": "tool",
+   "summary": "Windows 键盘/鼠标热键自动化工具，v1 与 v2 语法不兼容；本机为 v2.0.28 解压版。"
+  },
+  {
+   "id": 5,
+   "name": "Python 3.10.9",
+   "kind": "product",
+   "summary": "用户需要在 Windows x64 与麒麟 arm64 上离线部署的目标 Python 版本。"
+  },
+  {
+   "id": 6,
+   "name": "银河麒麟 V10",
+   "kind": "product",
+   "summary": "国产 Linux 发行版，桌面版基于 Ubuntu 20.04（glibc 2.31），用户机器为 arm64、无 root、无外网。"
+  },
+  {
+   "id": 7,
+   "name": "Podman",
+   "kind": "tool",
+   "summary": "用户 Windows 上的容器工具（5.8.1，podman-machine-default），可替代 Docker，机器自带 QEMU。"
+  },
+  {
+   "id": 8,
+   "name": "WSL Ubuntu-22.04",
+   "kind": "tool",
+   "summary": "用户 Windows 上的 WSL 发行版，与 podman machine 共享内核，用于 QEMU binfmt 与 chroot 测试。"
+  },
+  {
+   "id": 9,
+   "name": "QEMU",
+   "kind": "tool",
+   "summary": "用户态模拟器，配合 binfmt_misc 在 x86_64 上运行 arm64 二进制。"
+  },
+  {
+   "id": 10,
+   "name": "python-build-standalone",
+   "kind": "project",
+   "summary": "提供各平台预编译、可解压即用的 Python 发行版（astral-sh 维护），C 扩展静态链接、glibc 要求低。"
+  },
+  {
+   "id": 11,
+   "name": "pandas",
+   "kind": "tool",
+   "summary": "Excel 数据处理核心库，依赖 numpy，需选有预编译 wheel 的版本。"
+  },
+  {
+   "id": 12,
+   "name": "numpy",
+   "kind": "tool",
+   "summary": "数值计算基础库，离线零编译安装选 1.26.4。"
+  },
+  {
+   "id": 13,
+   "name": "openpyxl",
+   "kind": "tool",
+   "summary": "读写 .xlsx 的纯 Python 库，适合离线环境。"
+  },
+  {
+   "id": 14,
+   "name": "XlsxWriter",
+   "kind": "tool",
+   "summary": "写 .xlsx 的纯 Python 库。"
+  },
+  {
+   "id": 15,
+   "name": "gh-proxy.com",
+   "kind": "tool",
+   "summary": "GitHub release 文件加速镜像，间歇可用，不代理网页内容。"
+  },
+  {
+   "id": 16,
+   "name": "ghproxy.net",
+   "kind": "tool",
+   "summary": "GitHub 加速镜像，与 gh-proxy.com 轮流抽风。"
+  },
+  {
+   "id": 17,
+   "name": "微信",
+   "kind": "product",
+   "summary": "用户常用即时通讯软件，回车键用于发送消息。"
+  },
+  {
+   "id": 18,
+   "name": "Claude Code",
+   "kind": "product",
+   "summary": "Anthropic 的编码智能体 CLI，可作为 ruagent 的执行运行时。"
+  },
+  {
+   "id": 19,
+   "name": "Docker",
+   "kind": "tool",
+   "summary": "用户机器上未安装的容器引擎，本想用于断网 arm64 测试。"
+  },
+  {
+   "id": 20,
+   "name": "清华 PyPI 镜像",
+   "kind": "org",
+   "summary": "国内 PyPI/系统软件镜像源，用于加速下载与 WSL 内 apt。"
+  },
+  {
+   "id": 21,
+   "name": "Agent Client Protocol (ACP)",
+   "kind": "concept",
+   "summary": "Zed/JetBrains JSON-RPC-over-stdio protocol for client<->agent interop; the standard ruagent builds on."
+  },
+  {
+   "id": 22,
+   "name": "Model Context Protocol (MCP)",
+   "kind": "concept",
+   "summary": "Standard tool layer for agents; ACP carries mcpServers config into session/new, and ruagent exposes itself as an MCP server."
+  },
+  {
+   "id": 23,
+   "name": "OpenViking",
+   "kind": "product",
+   "summary": "字节跳动/火山引擎开源的 Agent 上下文数据库，统一记忆/知识 RAG/Skills，AGPL-3.0"
+  },
+  {
+   "id": 24,
+   "name": "Multica",
+   "kind": "product",
+   "summary": "开源可自部署的 AI 编码 agent 团队工作台，支持 26 个 agent CLI，Apache-2.0 附加条件"
+  },
+  {
+   "id": 25,
+   "name": "LoopX",
+   "kind": "product",
+   "summary": "确定性状态内核/控制面，坐在 harness 之上管理 long-horizon 目标，Apache-2.0"
+  },
+  {
+   "id": 26,
+   "name": "Agno",
+   "kind": "product",
+   "summary": "Python 多智能体框架 v3，含六类记忆存储分类法，Apache-2.0"
+  },
+  {
+   "id": 27,
+   "name": "DeepSeek Harness (dsh)",
+   "kind": "product",
+   "summary": "DeepSeek's official ACP-native, plugin-based coding harness (npm @deepseek-ai/dsh, MIT); drives ACP via `dsh --profile acp`."
+  },
+  {
+   "id": 28,
+   "name": "OpenCode",
+   "kind": "product",
+   "summary": "开源编码智能体 CLI，是 ruagent 支持的运行时之一。"
+  },
+  {
+   "id": 29,
+   "name": "Ant Design",
+   "kind": "tool",
+   "summary": "React 企业级 UI 组件库，ruagent 面板采用的组件层"
+  },
+  {
+   "id": 30,
+   "name": "LanceDB",
+   "kind": "tool",
+   "summary": "ruagent 知识库使用的向量数据库，构建期依赖 protoc。"
+  },
+  {
+   "id": 31,
+   "name": "fastembed",
+   "kind": "tool",
+   "summary": "Qdrant 的 Rust ONNX 嵌入推理库，ruagent 本地嵌入方案"
+  },
+  {
+   "id": 32,
+   "name": "skills.sh",
+   "kind": "product",
+   "summary": "可检索和安装的公开 Agent Skill 市场/生态。"
+  },
+  {
+   "id": 33,
+   "name": "SKILL.md / Agent Skills",
+   "kind": "concept",
+   "summary": "Markdown+frontmatter skill standard (name/description/allowed-tools) with progressive disclosure; fastest-converging cross-CLI artifact."
+  },
+  {
+   "id": 34,
+   "name": "AGENTS.md",
+   "kind": "concept",
+   "summary": "Vendor-neutral agent instructions file, one of the two settled standards alongside MCP."
+  },
+  {
+   "id": 35,
+   "name": "Graphiti / Zep",
+   "kind": "tool",
+   "summary": "Temporal knowledge-graph memory system; source of bi-temporal edge design (valid_at/invalid_at + created_at/expired_at)."
+  },
+  {
+   "id": 36,
+   "name": "HippoRAG",
+   "kind": "concept",
+   "summary": "图谱参与检索的路线：查询→实体定位→邻域子图→定向取块"
+  },
+  {
+   "id": 37,
+   "name": "dsh-import-agents",
+   "kind": "tool",
+   "summary": "dsh plugin for syncing session history from codex/claude-code/opencode; reference for external history ingestion."
+  },
+  {
+   "id": 38,
+   "name": "Andrej Karpathy",
+   "kind": "person",
+   "summary": "提出 context engineering 与 LLM OS 隐喻的方法论作者"
+  },
+  {
+   "id": 39,
+   "name": "hfldqwe",
+   "kind": "person",
+   "summary": "用户的 GitHub 账号，ruagent 仓库所有者"
+  },
+  {
+   "id": 40,
+   "name": "Vibe Kanban",
+   "kind": "product",
+   "summary": "Kanban board orchestrating many coding-agent CLIs; closest thing to an execution-layer category leader."
+  },
+  {
+   "id": 41,
+   "name": "acpx",
+   "kind": "tool",
+   "summary": "Headless CLI client for stateful ACP sessions; a programmatic building block in the ACP ecosystem."
+  },
+  {
+   "id": 42,
+   "name": "DeepSeek Harness",
+   "kind": "product",
+   "summary": "DeepSeek 的编码智能体运行时（dsh），是 ruagent 支持的引擎之一。"
+  },
+  {
+   "id": 43,
+   "name": "Agent Client Protocol",
+   "kind": "concept",
+   "summary": "用于把不同编码智能体 CLI 接入统一控制面的客户端协议标准。"
+  },
+  {
+   "id": 44,
+   "name": "Model Context Protocol",
+   "kind": "concept",
+   "summary": "智能体工具调用协议，ruagent 以平台 MCP 服务器统一向各引擎暴露记忆与知识工具。"
+  },
+  {
+   "id": 45,
+   "name": "Graphiti",
+   "kind": "product",
+   "summary": "Zep 的时序知识图谱引擎，双时间线边设计"
+  },
+  {
+   "id": 46,
+   "name": "Postgres 16",
+   "kind": "product",
+   "summary": "PostgreSQL 16, the production database for the project, exposed on port 6543."
+  },
+  {
+   "id": 47,
+   "name": "sqlx",
+   "kind": "tool",
+   "summary": "Rust async SQL toolkit and migration tool used to manage the project's migrations."
+  },
+  {
+   "id": 48,
+   "name": "Supabase",
+   "kind": "org",
+   "summary": "Managed Postgres platform whose connection conventions (6543 pooler vs 5432 direct) motivated the review."
+  },
+  {
+   "id": 49,
+   "name": "PgBouncer",
+   "kind": "tool",
+   "summary": "Connection pooler whose transaction vs session pool mode determines prepared-statement and advisory-lock behavior."
+  },
+  {
+   "id": 50,
+   "name": "audit_log",
+   "kind": "concept",
+   "summary": "被约束为不可 drop 的数据表，DROP 形状操作会被 lint 拦截。"
+  },
+  {
+   "id": 51,
+   "name": "SQLite",
+   "kind": "tool",
+   "summary": "Planned queryable store for the project (WAL mode, single-writer actor, group commit)."
+  },
+  {
+   "id": 52,
+   "name": "distill",
+   "kind": "project",
+   "summary": "The project whose production database, migration tooling, and storage design are under discussion."
+  },
+  {
+   "id": 54,
+   "name": "Windows 11",
+   "kind": "product",
+   "summary": "用户使用的操作系统环境。"
+  },
+  {
+   "id": 55,
+   "name": "deepseek-v4-flash",
+   "kind": "product",
+   "summary": "由 DeepSeek Harness 驱动的语言模型，可承担权限审批等轻量角色。"
+  },
+  {
+   "id": 56,
+   "name": "qpl",
+   "kind": "project",
+   "summary": "用户本机 `Documents\\ai\\` 下的一个代码仓库。"
+  },
+  {
+   "id": 57,
+   "name": "data-qpl",
+   "kind": "project",
+   "summary": "用户本机 `Documents\\ai\\` 下的一个代码仓库。"
+  },
+  {
+   "id": 58,
+   "name": "dsh",
+   "kind": "project",
+   "summary": "用户本机 `Documents\\ai\\` 下的一个代码仓库。"
+  },
+  {
+   "id": 59,
+   "name": "dsh-kanban",
+   "kind": "project",
+   "summary": "用户的看板/任务平台项目，卡片 ID 形如 `cof80yi5s`。"
+  },
+  {
+   "id": 60,
+   "name": "t99",
+   "kind": "concept",
+   "summary": "一次对照扰动测试中出现的占位符名称，工作区、记忆与任务列表中均无对应实体"
+  },
+  {
+   "id": 61,
+   "name": "find-skills",
+   "kind": "tool",
+   "summary": "用于发现并推荐/安装 Agent Skill 的技能，用户问「有没有做 X 的技能」时使用。"
+  },
+  {
+   "id": 62,
+   "name": "Skills CLI",
+   "kind": "tool",
+   "summary": "通过 npx skills 调用的技能管理命令行工具（v1.7.0），支持 find/add 子命令。"
+  },
+  {
+   "id": 63,
+   "name": "蓝鲸潜艇",
+   "kind": "concept",
+   "summary": "用户与本会话约定的暗号/验证口令，用于确认记忆是否保留。"
+  },
+  {
+   "id": 64,
+   "name": "Codex",
+   "kind": "product",
+   "summary": "OpenAI 的编码智能体 CLI，是 ruagent 支持的引擎之一。"
+  }
+ ],
+ "edges": [
+  {
+   "id": 1,
+   "src": 1,
+   "dst": 2,
+   "relation": "uses_protocol",
+   "fact_text": "ruagent speaks ACP to all agents",
+   "valid_at": "2026-09-13",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 2,
+   "src": 3,
+   "dst": 6,
+   "relation": "uses",
+   "fact_text": "用户在一台无 root、无外网的 arm64 银河麒麟 V10 上部署 Python 3.10.9。",
+   "valid_at": "2026-09-13T17:06:33.250986400+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 3,
+   "src": 6,
+   "dst": 8,
+   "relation": "shares_kernel_with",
+   "fact_text": "用户的麒麟机器与 WSL/ podman machine 场景共享同一套 arm64 模拟测试思路。",
+   "valid_at": "2026-09-13T17:06:33.251137300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 4,
+   "src": 3,
+   "dst": 4,
+   "relation": "uses",
+   "fact_text": "用户用 AutoHotkey v2 把鼠标侧键映射为 F6 与回车。",
+   "valid_at": "2026-09-13T17:06:33.251282800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 5,
+   "src": 3,
+   "dst": 17,
+   "relation": "uses",
+   "fact_text": "用户通过微信/QQ 验证鼠标后退键映射为回车发送。",
+   "valid_at": "2026-09-13T17:06:33.251418700+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 6,
+   "src": 10,
+   "dst": 5,
+   "relation": "provides",
+   "fact_text": "该项目的 aarch64 预编译包是麒麟机上零编译离线 Python 3.10.9 的来源。",
+   "valid_at": "2026-09-13T17:06:33.251654+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 7,
+   "src": 5,
+   "dst": 11,
+   "relation": "depends_on",
+   "fact_text": "离线 Excel 能力依赖 pandas 等库的预编译 wheel。",
+   "valid_at": "2026-09-13T17:06:33.251814800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 8,
+   "src": 11,
+   "dst": 12,
+   "relation": "depends_on",
+   "fact_text": "pandas 依赖 numpy，二者都需选带预编译 wheel 的版本。",
+   "valid_at": "2026-09-13T17:06:33.251966+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 9,
+   "src": 7,
+   "dst": 9,
+   "relation": "uses",
+   "fact_text": "Podman 机器自带 QEMU，可运行 arm64 容器。",
+   "valid_at": "2026-09-13T17:06:33.252097500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 10,
+   "src": 8,
+   "dst": 9,
+   "relation": "uses",
+   "fact_text": "在 WSL 内安装 qemu-user-static 并注册 binfmt 以获得 arm64 执行能力。",
+   "valid_at": "2026-09-13T17:06:33.252221500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 11,
+   "src": 3,
+   "dst": 18,
+   "relation": "uses",
+   "fact_text": "用户以 C:\\Users\\19410\\Documents\\ai\\dsh 作为 Claude Code 工作目录。",
+   "valid_at": "2026-09-13T17:06:33.252333400+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 12,
+   "src": 1,
+   "dst": 21,
+   "relation": "built_on",
+   "fact_text": "ruagent acts as an ACP client to drive coding-agent runtimes over stdio JSON-RPC.",
+   "valid_at": "2026-09-13T18:34:20.789762500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 13,
+   "src": 1,
+   "dst": 22,
+   "relation": "exposes",
+   "fact_text": "The ruagent daemon hosts an MCP server and injects the same MCP config into every spawned agent via ACP session/new.",
+   "valid_at": "2026-09-13T18:34:20.790281200+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 14,
+   "src": 1,
+   "dst": 18,
+   "relation": "integrates_runtime",
+   "fact_text": "ruagent drives Claude Code through the npx @agentclientprotocol/claude-agent-acp adapter.",
+   "valid_at": "2026-09-13T18:34:20.790578200+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 15,
+   "src": 1,
+   "dst": 28,
+   "relation": "integrates_runtime",
+   "fact_text": "ruagent drives opencode natively via `opencode acp`.",
+   "valid_at": "2026-09-13T18:34:20.790810700+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 16,
+   "src": 1,
+   "dst": 27,
+   "relation": "integrates_runtime",
+   "fact_text": "ruagent drives dsh natively via `dsh --profile acp`.",
+   "valid_at": "2026-09-13T18:34:20.791022900+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 17,
+   "src": 1,
+   "dst": 23,
+   "relation": "borrows_design_from",
+   "fact_text": "ruagent borrows OpenViking's file-URI navigation, tiered summaries and audited memory writes, but cannot copy its AGPL-3.0 code.",
+   "valid_at": "2026-09-13T18:34:20.791241100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 18,
+   "src": 1,
+   "dst": 30,
+   "relation": "uses",
+   "fact_text": "ruagent uses embedded LanceDB for vector storage alongside SQLite for state.",
+   "valid_at": "2026-09-13T18:34:20.791485300+00:00",
+   "invalid_at": "2026-09-13T18:38:15.350633200+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 19,
+   "src": 1,
+   "dst": 29,
+   "relation": "uses",
+   "fact_text": "The ruagent Web panel was migrated to Ant Design components with light/dark theme algorithms.",
+   "valid_at": "2026-09-13T18:34:20.792034600+00:00",
+   "invalid_at": "2026-09-13T18:38:15.351211800+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 20,
+   "src": 1,
+   "dst": 31,
+   "relation": "uses",
+   "fact_text": "ruagent uses fastembed with bge-small-en-v1.5 for local ONNX embeddings.",
+   "valid_at": "2026-09-13T18:34:20.792301700+00:00",
+   "invalid_at": "2026-09-13T18:38:15.350897100+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 21,
+   "src": 1,
+   "dst": 24,
+   "relation": "benchmarked_against",
+   "fact_text": "The user demanded the panel and backend match Multica's maturity (board, execution log, inbox).",
+   "valid_at": "2026-09-13T18:34:20.792562800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 22,
+   "src": 1,
+   "dst": 26,
+   "relation": "borrows_design_from",
+   "fact_text": "ruagent's six memory stores derive from Agno's memory taxonomy.",
+   "valid_at": "2026-09-13T18:34:20.792724+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 23,
+   "src": 1,
+   "dst": 35,
+   "relation": "borrows_design_from",
+   "fact_text": "ruagent's entity graph uses bi-temporal validity inspired by Graphiti/Zep.",
+   "valid_at": "2026-09-13T18:34:20.792910800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 24,
+   "src": 1,
+   "dst": 37,
+   "relation": "references",
+   "fact_text": "ruagent's session-history sync follows the approach of the dsh-import-agents plugin for codex/claude-code/opencode.",
+   "valid_at": "2026-09-13T18:34:20.793354500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 25,
+   "src": 27,
+   "dst": 21,
+   "relation": "implements",
+   "fact_text": "dsh ships an official ACP server mode (`--profile acp`) and an ACP client subagent package.",
+   "valid_at": "2026-09-13T18:34:20.793641300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 26,
+   "src": 18,
+   "dst": 21,
+   "relation": "supported_via_adapter",
+   "fact_text": "Claude Code gains ACP through the @agentclientprotocol/claude-agent-acp adapter, replacing the deprecated @zed-industries package.",
+   "valid_at": "2026-09-13T18:34:20.793895600+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 27,
+   "src": 23,
+   "dst": 38,
+   "relation": "conceptually_related",
+   "fact_text": "OpenViking's file-URI memory model shares the design family of Karpathy's agent-written tagged Markdown notes.",
+   "valid_at": "2026-09-13T18:34:20.794114100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 28,
+   "src": 39,
+   "dst": 1,
+   "relation": "owns",
+   "fact_text": "hfldqwe owns the private GitHub repository github.com/hfldqwe/ruagent.",
+   "valid_at": "2026-09-13T18:34:20.794560500+00:00",
+   "invalid_at": "2026-09-13T18:38:15.351531100+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 29,
+   "src": 24,
+   "dst": 21,
+   "relation": "uses",
+   "fact_text": "Multica drives ~10 agent CLIs with a shared ACP JSON-RPC client and stream-JSON spawns for the rest.",
+   "valid_at": "2026-09-13T18:34:20.794815700+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 30,
+   "src": 32,
+   "dst": 33,
+   "relation": "distributes",
+   "fact_text": "skills.sh installs SKILL.md-format skills into each harness's skill directories.",
+   "valid_at": "2026-09-13T18:34:20.795042700+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 31,
+   "src": 1,
+   "dst": 43,
+   "relation": "uses",
+   "fact_text": "ruagent 以 ACP client 身份统一接入多种 coding agent CLI。",
+   "valid_at": "2026-09-13T18:38:15.350021600+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 32,
+   "src": 1,
+   "dst": 44,
+   "relation": "uses",
+   "fact_text": "ruagent 既是 MCP 客户端（管理外部 server）又是 MCP server 宿主（向 agent 暴露记忆/知识/任务工具）。",
+   "valid_at": "2026-09-13T18:38:15.350292800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 33,
+   "src": 1,
+   "dst": 30,
+   "relation": "uses",
+   "fact_text": "ruagent 用嵌入式 LanceDB 存向量化的知识库与 procedures。",
+   "valid_at": "2026-09-13T18:38:15.350633200+00:00",
+   "invalid_at": "2026-09-26T10:28:22.965316500+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 34,
+   "src": 1,
+   "dst": 31,
+   "relation": "uses",
+   "fact_text": "ruagent 用 fastembed + bge-small-en-v1.5 做本地语义嵌入。",
+   "valid_at": "2026-09-13T18:38:15.350897100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 35,
+   "src": 1,
+   "dst": 29,
+   "relation": "uses",
+   "fact_text": "ruagent Web 面板整体迁移到 Ant Design 6 组件库。",
+   "valid_at": "2026-09-13T18:38:15.351211800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 36,
+   "src": 39,
+   "dst": 1,
+   "relation": "owns",
+   "fact_text": "hfldqwe 是 ruagent 私有 GitHub 仓库的所有者。",
+   "valid_at": "2026-09-13T18:38:15.351531100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 37,
+   "src": 23,
+   "dst": 1,
+   "relation": "inspires",
+   "fact_text": "ruagent 的记忆/知识设计借鉴 OpenViking 的文件式记忆与分层摘要，但因 AGPL-3.0 只借设计不抄代码。",
+   "valid_at": "2026-09-13T18:38:15.351782800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 38,
+   "src": 1,
+   "dst": 42,
+   "relation": "supports",
+   "fact_text": "ruagent 通过 dsh --profile acp 原生接入 DeepSeek Harness。",
+   "valid_at": "2026-09-13T18:38:15.351987900+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 39,
+   "src": 1,
+   "dst": 18,
+   "relation": "supports",
+   "fact_text": "ruagent 经 @agentclientprotocol/claude-agent-acp 适配器接入 Claude Code。",
+   "valid_at": "2026-09-13T18:38:15.352204+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 40,
+   "src": 1,
+   "dst": 28,
+   "relation": "supports",
+   "fact_text": "ruagent 经 opencode acp 原生接入 OpenCode。",
+   "valid_at": "2026-09-13T18:38:15.352437900+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 41,
+   "src": 24,
+   "dst": 42,
+   "relation": "supports",
+   "fact_text": "Multica 的 26 个受支持 agent CLI 中包含 DeepSeek Harness。",
+   "valid_at": "2026-09-13T18:38:15.352692800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 42,
+   "src": 38,
+   "dst": 1,
+   "relation": "influences",
+   "fact_text": "ruagent 的统一记忆层借鉴 Karpathy 的 context engineering 与 LLM OS 隐喻。",
+   "valid_at": "2026-09-13T18:38:15.352898800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 43,
+   "src": 52,
+   "dst": 46,
+   "relation": "uses_as_production_database",
+   "fact_text": "distill runs Postgres 16 in production on port 6543.",
+   "valid_at": "2026-09-14T01:37:07.566385200+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 44,
+   "src": 52,
+   "dst": 47,
+   "relation": "manages_migrations_with",
+   "fact_text": "distill manages database migrations using sqlx.",
+   "valid_at": "2026-09-14T01:37:07.566871200+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 45,
+   "src": 52,
+   "dst": 50,
+   "relation": "must_never_drop",
+   "fact_text": "The audit_log table in distill's production database must never be dropped.",
+   "valid_at": "2026-09-14T01:37:07.567120300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 46,
+   "src": 52,
+   "dst": 30,
+   "relation": "uses_for_vector_storage",
+   "fact_text": "distill's recorded storage plan uses LanceDB for vector storage.",
+   "valid_at": "2026-09-14T01:37:07.567225700+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 47,
+   "src": 52,
+   "dst": 51,
+   "relation": "planned_queryable_store",
+   "fact_text": "distill's recorded plan uses SQLite (WAL, single-writer actor, group commit) as the queryable store.",
+   "valid_at": "2026-09-14T01:37:07.567357500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 48,
+   "src": 1,
+   "dst": 54,
+   "relation": "runs_on",
+   "fact_text": "ruagent 运行在 Windows 11 上。",
+   "valid_at": "2026-09-19T13:27:27.928782200+00:00",
+   "invalid_at": "2026-09-25T01:38:51.348817+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 49,
+   "src": 42,
+   "dst": 55,
+   "relation": "drives_model",
+   "fact_text": "DeepSeek Harness 驱动 deepseek-v4-flash 模型运行。",
+   "valid_at": "2026-09-19T16:11:40.988680+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 50,
+   "src": 1,
+   "dst": 55,
+   "relation": "uses_model_for_permission_gatekeeping",
+   "fact_text": "ruagent 的权限守门人角色由 deepseek-v4-flash 承担，仅回复 ALLOW 或 REJECT。",
+   "valid_at": "2026-09-19T16:11:40.988853800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 51,
+   "src": 1,
+   "dst": 42,
+   "relation": "powered_by",
+   "fact_text": "ruagent 会话由 DeepSeek Harness 驱动。",
+   "valid_at": "2026-09-19T23:27:43.763080500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 52,
+   "src": 42,
+   "dst": 55,
+   "relation": "runs_model",
+   "fact_text": "DeepSeek Harness 在该会话中运行 deepseek-v4-flash 模型。",
+   "valid_at": "2026-09-19T23:27:43.763816700+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 53,
+   "src": 42,
+   "dst": 55,
+   "relation": "powers",
+   "fact_text": "DeepSeek Harness 驱动 deepseek-v4-flash 模型运行。",
+   "valid_at": "2026-09-20T14:40:41.049974+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 54,
+   "src": 1,
+   "dst": 55,
+   "relation": "uses_as_permission_gatekeeper",
+   "fact_text": "ruagent 使用由 deepseek-v4-flash 驱动的 agent 作为权限守门人，仅回复 ALLOW 或 REJECT。",
+   "valid_at": "2026-09-20T14:40:41.050380400+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 55,
+   "src": 55,
+   "dst": 42,
+   "relation": "powered_by",
+   "fact_text": "deepseek-v4-flash 模型由 DeepSeek Harness 驱动运行。",
+   "valid_at": "2026-09-23T11:24:41.542174200+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 56,
+   "src": 1,
+   "dst": 55,
+   "relation": "hosts",
+   "fact_text": "ruagent 会话中可由 deepseek-v4-flash 担任权限守门人，仅回复 ALLOW 或 REJECT。",
+   "valid_at": "2026-09-23T11:24:41.542706100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 57,
+   "src": 61,
+   "dst": 32,
+   "relation": "searches",
+   "fact_text": "find-skills 技能通过 Skills CLI 在 skills.sh 市场检索可安装的技能。",
+   "valid_at": "2026-09-23T17:33:33.633120100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 58,
+   "src": 62,
+   "dst": 32,
+   "relation": "installs_from",
+   "fact_text": "Skills CLI 用 `npx skills find` 搜索、`npx skills add` 从 skills.sh 安装技能。",
+   "valid_at": "2026-09-23T17:33:33.633432300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 59,
+   "src": 1,
+   "dst": 54,
+   "relation": "runs_on",
+   "fact_text": "ruagent 运行在 Windows 11 上。",
+   "valid_at": "2026-09-25T01:38:51.348817+00:00",
+   "invalid_at": "2026-09-25T02:39:34.606428300+00:00",
+   "event_time_source": null
+  },
+  {
+   "id": 60,
+   "src": 1,
+   "dst": 54,
+   "relation": "runs_on",
+   "fact_text": "ruagent 运行在 Windows 11 上。",
+   "valid_at": "2026-09-25T02:39:34.606428300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 61,
+   "src": 1,
+   "dst": 43,
+   "relation": "uses_protocol",
+   "fact_text": "ruagent 基于 Agent Client Protocol 接入并编排多个编码智能体 CLI。",
+   "valid_at": "2026-09-26T10:28:22.962558800+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 62,
+   "src": 1,
+   "dst": 18,
+   "relation": "orchestrates",
+   "fact_text": "ruagent 可把 Claude Code 作为运行时拉起并纳入统一记忆。",
+   "valid_at": "2026-09-26T10:28:22.963041300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 63,
+   "src": 1,
+   "dst": 28,
+   "relation": "orchestrates",
+   "fact_text": "ruagent 支持将 OpenCode 作为执行引擎。",
+   "valid_at": "2026-09-26T10:28:22.963293600+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 64,
+   "src": 1,
+   "dst": 42,
+   "relation": "orchestrates",
+   "fact_text": "ruagent 支持 dsh（DeepSeek Harness）作为执行引擎，并同步其会话历史。",
+   "valid_at": "2026-09-26T10:28:22.963553+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 65,
+   "src": 1,
+   "dst": 64,
+   "relation": "orchestrates",
+   "fact_text": "ruagent 支持将 Codex 作为执行引擎。",
+   "valid_at": "2026-09-26T10:28:22.965074300+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 66,
+   "src": 1,
+   "dst": 30,
+   "relation": "uses",
+   "fact_text": "ruagent 知识库使用 LanceDB 做向量检索，构建时需要 protoc。",
+   "valid_at": "2026-09-26T10:28:22.965316500+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  },
+  {
+   "id": 67,
+   "src": 1,
+   "dst": 44,
+   "relation": "provides",
+   "fact_text": "ruagent 为每个拉起的智能体注入同一个平台 MCP 服务器以共享记忆与知识工具。",
+   "valid_at": "2026-09-26T10:28:22.965854100+00:00",
+   "invalid_at": null,
+   "event_time_source": null
+  }
+ ]
+}

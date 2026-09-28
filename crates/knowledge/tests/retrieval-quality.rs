@@ -70,6 +70,28 @@
 //! Real embedder mode: RUAGENT_T245_REAL=1 uses the product's FastEmbedder; if it
 //! cannot be constructed the JSON records that as ABSENT with the error, and the
 //! run continues on the hash embedder.
+//!
+//! t7 (recall) extended this file in two ways, both recorded here:
+//!   1. The stage counter that used to say "at least one query reached the
+//!      Substring (LIKE) stage" became "at least one query reached a stage
+//!      BEYOND precision/prefix". After t7 the CJK queries are served by the
+//!      Han-bigram index, so the old assertion would have failed while the
+//!      property it stood for (the ladder must go deeper than the two FTS
+//!      stages) still holds. The variant that does the work is named in
+//!      retrieval-cjk.rs, because naming it here would stop this file from
+//!      compiling against the pre-t7 code -- and this file's whole value is
+//!      that it runs against BOTH revisions (it is the before/after pair).
+//!   2. A new assertion pins the property C4 is really about: the CJK
+//!      substring queries must NOT be served by the full-table scan. That one
+//!      fails on the pre-t7 code, which is what makes the t7 reading evidence.
+//!
+//! NOT extended here, on purpose: the provenance fields for the fusion and the
+//! leg window. Reading them means `legs.fusion` / `legs.leg_window`, which do
+//! not exist before t7 — and this file's value is that it still COMPILES on the
+//! pre-t7 revision, so the before/after pair comes from one instrument. The
+//! fusion provenance therefore lives in retrieval-gold-live.rs (the new
+//! instrument), which prints `fusion=`, `leg_window=` and `scoring_version=`
+//! from the store's own constants.
 
 use ruagent_knowledge::{Embedder, HashEmbedder, Knowledge};
 use std::collections::HashMap;
@@ -328,6 +350,17 @@ struct ReadingCounts {
     substring_floor_only: Vec<String>,
     substring_unexplained: Vec<String>,
     substring_stage_rows: usize,
+    /// t7: queries whose keyword leg came from a stage DEEPER than precision and
+    /// prefix (the exact-token stage and the prefix stage). Before t7 that meant
+    /// the LIKE scan; after t7 it means the Han-bigram index for the CJK cases
+    /// and still the scan for the one-character cases. The property is "the
+    /// ladder goes deeper than the two FTS stages", stated without naming the
+    /// variant so this file compiles on both revisions.
+    beyond_precision_prefix_rows: usize,
+    /// t7: `cjk-substring`-class queries, and how many of them were NOT served
+    /// by the full-table scan. The second must equal the first (C4).
+    cjk_substring_rows: usize,
+    cjk_substring_not_scan: usize,
 }
 
 impl ReadingCounts {
@@ -452,6 +485,20 @@ async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
         if legs.keyword_stage == ruagent_knowledge::store::KeywordStage::Substring {
             counts.substring_stage_rows += 1;
         }
+        if !matches!(
+            legs.keyword_stage,
+            ruagent_knowledge::store::KeywordStage::Empty
+                | ruagent_knowledge::store::KeywordStage::Precision
+                | ruagent_knowledge::store::KeywordStage::Prefix
+        ) {
+            counts.beyond_precision_prefix_rows += 1;
+        }
+        if *class == "cjk-substring" {
+            counts.cjk_substring_rows += 1;
+            if legs.keyword_stage != ruagent_knowledge::store::KeywordStage::Substring {
+                counts.cjk_substring_not_scan += 1;
+            }
+        }
         // t293: classify this query under both readings of "the term exists".
         {
             let terms = ruagent_store::fts::terms(query);
@@ -569,6 +616,15 @@ async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
         &mut out,
         4,
         &format!("\"no_answer\": {},", QUERIES.len() - ranks.len()),
+    );
+    // A recall number is not comparable with one taken under a different fusion
+    // or a different leg window. This file cannot read them without losing its
+    // pre-t7 compilability, so it names them as the t7 values the store's own
+    // constants are pinned to in retrieval-cjk.rs (one place, not two).
+    line(
+        &mut out,
+        4,
+        "\"scoring_generation\": \"t7: weighted RRF + a constant leg window; the fusion and window are printed by retrieval-gold-live.rs from the store's constants\",",
     );
     line(
         &mut out,
@@ -690,7 +746,23 @@ async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
     line(
         &mut out,
         4,
-        &format!("\"substring_stage_rows\": {}", counts.substring_stage_rows),
+        &format!(
+            "\"beyond_precision_prefix_rows\": {},",
+            counts.beyond_precision_prefix_rows
+        ),
+    );
+    line(
+        &mut out,
+        4,
+        &format!("\"cjk_substring_rows\": {},", counts.cjk_substring_rows),
+    );
+    line(
+        &mut out,
+        4,
+        &format!(
+            "\"cjk_substring_not_scan\": {}",
+            counts.cjk_substring_not_scan
+        ),
     );
     line(&mut out, 2, "},");
     line(&mut out, 2, "\"missing_gold_documents\": [");
@@ -728,7 +800,7 @@ async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
     out.push(NL);
 
     println!(
-        "[t245/{}] embedder={} docs={} queries={} answerable={} fused recall@1={:.4} recall@5={:.4} mrr={:.4} keyword_nonempty={}/{} semantic_nonempty={} substring_rows={} elapsed={}ms",
+        "[t245/{}] embedder={} docs={} queries={} answerable={} fused recall@1={:.4} recall@5={:.4} mrr={:.4} keyword_nonempty={}/{} semantic_nonempty={} beyond_precision_prefix={} cjk_substring_not_scan={}/{} elapsed={}ms",
         tag,
         embedder_note,
         docs.len(),
@@ -740,7 +812,9 @@ async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
         kw_nonempty,
         QUERIES.len(),
         sem_nonempty,
-        counts.substring_stage_rows,
+        counts.beyond_precision_prefix_rows,
+        counts.cjk_substring_not_scan,
+        counts.cjk_substring_rows,
         started.elapsed().as_millis()
     );
     println!(
@@ -871,21 +945,27 @@ async fn retrieval_quality() {
         "two runs must be byte-identical (no timing inside the JSON)"
     );
 
-    // t293: the substring stage must actually APPEAR in this quality harness.
-    // Until t293 no row here had raw_score 0.0, so the one stage with no bm25
-    // was covered only by retrieval-legs' unit tests (F-286c).
+    // t293, restated for t7: the ladder must reach deeper than the two FTS
+    // stages for at least one query, or the deeper stages are never exercised
+    // here. Which variant does it is pinned in retrieval-cjk.rs (naming it in
+    // this file would break its pre-t7 run, which is the before/after pair).
     assert!(
-        counts.substring_stage_rows >= 1,
-        "at least one query must reach the substring stage, or this harness never exercises LIKE"
+        counts.beyond_precision_prefix_rows >= 1,
+        "at least one query must be served by a stage deeper than precision/prefix, or this harness never exercises the deeper ladder"
+    );
+    // t7 / C4, and this one FAILS on the pre-t7 code: no CJK substring query may
+    // be answered by the full-table LIKE scan.
+    assert_eq!(
+        counts.cjk_substring_not_scan, counts.cjk_substring_rows,
+        "every cjk-substring query must be indexed rather than scanned"
     );
     assert!(
-        a.contains("\"keyword_stage\": \"Substring\""),
-        "the per-query table must name the stage; a row with raw_score 0.0 is otherwise indistinguishable from a bm25 of zero"
+        counts.cjk_substring_rows >= 1,
+        "the fixture must contain a cjk-substring query, or the assertion above is vacuous"
     );
     assert!(
-        a.contains("\"keyword_stage\": \"Substring\", \"keyword_hits\": [")
-            && a.contains("0.000000"),
-        "the substring row must be present with its raw score"
+        a.contains("\"keyword_stage\":"),
+        "the per-query table must name the stage; a row with a 0.0 raw score is otherwise indistinguishable from a bm25 that happens to be zero"
     );
 
     // t293: the criterion's own content, now that its semantics are written

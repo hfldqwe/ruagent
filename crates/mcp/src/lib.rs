@@ -269,7 +269,34 @@ impl PlatformTools {
             .json()
             .await
             .map_err(rpc_error)?;
-        let facts = resp["facts"].as_array().cloned().unwrap_or_default();
+        // t93 / audit M1 (second half): `resp["facts"].as_array().cloned()
+        // .unwrap_or_default()` was a protocol-drift absorber -- rename the field
+        // and EVERY entity reports "has no current facts", with no test to catch
+        // it. A missing or mistyped field is an error, not an empty result.
+        //
+        // M1 (first half): "this entity does not exist" must not read the same as
+        // "this entity exists with no current facts". The daemon's
+        // `GET /graph/entity/{id}` (api.rs:1207-1216) returns `{"facts": []}` for
+        // BOTH today -- it carries no existence field and no 404 -- so this tool
+        // cannot invent the distinction on its own. The branch below already
+        // honours an existence field (`entity: null` or `exists: false`), so the
+        // daemon side is a one-line change; see the finding in the report.
+        let entity_missing = resp
+            .get("entity")
+            .map(|e| e.is_null())
+            .or_else(|| resp.get("exists").and_then(|e| e.as_bool()).map(|b| !b))
+            .unwrap_or(false);
+        if entity_missing {
+            return Err(rmcp::ErrorData::internal_error(
+                format!(
+                    "entity #{} not found: the graph has no entity with that id",
+                    params.id
+                ),
+                None,
+            ));
+        }
+        let facts =
+            facts_of(&resp).map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         if facts.is_empty() {
             return Ok(format!("entity #{} has no current facts", params.id));
         }
@@ -284,6 +311,130 @@ impl PlatformTools {
             ));
         }
         Ok(out)
+    }
+
+    // -- gen2 consumption surface (DEP-4 + R-B U-6; t46) ------------------
+    //
+    // Five READ-ONLY tools. Each one is a thin proxy to the HTTP route of the
+    // same name -- ONE consumption surface, not a second implementation: the
+    // JSON the daemon returns is the JSON the agent sees (pretty-printed only
+    // where a table is unreadable otherwise). No write tool is added here: the
+    // graph's merge/community writes stay human/agent decisions made through the
+    // HTTP API with an explicit body.
+
+    #[tool(
+        description = "Audit trail for a forgotten memory: where the content still exists (the local index/file copies) and which conclusions were derived from it. Needs the memory's content_hash (64 hex chars, from memory_get)."
+    )]
+    async fn memory_forget_report(
+        &self,
+        Parameters(params): Parameters<HashParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/forget-report", self.config.daemon_url);
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("content_hash", &params.content_hash)])
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
+    }
+
+    #[tool(
+        description = "Search the knowledge graph's entities by name/summary (a flat name search, NOT multi-hop). Use graph_retrieve when the question needs a path between things."
+    )]
+    async fn graph_search(
+        &self,
+        Parameters(params): Parameters<GraphSearchParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/graph/search", self.config.daemon_url);
+        let mut req = self.http.get(&url).query(&[("q", params.query.clone())]);
+        if let Some(limit) = params.limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: serde_json::Value = req
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
+    }
+
+    #[tool(
+        description = "Multi-hop retrieval over the knowledge graph: seeds (entities matching the text) + evidence paths (edges with their temporal status and their source episode/session). Optional as_of=<RFC3339> answers 'what was true at that instant'; three spellings of one instant give identical evidence. `stats.graph_edges` is the graph's SIZE, not the edge count at as_of. Empty results carry stats.empty_reason -- read it instead of guessing."
+    )]
+    async fn graph_retrieve(
+        &self,
+        Parameters(params): Parameters<GraphRetrieveParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/graph/retrieve", self.config.daemon_url);
+        let mut req = self.http.get(&url).query(&[("q", params.query.clone())]);
+        if let Some(hops) = params.hops {
+            req = req.query(&[("hops", hops.to_string())]);
+        }
+        if let Some(as_of) = &params.as_of {
+            req = req.query(&[("as_of", as_of)]);
+        }
+        if let Some(sup) = params.include_superseded {
+            req = req.query(&[("include_superseded", sup.to_string())]);
+        }
+        let resp: serde_json::Value = req
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
+    }
+
+    #[tool(
+        description = "The generated wiki's pages: slug, status, freshness (fresh|stale|unknown), the recorded cite_coverage and has_anchors. `cite_coverage: null` means NO BUILD RECORDED a reading for that page -- it is not 0.0 and not 1.0: read it as unknown."
+    )]
+    async fn wiki_pages(&self) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/knowledge/wiki/pages", self.config.daemon_url);
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
+    }
+
+    #[tool(
+        description = "The wiki's link graph: links_out per page (counts broken links, excludes self-links) and links_in, plus the pages that wanted-but-missing pages demand."
+    )]
+    async fn wiki_links(&self) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/knowledge/wiki/links", self.config.daemon_url);
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(rpc_error)?
+            .error_for_status()
+            .map_err(rpc_error)?
+            .json()
+            .await
+            .map_err(rpc_error)?;
+        Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
     }
 
     // -- platform ops (the symmetric design, §7.2) -----------------------
@@ -326,6 +477,41 @@ impl PlatformTools {
     }
 }
 
+/// The `facts` array of a graph-entity response, or an error that NAMES the
+/// drift (t93 / audit M1). Public so the roundtrip test can press the branch
+/// without a live daemon: `unwrap_or_default()` here is what made a renamed
+/// field indistinguishable from "no facts".
+pub fn facts_of(resp: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    resp.get("facts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| format!("daemon response carries no `facts` array: {resp}"))
+}
+
+#[test]
+fn t93_facts_of_rejects_a_renamed_or_mistyped_field() {
+    let normal = serde_json::json!({ "facts": [] });
+    assert_eq!(
+        facts_of(&normal)
+            .expect("an empty array is a reading")
+            .len(),
+        0
+    );
+
+    let one = serde_json::json!({ "facts": [{ "src": 1, "relation": "runs_on", "dst": 2 }] });
+    assert_eq!(facts_of(&one).unwrap().len(), 1);
+
+    let renamed = serde_json::json!({ "edges": [] });
+    let err = facts_of(&renamed).expect_err("a renamed field must be an error, not []");
+    assert!(err.contains("no `facts` array"), "{err}");
+
+    let mistyped = serde_json::json!({ "facts": "no" });
+    assert!(
+        facts_of(&mistyped).is_err(),
+        "a non-array `facts` must be an error"
+    );
+}
+
 #[tool_handler]
 impl ServerHandler for PlatformTools {
     fn get_info(&self) -> ServerInfo {
@@ -357,6 +543,32 @@ pub struct RecallParams {
     pub conservative: Option<bool>,
     #[schemars(description = "Max results per section (default 5)")]
     pub top_n: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HashParams {
+    #[schemars(description = "The memory's content_hash (64 hex chars)")]
+    pub content_hash: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GraphSearchParams {
+    #[schemars(description = "Name/summary text to look for")]
+    pub query: String,
+    #[schemars(description = "Max results (default 8)")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GraphRetrieveParams {
+    #[schemars(description = "The question, in words")]
+    pub query: String,
+    #[schemars(description = "Hops to walk (default 2, max 3)")]
+    pub hops: Option<u32>,
+    #[schemars(description = "RFC3339 instant: answer 'what was true then'")]
+    pub as_of: Option<String>,
+    #[schemars(description = "true = include edges that were superseded")]
+    pub include_superseded: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

@@ -41,6 +41,15 @@ export const zh: Record<string, string> = {
   "memory.recallGo": "召回",
   "memory.recallExpand": "拉取全文",
   "memory.recallHitChunk": "命中块",
+  // 量纲（契约：并排显示必须带量纲或改为不可比）。召回日志里两个并排的分数是
+  // **不同量纲**：记忆腿是余弦相似度（越大越像），知识腿是无量纲的 RRF 名次分。
+  // 以前记忆腿只写一个字母 `m`，读者会拿它和旁边的「名次分」比大小。
+  "memory.topMemoryScore": "记忆腿余弦 {s}",
+  "memory.topMemoryScoreHint":
+    "记忆腿的余弦相似度（0–1，越大越像）。它与旁边的「名次分」不是同一量纲：名次分只由名次算出、无量纲、上界=腿数/61。两者不能比较。",
+  "memory.hitScore": "余弦 {s}",
+  "memory.hitScoreHint":
+    "记忆腿的余弦相似度（0–1）。它与知识腿的「名次分」不同量纲，跨腿比较大小没有意义。",
   "memory.recallNoFacts": "暂无有效事实",
   "memory.recallEmpty": "没有命中——换个说法试试。",
   "memory.err": "无法读取记忆",
@@ -111,6 +120,16 @@ export const en: Record<string, string> = {
   "memory.recallGo": "Recall",
   "memory.recallExpand": "Fetch full text",
   "memory.recallHitChunk": "Hit chunk",
+  // Units (the contract: side-by-side readings carry their dimension or are not
+  // comparable). The two scores next to each other have DIFFERENT units: the
+  // memory leg is a cosine (higher = closer), the knowledge leg is the unitless
+  // RRF rank score. The memory leg used to render as a bare `m`.
+  "memory.topMemoryScore": "memory leg cosine {s}",
+  "memory.topMemoryScoreHint":
+    "The memory leg's cosine similarity (0–1, higher is closer). Different units from the rank score beside it, which is unitless, computed from ranks alone (ceiling = legs/61). The two are not comparable.",
+  "memory.hitScore": "cosine {s}",
+  "memory.hitScoreHint":
+    "The memory leg's cosine similarity (0–1). Different units from the knowledge leg's rank score — comparing the two across legs is meaningless.",
   "memory.recallNoFacts": "No current facts",
   "memory.recallEmpty": "No hits — try different wording.",
   "memory.err": "Cannot read memory",

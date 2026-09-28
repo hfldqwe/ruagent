@@ -525,8 +525,7 @@ impl ChatManager {
         query: &str,
     ) -> Option<String> {
         use ruagent_memory::inject::{
-            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, WIKI_PAGES,
-            knowledge_items, render_context,
+            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, WIKI_PAGES, render_context,
         };
 
         let mut items: Vec<ContextItem> = Vec::new();
@@ -554,19 +553,66 @@ impl ChatManager {
         //    the contract (knowledge_items): top N sources and top M generated
         //    pages, by the retrieval's own score, sources first. No hits means
         //    no block -- never an invented placeholder.
+        //
+        //    t19 (DEP-INT-8 / R-A H-1..H-4 / R-D D.7): the hits now reach the
+        //    contract ENRICHED -- each one carries its scale-carrying relevance and,
+        //    for a wiki page, the lead. The renderer, the budget and the truncation
+        //    vocabulary are untouched: only the input shape changed, which is why
+        //    the no-enrichment render stays byte-identical (golden test).
         if let Some(k) = knowledge
-            && let Ok(found) = k.search(query, CHAT_KNOWLEDGE_SEARCH_N).await
+            && let Ok(page) = k.search_page(query, CHAT_KNOWLEDGE_SEARCH_N).await
         {
-            let hits: Vec<RetrievalHit> = found
-                .into_iter()
-                .map(|h| RetrievalHit {
-                    wiki: h.document.starts_with("wiki/"),
-                    document: h.document,
-                    content: h.content,
-                    score: h.score,
-                })
-                .collect();
-            items.extend(knowledge_items(&hits, KNOWLEDGE_SOURCES, WIKI_PAGES));
+            let mut enriched: Vec<ruagent_memory::inject::EnrichedHit> = Vec::new();
+            for r in &page.hits {
+                let relevance = r.relevance.as_ref().map(|v| {
+                    crate::memembed::relevance_meta(
+                        v.value,
+                        v.kind.as_str(),
+                        v.version,
+                        Some(v.query_background),
+                    )
+                });
+                // G8 / RV-D2-1: the lead comes from the ASYNC `lead_for`, which is
+                // the only entry point that can report a RECORDED coverage.
+                // `lead_from` reports `None` by construction, so wiring it would
+                // make the block's `coverage=` permanently `unknown` -- a
+                // constructively-empty attainment of a criterion that only asks
+                // whether the field is present.
+                let lead = if r.hit.document.starts_with("wiki/") {
+                    let slug = r
+                        .hit
+                        .document
+                        .trim_start_matches("wiki/")
+                        .trim_end_matches(".md");
+                    let record = crate::wiki::page_record(db, slug).await;
+                    crate::wiki::lead_for(k, &record, slug)
+                        .await
+                        .as_ref()
+                        .map(crate::memembed::lead_meta)
+                } else {
+                    None
+                };
+                enriched.push(crate::memembed::enriched_hit(&r.hit, relevance, lead));
+            }
+            items.extend(ruagent_memory::inject::knowledge_items_enriched(
+                &enriched,
+                KNOWLEDGE_SOURCES,
+                WIKI_PAGES,
+            ));
+        }
+
+        // G10 / F5 closure (t63): the graph evidence producer mem-core shipped in
+        // t58, called from THIS path. It goes in before the sort below so the
+        // block order and the drop order stay owned by `tag_rank` alone; no new
+        // parameter and no new dependency (the daemon already depends on
+        // `ruagent_graph`). `GRAPH_PATHS` is the producer's per-turn path budget.
+        if let Ok(evidence) =
+            ruagent_graph::retrieve(db, &ruagent_graph::GraphQuery::for_text(query)).await
+        {
+            items.extend(crate::memembed::graph_evidence_items(
+                &evidence,
+                ruagent_memory::inject::GRAPH_PATHS,
+            ));
         }
 
         // The BLOCK order is the contract drop order, not the order these

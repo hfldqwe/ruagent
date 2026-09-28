@@ -17,8 +17,13 @@ pub use chunk::{chunk_sections, chunk_text};
 pub use embed::{Embedder, HashEmbedder};
 pub use fast::FastEmbedder;
 pub use files::{ChunkRevision, EditOutcome, Expansion, ScanReport};
-pub use rrf::rrf;
-pub use store::{Knowledge, KnowledgeError, LegHit, SearchHit, SearchLegs};
+pub use rrf::{rrf, rrf_weighted};
+pub use store::{
+    FUSION, FusionKind, Knowledge, KnowledgeError, LEG_WINDOW, LegEvidence, LegHit,
+    RELEVANCE_VERSION, RankedHit, RelevanceScore, ResidualHit, ResidualOrigin, ResidualPage,
+    SCORING_VERSION, ScoreKind, SearchEvidence, SearchHit, SearchLegs, SearchPage,
+    relevance_from_distance,
+};
 
 /// Deterministic hashing for the offline embedder / dedup.
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {

@@ -85,8 +85,8 @@ violations **0** (row 10), inline `font-size` **0** (row 11).
 ```bash
 cd panel
 npm run build                     # 记 buildId；staleSrc 必须为 false，否则数字无效
-node tools/design-audit.mjs --self-test                    # 203/203
-node tools/design-audit.mjs --check                        # §12 判定表（有 FAIL 则 exit 1）
+node tools/design-audit.mjs --self-test                    # 495/495（2026-09-29 实测；旧读数 203/203，t97 勘误）
+node tools/design-audit.mjs --check                        # §12 判定表（有 FAIL 则 exit 1；t97 起 contract/threshold 读警告与 unmeasured 也载重）
 node tools/design-audit.mjs --json --api-window=11500       # 全量 26 captures ≈ 6.5 min
 npx playwright test                                        # 41 项：39 passed / 2 skipped
 ```

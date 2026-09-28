@@ -85,6 +85,13 @@ export function Memory() {
    *  counting them says nothing about the log — the daemon's envelope carries
    *  the real total, and the view must read it instead of implying it. */
   const [logTotal, setLogTotal] = useState<number | null>(null);
+  /** t84 / audit P2: the recall log was the one view where a read failure rendered
+   *  as an empty result (`setRecallLog([])` + a `length > 0` guard hid the card).
+   *  "We could not read the log" is not "the log is empty" -- the repo already
+   *  states that rule for the wiki (`Wiki.tsx:73`, "an unreadable wiki is not an
+   *  empty wiki"); this is the exception being closed. On failure the rows become
+   *  `null` (unknown, not empty) and this flag drives a visible error. */
+  const [logError, setLogError] = useState(false);
   const [logFilter, setLogFilter] = useState<string | null>(null);
   const [writing, setWriting] = useState(false);
   const [tab, setTab] = useState<"browse" | "recall" | "audit">(readTab);
@@ -159,11 +166,16 @@ export function Memory() {
         // lowercased), which is worth showing: it is the server's answer, not
         // the panel's assumption about what it asked for.
         setLogFilter(page.source_filter ?? null);
+        setLogError(false);
       })
       .catch(() => {
-        setRecallLog([]);
+        // t84 (P2): NOT `setRecallLog([])`. An empty array is a reading ("the log
+        // has no rows"); a failed request is the absence of a reading. Keeping
+        // them distinct is what makes the failure visible below.
+        setRecallLog(null);
         setLogTotal(null);
         setLogFilter(null);
+        setLogError(true);
       });
   }, [srcFilter]);
 
@@ -306,6 +318,14 @@ export function Memory() {
         </>
       )}
 
+      {logError && (
+        <Zone title={t("stats.recallLog")} note={t("memory.recall.err")}>
+          <div className="card">
+            <div className="row tight muted">{t("memory.recall.err")}</div>
+          </div>
+        </Zone>
+      )}
+
       {recallLog && recallLog.length > 0 && (
         <Zone
           title={t("stats.recallLog")}
@@ -365,8 +385,17 @@ export function Memory() {
                     {r.entities}
                   </span>
                   {r.top_memory_score != null && (
-                    <span className="muted mono micro">
-                      m {r.top_memory_score.toFixed(2)}
+                    // The memory leg's score carries its UNIT. Before, this was a
+                    // bare `m {s}` next to the knowledge leg's "名次分" — two
+                    // different dimensions rendered as if they were comparable
+                    // (cosine 0.86 vs rank score 0.016).
+                    <span
+                      className="muted mono micro"
+                      title={t("memory.topMemoryScoreHint")}
+                    >
+                      {t("memory.topMemoryScore", {
+                        s: r.top_memory_score.toFixed(2),
+                      })}
                     </span>
                   )}
                   {/* t253: 3 decimals, not 2. The live values are 0.0164 /
@@ -1215,7 +1244,12 @@ function RecallPlayground() {
                         <span className="tag">{m.store}</span>
                         <span className="tag">{m.namespace}</span>
                         {m.score != null && (
-                          <span className="muted mono">{m.score.toFixed(2)}</span>
+                          <span
+                            className="muted mono"
+                            title={t("memory.hitScoreHint")}
+                          >
+                            {t("memory.hitScore", { s: m.score.toFixed(2) })}
+                          </span>
                         )}
                       </div>
                       <p className="hit-content">{m.content ?? m.title}</p>

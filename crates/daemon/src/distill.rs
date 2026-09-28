@@ -23,14 +23,14 @@ Answer-quality signals — judge BEFORE extracting an agent statement as memory:
 
 Extract:
 1. memories: durable facts about the user (profile), observations, procedures (how-to knowledge), and lessons learned. Only things that generalize beyond this single session. Each memory carries a confidence (0.5–1.0) from the signals above.
-2. entities: real-world objects mentioned (people, projects, tools, organizations, products). Entity identity = the real-world object, NOT its category. Merge only explicit aliases of the same object.
-3. relations: durable facts between entities (src/dst by entity name).
+2. entities: real-world objects mentioned (people, projects, tools, organizations, products). Entity identity = the real-world object, NOT its category. Merge only explicit aliases of the same object. Also list every OTHER spelling you saw for that same object in `aliases` (an abbreviation, its expansion, a Chinese/English variant) — that list is what lets two mentions of one object resolve to one node later.
+3. relations: durable facts between entities (src/dst by entity name). Set `valid_at` to the RFC3339 instant the fact became true ONLY when the transcript states or implies that time. If the transcript gives no time, `valid_at` MUST be null. NEVER put the current time there: null means "no event time is known", while the current clock means "this became true now", and those are different facts.
 
 Respond with ONLY a JSON object, no markdown fences, no commentary:
 {
   "memories": [{"store": "profile|observation|procedure|lesson", "namespace": "user|global|project:<name>", "content": "...", "confidence": 0.8}],
-  "entities": [{"name": "...", "kind": "person|project|tool|org|product|concept", "summary": "one line"}],
-  "relations": [{"src": "...", "dst": "...", "relation": "snake_case", "fact": "one sentence"}]
+  "entities": [{"name": "...", "kind": "person|project|tool|org|product|concept", "summary": "one line", "aliases": ["..."]}],
+  "relations": [{"src": "...", "dst": "...", "relation": "snake_case", "fact": "one sentence", "valid_at": "RFC3339 timestamp when the transcript says when it became true, else null"}]
 }
 Empty arrays are valid. Quality over quantity.
 "#;
@@ -62,6 +62,12 @@ struct ExtractedEntity {
     kind: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    /// Other spellings of the SAME real-world object. They are written into
+    /// `entity_aliases` so a later query for any of them resolves to one node
+    /// (gen2: the graph had no alias table, and 4 pairs of live rows were the
+    /// same object under two names).
+    #[serde(default)]
+    aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +76,25 @@ struct ExtractedRelation {
     dst: String,
     relation: String,
     fact: String,
+    /// T: the EVENT time, when the transcript stated one. `None` means "no event
+    /// time is known" and is written as a NULL valid_at source, never as now()
+    /// (measured before gen2: 66 of 67 live edges had valid_at == created_at, so
+    /// the event-time axis carried no information at all).
+    #[serde(default)]
+    valid_at: Option<String>,
+}
+
+/// What a memory write pass did, including the episode it attached the writes to.
+///
+/// The episode id is returned (not just used internally) because the graph edges
+/// written in the same distillation point at the SAME episode: one session's raw
+/// material, two derived stores. Named fields, not a tuple, so a reader of a call
+/// site cannot mistake one count for another.
+#[derive(Debug, Clone, PartialEq)]
+struct MemoryWriteOutcome {
+    written: u32,
+    skipped: u32,
+    episode: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -171,11 +196,63 @@ impl Distiller {
     /// Distill one session: run the extraction prompt through the given
     /// agent (one ACP chat turn), then write the results into memory
     /// and — unless graph extraction is off — the entity graph.
+    ///
+    /// EVERY attempt now leaves a row in `distill_log`, including a failed one
+    /// (gen2 G9/D4). Measured before this change: in one daemon.log window there
+    /// were 22 distillation attempts and 21 of them failed, while the DATABASE
+    /// held exactly one row for that same window -- the failure rate lived only
+    /// in the log file, so no query could read it.
     pub async fn distill(
         &self,
         session_key: &str,
         card: &ruagent_core::AgentCard,
     ) -> Result<DistillOutcome> {
+        let prompt_hash = ruagent_memory::write::content_hash(&self.compose_prompt());
+        match self.distill_once(session_key, card).await {
+            Ok((outcome, status)) => {
+                self.log_outcome(&outcome, status, &prompt_hash, None)
+                    .await?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                // A failure MUST NOT create an episode: the panel's "distilled"
+                // boolean is derived from episodes.kind = 'run_turn' (t350), so a
+                // failure row that materialised one would claim a distillation
+                // that did not happen.
+                if let Err(log_err) = self
+                    .log_outcome(
+                        &DistillOutcome {
+                            session_key: session_key.to_string(),
+                            memories_written: 0,
+                            memories_skipped: 0,
+                            entities_written: 0,
+                            relations_written: 0,
+                            agent: card.name.clone(),
+                        },
+                        "failed",
+                        &prompt_hash,
+                        Some(&reason),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        session = %session_key, error = %log_err,
+                        "could not record the distillation failure"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of one distillation, split out so `distill` can record the
+    /// outcome of every path through it (including the error path).
+    async fn distill_once(
+        &self,
+        session_key: &str,
+        card: &ruagent_core::AgentCard,
+    ) -> Result<(DistillOutcome, &'static str)> {
         let transcript = self.render_transcript(session_key).await?;
         if transcript.is_empty() {
             anyhow::bail!("session has no messages to distill");
@@ -188,40 +265,216 @@ impl Distiller {
             .context("distillation agent run failed")?;
         let extraction = parse_extraction(&raw)?;
 
-        let (mem_w, mem_s) = self
+        let mem = self
             .write_memories(&extraction.memories, Some((session_key, &transcript)))
             .await?;
         // graph = false: memories only; entities/relations count 0 and
         // the log still records the run.
         let (ent_w, rel_w) = if self.graph {
-            self.write_graph(&extraction).await?
+            self.write_extraction(&extraction, mem.episode).await?
         } else {
             (0, 0)
         };
 
-        let outcome = DistillOutcome {
-            session_key: session_key.to_string(),
-            memories_written: mem_w,
-            memories_skipped: mem_s,
-            entities_written: ent_w,
-            relations_written: rel_w,
-            agent: card.name.clone(),
+        // Three states, not two (D5): an extraction that returned NOTHING is a
+        // different fact from one whose memories were all duplicates of rows
+        // that already existed.
+        let status = if extraction.memories.is_empty()
+            && extraction.entities.is_empty()
+            && extraction.relations.is_empty()
+        {
+            "empty"
+        } else {
+            "ok"
         };
-        self.log_outcome(&outcome).await?;
-        Ok(outcome)
+        Ok((
+            DistillOutcome {
+                session_key: session_key.to_string(),
+                memories_written: mem.written,
+                memories_skipped: mem.skipped,
+                entities_written: ent_w,
+                relations_written: rel_w,
+                agent: card.name.clone(),
+            },
+            status,
+        ))
     }
 
-    /// Record the outcome in distill_log (the per-session content
-    /// dedup marker; re-distilling a session replaces its row).
-    async fn log_outcome(&self, outcome: &DistillOutcome) -> Result<()> {
+    /// Record ONE ATTEMPT in `distill_log`.
+    ///
+    /// WHAT CHANGED, AND WHY (R-2; the schema half landed as I-SCHEMA-2 / t25,
+    /// `0024_distill_attempts.sql`): `distill_log` used to key on
+    /// `session_key`, so every attempt for a session hit the same key and the
+    /// previous attempt's row was replaced. Measured consequence: a window with
+    /// 22 attempts and 21 failures left ONE row in the database, and "how often
+    /// does distillation fail?" was unanswerable from the database. 0024 rebuilt
+    /// the table with `id INTEGER PRIMARY KEY` (session_key is no longer unique)
+    /// and named this statement as the writer that must change: a writer keeping
+    /// `ON CONFLICT(session_key)` now fails at PREPARE time with "ON CONFLICT
+    /// clause does not match any PRIMARY KEY or UNIQUE constraint", which is
+    /// exactly how this was found (the t329 test went red).
+    ///
+    /// So: a plain INSERT, one row per attempt, and the old "a failure must not
+    /// overwrite a recorded success" rule stops being a WHERE clause over one
+    /// row and becomes a ROW-LEVEL FACT -- the successful attempt's row is still
+    /// there, next to the failed one. Readers who want one outcome per session
+    /// read the newest row (`ORDER BY id DESC LIMIT 1`), and readers who want a
+    /// success/failure RATE use the `distill_recorded_outcomes` view (rows whose
+    /// outcome was actually recorded; the 33 pre-0024 rows have NULL status and
+    /// are not part of a denominator they never observed).
+    ///
+    /// Write the graph half of one distillation, and COMPENSATE if it fails.
+    ///
+    /// RVC-3: by the time this runs, `write_memories` has already created the
+    /// episode for this attempt (on purpose -- mem-core's D2(b): the memories of
+    /// the same pass must point at it). If the graph write fails, an unmarked
+    /// `run_turn` episode would make the panel's distilled badge claim a
+    /// distillation that did not complete, so the episode is MARKED failed here.
+    /// This function exists as its own step so a test can drive the REAL failure
+    /// path (a real SQL error out of `write_graph`) and assert the compensation,
+    /// rather than asserting the log writer and calling the claim proved.
+    async fn write_extraction(
+        &self,
+        extraction: &Extraction,
+        episode: Option<i64>,
+    ) -> Result<(u32, u32)> {
+        match self.write_graph(extraction, episode).await {
+            Ok(counts) => Ok(counts),
+            Err(e) => {
+                if let Some(ep) = episode {
+                    let voided = self.void_episode(ep, &e.to_string()).await;
+                    tracing::warn!(
+                        episode = ep, voided, error = %e,
+                        "graph write failed: this attempt's episode is marked failed, so the \
+                         panel's distilled badge cannot claim a distillation that did not \
+                         complete"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Which existing row this content should SUPERSEDE, in the WRITE path (R-3).
+    ///
+    /// TWO CRITERIA, AND WHY BOTH EXIST:
+    ///
+    /// * With a real embedder: `memembed::judge_merge` decides. It builds the
+    ///   BOUNDED candidate set (top_k = 3, cosine, `tau_scope` derived from that
+    ///   scope's own p99 distribution -- no absolute threshold), applies the NAMED
+    ///   criterion from `ruagent_memory::dedupe`, and writes the decision into
+    ///   `memory_diffs` as `op = 'merge_judged'` with a reason such as
+    ///   `candidates=3 rule=lexical_ignorable verdict=merge`. Before this wiring
+    ///   that function had **no production caller at all** (V-B/t12 measured
+    ///   `op='merge_judged'` = 0 rows on the live database): the write path stopped
+    ///   at the lexical judge, so the "bounded candidates + named criterion +
+    ///   audited decision" half of R-B C2 did not exist end to end.
+    ///
+    /// * Without an embedder, or with the offline hash fallback, the lexical judge
+    ///   in `mergeable_target` stays. WHY: the candidate rule is a COSINE rank, and
+    ///   the hash embedder's cosine is not evidence (measured earlier in this file:
+    ///   the polarity pair "用户偏好简体中文" / "用户不使用简体中文" sits at cosine
+    ///   0.5000 under `hash-embedder`). Ranking on a meaningless scale would merge
+    ///   unrelated rows, which is the one outcome worse than keeping two.
+    ///
+    /// WHAT IS *NOT* LANDED, SAID OUT LOUD: the LLM ESCALATION half. When the
+    /// criterion answers `NeedsJudgement` ("lexical refused, but these two are as
+    /// close as rewritten duplicates get -- a named judge decides"), this writer
+    /// does not spend a second per-memory LLM call: such a row is written as NEW
+    /// content, and the `merge_judged` audit row records that a judgement was
+    /// needed. A non-merge stays visible in the ledger instead of being silently
+    /// converted into a merge, so the escalation can be added later without
+    /// destroying the evidence that it is missing.
+    async fn merge_target(
+        &self,
+        store: ruagent_memory::MemoryStore,
+        namespace: &str,
+        content: &str,
+        existing: &[(i64, String)],
+    ) -> Option<i64> {
+        use ruagent_memory::MergeVerdict;
+        let Some(embedder) = self.embedder.clone() else {
+            return mergeable_target(content, existing);
+        };
+        if embedder.is_fallback() {
+            return mergeable_target(content, existing);
+        }
+        let (verdict, _reason) =
+            crate::memembed::judge_merge(&self.db, embedder, store, namespace, content).await;
+        match verdict {
+            MergeVerdict::Merge { candidate, .. } => Some(candidate),
+            // `Same` = byte-identical once normalised: the store's own content-hash
+            // check records that as `skip_dedupe`, so it is not a supersede.
+            MergeVerdict::Same => None,
+            // The escalation half (see above): recorded, not merged.
+            MergeVerdict::NeedsJudgement { .. } => None,
+            MergeVerdict::New | MergeVerdict::Refused(_) => None,
+        }
+    }
+
+    /// Err-path compensation for a distillation that died AFTER its episode
+    /// existed (RVC-3).
+    /// WHY NOT DELETE: `memories.source_episode` points at this episode (that is
+    /// the provenance t347 moved out of the memory body), so deleting the row
+    /// either fails on the foreign key or forces us to throw away the provenance
+    /// of memories that are perfectly good. Marking keeps both facts: the
+    /// memories and their origin stay, and the episode stops claiming to be a
+    /// completed session distillation.
+    ///
+    /// The panel's `distilled` boolean is derived from `episodes.kind =
+    /// 'run_turn'` (t350, `api.rs` DISTILLED_EPISODE_KIND), so relabelling is
+    /// exactly what makes the badge honest. `kind` has no CHECK constraint
+    /// (verified in 0020's notes: plain TEXT, seven ops already in use), so the
+    /// new value is legal; the reason travels in `distill_log.failure_reason`,
+    /// which is the ledger for the same attempt.
+    ///
+    /// Returns true when a row was actually relabelled (idempotent: running it
+    /// twice, or on an episode that is not a run_turn, changes nothing).
+    async fn void_episode(&self, episode: i64, reason: &str) -> bool {
+        let note = format!(
+            "{{\"voided_by\":\"write_graph\",\"reason\":{}}}",
+            serde_json::Value::String(reason.chars().take(300).collect())
+        );
+        self.db
+            .call(move |conn| -> Result<usize, ruagent_store::DbError> {
+                // `COALESCE(meta, ?2)`: an episode that already carries meta keeps
+                // it -- this compensation may never destroy a field it did not write.
+                let n = conn
+                    .execute(
+                        "UPDATE episodes
+                            SET kind = 'run_turn_failed',
+                                meta = COALESCE(meta, ?2)
+                          WHERE id = ?1 AND kind = 'run_turn'",
+                        rusqlite::params![episode, note],
+                    )
+                    .map_err(ruagent_store::DbError::from)?;
+                Ok(n)
+            })
+            .await
+            .map(|n| n.unwrap_or(0) > 0)
+            .unwrap_or(false)
+    }
+
+    /// `status` is one of `ok` | `empty` | `failed` and is written on every
+    /// attempt, and `prompt_hash` attributes it to the prompt that produced it.
+    async fn log_outcome(
+        &self,
+        outcome: &DistillOutcome,
+        status: &str,
+        prompt_hash: &str,
+        failure_reason: Option<&str>,
+    ) -> Result<()> {
         let log = outcome.clone();
+        let status = status.to_string();
+        let prompt_hash = prompt_hash.to_string();
+        let failure_reason = failure_reason.map(|r| r.chars().take(300).collect::<String>());
         self.db
             .call(move |conn| {
                 conn.execute(
-                    "INSERT OR REPLACE INTO distill_log
+                    "INSERT INTO distill_log
                          (session_key, distilled_at, memories_written, entities_written,
-                          relations_written, agent)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
+                          relations_written, agent, status, failure_reason, prompt_hash)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     rusqlite::params![
                         log.session_key,
                         chrono::Utc::now().to_rfc3339(),
@@ -229,6 +482,9 @@ impl Distiller {
                         log.entities_written,
                         log.relations_written,
                         log.agent,
+                        status,
+                        failure_reason,
+                        prompt_hash,
                     ],
                 )
             })
@@ -381,7 +637,7 @@ impl Distiller {
         &self,
         memories: &[ExtractedMemory],
         provenance: Option<(&str, &str)>,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<MemoryWriteOutcome> {
         let episode = match provenance {
             Some((key, transcript)) => match ruagent_memory::episode::record_episode(
                 &self.db,
@@ -419,12 +675,26 @@ impl Distiller {
             // had to treat the word as noise. The write below passes source_episode,
             // which is where a reader can find the same fact now.
             let content = m.content.trim().to_string();
+            // The store/namespace must be resolved BEFORE the merge decision is
+            // asked for: `judge_merge` (R-3) takes the typed store, and a
+            // governance rejection must happen before anything is written.
+            let (store_t, ns_t) = match (
+                parse_store(&store),
+                ruagent_memory::namespace::Namespace::parse(&namespace),
+            ) {
+                (Some(s), Some(n)) => (s, n),
+                _ => {
+                    skipped += 1; // governance: bad store/namespace from the agent
+                    continue;
+                }
+            };
             // Near-duplicate check against the live rows in scope. A hit is no
             // longer a SKIP: t323 measured 8 of 44 `profile` rows saying the same
             // thing in different words, because the check it had was word-based
             // and therefore blind to Chinese. A hit now SUPERSEDES that row, so
             // the store keeps one row per meaning instead of one per phrasing
-            // (t329).
+            // (t329). WHICH row, and by what criterion, is `merge_target`'s job
+            // (R-3: it is the caller of `memembed::judge_merge`).
             let supersedes: Option<i64> = {
                 let db = self.db.clone();
                 let (store_c, ns_c) = (store.clone(), namespace.clone());
@@ -444,27 +714,30 @@ impl Distiller {
                         },
                     )
                     .await??;
-                mergeable_target(&content, &existing)
+                self.merge_target(store_t, &namespace, &content, &existing)
+                    .await
             };
             // The memory crate's write path handles the content hash,
             // exact-duplicate rejection and the audit trail.
-            let (store_t, ns_t) = match (
-                parse_store(&store),
-                ruagent_memory::namespace::Namespace::parse(&namespace),
-            ) {
-                (Some(s), Some(n)) => (s, n),
-                _ => {
-                    skipped += 1; // governance: bad store/namespace from the agent
-                    continue;
-                }
-            };
+            let (store_t, ns_t) = (store_t, ns_t);
             let outcome = ruagent_memory::write::write_memory(
                 &self.db,
                 &ruagent_memory::write::MemoryWrite {
                     store: store_t,
                     namespace: ns_t,
                     content: content.clone(),
-                    confidence: m.confidence.unwrap_or(0.8).clamp(0.5, 1.0),
+                    // ONE RULE, IN ONE PLACE (t8 contract): the value the
+                    // extraction reported is kept VERBATIM, and this writer no
+                    // longer silently raises it to a floor of 0.5. Before this
+                    // change `clamp(0.5, 1.0)` made `< 0.5` unreachable on every
+                    // production path (live reading: 0 of 157 rows), so the
+                    // hedged-confidence signal the prompt asks for (0.4) could
+                    // never appear in the data. `None` = the extraction said
+                    // nothing, which is the unconfirmed default.
+                    confidence: ruagent_memory::confidence::confidence(&match m.confidence {
+                        Some(v) => ruagent_memory::confidence::ConfidenceSignals::explicit(v),
+                        None => ruagent_memory::confidence::ConfidenceSignals::unconfirmed(),
+                    }),
                     source_episode: episode,
                     supersedes,
                 },
@@ -489,48 +762,76 @@ impl Distiller {
                 W::RejectedNamespace => skipped += 1,
             }
         }
-        Ok((written, skipped))
+        Ok(MemoryWriteOutcome {
+            written,
+            skipped,
+            episode,
+        })
     }
 
     /// Find-or-create entities, then add relations — through the graph
-    /// crate (norm_name resolution, deterministic supersession, FTS sync).
-    async fn write_graph(&self, ex: &Extraction) -> Result<(u32, u32)> {
-        use std::collections::HashMap;
-        let mut ids: HashMap<String, i64> = HashMap::new();
+    /// crate (alias-aware resolution, deterministic supersession, FTS sync).
+    ///
+    /// `episode` is the id `write_memories` attached to this run's memories: the
+    /// SAME raw session material backs both stores, so an edge can answer "which
+    /// session said this" (before gen2: 0 of 67 edges had any source at all).
+    async fn write_graph(&self, ex: &Extraction, episode: Option<i64>) -> Result<(u32, u32)> {
+        // ONE transaction for the whole graph half (t81, audit #1). Building the
+        // graph item by item -- an `upsert_entity_with_aliases` per entity and an
+        // `upsert_fact` per relation, each its own closure through the
+        // single-writer actor -- meant a failure at relation 7 left the first 6
+        // entities and their aliases COMMITTED. Measured with an injected failure
+        // (trigger on `entity_edges`), the failed attempt had already created
+        // `entities 2` and `aliases 1` while its episode was marked
+        // `run_turn_failed`: the badge was honest and the graph was not.
+        // `apply_extraction` drives the SAME per-item rules inside one
+        // transaction, so a failure now leaves the graph exactly as it was.
+        let entities: Vec<ruagent_graph::ExtractEntity> = ex
+            .entities
+            .iter()
+            .map(|e| ruagent_graph::ExtractEntity {
+                name: e.name.clone(),
+                kind: e.kind.clone(),
+                summary: e.summary.clone(),
+                aliases: e.aliases.clone(),
+            })
+            .collect();
+        let facts: Vec<ruagent_graph::ExtractFact> = ex
+            .relations
+            .iter()
+            .map(|r| ruagent_graph::ExtractFact {
+                src: r.src.clone(),
+                dst: r.dst.clone(),
+                relation: r.relation.clone(),
+                fact_text: r.fact.clone(),
+                valid_at: r.valid_at.clone(),
+                event_time_source: if r.valid_at.is_some() {
+                    ruagent_graph::EventTimeSource::Extracted
+                } else {
+                    ruagent_graph::EventTimeSource::Recorded
+                },
+            })
+            .collect();
 
-        for e in &ex.entities {
-            let name = e.name.trim().to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let kind = e.kind.as_deref();
-            let summary = e.summary.as_deref();
-            let id = ruagent_graph::upsert_entity(&self.db, &name, kind, summary)
+        let report =
+            ruagent_graph::apply_extraction(&self.db, &entities, &facts, "extraction", episode)
                 .await
-                .with_context(|| format!("upserting entity {name}"))?;
-            ids.insert(name, id);
-        }
-        let entities_written = ids.len() as u32;
+                .context("writing this extraction into the graph (all-or-nothing)")?;
 
-        let mut relations_written = 0u32;
-        for r in &ex.relations {
-            let (Some(src), Some(dst)) = (ids.get(r.src.trim()), ids.get(r.dst.trim())) else {
-                continue; // relation to an unlisted entity — skip
-            };
-            ruagent_graph::add_fact(
-                &self.db,
-                *src,
-                *dst,
-                r.relation.trim(),
-                r.fact.trim(),
-                None,
-                None,
-            )
-            .await
-            .with_context(|| format!("adding relation {}", r.relation))?;
-            relations_written += 1;
+        // NOT A SILENT SKIP (G7): a duplicate or a refused name is counted and
+        // reported, because "we dropped 8 of your 20 relations" is a reading, not
+        // a detail. Relations to entities the extraction did not list are skipped
+        // inside the write (the count difference is visible as
+        // `relations.len() - report.relations - report.duplicates - report.refused`).
+        if report.duplicates > 0 || report.refused > 0 {
+            tracing::info!(
+                written = report.relations,
+                duplicate = report.duplicates,
+                refused = report.refused,
+                "graph write: deduped at the write side (G7)"
+            );
         }
-        Ok((entities_written, relations_written))
+        Ok((report.entities, report.relations))
     }
 }
 
@@ -691,6 +992,17 @@ mod t329_tests {
             .unwrap()
     }
 
+    /// The three graph tables one distillation's graph half touches, as one
+    /// comparable value (t81): "the failed attempt changed the graph" and "the
+    /// successful attempt wrote it" are both single comparisons of this.
+    async fn graph_counts(d: &Distiller) -> (i64, i64, i64) {
+        (
+            count(&d.db, "SELECT count(*) FROM entities").await,
+            count(&d.db, "SELECT count(*) FROM entity_aliases").await,
+            count(&d.db, "SELECT count(*) FROM entity_edges").await,
+        )
+    }
+
     fn root(tag: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -728,24 +1040,34 @@ mod t329_tests {
     async fn a_distilled_body_carries_no_provenance_marker() {
         let root = root("t347-prefix");
         let d = distiller(&root).await;
-        let (w, _s) = d
+        let out = d
             .write_memories(
                 &[mem("用户偏好使用简体中文交流。")],
                 Some(("ruagent:t347-test", "[t347] the marker moved to a field")),
             )
             .await
             .unwrap();
-        assert_eq!(w, 1, "the write must land, or the assertion below is vacuous");
-        let rows: Vec<(i64, String, Option<i64>)> = d
-            .db
-            .call(|conn| -> Result<Vec<(i64, String, Option<i64>)>, rusqlite::Error> {
-                let mut st =
-                    conn.prepare("SELECT id, content, source_episode FROM memories ORDER BY id")?;
-                let v: Vec<(i64, String, Option<i64>)> = st
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(v)
-            })
+        let w = out.written;
+        assert_eq!(
+            w, 1,
+            "the write must land, or the assertion below is vacuous"
+        );
+        assert!(
+            out.episode.is_some(),
+            "the write pass must report the episode it attached the rows to: the graph \
+             edges of the same distillation point at the same episode"
+        );
+        let rows: Vec<(i64, String, Option<i64>)> =
+            d.db.call(
+                |conn| -> Result<Vec<(i64, String, Option<i64>)>, rusqlite::Error> {
+                    let mut st = conn
+                        .prepare("SELECT id, content, source_episode FROM memories ORDER BY id")?;
+                    let v: Vec<(i64, String, Option<i64>)> = st
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(v)
+                },
+            )
             .await
             .unwrap()
             .unwrap();
@@ -775,14 +1097,17 @@ mod t329_tests {
             "偏好使用简体中文交流。",
         ];
         for (i, p) in phrasings.iter().enumerate() {
-            let (w, s) = d
+            let out = d
                 .write_memories(
                     &[mem(p)],
                     Some(("ruagent:t329-test", "[t329] the user's language preference")),
                 )
                 .await
                 .unwrap();
-            println!("READING write {i}: written={w} skipped={s}");
+            println!(
+                "READING write {i}: written={} skipped={} episode={:?}",
+                out.written, out.skipped, out.episode
+            );
         }
         let live = count(
             &d.db,
@@ -863,5 +1188,661 @@ mod t329_tests {
             ruagent_memory::dedupe::Verdict::Refused(_)
         ));
         assert!(cos > 0.5, "a neighbour in vector space, and still refused");
+    }
+
+    // -----------------------------------------------------------------------
+    // gen2 (t9 / I-C): provenance, event-time source, distill three states,
+    // and the confidence floor that made `< 0.5` unreachable.
+    // -----------------------------------------------------------------------
+
+    /// One row of `entity_edges` as this test reads it: the provenance fields a
+    /// distillation must leave behind. Named because the four-column tuple is
+    /// past what `clippy::type_complexity` accepts (t10 found it: the daemon's
+    /// `--all-targets -D warnings` gate compiles this test target, so an inline
+    /// tuple here turns into a red gate for whoever owns that command).
+    type EdgeRow = (String, Option<i64>, Option<String>, Option<String>);
+
+    fn extraction(
+        entities: &[(&str, &[&str])],
+        relations: &[(&str, &str, &str, &str, Option<&str>)],
+    ) -> Extraction {
+        Extraction {
+            memories: Vec::new(),
+            entities: entities
+                .iter()
+                .map(|(name, aliases)| ExtractedEntity {
+                    name: name.to_string(),
+                    kind: Some("tool".to_string()),
+                    summary: Some(format!("{name} summary")),
+                    aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                })
+                .collect(),
+            relations: relations
+                .iter()
+                .map(|(src, relation, dst, fact, valid_at)| ExtractedRelation {
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                    relation: relation.to_string(),
+                    fact: fact.to_string(),
+                    valid_at: valid_at.map(str::to_string),
+                })
+                .collect(),
+        }
+    }
+
+    /// G3/E5: the edges of one distillation point at the SAME episode its
+    /// memories do; before this, `entity_edges.source_episode` was NULL on 0/67
+    /// live rows, so no edge could answer "which session said this".
+    #[tokio::test]
+    async fn graph_edges_carry_the_episode_and_the_event_time_source() {
+        let root = root("t9-provenance");
+        let d = distiller(&root).await;
+        let mems = d
+            .write_memories(
+                &[mem("用户在一个离线麒麟机上部署 Python。")],
+                Some(("ruagent:t9-prov", "[t9] the session that knows this")),
+            )
+            .await
+            .unwrap();
+        let episode = mems.episode.expect("the pass reports its episode");
+
+        let ex = extraction(
+            &[("ruagent", &[]), ("麒麟 V10", &["银河麒麟"])],
+            &[
+                (
+                    "ruagent",
+                    "runs_on",
+                    "麒麟 V10",
+                    "ruagent runs on 麒麟",
+                    Some("2026-08-01T00:00:00Z"),
+                ),
+                (
+                    "ruagent",
+                    "uses",
+                    "麒麟 V10",
+                    "ruagent uses 麒麟 without an event time",
+                    None,
+                ),
+            ],
+        );
+        let (ent, rel) = d.write_graph(&ex, Some(episode)).await.unwrap();
+        assert_eq!(ent, 2);
+        assert_eq!(rel, 2);
+
+        let rows: Vec<EdgeRow> =
+            d.db.call(|conn| -> Result<Vec<EdgeRow>, rusqlite::Error> {
+                let mut st = conn.prepare(
+                    "SELECT relation, source_episode, event_time_source, fact_hash
+                     FROM entity_edges ORDER BY id",
+                )?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        println!("READING edges: {rows:?}");
+        for (relation, source, ets, hash) in &rows {
+            assert_eq!(
+                *source,
+                Some(episode),
+                "edge {relation} must point at the distillation's episode"
+            );
+            assert!(
+                hash.as_deref().map(|h| h.len()) == Some(16),
+                "edge {relation} must carry a stable fact identity"
+            );
+            let want = if relation == "runs_on" {
+                "extracted"
+            } else {
+                "recorded"
+            };
+            assert_eq!(ets.as_deref(), Some(want), "edge {relation}");
+        }
+        // The alias list from the extraction resolved the second name onto the
+        // first one (same real-world object) instead of creating a third row.
+        let entities = count(&d.db, "SELECT count(*) FROM entities").await;
+        let aliases = count(&d.db, "SELECT count(*) FROM entity_aliases").await;
+        let edges = count(&d.db, "SELECT count(*) FROM entity_edges").await;
+        println!(
+            "READING entities={entities} aliases={aliases} edges={edges} (success path, t81 #1 control)"
+        );
+        assert_eq!(entities, 2);
+        assert!(aliases >= 1, "the extracted alias was recorded");
+        assert_eq!(edges, 2, "both relations landed in the same write");
+    }
+
+    /// D4/D5: all three outcomes leave a row, and a FAILED attempt never
+    /// overwrites a recorded success (nor creates an episode).
+    #[tokio::test]
+    async fn the_log_records_three_states_and_a_failure_keeps_a_success() {
+        let root = root("t9-states");
+        let d = distiller(&root).await;
+        // One real write first, so "the failure created no episode" is a
+        // NON-vacuous assertion (there is already exactly one episode).
+        d.write_memories(
+            &[mem("用户偏好简体中文。")],
+            Some(("ruagent:t9-ok", "[t9] raw")),
+        )
+        .await
+        .unwrap();
+        let episodes_before = count(&d.db, "SELECT count(*) FROM episodes").await;
+        assert_eq!(episodes_before, 1);
+        let ok = DistillOutcome {
+            session_key: "ruagent:t9-ok".into(),
+            memories_written: 3,
+            memories_skipped: 0,
+            entities_written: 2,
+            relations_written: 1,
+            agent: "dsh".into(),
+        };
+        d.log_outcome(&ok, "ok", "hash-a", None).await.unwrap();
+        d.log_outcome(
+            &DistillOutcome {
+                session_key: "ruagent:t9-ok".into(),
+                memories_written: 0,
+                memories_skipped: 0,
+                entities_written: 0,
+                relations_written: 0,
+                agent: "dsh".into(),
+            },
+            "failed",
+            "hash-a",
+            Some("Query returned no rows"),
+        )
+        .await
+        .unwrap();
+        // ONE ROW PER ATTEMPT (0024): the "failure must not overwrite a success"
+        // rule is now a row-level fact, so the succeeded attempt is still there
+        // beside the failed one -- not a WHERE clause that had to choose.
+        let ok_row: (String, Option<String>, i64) =
+            d.db.call(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(status,'<null>'), failure_reason, memories_written
+                     FROM distill_log WHERE session_key = 'ruagent:t9-ok'
+                     ORDER BY id ASC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        println!("READING the succeeded attempt after a later failure: {ok_row:?}");
+        assert_eq!(
+            ok_row.0, "ok",
+            "a failure must not erase a recorded success"
+        );
+        assert_eq!(ok_row.2, 3);
+        assert!(ok_row.1.is_none());
+        let newest: String =
+            d.db.call(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(status,'<null>') FROM distill_log
+                     WHERE session_key = 'ruagent:t9-ok' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        println!("READING the newest attempt of that session: {newest}");
+        assert_eq!(
+            newest, "failed",
+            "the newest attempt is the failure, and it is visible"
+        );
+        let attempts_of_ok: i64 = count(
+            &d.db,
+            "SELECT count(*) FROM distill_log WHERE session_key = 'ruagent:t9-ok'",
+        )
+        .await;
+        assert_eq!(
+            attempts_of_ok, 2,
+            "two attempts, two rows: that is the whole fix"
+        );
+        // The contract's reading, verbatim: ONE success + ONE failure for the
+        // same session must be TWO readable rows, each with its own status.
+        let same_session: Vec<(i64, String, Option<String>, Option<String>)> =
+            d.db.call(|conn| {
+                let mut st = conn.prepare(
+                    "SELECT id, COALESCE(status,'<null>'), failure_reason, prompt_hash
+                     FROM distill_log WHERE session_key = 'ruagent:t9-ok' ORDER BY id",
+                )?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        println!("READING one session, two attempts: {same_session:?}");
+        assert_eq!(same_session.len(), 2);
+        assert_eq!(same_session[0].1, "ok");
+        assert!(
+            same_session[0].2.is_none(),
+            "the success carries no failure reason"
+        );
+        assert_eq!(same_session[1].1, "failed");
+        assert_eq!(same_session[1].2.as_deref(), Some("Query returned no rows"));
+        assert_eq!(
+            same_session[1].3.as_deref(),
+            Some("hash-a"),
+            "the failed attempt is attributable to the prompt it ran with"
+        );
+
+        // A session that never succeeded keeps its failure, with a reason.
+        d.log_outcome(
+            &DistillOutcome {
+                session_key: "ruagent:t9-fail".into(),
+                memories_written: 0,
+                memories_skipped: 0,
+                entities_written: 0,
+                relations_written: 0,
+                agent: "dsh".into(),
+            },
+            "failed",
+            "hash-b",
+            Some("Query returned no rows"),
+        )
+        .await
+        .unwrap();
+        let failed: (String, Option<String>, Option<String>) =
+            d.db.call(|conn| {
+                conn.query_row(
+                    "SELECT status, failure_reason, prompt_hash FROM distill_log
+                     WHERE session_key = 'ruagent:t9-fail'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        println!("READING a first-attempt failure: {failed:?}");
+        assert_eq!(failed.0, "failed");
+        assert_eq!(failed.1.as_deref(), Some("Query returned no rows"));
+        assert_eq!(
+            failed.2.as_deref(),
+            Some("hash-b"),
+            "the prompt is attributable"
+        );
+        // The failure path must not have produced an episode.
+        assert_eq!(
+            count(&d.db, "SELECT count(*) FROM episodes").await,
+            episodes_before,
+            "a failed attempt must not create an episode"
+        );
+
+        // empty is its own state, distinct from a dedup-skip.
+        d.log_outcome(
+            &DistillOutcome {
+                session_key: "ruagent:t9-empty".into(),
+                memories_written: 0,
+                memories_skipped: 0,
+                entities_written: 0,
+                relations_written: 0,
+                agent: "dsh".into(),
+            },
+            "empty",
+            "hash-c",
+            None,
+        )
+        .await
+        .unwrap();
+        let by_state: Vec<(Option<String>, i64)> =
+            d.db.call(|conn| {
+                let mut st =
+                    conn.prepare("SELECT status, COUNT(*) FROM distill_log GROUP BY 1 ORDER BY 1")?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        println!("READING distill_log by status: {by_state:?}");
+        let states: Vec<Option<String>> = by_state.iter().map(|(s, _)| s.clone()).collect();
+        assert!(states.contains(&Some("ok".to_string())));
+        assert!(states.contains(&Some("failed".to_string())));
+        assert!(states.contains(&Some("empty".to_string())));
+
+        // R-2's ACCEPTANCE READING: for this window, rows in the library MINUS
+        // attempts made = 0. Before 0024 the same four attempts left ONE row.
+        let attempts = 4i64;
+        let rows = count(&d.db, "SELECT count(*) FROM distill_log").await;
+        let recorded = count(&d.db, "SELECT count(*) FROM distill_recorded_outcomes").await;
+        println!(
+            "READING R-2: attempts={attempts} rows={rows} recorded_outcomes={recorded} | rows - attempts = {}",
+            rows - attempts
+        );
+        assert_eq!(
+            rows, attempts,
+            "one row per attempt: 库行数 − 日志尝试数 = 0"
+        );
+        assert_eq!(
+            recorded, attempts,
+            "every attempt in this window recorded its outcome (no NULL status)"
+        );
+    }
+
+    /// RVC-3: the compensation must run on the REAL failure path of the graph
+    /// write, not on a direct call to the log writer. A trigger aborts every
+    /// `entity_edges` insert, so `write_extraction` fails exactly the way a
+    /// constraint violation would.
+    #[tokio::test]
+    async fn a_graph_write_failure_leaves_no_run_turn_episode() {
+        let root = root("t27-void");
+        let d = distiller(&root).await;
+        let mems = d
+            .write_memories(
+                &[mem("用户在一个离线麒麟机上部署 Python。")],
+                Some(("ruagent:t27-void", "[t27] the transcript of the attempt")),
+            )
+            .await
+            .unwrap();
+        let episode = mems.episode.expect("the write pass reports its episode");
+        let episodes_before = count(&d.db, "SELECT count(*) FROM episodes").await;
+        let run_turn_before = count(
+            &d.db,
+            "SELECT count(*) FROM episodes WHERE kind = 'run_turn'",
+        )
+        .await;
+        let graph_before = graph_counts(&d).await;
+        assert_eq!(episodes_before, 1);
+        assert_eq!(
+            run_turn_before, 1,
+            "the attempt starts with a run_turn episode"
+        );
+        assert_eq!(
+            graph_before,
+            (0, 0, 0),
+            "the graph is empty before the graph write"
+        );
+
+        // Poison the real write path.
+        d.db.call(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER t27_boom BEFORE INSERT ON entity_edges
+                 BEGIN SELECT RAISE(ABORT, 't27 injected failure'); END;",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let ex = extraction(
+            &[("ruagent", &[]), ("麒麟 V10", &["银河麒麟"])],
+            &[(
+                "ruagent",
+                "runs_on",
+                "麒麟 V10",
+                "ruagent runs on 麒麟",
+                None,
+            )],
+        );
+        let err = d
+            .write_extraction(&ex, Some(episode))
+            .await
+            .expect_err("the poisoned graph write must fail");
+        println!("the real failure: {err:#}");
+
+        let episodes_after = count(&d.db, "SELECT count(*) FROM episodes").await;
+        let run_turn_after = count(
+            &d.db,
+            "SELECT count(*) FROM episodes WHERE kind = 'run_turn'",
+        )
+        .await;
+        let kind: String =
+            d.db.call(move |conn| {
+                conn.query_row("SELECT kind FROM episodes WHERE id = ?1", [episode], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let meta: Option<String> =
+            d.db.call(move |conn| {
+                conn.query_row("SELECT meta FROM episodes WHERE id = ?1", [episode], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let with_source = count(
+            &d.db,
+            "SELECT count(*) FROM memories WHERE source_episode IS NOT NULL",
+        )
+        .await;
+        // t81 (audit #1): BEFORE the fix this graph half was N autocommit writes,
+        // so a failure at the relation left `entities 2 … aliases 1` behind. The
+        // graph part of the attempt must now read exactly as it did before it.
+        let graph_after = graph_counts(&d).await;
+        println!(
+            "READING RVC-3: episodes {episodes_before} -> {episodes_after} | kind=run_turn {run_turn_before} -> {run_turn_after} | episode kind={kind:?} | meta={meta:?} | memories keeping their provenance {with_source}"
+        );
+        println!(
+            "READING t81 #1: failed graph write -> entities {}/{} aliases {}/{} edges {}/{} \
+             (before/after; 0 residue is the invariant)",
+            graph_before.0,
+            graph_after.0,
+            graph_before.1,
+            graph_after.1,
+            graph_before.2,
+            graph_after.2
+        );
+        assert_eq!(
+            graph_after, graph_before,
+            "a failed distillation must leave the graph exactly as it was: entities, aliases and \
+             edges all unchanged (the audit measured 2 entities + 1 alias surviving here)"
+        );
+        assert_eq!(
+            episodes_after, episodes_before,
+            "the failed attempt must not ADD or DELETE an episode row"
+        );
+        assert_eq!(
+            run_turn_after, 0,
+            "a failed graph write must leave NO run_turn episode: that is what the panel's badge reads"
+        );
+        assert_eq!(
+            kind, "run_turn_failed",
+            "the episode is MARKED, not deleted"
+        );
+        assert!(
+            meta.unwrap_or_default().contains("voided_by"),
+            "the marking says who voided it"
+        );
+        assert_eq!(with_source, 1, "the memory keeps pointing at its episode");
+    }
+
+    /// A deterministic, NON-fallback test embedder: the trait's `is_fallback`
+    /// defaults to false, which is what makes `merge_target` take the
+    /// `judge_merge` branch (the hash fallback's cosine is not evidence).
+    struct TestEmbedder;
+
+    impl ruagent_knowledge::embed::Embedder for TestEmbedder {
+        fn embed(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, ruagent_knowledge::embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let mut v = vec![0f32; 8];
+                    let chars: Vec<char> = t.chars().collect();
+                    for pair in chars.windows(2) {
+                        let mut h = 0u32;
+                        for c in pair {
+                            h = h.wrapping_mul(31).wrapping_add(*c as u32);
+                        }
+                        v[(h % 8) as usize] += 1.0;
+                    }
+                    for c in &chars {
+                        v[(*c as usize) % 8] += 0.5;
+                    }
+                    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for x in &mut v {
+                            *x /= norm;
+                        }
+                    }
+                    v
+                })
+                .collect())
+        }
+        fn name(&self) -> &'static str {
+            "t27-test-embedder"
+        }
+        fn dim(&self) -> usize {
+            8
+        }
+    }
+
+    /// R-3: `memembed::judge_merge` had NO production caller (live
+    /// `op='merge_judged'` = 0 rows). This drives a REAL write path with a real
+    /// (non-fallback) embedder and asserts the audit rows appear, with the
+    /// bounded candidate count and the verdict visible in the reason.
+    #[tokio::test]
+    async fn the_write_path_asks_the_bounded_merge_judge_and_audits_the_decision() {
+        let root = root("t27-judge");
+        let mut d = distiller(&root).await;
+        d.embedder = Some(std::sync::Arc::new(TestEmbedder));
+        let before = count(
+            &d.db,
+            "SELECT count(*) FROM memory_diffs WHERE op = 'merge_judged'",
+        )
+        .await;
+        let out = d
+            .write_memories(
+                &[
+                    mem("用户偏好使用简体中文交流。"),
+                    mem("用户偏好使用简体中文进行交流。"),
+                ],
+                Some(("ruagent:t27-judge", "[t27] the transcript")),
+            )
+            .await
+            .unwrap();
+        let after = count(
+            &d.db,
+            "SELECT count(*) FROM memory_diffs WHERE op = 'merge_judged'",
+        )
+        .await;
+        let rows: Vec<(Option<String>, Option<String>)> =
+            d.db.call(|conn| {
+                let mut st = conn.prepare(
+                    "SELECT before, reason FROM memory_diffs WHERE op = 'merge_judged' ORDER BY id",
+                )?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let live = count(
+            &d.db,
+            "SELECT count(*) FROM memories WHERE superseded_at IS NULL",
+        )
+        .await;
+        let superseded = count(
+            &d.db,
+            "SELECT count(*) FROM memories WHERE superseded_at IS NOT NULL",
+        )
+        .await;
+        println!(
+            "READING R-3: merge_judged rows {before} -> {after} | written={} skipped={} | live={live} superseded={superseded}",
+            out.written, out.skipped
+        );
+        for r in &rows {
+            println!("   audit: before={:?} reason={:?}", r.0, r.1);
+        }
+        assert!(
+            after > before,
+            "the write path must call judge_merge: op='merge_judged' was {before} and is {after}"
+        );
+        assert_eq!(after - before, 2, "one decision per extracted memory");
+        assert!(
+            rows.iter().all(|(_, reason)| {
+                let r = reason.as_deref().unwrap_or("");
+                // mem-core's audited shape (t31): the candidate count, WHERE the
+                // candidate came from, WHICH row the decision followed, and the
+                // verdict. Asserting only `rule=`/`verdict=` would let a decision
+                // that followed the wrong anchor pass.
+                r.contains("candidates=")
+                    && r.contains("source=")
+                    && r.contains("anchor=")
+                    && r.contains("rule=")
+                    && r.contains("verdict=")
+            }),
+            "every audit row names the candidate count, its source, the anchor and the verdict: {rows:?}"
+        );
+    }
+
+    /// C1 (asked by mem-core): the agent's confidence is kept verbatim, so a
+    /// hedged value below the 0.5 floor can finally reach the database.
+    #[tokio::test]
+    async fn a_hedged_confidence_is_not_silently_raised_to_the_floor() {
+        let root = root("t9-confidence");
+        let d = distiller(&root).await;
+        let mut hedged = mem("用户可能偏好简体中文。");
+        hedged.confidence = Some(0.4);
+        let mut unstated = mem("用户使用双屏显示器。");
+        unstated.confidence = None;
+        let out = d
+            .write_memories(
+                &[hedged, unstated],
+                Some(("ruagent:t9-conf", "[t9] signals")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.written, 2);
+        let rows: Vec<(String, f64)> =
+            d.db.call(|conn| {
+                let mut st =
+                    conn.prepare("SELECT content, confidence FROM memories ORDER BY id")?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        for (content, conf) in &rows {
+            println!("READING confidence({content}) = {conf}");
+        }
+        let below = rows.iter().filter(|(_, c)| *c < 0.5).count();
+        assert_eq!(
+            below, 1,
+            "the hedged row keeps 0.4; `clamp(0.5, 1.0)` made this unreachable (0/157 live rows)"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|(c, _)| c.contains("双屏"))
+                .map(|(_, c)| *c),
+            Some(ruagent_memory::confidence::CONF_UNCONFIRMED),
+            "an unstated confidence is the unconfirmed default, from the single source"
+        );
+    }
+
+    /// D3 gate 1: the MEMORIES half of the extraction prompt is byte-identical
+    /// to what shipped before gen2 -- adding fields to the graph half must not
+    /// move the bytes the memory extraction reads.
+    #[test]
+    fn the_memories_half_of_the_prompt_is_byte_identical() {
+        let p = extraction_prompt(None, None);
+        let memories_bullet = "1. memories: durable facts about the user (profile), observations, procedures (how-to knowledge), and lessons learned. Only things that generalize beyond this single session. Each memory carries a confidence (0.5\u{2013}1.0) from the signals above.";
+        let memories_json = "  \"memories\": [{\"store\": \"profile|observation|procedure|lesson\", \"namespace\": \"user|global|project:<name>\", \"content\": \"...\", \"confidence\": 0.8}],";
+        assert!(
+            p.contains(memories_bullet),
+            "the memories bullet moved: gate 1 of mem-core's D3 review"
+        );
+        assert!(
+            p.contains(memories_json),
+            "the memories JSON example moved: gate 1 of mem-core's D3 review"
+        );
+        // Gate 2: the event-time rule is stated, and it says null explicitly.
+        assert!(p.contains("MUST be null"), "the null rule is in the prompt");
+        assert!(p.contains("NEVER put the current time there"));
+        // The graph half gained the two new fields.
+        assert!(p.contains("\"aliases\": [\"...\"]"));
+        assert!(p.contains("\"valid_at\":"));
     }
 }

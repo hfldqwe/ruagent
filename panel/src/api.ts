@@ -420,6 +420,38 @@ export interface WikiPageInfo {
   edited: boolean;
   links_out: number;
   links_in: number;
+  /** `fresh` | `stale` | `unknown` — never omitted. `stale` stays a bool for
+   *  existing consumers, with the invariant `stale === (freshness === "stale")`,
+   *  so "cannot tell" is never hidden behind a `false`. */
+  freshness?: string;
+  /** The BUILD's `anchored / content` sections ratio, quoted only while the page
+   *  still matches it. `null` = UNKNOWN (never built, or the recorded reading no
+   *  longer applies) — it is neither 0 nor 1, and the key is never omitted
+   *  (RV-D-1). Render it as `unknown`, never as 0.00/1.00. */
+  cite_coverage?: number | null;
+  /** Content sections with no live anchor, as the read API reports them. */
+  uncited_sections?: string[];
+  /** Anchors the build verified. */
+  citations?: number;
+  /** First observation time of the current staleness episode (RFC3339). */
+  stale_since?: string | null;
+  /** Source names that drifted or vanished. Only nameable when the page itself
+   *  recorded `source_hashes`; empty means "no name to give", not "no reason". */
+  stale_sources?: string[];
+  /** WHY it is stale, as tokens (`source hash drift` / `source missing` /
+   *  `chunk missing` / `chunk hash drift` / `hand edited`). Non-empty iff stale. */
+  stale_reasons?: string[];
+  /** Set iff `freshness === "unknown"`: why the knowledge base could not answer. */
+  unknown_cause?: string | null;
+  /** The page's own `generated_at` (one source, not a second one). */
+  built_at?: string | null;
+  /** Out-links that point at a page which does not exist — they ARE counted in
+   *  `links_out` ("tries to reach X" is a property of this page). */
+  links_out_broken?: number;
+  /** Self-links; NOT counted in `links_out`. */
+  self_links?: number;
+  /** `pin` when a recorded correction freezes the page (pin path only). */
+  frozen_by?: string | null;
 }
 
 /** The link graph: broken = linked but missing (wanted pages). */
@@ -428,6 +460,21 @@ export interface WikiLinks {
   edges: { src: string; dst: string }[];
   broken: string[];
   orphans: string[];
+  /** Broken targets with who asks for them. */
+  wanted?: { slug: string; demanders: string[]; demand_count: number }[];
+  /** Pages nothing links into. */
+  unreachable?: string[];
+  /** Self-edges: a node property, excluded from `edges` and from `links_out`. */
+  self_links?: { src: string; dst: string }[];
+  /** Per-node readings — the SAME numbers `WikiPageInfo` reports. */
+  degrees?: {
+    slug: string;
+    links_in: number;
+    links_out: number;
+    links_out_broken: number;
+  }[];
+  /** When this reading was taken (RFC3339). */
+  readings_at?: string;
 }
 
 export interface WikiBuild {

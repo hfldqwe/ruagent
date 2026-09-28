@@ -28,6 +28,12 @@ enum Cmd {
         /// Listen address.
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: String,
+        /// Bind a NON-loopback address on purpose (t76 / audit A-3). Without this
+        /// (or RUAGENT_ALLOW_REMOTE=1) the daemon refuses to start on anything but
+        /// loopback: it has no authentication, so a remote bind publishes every
+        /// read and write endpoint to the network.
+        #[arg(long)]
+        allow_remote: bool,
         /// Data root (default: ~/.ruagent).
         #[arg(long, env = "RUAGENT_HOME")]
         root: Option<std::path::PathBuf>,
@@ -122,7 +128,11 @@ enum KnowledgeCmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, root } => {
+        Cmd::Serve {
+            addr,
+            root,
+            allow_remote,
+        } => {
             let addr: std::net::SocketAddr = addr.parse().context("invalid listen address")?;
             let root = root.unwrap_or_else(ruagent_daemon::default_root);
             // Only serve needs a runtime; the other subcommands are sync
@@ -132,7 +142,7 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()
                 .context("building tokio runtime")?;
-            runtime.block_on(ruagent_daemon::serve(root, addr))
+            runtime.block_on(ruagent_daemon::serve_with_remote(root, addr, allow_remote))
         }
         Cmd::Agents => list_agents(&cli.url),
         Cmd::Doctor { cleanup } => doctor(&cli.url, cleanup),
@@ -806,6 +816,18 @@ fn count_non_md(dir: &std::path::Path) -> usize {
 }
 
 #[cfg(test)]
+// t45 (INT): `cli/` had no owner until this unit, and this module sits in the
+// middle of the file -- 9 functions (client/doctor/list_agents/status/run/...)
+// are defined AFTER it, which is what `items_after_test_module` reports.
+//
+// WHY AN ALLOW AND NOT A MOVE: moving ~500 lines of CLI code to the end of
+// `main.rs` is a reordering of a file no one owns, in a unit whose contract is
+// "make the workspace lint gate green"; a mechanical move would be a far larger
+// diff to review than the lint it silences, and it would churn every line
+// number in the file. The allow is scoped to the lint, on the module it
+// describes, with this comment as the reason. (If `cli/` gets an owner, the
+// move is the better fix -- and this attribute is the marker for it.)
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

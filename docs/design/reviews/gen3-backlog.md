@@ -1,0 +1,273 @@
+# gen3 backlog — ruagent 待完善项总账（captain 维护）
+
+**这份文件的作用**：把「持续发掘 → 优化」的入口与在办事项集中在**一处**，使每一轮都有唯一的去处可查、可对账。逐条以**各任务报告**为准；本文件只做**索引与状态**，不替代证据。
+
+## 0. 工作方式（intake → 任务 → 合并门）
+
+1. **intake**：审计或任何成员交回一条 finding 时必须带 —
+   `id` · 区域 · 严重度 · **`file:line`** · **可复现命令** · **证据读数** · 「为什么重要」· **可证伪的修复判据**（修好后能跑出什么读数）· 建议 owner。
+   缺「可复现命令」或「可证伪判据」的条目**不进实现队列**（先补证据，或进 §4 未验证猜想）。
+2. **分诊**：captain 把 finding 变成实现单，写进质量契约（objective / acceptance / verify / inScope），并与其它单**串行化**（同一成员、同一路径一次一个写者）。
+3. **合并门**：**CI 绿** + 独立验证 + 评审。读数按契约 §6.0 第 22 条形态报（逐 target `test result: ok`/`FAILED`/`panicked` **行数** + 退出码，**不用求和**）。
+4. **状态词**：`open` · `in-task (tNN)` · `deferred (owner+前置)` · `wontfix (理由)`。**不许**用 `not_measured` 掩盖「未达成」。
+
+## A. gen2 遗留（已登记，带 owner 与前置）
+
+| # | 事项 | 前置 / 原因 | owner | 状态 |
+|---|---|---|---|---|
+| A1 | 召回侧 C3：人工分级 gold（≥60 查询，含 ≥20 不可答） | **需要人类标注**（`judged_by='human'` 今天 0 行） | 你我 + 下一代 recall | deferred |
+| A2 | G7 实体族 P≥0.85 / R≥0.70（20 段会话） | **需要人工标注的会话语料** | 你我 + 下一代 graph | deferred |
+| A3 | 关系 recall ≥0.60 + 幻觉率 ≤0.10（R-4） | 需**一次真实重蒸馏跑批**产出带 `source_episode` 的边集（活库 0/67） | 下一代 graph | deferred |
+| A4 | G4 `extracted ≥30%` | 挂在 A3 的 gold 上；gold 落地前不判 | 下一代 graph | deferred |
+| A5 | G8 三指标成对判决 ≥60% | 需 **LLM 判决跑批** | 下一代评测 | deferred |
+| A6 | `wiki_citations` 表未被使用 + 反查索引 | 无消费者写路径 | 下一代 wiki | deferred |
+| A7 | `selected_by` 在活库 16/21 行为 NULL | 数据/运维侧回填 | 运维 | deferred |
+| A8 | `episode::episode_count` 不分 `kind`（可删除候选） | 今天无调用点；**任何「蒸馏发生过」的代理必须按 kind 过滤** | 下一代 mem | deferred |
+| A9 | `GRAPH_PATHS = 3` 的取值依据 | 未实测最优；t63 的块内行匹配仪器缺陷导致取不到「3 条够不够」 | 下一代 graph/INT | deferred |
+| A10 | §3.3 Q2「丢的是哪个 tag」 | `blocks[]` 只列**发出**的块；t64 正在二选一处置 | t64 | in-task |
+| A11 | `crates/knowledge/src/lib.rs` 的除零 ms/row 与采样上限 | recall 侧遗留，未立单 | recall | open |
+| A12 | `crates/acp/src/adapter.rs:160` 条件跳过（`dsh` 不在 PATH 就 skip） | 无主路径（acp 侧） | 下一代 | open |
+| A13 | A-4 MCP stdio 未被独立驱动 · A-12 文献注（`knowledge_api.rs` 调 `/recall` 未注明会写 `recall_log`） | INT/文献面 | 下一代 INT | open |
+| A14 | 面板 e2e 的绿依赖根的数据形状（F8） | 测试基建；4 条红可归因、非面板缺陷 | 下一代 | open |
+| A15 | 「断言恒真但**没有** `return`」这一类全仓未扫 | 本代只修了 store 侧已知实例 | **t70 审计** | in-task |
+| A16 | `cli/` 无属主（含 `cli/src/main.rs:809` 那处作用域限定 `#[allow]`） | 已在 `AGENTS.md` 登记为 intentional | 下一代 | deferred |
+| A17 | 交付账：`t45–t48` 被平台记为「failed 且无后续 repair」 | 实为同一件集成的连续部分交付（内容已被 t50/t57 等吸收） | captain | open（见 §C） |
+
+## B. 审计 intake（新阶段「持续发掘」第一批）
+
+| 单 | 区域 | 报告 | 状态 |
+|---|---|---|---|
+| t67 | `crates/graph/**` + `daemon/src/distill.rs` | `gen3-audit-graph.md` | 在跑 |
+| t68 | `daemon/src/wiki.rs` + wiki 测试/面板 | `gen3-audit-wiki.md` | 在跑 |
+| t69 | `crates/memory/**` + `memembed.rs`（对抗输入与边界） | `gen3-audit-memory.md` | 在跑 |
+| t70 | **全仓测量面**（静默跳过/恒真断言/陈旧期望/CI 覆盖缺口） | `gen3-audit-instruments.md` | 在跑 |
+| t71 | **安全/隐私/耐久**（凭据/SQL/路径/迁移/进程） | `gen3-audit-security.md` | 在跑 |
+
+审计单的共同硬要求：**只读**（只写自己的报告）、每条带证据与可证伪判据、最多 12–15 条、猜测另列、**写清未覆盖范围**。
+
+## B2. 第二波 intake 已立案（t67–t71 审计产出）
+
+| 单 | 来源 | 事项（每条都带审计给的可证伪判据） | owner |
+|---|---|---|---|
+| t72 | t69 **F1+F2**（high） | 软删除的行堵死同内容重写（**静默数据丢失**）+ `supersedes` 静默 no-op 与**说谎审计** | mem-core |
+| t73 | t69 **F3**（high） | 公开 FTS 吃原始用户文本 ⇒ 净化收进 `crates/memory::query` 共享层 + 负控 | mem-core |
+| t74 | t68 **A1+A2**（high） | 正文锚点不参与 freshness/uncited（同一处断链两种读数）+ `stale_since` 无起点 | wiki |
+| t75 | t71 **A-1**（high） | 遗忘的残余面**不含备份副本** ⇒ `ResidualSurface` 扩面 + C5 判据（**captain 裁决：备份属结论面**；本单只检测/报告，不做破坏性动作） | mem-core |
+| t76 | t71 **A-3**（medium） | 非 loopback 绑定必须显式解锁（默认值不变）+ 日志点名暴露面 | integ |
+| t77 | t70 **F6**（medium） | 两条**恒真断言**（`migrations.rs:1285/:1286` 自比较）换成真 before/after + **能红的负控** | recall |
+| t66（已 amend） | t70 **F1+F2**（high） | 提交前必须把测量硬化与**未跟踪的** `.github/workflows/scripts/test-evidence.sh` **同一次**提交（否则 evidence 步直接红、fresh checkout 静默跑旧 CI）+ 新增「workflow 引用的路径必须在 `git ls-files` 里」自检；提交版不得再有 `cargo test.*||` | recall |
+
+## B3. 已登记待派（`open`，按投产比排序；每条均在对应审计报告里有六要素）
+
+**来自 t69（记忆）**：F4 正文可伪造块标签与截断/丢块词表（**冻结面改动 ⇒ 必须单独成单 + 更新冻结清单 + 全量 before/after**，且让「数块头/找截断标记」这类**验证方法本身**不可靠） · F5 `run_turn_failed` 不在 `EpisodeKind`（只以裸 SQL 存在） · F6 episode 去重只看 content hash ⇒ **kind 由第一个写入者决定** · F7 `confidence` 越界静默夹紧、NaN 报 NOT NULL · F8 `per_block` **不是块大小上界**（只有 `total` 是硬界） · F9 `decay_score` 对非有限 base 无守卫 · F10 用量列不在 `MemoryRow`（E0609）+ `record_usage` 会更新已取代的行 · F11 `tag_rank` 精确匹配、无未知 tag breadcrumb。
+
+**来自 t68（wiki）**：A3 纠错端点不校验 slug（**已并入 t59 的 F6 验收**） · A4 `corrections()` 静默丢弃无法解析的行 · A5 同一事实两份记录（`wiki_pages.content_hash` **只写不读**） · A6 `/wiki/pages` 每页成本线性增长（3→28→53 页 = 30.2→73.7→157.8ms）而面板 3s 轮询 —— **需先定预算才有判据** · A7 闸门词表只有中文（`starts_with("来源")`）⇒ 写 `## Sources` 的页永远不可能通过，且该约束**只存在于代码里** · A8 面板原因字段 0 命中（`stale_reasons`/`stale_since` 都不显示） · A9 `citations` 不去重 · A10 冻结判定按 `at` **字符串**排序且 `at` 可由调用方给出 · **K-1**（猜想，最要紧）：构建后手改正文删掉锚点，`cite_coverage` 是否仍 1.0？需构建行/mock distiller 才能取证，建议补测试。
+
+**来自 t71（安全/隐私/耐久）**：A-2 agent stderr **整行不脱敏**进日志（`acp/run.rs:80`、`chat.rs:217`；默认 filter 关着，`RUST_LOG=debug` 一开就全量落盘，且**日志不在任何清理面上**） · A-4 工作流 `uses:` 共 **19 处、SHA 固定 0 处**；`release.yml` 持 `contents: write`；`ci.yml` **无 `permissions:`** · A-5 全仓 **0 命中** `integrity_check|quick_check`、`VACUUM INTO` 只在测试里、`doctor` 是 HTTP 版（不开库）⇒ **DB/WAL 损坏 = 起不来、无检测、无恢复路径** · A-7 `orphans.rs:83-100` 活性检查与子进程枚举之间的 **TOCTOU**（全仓唯一可能杀到非记录进程的形状） · A-8 `wiki.rs:3400` 动态列名 `&str` · A-9 `knowledge/files.rs:145-152` 注释说不跟随符号链接，但**指向文件的 `.md` 符号链接会被索引** · A-10（仅测试）session key 插进带引号的 SQL 字面量。
+
+**来自 t70（测量面）**：F3 env 门控的**测量分支在 skip 记账之外**（`retrieval-quality.rs:927` 的 `RUAGENT_T245_REAL`：默认 hash embedder，「真 e5」那一侧没有任何门禁会跑） · F4 CI 只跑设计工具的 `--self-test`（判据代码的定理证明），**§12 真正的测量 `--check` 只在本地**且 coverage declaration 没声明它 · F5 Playwright **无 PR 闸门**（`on: push [main]`）且除 `registry.spec.ts` 外任何 skip 都不失败 · F7 四个 **tracked 仪器全仓 0 提及**（`capture-readiness`/`interaction-probe`/`memory-kb-readings`/`t150-blank-control`） · F8 **83 条**把 `len()/count()` 钉成字面量的断言（31 文件） · F10 写路径闸门挂在**文件名字面量**上（改名即失去闸门） · F11 ignored 清单是「总数机器核对 + 逐名散文」（改名/挪窝能通过） · F12 PR 从不跑 Windows Rust（**已声明**的缺口）。
+
+### 已证伪 / 已核验干净（**别重查**）
+
+- **t68 已证伪 7 条**：大小写差异 fail-closed · `reconcile_page_hashes` 不抹手改证据 · 重复锚点不能绕闸门 · 正文 `#0`/负数不能绕 · 部分 chunk 变化有双层检测 · 两端点度数不矛盾 · RV-D-1 本批无反例。
+- **t69 阳性 7 条**：对抗输入下「有界·带 tag·截断可见」全部成立（1M 正文/2000 条目/零宽+星平面+NUL/退化预算）· 冻结面在 **crate 外**重算与 crate 内 golden 逐字节一致 · **适配器唯一性成立** · 审计 op 词表与 `write_vocabulary()` 一致 · `store_counts` 确是当前行计数 · 衰减四处边界正确。
+- **t70 防伪证 5 条**：`npm run check` 不是覆盖缺口 · `e2e_daemon.rs` 陈旧期望**已修好** · `recall.spec.ts:32` 是**条件**跳过 · `registry.spec.ts` 在 npm 入口会跑 · `smoke` 特性/目标存在。
+- **t71 干净清单 10 行**：生产路径**没有 SQL 注入面** · 文档名/wiki slug 校验严格 · 路径遍历被代码+测试挡住 · 面板无 XSS 注入点 · `~/.ruagent` ACL 只给 SYSTEM/Administrators/属主 · 脚本只按记录的 PID 杀。
+
+
+
+## B4. 第三波 intake（t67 图谱审计）已立案 / 待派
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t81 | t67 **#1+#2+#6（同根因：多步写入没开事务）** | 蒸馏失败不留半成品 · `build_communities` 的层级替换真的原子 · `merge_entities` 八条语句同事务（三处都要「注入失败后读产物」+ 成功路径负控） | graph |
+| t82 | t67 **#3** | `facts_as_of` 把时刻**当字符串比**（同一时刻三种写法 **38/30/43** 条边，解析正确值 30；API 形状下 6/63 个实体条数不同） | graph |
+| t83 | t59 未交付项 + **captain 键名裁决** | `log`→`rows` **三处同改**（`api.rs` + `crates/daemon/tests/**` + `Memory.tsx:82`；只改 api.rs 必红已实测）· R-1..R-4 · F6（非空 `author` + 0 页根）· F3/F4 版本读点 · 报告 §20 | integ |
+
+**已登记待派（t67 其余）**：`retrieve()` 每次读**全边表**（`EXPLAIN` = `SCAN e`；67→670→6700 边放大后 SQL 0.0002→0.0025→0.0220s；「bounded by construction」只对**输出**成立） · 合并相连实体会造**自环**且不转移社区成员（`covered != non_isolated`） · `merge_entities` 注释与实现不符 · **错误被吞成误阴**（`lib.rs:946/953` 把任何 DB 错误当 no-match ⇒ 静默造重复实体；`distill.rs:432-455` 把补偿失败吞成 `false`） · `build_evidence` N+1（每节点一次 `query_row`） · `resolve_seeds` 循环里 `prepare`（全 crate `prepare_cached` **0 处**） · 两条种子腿全表扫 · `redundant_pairs` **O(N²)**（63 实体 ⇒ 1953 次判据，**且在 HTTP 端点上**） · `base_name` **0 个调用者**。
+
+**t67 已证伪 4 条（别重查）**：`list_entities` 的 `OR` 实际走 `MULTI-INDEX OR` · `hops` 在 `api.rs:1260` 被 `.min(4)` 封顶 · 产品路径 **0** 个 unwrap · `log_outcome` 已是普通 INSERT（0024 的警告已兑现）。
+
+## B5. 第四波 intake（t79 面板审计 / t80 规格漂移审计）
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t84 | t79 **P2+P3** | 面板**失败可见性**：召回日志读取失败不得显示成「没有记录」· 模型探针失败不得显示成「0 models」 | integ |
+
+**并入既有单**：**t83** 的 R-3 现在带 **P1 的双向读数** —— `observation×global` 服务器**永远拒绝**却可选、`procedure/lesson` **漏了 `project:<x>`**（服务器允许但 UI 选不到）⇒ 判据是**双向**的：**UI 可选集合 ⊆ 服务器接受集合**，且 `project:<x>` 必须有输入路径。
+
+**已登记待派（t79 其余）**：P4 `Settings.tsx` 是 13 个路由里**唯一零 e2e 覆盖**（却承载 `PUT /distill` 等写路径）· P5 9 个轮询点里 **5 个不因标签隐藏而停**（Wiki 3s、**TaskDetail 2s**、Sessions/Home 10s、Chat 3/5s）⇒ 一个隐藏标签即 ≥50 请求/分，多视图叠加在结构上看不到 · P6「自定义 prompt」徽章是**文本比较**（因为 `/distill` 还没有 `prompt_hash` ⇒ 随 t83 的 F3 一起解）· P7 6 条 `eslint-disable` **抑制的是空气**（无 eslint 依赖/配置/lint 脚本）⇒ 恰好 6 处 hooks 依赖无机械门禁 · P8 来源筛选硬编码 `["probe","distill","user"]` + 当前页出现的 source（**筛选器与被筛数据同源**）· P9 19 个 `test.skip` 点 / 9 个 spec ⇒「套件绿」= 有数据的那些 spec 跑了。
+
+**t80 漂移（规格 vs 实现）**：**D-2** 五份规格共 **80 处 `crates/….rs:NNN` 引用**、机械扫描 55 处可疑、语义复核 **≥8 处真漂移**（最远 `wiki.rs:1482 → 3181`，**+1699 行**）⇒ 建议**一次性脚本化勘误**（每条引用用锚词断言该行）· **D-3** graph-spec:165「未知 tag 返回 **5**」vs today `inject.rs:334 _ => 6` · **D-4** graph-spec G9 判据落后于**迁移 0024**（契约 §3.1 落地表止于 0023）· **D-5** 契约 §6.0 第 11 条要求的 `#[ignore = "…needs ENV…"]` 只覆盖一部分：16 处合格、**7 处裸 `#[ignore]`**（`injection_e2e.rs:96`、`graph/live-after.rs:3`、`knowledge/retrieval-gold-copy.rs:34`、`retrieval-gold-live.rs:26`、`store/src/lib.rs:1281`、`store/src/migrations.rs:766/894`）⇒ 显式跑且缺 env 时可能静默通过 · **D-10** 22 条纪律里 **6–10 已工具化进 `scripts/cargo-team.ps1`**（本代最好的形态）、1–5/16 有 CI、11 部分，**12/13/14/15②/17/18/20/21/22 只活在文档**（建议至少给 17/21 加守卫）· **D-11** 在飞单作废预警（t60/t63/t62 落地后契约 §3.2/§6.3 的相应文字作废，须随单同步）。
+
+**t79/t80 已核对成立（别重做）**：召回日志**列与端点 12 个行键一致** ⇒ 看不到新遥测列是**服务端缺口**· i18n「76 无字面量 / 40 无动态族」按契约**只列不算失败**· 类型面干净（`@ts-ignore` 0）· `LEG_WINDOW=60` · **MCP 恰好 14 个工具**（用 `#[tool` 数会误得 16）· `facts?at=` 已归一化（t57 落地，INT-F2 关闭）· G7 43/47=0.9149 · `TAG_GRAPH` rank=3。
+
+## B6. 第五波 intake（t78 编排/策略/纯域层审计）
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t88 | t78 **C-2** | `Interrupted` 同时 active 且 terminal ⇒ 互斥（裁决 `is_active=false`/`is_terminal=true`）+ 更正把矛盾断言成期望的测试 + **能红的负控** | verify2 |
+| t89 | t78 **C-3** | 权限审计把「默认值决定」记成「规则决定」⇒ 可辨 + 停止用标题合成 `rule_id` + 可反查回 `policy.toml` | integ |
+| t90 | t78 **C-1** | 状态机没有家 ⇒ **裁决：转移表与校验器住 `core`**；daemon 13 处赋值**同块接线**（第 13 条）+ 逐格矩阵 + 非法转移负控 | integ |
+
+**已登记待派（t78 其余）**：**C-4** 策略编译器全函数且不出声（未解析 `action` 静默丢弃**且被测试钉成期望** · `default` 拼错静默变 `Ask` · 先宽后具体**静默遮蔽** · `per_harness=0` 被接受）· **C-5 没有任何 run 级超时**（`select!` 四分支无 timer，而同仓 `distill.rs:612` 就是现成的 300s 模式；**许可位永久占住有指向证据**：`_permit` 是 `start_run` 的局部量、同函数 `:808` await `supervise`，默认 `per_harness=2` ⇒ 两个挂死 run 让该 harness 容量归零且**无任何遥测**）· **C-6 三处 fail-open 兜底**（`_ => Pending` / `_ => Queued` / **`_ => EndTurn`（失败读回成成功）**；`run_status_from_str` 漏 `"queued"` 靠兜底恰好等于真值掩盖；`api.rs` 的同义映射却是严格 `Option` ⇒ **同义两实现、语义不同**）· **C-7 级联不可辨**（`route() -> Option` 无理由通道、`rule_id` 是 Debug 拼串）· **C-8 pipeline 第 2 步起丢掉 `project`/`pinned_agent`**（同一逻辑形状因步数不同而路由到不同 agent）· low 5 条（`HarnessKind::ALL` 靠注释同步 · `core` 构造器读挂钟且「时间有序」**仅进程内** · `task.rs:106` 恒真断言 · `path()` 把三种「要人」压成无理由 `Human` · `AgentCard.command: String` 空白切分 ⇒ **含空格路径（Windows 常态）无法表达** · 三处描述把不存在的东西写成存在，含 policy 的 **"cost policy" 全仓 0 命中**）。
+
+**t78 已证伪 6 条（别重查）**：`orchestrator:208` 的 `.ok()?` 跳过 default（上游 `api.rs:4699/4707/4710` 已预解析成 UUID 串，生产路径不可达）· `runs.rs:673/680` 的 Failed→Queued 是同一 `if let Err(reserve_slot)` 的互斥分支 · 恢复循环只遍历四个非终态 · 四个终态出口都发 `StateChanged` · `ids_are_time_ordered` 不是 flaky · **`core` 确实零 I/O**（依赖表只有 serde/serde_json/uuid/chrono）。
+
+## B7. 第六波 intake（t92 纪律守卫决策文档）—— captain 裁决
+
+**先做（已并入/待接）**：
+- **G-21**：`check-workflow-refs.sh` **已存在但 0 调用点**（死代码）⇒ **接进 CI + 跟踪入库**（并入 t66 的 F1 项；见 §C17）。
+- **G-15②**：每个**会写输入的夹具**断言「我建的已删 + 同 pid 能重建」，且断言必须在**连接关闭后**跑（t42 的原始成因）；每夹具≈10 行、CI≈0、**自归因 ⇒ 无归因歧义**。（登记待派，owner = 各夹具属主）
+- **G-20**：把 `-DryRun` 解析出的命令行打进 CI（极低成本；杀 t53→t54→t55 那类「只读入口名字」，其中一次还被写进 `AGENTS.md` 传播两次）。
+
+**留待决定**：**G-12 公开面快照 + 增量打印**（≈40 行 + baseline、~1s、维护面中）—— 价值最高但**必须归一化**（排序/剥注释/剥行号）且**必须同时记 `#[derive]` 与手写 `as_str()`**，否则漏掉 `ScoreKind` 漂移那一类；建议先在**一个 crate 试点**（跨 crate 被消费最多的那个）。
+
+**只做 warn-only**：**G-15③ 临时 root 泄漏增量**（共享 `%TEMP%` 的增量**不可归因**，做成 fail 会与「不误归因」冲突）。
+
+**不进 CI 的工具**：**G-21b `scripts/evidence.ps1 <路径…>`**（打印 `tracked? + sha256 + 行数 + mtime`）—— 报告期工具，专治「未跟踪文件的空 `git diff` 被当证据」。
+
+**captain 采纳「不机械化」的三条**（附抽检触发条件）：**13**（门禁分不清「队友正在改」与「我读错了」；`git status` 在共享树里**不是证据** —— 本代已误归因过一次）· **14**（判据是**行为归因**，机械豁免不可判定 ⇒ 必误报；触发 = 报告写推断性归因且它支撑判据/结论时，看「把 X 改回去、症状是否仍在」的两次读数）· **18**（静态无法判「读得够晚」；替代品 = 把「等到终态」的 helper 放进共享测试工具，让**默认写法就是对的**）。
+
+**t80 的三条自我更正（记此以免重复）**：第 **17/22** 条**早已机械化**（`test-evidence.sh`，`ci.yml` 5 处调用）· 第 **11/19** 条比 t80 写的更全（ignored 清单 `ci.yml:153-186`；每 job 都有 Coverage declaration 步）· 第 **21** 条的守卫**写完却从未被调用**。
+
+## B8. 第七波 intake（t91 MCP/ACP 审计 + t95 守卫审计 + t83/t72 交回）
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t93 | t91 **M1+M5** | `graph_entity` 把不存在报成成功（`unwrap_or_default()` 静默吸收协议字段改名）+ roundtrip 只对 9/14 名字做 `any()` | integ |
+| t94 | — | 审计：存储层本体（单写者 actor / 迁移运行器 / 三实现一致性 / LanceDB） | verify |
+| t95 | — | 审计：守卫的守卫（design-audit / build-panel / run-e2e / scripts / release.yml）→ **completed** | review |
+| t96 | t83+t80 F7 | 消费面收口第 4 轮：`log`→`rows` **四处同改（含面板 api 客户端）** + F3/F4 + §20 | integ |
+| t97 | t95 **T-1/T-3** | design-audit 退出码载重 + 过期读数更正 | review |
+
+**t95 待派（按它的排序 T-1→T-2→T-6→T-4/T-5→T-3/T-7/T-8）**：**T-2** 真测量没门禁（CI 只跑 `--self-test`＝证明 row 16/23，`--check`＝判全部可实现行 ≈6.5 min）⇒ 需非每推必跑的 job（dispatch/nightly）或登记为**每代仪式** + coverage declaration 点名；**T-6** `release.yml` 工作流级 `contents: write` 对每个 job 生效、`uses:` 全未固定 SHA、`dtolnay/rust-toolchain@stable` 是移动分支、**发布 job 不跑测试（红提交打 tag 也会发）**；**T-4** `build-panel.mjs` 换出后无护栏（`renameSync` EPERM 未捕获、`rmSync` 在换出后才跑 ⇒ 信号反向、无「新 index 引用的 asset 都在」自检）；**T-5** `run-e2e.mjs` 零信号钩子 ⇒ 中断后孤儿 chromium/node 只靠人工纪律。
+**t95 已证伪/不判缺陷**：`build-panel.mjs` 的「失败 ⇒ dist untouched」**成立**（三步检查 + FORCE_FAIL 钩子都在触碰 dist 之前）；三个 scripts 无自动调用点但 canary 拒绝杀非本 root 的 pid、post-switch-check 刻意不用 `/recall` ⇒ **合纪律，只登记「别当门禁」**。
+
+**t72 交回（R-1..R-4，owner 待派；R-1 需排在 t96 之后，因同写 `crates/daemon/src/api.rs`）**：**R-1** 非法 supersede 的 HTTP 面仍是 **500**（`sqlite error: supersede refused…` / `FOREIGN KEY constraint failed`）⇒ 应映成 **400 + 明确原因**，并去掉 `sqlite error:` 前缀；**R-2** MCP 说明补「只替换同一 store+namespace 的当前条目」；**R-3** 墓碑占键的设计岔口（复活 vs 部分唯一索引 `WHERE deleted_at IS NULL`）⇒ **裁决：本代保留复活**（已端到端验证），部分唯一索引需**重建 `memories` 表** ⇒ 登记为**独立迁移轮次**的 schema 项，**在那之前谁都不许动该唯一约束**；**R-4** `lifecycle.rs` 的 delete/restore 按**预读**而非受影响行数（low）。
+
+## B9. 第八波 intake（t94 存储层审计）
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t98 | t94 **S1+S2+S7** | 账本不是事实：25 个迁移**可重放**（今天 5/25）+ 连续性校验（挖洞必须报缺 vN，今天静默跳过）+ 声称面更正（`store` 无 LanceDB 实现） | verify |
+
+**待派（t94 其余）**：**S3（medium）** 四处 `_ => Default` 把读不出来的文本变成合法状态（`lib.rs:564/582/608/630`：未知 → `Pending`/`DependsOn`/`Queued`/**`EndTurn`**）⇒ 未知停止原因**看起来正常结束**；这段在**所有消费面之下** ⇒ 判据：插 `status='donee'` 读回必须报错/报未知（今天静默 `Pending`）· **S4（medium）** 删除路径三处把 SQL 失败伪装成「不存在/已删除」（`delete_chat` 的 `unwrap_or(0)`、`delete_session` 的 `.ok()`、最重的是 **`let _ = conn.execute("INSERT OR REPLACE INTO session_deletions …")` ⇒ tombstone 写失败仍照删会话并回 `Deleted`**，正是它上面注释要防的事；`let _ = DELETE FROM session_archives` 留孤儿档案）· **S5（medium）** CI 的 nested-Result 守卫**只覆盖 1/4 种形状**（`ci.yml:101-110` 只抓 `.await.is_err()/.is_ok()`；`sqlite.rs:76-77` 自己点名的还有 `if let Err(..)` / `let _ = call(..)` / 只对 `?` 作用于外层；用法普查 `call` 199 处 vs `call_flat` 48 处）⇒ 这条守卫**在已提交版本里**，覆盖面问题此刻就在生效 · **S6（medium）** 迁移登记表是手写 `include_str!` 列表、**版本号来自数组下标**（`(i+1)`）而非文件名、且**无目录↔数组漂移检查** ⇒ 丢一个 `.sql` 进目录 = 存在但永不应用（静默）；中间插入/重排 ⇒ 已迁移的库静默跳过新脚本 · **S9/S10（low）** `let _ = tx.send(f(conn))`（接收方消失后写仍执行、结果被丢）；`Db::open` 失败留半初始化不可用 DB 且无修复指引。
+**t94 的前提更正（重要）**：① 本仓**不用 `PRAGMA user_version`**（fresh root 实测 = 0，grep 0 命中），版本在 `schema_migrations` 表里；② **store 里没有 LanceDB 实现**（`crates/store/src` 0 处引用；向量层在 `crates/knowledge`，`lancedb 0.38`）⇒ 以后说「三实现」要改成「SQLite+JSONL（store）与 LanceDB（knowledge）」，**LanceDB 层单独立项**。
+**t94 的残留读数（S8）**：`%TEMP%` 匹配 `ruagent*|ra-*|pw-*|vint*` = **598 个目录 / 78.4 GB**，其中共享构建树 `ruagent-team-target` = **72.12 GB**（合法但巨大；删它要一次全量重建 ⇒ 暂留）；store crate 自己留下 ~298 MB（`ra-t36-target` 272.8 MB 等）。⇒ 成员自清私有 target 的纪律继续有效；**谁都不许删别人正在用的 target**。
+
+**t74 的代价（诚实登记，需后续优化）**：A1（正文锚点参与判定）使 `/wiki/pages` 53 页 **157.8ms → 317.6ms（~2×）**，审计 A6 变重 ⇒ 若该端点被面板轮询（见 t79 的 P 系列），下一轮给它**缓存/预计算**；**先记录，不在本代为此开单**。
+**t74 的范围裁决（cap 定案）**：它必须改 `crates/mock-agent/tests/wiki_pipeline.rs`（该断言**逐字把本单判定为失真的行为钉成期望**：注释 "the OBSERVATION TIME is written by the next build … nothing else observes drift" + `stale_since.is_null()`），而该文件不在原 inScope ⇒ **captain 裁决：纳入 inScope**（规则：**改变行为的单必须拥有钉住该行为的测试**）。成员**拒绝**用「只给没有 build row 的页盖章」让旧断言继续绿（那会让「构建后漂移」这一最常见情形仍无起点）——**记功**。
+
+## B10. 第九波 intake（t95 守卫审计的收尾 + t97 交回）
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t97 | t95 **T-1+T-3** | design-audit 退出码载重（唯一决策点纯函数）+ 过期读数更正 → **completed**（负控①在**副本树**里做、仓库契约未动；诚实登记「四计数未取得」） | review |
+| t99 | t95 **T-2** | 把真测量接进门禁：`workflow_dispatch`+nightly 跑 `--check`（临时 root daemon）+ 四计数进 job summary + 能红的负控 + 第 19 条覆盖声明 | recall |
+
+**t99 的基线要求**：t97 **未取到四计数**（只给 ≈6.5 min 的**估算**）⇒ 本单必须真取到，或写「未取得 + 原因 + 为何不影响判据」。
+**captain 已自行落地的勘误**：`docs/design-language.md:88/89`（**`203/203` → `495/495`（2026-09-29 实测，旧读数保留）**，并把 `--check` 的新语义写进注释）。review 交回时说任务单里的 `docs/design/design-language.md` **不存在**、真实路径是 `docs/design-language.md`（我的路径写错，已改注释）。
+
+**待派（t95 其余，按 review 给的排序）**：**T-6** `release.yml` 工作流级 `contents: write` 对每个 job 生效、`uses:` **全未固定 SHA**（`dtolnay/rust-toolchain@stable` 是移动分支）、**发布 job 不跑测试**（红提交打 tag 也会发）⇒ 危险面在**只读评估 + 固定 SHA + 发布前门禁**；**T-4** `build-panel.mjs` 换出后无护栏（`renameSync` EPERM 未捕获、`rmSync` 在换出后才跑 ⇒ 信号反向、无「新 index 引用的 asset 都在」自检）；**T-5** `run-e2e.mjs` `spawn(..., shell:true)` + **零信号钩子** ⇒ 中断后孤儿 chromium/node 只靠人工纪律。
+**t97 §6 两条顺带读数（待裁）**：① §12.1 的节匹配是**前缀正则**（`/^### 12\.1/` 也匹配 `### 12.1x`）⇒ 将来的 `### 12.10` 会被吞进 §12.1 的切片（判据：加一个 `### 12.10` 小节看 §12.1 解析是否变化）；② row 32 的 `pending`（判据修订态）**仍不进退出码**——有意保留为第三态，若要与 T-1 同强度，先给它一个**到期条件**。
+**t97 的事务性请求（已采纳）**：**它是作者 ⇒ 不把 t97 的评审单派给它**。
+
+## E. 已验证的头条读数（可引用，须带来源与限定）
+
+> 规则：每条都带**来源**（哪份报告/哪次读数）与**限定**（哪些是自造夹具、哪些只在临时 root 上测过）。**未验证/未取到的**一律写成「未取到 + 原因」，不得写成达标。
+
+| 区域 | 读数（改前 → 改后） | 来源 | 限定 |
+|---|---|---|---|
+| 召回 | **recall@1 0.4667 → 0.7333** · **MRR 0.6889 → 0.8185** · **nDCG@10 0.7682 → 0.8621** | `gen2-recall-impl.md`（t7）+ 独立验证 t11 | 活库只读、分层 gold；分页无关性 2/13 → 15/15 |
+| 召回（CJK） | CJK 字面腿接入 + 融合/重排；`score_kind` 线上形状 | 同上 | 负控见报告 |
+| 图谱 | **G7 关系精度 0.7500 → 0.9149（43/47）** · **G5 多跳 0/20 → 0.70** · **G1 实体腿 1/23 → 13/23** | `gen2-graph-impl.md`（t9）+ t13 | gold 夹具；`GRAPH_PATHS=3` 的**最优性未获支持**（t63 的在块匹配器有缺陷）⇒ 只说「可达」，不说「最优」 |
+| 图谱（注入面） | **`<graph>` 块 0/5 → 3/5**（`with_graph=3`），负控干净（106 vs 242 字符） | t58/t63 | 事件读数；`context_injected` 5 条里 3 条带 graph |
+| Wiki | **`cite_coverage` 1.0**，且**负控**（无锚点的页）判 **failed** ⇒ 判据不是空转 | `gen2-wiki-impl.md`（t10）+ t14 | 页级判据 |
+| Wiki（新鲜度） | 正文锚点与 frontmatter 锚点**判定逐位一致**（`p-body-dangle` vs `p-front-dangle`）；`stale_since` 在**读路径**非空且连读两次逐字相同 | t74 | **代价**：`/wiki/pages` 53 页 157.8 → **317.6ms**（~2×，已登记待优化） |
+| 记忆（衰减） | `used=5,last_used=now → 0.500000` vs `used=0,last_used=now-30d → 0.058660` | `gen2-memory-impl.md`（t8）+ t12 | 纯函数读数 |
+| 记忆（判据性） | 标注语料 **误并 0/20、召回 14/20** | t8 | **自造夹具**（非人工 gold；人工 gold 为 C3/G7 的遗留项） |
+| 记忆（写侧） | 软删后同内容重写 **`Inserted(1)` 且列表可见**；supersede 非法目标 **`Err` + 零行写入 + 审计 `supersede_refused`** | t72 | HTTP 端到端；HTTP 面仍 500（R-1 待修） |
+| 消费面 | MCP **14 个工具全是到 HTTP 路由的一行薄代理**（`lib.rs:289-296`），URL/参数逐条核过 ⇒「两份实现」不成立 | t91 | 只读审计 + 运行时 stdio 实例 |
+| 消费面（键名） | `log` → `rows`：**daemon 半已绿**（编译面 exit 0；测试面 `ok=56 / Running=45`），卡在**面板 api 客户端**一个文件 | t83 | **已一致回退到 `log`**，第 4 轮 t96 收口 |
+| 安全 | 非 loopback 绑定**必须显式解锁**，否则非零退出 + 点名实际地址与「无认证」；grep 由 0 → 13 命中 | t76 + captain 独立复核 | 已写进 `AGENTS.md` 约定 |
+| 领域层 | `RunStatus` 的 active/terminal **在类型上不再可能同时为真**；8 状态矩阵非法行 **1 → 0** | t88 | 负控真红（注入旧实现 ⇒ FAILED / exit 101） |
+| 存储层 | **25 个迁移里 20 个不可重放**；删一行版本记录 ⇒ 守护进程起不来或**静默跳过** | t94 | 已在库副本上测；修复单 t98 |
+| CI 加固 | 计数口径机械化（0 reporting target = error）· `--no-fail-fast` 4 处 · F1 守卫**今天真红**（6 处引用 2 个未跟踪脚本、**零误报**）· 负控 exit 1 / 健康日志 exit 0 | t65 + captain 独立复核（`$LASTEXITCODE` 通道） | 见 C20/C21 |
+| CI 基线 | run `36272344732`：ubuntu **Format 红** ⇒ Clippy/守卫/Test **全部 skipped**；windows **Test 红**；Panel 绿；E2E 绿 | `gh run view` | 这是 `t66` 要翻转的红基线 |
+
+## B11. 第十波 intake（t100 发布加固 + CI 红史取证）
+
+| 单 | 来源 | 事项 | owner |
+|---|---|---|---|
+| t100 | t95 **T-6** | 发布路径加固：工作流级 `contents: write` → **`read`** + 按 job 授足（`gate{actions:read}` / `build{contents:read,actions:write}` / `release{contents:write,actions:read}`）· **六个 `uses:` 全部固定 40-hex SHA**（含 `dtolnay/rust-toolchain@stable` → `6bed0761…`）· **新增 `gate` job**（读**这个 commit** 的 CI 裁决：success 放行 / failure 与「没有 run」**fail-closed** / 还在跑最多等 15 分钟），`build.needs=gate`、`release.needs=build` → **completed** | wiki |
+| t101 | 同上 | 审计（只读）：CI 红史取证 —— 失败步分类 + 那 87 个 `cancelled` 的机制 + 「第一次绿还差什么」 | wiki |
+
+**t100 的负控与诚实标注**：负控用**真 `gh` + 真 API** 跑（真红 commit `5db881d8…` ⇒ `exit=1`；无 CI run 的 SHA ⇒ `status=none` ⇒ `exit=1`；成功桩 ⇒ `exit=0`）；**未验证环已标出** —— GitHub 的 `needs:` 调度语义本机不可执行（无 act/Docker），以 YAML 策略断言 `build.needs==gate` 佐证。**未覆盖 10 条**（GitHub 端 environment/tag 保护未验证 · 未真跑发布 ⇒ 六个 SHA 固定尚未被运行验证 · SHA 固定 ≠ Rust 版本固定（stable 仍浮动）· 无 Dependabot ⇒ 升级要人工 bump · 门禁依赖 `ci.yml` 名字（改名 fail-closed）· 15 分钟等待上限是**行为变化** · runner 镜像仍浮动 · `build` 的 `actions:write` 是「最小且够用」而非只读 · 发布产物质量不在门禁射程 · 已提交的 scripts 目录需被正确 `git add`）。
+
+**⚠️ CI 红史（captain 独立核实，纠正一处错误前提）**：**`ci.yml` 不是从未绿过** —— **全量 300 次历史 success = 97**，**最近一次绿 = 2026-09-26T11:09:39Z**；**最近 100 次**（`14:06:59Z → 21:16:08Z`）= `failure 13` + **`cancelled 87`** + `success 0`。最新 run `36272344732`：ubuntu **`Format`** 红 ⇒ 同 job `Clippy`/`Guard`/`Test` **全 skipped**；windows **`Test`** 红；**Panel 绿**。`e2e.yml` 近 50 次 **49 绿 / 1 红**。⇒ 结论：**「那天下午一串推送把 CI 打红并一直红着」**，不是「从来绿不了」；目标②是**恢复**绿，不是**首次**绿。（t100 报告里「CI 从来没有绿过」的说法据此更正。）
+**t100 另两条登记**：① `release.yml` 上一次真实运行（2026-09-17）**在 `Create release` 失败**（`##[error]<!DOCTYPE html>`）⇒ 加固只保证「红的不会被发」，**不保证下次发布成功**；② 本机 `check-workflow-refs.sh` **exit 1**（两脚本未跟踪）⇒ **推送时若忘记 `git add` 它们，CI 第一次就会红在那条守卫上**（正是该守卫的目的）。
+
+## B12. 第十一波 intake（t73 / t84 交单）
+
+| 单 | 来源 | 事项 | 状态 |
+|---|---|---|---|
+| t73 | t69 **F3** | 公开 FTS 吃原始用户文本 ⇒ 净化上移进共享 `query.rs::fts_pattern`（**幂等**，见 C23）| **completed**：`before(raw) errors=8/11 → after ok=11/11`；八条特殊语法 **HTTP 500→200**；**顺带修好真实查询 `release.sh`**（`.` 是 FTS5 语法字符）；负控 `deploy`/`部署`/`"deploy script"`/`café` 一致 |
+| t84 | t79 **P2/P3** | 面板失败可见性 | **failed（只差「观察」）**：代码落地、`panel build` exit 0、成功路径 diff 级未变（`Memory.tsx 38/4`、`Runtimes.tsx 21/5`）；**四条 DOM 读数未取** ⇒ 已立 t102（verify2）补上 |
+
+**t73 交回的路由（R-6..R-9，均未越界改）**：**R-6** `api.rs:3638`（`fts_related`）是这条净化规则的**第三份拷贝**（内联、无名、没人当它是净化器）⇒ 与 R-1 同批走 `api.rs`（现被 t96 占着）；**R-7** `memembed.rs:200` 现成重复实现待删；**R-8** graph 的 `entities_fts`（`graph/src/lib.rs:357,412`、`retrieve.rs:517,578`）与 store/knowledge 的 `chunks_fts_cjk`（`store/src/lib.rs:1187,1382`、`migrations.rs:560,634`）是**同族 FTS 面**、未取证其参数是否来自用户文本 ⇒ 各自 owner 自查一次；**R-9** 多词语义变更（隐式 AND → 短语）已登记、不建议在 repair 里改。
+
+## B13. 第十二波（t81 图侧原子性收口）
+
+| 单 | 事项 | 状态 |
+|---|---|---|
+| t81 | 图侧三处非原子写（t67 #1/#2/#6，同根因） | **completed**：**一种形状修三处** —— 每个公开入口的语句抽成吃 `&Connection` 的私有 `*_in`、公开签名一字未变（薄包装开一个事务）；新增聚合入口 `ruagent_graph::apply_extraction`（+ `ExtractEntity`/`ExtractFact`/`ExtractionWrite`）让「整份抽取」在**一个闭包、一个事务**里写完，且沿用同一套 `resolve_entity_in`/`upsert_fact_in`（G7 写侧去重、别名解析、`NeedsJudgement` 不合并**一条未绕**）。**`crates/store` 一个字节未改** ⇒ 「根因在 `call*` 语义」**经检不成立**（`store/lib.rs:838–845` 自己就用 `FnOnce(&mut Connection)`）⇒ 只留一条文档建议，**不需要交回 finding** |
+| 验收 | 注入失败读产物（最终字节） | `#1 entities 0/0 · aliases 0/0 · edges 0/0`（审计改前 2 实体 + 1 别名残留）· `#2 partition after == before`（2 社区/成员 6/`parent_id NULL 0`）· `#6 entities 2/2 · edges 1->1 · aliases 1/1`；三条成功路径负控各一；**RVC-3 契约一字未动** |
+| 反做负控 | 坏侧红 | 三处事务降级成 autocommit ⇒ 三条测试全红并打出**审计同族残留**（`#1 0/2 · #6 1/2 · #2 members 5/NULL 父 2`）、`3 passed; 3 failed`、exit 101 ⇒ **断言真挡得住「事务被拿掉」**；按新纪律（先广播 → 限时 ~12s → 报窗口起止 + 恢复绿 + SHA-256 逐字还原） |
+| 门禁 | 三面 | 编译面 `check --workspace --all-targets` exit 0 · graph 测试面 ok=12/FAILED=0/exit 0 · daemon lib ok=80/exit 0 · 两条 clippy `-CleanFirst` exit 0（error-lines=0） |
+| **未做** | 明确留原地 | 审计 **#5**（合并自环/社区成员不转移）· **#7**（`if let Ok(..) = query_row` 吞错误、`void_episode` 吞成 false）· **#4/#8/#9/#10/#11/#12**（全表读、N+1、循环内 prepare、全表扫、O(N²)、死 API）—— 报告 §8 逐条登记待 triage |
+
+## C. 质量门与仓库工程
+
+| # | 事项 | 证据 | 状态 |
+|---|---|---|---|
+| C1 | **CI 红 · `Format`** | `cargo fmt --all --check` 本地 **170 处** diff（多在 `daemon/src/distill.rs`）；因格式步在第一位，**ubuntu 上 clippy/test 从未跑到** | t66 |
+| C2 | **CI 红 · `Test`(windows)** —— **工作区已修好，待提交** | 原挂 `crates/mock-agent/tests/e2e_daemon.rs:2161` 的 `distill_graph_toggle_controls_entity_extraction`（t347 移除 `[distilled]` 正文前缀后的过期期望）。复核：t70 读 `:2161-2179` 确认**已修好**（该行今天是注释）；captain 本机复现 `test -p ruagent-mock-agent --test e2e_daemon distill_graph_toggle_controls_entity_extraction` ⇒ `1 passed; 0 failed`、wrapper **exit 0**。**剩下的只是提交**（t66） | t66 |
+| C3 | CI 加固：跳过必须可见 / 计数口径 / 门禁覆盖声明 | `#[ignore]` 活库仪器共 13 条（store 3 · graph 3 · daemon `injection_e2e` 7）在默认跑里只显示 `ignored` | t65 |
+| C4 | 首次推送前的卫生审查（captain 已验） | 120 条目 / untracked 79 / 1.9 MB / 无大文件 / 无被漏掉的构建产物 / **密钥扫描 0 命中** | ✅ 已验 |
+| C5 | CI 其余步的潜在失败（captain 已探） | nested-Result 守卫（t324）在 93 个 `.rs` 上 **0 命中**；`clippy --workspace --all-targets -D warnings` 本地 **exit 0**（重查 memory/daemon/mock-agent/mcp/cli） | ✅ 已探 |
+| C6 | `scripts/cargo-team.ps1`（8.1 KB，未跟踪）应随提交进入 | `scripts/` 下已有 5 个跟踪文件；它是本代构建纪律（共享 target / 一次一个编译 / 0–11 核）的载体 | t66 |
+| C7 | 推送方式：**直接推 `main`**（沿用仓库现状——远端所有 CI 记录都是 push 事件） | 若改为 PR + 评审合并，需先立规则 | 已定（可改） |
+| C8 | 成员上限 8 ⇒ 无法新增专职发布工程师 | `add_member` 被平台拒；发布/CI 职责交给空闲的 `recall` | 已定 |
+| C9 | **推送前自检的正确形状**（captain 已探明；天真实现会误报） | 工作区 `ci.yml` 357 行/18,998 B vs 提交版 110 行；`test-evidence` 命中 **工作区 7 / 提交版 0**。**真实未跟踪且被 5 处引用**（`ci.yml:111/131/243/264/274`）的只有一个：`.github/workflows/scripts/test-evidence.sh`（70 行/2,580 B）。天真检查会误报 2 类：① `scripts/build-panel.mjs`、`tools/design-audit.mjs` 实际在 `working-directory: panel` 之下（`panel/...`，**已跟踪**）；② `docs/design/reviews/gen2-ci-hardening.md` 是 `ci.yml:3` 的**散文引用**。⇒ 自检必须**只取 `run:` 体里的可执行引用**、**相对路径按 `working-directory` 解析**，再做 tracked 断言 | t66 |
+
+| C10 | **CI 的测试计数必须覆盖全部 target ⇒ 用 `--no-fail-fast`**（captain 裁决） | `cargo test --workspace` 默认在**第一个失败 target 后中止** ⇒ `test-evidence.sh` 的「targets reporting」**按构造残缺**，「0 targets = error」也挡不住「后面的 target 根本没跑」（第 6 条同族） | t66 |
+| C11 | **`test-evidence.sh` 在日志缺失时静默地绿**（captain 实测） | `bash .github/workflows/scripts/test-evidence.sh missing .does-not-exist.log 0` ⇒ 三行 `integer expression expected` + **exit 0**（计数字段为空串时 `[ -gt ]`/`[ -eq ]` 静默为假）。修法：开头 `[ -r "$log" ] \|\| exit 1` + 计数默认 0；负控：删日志 ⇒ 必红、空日志 ⇒ 必红（后者今天已经是红的，别退化） | recall（t65/t66） |
+| C12 | **键名现状（captain 机械核对，纠正 t80 的误读）** | `api.rs:3472` = **`"log": rows`**（GET `/recall/log` 的响应键）· `:3455` 的 `"rows"` 属**计数端点**（同响应有 `max_rows`）· 消费方 `knowledge_api.rs:737`、`Memory.tsx:82` 都读 `["log"]` ⇒ **契约写 `rows`、实现仍是 `log`，不一致未收口** | t83（三处同改） |
+
+| C13 | **平台的 inScope 串行规则（captain 撞了 4 次）** | 新增/编辑一个任务时，若它的 inScope 与**任何 pending 任务的 inScope 重叠，就必须把那个任务列进自己的 `dependencies`** —— **跨成员也一样**（我第 9 轮为「裸 `#[ignore]` 守卫」依次被 `t65`→`t77`→`t83`→`t85` 挡回）。⇒ 规划时应**先算路径交集再写依赖**；同目录（如 `scripts/`、`crates/daemon/tests/`）会让多个单互相串起来 | captain |
+
+| C14 | **构建锁争用会把成员的工具调用饿死**（captain 观察 + 成员实测） | 共享单飞锁上排队导致的**工具调用超时**：integ 私有构建 **479.9s 无产物**、graph 的 `check` **600s 无输出**、我两次 **120s/300s** 超时。⇒ **只读检查**可用 `-NoLock` + **私有 `-TargetDir`**（verify2 实测 `core 11 + orchestrator 4 + policy 7 = 22 passed/0 failed`），或把构建放**后台**再收；**写型/正式门禁仍必须走锁**（一次一个编译是纪律，不是障碍） | 各属主 |
+| C15 | **共享树停在不可编译状态的代价**（t81 实例） | graph 分步改同一文件时停在不可编译窗口、**未广播** ⇒ integ 白烧 479.9s 私有构建 + 四探针全打在「文件不存在」上；`test --workspace` = exit 101 且 `ok=0 FAILED=0 Running=0`（**根本没编译过**）。**纪律候选（第 23 条）**：跨文件/跨步骤改动前先确认当前树可编译；若不可避免，**立刻广播 `file:line` + 错误原文**。graph 已认领该违反并改为「每跨文件前先跑 `check -p ruagent-graph --all-targets`」 | 契约（t64 落地时收编） |
+
+| C16 | **推送后立即核 CI 的清单**（captain 自用，避免「推了就算完」） | ① `gh run list --limit 3` 确认新 run 出现且 **headSha 对齐**要推的 commit；② 对每个 run `gh run view <id> --json jobs` 取**逐 job 结论**，红的取**失败步名**；③ **特别核 evidence 步真的跑了**：摘要里计数非空、`Running ` 与 `test result:` 行数 > 0（刚加固过的脚本不能「跑了但没读数」）；④ **windows job 只在 main push 跑** ⇒ 必须确认它**有结论**（不是 skipped）；⑤ 若红：把失败步名 + 日志片段贴进总账，开修复单（owner = 该步属主），**不许**在红的状态下宣称「CI 绿」 | captain |
+
+| C17 | **第 21 条的守卫是死代码**（t92 发现） | `.github/workflows/scripts/check-workflow-refs.sh`（t65/F1 产物）**全仓 0 调用点**（除自身 `:30/:57`）⇒ 与 `RUAGENT_REQUIRE_MOCK` 同形（「谁打开它？」→**没有人**）。它已按「**欠近似**」写好（注释里记着天真版本误报过的两类：`panel/scripts/…` 被读成 `scripts/…`、文档头注释里的路径是散文）⇒ **只需接线 + 入库**（已并入 t66 的 F1 项：跟踪入库 + 在 `ci.yml` 里真的调用 + 让它失败即红） | t66 |
+
+| C18 | **平台依赖规则的第二形态：repair 不许依赖已失败任务** | 我试图把 `t83` 硬挂进 `t66` 的依赖（防止推送快照到「半改键名」的树），平台先拒 `repair must not depend on failed task \"t59\"`（`t66` 的旧依赖里有失败的 `t59` ⇒ 必须摘掉），摘掉后再拒 `inScope overlaps t86 at .github/workflows/`（`t86` 依赖 `t66` 且共享该路径）。⇒ **与在途从属单重叠时，该任务的依赖根本改不动**；硬保证拿不到时，改为**一行的提交前一致性检查**（我在消息里给了 recall 具体命令：服务端键与每一个消费方必须一致，`grep '\["log"\]|\["rows"\]'`） | captain |
+
+| C19 | **失败依赖会永久冻结一个 pending 任务（连取消都不行）** —— 本代最贵的结构性限制 | 实测链：`DELETE`/失败让 `t59`、`t83` 终态失败 ⇒ ① 任何**依赖它们**的 pending 任务被永久封锁（`reassign_task` 原文：`task t64 is blocked by unfinished dependencies: t59 — complete them before captain takeover`）⇒ **既不能重派、也不能取消**；② 更糟：被冻结任务的 **inScope 对所有人变成禁区**（新单与它重叠就必须依赖它 ⇒ 一起死）；③ 而**依赖编辑又常被「与在途从属单重叠」挡住**（`t86`→`t66`、`t89/t90`→`t64`），于是连「摘掉失败依赖」都做不到。**本代被冻结**：**t64**（预算账本接线 + F7 + D-11 契约同步）· **t89**（权限审计可辨，C-3）· **t90**（状态机住 `core` + 13 处接线，C-1）—— 三者的内容都已在总账登记，可在**新会话/新团队**中干净重建（或平台提供「取消被封锁任务」后解冻）。**教训（今后立单纪律）**：**宁可拆 inScope 路径，也不要把关键路径挂在可能失败的任务后面**；`t66`（推送）就因此被 `t59`/`t64`/`t83` 连咬三口，每次都要拆路径抢救 | captain |
+
+| C20 | **main 上 CI 红的确切基线（`gh` 直查真实 run，非推断）** | run `36272344732`（headSha `5db881d` = `origin/main`）：**Rust (ubuntu) = failure，失败步 `Format`** ⇒ **`Clippy`/`Guard against nested-Result misjudgement`/`Test` 全部 `skipped`**（也就是说 ubuntu 侧的静态检查与测试**从未在这条 run 上跑过**）；**Rust (windows) = failure，失败步 `Test`**（`crates/mock-agent/tests/e2e_daemon.rs:2161` 的过期期望，**已在工作树里修好**）；**Panel (node) = success**；独立 E2E run `36272344709` = **success**。⇒ `t66` 要翻转的正是这两条：`cargo fmt --all`（现 178 处）+ windows 重跑测试。**取证指令**：推完必须用 `gh run view <id> --json jobs` 逐 job 取「结论 + 失败步名」，并确认 ubuntu 的 Clippy/Test **这次真的跑了**（不是又一次被 Format 短路） | captain |
+
+| C21 | **跨 Windows→WSL 测退出码：只能用 `$LASTEXITCODE` 或内部 `if`，`echo $?` 不可信** | 我在多行 `wsl bash -c '…; echo "RC=$?"'` 里读到**全 0**（含 `check-workflow-refs.sh` 打印了 `::error::` 却「退出 0」）⇒ 差点**对正确的守卫报假警**、进而「修好」一个并不存在的 bug。判定性对照：`wsl bash -c "exit 7"` 用 `echo $?` 也读 **0**，而 **PowerShell 读 `$LASTEXITCODE` 得 7** ⇒ **测量通道本身是坏的**。真相（两条独立通道一致 + `bash -x` 轨迹显示 `+ exit 1` 确实执行）：**F1 守卫在今天的树上 exit 1**（6 处引用 2 个未跟踪脚本，**零误报**；`panel/` 路径正确按 working-directory 解析并标 tracked）· 证据脚本 **缺日志 ⇒ exit 1** · **空日志 ⇒ exit 1** · **健康日志 ⇒ exit 0** ⇒ **整套 CI 加固是载重的，不是装饰**。**纪律**：测退出码要用**调用方的退出码通道**（`$LASTEXITCODE`）或被测程序内部 `if`；`echo $?` 在多行 `bash -c` 里会静默给你 0 —— 这是「工具默认值/测量口径」族的又一实例（与第 17/20 条同族） | captain |
+
+| C22 | **变异负控不得把共享树弄红**（t93/t81，成员自报的流程 finding） | 为证明「测试能红」而**临时改共享源码**（把 `facts_of` 改回 `unwrap_or_default()`、把事务降级成 autocommit、改断言主语）会让**全员的 `test --workspace` 在那个窗口变红**；本代已因此产生**一次误诊**（`crates/mcp/src/lib.rs:495` 的红被读成「测试已写、实现未落」）。⇒ 纪律：**在隔离检出/`git worktree` 里做**，或**事先广播**（哪些文件/哪些测试/预计时长）+ **限时** + **报告窗口起止与恢复后的绿读数**。**没广播的变异窗口，对其他人来说与被它抓的那个 bug 无法区分**。已写入 `AGENTS.md` | 全员 |
+
+| C23 | **规则上移一层必须对旧调用点幂等**（t73，captain 采纳为通则） | 把净化规则从 `memembed.rs:200` 上移到共享 `query.rs::fts_pattern` 时，若不做幂等（`fts_pattern(fts_pattern(x))==fts_pattern(x)`），**旧调用点传进来的已是短语** ⇒ 共享层再转义一次会让召回 keyword 腿**静默 0 命中**。⇒ **通则：上移一条规则时，必须保证它对旧调用点幂等，否则上移本身就是一次静默行为变更**（与「同一件事两处说」「不可判定被合法值掩盖」同族）。附带读数：`before(raw) errors=8/11 → after ok=11/11`；负控 `deploy`/`部署`/`"deploy script"`/`café` 前后一致；**唯一差异已明写**（多词 `deploy script` 由隐式 AND `[1,2]` → 短语 `[1]`，理由是 keyword 腿一直如此，替代方案会拆坏合法引号查询）；**顺带修好真实查询 `release.sh` 的 500**（`.` 是 FTS5 语法字符） | 全员 |
+
+| C24 | **`Select-String 'FAILED'` 默认大小写不敏感 ⇒ 把 `0 failed` 数成假红**（t81 自报） | 成员第一遍统计测试行时，把 **12 行 `0 failed`** 计成 FAILED ⇒ **假红**（与假绿同族、方向相反，同属「测量口径的默认值本身就是缺陷来源」）。**判据**：统计一律 `-CaseSensitive` 并**锚定 `test result: FAILED`**；`test-evidence.sh` 的口径正是如此（按 `test result:` 行分类 + 大小写敏感）。与第 17/20 条、C21（跨 WSL 的 `$?` 永远是 0）同族 | 全员 |
+
+## D. 纪律账
+
+本代把 22 条纪律写进了 `docs/design/reviews/gen2-integration-contract.md` §6.0（六族：**判据 / 绿红 / 解释 / 量词 / 声称面 / 异步面**）。此处**不复制**，只指向那份契约——**一个事实一个来源**。

@@ -33,9 +33,30 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# panel
-cd panel && npm ci && npm run build   # tsc + vite build
+# panel -- this command has ALWAYS covered the panel's type check, inside the
+# wrapper: panel/scripts/build-panel.mjs runs `node e2e/i18n-check.mjs` (L33),
+# then `npx tsc -b` (L34), then `npx tsc -p e2e/tsconfig.json --noEmit` (L35),
+# and only then vite (L44); any non-zero step exits and leaves dist untouched.
+# Read the wrapper, do not judge this command by its one-line script name --
+# t53 read the name and got the history wrong (t55 corrected it).
+cd panel && npm ci && npm run build
 ```
+
+**What these gates do NOT cover (read this before claiming a green).** The three Rust
+commands above (`fmt` / `clippy` / `test`) compile and lint **the Rust workspace only**.
+`panel/` is not a Rust package, so a TypeScript type error, a broken antd prop, or a dead
+import in `panel/src/**` is invisible to them: the panel's own gate is
+`cd panel && npm run build`. (That gate **does** cover the type check, and always has: the
+`build-panel.mjs` wrapper runs `i18n-check`, `tsc -b`, `tsc -p e2e/tsconfig.json --noEmit` and
+then vite, with a non-zero step aborting before anything writes `dist`. The `check` script in
+`panel/package.json` names the same two `tsc` steps, but no verify command ever called it by
+name — a statement about that script's callers, not about the gate's coverage.) The panel
+e2e suite is a third, separate gate: run it through the repo entry point
+(`cd panel && npm run test:e2e`, which is `node e2e/run-e2e.mjs`), never through a bare
+`npx playwright test`; specs that write real daemon config must call `writeAccess()` and
+`test.skip()` unless `RUAGENT_E2E_ALLOW_WRITES=1`, i.e. unless they came through that entry
+point. So: **no Rust gate protects the panel** — a workspace-green run says nothing about
+`panel/`, and vice versa.
 
 ### Running the daemon (the reliable start)
 
@@ -88,6 +109,41 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
 - High-volume run events are append-only JSONL under `transcripts/`; SQLite holds queryable state only.
 - New adapters must come with mock-driven tests; real-harness smoke tests are feature-gated (`--features smoke`).
 - Windows is a first-class platform: no Unix-only assumptions (paths, process groups, signals).
+- **Format before you submit** (t66). CI's first gate is `cargo fmt --all --check`; a task that
+  leaves unformatted Rust does not fail *itself* — it fails the **next push** (observed: **177
+  diff sites** accumulated across the tree, concentrated in files no gate ever reformatted:
+  `daemon/src/distill.rs`, `graph/tests/{fixture,extraction-gold,multihop-gold,live-after}.rs`,
+  `store/src/migrations.rs`). Run `cargo fmt --all` (or `rustfmt` on the files you touched)
+  before you finish, and **do not** reformat files you did not touch — that turns a local diff
+  into a repository-wide one that cannot be reviewed. Because `cargo fmt --all` rewrites the
+  whole tree, whoever runs it while others are editing must treat it as a race: snapshot
+  `git status --porcelain` before and after, and re-run the gates on the new bytes if a file
+  moved under you. Never `git stash` a shared tree to get a "before" reading.
+- **Mutation negative controls must not redden the shared tree** (t93/t81, adopted from a member's
+  self-filed finding). A control that temporarily reverts *shared source* to prove a test can fail
+  — `unwrap_or_default()` restored, a transaction degraded to autocommit, an assertion's subject
+  renamed — makes **everyone's** `test --workspace` red for that window. It has already caused one
+  false alarm (a red at `crates/mcp/src/lib.rs:495` was a control window, not a real failure, and a
+  second reader misdiagnosed it as "test written, implementation not landed"). Either run such a
+  control in an **isolated checkout / `git worktree`**, or **announce it first** (which files, which
+  tests, expected duration), keep it **time-boxed**, and report the **window start/end plus the
+  restored-green reading**. A control that is *not* announced is indistinguishable, to every other
+  member, from the bug it is meant to catch.
+- **Binding is loopback by default** (t76). `ruagent serve` binds `127.0.0.1:8787` unless
+  `--addr` says otherwise; a non-loopback address additionally requires **explicit consent**
+  (`--allow-remote`, or `RUAGENT_ALLOW_REMOTE=1|true|TRUE|yes`), and without it startup fails
+  non-zero with a WARN that names the **actual** bound address and states that there is no
+  authentication. `serve(root, addr)` remains a thin wrapper over
+  `serve_with_remote(root, addr, allow_remote)`. Do not relax this default when touching `cli/`
+  (still unowned) or `daemon`: the API has no auth, and a reachable instance can rewrite memory
+  bodies (`POST /api/v1/memory/migrate-distilled-prefix`).
+- **`cli/` has no dedicated owner yet** (t45/t54). `cli/src/main.rs:809` therefore carries a
+  **scoped** `#[allow(clippy::items_after_test_module)]` on `mod tests` plus a reason comment:
+  the test module sits mid-file (nine functions are defined after it), and moving ~500 lines to
+  the end is a far larger, review-unfriendly diff in an unowned file than the lint it silences.
+  That attribute is **intentional, not leftover debt**: when `cli/` gets an owner, the move is
+  the better fix, and the comment is the marker for exactly that. Do not delete the comment and
+  do not "fix" the allow by moving code as a drive-by.
 
 ## E2E specs that write the daemon's real config
 

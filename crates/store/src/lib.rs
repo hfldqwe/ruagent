@@ -796,6 +796,62 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
+// Chunk bigram backfill (t6)
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Fill `chunks.grams` for every chunk that has none, and return how many
+    /// rows were filled.
+    ///
+    /// WHY THIS LIVES IN THE STORE RATHER THAN IN THE CALLER (t6): migration
+    /// 0019 adds the column and the `chunks_fts_cjk` index, but no SQL statement
+    /// can compute a bigram decomposition -- so the column is added empty and
+    /// SOMETHING has to fill it. If that "something" is left to the knowledge
+    /// crate, the CJK leg silently indexes nothing until someone remembers; here
+    /// the schema and the pass that makes the schema useful ship together, and
+    /// `rows == 0` is a reading a caller can print instead of an assumption.
+    ///
+    /// IDEMPOTENT AND RESUMABLE: it only reads rows whose `grams` IS NULL, in
+    /// batches of 256, each batch in its own transaction. An interrupted run
+    /// resumes where it stopped, and a second call on a filled table returns 0.
+    ///
+    /// A row whose content yields NO bigrams (punctuation only) is set to the
+    /// EMPTY STRING, never back to NULL: leaving it NULL would make the "rows
+    /// whose grams IS NULL" loop find it again for ever. Empty is also the
+    /// truthful value -- there is nothing to index -- and the row is simply not
+    /// reachable by the bigram leg, which is what an empty value means.
+    pub async fn backfill_chunk_grams(&self) -> Result<u64, DbError> {
+        const BATCH: i64 = 256;
+        self.call_flat(move |conn| {
+            let mut filled: u64 = 0;
+            loop {
+                let rows: Vec<(i64, String)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, content FROM chunks WHERE grams IS NULL ORDER BY id LIMIT ?1",
+                    )?;
+                    stmt.query_map([BATCH], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt = tx.prepare("UPDATE chunks SET grams = ?2 WHERE id = ?1")?;
+                    for (id, content) in &rows {
+                        stmt.execute(rusqlite::params![id, crate::fts::han_bigrams(content)])?;
+                    }
+                }
+                tx.commit()?;
+                filled += rows.len() as u64;
+            }
+            Ok(filled)
+        })
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1091,5 +1147,266 @@ mod tests {
             DeleteSession::Deleted
         );
         assert_eq!(db.deleted_session_keys().await.unwrap().len(), 1);
+    }
+
+    // -- chunk bigram backfill (t6) ----------------------------------------
+
+    /// One document with N chunks, so the chunk writer has a real parent row.
+    async fn seed_chunks(db: &Db, contents: &[&str]) {
+        let contents: Vec<String> = contents.iter().map(|s| s.to_string()).collect();
+        db.call_flat(move |conn| {
+            conn.execute(
+                "INSERT INTO documents (id, name, content_hash, chunk_count, created_at)
+                 VALUES (1, 'doc', 'h', ?1, '2026-01-01T00:00:00Z')",
+                rusqlite::params![contents.len() as i64],
+            )?;
+            for (i, c) in contents.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO chunks (document_id, idx, content) VALUES (1, ?1, ?2)",
+                    rusqlite::params![i as i64, c],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// How many INDEXED rows match the bigram form of `query`.
+    ///
+    /// MATCH, not COUNT(*): `chunks_fts_cjk` is an external-content table, so a
+    /// plain SELECT reads `chunks` and would report every row no matter what the
+    /// index holds. Only a MATCH consults the index.
+    async fn bigram_matches(db: &Db, query: &str) -> i64 {
+        let pattern = crate::fts::match_bigrams(&crate::fts::terms(query));
+        if pattern.is_empty() {
+            return 0; // an empty pattern is never handed to MATCH
+        }
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM chunks_fts_cjk WHERE chunks_fts_cjk MATCH ?1",
+                [&pattern],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bigram_backfill_fills_the_index_and_terminates_on_empty_bigrams() {
+        let db = Db::open_in_memory().unwrap();
+        // The first chunk is the measured case: 研磨度 is a substring of a longer
+        // Han run, so unicode61 makes the whole run one term and neither the
+        // precision nor the prefix stage can reach it. The third chunk yields NO
+        // bigrams at all -- the input that would make a naive loop spin for ever.
+        seed_chunks(
+            &db,
+            &[
+                "手冲咖啡的水温是九十二度。咖啡研磨度决定萃取速度。",
+                "茶",
+                "！！！",
+            ],
+        )
+        .await;
+
+        // Before: the column is empty, so the ONE query that used to need a
+        // full-table LIKE scan matches nothing.
+        assert_eq!(bigram_matches(&db, "研磨度").await, 0);
+
+        assert_eq!(
+            db.backfill_chunk_grams().await.unwrap(),
+            3,
+            "all three rows must be filled, including the one with no bigrams"
+        );
+        assert_eq!(bigram_matches(&db, "研磨度").await, 1);
+        assert_eq!(bigram_matches(&db, "水温").await, 1);
+        assert_eq!(bigram_matches(&db, "茶").await, 1);
+        assert_eq!(
+            bigram_matches(&db, "潜艇").await,
+            0,
+            "a substring that is not in the corpus must not match"
+        );
+
+        // Idempotent AND terminating: the second call finds nothing to do.
+        assert_eq!(db.backfill_chunk_grams().await.unwrap(), 0);
+
+        // The mechanism behind that: a no-bigram row is '', not NULL. If it were
+        // left NULL the loop above would find it again on every pass.
+        let (empty, nulls) = db
+            .call_flat(|conn| {
+                let empty: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM chunks WHERE grams = ''", [], |r| {
+                        r.get(0)
+                    })?;
+                let nulls: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM chunks WHERE grams IS NULL", [], |r| {
+                        r.get(0)
+                    })?;
+                Ok((empty, nulls))
+            })
+            .await
+            .unwrap();
+        assert_eq!(empty, 1, "the punctuation-only chunk must be ''");
+        assert_eq!(nulls, 0, "nothing may be left NULL");
+    }
+
+    /// The backfill is not a second tokenizer: it is the same one, applied to the
+    /// text, and the recall form built from a query is what finds it. This test
+    /// exists to catch a future edit that changes one half only.
+    #[tokio::test]
+    async fn bigram_index_and_query_form_are_one_pair() {
+        let db = Db::open_in_memory().unwrap();
+        seed_chunks(&db, &["反射的访问权限问题"]).await;
+        db.backfill_chunk_grams().await.unwrap();
+
+        // The 9-character run is ONE term under fts::terms, and its recall form
+        // is the ordered phrase of its bigrams.
+        assert_eq!(
+            crate::fts::terms("反射的访问权限问题"),
+            vec!["反射的访问权限问题".to_string()]
+        );
+        assert_eq!(bigram_matches(&db, "反射的访问权限问题").await, 1);
+        assert_eq!(
+            bigram_matches(&db, "访问权限").await,
+            1,
+            "an inner substring"
+        );
+        assert_eq!(bigram_matches(&db, "权限访问").await, 0, "order matters");
+    }
+
+    /// t6 at SCALE, on a migrated COPY of the live database. A fresh in-memory
+    /// fixture cannot show that the pass terminates on 10765 real rows, that a
+    /// second call is a no-op, or that a 2-character Han query really becomes an
+    /// indexed lookup on real text -- which is the whole point of the column.
+    ///
+    /// t33 SHAPE: it used to print `NOT MEASURED` and `return` when the copy was
+    /// not pointed at, so the harness counted it as a pass while nothing had been
+    /// measured. That is the fifth family of false green ("a pass that measured
+    /// nothing") and store-side it ends here: `#[ignore]`d (the count field says
+    /// `ignored`), running it explicitly without the env var FAILS at the `expect`,
+    /// and the object set is asserted non-empty so "env set but nothing to
+    /// measure" also fails.
+    #[ignore = "measures the at-scale grams backfill and bigram/LIKE equivalence: needs \
+                RUAGENT_T6_LIVE_COPY=<a COPY of the live db> (the test APPLIES migrations and \
+                WRITES grams) and runs with `-- --ignored`"]
+    #[tokio::test]
+    async fn live_copy_bigram_backfill_at_scale() {
+        let path = std::env::var("RUAGENT_T6_LIVE_COPY").expect(
+            "this instrument has no state in which it passes without measuring: set \
+             RUAGENT_T6_LIVE_COPY=<a COPY of the live db> (the test APPLIES migrations and WRITES \
+             grams -- never point it at ~/.ruagent) and run with `-- --ignored`",
+        );
+        let started = std::time::Instant::now();
+        let db = Db::open(&path).unwrap();
+        let (chunks, missing_before) = db
+            .call_flat(|conn| {
+                let chunks: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+                let missing: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM chunks WHERE grams IS NULL", [], |r| {
+                        r.get(0)
+                    })?;
+                Ok((chunks, missing))
+            })
+            .await
+            .unwrap();
+        // NON-VACUITY (t33): on an empty copy `filled == missing_before == 0` and
+        // the equivalence loop has no substrings to compare, so every assertion
+        // below would pass while measuring nothing.
+        assert!(
+            chunks > 0,
+            "the copy has no chunks: there is nothing to backfill and no Han substring to compare, \
+             so this run measures nothing and must not be reported as a pass"
+        );
+        let filled = db.backfill_chunk_grams().await.unwrap();
+        let elapsed = started.elapsed();
+        println!(
+            "[t6] live copy: chunks={chunks} grams_missing_before={missing_before} filled={filled} \
+             elapsed={}ms ({:.2} ms/row)",
+            elapsed.as_millis(),
+            elapsed.as_secs_f64() * 1000.0 / filled.max(1) as f64
+        );
+        assert_eq!(
+            filled as i64, missing_before,
+            "the pass must fill exactly the rows that were missing a value"
+        );
+        let again = db.backfill_chunk_grams().await.unwrap();
+        assert_eq!(again, 0, "the second pass must find nothing to do");
+
+        // The end-to-end claim, as an EQUIVALENCE rather than a spot check: for
+        // 2-character Han substrings, the bigram index must find exactly the rows
+        // a LIKE '%XY%' scan finds. The substrings are DERIVED from the corpus
+        // (never hardcoded -- a hardcoded pair would only show that the corpus
+        // happens to contain it), and equality is asserted per substring, so a
+        // disagreement names the pair that broke it.
+        let sample: Vec<String> = db
+            .call_flat(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT content FROM chunks WHERE content GLOB '*[一-龥]*[一-龥]*' \
+                     ORDER BY id LIMIT 4000",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut seen: Vec<String> = Vec::new();
+                for text in rows {
+                    for token in crate::fts::han_bigrams(&text).split(' ') {
+                        if token.chars().count() == 2
+                            && token.chars().all(|c| matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF))
+                            && !seen.contains(&token.to_string())
+                        {
+                            seen.push(token.to_string());
+                        }
+                    }
+                    if seen.len() >= 25 {
+                        break;
+                    }
+                }
+                Ok(seen)
+            })
+            .await
+            .unwrap();
+        assert!(
+            !sample.is_empty(),
+            "no 2-character Han substring found in the corpus: this reading is then vacuous and \
+             must not be reported as a pass"
+        );
+        let mut disagreements: Vec<(String, i64, i64)> = Vec::new();
+        for sub in &sample {
+            let pattern = crate::fts::match_bigrams(&crate::fts::terms(sub));
+            let like = format!("%{sub}%");
+            let (indexed, scanned) = db
+                .call_flat(move |conn| {
+                    let indexed: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM chunks_fts_cjk WHERE chunks_fts_cjk MATCH ?1",
+                        [&pattern],
+                        |r| r.get(0),
+                    )?;
+                    let scanned: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM chunks WHERE content LIKE ?1",
+                        [&like],
+                        |r| r.get(0),
+                    )?;
+                    Ok((indexed, scanned))
+                })
+                .await
+                .unwrap();
+            if indexed != scanned {
+                disagreements.push((sub.clone(), indexed, scanned));
+            }
+        }
+        println!(
+            "[t6] live copy: bigram-index vs LIKE equivalence on {} derived 2-char Han substrings \
+             -> {} disagreement(s) {:?}",
+            sample.len(),
+            disagreements.len(),
+            disagreements
+        );
+        assert!(
+            disagreements.is_empty(),
+            "the index and the LIKE scan must agree on every 2-character Han substring: \
+             {disagreements:?}"
+        );
     }
 }

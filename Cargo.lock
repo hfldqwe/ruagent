@@ -6379,6 +6379,7 @@ dependencies = [
  "ruagent-store",
  "rusqlite",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -6396,6 +6397,7 @@ dependencies = [
  "ruagent-store",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "tokio",
@@ -6429,6 +6431,7 @@ dependencies = [
  "ruagent-store",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "tokio",

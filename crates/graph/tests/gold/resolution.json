@@ -1,0 +1,173 @@
+{
+ "criterion": "same real-world object; `how` says whether the JUDGE must derive it (mechanical) or whether only a declared alias can link it (declared)",
+ "pairs": [
+  {
+   "a": "ACP",
+   "b": "Agent Client Protocol (ACP)",
+   "same": true,
+   "how": "mechanical",
+   "why": "same protocol, abbreviation vs expansion"
+  },
+  {
+   "a": "Agent Client Protocol",
+   "b": "Agent Client Protocol (ACP)",
+   "same": true,
+   "how": "mechanical",
+   "why": "expansion with the abbreviation in parentheses"
+  },
+  {
+   "a": "ACP",
+   "b": "Agent Client Protocol",
+   "same": true,
+   "how": "mechanical",
+   "why": "acronym of the expansion"
+  },
+  {
+   "a": "Model Context Protocol (MCP)",
+   "b": "Model Context Protocol",
+   "same": true,
+   "how": "mechanical",
+   "why": "expansion with the abbreviation in parentheses"
+  },
+  {
+   "a": "DeepSeek Harness (dsh)",
+   "b": "DeepSeek Harness",
+   "same": true,
+   "how": "mechanical",
+   "why": "expansion with the abbreviation in parentheses"
+  },
+  {
+   "a": "DeepSeek Harness",
+   "b": "dsh",
+   "same": true,
+   "how": "declared",
+   "why": "NOT derivable from the two names: the link is the parenthetical the extraction declared, so it belongs in the alias table, not in a guess"
+  },
+  {
+   "a": "Agent Client Protocol",
+   "b": "ACP",
+   "same": true,
+   "how": "mechanical",
+   "why": "the pair again, order swapped: the judge must not be asymmetric"
+  },
+  {
+   "a": "dsh",
+   "b": "dsh-kanban",
+   "same": false,
+   "how": "none",
+   "why": "dsh-kanban is a separate product built on dsh"
+  },
+  {
+   "a": "dsh",
+   "b": "dsh-import-agents",
+   "same": false,
+   "how": "none",
+   "why": "import-agents is a separate plugin"
+  },
+  {
+   "a": "dsh-kanban",
+   "b": "dsh-import-agents",
+   "same": false,
+   "how": "none",
+   "why": "two different products sharing a prefix"
+  },
+  {
+   "a": "ACP",
+   "b": "acpx",
+   "same": false,
+   "how": "none",
+   "why": "acpx is a separate client CLI, not the protocol"
+  },
+  {
+   "a": "Graphiti",
+   "b": "Graphiti / Zep",
+   "same": true,
+   "how": "mechanical",
+   "why": "one product documented under two names"
+  },
+  {
+   "a": "Graphiti / Zep",
+   "b": "HippoRAG",
+   "same": false,
+   "how": "none",
+   "why": "different systems"
+  },
+  {
+   "a": "qpl",
+   "b": "data-qpl",
+   "same": false,
+   "how": "none",
+   "why": "a tool and a data set"
+  },
+  {
+   "a": "python-build-standalone",
+   "b": "Python 3.10.9",
+   "same": false,
+   "how": "none",
+   "why": "a distribution vs one of its outputs"
+  },
+  {
+   "a": "pandas",
+   "b": "numpy",
+   "same": false,
+   "how": "none",
+   "why": "two libraries"
+  },
+  {
+   "a": "SQLite",
+   "b": "LanceDB",
+   "same": false,
+   "how": "none",
+   "why": "two stores"
+  },
+  {
+   "a": "find-skills",
+   "b": "Skills CLI",
+   "same": false,
+   "how": "none",
+   "why": "one skill vs the CLI that installs it"
+  },
+  {
+   "a": "skills.sh",
+   "b": "SKILL.md / Agent Skills",
+   "same": false,
+   "how": "none",
+   "why": "a registry vs a format"
+  },
+  {
+   "a": "DeepSeek Harness",
+   "b": "deepseek-v4-flash",
+   "same": false,
+   "how": "none",
+   "why": "a harness vs a model it runs"
+  },
+  {
+   "a": "Claude Code",
+   "b": "Codex",
+   "same": false,
+   "how": "none",
+   "why": "two agent CLIs"
+  },
+  {
+   "a": "ruagent",
+   "b": "用户19410",
+   "same": false,
+   "how": "none",
+   "why": "a platform vs its user"
+  },
+  {
+   "a": "蓝鲸潜艇",
+   "b": "t99",
+   "same": false,
+   "how": "none",
+   "why": "two unrelated placeholders"
+  },
+  {
+   "a": "dsh",
+   "b": "ruagent",
+   "same": false,
+   "how": "none",
+   "why": "a harness vs the platform that drives it"
+  }
+ ]
+}

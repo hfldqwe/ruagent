@@ -1,5 +1,26 @@
 name: CI
 
+# EVIDENCE DISCIPLINE (t65, report: docs/design/reviews/gen2-ci-hardening.md)
+#
+# This generation collected four families of "a green that measured nothing",
+# each with a real cost:
+#   1. AN EMPTY RUN -- with no `#[ignore]`d tests, `cargo test -- --ignored`
+#      exits 0 and prints "0 passed ... N filtered out" (measured in t36). So a
+#      run's metric here is the number of TARGETS that reported (0 is an error),
+#      per-target `test result:` lines and the exit code -- never a sum of passes.
+#   2. A CACHED GREEN -- a `-D`-only change does not invalidate fingerprints, so
+#      "no diagnostics" can come from a build that never re-checked the crate.
+#   3. A STALE-BINARY GREEN/RED -- the reading came from an older executable.
+#   4. A SILENT SKIP -- a missing precondition `return`ing early is counted as
+#      `passed`; and a bare `npx playwright test` lets the write-guarded spec
+#      skip itself silently.
+#
+# What that means in this file: every test step tees its output and runs
+# `scripts/test-evidence.sh` over it; every `#[ignore]`d instrument is either RUN
+# with `--include-ignored` (and its name demanded in the log) or NAMED in the
+# manifest step with the reason it cannot run here; and every job declares what it
+# does NOT cover.
+
 on:
   push:
     branches: [main]
@@ -11,6 +32,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Knowledge tests prefer real embeddings; offline CI uses the deterministic hash
+  # embedder fallback (same as first boot).
+  RUAGENT_EMBEDDER: hash
 
 jobs:
   rust-linux:
@@ -25,6 +49,42 @@ jobs:
       # lancedb's lance-encoding needs protoc at build time
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # F1 GUARD: every path a workflow EXECUTES must be tracked, in the same
+      # commit. Its own reason to exist: this file references
+      # `.github/workflows/scripts/test-evidence.sh` and
+      # `.github/workflows/scripts/check-workflow-refs.sh`, and an UNTRACKED step
+      # script does not make the pipeline weaker -- it makes it red on the first
+      # push. The guard is deliberately an under-approximation (executable
+      # positions only, paths resolved against the step's `working-directory`,
+      # prose excluded); its two measured false positives are recorded in the
+      # script's header.
+      - name: "Guard: workflow-referenced paths must be tracked"
+        run: bash .github/workflows/scripts/check-workflow-refs.sh
+
+      # ---------------------------------------------------------------- coverage
+      # Declared BEFORE the greens on purpose: a reader must know what a green
+      # here does not mean (t53 read a script name and got the history wrong; the
+      # cure is stating coverage next to the claim, not in a wiki).
+      - name: Coverage declaration (what a green here does NOT mean)
+        run: |
+          {
+            echo "### Rust (ubuntu) -- NOT covered by this job"
+            echo ""
+            echo "* **the panel**: \`panel/**\` is not a Rust package, so a TypeScript"
+            echo "  type error, a broken antd prop or a dead import is invisible to"
+            echo "  every step below. That is the \`panel\` job and the \`E2E\` workflow."
+            echo "* **Windows-specific paths**: MAIN_SEPARATOR handling, DLL init order,"
+            echo "  \`MAX_PATH\`, drive-letter case, the lance rmeta race -- the"
+            echo "  \`Rust (windows)\` job (main pushes only)."
+            echo "* **the live-COPY instruments that need real history** (8 of them:"
+            echo "  store 3, graph 3, knowledge 2). They are NAMED in the manifest step"
+            echo "  below with the reason; a CI runner has no \`~/.ruagent\` database and"
+            echo "  no e5 model, and their whole point is real data -- see the manifest."
+            echo "* **the Playwright suite** (its own workflow, needs a daemon +"
+            echo "  browsers) and **coverage of anything outside the workspace manifest**."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -49,12 +109,97 @@ jobs:
           fi
           echo "no nested-Result misjudgement found"
 
-      - name: Test
-        run: cargo test --workspace
-        env:
-          # Knowledge tests prefer real embeddings; offline CI uses the
-          # deterministic hash embedder fallback (same as first boot).
-          RUAGENT_EMBEDDER: hash
+      # ------------------------------------------------------------- the run
+      # `--no-fail-fast` is NOT cosmetic (captain's ruling, t65): cargo stops
+      # launching further test targets as soon as one fails, so without it the
+      # "targets reporting" count below is structurally incomplete -- one early
+      # red hides every later target's reading, and the "0 targets = error" guard
+      # cannot see what never ran. Measured: an unfixed workspace run reported 7
+      # targets and stopped, while the workspace has 21+.
+      - name: Test (default run -- skips stay countable)
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/t65"
+          cargo test --workspace --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/t65/linux-default.log"
+
+      - name: Test evidence (per-target counts + exit code)
+        if: always()
+        run: |
+          rc=${{ job.status == 'success' && 0 || 1 }}
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (ubuntu) -- default run" "$RUNNER_TEMP/t65/linux-default.log" "$rc"
+
+      # ------------------------------------------- the ignored instruments
+      # THE SATISFIABLE ONE. The seven daemon instruments in
+      # `crates/daemon/tests/injection_e2e.rs` need `ruagent-mock-agent` next to
+      # the test binary -- and `cargo test --workspace` just built it there. Their
+      # body-head `expect(NEEDS_MOCK)` means a missing binary is a FAILURE, not a
+      # silent pass (t37), so running them here is the positive reading; the
+      # negative one (missing binary => FAILED) is in the report §2.
+      #
+      # Each name is DEMANDED in the log: with `--include-ignored` alone, a test
+      # could still be skipped by a *new* `#[ignore]` and the summary would not
+      # notice it.
+      - name: Ignored instruments CI can satisfy (daemon / mock-agent present)
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/t65"
+          cargo test -p ruagent-daemon --test injection_e2e -- --include-ignored \
+            2>&1 | tee "$RUNNER_TEMP/t65/linux-daemon-ignored.log"
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (ubuntu) -- daemon instrumentation (--include-ignored)" \
+            "$RUNNER_TEMP/t65/linux-daemon-ignored.log" 0 \
+            run_injects_memory_knowledge_and_wiki \
+            run_without_knowledge_documents_has_no_knowledge_block \
+            chat_injects_memory_knowledge_and_wiki \
+            chat_without_knowledge_documents_has_no_knowledge_block \
+            chat_and_run_use_the_same_block_wording \
+            both_paths_emit_the_contract_truncation_marker \
+            a_retried_run_carries_the_shared_retry_prefix
+
+      # ------------------------------------------- the manifest of the rest
+      # Visible skip accounting. `--ignored --list` is the source of truth for
+      # which tests exist but are not run by default; the step compares it to the
+      # DECLARED sets, so a new `#[ignore]` cannot appear silently and an old one
+      # cannot disappear silently either.
+      - name: Ignored-instrument manifest (what does NOT run here, and why)
+        if: always()
+        run: |
+          set -euo pipefail
+          cargo test --workspace -- --ignored --list > "$RUNNER_TEMP/t65/ignored-list.txt" 2>&1
+          found=$(grep -cE ': test$' "$RUNNER_TEMP/t65/ignored-list.txt" || true)
+
+          # RUN by the step above (7). Their names are demanded there.
+          covered=7
+          # DECLARED NOT COVERED here (8). CI has no ~/.ruagent database and no e5
+          # model; these instruments' subject IS the real history, so a synthetic
+          # fixture would not measure them (an empty copy is rejected by their own
+          # non-vacuity assertions, t33/t36) -- that is why they are named instead
+          # of faked.
+          declared_not_covered=8
+          expected=$((covered + declared_not_covered))
+
+          {
+            echo "### Ignored instruments: skip accounting"
+            echo ""
+            echo "\`cargo test --workspace -- --ignored --list\` found **$found** ignored test(s);"
+            echo "this job accounts for **$expected** ($covered run with \`--include-ignored\`,"
+            echo "$declared_not_covered declared not covered below)."
+            echo ""
+            echo "| ignored test | disposition here |"
+            echo "| --- | --- |"
+            echo "| \`injection_e2e\`: 7 names | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`) |"
+            echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_…, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` = a migrated COPY of a real database (and for t25 a PRE-0024 copy). A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. |"
+            echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
+            echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::ignored-test count changed: found $found, this job accounts for $expected. A new #[ignore] must be either RUN with --include-ignored (and its name demanded in the test-evidence call) or DECLARED here with its reason -- silently skipping is not an option (t65)."
+            echo "--- found ---"; cat "$RUNNER_TEMP/t65/ignored-list.txt"
+            exit 1
+          fi
+          echo "skip accounting OK: $found ignored = $covered run + $declared_not_covered declared"
 
   # Windows is a first-class platform (design §3) but costs 2x CI minutes,
   # so it runs on main pushes only.
@@ -65,18 +210,91 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: choco install -y protoc
-      - name: Test
-        # The lancedb/datafusion graph is heavy; low parallelism dodges
-        # Windows DLL-init failures, and the retry absorbs the known
-        # lance rmeta race (E0786 invalid metadata) — the second run is
-        # incremental and almost always clean.
-        run: cargo test --workspace || cargo test --workspace
+
+      - name: Coverage declaration (what a green here does NOT mean)
+        shell: bash
+        run: |
+          {
+            echo "### Rust (windows) -- NOT covered by this job"
+            echo ""
+            echo "* **the panel** (its own job) and **the Playwright suite** (its own workflow)."
+            echo "* **the 8 live-COPY instruments** (store 3, graph 3, knowledge 2): same reason as the ubuntu job's manifest -- no real \`~/.ruagent\` and no e5 model on a runner."
+            echo "* **the ubuntu job's \`--include-ignored\` instrumentation of the daemon 7**: this job builds them too, but does not demand those 7 names; the ubuntu job is the one that does."
+            echo "* **anything only a non-main push would catch**: this job does not run on pull requests."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # --------------------------------------------------- attempt 1 + retry
+      # THE RETRY IS NOT UNCONDITIONAL ANY MORE (t65). Evidence from the run of
+      # 2026-09-26 (job 108488556558): attempt 1 failed with
+      # `distill_graph_toggle_controls_entity_extraction ... FAILED` +
+      # `panicked at crates\mock-agent\tests\e2e_daemon.rs:2161` and attempt 2
+      # reproduced it exactly (`test result: FAILED. 22 passed; 1 failed`), while
+      # `E0786` -- the lance rmeta race the retry was written for -- never appeared
+      # in the log: the retry doubled the wall clock and absorbed nothing.
+      #
+      # A build-level race is a *build* failure. A test-level failure is never that
+      # race, so: retry ONLY when attempt 1 shows no test-level failure, and print
+      # every attempt's counts either way.
+      - name: Test attempt 1
+        id: attempt1
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/t65"
+          set +e
+          cargo test --workspace --no-fail-fast > "$RUNNER_TEMP/t65/win-attempt1.log" 2>&1
+          echo $? > "$RUNNER_TEMP/t65/win-attempt1.rc"
+          set -e
+          tail -40 "$RUNNER_TEMP/t65/win-attempt1.log"
+          echo "attempt 1 exit code: $(cat "$RUNNER_TEMP/t65/win-attempt1.rc")"
         env:
           CARGO_BUILD_JOBS: "2"
-          RUAGENT_EMBEDDER: hash
+
+      - name: Test attempt 1 evidence
+        if: always()
+        shell: bash
+        run: |
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (windows) -- attempt 1" "$RUNNER_TEMP/t65/win-attempt1.log" \
+            "$(cat "$RUNNER_TEMP/t65/win-attempt1.rc")" \
+          && exit 0 || exit 1
+
+      - name: Test attempt 2 (only for the known build race)
+        if: failure() && steps.attempt1.outcome == 'failure'
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/t65/win-attempt1.log"
+          if grep -qE 'panicked at|^test result: FAILED' "$log"; then
+            echo "::error::attempt 1 failed with a TEST-level failure. The documented flake is a BUILD race (lance rmeta / E0786), which never shows as a test failure -- so retrying would hide a real red behind a lucky second run. Stopping here with attempt 1's evidence above."
+            exit 1
+          fi
+          echo "attempt 1 failed without a test-level failure (build/toolchain level) -> retrying once"
+          set +e
+          cargo test --workspace --no-fail-fast > "$RUNNER_TEMP/t65/win-attempt2.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$RUNNER_TEMP/t65/win-attempt2.rc"
+          tail -40 "$RUNNER_TEMP/t65/win-attempt2.log"
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (windows) -- attempt 2 (retry)" "$RUNNER_TEMP/t65/win-attempt2.log" "$rc"
+        env:
+          CARGO_BUILD_JOBS: "2"
+
+      - name: Test attempt 2 evidence
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/t65/win-attempt2.log" ]; then
+            bash .github/workflows/scripts/test-evidence.sh \
+              "Rust (windows) -- attempt 2" "$RUNNER_TEMP/t65/win-attempt2.log" \
+              "$(cat "$RUNNER_TEMP/t65/win-attempt2.rc")"
+          else
+            echo "attempt 2 did not run (attempt 1 was clean, or its failure was test-level)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
   panel:
     name: Panel (node)
@@ -88,6 +306,27 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: panel/package-lock.json
+
+      - name: Coverage declaration (what a green here does NOT mean)
+        run: |
+          {
+            echo "### Panel (node) -- NOT covered by this job"
+            echo ""
+            echo "* **Rust, entirely**: no \`cargo\` step runs here; a Rust compile error,"
+            echo "  a clippy lint or a failing Rust test is invisible to this job."
+            echo "* **the Playwright e2e suite**: separate workflow (\`E2E\`), needs a real"
+            echo "  daemon plus browsers. Its write-guarded spec only runs through"
+            echo "  \`panel/e2e/run-e2e.mjs\`."
+            echo "* **runtime behaviour of the built bundle**: this job type-checks and"
+            echo "  builds; a bundle that builds and then breaks in a browser is the E2E"
+            echo "  workflow's job."
+            echo ""
+            echo "Counting unit here: there are no Rust test targets in this job, so the"
+            echo "evidence below is the exit code plus the \`error TS\` / \`error\` line count"
+            echo "of \`node scripts/build-panel.mjs\` (which itself runs i18n-check,"
+            echo "\`tsc -b\`, the e2e tsconfig check and then vite -- AGENTS.md)."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Install
         working-directory: panel
         run: npm ci
@@ -103,8 +342,34 @@ jobs:
       - name: Audit self-test
         working-directory: panel
         run: node tools/design-audit.mjs --self-test
-      - name: Typecheck + build
+
+      # The type check is INSIDE npm run build (panel/scripts/build-panel.mjs runs
+      # i18n-check, `tsc -b`, the e2e tsconfig check, then vite; any non-zero step
+      # aborts before dist is written -- AGENTS.md). `npx tsc -b` is kept in front
+      # of it because it names the type error first; it is not the only coverage.
+      - name: Typecheck + build (with counts)
         working-directory: panel
         run: |
-          npx tsc -b
-          npm run build
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/t65"
+          set +e
+          { npx tsc -b && npm run build; } > "$RUNNER_TEMP/t65/panel-build.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/t65/panel-build.log"
+          ts_errors=$(grep -cE 'error TS[0-9]+' "$RUNNER_TEMP/t65/panel-build.log" || true)
+          other_errors=$(grep -cE '^error|ERROR' "$RUNNER_TEMP/t65/panel-build.log" || true)
+          {
+            echo "### Panel build evidence"
+            echo ""
+            echo "| line class | count |"
+            echo "| --- | --- |"
+            echo "| \`error TS<code>\` | $ts_errors |"
+            echo "| other \`error\`-shaped lines | $other_errors |"
+            echo "| exit code | $rc |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::panel typecheck/build failed (exit $rc): $ts_errors TS error(s)"
+            exit 1
+          fi
+          echo "panel build: exit 0, $ts_errors TS error(s)"

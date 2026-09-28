@@ -58,6 +58,28 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/graph/entity/{id}/neighbors", get(graph_neighbors))
         .route("/api/v1/graph/entity/{id}/facts", get(graph_facts))
+        // DEP-4 (graph spec, wired in t19): the six multi-hop / community /
+        // resolution entry points. Everything here is READ-ONLY except the three
+        // explicit writes, and no write ever happens implicitly (a merge is a
+        // human/agent decision, never a background side effect).
+        .route("/api/v1/graph/retrieve", get(graph_retrieve))
+        .route("/api/v1/graph/communities", get(graph_communities))
+        .route(
+            "/api/v1/graph/communities/build",
+            post(graph_communities_build),
+        )
+        .route(
+            "/api/v1/graph/community/{id}/summary",
+            axum::routing::put(graph_community_summary),
+        )
+        .route(
+            "/api/v1/graph/resolution/pending",
+            get(graph_resolution_pending),
+        )
+        .route(
+            "/api/v1/graph/resolution/merge",
+            post(graph_resolution_merge),
+        )
         .route("/api/v1/memory/write", post(memory_write))
         .route("/api/v1/memory/supersede", post(memory_supersede))
         .route("/api/v1/memory/diffs", get(memory_diffs))
@@ -96,6 +118,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/knowledge/wiki/builds", get(wiki_builds))
         .route("/api/v1/knowledge/wiki/builds/{id}", get(wiki_build_get))
         .route("/api/v1/knowledge/wiki/pages", get(wiki_pages))
+        .route(
+            // The correction loop's WRITE side (R-D D.6). `wiki.rs` owns the
+            // semantics (empty reason/author is refused); the endpoint owns the
+            // status codes, so a refusal is a 400 that says which field.
+            "/api/v1/knowledge/wiki/pages/{slug}/corrections",
+            get(wiki_page_corrections).post(wiki_add_correction),
+        )
         .route("/api/v1/knowledge/wiki/links", get(wiki_links))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
@@ -149,6 +178,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/{key}/distill", post(session_distill))
         .route("/api/v1/recall", get(recall))
         .route("/api/v1/recall/log", get(recall_log))
+        // INT46-1 (t47): the route the MCP tool `memory_forget_report` proxies.
+        // It did not exist -- the capability lived only in `crates/memory`'s
+        // report function -- so the tool registered fine and failed on every call.
+        // A consumption surface is the test of the contract: the tool found a
+        // missing route on the day it was added.
+        .route("/api/v1/forget-report", get(forget_report))
         .route(
             "/api/v1/memory/backfill-embeddings",
             post(memory_backfill_embeddings),
@@ -1063,6 +1098,70 @@ async fn wiki_links(State(state): State<AppState>) -> Result<Json<serde_json::Va
     ))
 }
 
+/// The corrections recorded for one page, newest first (R-D D.6). Reading is
+/// unconditional: an empty list is a reading, not a 404 — "no correction" and
+/// "no such page" are different facts and this endpoint only knows the first.
+async fn wiki_page_corrections(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows = crate::wiki::corrections(state.mgr.db(), &slug).await;
+    Ok(Json(
+        serde_json::json!({ "slug": slug, "corrections": rows }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AddCorrectionRequest {
+    /// `pin` | `release` | `note`.
+    kind: String,
+    reason: String,
+    /// Who is recording it. `None`/empty is refused (`wiki::add_correction`).
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Record a correction (pin / release / note). The refusals keep their identity:
+/// an unknown kind names the accepted vocabulary, and an empty reason/author is a
+/// 400 carrying the storage layer's own sentence — never a silent insert with a
+/// blank "why", which is the whole reason this table exists.
+async fn wiki_add_correction(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Json(req): Json<AddCorrectionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(kind) = crate::wiki::CorrectionKind::parse(req.kind.trim()) else {
+        let accepted: Vec<&str> = crate::wiki::CorrectionKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
+        return Err(ApiError::bad_request(format!(
+            "unknown correction kind `{}`; accepted: {}",
+            req.kind,
+            accepted.join(", ")
+        )));
+    };
+    let c = crate::wiki::Correction {
+        slug: slug.clone(),
+        kind,
+        reason: req.reason,
+        author: req.author.unwrap_or_default(),
+        at: String::new(), // the writer stamps it
+    };
+    match crate::wiki::add_correction(state.mgr.db(), &c).await {
+        Ok(id) => Ok(Json(serde_json::json!({
+            "id": id,
+            "correction": {
+                "slug": c.slug,
+                "kind": kind.as_str(),
+                "reason": c.reason.trim(),
+                "author": c.author,
+            }
+        }))),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
+    }
+}
+
 async fn graph_create_entity(
     State(state): State<AppState>,
     Json(req): Json<CreateEntityRequest>,
@@ -1180,11 +1279,233 @@ async fn graph_facts(
     let id: i64 = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid entity id"))?;
+    // t57 (F2; V-INT's residual of V-C F-1 / RVC-1): normalize `at` at the ENTRY,
+    // exactly as `retrieve?as_of=` has since t27. `facts_as_of` compares
+    // timestamps as text, so an unnormalized spelling silently selects a
+    // different edge set -- and a non-instant used to be accepted with a 200
+    // (measured t57: `not-a-time` / `2026-13-45T99:99:99Z` / `now` => 200).
+    // Now a non-instant is a 400; it is never compared as a string.
     let facts = match &q.at {
-        Some(at) => ruagent_graph::facts_as_of(state.mgr.db(), id, at).await?,
+        Some(at) => {
+            let dt = ruagent_graph::parse_ts(at)
+                .ok_or_else(|| ApiError::bad_request("at must be an RFC3339 instant"))?;
+            ruagent_graph::facts_as_of(state.mgr.db(), id, &dt.to_rfc3339()).await?
+        }
         None => ruagent_graph::current_facts(state.mgr.db(), id).await?,
     };
     Ok(Json(serde_json::json!({ "facts": facts })))
+}
+
+// ---------------------------------------------------------------------------
+// DEP-4 (graph spec; wired in t19): multi-hop retrieval, communities, resolution.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GraphRetrieveQuery {
+    q: String,
+    #[serde(default)]
+    hops: Option<u32>,
+    #[serde(default)]
+    beam: Option<u32>,
+    #[serde(default)]
+    max_paths: Option<u32>,
+    #[serde(default)]
+    max_facts: Option<u32>,
+    /// "What was true at this instant". Normalised at THIS entrance (RVC-1's
+    /// rule, restated for the HTTP face): three spellings of one instant must
+    /// produce byte-identical evidence, so the string is parsed once and
+    /// re-rendered in one canonical form before it reaches the graph. A string
+    /// that is not an instant is a 400, never a silent string comparison.
+    #[serde(default)]
+    as_of: Option<String>,
+    #[serde(default)]
+    include_superseded: Option<bool>,
+}
+
+/// `GET /api/v1/graph/retrieve?q=&hops=` — the ONLY multi-hop entry point.
+async fn graph_retrieve(
+    State(state): State<AppState>,
+    Query(q): Query<GraphRetrieveQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut query = ruagent_graph::GraphQuery::for_text(q.q.clone());
+    if let Some(h) = q.hops {
+        query.hops = h;
+    }
+    if let Some(b) = q.beam {
+        query.beam = b;
+    }
+    if let Some(m) = q.max_paths {
+        query.max_paths = m;
+    }
+    if let Some(m) = q.max_facts {
+        query.max_facts = m;
+    }
+    if let Some(s) = q.include_superseded {
+        query.include_superseded = s;
+    }
+    query.as_of = match q.as_of.as_deref() {
+        None => None,
+        Some(raw) => match ruagent_graph::parse_ts(raw) {
+            Some(dt) => Some(dt.to_rfc3339()),
+            None => {
+                return Err(ApiError::bad_request(format!(
+                    "as_of `{raw}` is not an RFC3339 instant"
+                )));
+            }
+        },
+    };
+    let evidence = ruagent_graph::retrieve(state.mgr.db(), &query).await?;
+    Ok(Json(serde_json::json!({
+        "seeds": evidence.seeds,
+        "paths": evidence.paths,
+        "stats": evidence.stats,
+        // Stated where it can be read: `graph_edges` is the graph's SIZE (it does
+        // not move with `as_of`) — contract §1.5, RV-C's reminder.
+        "stats_note": "graph_edges is the graph's total size, not the edge count at as_of",
+    })))
+}
+
+#[derive(Deserialize)]
+struct LevelQuery {
+    #[serde(default)]
+    level: Option<u32>,
+}
+
+/// `GET /api/v1/graph/communities?level=` — `null` means NEVER BUILT.
+async fn graph_communities(
+    State(state): State<AppState>,
+    Query(q): Query<LevelQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let level = q.level.unwrap_or(0);
+    let found = ruagent_graph::communities(state.mgr.db(), level).await?;
+    let built = found.is_some();
+    let (entities_covered, non_isolated) =
+        ruagent_graph::community_coverage(state.mgr.db(), level).await?;
+    Ok(Json(serde_json::json!({
+        // `null` (never built) is NOT `[]` (built, no communities): a consumer
+        // that renders both as "0 communities" invents a partition.
+        "communities": found,
+        "built": built,
+        "coverage": {
+            "entities_covered": entities_covered,
+            "non_isolated": non_isolated,
+        },
+    })))
+}
+
+/// `POST /api/v1/graph/communities/build` — one explicit (re)build of one level.
+async fn graph_communities_build(
+    State(state): State<AppState>,
+    Query(q): Query<LevelQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let level = q.level.unwrap_or(0);
+    let build = ruagent_graph::build_communities(state.mgr.db(), level).await?;
+    Ok(Json(serde_json::json!(build)))
+}
+
+#[derive(Deserialize)]
+struct SummaryBody {
+    summary: Option<String>,
+}
+
+/// `PUT /api/v1/graph/community/{id}/summary` — an empty summary is a 400; a
+/// summary for a community that does not exist is a 404 (`updated: false` must
+/// not be reported as a successful 200).
+async fn graph_community_summary(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SummaryBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: i64 = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid community id"))?;
+    let summary = body.summary.unwrap_or_default();
+    if summary.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "summary must not be empty (clearing a summary is not a summary)",
+        ));
+    }
+    let updated = ruagent_graph::set_community_summary(state.mgr.db(), id, &summary).await?;
+    if !updated {
+        return Err(ApiError::not_found(format!("no community {id}")));
+    }
+    Ok(Json(serde_json::json!({ "id": id, "updated": updated })))
+}
+
+/// `GET /api/v1/graph/resolution/pending` — two SEPARATE readings: the queued
+/// pairs (a decision is waiting) and the pairs that are already the same object
+/// under two rows (a merge was missed).
+async fn graph_resolution_pending(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let pending = ruagent_graph::pending_pairs(state.mgr.db()).await?;
+    let redundant = ruagent_graph::redundant_pairs(state.mgr.db()).await?;
+    Ok(Json(serde_json::json!({
+        "pending": pending,
+        "redundant": redundant,
+        "pending_count": pending.len(),
+        "redundant_count": redundant.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct MergeBody {
+    keeper: i64,
+    absorbed: i64,
+}
+
+/// `POST /api/v1/graph/resolution/merge` — EXPLICIT, never automatic.
+async fn graph_resolution_merge(
+    State(state): State<AppState>,
+    Json(body): Json<MergeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.keeper == body.absorbed {
+        return Err(ApiError::bad_request(
+            "keeper and absorbed are the same entity",
+        ));
+    }
+    // Existence is checked HERE, so "one of them is gone" is a 404 rather than a
+    // `moved: 0` that reads like a no-op merge.
+    let names: std::collections::HashMap<i64, String> = {
+        let ids = vec![body.keeper, body.absorbed];
+        state
+            .mgr
+            .db()
+            .call(
+                move |conn| -> Result<std::collections::HashMap<i64, String>, ruagent_store::DbError> {
+                    let mut out = std::collections::HashMap::new();
+                    for id in ids {
+                        let name: Option<String> = conn
+                            .query_row("SELECT name FROM entities WHERE id = ?1", [id], |r| r.get(0))
+                            .ok();
+                        if let Some(n) = name {
+                            out.insert(id, n);
+                        }
+                    }
+                    Ok(out)
+                },
+            )
+            .await??
+    };
+    if !names.contains_key(&body.keeper) {
+        return Err(ApiError::not_found(format!("no entity {}", body.keeper)));
+    }
+    let absorbed_name = match names.get(&body.absorbed) {
+        Some(n) => n.clone(),
+        None => return Err(ApiError::not_found(format!("no entity {}", body.absorbed))),
+    };
+    let moved = ruagent_graph::merge_entities(state.mgr.db(), body.keeper, body.absorbed).await?;
+    // The absorbed name must become an alias of the keeper, or the next scan
+    // rebuilds the entity we just merged away.
+    let alias_written =
+        ruagent_graph::add_alias(state.mgr.db(), body.keeper, &absorbed_name, "merge").await?;
+    Ok(Json(serde_json::json!({
+        "keeper": body.keeper,
+        "absorbed": body.absorbed,
+        "moved": moved,
+        "alias": absorbed_name,
+        "alias_written": alias_written,
+    })))
 }
 
 /// Discovered skills (platform library + the daemon's working-dir
@@ -2266,8 +2587,8 @@ async fn memory_migrate_distilled_prefix(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backup_dir = state.mgr.root().join("data").join("backups");
-    let out = ruagent_memory::lifecycle::strip_distilled_prefix(state.mgr.db(), &backup_dir)
-        .await?;
+    let out =
+        ruagent_memory::lifecycle::strip_distilled_prefix(state.mgr.db(), &backup_dir).await?;
     Ok(Json(serde_json::json!({
         "scanned": out.scanned,
         "stripped": out.stripped,
@@ -2500,11 +2821,49 @@ async fn recall(
     // "autohotkey 改键" returned 5 wiki chunks, 0 source docs). Each
     // section gets its own top_n instead.
     let search_n = (top_n.saturating_mul(3)).min(30);
-    let all_hits = state
+    // H-1/H-2 (t19): ONE paged entry point. `search_page` returns every hit WITH
+    // its scale (`score_kind`), its per-leg evidence (rank + raw + kind) and the
+    // calibrated relevance, plus the page's own provenance (`leg_window`,
+    // `fusion`, candidate count). The response, the telemetry row and the panel
+    // all read THESE values: the old shape called `search` AND `search_legs`
+    // (two passes that could disagree) and had no scale to report at all.
+    let page = state
         .knowledge
-        .search(&q.q, search_n)
+        .search_page(&q.q, search_n)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    let leg_window = page.evidence.leg_window as i64;
+    let candidates = page.evidence.candidates as i64;
+    let fusion_label = match page.evidence.fusion {
+        ruagent_knowledge::store::FusionKind::Rrf {
+            k,
+            w_semantic,
+            w_keyword,
+        } => format!("rrf:k={k},w_semantic={w_semantic},w_keyword={w_keyword}"),
+    };
+    let kw_stage = Some(keyword_stage_label(&page.evidence.keyword_stage));
+    let ranked: Vec<ruagent_knowledge::store::RankedHit> = page.hits;
+    // The scale of the top score, its window and the calibration version, taken
+    // from the SAME page the score came from (H-2: a score without its scale is
+    // not comparable to the pre-0019 rows, whose window was `limit.max(10)`).
+    let top_score_kind = ranked
+        .first()
+        .map(|r| r.score_kind.as_str())
+        .unwrap_or("rrf_rank");
+    let scoring_version = ranked
+        .first()
+        .and_then(|r| r.relevance.as_ref())
+        .map(|r| r.version);
+    let top_knowledge_relevance = ranked
+        .first()
+        .and_then(|r| r.relevance.as_ref())
+        .map(|r| r.value as f64);
+    let top_knowledge_relevance_kind = ranked
+        .first()
+        .and_then(|r| r.relevance.as_ref())
+        .map(|r| r.kind.as_str());
+    let all_hits: Vec<ruagent_knowledge::store::SearchHit> =
+        ranked.iter().map(|r| r.hit.clone()).collect();
     // raw best score BEFORE any filtering — logged for threshold
     // tuning (what the filters dropped)
     let top_knowledge_score = all_hits.first().map(|h| h.score as f64);
@@ -2519,11 +2878,46 @@ async fn recall(
         .parents_for(&hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>())
         .await;
 
-    // Graph entities (name/summary match) + their currently-valid facts
-    // (the relations half of the conservative strategy's stubs).
-    let entities = ruagent_graph::search_entities(state.mgr.db(), &q.q, top_n)
+    // Graph seeds + one multi-hop evidence pass.
+    //
+    // DEP-1 (graph spec, wired in t19): this leg used to be the STRICT name/summary
+    // FTS match (`search_entities`), which matched 1 of 23 real queries. It is now
+    // the graph's own seed resolver (semantic + name + alias + summary + fact-text
+    // legs), followed by one retrieval so the counts below are the production
+    // path's own reading — and they are what lands in `recall_log.graph_entities`
+    // / `graph_paths` (DEP-3).
+    let seeds = ruagent_graph::resolve_seeds(state.mgr.db(), &q.q, top_n)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    let graph_evidence = ruagent_graph::retrieve(
+        state.mgr.db(),
+        &ruagent_graph::GraphQuery::for_text(q.q.clone()),
+    )
+    .await
+    .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    // NOT "the edge count at the instant": the graph's total size, constant
+    // across `as_of` (RV-C). Recorded for provenance, never read as temporal.
+    let graph_edges_total = graph_evidence.stats.graph_edges as i64;
+    let graph_paths = graph_evidence.stats.paths_emitted as i64;
+    let graph_truncated_by = graph_evidence
+        .stats
+        .truncated_by
+        .map(|t| format!("{t:?}").to_lowercase());
+    let graph_empty_reason = graph_evidence
+        .stats
+        .empty_reason
+        .map(|r| format!("{r:?}").to_lowercase());
+    // The telemetry closure is `move`, so the response keeps its own copies of
+    // these two (they are reported in BOTH places on purpose).
+    let graph_empty_resp = graph_empty_reason.clone();
+    let graph_truncated_resp = graph_truncated_by.clone();
+    let mut seen_entities: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let entities: Vec<ruagent_graph::Entity> = seeds
+        .into_iter()
+        .filter(|s| seen_entities.insert(s.entity.id))
+        .map(|s| s.entity)
+        .collect();
+    let graph_entities = entities.len() as i64;
     let mut entity_facts: std::collections::HashMap<i64, Vec<(String, String, String)>> =
         std::collections::HashMap::new();
     {
@@ -2603,36 +2997,23 @@ async fn recall(
     // COST, stated rather than hidden: this is a second pass over the same two
     // legs. crates/knowledge is frozen by t250, so search() and search_legs()
     // cannot be merged into one call from here; both use the same leg_k, so the
-    // leg sets are identical by construction.
-    let legs = state.knowledge.search_legs(&q.q, search_n).await;
-    let leg_of = |v: &[ruagent_knowledge::store::LegHit], id: i64| -> Option<(usize, f64)> {
-        v.iter()
-            .find(|l| l.chunk_id == id)
-            .map(|l| (l.rank, l.raw_score as f64))
-    };
-    let (sem_legs, kw_legs, kw_stage) = match &legs {
-        Ok(l) => (
-            l.semantic.as_slice(),
-            l.keyword.as_slice(),
-            Some(keyword_stage_label(&l.keyword_stage)),
-        ),
-        Err(_) => (&[][..], &[][..], None),
-    };
+    // Per-leg evidence comes from the SAME page the ranking came from (t19):
+    // one pass, one leg window, no second `search_legs` call that could disagree.
+    let ranked_of = |id: i64| ranked.iter().find(|r| r.hit.chunk_id == id);
     let mut out_chunks: Vec<serde_json::Value> = Vec::new();
     for hit in hits {
         if (hit.score as f64) < min_score as f64 {
             continue;
         }
-        let sem = leg_of(sem_legs, hit.chunk_id);
-        let kw = leg_of(kw_legs, hit.chunk_id);
+        let Some(ranked_hit) = ranked_of(hit.chunk_id) else {
+            continue;
+        };
         let content = parents
             .get(&hit.chunk_id)
             .map(|p| truncate_chars(p, PARENT_CONTEXT_CAP))
             .unwrap_or_else(|| hit.content.clone());
         out_chunks.push(knowledge_hit_json(
-            &hit,
-            sem,
-            kw,
+            ranked_hit,
             kw_stage.as_deref(),
             conservative,
             content,
@@ -2760,13 +3141,78 @@ async fn recall(
         );
         let tm = mem_legs.top_semantic_score;
         let declared = source.clone();
+        // t19 (contract §3.1): the row records the SCALE of every score it
+        // carries, the page's provenance, and the graph legs. "A column exists" is
+        // not "a column is filled"; NULL still means UNKNOWN and the pre-0019 rows
+        // are never rewritten.
+        let selected_ids: Vec<i64> = out_chunks
+            .iter()
+            .filter_map(|c| c.get("chunk_id").and_then(|v| v.as_i64()))
+            .collect();
+        let top_legs_json = serde_json::json!(
+            ranked
+                .iter()
+                .map(|r| serde_json::json!({
+                    "chunk_id": r.hit.chunk_id,
+                    "score": r.hit.score,
+                    "score_kind": r.score_kind.as_str(),
+                    "semantic": r.semantic.as_ref().map(|e| serde_json::json!({
+                        "rank": e.rank, "raw": e.raw_score, "kind": e.kind.as_str(),
+                    })),
+                    "keyword": r.keyword.as_ref().map(|e| serde_json::json!({
+                        "rank": e.rank, "raw": e.raw_score, "kind": e.kind.as_str(),
+                    })),
+                    "relevance": r.relevance.as_ref().map(|v| serde_json::json!({
+                        "value": v.value, "kind": v.kind.as_str(), "version": v.version,
+                    })),
+                }))
+                .collect::<Vec<_>>()
+        )
+        .to_string();
+        let rejected_ids: Vec<i64> = ranked
+            .iter()
+            .map(|r| r.hit.chunk_id)
+            .filter(|id| !selected_ids.contains(id))
+            .collect();
+        let candidates_json = serde_json::json!({
+            "candidates": candidates,
+            "leg_window": leg_window,
+            "fusion": fusion_label.clone(),
+            "ranked_page": ranked.len(),
+        })
+        .to_string();
+        let selected_json = serde_json::json!({
+            "memories": nm,
+            "knowledge": nk,
+            "wiki": nw,
+            "entities": ne,
+            "knowledge_chunk_ids": selected_ids,
+            "graph_entities": graph_entities,
+            "graph_paths": graph_paths,
+        })
+        .to_string();
+        let rejected_json = serde_json::json!({
+            "below_min_score_or_outside_top_n": rejected_ids,
+            "min_score": min_score,
+            "graph_empty_reason": graph_empty_reason.clone(),
+            "graph_truncated_by": graph_truncated_by.clone(),
+        })
+        .to_string();
+        // The closure is `move`: keep the response's own copy of the fusion label.
+        let fusion_for_row = fusion_label.clone();
         let _ = db
             .call(move |conn| -> Result<(), rusqlite::Error> {
                 conn.execute(
                     "INSERT INTO recall_log
                         (ts, query, strategy, top_n, memories, knowledge, wiki, entities,
-                         top_memory_score, top_knowledge_score, source)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                         top_memory_score, top_knowledge_score, source,
+                         top_knowledge_relevance, top_knowledge_relevance_kind,
+                         knowledge_leg_window, scoring_version,
+                         graph_entities, graph_paths,
+                         score_kind, fusion, top_legs_json, candidates_json,
+                         selected_json, rejected_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
+                             ?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                     rusqlite::params![
                         chrono::Utc::now().to_rfc3339(),
                         query,
@@ -2779,6 +3225,18 @@ async fn recall(
                         tm,
                         top_knowledge_score,
                         declared,
+                        top_knowledge_relevance,
+                        top_knowledge_relevance_kind,
+                        leg_window,
+                        scoring_version,
+                        graph_entities,
+                        graph_paths,
+                        top_score_kind,
+                        fusion_for_row,
+                        top_legs_json,
+                        candidates_json,
+                        selected_json,
+                        rejected_json,
                     ],
                 )?;
                 // Retention (t251): the log is a tuning SAMPLE, not a ledger.
@@ -2800,6 +3258,31 @@ async fn recall(
         // declaration was recorded, and a caller that declared nothing sees
         // null rather than a guessed label.
         "source": source,
+        // H-2 (t19): a score is only readable together with its scale, the window
+        // it was ranked in and the calibration version — emitted next to each
+        // other, never separately (the pre-0019 rows' window was `limit.max(10)`).
+        "scoring": {
+            "score_kind": top_score_kind,
+            "fusion": fusion_label,
+            "leg_window": leg_window,
+            "scoring_version": scoring_version,
+            "candidates": candidates,
+            "top_knowledge_score": top_knowledge_score,
+            "top_knowledge_relevance": top_knowledge_relevance,
+            "top_knowledge_relevance_kind": top_knowledge_relevance_kind,
+        },
+        // DEP-1/DEP-3 (t19): the graph leg's own counts, from the seed resolver and
+        // one retrieval — these are the numbers the telemetry row records.
+        // `graph_edges_total` is the graph's SIZE, not "edges at the instant"
+        // (RV-C): it does not move with `as_of`, and reading it as temporal is the
+        // mistake this key name exists to prevent.
+        "graph": {
+            "entities": graph_entities,
+            "paths": graph_paths,
+            "graph_edges_total": graph_edges_total,
+            "empty_reason": graph_empty_resp,
+            "truncated_by": graph_truncated_resp,
+        },
         "memories": out_memories,
         // What each memory leg did. Before t251 the response could not
         // distinguish "the keyword leg added nothing" from "the keyword leg was
@@ -2818,6 +3301,46 @@ async fn recall(
         // downweight or verify them.
         "wiki": out_wiki,
         "entities": out_entities,
+    })))
+}
+
+/// `GET /api/v1/forget-report?content_hash=<64hex>` (INT46-1, t47).
+///
+/// What is still there for a hash, in two SEPARATE lists: the local residuals
+/// (rows/files that still carry the content) and the external ones, exactly as
+/// `crates/memory`'s report computed them -- this handler adds no second opinion.
+///
+/// An unknown hash is an EMPTY READING, NOT a 404 and NOT a silent fallback: the
+/// report answers "what is left for this hash", it never claims the hash was
+/// written. Read `local[].status.readout.hits` -- every surface answers 0 and
+/// `sample` is empty. **`total` is NOT a residual count**: it is the number of
+/// surface readings the report carries (10 in this generation), which is the same
+/// for a written and an unwritten hash, so it cannot distinguish them. (Measured:
+/// a never-written `aaaa...` hash answers 200 with `total: 10` and all hits 0.)
+/// A malformed hash is a 400 instead, so the two answers differ by shape.
+#[derive(Deserialize)]
+struct ForgetReportQuery {
+    content_hash: String,
+}
+
+async fn forget_report(
+    State(state): State<AppState>,
+    Query(q): Query<ForgetReportQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = q.content_hash.trim();
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(
+            "content_hash must be 64 hex characters",
+        ));
+    }
+    let report = ruagent_memory::lifecycle::forget_report(state.mgr.db(), hash).await?;
+    Ok(Json(serde_json::json!({
+        "content_hash": report.content_hash,
+        "local": report.local,
+        "external": report.external,
+        // Derived here, once: a reader that adds the lists up itself would be a
+        // second answer to the same question.
+        "total": report.local.len() + report.external.len(),
     })))
 }
 
@@ -2854,7 +3377,14 @@ async fn recall_log(
             move |conn| -> Result<Vec<serde_json::Value>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT ts, query, strategy, top_n, memories, knowledge, wiki, entities,
-                            top_memory_score, top_knowledge_score, source
+                            top_memory_score, top_knowledge_score, source,
+                            CAST(score_kind AS TEXT), CAST(knowledge_leg_window AS INTEGER),
+                            CAST(scoring_version AS INTEGER), CAST(fusion AS TEXT),
+                            CAST(top_knowledge_relevance AS REAL),
+                            CAST(top_knowledge_relevance_kind AS TEXT),
+                            CAST(top_legs_json AS TEXT), CAST(candidates_json AS TEXT),
+                            CAST(selected_json AS TEXT), CAST(rejected_json AS TEXT),
+                            CAST(graph_entities AS INTEGER), CAST(graph_paths AS INTEGER)
                        FROM recall_log
                       WHERE (?2 IS NULL
                              OR (?2 = 'unknown' AND source IS NULL)
@@ -2879,6 +3409,26 @@ async fn recall_log(
                             // row (written before the column existed), not a
                             // missing value to be papered over.
                             "source": source,
+                            // t59 (F1): every column the writer stores is read
+                            // back here (contract §1.2 "新列一律透出"; its L52 row
+                            // lists them). The CASTs make this independent of the
+                            // migrations' declared types -- SQLite is dynamically
+                            // typed, so reading an INTEGER column as String would
+                            // fail at runtime. NULL stays null: a row written
+                            // before the column existed is a fact about the row,
+                            // not a gap to paper over (same rule as above).
+                            "score_kind": r.get::<_, Option<String>>(11)?,
+                            "knowledge_leg_window": r.get::<_, Option<i64>>(12)?,
+                            "scoring_version": r.get::<_, Option<i64>>(13)?,
+                            "fusion": r.get::<_, Option<String>>(14)?,
+                            "top_knowledge_relevance": r.get::<_, Option<f64>>(15)?,
+                            "top_knowledge_relevance_kind": r.get::<_, Option<String>>(16)?,
+                            "top_legs_json": r.get::<_, Option<String>>(17)?,
+                            "candidates_json": r.get::<_, Option<String>>(18)?,
+                            "selected_json": r.get::<_, Option<String>>(19)?,
+                            "rejected_json": r.get::<_, Option<String>>(20)?,
+                            "graph_entities": r.get::<_, Option<i64>>(21)?,
+                            "graph_paths": r.get::<_, Option<i64>>(22)?,
                             "source_label": match &source {
                                 Some(s) => s.clone(),
                                 None => "unknown (pre-0018)".to_string(),
@@ -2912,6 +3462,17 @@ async fn recall_log(
         })
         .await??;
     Ok(Json(serde_json::json!({
+        // t83 HANDED BACK (kept as `log`): captain adjudicated that this key moves
+        // to the contract's `rows`, and the daemon half was made to work --
+        // `test --workspace` went green (56 ok, `recall_calls_are_logged ... ok`)
+        // with `api.rs` + `crates/daemon/tests/knowledge_api.rs` renamed together.
+        // The PANEL half cannot be finished from `panel/src/views/Memory.tsx`
+        // alone: `Awaited<ReturnType<typeof api.recallLog>>["rows"]` has no type
+        // (TS7006 at Memory.tsx:344) because the response type of `api.recallLog`
+        // lives in the panel's api client, outside this unit's inScope -- and
+        // typing the state as `MemoryRow[]` instead made three render sites fail
+        // (TS2339 on `top_knowledge_score`/`ts`). So the wire keeps `log` until a
+        // unit that owns the whole panel can move all consumers at once.
         "log": rows,
         "retention": retention,
         "source_filter": filter,
@@ -2981,18 +3542,32 @@ fn keyword_stage_label(stage: &ruagent_knowledge::store::KeywordStage) -> String
 /// chunk is `null`, never 0: 0 is a legal score, `null` is "this leg missed"
 /// (t290 — the panel would otherwise read a miss as a perfect match).
 fn knowledge_hit_json(
-    hit: &ruagent_knowledge::store::SearchHit,
-    sem: Option<(usize, f64)>,
-    kw: Option<(usize, f64)>,
+    ranked: &ruagent_knowledge::store::RankedHit,
     stage: Option<&str>,
     conservative: bool,
     content: String,
 ) -> serde_json::Value {
+    let hit = &ranked.hit;
+    // Each score is emitted NEXT TO its scale (H-1): `semantic_score` without
+    // `semantic_score_kind` reads as a similarity when it is a distance, and
+    // `relevance` without `relevance_kind` reads as an RRF rank when it is a
+    // calibrated [0,1]. The kinds come from the leg/relevance objects themselves,
+    // never from a second literal that could drift (F-5).
+    let leg = |l: &Option<ruagent_knowledge::store::LegEvidence>| match l {
+        Some(e) => (
+            Some(e.rank as i64),
+            Some(round_to(e.raw_score as f64, 4)),
+            Some(e.kind.as_str()),
+        ),
+        None => (None, None, None),
+    };
+    let (sem_rank, sem_score, sem_kind) = leg(&ranked.semantic);
+    let (kw_rank, kw_score, kw_kind) = leg(&ranked.keyword);
     let mut found_in: Vec<&str> = Vec::new();
-    if sem.is_some() {
+    if ranked.semantic.is_some() {
         found_in.push("semantic");
     }
-    if kw.is_some() {
+    if ranked.keyword.is_some() {
         found_in.push("keyword");
     }
     let mut obj = serde_json::json!({
@@ -3000,13 +3575,26 @@ fn knowledge_hit_json(
         "chunk_id": hit.chunk_id,
         "document": hit.document,
         "score": hit.score,
-        "score_kind": "rrf_rank",
+        // The scale of `score`. From the value itself, not a copy of the literal.
+        "score_kind": ranked.score_kind.as_str(),
         "legs": found_in,
-        "semantic_rank": sem.map(|(r, _)| r as i64),
-        "semantic_score": sem.map(|(_, s)| round_to(s, 4)),
-        "keyword_rank": kw.map(|(r, _)| r as i64),
-        "keyword_score": kw.map(|(_, s)| round_to(s, 4)),
+        "semantic_rank": sem_rank,
+        "semantic_score": sem_score,
+        "semantic_score_kind": sem_kind,
+        "keyword_rank": kw_rank,
+        "keyword_score": kw_score,
+        "keyword_score_kind": kw_kind,
         "query_keyword_stage": stage,
+        // The calibrated display relevance (a DIFFERENT quantity from `score`:
+        // [0,1] cosine-derived, not an RRF rank). `null` when the query had no
+        // semantic leg to calibrate against.
+        "relevance": ranked.relevance.as_ref().map(|r| round_to(r.value as f64, 4)),
+        "relevance_kind": ranked.relevance.as_ref().map(|r| r.kind.as_str()),
+        "relevance_version": ranked.relevance.as_ref().map(|r| r.version),
+        "relevance_query_background": ranked
+            .relevance
+            .as_ref()
+            .map(|r| round_to(r.query_background as f64, 4)),
     });
     if conservative {
         obj["excerpt"] = serde_json::json!(truncate_chars(&hit.content, 80));
@@ -3702,11 +4290,21 @@ async fn memory_write(
     State(state): State<AppState>,
     Json(req): Json<MemoryWriteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // C-INT (R-B spec, delivered in t19): an UNKNOWN store used to fall through
+    // to `Observation` — the caller asked for something that does not exist and
+    // got a row in a store it never named. Unknown values are now named in a 400;
+    // `observation` is spelled out so the old fallback's legitimate uses still
+    // work (the fallback was doing two jobs: a default AND a typo sink).
     let store = match req.store.as_str() {
+        "observation" => ruagent_memory::MemoryStore::Observation,
         "profile" => ruagent_memory::MemoryStore::Profile,
         "procedure" => ruagent_memory::MemoryStore::Procedure,
         "lesson" => ruagent_memory::MemoryStore::Lesson,
-        _ => ruagent_memory::MemoryStore::Observation,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown store `{other}` (observation | profile | procedure | lesson)"
+            )));
+        }
     };
     let Some(namespace) = ruagent_memory::Namespace::parse(&req.namespace) else {
         return Err(ApiError::bad_request(format!(
@@ -3811,7 +4409,9 @@ async fn distilled_ids(
     let ids: Vec<i64> = ids.to_vec();
     let found = db
         .call(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
-            let marks = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+            let marks = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
                 "SELECT m.id FROM memories m
                  JOIN episodes e ON e.id = m.source_episode
@@ -4009,51 +4609,86 @@ async fn knowledge_search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = q.limit.unwrap_or(8);
-    let hits = state
+    let limit = q.limit.unwrap_or(8).clamp(1, 50);
+    // H-1/H-3 (t19): the same paged entry point the recall endpoint uses, so the
+    // leg fields here and there come from ONE implementation (the doc comment
+    // above promises key-for-key agreement on the intersection; this is what makes
+    // that promise structural rather than a coincidence of two code paths).
+    let page = state
         .knowledge
-        .search(&q.q, limit)
+        .search_page(&q.q, limit)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    let total = hits.len();
+    let leg_window = page.evidence.leg_window as i64;
+    let candidates = page.evidence.candidates as i64;
+    let fusion_label = match page.evidence.fusion {
+        ruagent_knowledge::store::FusionKind::Rrf {
+            k,
+            w_semantic,
+            w_keyword,
+        } => format!("rrf:k={k},w_semantic={w_semantic},w_keyword={w_keyword}"),
+    };
+    let kw_stage = Some(keyword_stage_label(&page.evidence.keyword_stage));
+    let scoring_version = page
+        .hits
+        .first()
+        .and_then(|r| r.relevance.as_ref())
+        .map(|r| r.version);
+    let total = page.hits.len();
+    let matched = page.evidence.fused.len();
+    // `?legs=false` keeps its old meaning: the leg keys are present but NULL (a
+    // cheaper response for a caller that only wants chunk ids), never a second
+    // ranking path.
     let want_legs = q.legs.unwrap_or(true);
-    let (sem_legs, kw_legs, kw_stage, matched) = if want_legs {
-        match state.knowledge.search_legs(&q.q, limit).await {
-            Ok(l) => (
-                l.semantic.clone(),
-                l.keyword.clone(),
-                Some(keyword_stage_label(&l.keyword_stage)),
-                l.fused.len(),
-            ),
-            // Best-effort: the hits are already in hand, and a failing leg
-            // listing must not turn a working search into a 400.
-            Err(_) => (Vec::new(), Vec::new(), None, total),
-        }
-    } else {
-        (Vec::new(), Vec::new(), None, total)
-    };
-    let leg_of = |v: &[ruagent_knowledge::store::LegHit], id: i64| -> Option<(usize, f64)> {
-        v.iter()
-            .find(|l| l.chunk_id == id)
-            .map(|l| (l.rank, l.raw_score as f64))
-    };
     let mut out: Vec<serde_json::Value> = Vec::new();
-    for hit in &hits {
-        let sem = leg_of(&sem_legs, hit.chunk_id);
-        let kw = leg_of(&kw_legs, hit.chunk_id);
-        out.push(knowledge_hit_json(
-            hit,
-            sem,
-            kw,
+    for ranked in &page.hits {
+        let mut obj = knowledge_hit_json(
+            ranked,
             kw_stage.as_deref(),
             false,
-            hit.content.clone(),
-        ));
+            ranked.hit.content.clone(),
+        );
+        if !want_legs {
+            // `legs` stays an EMPTY ARRAY (a hit found by no recorded leg), not
+            // null: the key's type must not change with the opt-out, and `[]` is
+            // what "no leg evidence" has always meant here.
+            obj["legs"] = serde_json::json!([]);
+            for key in [
+                "semantic_rank",
+                "semantic_score",
+                "semantic_score_kind",
+                "keyword_rank",
+                "keyword_score",
+                "keyword_score_kind",
+                "query_keyword_stage",
+                "relevance",
+                "relevance_kind",
+                "relevance_version",
+                "relevance_query_background",
+            ] {
+                obj[key] = serde_json::Value::Null;
+            }
+        }
+        out.push(obj);
     }
     Ok(Json(serde_json::json!({
         "hits": out,
         "total": total,
         "matched": matched,
+        // H-2: every score above is an RRF rank computed in THIS window at THIS
+        // calibration version. Emitted together so a reader never has to guess
+        // which scale a number is on (the pre-0019 rows used `limit.max(10)`).
+        "scoring": {
+            "score_kind": page
+                .hits
+                .first()
+                .map(|r| r.score_kind.as_str())
+                .unwrap_or("rrf_rank"),
+            "fusion": fusion_label,
+            "leg_window": leg_window,
+            "scoring_version": scoring_version,
+            "candidates": candidates,
+        },
     })))
 }
 
@@ -4556,6 +5191,170 @@ mod tests {
             raw2.contains("no source documents") || raw2.contains("selects no source"),
             "{raw2}"
         );
+    }
+
+    /// The correction loop's write side (R-D D.6): `POST` records, `GET` reads,
+    /// and a refusal keeps its identity (unknown kind names the vocabulary; an
+    /// empty reason/author is a 400 that says which field). Wiring is asserted,
+    /// not assumed: a `pin` must reach the SEMANTICS (`active_correction`), not
+    /// just the table, or the panel's freeze button would store a row that
+    /// changes nothing.
+    #[tokio::test]
+    async fn wiki_corrections_records_reads_and_refuses_by_name() {
+        let (app, db, _root) = harness().await;
+        let path = "/api/v1/knowledge/wiki/pages/engine-notes/corrections";
+
+        // Nothing recorded yet: an empty list is a reading, not a 404.
+        let (st0, v0, raw0) = send_json(&app, "GET", path, None).await;
+        println!("READING GET empty: HTTP {st0} body={raw0}");
+        assert_eq!(st0, StatusCode::OK, "{raw0}");
+        assert_eq!(v0["slug"], "engine-notes", "{raw0}");
+        assert_eq!(v0["corrections"], serde_json::json!([]), "{raw0}");
+
+        let (st, v, raw) = send_json(
+            &app,
+            "POST",
+            path,
+            Some(serde_json::json!({
+                "kind": "pin",
+                "reason": "hand-checked against the vendor page",
+                "author": "operator",
+            })),
+        )
+        .await;
+        println!("READING POST pin: HTTP {st} body={raw}");
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert!(v["id"].as_i64().unwrap_or(0) > 0, "{raw}");
+        assert_eq!(v["correction"]["kind"], "pin", "{raw}");
+        assert_eq!(v["correction"]["author"], "operator", "{raw}");
+
+        // ONE vocabulary: the value this endpoint ECHOES must be a value it
+        // accepts. Before the fix the enum serialised as `Pin` while `parse()`
+        // only knew `pin`, so a client echoing the reading back got a 400.
+        let echoed = v["correction"]["kind"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (echo_s, _echo_v, echo_raw) = send_json(
+            &app,
+            "POST",
+            path,
+            Some(serde_json::json!({
+                "kind": echoed,
+                "reason": "round-trip of the value the endpoint just returned",
+                "author": "operator",
+            })),
+        )
+        .await;
+        println!("READING round-trip: echoed={echoed} HTTP {echo_s}");
+        assert_eq!(echo_s, StatusCode::OK, "{echo_raw}");
+
+        let (st1, v1, raw1) = send_json(&app, "GET", path, None).await;
+        assert_eq!(st1, StatusCode::OK, "{raw1}");
+        let rows1 = v1["corrections"].as_array().cloned().unwrap_or_default();
+        let kinds1: Vec<&str> = rows1
+            .iter()
+            .map(|c| c["kind"].as_str().unwrap_or(""))
+            .collect();
+        println!("READING GET after pin+round-trip: kinds={kinds1:?} body={raw1}");
+        // Order-independent on purpose: `at DESC, id DESC` is the storage order,
+        // not part of this endpoint's contract, and a test that reads index 0 is
+        // testing the clock. BOTH rows are pins because the round-trip re-sent the
+        // value the endpoint had just echoed — which is the point of that step.
+        assert_eq!(
+            kinds1,
+            vec!["pin", "pin"],
+            "the pin and the round-tripped pin: {raw1}"
+        );
+        let reasons: Vec<&str> = rows1
+            .iter()
+            .map(|c| c["reason"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            reasons.contains(&v["correction"]["reason"].as_str().unwrap_or("")),
+            "the reason travels with its row: {raw1}"
+        );
+        assert!(
+            reasons.contains(&"round-trip of the value the endpoint just returned"),
+            "{raw1}"
+        );
+
+        // The pin reaches the freeze semantics the build reads.
+        let active = crate::wiki::active_correction(&db, "engine-notes").await;
+        println!("READING active_correction after pin: {active:?}");
+        assert_eq!(
+            active.map(|c| c.kind.as_str()),
+            Some("pin"),
+            "a pin must be the active correction the build consults"
+        );
+
+        // `release` unfreezes; the history is kept (nothing is deleted).
+        let (st2, _v2, raw2) = send_json(
+            &app,
+            "POST",
+            path,
+            Some(serde_json::json!({
+                "kind": "release",
+                "reason": "source rewritten upstream",
+                "author": "operator",
+            })),
+        )
+        .await;
+        assert_eq!(st2, StatusCode::OK, "{raw2}");
+        assert!(
+            crate::wiki::active_correction(&db, "engine-notes")
+                .await
+                .is_none(),
+            "a release must clear the freeze"
+        );
+        let (st3, v3, raw3) = send_json(&app, "GET", path, None).await;
+        assert_eq!(st3, StatusCode::OK, "{raw3}");
+        assert_eq!(
+            v3["corrections"].as_array().map(|a| a.len()),
+            Some(3),
+            "history is kept: pin + note + release: {raw3}"
+        );
+
+        // Refusals, each naming what is wrong.
+        let (bad_kind_s, _bk, bad_kind) = send_json(
+            &app,
+            "POST",
+            path,
+            Some(serde_json::json!({"kind": "freeze", "reason": "x", "author": "a"})),
+        )
+        .await;
+        println!("READING POST unknown kind: HTTP {bad_kind_s} body={bad_kind}");
+        assert_eq!(bad_kind_s, StatusCode::BAD_REQUEST, "{bad_kind}");
+        assert!(
+            bad_kind.contains("pin") && bad_kind.contains("note"),
+            "{bad_kind}"
+        );
+
+        let (bad_reason_s, _br, bad_reason) = send_json(
+            &app,
+            "POST",
+            path,
+            Some(serde_json::json!({"kind": "note", "reason": "  ", "author": "a"})),
+        )
+        .await;
+        assert_eq!(bad_reason_s, StatusCode::BAD_REQUEST, "{bad_reason}");
+        assert!(bad_reason.contains("reason"), "{bad_reason}");
+
+        let (bad_author_s, _ba, bad_author) = send_json(
+            &app,
+            "POST",
+            path,
+            Some(serde_json::json!({"kind": "note", "reason": "why", "author": ""})),
+        )
+        .await;
+        assert_eq!(bad_author_s, StatusCode::BAD_REQUEST, "{bad_author}");
+        assert!(bad_author.contains("author"), "{bad_author}");
+
+        // Three refusals wrote nothing: the table still holds exactly the two
+        // rows we recorded on purpose.
+        let rows = count(&db, "select count(*) from wiki_corrections").await;
+        println!("READING wiki_corrections rows after refusals: {rows}");
+        assert_eq!(rows, 3, "a refused correction must not be stored");
     }
 
     /// t320: the panel's entity search must not answer "nothing" for an entity

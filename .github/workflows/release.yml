@@ -1,19 +1,109 @@
 name: Release
 
+# HARDENING (t100 -- report: docs/design/reviews/gen3-release-hardening.md)
+#
+# Three things were wrong here, and each had a cost:
+#
+#   1. `permissions: contents: write` stood at the WORKFLOW level, so the token
+#      held by every job was write-scoped -- including the jobs that only run
+#      `npm ci`, `choco install` and `cargo build`. Least privilege is now the
+#      workflow DEFAULT (`contents: read`) and the one job that creates a release
+#      is the one job that raises it. NB: with a workflow-level `permissions`
+#      block, every scope you do NOT list is `none` for jobs that do not override
+#      it -- so each job below states what it actually needs (`actions: read` for
+#      reading run verdicts, `actions: write` for uploading artifacts) instead of
+#      relying on the repository default.
+#
+#   2. Every `uses:` floated on a tag or branch -- `dtolnay/rust-toolchain@stable`
+#      is a MOVING BRANCH -- so the same tag push could execute different code
+#      from one day to the next with no change in this repository to review. All
+#      actions are now pinned to a commit SHA, with the human-readable ref in a
+#      comment. Upgrading one is a deliberate edit:
+#        gh api repos/<owner>/<repo>/commits/<ref> --jq .sha   # then update both
+#      (Pinning the action does NOT pin the Rust toolchain itself: `stable` still
+#      floats at run time. That is a separate decision -- see the report §19.)
+#
+#   3. The release path ran NO gate: a red commit that got a tag was published as
+#      a release. The `gate` job now demands that CI has already reached a green
+#      verdict for THIS commit, and both `build` and `release` need it. The gate
+#      consumes ci.yml's verdict rather than duplicating a 30-minute suite -- that
+#      is what "publish only what the pipeline has passed" means here.
+
 on:
   push:
     tags: ["v*"]
 
+# Least privilege by DEFAULT (see note 1 above).
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # THE GATE. A tag is a promise that this commit was green; this job is what
+  # makes the promise checkable. It asks the Actions API for the CI verdict of
+  # THIS commit and refuses to let anything build or publish unless the newest
+  # completed CI run for it succeeded:
+  #   * no CI run at all      -> fail (nothing proved this commit)
+  #   * newest verdict red    -> fail (the defect this gate exists for)
+  #   * still running         -> wait, up to 15 minutes, then fail with the state
+  #   * success               -> the release jobs may run
+  # `contents` is deliberately absent here: this job reads run verdicts and
+  # nothing else.
+  gate:
+    name: Gate (this commit must already be green)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read # REQUIRED: reading this commit's runs IS the gate
+    steps:
+      - name: Require a green CI verdict for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            line=$(gh run list --repo "$REPO" --workflow=ci.yml --commit "$SHA" --limit 1 \
+                     --json status,conclusion \
+                     --jq '.[0] // {} | "\(.status // "none") \(.conclusion // "")"')
+            status=${line%% *}
+            conclusion=${line##* }
+            echo "CI for ${SHA}: status=${status} conclusion=${conclusion:-<none>}"
+            case "$status" in
+              completed)
+                if [ "$conclusion" = "success" ]; then
+                  echo "gate: green CI verdict for ${SHA}"
+                  exit 0
+                fi
+                echo "::error::the newest CI run for ${SHA} concluded '${conclusion:-unknown}'. A red commit must not be published. See https://github.com/${REPO}/actions/runs?query=head_sha%3A${SHA}"
+                exit 1
+                ;;
+              none)
+                echo "::error::no CI run found for ${SHA}. Push this commit to main (or open a PR) and let CI report a verdict, then re-push the tag. A tag with no verdict is not a release candidate."
+                exit 1
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::CI for ${SHA} is still '${status}' after 15 minutes; not publishing on an unfinished verdict. Re-push the tag once CI is green."
+              exit 1
+            fi
+            sleep 30
+          done
+
   build:
     name: Build ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
+    # `actions: write` is required by upload-artifact (it writes to artifact
+    # storage). It is NOT `contents: write`: this job cannot touch repository
+    # contents or create releases.
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -25,11 +115,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: ruagent-${{ github.ref_name }}-x86_64-linux.tar.gz
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+        with:
+          persist-credentials: false # nothing here pushes; do not leave a token in .git/config
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03)
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -64,7 +156,7 @@ jobs:
           cp README.md staging/
           tar czf ${{ matrix.archive }} -C staging .
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (2025-03-19)
         with:
           name: ${{ matrix.target }}
           path: ${{ matrix.archive }}
@@ -73,14 +165,19 @@ jobs:
     name: Create release
     needs: build
     runs-on: ubuntu-latest
+    # The ONE job that writes: creating the release. `actions: read` is what
+    # download-artifact needs; nothing else is granted.
+    permissions:
+      contents: write
+      actions: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4 (2025-04-24)
         with:
           path: artifacts
           merge-multiple: true
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2 (2026-04-12)
         with:
           generate_release_notes: true
           files: artifacts/*

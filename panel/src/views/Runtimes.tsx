@@ -21,6 +21,12 @@ const modelOption = (options: SessionOptionInfo[]) =>
 /** Model-count chip state for the card grid. */
 function useModelCounts(names: string[]) {
   const [counts, setCounts] = useState<Record<string, number>>({});
+  /** t84 / audit P3: a failed probe must not render as "0 models". The old
+   *  `.catch(() => {})` left `counts[name]` undefined -- indistinguishable from a
+   *  runtime that really has none -- and the total at `:190` then added 0 for it.
+   *  This file already argued the rule for the SYNC path (`sync` returns whether
+   *  the probe succeeded, R11); the mount probe was the sibling left behind. */
+  const [probeFailed, setProbeFailed] = useState<Record<string, boolean>>({});
   const [syncing, setSyncing] = useState<string | null>(null);
   const key = names.join(",");
   useEffect(() => {
@@ -32,8 +38,14 @@ function useModelCounts(names: string[]) {
         .then((o) => {
           if (!alive) return;
           setCounts((c) => ({ ...c, [n]: modelOption(o.options)?.choices.length ?? 0 }));
+          setProbeFailed((f) => (f[n] ? { ...f, [n]: false } : f));
         })
-        .catch(() => {});
+        .catch(() => {
+          if (!alive) return;
+          // t84 (P3): a failure is a reading of its own -- record it instead of
+          // swallowing it, so the tag can say "probe failed" rather than "0".
+          setProbeFailed((f) => ({ ...f, [n]: true }));
+        });
     }
     return () => {
       alive = false;
@@ -53,7 +65,7 @@ function useModelCounts(names: string[]) {
       setSyncing(null);
     }
   };
-  return { counts, syncing, sync };
+  return { counts, syncing, sync, probeFailed };
 }
 
 /** The create/edit form state; `editing` names the runtime being edited. */
@@ -108,7 +120,7 @@ export function Runtimes() {
 
   // Model-count chips per runtime, from the daemon's cached catalog.
   // Runs before the early return (hook order), names derived from state.
-  const { counts, syncing, sync } = useModelCounts(
+  const { counts, syncing, sync, probeFailed } = useModelCounts(
     (agents ?? []).filter((a) => !isRoleAgent(a) && a.enabled).map((a) => a.name),
   );
 
@@ -187,7 +199,9 @@ export function Runtimes() {
             {
               key: "models",
               label: t("metric.models"),
-              value: Object.values(counts).reduce((s, n) => s + n, 0),
+              value: Object.entries(counts)
+      .filter(([n]) => !probeFailed[n])
+      .reduce((s, [, n]) => s + n, 0),
             },
           ]}
         />
@@ -266,7 +280,9 @@ export function Runtimes() {
                   </div>
                 ) : null}
                 <div className="row">
-                  {counts[r.name] ? (
+                  {probeFailed[r.name] ? (
+                    <span className="tag">{t("runtimes.probeFailed")}</span>
+                  ) : counts[r.name] ? (
                     <span className="tag">{t("runtimes.models", { n: counts[r.name] })}</span>
                   ) : (
                     // "not probed" is not "0 models" (§5 empty ②).

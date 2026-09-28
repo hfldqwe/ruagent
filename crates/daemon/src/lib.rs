@@ -38,7 +38,31 @@ pub fn default_root() -> PathBuf {
 }
 
 /// Start the daemon on `addr` with data rooted at `root`.
+/// t76 / audit A-3: a non-loopback bind is a CAPABILITY, never a default.
+///
+/// This daemon is local-first and single-user, and it has **no authentication of
+/// any kind** (audit t71: `Authorization`/`bearer` have 0 hits in the tree). So
+/// binding anything other than a loopback address publishes *every* read and
+/// write endpoint to whoever can reach the port -- including the one-shot
+/// `POST /api/v1/memory/migrate-distilled-prefix`, which rewrites memory bodies.
+/// Before t76, `ruagent serve --addr 0.0.0.0:8787` did that silently.
+///
+/// `RUAGENT_ALLOW_REMOTE=1` (or the CLI's `--allow-remote`) is the explicit
+/// consent. Loopback callers are unaffected: this is checked only when the
+/// address is not loopback.
+fn remote_bind_allowed() -> bool {
+    matches!(
+        std::env::var("RUAGENT_ALLOW_REMOTE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
 pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
+    serve_with_remote(root, addr, false).await
+}
+
+/// `serve`, with the explicit-consent bit for a non-loopback bind (t76).
+pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bool) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -290,10 +314,36 @@ pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
 
     let app = api::router(state);
 
+    // t76 / audit A-3: refuse a non-loopback bind that nobody asked for.
+    let allow_remote = allow_remote || remote_bind_allowed();
+    if !addr.ip().is_loopback() && !allow_remote {
+        let msg = format!(
+            "refusing to bind {addr}: this daemon has NO authentication, so a non-loopback bind \
+             publishes every endpoint -- including POST /api/v1/memory/migrate-distilled-prefix, \
+             which rewrites stored memory bodies -- to anyone who can reach the port. \
+             Pass --allow-remote or set RUAGENT_ALLOW_REMOTE=1 to accept that exposure \
+             (see audit A-3, docs/design/reviews/gen3-audit-security.md)."
+        );
+        tracing::warn!("{msg}");
+        eprintln!("ruagent: WARN: {msg}");
+        anyhow::bail!(msg);
+    }
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    tracing::info!("ruagent daemon listening on http://{addr}");
+    // Name the ACTUAL bound address (a port of 0 is resolved by the kernel) and
+    // say out loud which side of the loopback line we are on.
+    let local = listener.local_addr().unwrap_or(addr);
+    if local.ip().is_loopback() {
+        tracing::info!("ruagent daemon listening on http://{local} (loopback only, no auth)");
+    } else {
+        tracing::warn!(
+            "ruagent daemon listening on http://{local} -- EXPOSED to non-loopback (explicitly \
+             allowed by --allow-remote/RUAGENT_ALLOW_REMOTE): every read and write endpoint is \
+             reachable from the network and there is no authentication"
+        );
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

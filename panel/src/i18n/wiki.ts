@@ -16,6 +16,14 @@ export const zh: Record<string, string> = {
   "wiki.editedTag": "手改",
   "wiki.orphanTag": "孤儿页",
   "wiki.links": "{out} 出 {in} 入",
+  // 覆盖率三态（R-D D.2 / RV-D-1）。`unknown` 不是 0，也不是 1：这一页**从来没
+  // 有构建记录过可验证读数**（手写的页、或记录值已不再适用）。键**不许省略** ——
+  // 「不知道」必须显示成不知道，与 stale=unknown / edited=unknown 同一套词表。
+  "wiki.coverage": "覆盖 {s}",
+  "wiki.coverageUnknown": "覆盖 unknown",
+  "wiki.coverageHint":
+    "构建期记录的「有锚内容节 / 内容节」比例。unknown = 没有可用的构建期记录（从没构建过，或页面已失效 ⇒ 旧记录不再适用）；它既不是 0 也不是 1。",
+  "wiki.freshUnknown": "新鲜度 unknown",
   "wiki.builds": "构建历史",
   "wiki.buildPages": "{written}/{planned} 页",
   "wiki.buildFailed": "{n} 失败",
@@ -52,6 +60,15 @@ export const en: Record<string, string> = {
   "wiki.editedTag": "hand-edited",
   "wiki.orphanTag": "orphan",
   "wiki.links": "{out} out {in} in",
+  // Coverage's third state (R-D D.2 / RV-D-1). `unknown` is neither 0 nor 1: no
+  // build ever recorded a verifiability reading for this page (hand-written, or
+  // the recorded one no longer applies). The key is NEVER omitted — "cannot tell"
+  // must read as cannot-tell, the same vocabulary as stale=unknown.
+  "wiki.coverage": "coverage {s}",
+  "wiki.coverageUnknown": "coverage unknown",
+  "wiki.coverageHint":
+    "The build's own anchored-sections / content-sections ratio. unknown = no usable build reading (never built, or the page drifted so the old reading no longer applies); it is neither 0 nor 1.",
+  "wiki.freshUnknown": "freshness unknown",
   "wiki.builds": "Build history",
   "wiki.buildPages": "{written}/{planned} pages",
   "wiki.buildFailed": "{n} failed",

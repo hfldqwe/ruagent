@@ -2158,13 +2158,32 @@ async fn distill_graph_toggle_controls_entity_extraction() {
         .json()
         .await
         .unwrap();
+    // t19: the assertion used to be `content == "[distilled] 用户喜欢深色主题"`.
+    // t347 removed that BODY PREFIX: provenance is a FIELD now, and keeping the
+    // text assertion would assert the old marker instead of the row. What is
+    // checked instead is what the integration actually promises: the row carries
+    // the distilled text AND the derived boolean (`distilled` is computed from the
+    // episode kind join in api.rs, never from a prefix).
+    let distilled_rows: Vec<&serde_json::Value> = memories["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("用户喜欢深色主题"))
+        })
+        .collect();
     assert!(
-        memories["memories"]
-            .as_array()
-            .unwrap()
+        !distilled_rows.is_empty(),
+        "no memory carries the distilled text: {memories}"
+    );
+    assert!(
+        distilled_rows
             .iter()
-            .any(|m| m["content"] == "[distilled] 用户喜欢深色主题"),
-        "distilled memory missing: {memories}"
+            .any(|m| m["distilled"] == serde_json::Value::Bool(true)),
+        "the distilled row must be marked distilled=true (derived from the episode \
+         kind, not from a content prefix): {memories}"
     );
     let entities = d
         .db
@@ -2173,13 +2192,17 @@ async fn distill_graph_toggle_controls_entity_extraction() {
         .unwrap()
         .unwrap();
     assert_eq!(entities, 0, "graph=false must not write entities");
-    // distill_log still records the run (with zero entities).
-    let logged =
+    // t19: distill accounting is PER ATTEMPT (t26), so "the row" is no longer a
+    // single value to compare. The honest reading is "at least one attempt was
+    // recorded for this session" — asserting `entities_written == 0` against
+    // whichever row the query happened to return would read a later attempt's
+    // number as this one's.
+    let attempts =
         d.db.call({
             let key = off_key.clone();
             move |conn| {
                 conn.query_row(
-                    "SELECT entities_written FROM distill_log WHERE session_key = ?1",
+                    "SELECT COUNT(*) FROM distill_log WHERE session_key = ?1",
                     [&key],
                     |r| r.get::<_, i64>(0),
                 )
@@ -2188,10 +2211,10 @@ async fn distill_graph_toggle_controls_entity_extraction() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        logged,
-        Some(0),
-        "distill_log row must exist with 0 entities"
+    assert!(
+        attempts.unwrap_or(0) >= 1,
+        "distill_log must record at least one ATTEMPT for {off_key} (per-attempt \
+         accounting, t26)"
     );
 
     // graph=true (the default): the same shape of reply now writes the

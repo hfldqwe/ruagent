@@ -1,0 +1,349 @@
+[
+ {
+  "seed_id": 1,
+  "seed": "ruagent",
+  "target_id": 3,
+  "target": "用户19410",
+  "hops": 2,
+  "nodes": [
+   "ruagent",
+   "Claude Code",
+   "用户19410"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 1,
+  "seed": "ruagent",
+  "target_id": 4,
+  "target": "AutoHotkey",
+  "hops": 3,
+  "nodes": [
+   "ruagent",
+   "Claude Code",
+   "用户19410",
+   "AutoHotkey"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 2,
+  "seed": "ACP",
+  "target_id": 3,
+  "target": "用户19410",
+  "hops": 3,
+  "nodes": [
+   "ACP",
+   "ruagent",
+   "Claude Code",
+   "用户19410"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 2,
+  "seed": "ACP",
+  "target_id": 18,
+  "target": "Claude Code",
+  "hops": 2,
+  "nodes": [
+   "ACP",
+   "ruagent",
+   "Claude Code"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 3,
+  "seed": "用户19410",
+  "target_id": 1,
+  "target": "ruagent",
+  "hops": 2,
+  "nodes": [
+   "用户19410",
+   "Claude Code",
+   "ruagent"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 3,
+  "seed": "用户19410",
+  "target_id": 2,
+  "target": "ACP",
+  "hops": 3,
+  "nodes": [
+   "用户19410",
+   "Claude Code",
+   "ruagent",
+   "ACP"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 4,
+  "seed": "AutoHotkey",
+  "target_id": 1,
+  "target": "ruagent",
+  "hops": 3,
+  "nodes": [
+   "AutoHotkey",
+   "用户19410",
+   "Claude Code",
+   "ruagent"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 4,
+  "seed": "AutoHotkey",
+  "target_id": 6,
+  "target": "银河麒麟 V10",
+  "hops": 2,
+  "nodes": [
+   "AutoHotkey",
+   "用户19410",
+   "银河麒麟 V10"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 5,
+  "seed": "Python 3.10.9",
+  "target_id": 12,
+  "target": "numpy",
+  "hops": 2,
+  "nodes": [
+   "Python 3.10.9",
+   "pandas",
+   "numpy"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 6,
+  "seed": "银河麒麟 V10",
+  "target_id": 1,
+  "target": "ruagent",
+  "hops": 3,
+  "nodes": [
+   "银河麒麟 V10",
+   "用户19410",
+   "Claude Code",
+   "ruagent"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 6,
+  "seed": "银河麒麟 V10",
+  "target_id": 4,
+  "target": "AutoHotkey",
+  "hops": 2,
+  "nodes": [
+   "银河麒麟 V10",
+   "用户19410",
+   "AutoHotkey"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 7,
+  "seed": "Podman",
+  "target_id": 6,
+  "target": "银河麒麟 V10",
+  "hops": 3,
+  "nodes": [
+   "Podman",
+   "QEMU",
+   "WSL Ubuntu-22.04",
+   "银河麒麟 V10"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 7,
+  "seed": "Podman",
+  "target_id": 8,
+  "target": "WSL Ubuntu-22.04",
+  "hops": 2,
+  "nodes": [
+   "Podman",
+   "QEMU",
+   "WSL Ubuntu-22.04"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 8,
+  "seed": "WSL Ubuntu-22.04",
+  "target_id": 3,
+  "target": "用户19410",
+  "hops": 2,
+  "nodes": [
+   "WSL Ubuntu-22.04",
+   "银河麒麟 V10",
+   "用户19410"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 8,
+  "seed": "WSL Ubuntu-22.04",
+  "target_id": 4,
+  "target": "AutoHotkey",
+  "hops": 3,
+  "nodes": [
+   "WSL Ubuntu-22.04",
+   "银河麒麟 V10",
+   "用户19410",
+   "AutoHotkey"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 9,
+  "seed": "QEMU",
+  "target_id": 3,
+  "target": "用户19410",
+  "hops": 3,
+  "nodes": [
+   "QEMU",
+   "WSL Ubuntu-22.04",
+   "银河麒麟 V10",
+   "用户19410"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 9,
+  "seed": "QEMU",
+  "target_id": 6,
+  "target": "银河麒麟 V10",
+  "hops": 2,
+  "nodes": [
+   "QEMU",
+   "WSL Ubuntu-22.04",
+   "银河麒麟 V10"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 10,
+  "seed": "python-build-standalone",
+  "target_id": 11,
+  "target": "pandas",
+  "hops": 2,
+  "nodes": [
+   "python-build-standalone",
+   "Python 3.10.9",
+   "pandas"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 10,
+  "seed": "python-build-standalone",
+  "target_id": 12,
+  "target": "numpy",
+  "hops": 3,
+  "nodes": [
+   "python-build-standalone",
+   "Python 3.10.9",
+   "pandas",
+   "numpy"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 11,
+  "seed": "pandas",
+  "target_id": 10,
+  "target": "python-build-standalone",
+  "hops": 2,
+  "nodes": [
+   "pandas",
+   "Python 3.10.9",
+   "python-build-standalone"
+  ],
+  "kind": "reachable"
+ },
+ {
+  "seed_id": 1,
+  "seed": "ruagent",
+  "target_id": 7,
+  "target": "Podman",
+  "hops": 6,
+  "nodes": [
+   "ruagent",
+   "Claude Code",
+   "用户19410",
+   "银河麒麟 V10",
+   "WSL Ubuntu-22.04",
+   "QEMU",
+   "Podman"
+  ],
+  "kind": "beyond_cap"
+ },
+ {
+  "seed_id": 1,
+  "seed": "ruagent",
+  "target_id": 8,
+  "target": "WSL Ubuntu-22.04",
+  "hops": 4,
+  "nodes": [
+   "ruagent",
+   "Claude Code",
+   "用户19410",
+   "银河麒麟 V10",
+   "WSL Ubuntu-22.04"
+  ],
+  "kind": "beyond_cap"
+ },
+ {
+  "seed_id": 1,
+  "seed": "ruagent",
+  "target_id": 9,
+  "target": "QEMU",
+  "hops": 5,
+  "nodes": [
+   "ruagent",
+   "Claude Code",
+   "用户19410",
+   "银河麒麟 V10",
+   "WSL Ubuntu-22.04",
+   "QEMU"
+  ],
+  "kind": "beyond_cap"
+ },
+ {
+  "seed_id": 2,
+  "seed": "ACP",
+  "target_id": 4,
+  "target": "AutoHotkey",
+  "hops": 4,
+  "nodes": [
+   "ACP",
+   "ruagent",
+   "Claude Code",
+   "用户19410",
+   "AutoHotkey"
+  ],
+  "kind": "beyond_cap"
+ },
+ {
+  "seed_id": 2,
+  "seed": "ACP",
+  "target_id": 6,
+  "target": "银河麒麟 V10",
+  "hops": 4,
+  "nodes": [
+   "ACP",
+   "ruagent",
+   "Claude Code",
+   "用户19410",
+   "银河麒麟 V10"
+  ],
+  "kind": "beyond_cap"
+ }
+]

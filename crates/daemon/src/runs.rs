@@ -1269,6 +1269,13 @@ async fn supervise(
             &run,
             RunEvent::ContextInjected {
                 render: injection.clone(),
+                // DEP-INT-1 (t19): the producer's own label. `budget` stays `None`
+                // -- "not collected" -- because the injection contract exposes no
+                // report-returning render (`render_context` returns text only), and
+                // an all-zero budget object would read as a MEASURED empty
+                // injection (contract §3.2: `null` = 本次未采集, never all-zero).
+                path: Some("run".to_string()),
+                budget: None,
             },
         );
     }
@@ -1852,8 +1859,7 @@ async fn render_run_injection(
     knowledge: Option<&ruagent_knowledge::Knowledge>,
 ) -> String {
     use ruagent_memory::inject::{
-        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, RetrievalHit, WIKI_PAGES, knowledge_items,
-        render_context,
+        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, WIKI_PAGES, render_context,
     };
 
     let mut items: Vec<ContextItem> = Vec::new();
@@ -1879,18 +1885,55 @@ async fn render_run_injection(
     // leads outlive one project's notes -- and the total budget drops the LAST
     // blocks first, visibly.
     if let Some(k) = knowledge
-        && let Ok(found) = k.search(&run_query(task), RUN_KNOWLEDGE_SEARCH_N).await
+        && let Ok(page) = k
+            .search_page(&run_query(task), RUN_KNOWLEDGE_SEARCH_N)
+            .await
     {
-        let hits: Vec<RetrievalHit> = found
-            .into_iter()
-            .map(|h| RetrievalHit {
-                wiki: h.document.starts_with("wiki/"),
-                document: h.document,
-                content: h.content,
-                score: h.score,
-            })
-            .collect();
-        items.extend(knowledge_items(&hits, KNOWLEDGE_SOURCES, WIKI_PAGES));
+        // t19 (DEP-INT-8 / R-A H-1..H-4 / R-D D.7): same enriched shape as the
+        // chat path -- one contract, two producers. Wiki hits carry a lead from
+        // the ASYNC `lead_for` (the only entry point that can report a RECORDED
+        // coverage; `lead_from` would make `coverage=` permanently unknown).
+        let mut enriched: Vec<ruagent_memory::inject::EnrichedHit> = Vec::new();
+        for r in &page.hits {
+            let relevance = r.relevance.as_ref().map(|v| {
+                crate::memembed::relevance_meta(
+                    v.value,
+                    v.kind.as_str(),
+                    v.version,
+                    Some(v.query_background),
+                )
+            });
+            let lead = if r.hit.document.starts_with("wiki/") {
+                let slug = r
+                    .hit
+                    .document
+                    .trim_start_matches("wiki/")
+                    .trim_end_matches(".md");
+                let record = crate::wiki::page_record(db, slug).await;
+                crate::wiki::lead_for(k, &record, slug)
+                    .await
+                    .as_ref()
+                    .map(crate::memembed::lead_meta)
+            } else {
+                None
+            };
+            enriched.push(crate::memembed::enriched_hit(&r.hit, relevance, lead));
+        }
+        items.extend(ruagent_memory::inject::knowledge_items_enriched(
+            &enriched,
+            KNOWLEDGE_SOURCES,
+            WIKI_PAGES,
+        ));
+    }
+    // G10 / F5 closure (t63): same producer, same shape as the chat path, inserted
+    // before the sort for the same reason (the block order is owned by tag_rank).
+    if let Ok(evidence) =
+        ruagent_graph::retrieve(db, &ruagent_graph::GraphQuery::for_text(run_query(task))).await
+    {
+        items.extend(crate::memembed::graph_evidence_items(
+            &evidence,
+            ruagent_memory::inject::GRAPH_PATHS,
+        ));
     }
     // The project group is NOT read here any more: it is part of
     // RUNS_SELECTION, so the preset is the only place that says this path

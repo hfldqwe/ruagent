@@ -125,7 +125,11 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
     // List tools: the platform surface.
     let tools = client.list_all_tools().await.unwrap();
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
-    for expected in [
+    // t93 / audit M5: this used to be `any()` over 9 of the 14 names, so deleting
+    // any of the five tools this generation added (memory_forget_report,
+    // graph_search, graph_retrieve, wiki_pages, wiki_links) stayed green. Set
+    // EQUALITY (both directions) plus a count is what makes removal loud.
+    let mut expected = vec![
         "memory_search",
         "memory_write",
         "memory_recall",
@@ -134,13 +138,25 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
         "knowledge_ingest",
         "knowledge_expand",
         "graph_entity",
+        "memory_forget_report",
+        "graph_search",
+        "graph_retrieve",
+        "wiki_pages",
+        "wiki_links",
         "list_tasks",
-    ] {
-        assert!(
-            names.iter().any(|n| n == expected),
-            "missing {expected}: {names:?}"
-        );
-    }
+    ];
+    assert_eq!(
+        expected.len(),
+        14,
+        "the declared consumption surface is 14 tools"
+    );
+    let mut got = names.clone();
+    got.sort();
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "the MCP surface changed: missing or extra tools. got={names:?}"
+    );
 
     // Write a memory through the MCP tool.
     let out = client

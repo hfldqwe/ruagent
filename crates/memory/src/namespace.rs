@@ -16,6 +16,38 @@ pub enum Namespace {
     Agent(String),
 }
 
+/// The namespace's KIND, without its parameter — the unit a store×namespace
+/// write matrix is expressed in.
+///
+/// WHY THIS EXISTS (t52). `Namespace` carries `project:<x>`/`agent:<x>`
+/// payloads, so a matrix written as strings cannot be compared with an actual
+/// namespace. The write vocabulary had been *claimed* as a flat list of
+/// namespace VALUES (`user | global | project:<x> | agent:<x>`, api.rs:4234 and
+/// `0004_memory.sql:21`), which reads as "global is writable" — but the governed
+/// write path accepts (store, namespace) PAIRS, and `global` is only writable in
+/// the two stores that own the global scope. Kind is the unit that lets the
+/// matrix and its enforcement be ONE source instead of two lists that drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NamespaceKind {
+    User,
+    Global,
+    Project,
+    Agent,
+}
+
+impl NamespaceKind {
+    /// How the matrix spells this kind. `project:<x>`/`agent:<x>` are the
+    /// parameterised spellings a caller writes; the `<x>` is mandatory.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NamespaceKind::User => "user",
+            NamespaceKind::Global => "global",
+            NamespaceKind::Project => "project:<x>",
+            NamespaceKind::Agent => "agent:<x>",
+        }
+    }
+}
+
 impl Namespace {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
@@ -31,6 +63,17 @@ impl Namespace {
                     None
                 }
             }
+        }
+    }
+
+    /// This namespace's kind, dropping any parameter — the key the write matrix
+    /// is indexed by.
+    pub fn kind(&self) -> NamespaceKind {
+        match self {
+            Namespace::User => NamespaceKind::User,
+            Namespace::Global => NamespaceKind::Global,
+            Namespace::Project(_) => NamespaceKind::Project,
+            Namespace::Agent(_) => NamespaceKind::Agent,
         }
     }
 

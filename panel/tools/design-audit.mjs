@@ -396,6 +396,7 @@ function resolveContract(thresholds) {
 function parseArgs(argv) {
   const o = {
     json: false, check: false, table: false, quiet: false, selfTest: false,
+    allowNotMeasured: false,
     focus: true, shots: true, pixels: true,
     baseUrl: process.env.E2E_BASE_URL ?? "http://127.0.0.1:8787",
     viewport: "1440x900",
@@ -413,6 +414,7 @@ function parseArgs(argv) {
     switch (k) {
       case "--json": o.json = true; break;
       case "--check": o.check = true; break;
+      case "--allow-not-measured": o.allowNotMeasured = true; break;
       case "--table": o.table = true; break;
       case "--self-test": o.selfTest = true; break;
       case "--evaluate-context-gaps": o.contextGaps = true; break;
@@ -449,11 +451,21 @@ function parseArgs(argv) {
 const HELP = `design-audit.mjs — quantitative design audit for the ruagent panel
 
   --json                    print the metrics document to stdout (stdout stays parseable)
-  --check                   judge every implementable row of MASTER.md §12; exit 1 on failure
+  --check                   judge every implementable row of MASTER.md §12; exit 1 on failure.
+                            t97/T-1: the exit code is LOAD-BEARING. 0 only when no row fails,
+                            the contract/threshold read produced NO warning (a fallback to
+                            BUILTIN is a silent lie with a log line), and no row is
+                            not_measured -- or --allow-not-measured was given and every
+                            waived row is named in the output.
   --table                   print the §12 check table without judging/exiting
   --self-test               prove rows 16/23 implement the primitives §11 criterion
                             (not MASTER §12's defective wording) on synthetic
-                            inputs; no daemon, no browser. exit 1 on any failure.
+                            inputs; no daemon, no browser. exit 1 on any failure, and
+                            exit 1 if the real contract/threshold read warned (that is
+                            the same defect t17 found, now load-bearing).
+  --allow-not-measured      --check only: waive the not_measured rows. Every waived row is
+                            NAMED in the output (an unnamed waiver is not possible), and
+                            it never waives a contract/threshold fallback.
   --routes=a,b              audit a subset of routes (default: all 13)
   --modes=dark,light        modes to audit (default: both)
   --viewport=1440x900       measurement viewport for the screenshot pixel pass
@@ -473,6 +485,18 @@ const HELP = `design-audit.mjs — quantitative design audit for the ruagent pan
   --out=DIR                 artefact dir, resolved against the REPO ROOT (default docs/screenshots/audit-run)
   --no-failure-probe        skip row 20's failure-state injection (the row reports not_measured)
   --quiet                   suppress progress on stderr
+
+  WHAT THIS TOOL DOES NOT COVER (t97, §6.0 item 19):
+  * --self-test proves rows 16/23's criterion LOGIC and that the criteria are READABLE
+    where MASTER promises them; it never judges the live DOM, so it cannot tell you a
+    row's verdict on the shipped panel.
+  * --check DOES judge the live DOM, but only against a built panel served by a
+    reachable daemon (--base-url) -- 26 captures, minutes of wall clock. It is not run
+    by any CI job today: the wiring is a separate task.
+  * Neither mode says anything about the daemon's data quality. Rows that need data
+    report not_measured; --check now exits 1 on that, which is the point.
+  * The pixel/screenshot rows depend on the browser's rasteriser; a font or GPU change
+    can move them without any panel source changing.
 `;
 
 let QUIET = false;
@@ -8048,6 +8072,15 @@ function runSelfTest() {
   check('row35: the NEW wording (§12.16) parses to 4', pickAny('**① CSS 侧 ≤4 个断点**（不变）∧ **② JS 断点集 ⊆…**', [/CSS\s*侧\s*≤\s*(\d+)\s*个断点/, /≤\s*(\d+)\s*CSS\s*断点/], -1), 4);
   check('row35: an unrelated cell records a miss instead of silently returning the default',
     (() => { resetPickMisses(); const v = pickAny('没有任何断点数字', [/CSS\s*侧\s*≤\s*(\d+)\s*个断点/, /≤\s*(\d+)\s*CSS\s*断点/], -1); return v === -1 && takePickMisses().length === 1; })(), true);
+  // t97/T-1: prove the CONTRACT WAS READ. Without this a fallback is only a log line:
+  // a reworded MASTER cell silently swaps the criteria for BUILTIN constants and the
+  // gate stays green. Deliberately NOT a numbered case, so the row count the team
+  // gates on (495) is unchanged and no existing row was weakened.
+  const guardThresholds = loadThresholds(REPO);
+  const guardWarnings = [...(guardThresholds.warnings ?? [])];
+  guardWarnings.push(...(resolveContract(guardThresholds).warnings ?? []));
+  process.stdout.write(`\nself-test: contract/threshold read warnings = ${guardWarnings.length}\n`);
+  for (const w of guardWarnings) process.stdout.write(`  CONTRACT-WARNING ${w}\n`);
   const failed = cases.filter((c) => !c.pass);
   const w = Math.max(...cases.map((c) => c.name.length));
   for (const c of cases) {
@@ -8055,9 +8088,27 @@ function runSelfTest() {
   }
   process.stdout.write(`\nself-test: ${cases.length - failed.length}/${cases.length} pass\n`);
   if (failed.length) process.stdout.write(`self-test FAILED: ${failed.map((c) => c.name).join("; ")}\n`);
-  return failed.length ? 1 : 0;
+  return failed.length || guardWarnings.length ? 1 : 0;
 }
 
+
+// ── t97/T-1: the exit decision, as a pure function ──────────────────────────
+// --check's exit code is the only thing a CI job can act on, so it must be decided
+// in ONE place and be readable without a browser. Three states mean "this run did
+// not really judge the contract", and none of them may exit 0:
+//   * a §12 row failed                                    -> always fatal
+//   * the contract/threshold read warned (fell back to BUILTIN) -> always fatal
+//     (t17: a fallback that becomes the criteria is a silent lie)
+//   * a row has no verdict (not_measured)                 -> fatal unless waived
+// The waiver is explicit and NARROW: it covers not_measured rows only, and it
+// returns the waived rows so the caller must name them.
+export function exitDecision({ check, fails, contractWarnings = [], unmeasured = [], allowNotMeasured = false }) {
+  const waived = allowNotMeasured ? unmeasured : [];
+  const fatal = fails > 0
+    || contractWarnings.length > 0
+    || (unmeasured.length > 0 && !allowNotMeasured);
+  return { code: check && fatal ? 1 : 0, waived, fatal };
+}
 
 // ── main ────────────────────────────────────────────────────────────────────
 async function main() {
@@ -8130,10 +8181,15 @@ async function main() {
 
   const warnings = [];
   const thresholds = loadThresholds(REPO);
+  // t97/T-1: contract/threshold warnings are ALSO the exit-code basis under --check
+  // (see the tail of main). They live in their own array because a fallback to
+  // BUILTIN is never waivable, unlike a not_measured row.
+  const contractWarnings = [...thresholds.warnings];
   warnings.push(...thresholds.warnings);
   // The criteria come from the contract, not from this file. Anything that could
   // not be read falls back to BUILTIN and says so here.
   const contract = resolveContract(thresholds);
+  contractWarnings.push(...contract.warnings);
   warnings.push(...contract.warnings);
   const dist = distInfo();
   if (!dist.exists) warnings.push("panel/dist not found — the daemon is serving something else; run npm run build");
@@ -8348,12 +8404,37 @@ async function main() {
   }
   for (const w of warnings) log(`[audit] warning: ${w}`);
 
-  return args.check && fails.length ? 1 : 0;
+  // ── t97/T-1: the exit code is load-bearing ────────────────────────────────
+  // A run can look green while judging nothing: (a) the contract/threshold read fell
+  // back to BUILTIN (the criteria were silently swapped), (b) a row was never judged
+  // at all (not_measured). Neither may exit 0 under --check. The waiver is explicit,
+  // narrow (not_measured only) and NAMES every row it waives.
+  if (args.check && contractWarnings.length) {
+    log(`[audit] contract/threshold read fell back ${contractWarnings.length} time(s) — criteria may be BUILTIN, not MASTER:`);
+    for (const w of contractWarnings) log(`        ${w}`);
+  }
+  if (args.check && unmeasured.length && args.allowNotMeasured) {
+    log(`[audit] --allow-not-measured waives ${unmeasured.length} row(s): ${unmeasured.map((r) => `#${r.n}`).join(", ")}`);
+    for (const r of unmeasured) log(`        waived #${r.n} ${r.title}`);
+  } else if (args.check && unmeasured.length) {
+    log(`[audit] not measured: ${unmeasured.length} row(s) ${unmeasured.map((r) => `#${r.n}`).join(", ")} — exit 1 (pass --allow-not-measured to waive; the waiver is named)`);
+  }
+  return exitDecision({
+    check: args.check,
+    fails: fails.length,
+    contractWarnings,
+    unmeasured,
+    allowNotMeasured: args.allowNotMeasured,
+  }).code;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    console.error(`design-audit failed: ${err && err.stack ? err.stack : err}`);
-    process.exit(2);
-  });
+// t97: only run the audit when this file IS the entry point. Importing it (e.g. to
+// read exitDecision from a probe) must not start a 26-capture run against a daemon.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(`design-audit failed: ${err && err.stack ? err.stack : err}`);
+      process.exit(2);
+    });
+}
