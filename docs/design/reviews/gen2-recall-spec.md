@@ -74,7 +74,7 @@
 | 复现命令 | `python %TEMP%\ra_limit_probe.py`（§F.3） |
 | 读数 | `distinct_top1 = 2`（即 top-1 变了）的有 **2/13**：`kubernetes 滚动更新回滚` 与 `ruagent memory`。**翻转点都在 limit=10 → 20 之间**：`kubernetes...` 0.016393 → 0.028814；`ruagent memory` 0.016393 → 0.027652，且 top-1 文档从 `OpenWhisk...数据库内容` 变成 `obsidian/wiki/claude-code-02-记忆与配置-CC-Memory记忆与CLAUDE-md`。**同时**：`limit=20` 与 `limit=30` 的 top-1 **与分数**对 13/13 条完全相同 |
 | 时间窗 | 2026-09-27T21:47:54.472+08:00 |
-| 机制（代码判据，非推断） | `crates/knowledge/src/store.rs:610` 与 `:659`：`let leg_k = limit.max(10) as usize;` —— 调用方的**分页参数变成了检索窗口**。窗口变宽 ⇒ 并集变大 ⇒ RRF 的 1/(60+rank) 相加项变多 ⇒ 排序与分数都变 |
+| 机制（代码判据，非推断） | `crates/knowledge/src/store.rs:165（t85 勘误：原 610；锚 LEG_WINDOW（t80 复核））` 与 `:659`：`let leg_k = limit.max(10) as usize;` —— 调用方的**分页参数变成了检索窗口**。窗口变宽 ⇒ 并集变大 ⇒ RRF 的 1/(60+rank) 相加项变多 ⇒ 排序与分数都变 |
 | 判据 | 若排序是 `(query, hit)` 的性质，则任一 limit 的 top-1 必须相同 —— 实测 2/13 不同。**故"分数"今天不是 `(query, hit)` 的函数，而是 `(query, hit, limit)` 的函数。** |
 
 ### A5 活库 census（本会话实测，只读 `mode=ro`）
@@ -105,7 +105,7 @@
 
 | 面 | 值 | 量纲 | 代码坐标 |
 | --- | --- | --- | --- |
-| knowledge `score` / `score_kind` | `0.016393 … 0.032787` | **RRF 名次分**（越大越好，上界 2/61） | `crates/daemon/src/api.rs:3003`（`"score_kind": "rrf_rank"`） |
+| knowledge `score` / `score_kind` | `0.016393 … 0.032787` | **RRF 名次分**（越大越好，上界 2/61） | `crates/daemon/src/api.rs:2973-2985（t85 勘误：原 3003；锚 score_kind / rrf_rank（t80 复核））`（`"score_kind": "rrf_rank"`） |
 | knowledge `semantic_score` | `0.1244 … 0.4091` | **LanceDB 距离**（**越小越好**） | `api.rs:3006`；`store.rs:58-62` |
 | knowledge `keyword_score` | `-4.75 … -22.16` | **bm25**（**越负越好**） | `api.rs:3008`；`store.rs:545-566` |
 | memory `semantic_score` | **0.7555 … 0.9159**（均值 0.8615，n=651） | **余弦**（**越大越好**） | `api.rs:2581-2582`；`memembed.rs:41-104` |
@@ -162,7 +162,7 @@
 
 | # | 缺陷（任务书原文） | 复核 | 证据 |
 | --- | --- | --- | --- |
-| 1 | `score_kind=rrf_rank` 的名次分被当相似度显示（0.88 与 0.02 并列 ⇒「记忆比知识相关 26 倍」） | **成立且更强**：不是 2 种量纲并排，而是 **4 种量纲（名次分 / 距离 / 余弦 / bm25）共用 2 个字段名**；活读数 `m 0.86` vs `k 0.016` | **A7** · `api.rs:3003,3006,3008,2581` · `memembed.rs:41-104` · `Memory.tsx:367-384` |
+| 1 | `score_kind=rrf_rank` 的名次分被当相似度显示（0.88 与 0.02 并列 ⇒「记忆比知识相关 26 倍」） | **成立且更强**：不是 2 种量纲并排，而是 **4 种量纲（名次分 / 距离 / 余弦 / bm25）共用 2 个字段名**；活读数 `m 0.86` vs `k 0.016` | **A7** · `api.rs:2973-2985（t85 勘误：原 3003；锚 score_kind / rrf_rank（t80 复核））,3006,3008,2581` · `memembed.rs:41-104` · `Memory.tsx:367-384` |
 | 2 | 查询 `ruagent memory` 的 top-1 是一条 OpenWhisk 笔记（semantic 0.34）⇒ 没有真实 gold 集就无法判「检索好不好」 | **前半成立 / 后半已修**：`ruagent memory` 在 **`limit=5..10` 时 top-1 确实是 OpenWhisk 笔记**（`semantic_score 0.3437`，2026-09-27T21:30:33 复现）；但 **`limit=20` 时 top-1 变成 `claude-code-02-记忆与配置`**（0.3720）⇒ **这条反例本身依赖分页参数**（A4）。「没有真实 gold」**成立**，已由 A3 的冻结 gold 集补上（**并标注它是 title-derived 的弱代理**，见 C7/D3） | **A3 · A4 · A9** |
 | 3 | unicode61 无 CJK 分词（整段汉字一个 term），2 字中文查询只能靠 LIKE 段兜底 | **成立且已量化**：**63.20%** 的 2 字汉字查询只能靠子串腿；LIKE 全表扫 **10.47 ms/查询**（10765 chunk）。**并新增两条**：`trigram` 对 <3 字符**永不匹配**（0/40，与 FTS5 文档一致）；harness 的 `研磨度` 在活库语料里**不存在** | **A8 · A10** |
 | 4 | 融合只用 RRF：无语义/关键词权重、无重排、无多样性、无新近性先验、无查询理解 | **成立**：`rrf(&[ann_ids, fts_ids], 60)`，两处调用（`store.rs:614`、`:663`），无权重、无重排、无多样性、无时间先验、无查询理解；`FusionKind` 类型**不存在**。**并新增一条任务书没写的缺陷**：`leg_k = limit.max(10)` 让分页参数改排序（**A4**） | **A4 · A7** · `store.rs:609-680` · `rrf.rs:1-16` |
@@ -325,10 +325,10 @@
 | 项 | 内容 |
 | --- | --- |
 | metric | (a) 响应里每一个数值型分数键是否存在同级的 `*_kind`（可机器判定）；(b) 是否存在"渲染器把两种量纲并排而没有 kind 可读"的路径 |
-| baseline | (a) **不成立**：knowledge hit 的 `semantic_score` / `keyword_score` **没有** kind；只有行级的 `score_kind: "rrf_rank"`（`api.rs:3003`）。(b) **成立**：`Memory.tsx:367-384` 并排 `m 0.86`（余弦）与 `k 0.016`（名次分） |
+| baseline | (a) **不成立**：knowledge hit 的 `semantic_score` / `keyword_score` **没有** kind；只有行级的 `score_kind: "rrf_rank"`（`api.rs:2973-2985（t85 勘误：原 3003；锚 score_kind / rrf_rank（t80 复核））`）。(b) **成立**：`Memory.tsx:367-384` 并排 `m 0.86`（余弦）与 `k 0.016`（名次分） |
 | target | (a) **5/5 分数键都有 kind**（字段集是有限的，见下）；(b) **0 条渲染路径能并排两种量纲而不带 kind** |
 | 复现命令 | `python %TEMP%\ra_scorekind_probe.py`（§F.9）+ `cargo test -p ruagent-daemon api` |
-| **标定读数** | 字段集是**有限且今天就可枚举**的：knowledge hit 5 个分数键（`score` / `semantic_score` / `keyword_score` + 新增 2）、memory hit 3 个（`score` / `semantic_score` / `keyword_score`）。四个现存量纲：`rrf_rank`（两种 kind 共用）· **距离**（knowledge semantic，越小越好）· **余弦**（memory semantic，越大越好）· **bm25**（越负越好）—— `api.rs:3003,3006,3008,2581-2582` + `memembed.rs:41-104`。**注意**（I-B 已冻结）：`"rrf_rank"` 是**字面量**，不许改写成别的名字；新量纲只能用**新键**表达 |
+| **标定读数** | 字段集是**有限且今天就可枚举**的：knowledge hit 5 个分数键（`score` / `semantic_score` / `keyword_score` + 新增 2）、memory hit 3 个（`score` / `semantic_score` / `keyword_score`）。四个现存量纲：`rrf_rank`（两种 kind 共用）· **距离**（knowledge semantic，越小越好）· **余弦**（memory semantic，越大越好）· **bm25**（越负越好）—— `api.rs:2973-2985（t85 勘误：原 3003；锚 score_kind / rrf_rank（t80 复核））,3006,3008,2581-2582` + `memembed.rs:41-104`。**注意**（I-B 已冻结）：`"rrf_rank"` 是**字面量**，不许改写成别的名字；新量纲只能用**新键**表达 |
 
 ### C7 结构性诊断（**循环，只作诊断，不作 headline**）
 
@@ -401,8 +401,8 @@ pub trait Embedder: Send + Sync { fn embed(..); fn embed_query(..); fn is_fallba
 
 | 冻结项 | 依赖它的活调用点 | 违约后果 |
 | --- | --- | --- |
-| `SearchHit` 的字段集 | `crates/daemon/src/wiki.rs:1482`（`recall_stubs(hits: &[ruagent_knowledge::SearchHit], ..)`）、`api.rs:2984` | I-D（wiki）编译不过 |
-| `rrf` 的签名 | `crates/daemon/src/memembed.rs:310`（`ruagent_knowledge::rrf(&[sem_ids, kw_ids], RRF_K)`） | I-B（记忆两腿融合）编译不过；**改签名 = 跨 crate 破坏** |
+| `SearchHit` 的字段集 | `crates/daemon/src/wiki.rs:3181（t85 勘误：原 1482；锚 recall_stubs（t80 复核））`（`recall_stubs(hits: &[ruagent_knowledge::SearchHit], ..)`）、`api.rs:2984` | I-D（wiki）编译不过 |
+| `rrf` 的签名 | `crates/daemon/src/memembed.rs:581（t85 勘误：原 310；锚 rrf(&[sem_ids, kw_ids], RRF_K)（t80 复核））`（`ruagent_knowledge::rrf(&[sem_ids, kw_ids], RRF_K)`） | I-B（记忆两腿融合）编译不过；**改签名 = 跨 crate 破坏** |
 | `fts::{terms,match_all,match_any_prefix,like_patterns}` 的**语义** | `crates/graph` 按 R-C 规格 DEP-5 **照抄**这 4 个函数做 loose 复刻；`knowledge/src/store.rs:488` 的注释本身就是"so this crate and the graph crate cannot drift again" | I-C 的分词与 I-A 漂移 ⇒ 两套判据（这正是 t247 踩过的坑） |
 | `score_kind` 的**字面量** | R-B 规格 D.7 已把 `"rrf_rank"` 冻成字面量，且 `memembed.rs:151-152` 的注释已被点名有措辞漂移 | 两代 API 的消费方（面板/MCP/注入）读的是同一个字面量 |
 | **字段名的量纲** | knowledge `semantic_score` = 距离、memory `semantic_score` = 余弦（`api.rs:2581-2582` vs `:2600-2601`） | **这是 A7 的缺陷本身**：I-A **不许**"顺手把 `semantic_score` 改成相似度好让它看起来对" —— 那会让 memory 侧同一个键反向，缺陷变成静默错误 |
@@ -524,7 +524,7 @@ pub fn rrf_weighted(rankings: &[(&[i64], f32)], k: u32) -> Vec<(i64, f32)>;
 | --- | --- | --- | --- | --- |
 | **B-1** | `SearchLegs` 改名/扩写为 `SearchEvidence` | **编译破坏（可消除）** | `crates/daemon/src/api.rs:2607-2620,4020-4034`（读 `.semantic/.keyword/.keyword_stage/.fused.len()`）、`crates/knowledge/tests/retrieval-legs.rs` | **不要改名**：保留 `pub struct SearchLegs` 原名 + 只加 3 个字段，或用一个 `pub type SearchLegs = SearchEvidence;` 别名。**本规格要求后者** ⇒ 破坏 = 0，`.semantic/.keyword/.keyword_stage/.fused` 全部照旧可读 |
 | **B-2** | `leg_k = limit.max(10)` → `LEG_WINDOW = 60` | **行为破坏（不是编译破坏）** | 所有消费排序的人；**历史 `top_knowledge_score` 全部失去可比性** | ① 一次改到位，不许留两个窗口；② `recall_log` 加 `knowledge_leg_window` + `scoring_version`（§E schema），**历史行为 NULL**（R-B/t347 的纪律：新库上验过的字段不为历史行背书）；③ 跨这次改动**禁止**把新旧 `top_knowledge_score` 画在同一条曲线上 |
-| **B-3** | `rrf(&[Vec<i64>], k)` 加权重 | **会变成编译破坏，所以不做** | `memembed.rs:310` | 权重走**新函数** `rrf_weighted`；`rrf` 签名不动。**若有人想给 `rrf` 加默认权重参数，这就是违约** |
+| **B-3** | `rrf(&[Vec<i64>], k)` 加权重 | **会变成编译破坏，所以不做** | `memembed.rs:581（t85 勘误：原 310；锚 rrf 调用点（t80 复核））` | 权重走**新函数** `rrf_weighted`；`rrf` 签名不动。**若有人想给 `rrf` 加默认权重参数，这就是违约** |
 | **B-4** | `Knowledge::search` 的 `SearchHit.score` 语义从"RRF 名次分"变成别的 | **静默语义破坏（最危险）** | `api.rs:2984-3018`（把 `hit.score` 直接放进 JSON）、面板、MCP | **禁止**。真实相关性走**新字段** `relevance`。这条是 A7 的教训：缺陷不是"分数量纲混了"，而是"换名字时没人标注" |
 | **B-5** | `score_kind` 新增取值（`"semantic_l2sq"` / `"calibrated"` 等） | **加值，不是破坏** | 消费方若 `match` 穷举会不穷举 | 消费方必须按"未知 kind ⇒ 不渲染"处理。**已存在**的 `"rrf_rank"` 字面量不许动 |
 | **B-8** | `KeywordStage` **新增 `Bigram` 变体**（§E4）—— 注意它出现在 D.1 的 `[冻结]` 表里，所以**必须在这里显式登记为一次对冻结类型的扩写** | **加变体：源码兼容，语义新增** | 任何对 `KeywordStage` 做**穷尽 `match`** 的代码会编译不过 | **本会话已全仓核过：不存在任何穷尽 match。** 全部 13 个使用点都是**等值比较**（`retrieval-quality.rs:452`、`retrieval-legs.rs:147,163,187,215`）或**构造**（`store.rs:517,521,525,540,542`）。`api.rs:2967` 用 `format!("{stage:?}").to_lowercase()` ⇒ 自动输出新值 `"bigram"`，**零改动**。D.1 里"变体集合"的冻结因此被**收紧**为：前 4 个变体的**名字与含义**冻结，**集合可以扩（只能加，不能改名、不能改含义）** |
@@ -538,7 +538,7 @@ pub fn rrf_weighted(rankings: &[(&[i64], f32)], k: u32) -> Vec<(i64, f32)>;
 | 我 → I-B（mem-core） | 残余面清点：`residual_scan` + `document_path` 的形状（D.2 第 5 块，**含 `truncated`/`total` 的截断可分辨性**）；三条 read-only 事实（`chunks` **没有** content_hash ⇒ 只能 document 粒度按 sha256 查；裸 SQL 今天就能按子串查；934/934 有磁盘副本）。**类型各自定义、不跨 crate 依赖**（`crates/memory` 刻意不依赖 `ruagent_knowledge`，见 `inject.rs:276-289`）⇒ 两边字段集必须有一个**漂移自检**（比对字段名与 `origin` 取值集合），这是本表登记的第 5 条约定 | **已发消息两次**（2026-09-27 询问回执 + 22:16 截断请求的回执），答"t7 之后给" |
 | I-B → 我 | `crates/memory/src/inject.rs` 的注入面**不使用 RRF**（R-B D.7）；我的 `relevance` **不许**作为相似度泄露到注入面 | 已由 R-B 冻结，我照办 |
 | 我 → I-C（graph） | `fts::terms/match_all/match_any_prefix/like_patterns` 四函数**逐字节不变**（R-C DEP-5）；CJK 能力以**新函数**（`han_bigrams`/`match_bigrams`）提供，I-C 想同源就调它们 | 已由 R-C 登记，我确认 |
-| I-D（wiki）→ 我 | `wiki.rs:1482` 依赖 `SearchHit` ⇒ 它进 D.1 冻结集（本规格新增该依据） | 本规格登记 |
+| I-D（wiki）→ 我 | `wiki.rs:3186（t85 勘误：原 1482；锚 fn recall_stubs 定义行）` 依赖 `SearchHit` ⇒ 它进 D.1 冻结集（本规格新增该依据） | 本规格登记 |
 | 我 → integ（t19） | `crates/daemon/src/api.rs` 的 `knowledge_hit_json`（`:2983`）与面板 `Memory.tsx:367-384` / `Knowledge.tsx:418-470` 的改动**不在我 inScope**：本规格只给要求（C6），接线归 integ。**api.rs 是高冲突文件**（closure §7.62、mem-core 也登记过），同一时间窗只许一个写者 | **本规格即登记**，见 §E9 |
 
 ---
@@ -630,11 +630,11 @@ pub fn rrf_weighted(rankings: &[(&[i64], f32)], k: u32) -> Vec<(i64, f32)>;
 | # | 交给谁 | 文件与坐标 | 需要什么 | 依据 |
 | --- | --- | --- | --- | --- |
 | H-1 | **integ（t19）** | `crates/daemon/src/api.rs:2983-3019`（`knowledge_hit_json`） | 每个分数键旁挂 `*_kind`：`semantic_score_kind` / `keyword_score_kind`；hit 增 `relevance` / `relevance_kind` / `fusion` / `leg_window`。**保留 `score_kind: "rrf_rank"` 字面量** | C6；A7；R-B D.7 |
-| H-2 | **integ（t19）** | `crates/daemon/src/api.rs:2466-2700`（`recall`）· `:4008-4058`（`knowledge_search`） | ② 把 `search_legs` 换成 `search_page`（一次调用拿到腿 + 量纲，消掉"第二条腿重算一遍"的 60% 代价 —— closure §7.47 已量过）；③ `recall_log` 的 4 个新列写入（`api.rs:2766`） | C5/C6；§E6 |
+| H-2 | **integ（t19）** | `crates/daemon/src/api.rs:2889（t85 勘误：原 2466-2700；锚 resolve_seeds（t80 复核））`（`recall`）· `:4008-4058`（`knowledge_search`） | ② 把 `search_legs` 换成 `search_page`（一次调用拿到腿 + 量纲，消掉"第二条腿重算一遍"的 60% 代价 —— closure §7.47 已量过）；③ `recall_log` 的 4 个新列写入（`api.rs:2766`） | C5/C6；§E6 |
 | H-3 | **integ（t19）** | `panel/src/views/Memory.tsx:367-384` · `Knowledge.tsx:418-470` · `panel/src/api.ts:206-211,1120-1125` | 并排显示时必须带量纲（`m 0.86 cosine` / `k 0.016 rrf_rank`），或干脆不并排 | C6；A7 |
 | H-4 | mem-core（I-B） | `crates/memory/src/inject.rs` | 用 `relevance`（而不是 RRF 名次分）做重排；**不得**把它当相似度送进注入 | B11；R-B D.7 |
 | H-5 | graph（I-C） | 无文件改动 | 想同源 CJK 能力就调 `fts::han_bigrams` / `match_bigrams`；**不许**复制新实现 | B4；R-C DEP-5 |
-| H-6 | wiki（I-D） | 无文件改动 | `SearchHit` 进冻结集（D.1） | `wiki.rs:1482` |
+| H-6 | wiki（I-D） | 无文件改动 | `SearchHit` 进冻结集（D.1） | `wiki.rs:3186（t85 勘误：原 1482；锚 fn recall_stubs 定义行）` |
 
 ### E10 schema 变更汇总（I-SCHEMA 照此落地，**一个文件**：`crates/store/src/migrations/0019_recall_quality.sql`）
 
@@ -881,3 +881,24 @@ git status --porcelain -- crates panel
 | `trigram` 对 2 字查询 | **0/40**（与 FTS5 文档一致） | A8/B3 |
 | `limit` 改变 top-1 | **2/13**（10→20 之间） | A4 |
 | 记忆余弦 vs 知识名次分 | 0.86 vs 0.016（4 种量纲 / 2 个字段名） | A7 |
+
+---
+
+## t85 坐标勘误（2026-09-29）
+
+**为什么**：本文件里的 `crates/….rs:NNN` 引用是**判据来源**，代码一动行号就漂。t80 审计（D-2）与 `scripts/spec-anchors.ps1` 实测：引用句里反引号点名的**符号**如果由该文件**定义**，而所示行号 ±3 行内没有它，这条坐标就是错的 —— 下一位按坐标去核会读到无关代码并据此下结论。下表每条都**保留旧值**（就地标注 `（t85 勘误：原 …）`），旧引用形式逐字列在这里。
+
+| 行 | 旧引用（逐字） | 新引用 | 锚词 / 依据 |
+| --- | --- | --- | --- |
+| L77 | `crates/knowledge/src/store.rs:610` | `crates/knowledge/src/store.rs:165` | `LEG_WINDOW=60`；`limit.max(10)` 只剩 :160 注释（t80 复核） |
+| L108 | `crates/daemon/src/api.rs:3003` | `crates/daemon/src/api.rs:2973-2985` | `score_kind` / `rrf_rank`（t80 复核） |
+| L165 | `api.rs:3003` | `api.rs:2973-2985` | 同上 |
+| L328 | `api.rs:3003` | `api.rs:2973-2985` | 同上 |
+| L331 | `api.rs:3003` | `api.rs:2973-2985` | 同上 |
+| L404 | `crates/daemon/src/wiki.rs:1482` | `crates/daemon/src/wiki.rs:3181` | `recall_stubs`（t80 复核；定义行 = `:3186 pub fn recall_stubs`） |
+| L405 | `crates/daemon/src/memembed.rs:310` | `crates/daemon/src/memembed.rs:581` | `rrf(&[sem_ids, kw_ids], RRF_K)`（t80 复核） |
+| L527 | `memembed.rs:310` | `memembed.rs:581` | 同上 |
+| L541 / L637 | `wiki.rs:1482` | `wiki.rs:3186` | `fn recall_stubs` 定义行 |
+| L633 | `crates/daemon/src/api.rs:2466-2700` | `crates/daemon/src/api.rs:2889` | `resolve_seeds`（t80 复核） |
+
+**未收口（仍在本文件里，但检查器只能判 SUSPECT/UNVERIFIED —— 需要人工裁定，不要当成已修）**：`api.rs:3006/3008/2591/2581-2582/2766/2858`、`memembed.rs:41-104`、`store.rs:274/488/510-543/517/545-566/614/609-680`、`retrieval-quality.rs:452`、`retrieval-legs.rs:147`、`fts.rs:68`、`rrf.rs:1-16/1-2`、`inject.rs:276-289`、`output.rs:49`（**该文件不存在**）。owner：recall 规格属主。

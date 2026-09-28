@@ -43,7 +43,7 @@
 | A3 | episodes 与「蒸馏来源」的可用性 | `episodes` 全表 17 行 | `S`: `SELECT kind,COUNT(*) FROM episodes GROUP BY 1` | `mcp_write` **16**、`manual` **1**、`run_turn` **0**。**不可判定**：ep17 的 content 是 `legacy distilled memories: the [distilled] body prefix was r…`（2026-09-26T21:09:10Z），而盘上有 `ruagent.db.before-t229-cleanup-20260926-150802`（1.36 MB）⇒ 156 条指向 ep17 的记忆是 **t347 的回填**，不是 distill 写的；活库因此**不能**用来判断「distill 的 run_turn episode 路径是否可用」。判据必须另开干净库（见 C·G3） | 同上 |
 | A4 | distill 的产出记账 | `distill_log` 全表 33 行 | `S`: `SELECT COUNT(*), SUM(memories_written),SUM(entities_written),SUM(relations_written) FROM distill_log` | 33 行；三者全 0 **18/33 = 54.5%**；entities=0 **21/33 = 63.6%**；relations=0 **26/33 = 78.8%**；累计写入 mem **85** / ent **69** / rel **39**；agent 全是 `dsh` | **窗口 2026-09-13T17:06:33Z .. 2026-09-26T10:28:22Z** |
 | A5 | distill 的失败率（日志侧，窗口与 A4 **不同**） | `daemon.log` 全部 360 行；其中含 `distill` 的 22 行 | `S`: `Select-String daemon.log -Pattern "distill"` | 22 行 Try 中 **1 行成功**（`auto-distilled … memories=9 entities=8`，10:28:22.967Z）+ **21 行 WARN `auto-distill failed … error=Query returned no rows`** = **95.5% 失败**。同一窗口内 `distill_log` **只有 1 行**（`ruagent:5213faf6e69d4fbf`，mem 9 / ent 8 / rel 7）⇒ **库里只记 1/22 = 4.5% 的尝试** | **窗口 2026-09-26T04:52:45Z .. 2026-09-27T13:48:48Z**（= 当前 daemon.log 文件首行..末行；日志在 5 MB 轮转） |
-| A6 | 失败根因（只读核对） | A5 的 21 个失败 session key | `S`: `SELECT COUNT(*) FROM sessions WHERE key=?` | 21 个 key **现在全部**在 `sessions` 里（现场逐个查了 6 个 + 33 个 distill_log key 全部命中）⇒ 失败不是「会话不存在」，而是**索引落地与自动蒸馏的竞态**；失败串来自 `distill.rs:256`（`load_messages` 的 `session not indexed` 路径，实际是 `QueryReturnedNoRows`） | 同上 |
+| A6 | 失败根因（只读核对） | A5 的 21 个失败 session key | `S`: `SELECT COUNT(*) FROM sessions WHERE key=?` | 21 个 key **现在全部**在 `sessions` 里（现场逐个查了 6 个 + 33 个 distill_log key 全部命中）⇒ 失败不是「会话不存在」，而是**索引落地与自动蒸馏的竞态**；失败串来自 `distill.rs:497（t85 勘误：原 256；锚 load_messages 定义）`（`load_messages` 的 `session not indexed` 路径，实际是 `QueryReturnedNoRows`） | 同上 |
 | A7 | 关系词表 | `entity_edges` 67 行的 `relation` | `P`（A2） | 不同关系名 **35**；只出现 1 次的 **24（68.6%）**；当前有效边前五：`uses 12`、`supports 4`、`orchestrates 4`、`integrates_runtime 3`、`borrows_design_from 3`。长名字例：`uses_model_for_permission_gatekeeping`、`uses_as_production_database` | 至 2026-09-27T13:58Z |
 | A8 | 时序有效性是否携带信息 | `entity_edges` 67 行 | `P`（A3） | `abs(valid_at − created_at)`：**66/67 ≤ 1 秒**（中位 0.000），只有 **1 行 > 60 秒**（最大 41920.26 s）。`invalid_at = expired_at` 的 **0/7**。⇒ 所谓双时态的事件时间轴在 98.5% 的边上**等于写入时刻**；7 条被失效的边里有同一事实的中英改写各一条（edge 18 英文 → edge 33 中文 → edge 66 现行） | 同上 |
 | A9 | 实体消解 / 别名 | `entities` 63 行的 `name` | `P`（A4） | 判据：去尾部括号后小写归一相等 = **3 组**（`Agent Client Protocol (ACP)` ↔ `Agent Client Protocol`；`Model Context Protocol (MCP)` ↔ `Model Context Protocol`；`DeepSeek Harness (dsh)` ↔ `DeepSeek Harness`）；再做 token 子集 = **+1 对**（`Graphiti` ⊂ `Graphiti / Zep`）。**冗余实体 4 个 / 63 = 6.3%**，且 `dsh`(#58)/`acpx`(#41)/`dsh-kanban`(#59) 这一族无法用同一判据自动裁决（需要别名表或人工未决队列） | 同上 |
@@ -151,10 +151,10 @@
 - **标定读数**：孤立实体 **20/63 = 31.7%** 必须先补边（或先承认覆盖率分母只有 43）——这是「先量分母再定 target」的一次练习；B2 的 4%/700× 是 AP 语料读数，本地必须自测
 
 ### G9 distill 三态可观测（失败不再只活在日志里）
-- **metric**：同一窗口内 `distill_log` 行数 ÷ `daemon.log` 里的 distill 尝试数；`status ∈ {ok, empty, failed}` 的分布
+- **metric**：同一窗口内 `distill_log` 行数 ÷ `daemon.log` 里的 distill 尝试数；`status ∈ {ok, empty, failed}` 的分布 **（t85 勘误 D-4：迁移 `0024_distill_attempts.sql` 已把 `distill_log` 重建为「一次尝试一行」⇒ 行数**就是**尝试数，旧表「一 session 一行」的前提不存在；见文末 t85 勘误段）**
 - **baseline**：**库 1 行 / 日志 22 次尝试**（21 失败 = 95.5%），差值 **21**（A4/A5，**同一窗口 09-26T04:52:45Z..09-27T13:48:48Z**）
 - **target**：同窗口差值 **0**；每个失败行带 `failure_reason`；`empty`（抽到空数组）与 `failed`（agent 报错 / 会话未索引 / 超时）可区分；`failed` 行**绝不**创建 episode（mem-core D4 硬约束）
-- **复现命令**：`Select-String $env:USERPROFILE\.ruagent\logs\daemon.log -Pattern "distill"` 与 `S`: `SELECT status,COUNT(*) FROM distill_log GROUP BY 1`
+- **复现命令**：`Select-String $env:USERPROFILE\.ruagent\logs\daemon.log -Pattern "distill"` 与 `S`: `SELECT status,COUNT(*) FROM distill_log GROUP BY 1` **（t85 勘误 D-4：这条 SQL 在 0024 之后读的是**尝试**级行 —— 与 `daemon.log` 的尝试数应当**相等**；旧的「差值 21」只在 0024 之前可复现）**
 - **标定读数**：21 个失败 key 现在**全部**在 `sessions` 里（A6）⇒ 根因是竞态而非数据缺失；`Query returned no rows` 来自 `distill.rs:256`。两个窗口不同这件事必须写在读数里（mem-core 2026-09-27 明确要求）
 
 ### G10 图证据真的进过注入（mem-core 要的第三层证据）
@@ -162,7 +162,7 @@
 - **baseline**：**0**（closure §1 行 40，t259：79 个注入事件里含 knowledge/wiki/entity 块的 = 0）
 - **target**：≥ **1** 个运行路径事件里出现 `<graph>`，且块内每条路径能回溯到 `edge_id`（`events` 与 `transcripts` 两侧一致）
 - **复现命令**：`Select-String $env:USERPROFILE\.ruagent\transcripts\*.jsonl -Pattern "<graph>"`
-- **标定读数**：`tag_rank` 对**未知** tag 返回 **5**（`crates/memory/src/inject.rs:268`）⇒ 不把 `graph` 加进词表的话，图块会被**第一个丢弃**。mem-core 2026-09-27 已同意把位置定在 `knowledge(2)` 与 `wiki(4)` 之间（graph=3），并标注这是**策略变更**（`wiki`/`project_context` 的 rank 各 +1）
+- **标定读数**：`tag_rank` 对**未知** tag 返回 **6**（t85 勘误 D-3：此处原写 **5**、坐标原写 `:268`；今天 `crates/memory/src/inject.rs:326` 是 `fn tag_rank`、`:334` 是 `_ => 6`；详见文末 t85 勘误段）⇒ 不把 `graph` 加进词表的话，图块会被**第一个丢弃**。mem-core 2026-09-27 已同意把位置定在 `knowledge(2)` 与 `wiki(4)` 之间（graph=3），并标注这是**策略变更**（`wiki`/`project_context` 的 rank 各 +1）
 
 ---
 
@@ -391,7 +391,7 @@ ContextItem::dated(
 | D4 | 失败路径第一次写 `distill_log`（`status`/`failure_reason`）；`log_outcome`（216-237）扩列 | **同意**，并升为契约 | 失败行**绝不**创建 episode；面板「已蒸馏」布尔只允许来源于 `episodes.kind='run_turn'`（mem-core 的 `distilled = EXISTS(episode e JOIN memories m ON m.source_episode=e.id WHERE e.kind='run_turn')`） |
 | D5 | 抽到空数组时写 `status='empty'`，与「被去重跳过」区分 | **同意** | `empty` 需与 D3 闸门3 的 prompt 指纹一起读，才能回答「是抽取变严了，还是会话真没内容」 |
 
-**边界声明（写进规格，避免下游误读）**：D1/D2/D4/D5 都只动 `distill.rs` 与 `entity_edges`/`distill_log` 的写入，**不改 `memories` 行的语义**；D3 是本清单里唯一可能影响记忆产出的改动，因此它带着三条闸门。`builtin_extraction_prompt()`（`distill.rs:582`）被面板设置页**只读展示** ⇒ 改 prompt 等于改用户看到的文本，面板文案归 I-D/ integ 负责（不阻断）。
+**边界声明（写进规格，避免下游误读）**：D1/D2/D4/D5 都只动 `distill.rs` 与 `entity_edges`/`distill_log` 的写入，**不改 `memories` 行的语义**；D3 是本清单里唯一可能影响记忆产出的改动，因此它带着三条闸门。`builtin_extraction_prompt()`（`distill.rs:883（t85 勘误：原 582；锚 builtin_extraction_prompt 定义）`）被面板设置页**只读展示** ⇒ 改 prompt 等于改用户看到的文本，面板文案归 I-D/ integ 负责（不阻断）。
 
 ### E.11 与 I-A / I-B / I-D / I-SCHEMA 的边界（逐项：不冲突）
 
@@ -740,3 +740,35 @@ RV-C2-8 指出：§C 里还有三条复现命令指向**不存在**的测试 tar
 | 4 | §C·G8 target「三指标成对判决 ≥60%」 | 需要 LLM 成对判决**跑批**（协议照 B2）；本代没有该 harness，也没有带标签的对照组 | 评测 harness + 对照组（无社区层 vs 有社区层） | 评测（角色=跑批） |
 
 **替代性收获（不是这四条的替代，而是它们的机制半边）**：G8 的结构侧在本代**已经可判**并已升级为**前置条件** + 两条**可被证伪**的新指标（H.3 第 4 条 / §C·G8），所以「社区层有没有结构」这件事没有停在 `deferred` 里；G7 的关系 P 也已在本代达标关闭。**deferred 剩下的恰是没有数据/没有跑批的那部分。**
+
+---
+
+## t85 坐标勘误（2026-09-29）
+
+| 行 | 旧引用（逐字） | 新引用 | 锚词 / 依据 |
+| --- | --- | --- | --- |
+| L46 | `distill.rs:256` | `distill.rs:497` | `load_messages` 定义行 |
+| L394 | `distill.rs:582` | `distill.rs:883` | `builtin_extraction_prompt` 定义行 |
+
+**同批的语义勘误（不是坐标）见下两节**：D-3（`tag_rank` 未知 tag 5→6）与 D-4（G9 相对迁移 0024）。
+
+**未收口（SUSPECT/UNVERIFIED）**：`api.rs:776/784/1070/1095/1161/2524/4602`、`distill.rs:256/520`、`store.rs:488`、`inject.rs:268`、`lib.rs:309`（**缺 crate 名**）。其中 `api.rs:2524` 现在指的是**已被 DEP-1 改变**的召回路径（t80 D-7），owner：graph 规格属主。
+
+### t85 勘误 D-3：`tag_rank` 对未知 tag 返回 **6**，不是 5（2026-09-29）
+
+**原文（逐字保留）**：`- **标定读数**：\`tag_rank\` 对**未知** tag 返回 **5**（\`crates/memory/src/inject.rs:268\`）⇒ 不把 \`graph\` 加进词表的话，图块会被**第一个丢弃**。`
+
+**更正**：`tag_rank` 的兜底分支今天是 `crates/memory/src/inject.rs:334 _ => 6`（`profile=0 memories=1 knowledge=2 graph=3 wiki=4 project=5 **unknown=6**`；`gen2-integration-contract.md` §3.2 的读数也是 6）。**方向不变**（未登记 tag 会被**最后**丢弃），但按 5 去推 `graph` 的插入位置会算错一格。旧坐标 `inject.rs:268` 也已漂（定义在 `:326`）。
+
+### t85 勘误 D-4：G9 的判据落后于迁移 0024（2026-09-29）
+
+**原文（逐字保留）**：
+`- **metric**：同一窗口内 \`distill_log\` 行数 ÷ \`daemon.log\` 里的 distill 尝试数；\`status ∈ {ok, empty, failed}\` 的分布`
+`- **复现命令**：… \`SELECT status,COUNT(*) FROM distill_log GROUP BY 1\``
+
+**更正**：仓库现在有 **25** 个迁移（最大 `0025_query_eval_gold_unique.sql`），其中 **`crates/store/src/migrations/0024_distill_attempts.sql`** 把 `distill_log` **重建**为「**一次尝试一行**」：`CREATE TABLE distill_log_attempts (…)` → `ALTER TABLE distill_log_attempts RENAME TO distill_log` → `CREATE INDEX idx_distill_log_session ON distill_log(session_key, id)` → `CREATE INDEX … status`。因此在 **0024 之后**：
+* 「同一窗口内 `distill_log` **行数** ÷ `daemon.log` 尝试数」这个比值不再度量「一次 session 记了几次尝试」——行数现在**就是**尝试数（旧读法之所以能看出「库 1 行 / 日志 22 次」，是因为旧表按 `session_key` 一行一 session，**那个前提已被 0024 删除**）；
+* 旧 baseline「**库 1 行 / 日志 22 次尝试**（差值 21）」只在 **0024 之前**的库上可复现；在 0024 之后的库上，正确的读数形式是「`distill_log` 行数 == `daemon.log` 尝试数（差值 0）」+ `status` 分布 + `failure_reason`；
+* **判据本身（差值 0 / `empty` 与 `failed` 可区分 / `failed` 不建 episode）不变**，变的是它**所依据的数据模型**。
+
+**交回 finding（不在本单改）**：`gen2-integration-contract.md` §3.1 的落地表止于 `0023`，还没有 0024 的形状变更行 —— owner：contract（t64）。

@@ -105,9 +105,9 @@ Invoke-WebRequest "http://127.0.0.1:8787/api/v1/knowledge/wiki/pages" | % Conten
 | **D1c**（新增） | — | **成立** | B-21：`POST /wiki/build {"dry_run":true,"scope":"all","confirm_plan":1}` ⇒ **200**，返回 `build_id=3`（新行！）、`status:"planned"`，`confirm_plan` 被**静默忽略**。这正是 t294 §H1/closure §7.20 的同一形状，t300 只修了查询串（`?dry_run=true` → 400），**body 里的组合还在**。对照组（好的一侧）：`{"confirm_plan":<已完成的 build 2>}` ⇒ **400** `build 2 is not a reviewable dry-run plan` ✓ |
 | **D1d**（新增） | — | **成立** | B-05/B-21：只读计划构建仍写 `wiki_build_pages.status='pending'`（live 22/41 = 53.7%，canary 2/3）。`pending` 因此同时意味着「在途」和「终态、永不会执行」。canary 是新库，所以这不是历史数据问题 |
 | **D2** | 无「引用可验证」门 | **成立，且比原话强（原话说「不能逐条指回 chunk」，现场是「一条都没有、也没人检查」）** | B-21 的活体：正文含「Alpha 有两个分部，**年收入 123 亿美元**」——来源 `src-alpha.md` 全文只有 “Alpha has two divisions.” 与 “Beta ships in autumn.”；且正文**完全没有** `## 来源` 节（写者 prompt 的硬规则），构建仍 `done`、`pages_written=1`、页行 `written`。stage-3 的全部校验是两行：`body.starts_with("# ")` 与 `chars ≤ 10_000`（`wiki.rs:1121-1128`） |
-| **D3** | 无失效检测 / 增量刷新 | **部分成立：哈希失效信号存在且活体正例可复现；缺的是「持久化 + 动作 + 一致性」** | 存在：`stale` 由 `source_hashes` 与磁盘比对，在 **5 处**各自实现一遍（`wiki.rs:525` `wiki_state` · `1227` `regenerate_index` · `1446` `pages` · `1501` `recall_stubs` · `1602` `entity_related_pages`），B-11 已复现 false→true。缺 ①：`stale` 每次请求现算、从不落库，无 `stale_since`/`stale_sources`（`0010` 无对应列）。缺 ②：没有任何路径因为「页 stale」而重写它——`Scope::Changed` 选的是**来源**、planner 只被**告知** `[stale]`（`wiki.rs:556`）、`keep` 一律跳过。缺 ③：B-11 里 `GET /wiki/pages` 说 stale=true，而**人读的 `index.md` 没有任何标记**（`regenerate_index` 只在构建末尾算一次）。缺 ④：真库正例 0/4（B-10），即这条信号在生产上从未被观测到触发 |
-| **D4** | 无纠错回路（人改不了、也记不下为什么改） | **部分成立：「冻结」有，「回路」没有** | 有：§13-3 的手改保护工作正常（`wiki.rs:1030-1039`；mock 测试断言 `手工批注` 在后续构建中存活）。缺 ①：改动**没有任何记录**——无 reason / author / 时点，`wiki_build_pages.error` 只有一句 "human-edited since last build — skipped (§13-3)"。缺 ②：被改的页从该构建起**永久 skip**（planner 被告知默认 keep），因此来源以后的所有变化都进不了它，而它仍以 `stale=false` 的身份继续出现在 wiki 召回命中里 ⇒ **一次人工修正 = 一次静默写死**。缺 ③：同一个消费面的另一半（`crates/knowledge`）**有**完整的修订回路 `edit_chunk`（`files.rs:354`）、`chunk_revisions`（`467`）、`rollback_revision`（`505`），wiki 侧没有对应物 |
-| **D5** | 链接图没有质量读数（孤儿页、断链） | **不成立（读数已经有了）——但真实缺陷更窄、也更硬** | 已有：`WikiLinks{broken, orphans}`（`wiki.rs:1283`）、`links_in/links_out`（`WikiPageInfo`），B-13/B-16 现场取到 5 断链 / 0 孤儿。真缺陷四条：① **两面口径不一致**（B-14：2/4 页；成因是断链被计入 `links_out`、自链被一面算一面丢：`wiki.rs:1464` 的 `links_out = targets.len()`（含自链、含断链）vs `wiki.rs:1368-1370` 的 `link_graph`（丢自链、断链不计边））；② **断链无归属**（B-15：0/5 带需求方）⇒ 增长回路无法按需求强度排序；③ **图读数不持久**（无表、`wiki_builds` 无任何图列）⇒ 「这次构建让图变好了吗」不可答；④ `orphans` 的定义是「无出链且无入链」，B-16 活体证明它与「不可达」不是一回事（唯一入口 `index.md` 被排除） |
+| **D3** | 无失效检测 / 增量刷新 | **部分成立：哈希失效信号存在且活体正例可复现；缺的是「持久化 + 动作 + 一致性」** | 存在：`stale` 由 `source_hashes` 与磁盘比对，在 **5 处**各自实现一遍（`wiki.rs:877（t85 勘误：原 525；锚 regenerate_index 定义）` `wiki_state` · `1227` `regenerate_index` · `1446` `pages` · `1501` `recall_stubs` · `1602` `entity_related_pages`），B-11 已复现 false→true。缺 ①：`stale` 每次请求现算、从不落库，无 `stale_since`/`stale_sources`（`0010` 无对应列）。缺 ②：没有任何路径因为「页 stale」而重写它——`Scope::Changed` 选的是**来源**、planner 只被**告知** `[stale]`（`wiki.rs:877（t85 勘误：原 556；锚 regenerate_index 定义）`）、`keep` 一律跳过。缺 ③：B-11 里 `GET /wiki/pages` 说 stale=true，而**人读的 `index.md` 没有任何标记**（`regenerate_index` 只在构建末尾算一次）。缺 ④：真库正例 0/4（B-10），即这条信号在生产上从未被观测到触发 |
+| **D4** | 无纠错回路（人改不了、也记不下为什么改） | **部分成立：「冻结」有，「回路」没有** | 有：§13-3 的手改保护工作正常（`wiki.rs:1030-1039`；mock 测试断言 `手工批注` 在后续构建中存活）。缺 ①：改动**没有任何记录**——无 reason / author / 时点，`wiki_build_pages.error` 只有一句 "human-edited since last build — skipped (§13-3)"。缺 ②：被改的页从该构建起**永久 skip**（planner 被告知默认 keep），因此来源以后的所有变化都进不了它，而它仍以 `stale=false` 的身份继续出现在 wiki 召回命中里 ⇒ **一次人工修正 = 一次静默写死**。缺 ③：同一个消费面的另一半（`crates/knowledge`）**有**完整的修订回路 `edit_chunk`（`files.rs:505（t85 勘误：原 354；锚 rollback_revision 定义）`）、`chunk_revisions`（`467`）、`rollback_revision`（`505`），wiki 侧没有对应物 |
+| **D5** | 链接图没有质量读数（孤儿页、断链） | **不成立（读数已经有了）——但真实缺陷更窄、也更硬** | 已有：`WikiLinks{broken, orphans}`（`wiki.rs:2666（t85 勘误：原 1283；锚 WikiLinks 定义）`）、`links_in/links_out`（`WikiPageInfo`），B-13/B-16 现场取到 5 断链 / 0 孤儿。真缺陷四条：① **两面口径不一致**（B-14：2/4 页；成因是断链被计入 `links_out`、自链被一面算一面丢：`wiki.rs:2666（t85 勘误：原 1464；锚 WikiLinks 定义）` 的 `links_out = targets.len()`（含自链、含断链）vs `wiki.rs:2666（t85 勘误：原 1368-1370；锚 WikiLinks 定义）` 的 `link_graph`（丢自链、断链不计边））；② **断链无归属**（B-15：0/5 带需求方）⇒ 增长回路无法按需求强度排序；③ **图读数不持久**（无表、`wiki_builds` 无任何图列）⇒ 「这次构建让图变好了吗」不可答；④ `orphans` 的定义是「无出链且无入链」，B-16 活体证明它与「不可达」不是一回事（唯一入口 `index.md` 被排除） |
 | **D6**（新增） | — | **成立** | 页面身份不稳定：同一主题在 `wiki_build_pages` 里走过 `rose-gardening`（build 3 `delete`，行 12）→ `gardening-roses`（build 4 `create`，行 19）。重命名 = 删除 + 重建，入链/历史/`wiki_page_hashes` 全部断掉 |
 | **D7**（新增） | — | **成立** | B-06：`wiki_page_hashes` 有 5 行，`doctor-probe` 无文件、无 `documents` row。`delete` 路径会 `clear_page_hash`，但「文件在别处被删（扫描器删 row、或人手删文件）」这条路径没人清理它 |
 
@@ -308,7 +308,7 @@ pub struct WikiPageInfo {
 }
 ```
 
-**`links_out` 的语义收窄（唯一一处破坏性变更）**：`links_out` 从「去重后的目标数（含自链、含断链）」改为「**去重后的目标数（含断链，不含自链）**」，与 `link_graph` 一致。现场影响：`cooking-pasta` 3→2（自链转记 `self_links=1`），其余 3 页不变；`crates/daemon/tests/knowledge_api.rs:478`（`links_out == 2`）不受影响（该页无自链）。
+**`links_out` 的语义收窄（唯一一处破坏性变更）**：`links_out` 从「去重后的目标数（含自链、含断链）」改为「**去重后的目标数（含断链，不含自链）**」，与 `link_graph` 一致。现场影响：`cooking-pasta` 3→2（自链转记 `self_links=1`），其余 3 页不变；`crates/daemon/tests/knowledge_api.rs:480（t85 勘误：原 478；锚 links_out 钉住行（t80 复核））`（`links_out == 2`）不受影响（该页无自链）。
 
 ### D.3 链接图（`WikiLinks`）— 现有键全部保留，新增 5 项
 
@@ -635,7 +635,7 @@ wiki/kubernetes-troubleshooting: Kubernetes 故障排查 — stale=false coverag
 crates/daemon/src/wiki.rs
 crates/mock-agent/tests/wiki_pipeline.rs
 ```
-`crates/daemon/tests/knowledge_api.rs` **不在** I-D 的 inScope：它用**逐字段断言**钉住了今天的形状（`knowledge_api.rs:478-506`：`links_out==2`、`broken==["k8s"]`、`orphans==["orphan-page"]`）。D.2/D.3 落地后它必须被更新，**由 I-INT（或 captain 改派）修改**；I-D 不得碰它，否则一个文件两个写者。I-D 自己的端点回归放在 `wiki_pipeline.rs`（那条路径完全在 inScope 内）。
+`crates/daemon/tests/knowledge_api.rs` **不在** I-D 的 inScope：它用**逐字段断言**钉住了今天的形状（`knowledge_api.rs:480-506（t85 勘误：原 478-506；锚 links_out 钉住行（t80 复核））`：`links_out==2`、`broken==["k8s"]`、`orphans==["orphan-page"]`）。D.2/D.3 落地后它必须被更新，**由 I-INT（或 captain 改派）修改**；I-D 不得碰它，否则一个文件两个写者。I-D 自己的端点回归放在 `wiki_pipeline.rs`（那条路径完全在 inScope 内）。
 
 ### E.2 请求 I-SCHEMA 的 schema 变更（`crates/store/src/migrations/0019_wiki_gen2.sql`）
 
@@ -746,7 +746,7 @@ CREATE INDEX idx_wiki_corrections_slug ON wiki_corrections(slug, at);
 | 变更 | 文件 | 所有者 | I-D 的关系 |
 | --- | --- | --- | --- |
 | 迁移 0019（DDL-1…7）、`Db` 仓储方法 | `crates/store/src/**` | **I-SCHEMA (t6, recall)** | I-D **只请求**，不写。I-D 的每一次写都用现成的 `Db::call/call_flat`（`wiki.rs` 已有 `run_write` 封装） |
-| chunk 读取面 `Knowledge::document_chunks(id) -> Vec<(i64,String)>`（`store.rs:708`） | `crates/knowledge/src/**` | **I-A (t7, recall)** | **I-D 不需要 I-A 改任何东西**：锚的校验只需 `document_chunks`（拿 `chunk_id` + 正文）+ `documents`（用 `Knowledge::list_documents`）+ 页里的 `source_hashes`。`chunk_hash` 由 I-D 在 daemon 侧对正文算 sha256（`ruagent_knowledge::sha256_hex` 已导出，`lib.rs:36`）。**反向约束**：I-A 不要把 `chunks.content` 改成带语境前缀的文本（B3 的不采纳项），否则 `chunk_hash` 的语义与「逐字证据」一起漂移 |
+| chunk 读取面 `Knowledge::document_chunks(id) -> Vec<(i64,String)>`（`store.rs:1299（t85 勘误：原 708；锚 list_documents 定义）`） | `crates/knowledge/src/**` | **I-A (t7, recall)** | **I-D 不需要 I-A 改任何东西**：锚的校验只需 `document_chunks`（拿 `chunk_id` + 正文）+ `documents`（用 `Knowledge::list_documents`）+ 页里的 `source_hashes`。`chunk_hash` 由 I-D 在 daemon 侧对正文算 sha256（`ruagent_knowledge::sha256_hex` 已导出，`lib.rs:36`）。**反向约束**：I-A 不要把 `chunks.content` 改成带语境前缀的文本（B3 的不采纳项），否则 `chunk_hash` 的语义与「逐字证据」一起漂移 |
 | `RetrievalHit.lead: Option<WikiLeadMeta>` + `<wiki>` 块渲染（D.7） | `crates/memory/src/inject.rs` | **I-B (t8, mem-core)** | I-D 提供**数据**（`WikiLead`/`lead_for`），I-B 提供**契约字段**。I-D 不改 memory；I-B 不改 wiki.rs。类型形状已在 D.7 冻结（纯数据，不反向依赖 daemon） |
 | `chat.rs`/`runs.rs` 的 `RetrievalHit` 构造点、`api.rs` 的端点装配、`crates/daemon/tests/knowledge_api.rs` | `crates/daemon/src/{chat,runs,api}.rs`、`crates/daemon/tests/knowledge_api.rs` | **I-INT (t19, integ)** | I-D 不碰。需要 I-INT 吃下的三件事：① 两个构造点填 `lead`；② `/wiki/pages`、`/wiki/links` 的新字段直接透传（`wiki.rs` 已序列化好）；③ `knowledge_api.rs` 的逐字段断言按 D.2/D.3 更新 |
 | 纠错的**写**端点（`POST /api/v1/knowledge/wiki/pages/{slug}/corrections`） | `crates/daemon/src/api.rs` | **I-INT** | I-D 只给 `add_correction` 签名与语义 |
@@ -787,3 +787,21 @@ finally { Stop-Process -Id $proc.Id -Force }   # 绝不按名字/端口杀
 ```
 
 本单**未做**的事（照规矩列出来）：未改任何代码；未调用 `/api/v1/recall`；未对真库跑任何 wiki build（只读探测）；未启停真守护进程（pid 79984 在 21:46 仍是活的，启动时间 2026-09-27 05:35:37 +08:00）；未把写操作放到临时 root 之外。
+
+---
+
+## t85 坐标勘误（2026-09-29）
+
+| 行 | 旧引用（逐字） | 新引用 | 锚词 / 依据 |
+| --- | --- | --- | --- |
+| L108 | `wiki.rs:525` | `wiki.rs:877` | `regenerate_index` 定义行 |
+| L108 | `wiki.rs:556` | `wiki.rs:877` | 同上 |
+| L109 | `files.rs:354` | `files.rs:505` | `rollback_revision` 定义行 |
+| L110 | `wiki.rs:1283` | `wiki.rs:2666` | `WikiLinks` 定义行 |
+| L110 | `wiki.rs:1464` | `wiki.rs:2666` | 同上 |
+| L110 | `wiki.rs:1368-1370` | `wiki.rs:2666` | 同上 |
+| L311 | `crates/daemon/tests/knowledge_api.rs:478` | `crates/daemon/tests/knowledge_api.rs:480` | `links_out` 钉住行（t80 复核） |
+| L638 | `knowledge_api.rs:478-506` | `knowledge_api.rs:480-506` | 同上 |
+| L749 | `store.rs:708` | `store.rs:1299` | `list_documents` 定义行 |
+
+**未收口（SUSPECT/UNVERIFIED，需人工裁定）**：`wiki.rs:321-343/354/776/789/1030-1039/1121-1128/1322/1522`、`files.rs:290-309`、`inject.rs:274/651`、`runs.rs:1884-1893`、`chat.rs:560-569`、`knowledge_api.rs:478-506`、`store.rs:708`、`lib.rs:36`（**缺 crate 名**）。owner：wiki 规格属主。

@@ -324,6 +324,41 @@ gh api <output.annotations_url> | ConvertFrom-Json                           # :
 
 **嫌疑面（按证据排序）**：`crates/daemon/src/orphans.rs` 是仓库里**唯一的**平台分叉源文件（**6 处 `#[cfg(unix)]` + 6 处 `#[cfg(windows)]`**：`unix_children` 扫 `/proc` 按 ppid 匹配、`unix_process_start` 读 `/proc/<pid>/stat` 第 22 字段 + `/proc/stat` 的 `btime`、`read_stat_field` 用 `rsplit(')')` 取 comm 之后的字段）—— 这些 Unix 分支**在这台 Windows 开发机上从未被编译或执行**，今天第一次在 ubuntu 上跑。**captain 逐行读过，未发现明显缺陷**（字段偏移与 `/proc` 语义对得上）⇒ 嫌疑**不能**停在这里，需日志定位。`crates/knowledge/src/files.rs` 的 2 处命中**只是文档注释**（提到 symlink），**已排除**；`crates/acp/src/fs_tools.rs` 1 处待查。
 
+## B20. t85（规格坐标漂移）与 t107（e2e 打活守护进程）
+
+**t85 完成（review）**：新增 `scripts/spec-anchors.ps1`（三层检查器）+ 四份规格勘误 + `gen3-spec-errata.md`。**读数**：改前 `refs=158 pass=5 drift=20 suspect=43 unverified=133 unresolved=9 → exit 1`；改后 `refs=153 pass=20 **drift=0** suspect=42 unverified=133 unresolved=9 → **exit 0**`；**负控**（副本里把 `wiki.rs:877` 改成 `:100`）⇒ `DRIFT … 'regenerate_index' lives at :877` + **exit 1**（`-Spec` 传副本、仓库未动）。**三层只有一层会红**：DRIFT（反引号点名了**该文件定义**的符号、而行 ±3 内没有它）/ SUSPECT（只有使用点锚词，打印）/ UNVERIFIED（无可判别符号、basename 多义、文件不存在；打印+计数）。**它不是偷懒，是被读数逼出来的**：天真版「任一 token 不在该行 ⇒ 红」给 **122** 处、「代码形状+稀有」97、「反引号+稀有」60、加「必须是定义符号」才到 **20** ⇒ **122→20 是误报变少而非发现变少**（正是 t92 的头号告诫）。代价：**42 SUSPECT + 133 UNVERIFIED 需要人工，作者明确没把它们写成「已核对」**。一次性勘误 `applied=34 missed=0`，**每条旧值就地保留**；检查器**跳过并计数**勘误段内的旧引用。**交回**：① 契约 §3.1 落地表**止于 0023**、缺 `0024_distill_attempts.sql` 的形状变更行（owner `t64`，冻结）；② **9 条无法解析的引用**（basename 匹配多个文件；`output.rs:49` **全仓无此文件**）⇒ 建议规格一律写全 `crates/…`；③ 42 SUSPECT；④ 133 UNVERIFIED（**不是已核对**）。**未接进 CI**（接线时要带「改坏⇒红」负控）；作者**请求不要把 t85 的评审派给它自己**。
+
+**t107 立单（wiki）**：**e2e 默认打操作者的活守护进程并写活库**。根因：`panel/playwright.config.ts:36` 的 `baseURL ?? "http://127.0.0.1:8787"` + `run-e2e.mjs:9-16` 不设 `E2E_BASE_URL`；`consumption.spec.ts:48-65` 的 beforeAll **写记忆 + `recall_log`** 而 afterAll 不删；**证据**：活库（只读指纹）里有 1 条该 spec 的探针记忆 + 4 条 query 含 `consumption` 的 `recall_log` 行，而该 spec **今天 04:25 才进仓库** ⇒ 只能来自今天那几次 e2e。⇒ 那条「Wiki 覆盖率」红点**既不是实现回归也不是断言过期**，而是 e2e 被指到一个**两天前的旧守护进程**（其镜像 09/27 05:35:34 **早于**把 `cite_coverage` 加进 `WikiPageInfo` 的 `0da0cb6`；把同一旧镜像跑在临时 root 上 ⇒ `has cite_coverage key: False`，与 `Received: undefined` 逐字对上）。**成对读数**：旧守护进程 `1 failed` → 当前字节 `1 passed (3.0s) exit 0`。**⚠️ 需用户知悉**：今天的 e2e 运行**写了活库**（1 条探针记忆 + 4 条 `recall_log`）—— 本会话对活库的规则是**只读**，故 captain 不自作主张清理，已如实上报并提供「清理 or 保留」选项。
+
+## B21. ubuntu 唯一的失败用例 = 一个平台幼稚的测试夹具（t108）
+
+**CI 原文**（run `36483026749` / `cfb52b1` 的 ubuntu job，完整日志）：
+```
+test the_seed_guard_tells_a_copy_from_the_live_root ... FAILED
+thread '…' panicked at crates/knowledge/tests/gold-seed-idempotence.rs:373:9:
+assertion `left == right` failed: the live database itself: C:\Users\x\.ruagent\data\ruagent.db
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+error: test failed, to rerun pass `-p ruagent-knowledge --test gold-seed-idempotence`
+```
+**同一轮其余 target 全部 `ok`**（daemon lib **80 passed**、35 passed、多组 7/8/5/3/2 passed、若干 `0 passed; N ignored`）⇒ **ubuntu 的 Rust 测试面只差这一条**。
+
+**根因（源码级）**：`gold-seed-idempotence.rs:350` 的 `live = PathBuf::from(r"C:\Users\x\.ruagent")` 与四个 `C:\…` 字面量。该测试想验的是 `common::is_inside` 的**逐组件包含**（含「兄弟目录 `…/.ruagent-other/…` 不得被前缀混淆」这条核心判据）。**Windows** 上反斜杠是分隔符 ⇒ 成立；**Linux** 上反斜杠只是普通字符 ⇒ 整串退化成**单个组件** ⇒ 第 1 个 case（期望 `true`）在 `:373` panic，文案正是 `the live database itself`。⇒ 与 CI 原文逐字吻合。
+**为什么此前一直绿**：本机是 Windows ⇒ 走另一条分支；**CI ubuntu 是该测试第一次在 Linux 上执行** —— **第 19 条**（门禁必须声明「哪一侧被跑过」）的一手实例。captain 此前对 `orphans.rs` 的逐行排查是**正确的否定结果**（真正的分叉点在测试里）。
+
+**t108 立单（recall）**：平台中立地构造夹具（**不许** `#[cfg(windows)]` 整段跳过）· 四个 case 一个不少 · **能红的负控**（把 `is_inside` 临时改成字符串前缀比较 ⇒ 兄弟目录那条必须红）· 读数含「为何此前本机绿」· **顺带精确正则全仓扫同类硬编码 `C:\` 字面量**（只报不改）。
+
+**取证技巧（本轮实践，与 t101 的 supersede 机制同源）**：**被后续推送取消（superseded）的 run，其已完成 job 的日志不再被 gate** ⇒ 想读某条早已结束的 job 日志，可以「推一个新提交把它取消」，但**代价是丢掉未完成 job 的结论**（本轮就因此丢掉了 windows 的结论）。反之，run 处于 `in_progress` 时**只有 annotations 可读**（见 §B19）。
+
+## B22. e2e 的 skip 清单与「无条件 skip」finding（t107 落地形状）
+
+**t107 的核心已由 wiki 落地（在途、未提交）**：`panel/e2e/run-e2e.mjs` 头部写入 **「AND IT REFUSES TO GUESS THE TARGET (t107)」** —— 不指名守护进程就**什么都不跑**（playwright 根本不启动，而非跑完再 skip）；**CI 显式豁免，豁免键是 `process.env.CI`，绝不是端口或 URL**（「本地运行无法走那条分支」）。`consumption.spec.ts:42-43` 已改为 `writeAccess()` + `test.skip(!access.allowed, access.reason)`。
+
+**skip 清单（19 处，captain 复核）**：`registry.spec.ts:22` 与 `consumption.spec.ts:43` 挂在 `writeAccess()`（CI 里 `run-e2e.mjs` 已武装 ⇒ 应当真跑）；其余多依赖环境（`list.ok()`/`mock`/`judge`/`made.ok()`/`put.ok()`/`enabled.length`/wiki 有页）。⇒ CI 里那个 `1 skipped` 最可能是 **`recall.spec.ts:32`**：
+```ts
+test.skip(true, "recall matched no memories in this database");
+```
+**这是无条件跳过** ⇒ **一个永远不会执行的覆盖**（属「静默跳过」家族；区别是 t104 之后它**至少会被点名** —— 这正是 `--reporter=list` 的价值）。**登记待判**：这条 spec 要么在 CI 的 fixture 下真的建出可匹配记忆（让它跑），要么被删/改写成有意义的条件跳过；**不许**把它当成「覆盖已存在」。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
@@ -372,6 +407,8 @@ gh api <output.annotations_url> | ConvertFrom-Json                           # :
 
 | C26 | **改了源码但没重建产物 ⇒ 假绿**（t103，integ 自曝） | 面板行为验证时，它改了 `Runtimes.tsx` 却**没有重建 `dist`** 就重跑 e2e ⇒ 服务的是**旧 bundle** ⇒ 负控「通过」了，但那是**旧行为**。它自己判定该次负控**无效**并重跑（删掉 F2 的清标记行 + `npm run build` ⇒ `expect(locator).not.toHaveText` 在 `failure-visibility.spec.ts:253` 红、1 failed/5 passed/exit 1；恢复后重建 ⇒ 6 passed/exit 0）。**判据**：**面板的任何行为读数（绿或红）都必须在 `npm run build` 之后取**；「上次构建的产物」是本代第 15 条（陈旧产物）的实例 | 全员 |
 | C27 | **`immutable=1` 是正确性，不是优化**（t75，mem-core 实测） | 朴素 `SQLITE_OPEN_READ_ONLY` 打开一份 WAL 副本，会**在用户数据目录里生成** `-shm`/`-wal`（实测生成 32,768 B 的 `-shm` 与 0 B 的 `-wal`，**而一个「遗忘报告」不许写它正在报告的那个目录**）。⇒ 判据：读副本必须 `immutable=1`；候选集排除 `-shm`/`-wal`；**带非空 `-wal` 的副本判为未测**。同族的两条：**读不出来的候选 ⇒ 该面 `total: None`（未测）而不是 0**；**文件种类必须按字节嗅探而不是按扩展名**（`-150802` 结尾的副本被 `.db` 过滤器漏掉 ⇒ 候选 1 vs 2） | 全员 |
+
+| C28 | **合法 YAML ≠ GitHub 可加载的工作流：非法 `${{ }}` 会拒掉整个文件，而 YAML 解析器看不见**（captain 本轮真实事故，一行修复 `5d3adfd`） | t104 在 `e2e.yml` 的 `run: |` **块标量内部**（即 shell 脚本正文、**不是 YAML 注释**）写了字面量 `` `${{ ... }}` ``。**GitHub 对整段 `run:` 字符串做表达式替换（shell 注释也照做）** ⇒ 去解析 `...` 这个非法表达式 ⇒ **整个 workflow 文件被拒**：run `36484582363` **0s、无 job**、`name` 退化成**文件路径**、纯文本视图直说「This run likely failed because of a workflow file issue」。**PyYAML 说该文件合法**（我复核过：229 行、0 tab、唯一 `${{` 就在那处）⇒ **守卫与我都漏了它**。**判据**：① workflow 里的 `${{ }}` 必须**逐个是合法表达式**，且在 `run:` 块内也要检查；② `concurrency.group` 里的合法表达式**不许**被误报；③ 推一个改动过 workflow 的提交前，**必须用能看见这一层的检查**（已并入 t106 的验收，带「写 `${{ ... }}` ⇒ 必须红」的负控）。**旁证**：`ci.yml:30` 的 `${{ github.workflow }}-${{ github.ref }}` 是合法的、不在 run 块内 ⇒ 那次 CI run 只是 `pending`（没被拒），两件事正好互证 | captain + t106 |
 
 ## D. 纪律账
 

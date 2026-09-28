@@ -15,11 +15,32 @@
 //       recorded one no longer applies. Rendering that as 0.00 or 1.00 would be
 //       a fabricated measurement (RV-D-1).
 //
-// It runs against whatever daemon `E2E_BASE_URL` points at — a THROWAWAY root in
-// this task's run, never the operator's live daemon. The fixtures it writes go
-// through the same APIs the panel uses and are removed in afterAll.
+// It runs against the daemon `E2E_BASE_URL` NAMES -- a THROWAWAY root, never the
+// operator's live daemon. That is enforced twice over since t107: the entry point
+// refuses to start without `E2E_BASE_URL` (and `playwright.config.ts` throws), so
+// the old silent default (127.0.0.1:8787 = the live daemon, which this suite then
+// WROTE) cannot come back. See docs/design/reviews/gen3-e2e-live-daemon-guard.md.
+//
+// THIS SPEC WRITES REAL DATA. Its `beforeAll` writes a wiki page and a MEMORY,
+// and calls `GET /api/v1/recall`, which appends a `recall_log` row; two of its
+// tests write a document and a graph entity. So it is behind the same gate as
+// registry.spec.ts: `writeAccess()` is true only when the suite's entry point
+// armed it (`npm run test:e2e` -> RUAGENT_E2E_ALLOW_WRITES=1). A bare
+// `npx playwright test` skips this file and says why. `afterAll` removes the wiki
+// page and the document; the memory and the `recall_log` row are LEFT BEHIND on
+// purpose -- on a throwaway root they are the evidence that the run happened, and
+// deleting rows out of the operator's data is not this suite's business.
+//
+// (The `write-guard.ts` header still lists only registry.spec.ts as a writer; that
+// list becoming complete is a one-line edit in a file this task does not own --
+// registered in the report rather than made silently.)
 
 import { expect, test } from "@playwright/test";
+
+import { writeAccess } from "./write-guard";
+
+const access = writeAccess();
+test.skip(!access.allowed, access.reason);
 
 const WIKI_SLUG = "e2e-consumption-probe";
 const DOC = "e2e-consumption-doc";
@@ -43,6 +64,9 @@ const WIKI_PAGE = [
 ].join("\n");
 
 test.beforeAll(async ({ request }) => {
+  // NOTHING is written unless the entry point armed writes: a skipped file must
+  // not touch the target at all (the gate is the default, not a reminder).
+  if (!access.allowed) return;
   // A hand-written page lands with NO `wiki_pages` row ⇒ its coverage is
   // unknown by construction — which is exactly the state this rule is about.
   await request.put(`/api/v1/knowledge/raw/wiki/${WIKI_SLUG}`, {
@@ -65,6 +89,9 @@ test.beforeAll(async ({ request }) => {
 });
 
 test.afterAll(async ({ request }) => {
+  // Deleting is a write too: a file whose writes were never armed must not delete
+  // anything from the target either.
+  if (!access.allowed) return;
   await request.delete(`/api/v1/knowledge/raw/wiki/${WIKI_SLUG}`).catch(() => {});
   await request.delete(`/api/v1/knowledge/raw/${DOC}`).catch(() => {});
 });

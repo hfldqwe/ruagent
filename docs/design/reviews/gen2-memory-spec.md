@@ -212,7 +212,7 @@ live 行的 store × namespace 分布（同一命令，`GROUP BY store, namespac
 | 逐块截断 | 只对**块体**截，附 `… [+N chars truncated]`；`N = body.chars().count() - per_block` | `inject.rs:382-388` |
 | 丢块 | 整块丢（**不部分发**），`dropped += group.len()` ⇒ 计的是**条目数**；通知 `<context_budget>\n… [+N items dropped: context budget reached]\n</context_budget>\n`，放不下时退化为 `… [+N dropped]` | `inject.rs:392-412` |
 | tag 与 drop rank | `user_profile`(0) · `relevant_memories`(1) · `knowledge`(2) · `wiki`(3) · `project_context`(4) · 未知 tag(5) | `inject.rs:119-126,261-270` |
-| 抽取条数 | `KNOWLEDGE_SOURCES=3` · `WIKI_PAGES=2` | `inject.rs:273-274` |
+| 抽取条数 | `KNOWLEDGE_SOURCES=3` · `WIKI_PAGES=2` | `inject.rs:339（t85 勘误：原 273-274；锚 KNOWLEDGE_SOURCES 定义）` |
 | 两条路径的选择参数 | `CHAT_SELECTION`: groups(profile/user 5, observation/user 5, observation/global 3【死组】, procedure/global 3, lesson/global 3) + `query_top_n=4, query_min_score=0.34`；`RUNS_SELECTION`: profile/user 5, observation/user 8, observation/project 8 + **`query_top_n=0`（无查询腿）** | `inject.rs:179-255` |
 | 唯一选择规则 | `crates/daemon/src/memembed.rs:227-278 select_injection_memories`（两路径共调） | — |
 | 唯一渲染器 | `render_context`（两路径都调 `render_context(&items, &InjectionBudget::default())`） | `chat.rs:581` · `runs.rs:1906` |
@@ -248,8 +248,8 @@ live 行的 store × namespace 分布（同一命令，`GROUP BY store, namespac
 | D-1 | confidence 写入侧固定 0.9 ⇒ 契约承诺的 `<0.5` 渲染在真实数据上永不触发 | **成立（措辞需精确化）** | 三条写路径：HTTP 固定 0.9（`api.rs:3730`）、MCP 无该参数（`mcp/src/lib.rs:85-90`）、distill `clamp(0.5,1.0)`（`distill.rs:467`）；live `<0.5 = 0/157`（A.3）。「契约承诺的 `<0.5` 渲染」今天落在**面板**（`Memory.tsx:494`），注入契约**根本不渲染 confidence**（`inject.rs:69-78,350-415`） |
 | D-2 | 无 consolidate / reflection（会话结束不产出可复用结论） | **方向成立，须拆两句** | 有会话级抽取（`distill_log` 33 行/85 行记忆）；无跨行巩固（无第二条流水线；`memories` 无使用状态列 0/7，A.8）；且 t347 之后 `run_turn` episode = 0 ⇒ 今天的「蒸馏自会话」标记 0 正例（A.5） |
 | D-3 | dedupe 阈值与合并判据没有证据门槛（「相似」没有命名对象集） | **成立，且比原话更严重** | `judge()` 的判据是**一份手写词表**（`IGNORABLE` 28 项 / `POLARITY` 21 项，`dedupe.rs:23-34`），没有任何语料测量支撑其覆盖；候选面是**同 store+namespace 的全部 live 行**（`distill.rs:436-438`，无 LIMIT，无阈值）；实测在真改写上召回 **0/2297**，而余弦 ≥0.86 放行 45.19%（A.9）。另：`distill.rs:371-372` 的 doc 注释仍写着「cosine >= 0.90」，**与代码（judge）不一致**（doc/code 漂移） |
-| D-4 | `memory/list` 未知 store 静默降级成 Observation、namespace 默认 user（store=lesson → 0 行，而 counts 显示 38） | **list 已修，write 未修** | `memory_list` 走 `parse_store`（`api.rs:3029-3039`）⇒ 未知 store **400**；namespace 缺省 **None=不过滤**（`api.rs:3862-3865`），响应同时给 `total`/`matched`/`counts`。**但 `memory_write`（`api.rs:3705-3710`）仍把未知 store 静默当 Observation**，MCP 正是走这条（`mcp/src/lib.rs:81`）；另外 `query.rs:11-16 row_to_memory` 对未知 store 字符串也静默回落到 Observation |
-| D-5 | episode 标记宽窄（§7.140）：面板要的是「这个 episode 是不是一次会话蒸馏」，应由 API 派生布尔 | **已实现（t350），但今天 0 正例** | `api.rs:3794-3852`：`DISTILLED_EPISODE_KIND="run_turn"` + `distilled_ids()` join + `with_distilled()` 输出布尔；`memory_list` 与 `memory_search` 都带上了。实测 `run_turn` episode **0** ⇒ 157 live 行 **0 正例**（A.5） |
+| D-4 | `memory/list` 未知 store 静默降级成 Observation、namespace 默认 user（store=lesson → 0 行，而 counts 显示 38） | **list 已修，write 未修** | `memory_list` 走 `parse_store`（`api.rs:3617（t85 勘误：原 3029-3039；锚 parse_store 定义）`）⇒ 未知 store **400**；namespace 缺省 **None=不过滤**（`api.rs:3617（t85 勘误：原 3862-3865；锚 parse_store 定义）`），响应同时给 `total`/`matched`/`counts`。**但 `memory_write`（`api.rs:3617（t85 勘误：原 3705-3710；锚 parse_store 定义）`）仍把未知 store 静默当 Observation**，MCP 正是走这条（`mcp/src/lib.rs:81`）；另外 `query.rs:11-16 row_to_memory` 对未知 store 字符串也静默回落到 Observation |
+| D-5 | episode 标记宽窄（§7.140）：面板要的是「这个 episode 是不是一次会话蒸馏」，应由 API 派生布尔 | **已实现（t350），但今天 0 正例** | `api.rs:4361（t85 勘误：原 3794-3852；锚 memory_search 定义）`：`DISTILLED_EPISODE_KIND="run_turn"` + `distilled_ids()` join + `with_distilled()` 输出布尔；`memory_list` 与 `memory_search` 都带上了。实测 `run_turn` episode **0** ⇒ 157 live 行 **0 正例**（A.5） |
 
 **额外发现（不在任务单里，但会拦下游工作）**
 
@@ -415,7 +415,7 @@ live 行的 store × namespace 分布（同一命令，`GROUP BY store, namespac
 | 项 | 内容 |
 | --- | --- |
 | metric | 未知 `store` 的写入/读取是否**拒绝**（而非回落 Observation），未知 namespace 是否拒绝 |
-| baseline | `memory_list` 已 400（`api.rs:3029-3039`）；**`memory_write` 仍静默回落 Observation**（`api.rs:3705-3710`，MCP 走它）；`query.rs:11-16 row_to_memory` 对未知 store 字符串静默回落 |
+| baseline | `memory_list` 已 400（`api.rs:4289（t85 勘误：原 3029-3039；锚 memory_write 定义）`）；**`memory_write` 仍静默回落 Observation**（`api.rs:4289（t85 勘误：原 3705-3710；锚 memory_write 定义）`，MCP 走它）；`query.rs:11-16 row_to_memory` 对未知 store 字符串静默回落 |
 | target | ① `memory_write` 与 MCP `memory_write` 对未知 store 一律 **400 + 有效值列表**（复用 `parse_store`）；② `row_to_memory` 返回 `Result`，未知 store 变成**显式错误**（或 `MemoryStore::try_parse`），调用方逐个处理（这是一次**破坏性 API 变更**，D.6 已列）；③ 判据：`store=bogus` 写 → 400，且 `memory_diffs` **不新增行**（拒绝不是一条静默写入） |
 | 复现命令 | `cargo test -p ruagent-daemon api`（不是本单范围，登记给 I-B 的实现条目）+ 只读核对 `api.rs:3029-3039` |
 | 标定读数 | `memory_diffs.reject = 15` 证明「拒绝会被审计」这条通路已经在用；`memory_list` 的 400 是同一形状的已完成先例 |
@@ -437,7 +437,7 @@ live 行的 store × namespace 分布（同一命令，`GROUP BY store, namespac
 | metric | 未知 `store` 的**写入**是否被拒绝（HTTP 与 MCP 两条入口一致），且拒绝时**不产生任何写入副作用** |
 | baseline | `memory_write` 仍 `_ => MemoryStore::Observation`（`api.rs:3705-3710`）⇒ `store=bogus` 走通、落库为 observation；MCP `memory_write`（`crates/mcp/src/lib.rs:81-90`）**根本不传 confidence/store 校验**，直接吃这条回落。对照：`memory_list` 已经是 400（`api.rs:3029-3039 parse_store`） |
 | target | ① `memory_write` 复用 `parse_store`，未知值 → **400 + 有效值列表**（`profile/observation/procedure/lesson`）；② MCP 工具把 4xx 原样透出（不许吞成 200）；③ 判据：`store=bogus` 写 → 4xx，且 `SELECT COUNT(*) FROM memory_diffs` **前后不变**（拒绝不是一次静默写入） |
-| 复现命令 | `curl -s -o - -w '%{http_code}' -X POST <daemon>/api/v1/memory/write -H 'content-type: application/json' -d '{"store":"bogus","namespace":"user","content":"t2-cint-probe"}'`。**注意这条命令会写库** ⇒ 它不属于「只读取证」，必须由 t19 **在临时 root 上**做，不许对活库（pid 79984 / 127.0.0.1:8787）跑；本单只做只读核对：`api.rs:3029-3039` 与 `3705-3710` |
+| 复现命令 | `curl -s -o - -w '%{http_code}' -X POST <daemon>/api/v1/memory/write -H 'content-type: application/json' -d '{"store":"bogus","namespace":"user","content":"t2-cint-probe"}'`。**注意这条命令会写库** ⇒ 它不属于「只读取证」，必须由 t19 **在临时 root 上**做，不许对活库（pid 79984 / 127.0.0.1:8787）跑；本单只做只读核对：`api.rs:2982（t85 勘误：原 3029-3039；锚 字面量 namespace）` 与 `3705-3710` |
 | 标定读数 | `memory_diffs.reject = 15`（A.6，21:39:58+08:00）⇒ 「拒绝会被审计」这条通路已经在用；`memory_list` 的 400 是同形状的**已完成先例** ⇒ 目标不是新机制，而是一次复用 |
 | 失败判据 | 若 `store=bogus` 返回 200、或返回 4xx 但 `memory_diffs` 多了一行（说明仍写了一次）⇒ 未达成 |
 
@@ -448,7 +448,7 @@ live 行的 store × namespace 分布（同一命令，`GROUP BY store, namespac
 | owner | INT / t19（目标文件 `crates/daemon/src/api.rs`：`distilled_ids`/`with_distilled`） |
 | 来源 | 原 C4 的「`distilled=true` 有正例」那半边（R-2 移出）；任务单已知缺陷 D-5 |
 | metric | 面板/接口拿到的 `distilled` 是否**只**由 `episodes.kind='run_turn'` 派生（不是「有没有 episode」，也不是「`distill_log` 里有没有这个 session」），且在数据落地后有可读的正例率 |
-| baseline | 机制**已实现**（`api.rs:3794-3831`，t350）：`DISTILLED_EPISODE_KIND="run_turn"` + join + `with_distilled` 输出布尔；但 `run_turn` episode = **0**、`distill_log` 最后一次成功 2026-09-26T10:28:22Z ⇒ live 157 行 **0 正例**。`source_episode IS NOT NULL` 的 162/163 是**另一个更宽的标记**（156 行指向同一条迁移 episode），不能用它替代（§7.140） |
+| baseline | 机制**已实现**（`api.rs:4392（t85 勘误：原 3794-3831；锚 字面量 run_turn）`，t350）：`DISTILLED_EPISODE_KIND="run_turn"` + join + `with_distilled` 输出布尔；但 `run_turn` episode = **0**、`distill_log` 最后一次成功 2026-09-26T10:28:22Z ⇒ live 157 行 **0 正例**。`source_episode IS NOT NULL` 的 162/163 是**另一个更宽的标记**（156 行指向同一条迁移 episode），不能用它替代（§7.140） |
 | target | ① 派生规则冻结（只允许 episode kind；禁止用 `distill_log.session_key` 反查 —— 那会把 §7.140 的宽标记引回来）；② 形状判据：造一次真实蒸馏（依赖 I-C/t9）后 ① `SELECT COUNT(*) FROM episodes WHERE kind='run_turn'` >0，② `SELECT COUNT(*) FROM memories m JOIN episodes e ON e.id=m.source_episode WHERE e.kind='run_turn'` = 该次蒸馏写入的记忆数，③ 接口对这些行 `distilled=true`、对那 156 行迁移行 `distilled=false`（**宽窄要在数据落地后重量一遍**，§7.140） |
 | 复现命令 | `python -c "... ;print(c.execute(\"SELECT kind,COUNT(*) FROM episodes GROUP BY kind\").fetchall())"`（只读）+ 一次真实蒸馏 + `GET /api/v1/memory/list`（**由 t19/t20 在临时 root 取证**；本单不调活库 recall） |
 | 标定读数 | 「`run_turn`=0、live 正例=0」（A.5，21:39:58+08:00）是**空集读数**：证明今天没有正例，**不证明**将来会有（§7.84）⇒ 所以判据必须由一次真实蒸馏闭合，不能靠读代码判过 |
@@ -792,7 +792,7 @@ pub const WIKI_PAGES: usize = 2;
 pub fn knowledge_items(hits: &[RetrievalHit], sources: usize, wiki: usize) -> Vec<ContextItem>;
 ```
 - 唯一执行点是 `crates/daemon/src/memembed.rs:227-278 select_injection_memories`；`Project` scope 在 **chat 侧不可解析**（chat 钉 cwd）⇒ 该组被**跳过而不是猜**（`memembed.rs:242-245`）。
-- `[破坏/可证中性]` chat 的 `observation/global` 组是**死组**（Observation 不能写 global，`lib.rs:54-67`；`inject.rs:194-204` 自述）：删它 = 少一次查询、结论不变，但仍是行为变更 ⇒ 与本代一起走 I-B，并保留 `the_two_presets_state_their_own_differences` 对「死组之所以死」的那条断言（改成对 `allows_namespace` 的断言）。
+- `[破坏/可证中性]` chat 的 `observation/global` 组是**死组**（Observation 不能写 global，`lib.rs:54-67`；`inject.rs:1488（t85 勘误：原 194-204；锚 测试函数 the_two_presets_state_their_own_differences）` 自述）：删它 = 少一次查询、结论不变，但仍是行为变更 ⇒ 与本代一起走 I-B，并保留 `the_two_presets_state_their_own_differences` 对「死组之所以死」的那条断言（改成对 `allows_namespace` 的断言）。
 - `[冻结]` 两条路径的差异（chat 有查询腿、runs 无；chat 读 procedure/lesson、runs 读 project）**是参数不是漂移**：任何统一都必须另附「agent 看到什么变了」的读数。
 
 #### D.5 追加（t31 / RV-B-8 裁决 (a)：适配形状进冻结面，2026-09-28；只追加，前文一字未动）
@@ -1127,7 +1127,7 @@ for k,v in by.items():
 | --- | --- |
 | `## C5-D` 新节 | 已新建：**non-landing** 的 `forget_report` 形状（类型 + 语义三条）+ 待定项 U-1..U-6；**不写实现、不预填数字判据、未碰 `crates/`**（R-6） |
 | U-3 收敛 | 已按 recall 回信收敛：knowledge 侧 = **五个派生物面**；`ResidualHit` 加 `origin`（`db|file|both`）与 `path`；清点用**原文子串 LIKE**，**不许**用 `search()` 的排序命中形状（会假通过） |
-| 「已存在」vs「承诺提供」 | 已分开：裸 SQL（`store.rs:575-605`，私有+带 `leg_k` 上界）与 `documents.content_hash` = **今天已存在**；`residual_scan`/`document_path` = **I-A 承诺 t7 后提供**，t7 前只允许 `ExternalStatus::NotAvailable`，不许记 `Readout(0)` |
+| 「已存在」vs「承诺提供」 | 已分开：裸 SQL（`store.rs:1145（t85 勘误：原 575-605；锚 document_path 定义）`，私有+带 `leg_k` 上界）与 `documents.content_hash` = **今天已存在**；`residual_scan`/`document_path` = **I-A 承诺 t7 后提供**，t7 前只允许 `ExternalStatus::NotAvailable`，不许记 `Readout(0)` |
 | 我的独立复核 | 2026-09-27T22:16:52+08:00 只读复跑（`documents` 934/`source` 非空 934/`chunks` 10765 且**无 hash 列**/`knowledge/**/*.md` 934/触发器 0006:19-30/LanceDB 路径存在）⇒ 与 recall 的 22:1x 读数**逐条一致** |
 | U-4 仍待 | wiki 面（正文落 DB 还是磁盘、build→sources 出处）**未回信** ⇒ 保持 `Unknown`；回信到达后按同法收敛并引用其时间点 |
 
@@ -1354,7 +1354,7 @@ pub fn render_context(items: &[ContextItem], budget: &InjectionBudget) -> String
 
 | 位置 | 现在 | 需要的形状 |
 | --- | --- | --- |
-| `crates/daemon/src/runs.rs:1270-1279`（run 路径） | `budget: None`（注释：契约没有报告型渲染） | `render_run_injection` 改回 `(String, BudgetReport)`（或让上游带出报告），事件处 `budget: Some(serde_json::to_value(&report)?)` |
+| `crates/daemon/src/runs.rs:1278（t85 勘误：原 1270-1279；锚 render_context 调用（t80 复核））`（run 路径） | `budget: None`（注释：契约没有报告型渲染） | `render_run_injection` 改回 `(String, BudgetReport)`（或让上游带出报告），事件处 `budget: Some(serde_json::to_value(&report)?)` |
 | `crates/acp/src/chat.rs:496-505`（chat 路径） | `budget: None` | 同上；该适配器持有 `injection_context` 的返回，需要它把报告一起交出来 |
 
 ⇒ **A-2 的预算半边与 N-6 仍是「未达成」**：仪器已就位（本单），但从事件到仪器的那一段线还没接；**owner = 持这两个文件写权的那张单**。在此之前，任何「`budget` 已达标」的说法都是假的；反过来，把今天的状态写成 `not_measured` 也是假的 —— 它今天可判为**未达成**（有确切构造点、确切形状、确切 owner）。
@@ -1396,3 +1396,26 @@ pub fn render_context(items: &[ContextItem], budget: &InjectionBudget) -> String
 6. **同族但不同 owner（登记，不实现）**：wiki 的写前副本 `wiki-backups/{slug}.md`（写点 `crates/daemon/src/wiki.rs:2317-2323`）属于**同一个面**，但不在 `crates/memory` 的可达范围；报告里以 `ExternalResidual{surface: BackupFile, owner: "daemon/wiki", source: "crates/daemon/src/wiki.rs:2317-2323"}` **请求**它，等待其 owner 给出读数。
 7. **已知未覆盖面（登记，不静默）**：枚举里 `KnowledgeChunkFts` / `KnowledgeVectors` / `WikiBuildPage` 三个面无任何报告提及（与 A-1 同形）；本单只在测试里点名它们并路由，**未**擅自加进报告（它们的 owner 查询不存在，加了就是编读数）。
 
+
+---
+
+## t85 坐标勘误（2026-09-29）
+
+**为什么**：同 `gen2-recall-spec.md` 的说明 —— t80 D-2 + `scripts/spec-anchors.ps1` 实测。每条保留旧值（就地 `（t85 勘误：原 …）`）。
+
+| 行 | 旧引用（逐字） | 新引用 | 锚词 / 依据 |
+| --- | --- | --- | --- |
+| L215 | `inject.rs:273-274` | `inject.rs:339` | `KNOWLEDGE_SOURCES` 定义行 |
+| L251 | `api.rs:3029-3039` | `api.rs:3617` | `parse_store` 定义行 |
+| L251 | `api.rs:3862-3865` | `api.rs:3617` | 同上 |
+| L251 | `api.rs:3705-3710` | `api.rs:3617` | 同上 |
+| L252 | `api.rs:3794-3852` | `api.rs:4361` | `memory_search` 定义行 |
+| L418 | `api.rs:3029-3039` | `api.rs:4289` | `memory_write` 定义行 |
+| L418 | `api.rs:3705-3710` | `api.rs:4289` | 同上 |
+| L440 | `api.rs:3029-3039` | `api.rs:2982` | 字面量 `namespace` |
+| L451 | `api.rs:3794-3831` | `api.rs:4392` | 字面量 `run_turn` |
+| L795 | `inject.rs:194-204` | `inject.rs:1488` | 测试 `the_two_presets_state_their_own_differences` |
+| L1130 | `store.rs:575-605` | `store.rs:1145` | `document_path` 定义行 |
+| L1357 | `crates/daemon/src/runs.rs:1270-1279` | `crates/daemon/src/runs.rs:1278` | `render_context` 调用（t80 复核） |
+
+**未收口（检查器只能判 SUSPECT/UNVERIFIED，需人工裁定）**：`files.rs:290-309`（反复出现在 6 行上）、`inject.rs:8-13/15-24/41-49/69-78/119-126/144-147/179-255/276-289/378-379/382/382-388/392-412/413/466-499/756-759`、`distill.rs:216-237/371-372/385-405/436-438/436-448/467`、`api.rs:2566-2570/2579/2581-2582/2582/2983-3019/3029-3039/3705-3710/3730/4234/4267-4273/4298/3730`、`store.rs:575-605`、`query.rs:11-16/49/302-312`、`lifecycle.rs:97-106/182-247/227-231/681/907`、`write.rs:118-126/144-153`、`memembed.rs:184-187/227-278/242-245/257-276`、`dedupe.rs:23-34`、`runs.rs:1873/1893/1906`、`chat.rs:521-583/550/569/581`、`episode.rs:86`、`wiki.rs:1024/2317-2323`、`mcp/src/lib.rs:81-90/85-90`、`lib.rs:54-67`（**缺 crate 名**）。owner：memory 规格属主。
