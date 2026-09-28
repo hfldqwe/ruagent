@@ -599,6 +599,239 @@ pub async fn forget_report_at(
     })
 }
 
+/// One candidate file the backup scan examined.
+struct BackupFileReading {
+    name: String,
+    path: String,
+    bytes: u64,
+    /// `Some(n)` = checked, and it holds `n` records with this hash; `None` = the
+    /// file could not be checked, with the reason.
+    verdict: Result<usize, String>,
+}
+
+/// What one backup scan found. `inventory` is evidence (printed by tests and
+/// probes): the API carries `hits` plus, for unreadable candidates, one sample
+/// entry whose key says why.
+struct BackupScan {
+    hits: Vec<ResidualHit>,
+    inventory: Vec<String>,
+    unreadable: usize,
+}
+
+/// The `data/backups/*` + `data/*.before-*.db` half of a forget report.
+///
+/// READ-ONLY: `read_dir`, `metadata`, `read`, and a SQLite connection opened with
+/// `SQLITE_OPEN_READ_ONLY`. Nothing here creates, moves or deletes a file.
+fn backup_surface(root: Option<&std::path::Path>, content_hash: &str) -> LocalResidual {
+    let Some(root) = root else {
+        return LocalResidual {
+            surface: ResidualSurface::BackupFile,
+            status: ResidualStatus::NotAvailable(
+                "no filesystem root was given: `data/backups/*` and `data/*.before-*.db` cannot \
+                 be reached by SQL; call forget_report_at(db, Some(root), hash)",
+            ),
+            sample: Vec::new(),
+            source: "n/a (no root supplied)",
+        };
+    };
+    let scan = scan_backups(root, content_hash);
+    let hits = scan.hits.len();
+    // `total: None` = "not fully measured" (the crate's existing three-state
+    // convention), and it is set when a candidate could not be read: the byte
+    // may be there and this report cannot say. Confirmed carriers stay in `hits`.
+    let total = if scan.unreadable == 0 {
+        Some(hits)
+    } else {
+        None
+    };
+    LocalResidual {
+        surface: ResidualSurface::BackupFile,
+        status: ResidualStatus::Readout(ResidualCount {
+            hits,
+            truncated: false,
+            total,
+        }),
+        sample: scan.hits,
+        source: if scan.unreadable == 0 {
+            "read_dir + read (dump) / SQLITE_OPEN_READ_ONLY (db copy), root known"
+        } else {
+            "read_dir + read (dump) / SQLITE_OPEN_READ_ONLY (db copy); \
+             at least one candidate unreadable, so the total is not measured"
+        },
+    }
+}
+
+/// Every backup-class candidate under `root`, with a per-hash verdict.
+fn scan_backups(root: &std::path::Path, content_hash: &str) -> BackupScan {
+    let data = root.join("data");
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    push_files(&data.join("backups"), &mut candidates);
+    if let Ok(dir) = std::fs::read_dir(&data) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let name = file_name_of(&path);
+            // Whole-database copies: `data/*.before-*.db`.
+            if path.is_file() && name.contains(".before-") && name.ends_with(".db") {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort();
+
+    let mut hits: Vec<ResidualHit> = Vec::new();
+    let mut inventory: Vec<String> = Vec::new();
+    let mut unreadable = 0usize;
+    for path in candidates {
+        let reading = read_backup_candidate(&path, content_hash);
+        let path_text = path.to_string_lossy().to_string();
+        match &reading.verdict {
+            Ok(n) => {
+                if *n > 0 {
+                    hits.push(ResidualHit {
+                        surface: ResidualSurface::BackupFile,
+                        key: reading.name.clone(),
+                        source: "backup file holding this content_hash",
+                        origin: ResidualOrigin::File,
+                        path: Some(path_text.clone()),
+                    });
+                    inventory.push(format!(
+                        "{}: {} B, {} record(s) with this hash",
+                        reading.name, reading.bytes, n
+                    ));
+                } else {
+                    inventory.push(format!(
+                        "{}: {} B, checked, this hash is NOT in it",
+                        reading.name, reading.bytes
+                    ));
+                }
+            }
+            Err(reason) => {
+                unreadable += 1;
+                // The candidate is visible in the sample so a reader can see WHICH
+                // file is unmeasured; it is not counted as a hit.
+                hits.push(ResidualHit {
+                    surface: ResidualSurface::BackupFile,
+                    key: format!("{} (could not be checked: {reason})", reading.name),
+                    source: "backup file that could not be read",
+                    origin: ResidualOrigin::File,
+                    path: Some(path_text.clone()),
+                });
+                inventory.push(format!(
+                    "{}: {} B, COULD NOT BE CHECKED ({reason})",
+                    reading.name, reading.bytes
+                ));
+            }
+        }
+    }
+    BackupScan {
+        hits,
+        inventory,
+        unreadable,
+    }
+}
+
+fn push_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Check ONE candidate for this hash, read-only.
+fn read_backup_candidate(path: &std::path::Path, content_hash: &str) -> BackupFileReading {
+    let name = file_name_of(path);
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let verdict = if name.ends_with(".db") {
+        check_db_copy(path, content_hash)
+    } else {
+        check_dump(path, content_hash)
+    };
+    BackupFileReading {
+        name,
+        path: path.to_string_lossy().to_string(),
+        bytes,
+        verdict,
+    }
+}
+
+/// A whole-database copy: ask it the same question the live database answers,
+/// through a READ-ONLY connection.
+fn check_db_copy(path: &std::path::Path, content_hash: &str) -> Result<usize, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("cannot open read-only: {e}"))?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE content_hash = ?1",
+        [content_hash],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n as usize)
+    .map_err(|e| format!("not a memories database: {e}"))
+}
+
+/// The dump `strip_distilled_prefix` writes: `"<id> <byte_len>\n"`, then exactly
+/// that many bytes of the BEFORE content, then a newline — repeated. The hash is
+/// recomputed with the crate's own function, so there is one definition of what a
+/// content hash is.
+fn check_dump(path: &std::path::Path, content_hash: &str) -> Result<usize, String> {
+    let buf = std::fs::read(path).map_err(|e| format!("cannot read: {e}"))?;
+    let records = parse_dump(&buf)?;
+    let hits = records
+        .iter()
+        .filter(|(_, content)| crate::write::content_hash(content) == content_hash)
+        .count();
+    Ok(hits)
+}
+
+/// Parse a length-prefixed dump into `(id, content)` pairs. Returns the reason it
+/// is not a dump this crate wrote instead of pretending it holds nothing.
+fn parse_dump(buf: &[u8]) -> Result<Vec<(i64, String)>, String> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let header_end = buf[pos..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or_else(|| format!("unterminated record header at byte {pos}"))?;
+        let header = std::str::from_utf8(&buf[pos..pos + header_end])
+            .map_err(|e| format!("record header is not utf-8: {e}"))?;
+        let mut parts = header.split(' ');
+        let id: i64 = parts
+            .next()
+            .ok_or_else(|| format!("empty record header at byte {pos}"))?
+            .parse()
+            .map_err(|e| format!("record id is not a number: {e}"))?;
+        let len: usize = parts
+            .next()
+            .ok_or_else(|| format!("record header at byte {pos} has no byte length"))?
+            .parse()
+            .map_err(|e| format!("record byte length is not a number: {e}"))?;
+        let start = pos + header_end + 1;
+        let end = start
+            .checked_add(len)
+            .filter(|end| *end <= buf.len())
+            .ok_or_else(|| format!("record {id} claims {len} bytes past the end of the file"))?;
+        let content = std::str::from_utf8(&buf[start..end])
+            .map_err(|e| format!("record {id} is not utf-8: {e}"))?;
+        out.push((id, content.to_string()));
+        // the record is terminated by a newline (absent only at a truncated tail)
+        pos = end + 1;
+    }
+    Ok(out)
+}
+
 /// One row, before and after. Returned so the caller can show the change
 /// verbatim instead of trusting a count.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -1368,5 +1601,276 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![format!("memory/{}", ids[1])]
         );
+    }
+
+    /// t75 / A-1: the surface list, as the report actually emits it. Two things
+    /// this pins down: (a) the backup class is present on BOTH sides (memory reads
+    /// the memory backups, the wiki's copies are requested from their owner), and
+    /// (b) which enum variants no report mentions — the shape of the original
+    /// defect, where "not in the list" reads as "not there".
+    #[tokio::test]
+    async fn the_report_names_every_surface_it_answers_or_requests() {
+        let db = Db::open_in_memory().unwrap();
+        let report = forget_report(&db, "0123456789abcdef").await.unwrap();
+        let local: Vec<ResidualSurface> = report.local.iter().map(|l| l.surface).collect();
+        let external: Vec<ResidualSurface> = report.external.iter().map(|e| e.surface).collect();
+        println!("READING t75 local surfaces  = {local:?}");
+        println!("READING t75 external surfaces = {external:?}");
+        assert_eq!(
+            local,
+            vec![
+                ResidualSurface::Memories,
+                ResidualSurface::MemoriesFts,
+                ResidualSurface::Derived,
+                ResidualSurface::Episodes,
+                ResidualSurface::BackupFile,
+            ]
+        );
+        assert_eq!(
+            external,
+            vec![
+                ResidualSurface::KnowledgeFile,
+                ResidualSurface::KnowledgeDocument,
+                ResidualSurface::KnowledgeChunk,
+                ResidualSurface::WikiChunk,
+                ResidualSurface::WikiPageHash,
+                ResidualSurface::WikiPlan,
+                ResidualSurface::BackupFile,
+            ]
+        );
+        // The enum carries three more variants that NO surface of this report
+        // mentions: `KnowledgeChunkFts`, `KnowledgeVectors`, `WikiBuildPage`. They
+        // are named here rather than left implicit — and reported (t75 finding A-2)
+        // instead of being added to the report without their owners' queries.
+        let mentioned: Vec<ResidualSurface> =
+            local.iter().chain(external.iter()).copied().collect();
+        for surface in [
+            ResidualSurface::KnowledgeChunkFts,
+            ResidualSurface::KnowledgeVectors,
+            ResidualSurface::WikiBuildPage,
+        ] {
+            println!("READING t75 unmentioned enum variant: {surface:?}");
+            assert!(!mentioned.contains(&surface));
+        }
+        // ...and the one that IS mentioned on both sides is the new backup class.
+        assert!(
+            mentioned
+                .iter()
+                .filter(|s| **s == ResidualSurface::BackupFile)
+                .count()
+                == 2
+        );
+    }
+
+    /// The three-state discipline, applied to the new surface (t75): an unrooted
+    /// call must NAME the surface and say why it could not be read — never drop it.
+    #[tokio::test]
+    async fn an_unrooted_report_still_names_the_backup_surface() {
+        let db = Db::open_in_memory().unwrap();
+        let report = forget_report(&db, "0123456789abcdef").await.unwrap();
+        let backup = report
+            .local
+            .iter()
+            .find(|l| l.surface == ResidualSurface::BackupFile)
+            .expect("the backup surface must be in the list even without a root");
+        println!(
+            "READING t75 unrooted backup surface: {:?} source={}",
+            backup.status, backup.source
+        );
+        match &backup.status {
+            ResidualStatus::NotAvailable(reason) => {
+                assert!(
+                    reason.contains("forget_report_at"),
+                    "the reason must name the call that can answer: {reason}"
+                );
+            }
+            other => panic!("unrooted must be NotAvailable, got {other:?}"),
+        }
+        assert!(backup.sample.is_empty());
+    }
+
+    /// A dump file's inventory line, without needing a root on this machine.
+    fn dump_line(name: &str, bytes: u64, verdict: &str) -> String {
+        format!("{name}: {bytes} B, {verdict}")
+    }
+
+    /// t75 / A-1, the whole scenario in one test: a row that carried the
+    /// `[distilled]` prefix is cleaned from the live database, and the PRE-CLEANUP
+    /// bytes are still readable on disk. `forget_report_at` must say so — both for
+    /// the dump `strip_distilled_prefix` wrote and for a whole-database copy.
+    #[tokio::test]
+    async fn the_pre_cleanup_bytes_are_reported_as_a_residual() {
+        let dir = std::env::temp_dir().join(format!("ruagent-t75-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data/backups")).unwrap();
+        let db_path = dir.join("data/ruagent.db");
+        let db = Db::open(&db_path).unwrap();
+
+        let before = format!("{DISTILLED_PREFIX}the fact that was cleaned up");
+        let before_hash = crate::write::content_hash(&before);
+        write_memory(
+            &db,
+            &MemoryWrite {
+                store: MemoryStore::Observation,
+                namespace: crate::namespace::Namespace::parse("project:t75").unwrap(),
+                content: before.clone(),
+                confidence: 0.9,
+                source_episode: None,
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // a whole-database copy, taken the way the machine has one
+        std::fs::copy(&db_path, dir.join("data/ruagent.db.before-t75.db")).unwrap();
+
+        // the cleanup, which writes its own dump first
+        let outcome = strip_distilled_prefix(&db, &dir.join("data/backups"))
+            .await
+            .unwrap();
+        println!("READING t75 strip outcome: {outcome:?}");
+
+        let live = forget_report_at(&db, Some(&dir), &before_hash)
+            .await
+            .unwrap();
+        let memories = live
+            .local
+            .iter()
+            .find(|l| l.surface == ResidualSurface::Memories)
+            .unwrap();
+        let backup = live
+            .local
+            .iter()
+            .find(|l| l.surface == ResidualSurface::BackupFile)
+            .unwrap();
+        println!(
+            "READING t75 after cleanup: live memories surface={:?} backup surface={:?}",
+            memories.status, backup.status
+        );
+        for hit in &backup.sample {
+            println!(
+                "READING t75 backup carrier: key={} path={:?}",
+                hit.key, hit.path
+            );
+        }
+        // the live database no longer holds the hash ...
+        match &memories.status {
+            ResidualStatus::Readout(c) => assert_eq!(c.hits, 0, "the live row's bytes changed"),
+            other => panic!("expected a readout, got {other:?}"),
+        }
+        // ... and the plaintext copy is still there, on BOTH candidate kinds
+        match &backup.status {
+            ResidualStatus::Readout(c) => {
+                assert_eq!(c.hits, 2, "the dump AND the database copy carry the bytes");
+                assert_eq!(c.total, Some(2), "both candidates were readable");
+            }
+            other => panic!("expected a readout, got {other:?}"),
+        }
+        let names: Vec<String> = backup.sample.iter().map(|h| h.key.clone()).collect();
+        println!("READING t75 carriers = {names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("memories-distilled-prefix-"))
+        );
+        assert!(names.iter().any(|n| n == "ruagent.db.before-t75.db"));
+
+        // the inventory, printed as evidence (name, size, verdict)
+        let scan = scan_backups(&dir, &before_hash);
+        for line in &scan.inventory {
+            println!("READING t75 inventory {line}");
+        }
+        assert_eq!(scan.inventory.len(), 2);
+        assert!(scan.inventory[0].contains("record(s) with this hash"));
+    }
+
+    /// NEGATIVE CONTROL (t75): the surface must report "checked, not there" rather
+    /// than treating the mere existence of a backup as a residual.
+    #[tokio::test]
+    async fn a_backup_that_does_not_hold_the_hash_is_not_a_hit() {
+        let dir = std::env::temp_dir().join(format!("ruagent-t75-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data/backups")).unwrap();
+        let db = Db::open(dir.join("data/ruagent.db")).unwrap();
+        write_memory(
+            &db,
+            &MemoryWrite {
+                store: MemoryStore::Observation,
+                namespace: crate::namespace::Namespace::parse("project:t75").unwrap(),
+                content: format!("{DISTILLED_PREFIX}a different fact"),
+                confidence: 0.9,
+                source_episode: None,
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::copy(
+            dir.join("data/ruagent.db"),
+            dir.join("data/ruagent.db.before-t75-neg.db"),
+        )
+        .unwrap();
+        strip_distilled_prefix(&db, &dir.join("data/backups"))
+            .await
+            .unwrap();
+
+        let nowhere = crate::write::content_hash("content that exists nowhere at all");
+        let report = forget_report_at(&db, Some(&dir), &nowhere).await.unwrap();
+        let backup = report
+            .local
+            .iter()
+            .find(|l| l.surface == ResidualSurface::BackupFile)
+            .unwrap();
+        println!(
+            "READING t75 negative control: {:?} sample={:?}",
+            backup.status, backup.sample
+        );
+        match &backup.status {
+            ResidualStatus::Readout(c) => {
+                assert_eq!(c.hits, 0, "no carrier for a hash nothing ever held");
+                assert_eq!(c.total, Some(0), "and it WAS measured: not `None`");
+            }
+            other => panic!("expected a measured zero, got {other:?}"),
+        }
+        assert!(backup.sample.is_empty());
+        assert_eq!(dump_line("x.txt", 1, "checked"), "x.txt: 1 B, checked");
+        for line in scan_backups(&dir, &nowhere).inventory {
+            println!("READING t75 negative inventory {line}");
+            assert!(line.contains("NOT in it"));
+        }
+    }
+
+    /// The REAL machine, on request only: `RUAGENT_T75_REAL_ROOT` names a ruagent
+    /// root, and this test prints each backup file with its size and how it was
+    /// judged. Read-only, and loud when it is not asked for (no silent skip).
+    #[tokio::test]
+    async fn the_real_root_inventory_is_read_when_it_is_named() {
+        let Ok(root) = std::env::var("RUAGENT_T75_REAL_ROOT") else {
+            println!(
+                "READING t75 real-root inventory SKIPPED: RUAGENT_T75_REAL_ROOT is not set \
+                 (set it to a ruagent root to read that machine's backups; nothing is written)"
+            );
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let db = Db::open_in_memory().unwrap();
+        let report = forget_report_at(&db, Some(&root), "no-such-hash-on-purpose")
+            .await
+            .unwrap();
+        let backup = report
+            .local
+            .iter()
+            .find(|l| l.surface == ResidualSurface::BackupFile)
+            .unwrap();
+        println!(
+            "READING t75 real root {root:?} backup surface = {:?}",
+            backup.status
+        );
+        let scan = scan_backups(&root, "no-such-hash-on-purpose");
+        println!("READING t75 real candidates = {}", scan.inventory.len());
+        for line in &scan.inventory {
+            println!("READING t75 real inventory {line}");
+        }
     }
 }

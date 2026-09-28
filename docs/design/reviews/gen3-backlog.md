@@ -227,6 +227,25 @@
 | 门禁 | 三面 | 编译面 `check --workspace --all-targets` exit 0 · graph 测试面 ok=12/FAILED=0/exit 0 · daemon lib ok=80/exit 0 · 两条 clippy `-CleanFirst` exit 0（error-lines=0） |
 | **未做** | 明确留原地 | 审计 **#5**（合并自环/社区成员不转移）· **#7**（`if let Ok(..) = query_row` 吞错误、`void_episode` 吞成 false）· **#4/#8/#9/#10/#11/#12**（全表读、N+1、循环内 prepare、全表扫、O(N²)、死 API）—— 报告 §8 逐条登记待 triage |
 
+## B14. 首次推送的事故与处置（commit `0da0cb6`）
+
+**事故**：captain 代执行的首次推送 `0da0cb6` **定格了一份不完整的多文件改动** —— `crates/memory/src/lifecycle.rs`（mtime **04:24:55**，mem-core 正在做 t75）引用了**尚未定义**的 `backup_surface`；提交发生在 ~**04:25:30**。CI 原文：
+
+```
+Build | error[E0425]: cannot find function `backup_surface` in this scope
+Build | error: could not compile `ruagent-memory` (lib) due to 1 previous error
+```
+
+后果（两个工作流**同根因**）：
+- **`E2E` run `36479210565` = failure**：`Build` 红 ⇒ 其后 6 步（Build panel / Register mock agents / Boot daemon / Doctor / Panel serves / Playwright）**全 skip**，`E2E evidence` **按设计失败**（这一步就是「跳过必须可见」的执行者）。
+- **`CI` run `36479210529`**：**`Panel (node)` ✅ success**；**`Rust (ubuntu)` ❌ `Clippy`** —— 这是该 job **历史上第一次真正跑到 Clippy**，而它撞在同一个编译错误上；`nested-Result 守卫`/`Test`/`ignored instruments` 被 skip；**`Test evidence` 与 `Ignored-instrument manifest` 按设计失败** ✓；`Rust (windows)` 当时仍在跑。
+
+**captain 的错（两份，都记账）**：① **明知** `lifecycle.rs` 在 38 秒前被写过，**仍然提交**；② 为省时间**跳过了「推送前对已提交字节跑一遍编译面」**——我在同一轮里明确想到了这一步又放弃了它。**两个假设被证伪**：我曾怀疑「**工具链漂移**（本地 stable `1.95.0` vs CI 解析到的最新 stable，`rust-toolchain.toml` 只写 `channel = "stable"`）」与「`orphans.rs` 的平台分叉」——**都不是**本次红因；**同一份 `E0425` 同时解释了 ubuntu 与 E2E 的失败**。⇒ 教训：**先取原文，再怀疑环境**（诊断偏差：把「环境差异」当第一嫌疑，是本地绿/CI 红时最省事的解释，但这次错了）。
+
+**处置**：mem-core 收到 P0 —— 补齐 `backup_surface` 或撤掉调用点，**但绝不许把「残余面检测」删成空壳**（那会把 t75 的目的抹掉，会判假绿并要求重做）；完成后 captain 推第二个提交并按 **C16 + C20** 复核。
+
+**仍然成立的旁证发现（与本次红因无关，但要记账）**：`crates/daemon/src/orphans.rs` 有 **6 处 `#[cfg(unix)]` + 6 处 `#[cfg(windows)]`** ⇒ 这是仓库里第一个真正的**平台分叉**文件，本地 Windows 的 clippy **从不编译** cfg(unix) 的那些区块 —— 一条真实的**门禁覆盖**缺口（第 19 条：门禁必须声明「哪一侧被 lint 过」）。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
@@ -267,6 +286,8 @@
 | C23 | **规则上移一层必须对旧调用点幂等**（t73，captain 采纳为通则） | 把净化规则从 `memembed.rs:200` 上移到共享 `query.rs::fts_pattern` 时，若不做幂等（`fts_pattern(fts_pattern(x))==fts_pattern(x)`），**旧调用点传进来的已是短语** ⇒ 共享层再转义一次会让召回 keyword 腿**静默 0 命中**。⇒ **通则：上移一条规则时，必须保证它对旧调用点幂等，否则上移本身就是一次静默行为变更**（与「同一件事两处说」「不可判定被合法值掩盖」同族）。附带读数：`before(raw) errors=8/11 → after ok=11/11`；负控 `deploy`/`部署`/`"deploy script"`/`café` 前后一致；**唯一差异已明写**（多词 `deploy script` 由隐式 AND `[1,2]` → 短语 `[1]`，理由是 keyword 腿一直如此，替代方案会拆坏合法引号查询）；**顺带修好真实查询 `release.sh` 的 500**（`.` 是 FTS5 语法字符） | 全员 |
 
 | C24 | **`Select-String 'FAILED'` 默认大小写不敏感 ⇒ 把 `0 failed` 数成假红**（t81 自报） | 成员第一遍统计测试行时，把 **12 行 `0 failed`** 计成 FAILED ⇒ **假红**（与假绿同族、方向相反，同属「测量口径的默认值本身就是缺陷来源」）。**判据**：统计一律 `-CaseSensitive` 并**锚定 `test result: FAILED`**；`test-evidence.sh` 的口径正是如此（按 `test result:` 行分类 + 大小写敏感）。与第 17/20 条、C21（跨 WSL 的 `$?` 永远是 0）同族 | 全员 |
+
+| C25 | **提交/推送前必须查「最近被写过的文件」，并对已提交字节跑编译面**（t66 首次推送事故，**captain 自犯**） | 在 `lifecycle.rs` 被写后 38 秒提交、且跳过推送前的编译面 ⇒ 推上去的提交**编译不过**（`E0425 backup_surface`），两个工作流同因变红。**判据**：① 提交前查 `git status` 中是否有文件 mtime 落在最近 ~60 秒内，有则**等**；② **推送前**对已提交字节跑 `check --workspace --all-targets`（本地绿 ≠ CI 绿，但**本地红一定 CI 红**）；③「安静窗口」不是奢侈品，是提交的**必要条件**；④ 诊断顺序：**先取 CI 原文，再怀疑环境**（我这次先怀疑了工具链漂移与平台分叉，两者都不是） | captain（沿用） |
 
 ## D. 纪律账
 
