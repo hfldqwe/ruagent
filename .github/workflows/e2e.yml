@@ -144,7 +144,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           # t104: the state comes from the command (`PIPESTATUS[0]`, since `tee`
-          # would otherwise hide it), never from a `${{ ... }}` expression: in
+          # would otherwise hide it), never from a `job.status` expression: in
           # GitHub expressions `0` is falsy, so `success && 0 || 1` is ALWAYS 1.
           echo "$rc" > "$RUNNER_TEMP/t65/playwright.rc"
           echo "playwright exit code: $rc"
