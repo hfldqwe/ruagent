@@ -46,9 +46,16 @@ jobs:
     # exact shape: `--reporter=json` + `_NAME`/`_FILE` produced NO file at all, while
     # `PW_TEST_REPORTER=json` + `PLAYWRIGHT_JSON_OUTPUT_FILE` produced it at the named
     # absolute path (66-68 KB, JSON.parse-able) in all three shapes tested.
+    #
+    # The path below uses the `github` context ON PURPOSE. It was `runner.temp`, which
+    # is NOT available in a job-level env: GitHub validates contexts statically and
+    # rejects the WHOLE file -- run 36510848293 (commit 02dea44) died in 0s with no
+    # jobs and "This run likely failed because of a workflow file issue", while ci.yml
+    # with the same pinned SHAs and the same timeout keys loaded fine. A YAML parser
+    # cannot see that layer, which is exactly why the guard's expression check passed.
     env:
       PW_TEST_REPORTER: json
-      PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/t65/playwright.json
+      PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.workspace }}/playwright-evidence.json
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
