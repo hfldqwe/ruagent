@@ -322,6 +322,160 @@ if [ "$bad_expr" -gt 0 ]; then
   bad=$((bad + bad_expr))
 fi
 
+# ---------------------------------------------------------------------------
+# CONTEXT AVAILABILITY (t115) -- the THIRD "valid YAML, GitHub still rejects it"
+# shape, and the second one this generation paid for in a pushed run.
+#
+# MEASURED INCIDENT: e2e.yml at 02dea44 put
+#     PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/t65/playwright.json
+# in a JOB-LEVEL `env:`. `runner` is not available in `jobs.<job_id>.env`, so
+# GitHub's static validation rejected the WHOLE FILE: run 36510848293 finished in
+# 0s with 0 jobs, `name` degraded from `E2E` to `.github/workflows/e2e.yml`, and
+# `gh run view` said "This run likely failed because of a workflow file issue".
+# Both existing guards passed that file: PyYAML parsed it, and the shape check
+# above found nothing wrong with the expression. `22255c4` changed the value to
+# `${{ github.workspace }}` and the next run loaded again (36511070463, name E2E).
+#
+# RULE SOURCE (not a guess): the "Context availability" table in
+# https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
+# ("The listed contexts are only available for the given workflow key, and may not
+# be used anywhere else."). Implemented rows -- deliberately ONLY these two, since
+# each further row needs its own false-positive control and the scopes where
+# `runner` IS legal (steps.*, container.env, services.*.env) must not be caught:
+#   `env`               -> github, secrets, inputs, vars
+#   `jobs.<job_id>.env` -> github, needs, strategy, matrix, vars, secrets, inputs
+# Everything else is declared out of scope in the t115 report section; a checker
+# that cries wolf is worse than no checker (t92/t105), so this one only fires
+# where the scope is unambiguous and the doc row is explicit.
+# ---------------------------------------------------------------------------
+ALLOWED_ROOT_ENV=" github secrets inputs vars "
+ALLOWED_JOB_ENV=" github needs strategy matrix vars secrets inputs "
+KNOWN_CTX=" github env vars job jobs steps runner secrets strategy matrix needs inputs "
+bad_ctx=0
+
+ctx_allowed() { case "$1" in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+
+check_ctx_line() { # allowed-set keypath file lineno line
+  local allowed="$1" keypath="$2" f="$3" n="$4" line="$5"
+  local rest="$line" body name
+  while true; do
+    case "$rest" in *'${{'*) ;; *) break ;; esac
+    rest="${rest#*\${{}"
+    case "$rest" in
+      *'}}'*) body="${rest%%\}\}*}"; rest="${rest#*\}\}}" ;;
+      *) break ;;
+    esac
+    # Only the FIRST identifier of a top-level token can be a context name: the
+    # `[^A-Za-z0-9_.]` guard keeps `needs.build.runner` from reading as `runner`.
+    for name in $(printf '%s' "$body" | grep -oE '(^|[^A-Za-z0-9_.])[a-z][a-z0-9_-]*\.' | sed -e 's/^[^a-z]*//' -e 's/\.$//' | sort -u); do
+      ctx_allowed "$allowed" "$name" && continue
+      case "$KNOWN_CTX" in *" $name "*) ;; *) continue ;; esac
+      echo "  $f:$n CONTEXT NOT AVAILABLE under $keypath: '$name' is not allowed there (allowed:$allowed) -- GitHub validates context availability statically and rejects the WHOLE file (t115; docs: context availability table)"
+      bad_ctx=$((bad_ctx + 1))
+    done
+  done
+}
+
+for f in "${files[@]}"; do
+  lineno=0
+  jobs_indent=-1
+  jobid_indent=-1
+  jobkey_indent=-1
+  in_steps=0
+  steps_indent=-1
+  env_scope=""
+  env_allowed=""
+  env_indent=-1
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    stripped="${line%%#*}"
+    indent="${stripped%%[! ]*}"
+    indent=${#indent}
+    trimmed="$(printf '%s' "$stripped" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+    if [ -n "$env_scope" ]; then
+      if [ -n "$trimmed" ] && [ "$indent" -gt "$env_indent" ]; then
+        check_ctx_line "$env_allowed" "$env_scope" "$f" "$lineno" "$line"
+        continue
+      fi
+      env_scope=""
+      env_allowed=""
+      env_indent=-1
+    fi
+    [ -n "$trimmed" ] || continue
+    case "$trimmed" in '#'*) continue ;; esac
+
+    # ---- structural state (exactly what the two rows need) ----
+    case "$trimmed" in
+      jobs:) jobs_indent="$indent"; jobid_indent=-1; jobkey_indent=-1; in_steps=0; steps_indent=-1; continue ;;
+      -*) continue ;;                     # a list item is never a job id / job key
+    esac
+    key="${trimmed%%:*}"
+    case "$key" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+    case "$trimmed" in *:*) ;; *) continue ;; esac   # `key:` or `key: value`
+    [ "$jobs_indent" -ge 0 ] || continue
+    [ "$indent" -gt "$jobs_indent" ] || { jobid_indent=-1; jobkey_indent=-1; in_steps=0; continue; }
+
+    if [ "$jobid_indent" -lt 0 ]; then
+      jobid_indent="$indent"              # first key under `jobs:` is a job id
+      continue
+    fi
+    if [ "$indent" -eq "$jobid_indent" ]; then
+      jobid_indent="$indent"; jobkey_indent=-1; in_steps=0; steps_indent=-1
+      continue
+    fi
+    if [ "$in_steps" -eq 1 ]; then
+      # still inside the step list (its items are list items, handled above);
+      # a plain key at the job-key indent ends the list and is a job key
+      [ "$indent" -gt "$steps_indent" ] && continue
+      in_steps=0
+    fi
+    if [ "$jobkey_indent" -lt 0 ]; then
+      jobkey_indent="$indent"
+    fi
+    [ "$indent" -eq "$jobkey_indent" ] || continue    # deeper keys are container/service/step keys
+
+    case "$key" in
+      steps) in_steps=1; steps_indent="$indent"; continue ;;
+      env) env_scope="jobs.<job_id>.env"; env_allowed="$ALLOWED_JOB_ENV"; env_indent="$indent"; continue ;;
+    esac
+  done <"$f"
+done
+
+# workflow-level `env:` (indent 0) -- same table, row `env`
+for f in "${files[@]}"; do
+  lineno=0
+  env_scope=""
+  env_indent=-1
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    stripped="${line%%#*}"
+    indent="${stripped%%[! ]*}"
+    indent=${#indent}
+    trimmed="$(printf '%s' "$stripped" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ -n "$env_scope" ]; then
+      if [ -n "$trimmed" ] && [ "$indent" -gt "$env_indent" ]; then
+        check_ctx_line "$ALLOWED_ROOT_ENV" "env (workflow level)" "$f" "$lineno" "$line"
+        continue
+      fi
+      env_scope=""
+      continue
+    fi
+    [ -n "$trimmed" ] || continue
+    case "$trimmed" in '#'*) continue ;; esac
+    # workflow-level only: `env:` at column 0. A deeper `env:` belongs to a job,
+    # a container/service or a step -- and the first two of those DO allow
+    # `runner`, so treating them as root env would be a false red.
+    [ "$indent" -eq 0 ] || continue
+    case "$trimmed" in env:) env_scope="env (workflow level)"; env_indent="$indent" ;; esac
+  done <"$f"
+done
+
+if [ "$bad_ctx" -gt 0 ]; then
+  echo "::error::$bad_ctx workflow expression(s) use a context that is NOT available under the key they sit under. GitHub validates context availability statically and rejects the ENTIRE workflow file: run 0s, no job, and the run name degrades to the file path (measured: run 36510848293 / commit 02dea44, t115). PyYAML parses that file and the shape check above passes it -- this layer is the only one that sees it. Source: the context availability table in the GitHub Actions contexts reference."
+  bad=$((bad + bad_ctx))
+fi
+
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
   for f in "${files[@]}"; do
     if python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1], encoding='utf-8'))" "$f" 2>/dev/null; then
