@@ -1,7 +1,7 @@
 # 第三代总账（ruagent 记忆/知识/wiki/图谱/召回 + 单一消费面）
 
 > **本文件是 captain 维护的总结底座**：所有数字都**带来源与限定**；**未取到/未验证**一律明写。
-> 读数时间窗：2026-09-27 → 2026-09-29（UTC+08）。代码基线 `5db881d`（origin/main），本代成果**尚未提交推送**（见 §7）。
+> 读数时间窗：2026-09-27 → 2026-09-29（UTC+08）。代码基线 `5db881d`；**本代成果已推送 7 次**（`origin/main = e3a58ea`，见 §1/§7）。
 > 修订规则：只追加/就地更正，旧文字逐字保留。
 
 ---
@@ -10,11 +10,11 @@
 
 | 目标 | 状态 | 依据 |
 |---|---|---|
-| ① 提交并推送到 `main` | **✅ 已完成** | **四次推送**：`0da0cb6`（159 文件/+45,177/−914，含两个原先未跟踪的守卫脚本与 `ci.yml`/`e2e.yml`）→ `cb55073`（memory 编译修复）→ `877a909`（memory 无警告 + graph as-of）→ `cfb52b1`（fmt 漂移修复 + t75 备份面 + t103 面板第三态/闩锁）。**全程未 force-push、未推 tag**（仍只有 `v0.1.0`） |
-| ② `main` 上 CI 转绿 | **未完成（在收敛）** | 首个真跑 `0da0cb6`：`Panel (node)` **✅ 30s**；ubuntu ❌ `Clippy`（首次真跑）+ 派生红；windows ❌（同一条 `E0425`，**无任何测试失败**）；E2E ❌ `Build`（同一条）。随后逐层剥开：**编译错误 → 警告即错误 → fmt 漂移 → 判定步恒红（假红）**；`cfb52b1` 正在验证前三层已消解 |
-| ③ 持续发掘 → 实现 → 验证 → 评审 → 集成 | **在运转** | **105 张单**；八轮只读审计的 finding 全部登记；`t104`（判定步假红）、`t105`（守卫脚本独立审计）在办 |
+| ① 提交并推送到 `main` | **✅ 已完成** | **七次推送**：`0da0cb6`（159 文件/+45,177/−914）→ `cb55073`（memory 编译修复）→ `877a909`（memory 无警告 + graph as-of）→ `cfb52b1`（fmt 漂移 + t75 备份面 + t103 面板第三态）→ `44636db`（t104 判定步假红修复 + t105 审计）→ `5d3adfd`（`e2e.yml` 非法 `${{ }}` 一行修复）→ `e3a58ea`（t106 守卫加固 + t107 e2e 不许猜目标 + t85 规格锚点）。**全程未 force-push、未推 tag**（仍只有 `v0.1.0`） |
+| ② `main` 上 CI 转绿 | **未完成（已收敛到最后三条真实红）** | 逐层剥开的**四层结构性红已全部消解**：编译错误 → 警告即错误 → fmt 漂移 → **判定步恒红（假红）**；`e3a58ea` 之后剩下的红**只有三个真实原因**：ubuntu `Test` **1 个用例**（`gold-seed-idempotence.rs:373` 写死 `C:\…`，Linux 上退化 ⇒ **t108**）· E2E `Playwright` **3 条**（`failure-visibility.spec.ts` 假设活配置里有 `claude`，CI 只有 mock ⇒ **t109**）· **跳过点名机制实测失效**（CI `1 skipped` 却 `0 named` ⇒ **t110**）。`Panel (node)` 自始为 ✅ |
+| ③ 持续发掘 → 实现 → 验证 → 评审 → 集成 | **在运转** | **110 张单**；八轮只读审计的 finding 全部登记；`t104`/`t105`/`t106`/`t107`/`t85` 已完成并入库；`t108`/`t109`/`t110` 在办 |
 
-**一句话**：这一代把「**读数可不可信**」当成一等目标来打 —— 每一处「绿」都要求能被负控打红、每一处「未测」都要求写成未测。**目标①已达成**；**目标②正在收敛**，且收敛过程本身产出了本代最贵的一批发现：**一条永远为红的判定步会把真红淹没**（`rc = … && 0 || 1` 在 GitHub 表达式里恒为 1）、**warning 即错误**（CI 用 `clippy -D warnings`，本地 `check` 的 `Finished` 不是绿）、**fmt 漂移是累积的**（成员各自的 clean 不能替代推送者那一刻的整树检查）、**「跳过」必须点名**（CI 用 github reporter，只给数字不给名字）。
+**一句话**：这一代把「**读数可不可信**」当成一等目标来打 —— 每一处「绿」都要求能被负控打红、每一处「未测」都要求写成未测。**目标①已达成（7 次推送）**；**目标②收敛到三条真实缺陷**，而收敛过程本身产出了本代最贵的一批发现：**一条永远为红的判定步会把真红淹没**（`rc = … && 0 || 1` 在 GitHub 表达式里恒为 1）· **warning 即错误**（CI 用 `clippy -D warnings`）· **fmt 漂移是累积的**（成员各自 clean 不能替代推送者那一刻的整树检查）· **合法 YAML ≠ GitHub 可加载**（`run:` 块内注释里的非法 `${{ }}` 会拒掉整个 workflow 文件，而 PyYAML 看不见这一层）· **e2e 隐性依赖操作者的活配置**（默认打活守护进程并**写活库**；本地绿、CI 红）· **测试里的平台假设**（Windows 路径写死 ⇒ Linux 上第一次执行就红）—— 最后两条正是「**门禁必须声明哪一侧被跑过**」的一手代价。
 
 ---
 
@@ -80,7 +80,7 @@ cd panel && node tools/design-audit.mjs --self-test         # 495/495
 
 ## 7. 未取到 / 未验证（诚实登记）
 
-- **已推送四次**（`0da0cb6` → `cb55073` → `877a909` → `cfb52b1`）。**已确认的判定**：`Panel (node)` 真跑 **success**（两次）；ubuntu 的 `Format`/`Clippy` **已真正执行过**（不再被短路），且首次真跑就分别暴露了编译错误、警告即错误、fmt 漂移；windows 的红**全部**归因于那条 `E0425` 编译错误（**无任何测试失败**：`test result: FAILED` 行 = 0）；`E2E evidence` 与 `Test evidence` 的红是**判定步恒红的假红**（`t104` 在修）。**仍未取得**：`cfb52b1` 的最终逐 job 判定（尤其 ubuntu `Test` 与 `Test evidence` 的**逐 target 计数**是否非空）、E2E 的 Playwright 在 CI 上是否复现 `consumption.spec.ts` 的 Wiki 覆盖率失败（本机仓库入口整条 = `48 passed / 1 failed / 2 skipped`，已请 wiki 区分「断言过期 vs 实现回归」）。
+- **已推送七次**（`0da0cb6` → `cb55073` → `877a909` → `cfb52b1` → `44636db` → `5d3adfd` → `e3a58ea`）。**已确认的判定**：`Panel (node)` 真跑 **success**（多次）；ubuntu 的 `Format`/`Clippy`/两个守卫步**已真正执行**（首次真跑分别暴露了编译错误、警告即错误、fmt 漂移，均已修），且**加固后的守卫在真实 CI 上 ✅**（`checked: 15` 的真实树，无误伤）；**ubuntu `Test` 已收敛为「恰好 1 个 target 失败」**（annotations 原文 `exit code 101 with 1 failing target(s)`；`gold-seed-idempotence.rs:373`，t108）；**E2E 的 Playwright 已在 CI 上真跑**：`5d3adfd` = **3 failed**/1 skipped/46 passed，`e3a58ea` = **4 failed**/1 skipped/46 passed ⇒ **失败集合不稳定**（同 spec 内残留状态依赖），已并入 t109 的判据；**判定步的假红已消除**（`e3a58ea` 的 `Test evidence` 报的是**真实 rc=101 + 1 failing target**，而不再是恒 1）。**仍未取得**：**windows 的真实测试判定**（见 §9 —— 唯一空白）。~~E2E 的 Playwright 是否复现 `consumption.spec.ts` 的 Wiki 覆盖率失败~~ **已解决**：那条红是 e2e 打到了**两天前的旧守护进程**（t107 已修，wiki 取证；当前字节上 `1 passed`）。
 - `design-audit --check` 的**四计数**未取到（t97 只给 ≈6.5 min 估算）；t99 要补。
 - `release.yml` 的**六个 SHA 固定尚未被任何真实运行验证**；上一次真实发布（09-17）在 `Create release` 失败（`<!DOCTYPE html>`）⇒ 加固只保证「红的不会被发」。
 - 人工 gold（实体家族、真实蒸馏批次）与 `wiki_citations`/`episode_count`/`GRAPH_PATHS=3` 的依据仍在遗留清单。
@@ -97,6 +97,20 @@ cd panel && node tools/design-audit.mjs --self-test         # 495/495
 - **同类形状**：`t57` 等被标失败的单也多为「**第 N 轮收窄后仍未全中**」，其未交付项都已逐条登记（见 §5 与 `gen3-backlog.md` 的 §B 各波）。
 - **另一类噪音**：**变异负控窗口**（t93/t81）会让其他人在几十秒内看到「真红」，本代出现过**一次误诊**；现已立纪律 C22（见 §4），窗口必须**先广播 + 限时 + 报告起止与恢复读数**。
 - **第三类噪音**：**被平台依赖规则冻结的单**（t64/t86/t89/t90，见 §5）—— 它们会一直显示 `pending`，既不是失败也不是在办。
+
+## 9. 目标②的收敛清单（下一轮推送前请逐条核对）
+
+| 红 | 根因（有证据） | 单 | 修好后应看到什么 |
+|---|---|---|---|
+| ubuntu `Test` | `gold-seed-idempotence.rs:373` 把 `C:\…` 当输入，Linux 上反斜杠是普通字符 ⇒ 整串退化成单组件 ⇒ **恰好 1 个 target** 失败 | `t108` | ubuntu `Test` ✅ **且 `Test evidence` 首次读到 `rc=0`** —— 那才是「判定步不再恒红」的真确认（现在它红是因为**测试真失败**，属正确的派生红） |
+| E2E `Playwright` | `failure-visibility.spec.ts` 假设活配置里有 `claude`；CI 只造 `alpha`/`beta`/`judge`；**失败集合不稳定（3→4）** ⇒ 依赖同 spec 内残留状态 | `t109` | `Playwright` ✅ **且连续两次运行失败集合相同（都为空）**（不许按「让那 3 条变绿」调） |
+| E2E 跳过点名 | `1 skipped` 却 `0 named`（`--reporter=list` 的真实 skip 行形状与预期不符；作者已自陈「未用真跑验证」，CI 反证） | `t110` | 证据表 `distinct skipped SPECS (named) ≥ 1`，且名字与真实被跳过的 spec **逐字相符**；若某 reporter 给不出名字，该步必须**红**而不是报绿 |
+| 无上界 | `ci.yml`/`e2e.yml` 无 `timeout-minutes` ⇒ 默认 **360 分钟**，「挂住」与「慢」在读数上不可区分 | `t111` | 四个 job 各有**有依据**的上界（宁可宽也不许误杀真慢）；正常路径不因此变红 |
+| **windows 判定** | ~~唯一空白~~ **已取得（`e3a58ea`）**：`Test attempt 1` = **`success`，1087s（18.1 分钟）** · `Test attempt 1 evidence` = `success`（读到 **rc=0** 并给出逐 target 计数）· `Test attempt 2 (only for the known build race)` = **`skipped`**（设计正确：attempt 1 成功不重试）· `Test attempt 2 evidence` = `success` | ✅ | **windows 测试面绿** ⇒ 目标②的剩余红**只有** ubuntu 的 1 个用例（t108）与 E2E（t109/t110）。**校准**：此前「9–13 分钟」是**取消点（下界）**，真值 **18.1 分钟** ⇒ `t111` 的上界必须显著高于它 |
+
+**判据提醒**：上表的「应看到什么」都要求**成对读数**（改前→改后）与**能红的负控**；「CI 绿」只有在**这五项**都有读数之后才允许宣称。
+
+---
 
 ## 附：本账的维护
 

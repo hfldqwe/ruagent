@@ -37,7 +37,7 @@
 // throwaway `--root` (see the report for the commands that start it), and this
 // spec only reads. `writeAccess()` is therefore not needed here.
 
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 
 const RECALL_LOG = "**/api/v1/recall/log*";
 const AGENT_OPTIONS = "**/api/v1/agents/*/options*";
@@ -68,6 +68,38 @@ const EMPTY_LOG = JSON.stringify({
 const norm = async (loc: Locator) =>
   ((await loc.textContent()) ?? "").replace(/\s+/g, " ").trim();
 
+// ── t109: this spec must NOT depend on the operator's live config ──────────────
+// It used to hard-code the runtime name `claude`, which exists only in a real
+// ~/.ruagent. CI registers mock agents, so three tests died at
+// `cardOf(page,"claude")` with `element(s) not found` (run 36485138690). The
+// name now comes from the DAEMON'S OWN list; when the daemon has no runtime at
+// all the spec SKIPS with that reason instead of passing by accident.
+let RT = "";
+async function firstRuntime(request: APIRequestContext): Promise<{ name: string; all: string[] }> {
+  // `GET /api/v1/runtimes` is 405 (that path only takes POST/PATCH/DELETE); the
+  // panel itself lists runtimes from `GET /api/v1/agents`, where a runtime is the
+  // entry with `kind === "runtime"` (measured on the live daemon: 10 entries,
+  // kinds {role, runtime}). NOTE the old literal `claude` was not even a runtime
+  // name there -- `claude-code` is -- so the pre-fix spec passed locally only
+  // because `cardOf` matches by SUBSTRING.
+  const res = await request.get("/api/v1/agents");
+  if (!res.ok()) return { name: "", all: [] };
+  const body = (await res.json()) as { agents?: Array<{ name?: string; kind?: string }> };
+  const agents = body.agents ?? [];
+  const all = agents
+    .filter((a) => a.kind === "runtime")
+    .map((a) => String(a.name ?? ""))
+    .filter(Boolean);
+  return { name: all[0] ?? "", all: agents.map((a) => `${a.name}:${a.kind}`) };
+}
+test.beforeEach(async ({ request }) => {
+  const { name, all } = await firstRuntime(request);
+  RT = name;
+  test.skip(
+    !name,
+    `t109: this daemon exposes no runtime to probe (agents: [${all.join(", ")}]); this spec must not assume the operator's live config -- a machine configured with a runtime whose name merely CONTAINS "claude" used to be the only way it passed.`,
+  );
+});
 const err500 = {
   status: 500,
   contentType: "application/json",
@@ -160,18 +192,18 @@ test("P3: a failed mount probe says so on the CHIP, and the R11 alert is not wha
 }) => {
   await page.route(AGENT_OPTIONS, (r) => r.fulfill(err500));
   await page.goto("/#runtimes");
-  await expect(cardOf(page, "claude")).toBeVisible({ timeout: 15_000 });
-  await expect(cardOf(page, "claude")).toHaveText(/探测失败|probe failed/, {
+  await expect(cardOf(page, RT)).toBeVisible({ timeout: 15_000 });
+  await expect(cardOf(page, RT)).toHaveText(/探测失败|probe failed/, {
     timeout: 15_000,
   });
 
   // (3) the discriminator: the pre-existing R11 alert renders the SAME text,
   // but on `probeErr`, which the mount probe never sets. Zero in-card alerts
   // means the text above can only have come from the chip (t84's new state).
-  const alerts = await inCardAlerts(page, "claude").count();
+  const alerts = await inCardAlerts(page, RT).count();
   console.log(`DOM READING P3 in-card R11-alert nodes: ${alerts}`);
   expect(alerts, "the mount probe must not set the sync path's probeErr").toBe(0);
-  const text3 = await cardText(page, "claude");
+  const text3 = await cardText(page, RT);
   console.log(`DOM READING P3 claude card: ${text3}`);
 
   // (4) the model readout, reconciled against the cards: every runtime's probe
@@ -179,7 +211,7 @@ test("P3: a failed mount probe says so on the CHIP, and the R11 alert is not wha
   const models = await norm(await readoutOf(page, "模型"));
   console.log(`DOM READING P3 models readout (all probes failed): ${models}`);
   const cards: string[] = [];
-  for (const name of ["claude", "dsh", "opencode"]) {
+  for (const name of [RT]) {
     if ((await cardOf(page, name).count()) > 0) cards.push(`${name}=[${await cardText(page, name)}]`);
   }
   console.log(`DOM READING P3 cards: ${JSON.stringify(cards)}`);
@@ -192,14 +224,14 @@ test("P3: a failed mount probe says so on the CHIP, and the R11 alert is not wha
   await page.route(AGENT_OPTIONS, (r) =>
     r.fulfill({ status: 200, contentType: "application/json", body: THREE_MODELS }),
   );
-  await cardOf(page, "claude").locator("button[aria-label]").first().click();
+  await cardOf(page, RT).locator("button[aria-label]").first().click();
   await page.waitForTimeout(2000);
-  console.log(`DOM READING P3-after-successful-retry card: ${await cardText(page, "claude")}`);
+  console.log(`DOM READING P3-after-successful-retry card: ${await cardText(page, RT)}`);
   console.log(
     `DOM READING P3-after-successful-retry models readout: ${await norm(await readoutOf(page, "模型"))}`,
   );
   console.log(
-    `DOM READING P3-after-successful-retry in-card R11-alert nodes: ${await inCardAlerts(page, "claude").count()}`,
+    `DOM READING P3-after-successful-retry in-card R11-alert nodes: ${await inCardAlerts(page, RT).count()}`,
   );
 });
 
@@ -210,14 +242,14 @@ test("P3 success control: a real 0 models is 'not probed', not an error, and byt
     r.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ agent: "claude", options: [] }),
+      body: JSON.stringify({ agent: RT, options: [] }),
     }),
   );
   await page.goto("/#runtimes");
-  await expect(cardOf(page, "claude")).toBeVisible({ timeout: 15_000 });
+  await expect(cardOf(page, RT)).toBeVisible({ timeout: 15_000 });
   await page.waitForTimeout(1800);
 
-  const text = await cardText(page, "claude");
+  const text = await cardText(page, RT);
   const body = (await content(page).innerText()).replace(/\s+/g, " ");
   console.log(`DOM READING P3-success card (真 0 models): ${text}`);
   console.log(
@@ -240,10 +272,10 @@ test("F2 (t103): a successful retry after a failed mount probe CLEARS the failur
 }) => {
   await page.route(AGENT_OPTIONS, (r) => r.fulfill(err500));
   await page.goto("/#runtimes");
-  const card = cardOf(page, "claude");
+  const card = cardOf(page, RT);
   await expect(card).toBeVisible({ timeout: 15_000 });
   await expect(card).toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
-  console.log(`DOM READING F2-before-retry card: ${await cardText(page, "claude")}`);
+  console.log(`DOM READING F2-before-retry card: ${await cardText(page, RT)}`);
 
   await page.unroute(AGENT_OPTIONS);
   await page.route(AGENT_OPTIONS, (r) =>
@@ -252,7 +284,7 @@ test("F2 (t103): a successful retry after a failed mount probe CLEARS the failur
   await card.locator("button[aria-label]").first().click();
   await expect(card).not.toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
   const modelsAfter = await norm(await readoutOf(page, "模型"));
-  console.log(`DOM READING F2-after-retry card: ${await cardText(page, "claude")}`);
+  console.log(`DOM READING F2-after-retry card: ${await cardText(page, RT)}`);
   console.log(`DOM READING F2-after-retry models readout: ${modelsAfter}`);
   expect(modelsAfter, "the recovered count must reach the aggregate").toMatch(/3/);
 });
@@ -262,8 +294,8 @@ test("F1 (t103): with EVERY probe failed the models readout carries no number", 
 }) => {
   await page.route(AGENT_OPTIONS, (r) => r.fulfill(err500));
   await page.goto("/#runtimes");
-  await expect(cardOf(page, "claude")).toBeVisible({ timeout: 15_000 });
-  await expect(cardOf(page, "claude")).toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
+  await expect(cardOf(page, RT)).toBeVisible({ timeout: 15_000 });
+  await expect(cardOf(page, RT)).toHaveText(/探测失败|probe failed/, { timeout: 15_000 });
   const models = await norm(await readoutOf(page, "模型"));
   console.log(`DOM READING F1-models-readout-all-failed: ${models}`);
   expect(models, "an all-failed readout must not present a measured number").not.toMatch(/\d/);
