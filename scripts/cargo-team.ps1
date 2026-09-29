@@ -27,11 +27,25 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-team.ps1 check -p ruagent-daemon --all-targets
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-team.ps1 test --release -p ruagent-store
 #
-#   `cargo test ... -- --nocapture` and `clippy ... -- -D warnings` cannot be
-#   forwarded verbatim through `powershell -File` (PowerShell consumes the bare
-#   `--`). Use the two switches that expand to exactly those tails:
-#     -Nocapture   appends `-- --nocapture`
-#     -DenyWarnings appends `-- -D warnings`
+#   Two switches expand to the tails that are easy to get wrong:
+#     -Nocapture    appends `-- --nocapture`   (for test/bench only)
+#     -DenyWarnings appends `-- -D warnings`   (for clippy only -- see below)
+#
+#   MEASURED 2026-09-29 (t116/t117): a literal `--` IS forwarded verbatim from the
+#   documented invocation -- `... cargo-team.ps1 test -p ruagent-core -- --list`
+#   reaches cargo as `cargo test -p ruagent-core -- --list`. The earlier claim here
+#   that PowerShell eats the bare `--` was NOT reproduced from this caller, so these
+#   two switches are convenience and self-documentation, not a workaround for a
+#   demonstrated loss. (A caller that goes through another shell layer may still
+#   lose it; this script only knows what reaches it.)
+#
+#   -DenyWarnings IS COMMAND-AWARE (t117, fixing t116 W-4): `-- -D warnings` is only
+#   meaningful for `clippy` (and `cargo rustc`). With `check` cargo rejects the
+#   arguments (exit 1); with `test` libtest dies with "Unrecognized option: 'D'"
+#   while NO test runs -- a red that reads like a test failure (measured: exit 101
+#   with zero `test result:` lines). This script now REFUSES that pairing (exit 2 and
+#   the reason) instead of producing the misleading red. Every call site in this repo
+#   already uses -DenyWarnings with clippy.
 #
 #   Add -DryRun to print the exact cargo command line without compiling and
 #   without taking the build lock. Use it to check a shape first.
@@ -49,13 +63,39 @@
 #   `Checking <crate>` line -- cargo prints that per PACKAGE, so it proves the
 #   package was re-checked and never enumerates targets.
 #
+#   t117 (fixing t116 W-1, a gate-shaped false green): `-CleanFirst <name>` used to
+#   print "forced re-check" even when <name> was NOT a package the gate builds, and
+#   the mismatched run then reported a CACHED green with the SAME words as the
+#   matched one (measured: matched -> "Checking ruagent-core" + 1.1s; mismatched ->
+#   no Checking line + 0.3s; both exit 0). The wording is now honest:
+#     * a cleaned name that IS a gated package: "(forced re-check: '<name>' IS a
+#       package this gate builds)"
+#     * otherwise a NOT VERIFIED banner naming what the gate builds, what this run
+#       cleaned, and that the green below is a genuine re-read only if
+#       'Checking <gated package>' appears in THIS run's output.
+#   Cleaning a DEPENDENCY to force the gated package to rebuild stays allowed (the
+#   banner says so): it was the CLAIM that was wrong, not the technique.
+#
+#   THIS SCRIPT REFUSES (exit 2, with the reason on stdout) rather than guessing:
+#     * a nameless -CleanFirst with no `-p <spec>`                (t88/R-5)
+#     * -TargetDir with a missing or empty value                   (t116 W-2: it used
+#       to fall back to the SHARED target silently, so a two-tree comparison would
+#       compile the second tree into the first tree's cache -- closure 7.1)
+#     * -Jobs / -Cpus with a missing, non-numeric or < 1 value      (t116 W-3/W-8)
+#     * -DenyWarnings with a command other than clippy/rustc        (t116 W-4)
+#   Switch names are matched case-insensitively (PowerShell `-eq`), so `-dryrun`
+#   works too (t116 W-7); no cargo single-dash flag collides with them today.
+#
 # COMPARING TWO TREES: a before/after pair (git worktree, git archive export)
 # must NOT share a target dir -- cargo would hand the second tree the first
 # tree's rlibs (closure plan 7.1). Give the comparison tree a dir of its own:
 #   ... -File scripts/cargo-team.ps1 test -p X -TargetDir "$env:TEMP\ruagent-cmp-a"
 #
 # -NoLock is only for such a deliberate second target dir that you want to run
-# in parallel (rare).
+# in parallel (rare). It does NOT check that your dir differs from the team's
+# (t116 W-9): with the shared dir, two -NoLock builds are serialized only by
+# cargo's own "Blocking waiting for file lock on build directory", and the real
+# cost is CPU/memory headroom. This script prints a NOTE in that case.
 #
 # WHY THERE IS NO `param()` BLOCK (2026-09-28, found the hard way):
 #   With `powershell -File`, ANY declared parameter takes the first bare word:
@@ -79,6 +119,20 @@ $cargoArgs = New-Object 'System.Collections.Generic.List[string]'
 $cleanFirst = New-Object 'System.Collections.Generic.List[string]'
 
 $raw = @($args)
+
+function Refuse([string]$msg) {
+    Write-Host "[cargo-team] $msg"
+    exit 2
+}
+
+function PosInt([string]$v, [string]$name) {
+    $n = 0
+    if (-not [int]::TryParse($v, [ref]$n) -or $n -lt 1) {
+        Refuse "$name needs a positive integer (got '$v'). Refusing: 0 or a non-number used to reach cargo (or silently clamp), which is not a build parameter (t116 W-3/W-8)."
+    }
+    return $n
+}
+
 for ($i = 0; $i -lt $raw.Count; $i++) {
     $a = [string]$raw[$i]
     if ($a -eq '-CleanFirst') {
@@ -91,9 +145,21 @@ for ($i = 0; $i -lt $raw.Count; $i++) {
         if ($nxt -and -not $nxt.StartsWith('-')) { $i++; $cleanFirst.Add($nxt) }
         else { $cleanFirst.Add('') }
     }
-    elseif ($a -eq '-Jobs') { $i++; $jobs = [int]$raw[$i] }
-    elseif ($a -eq '-Cpus') { $i++; $cpus = [int]$raw[$i] }
-    elseif ($a -eq '-TargetDir') { $i++; $targetDir = [string]$raw[$i] }
+    elseif ($a -eq '-Jobs') {
+        $nxt = if ($i + 1 -lt $raw.Count) { [string]$raw[$i + 1] } else { '' }
+        $i++; $jobs = PosInt $nxt '-Jobs'
+    }
+    elseif ($a -eq '-Cpus') {
+        $nxt = if ($i + 1 -lt $raw.Count) { [string]$raw[$i + 1] } else { '' }
+        $i++; $cpus = PosInt $nxt '-Cpus'
+    }
+    elseif ($a -eq '-TargetDir') {
+        $nxt = if ($i + 1 -lt $raw.Count) { [string]$raw[$i + 1] } else { '' }
+        if (-not $nxt -or $nxt.StartsWith('-')) {
+            Refuse "-TargetDir needs a path (got '$nxt'). Refusing: a missing value used to fall back to the SHARED team target silently, so a two-tree before/after comparison would compile the second tree into the first tree's cache and its readings would not be the second tree's (t116 W-2)."
+        }
+        $i++; $targetDir = $nxt
+    }
     elseif ($a -eq '-NoLock') { $noLock = $true }
     elseif ($a -eq '-Nocapture') { $noCapture = $true }
     elseif ($a -eq '-DenyWarnings') { $denyWarnings = $true }
@@ -128,6 +194,26 @@ if ($cargoArgs.Count -eq 0) {
     Write-Host "usage: cargo-team.ps1 [-Jobs N] [-Cpus N] [-TargetDir PATH] [-NoLock] [-Nocapture] [-DenyWarnings] [-DryRun] <cargo args...>"
     exit 2
 }
+
+# W-4 (t117): the `-- -D warnings` tail only exists for clippy/rustc. Refusing here is
+# the honest choice -- "supporting" it for check/test would need RUSTFLAGS, which
+# changes the fingerprint of every crate and would rebuild/re-cache the whole shared
+# target dir (a silent, large side effect on the team cache).
+$sub = [string]$cargoArgs[0]
+if ($denyWarnings -and ($sub -ne 'clippy' -and $sub -ne 'rustc')) {
+    Write-Host "[cargo-team] -DenyWarnings does not apply to 'cargo $sub' -- it appends '-- -D warnings', which only clippy/rustc accept. Measured with the old shape (t116 W-4): 'check' -> cargo 'error: unexpected argument ''-D'' found' (exit 1); 'test' -> libtest 'Unrecognized option: ''D''' + cargo 'error: test failed' (exit 101) with ZERO 'test result:' lines, i.e. a red that reads like a test failure while no test ran."
+    Write-Host "[cargo-team] Refusing. Use -DenyWarnings with clippy (every call site in this repo does), or set RUSTFLAGS yourself if you really need rustc-level -D warnings."
+    exit 2
+}
+
+# the packages this gate actually builds (-p/--package); used by the W-1 honesty check
+$gated = New-Object 'System.Collections.Generic.List[string]'
+for ($i = 0; $i -lt $cargoArgs.Count; $i++) {
+    if (($cargoArgs[$i] -eq '-p' -or $cargoArgs[$i] -eq '--package') -and $i + 1 -lt $cargoArgs.Count) {
+        $gated.Add([string]$cargoArgs[$i + 1])
+    }
+}
+
 if ($noCapture) { $cargoArgs.Add('--'); $cargoArgs.Add('--nocapture') }
 if ($denyWarnings) { $cargoArgs.Add('--'); $cargoArgs.Add('-D'); $cargoArgs.Add('warnings') }
 
@@ -146,7 +232,15 @@ if ($useCpus -lt 1) { $useCpus = 1 }
 if ($dryRun) {
     Write-Host "[cargo-team] DRY RUN (nothing compiled, no lock taken)"
     Write-Host "[cargo-team] target=$shared jobs=$jobs cpus=0-$($useCpus - 1)/$logical priority=BelowNormal"
-    if ($cleanFirst.Count -gt 0) { Write-Host "[cargo-team] (under the same lock) cargo clean -p $($cleanFirst -join ', -p ')" }
+    if ($cleanFirst.Count -gt 0) {
+        foreach ($pkg in $cleanFirst) {
+            if ($gated.Count -gt 0 -and ($gated -contains $pkg)) {
+                Write-Host "[cargo-team] (under the same lock) clean -p $pkg (forced re-check: '$pkg' IS a package this gate builds)"
+            } else {
+                Write-Host "[cargo-team] (under the same lock) clean -p $pkg (NOT a package this gate builds -- the run will print NOT VERIFIED; t116 W-1)"
+            }
+        }
+    }
     Write-Host "[cargo-team] cargo $($cargoArgs -join ' ')"
     exit 0
 }
@@ -183,21 +277,53 @@ try {
     }
 
     Write-Host "[cargo-team] target=$shared jobs=$jobs cpus=0-$($useCpus - 1)/$logical priority=BelowNormal"
-    Write-Host "[cargo-team] cargo $($cargoArgs -join ' ')"
-    # -CleanFirst: force a real re-reading while still holding the lock, so no
-    # peer build can slip in and re-warm the cache against the gate.
+    if ($noLock -and -not $targetDir) {
+        Write-Host "[cargo-team] NOTE: -NoLock with the SHARED target dir. Two such builds are serialized only by cargo's own 'Blocking waiting for file lock on build directory' and otherwise compete for CPU/memory; -NoLock is meant for a deliberate second -TargetDir (t116 W-9)."
+    }
+
+    # -CleanFirst: force a real re-reading while still holding the lock, so no peer
+    # build can slip in and re-warm the cache against the gate.
+    # t117/W-1: say what is cleaned AND whether it is a package this gate builds. The
+    # old wording claimed "forced re-check" for any name, so a run that cleaned an
+    # unrelated package printed the same words as one that cleaned the gated package,
+    # while its green came from cargo's cache.
+    $uncovered = New-Object 'System.Collections.Generic.List[string]'
     foreach ($pkg in $cleanFirst) {
-        Write-Host "[cargo-team] clean -p $pkg (forced re-check)"
+        if ($gated.Count -gt 0 -and ($gated -contains $pkg)) {
+            Write-Host "[cargo-team] clean -p $pkg (forced re-check: '$pkg' IS a package this gate builds)"
+        } elseif ($gated.Count -gt 0) {
+            Write-Host "[cargo-team] clean -p $pkg (NOT a package this gate builds: gate builds $($gated -join ', '))"
+            $uncovered.Add($pkg)
+        } else {
+            Write-Host "[cargo-team] clean -p $pkg (the gate has no -p spec: it builds the workspace default set, so '$pkg' is not confirmed as a gated package)"
+            $uncovered.Add($pkg)
+        }
         & cargo clean -p $pkg
         if ($LASTEXITCODE -ne 0) {
             Write-Host "[cargo-team] cargo clean -p $pkg exited $LASTEXITCODE; not running the gate"
             exit $LASTEXITCODE
         }
     }
+    if ($uncovered.Count -gt 0) {
+        $gateDesc = if ($gated.Count -gt 0) { "-p " + ($gated -join ' -p ') } else { "the workspace default set (no -p spec)" }
+        Write-Host "[cargo-team] ============ NOT VERIFIED BY THE CLEAN ============"
+        Write-Host "[cargo-team] This run cleaned package(s) other than the ones it gates, so whether the gate was re-read is NOT established by the clean alone:"
+        Write-Host "[cargo-team]   gate builds        : $gateDesc"
+        Write-Host "[cargo-team]   this run cleaned   : $($cleanFirst -join ', ')"
+        Write-Host "[cargo-team]   cleaned, not gated: $($uncovered -join ', ')"
+        Write-Host "[cargo-team] A green below is a genuine re-read ONLY if the clean invalidates a gated package: cleaning a DEPENDENCY of it does, cleaning an unrelated package does NOT. Confirm by looking for 'Checking <gated crate>' in THIS run's output; if no such line appears, the green came from cargo's cache and is NOT a re-read (t116 W-1)."
+        Write-Host "[cargo-team] ==================================================="
+    }
+    # W-5 (t117): the gate's command line is announced AFTER the clean, so the log no
+    # longer reads as if the gate ran before anything was removed.
+    Write-Host "[cargo-team] cargo $($cargoArgs -join ' ')"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     & cargo @cargoArgs
     $code = $LASTEXITCODE
     $sw.Stop()
+    if ($uncovered.Count -gt 0) {
+        Write-Host "[cargo-team] re-read check: this run cleaned $($cleanFirst -join ', '); a re-read of $gateDesc shows up above as 'Checking <crate>'. No such line => cache green, not a gate (t116 W-1)."
+    }
     Write-Host ("[cargo-team] exit={0} elapsed={1:N1}s" -f $code, $sw.Elapsed.TotalSeconds)
     exit $code
 } finally {
