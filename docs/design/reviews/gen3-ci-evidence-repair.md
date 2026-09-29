@@ -287,4 +287,89 @@ RUAGENT_E2E_ALLOW_WRITES=0 E2E_BASE_URL=http://127.0.0.1:18788 npm run test:e2e 
 
 - 增量：`.github/workflows/e2e.yml` = **7 insertions(+), 1 deletion(-)**（CONFIRMED 行 + 收尾行两数并列）；本报告本节。
 - 真实运行（run C）：临时 root `%TEMP%\ra-t110-root2` + 端口 **18788**、自记 pid **83836**（已停、root 已删）；**活 pid 79984 与活库未触碰**。
-- 未测仍开放两条（并新增一条）：① ubuntu + chromium 上 `--reporter=json` + `PLAYWRIGHT_JSON_OUTPUT_NAME` 的组合**我没真跑**（下一条 CI run 是它的读数；若缺 JSON ⇒ 立即红，不会静默）；② 判定步依赖 job 里存在 `node`（未显式断言，缺了也是红而非绿）；③ **修订后的这张表（CONFIRMED 行 + 两数收尾行）本身还没在 ubuntu 上跑过** —— 它下一次 CI 的运行读数才算落地。
+- 未测仍开放两条（并新增一条）：① ubuntu + chromium 上 `--reporter=json` + `PLAYWRIGHT_JSON_OUTPUT_NAME` 的组合**我没真跑**（下一条 CI run 是它的读数；若缺 JSON ⇒ 立即红，不会静默）；② 判定步依赖 job 里存在 `node`（未显式断言，缺了也是红而非绿）；③ **修订后的这张表（CONFIRMED 行 + 两数收尾行）本身还没在 ubuntu 上跑过** —— 它下一次 CI 的运行读数才算落地。**⇒ 这三条的全部结果见 §9.9（第①条已被 CI 证伪并定位修复）。**
+
+## §9.9 CI 给出了那条读数：JSON 腿在 CI 上不工作 —— 已定位、已复现、补丁已验证（**尚未落盘，等 t111 推完**）
+
+> `5c0bc8f` 的 E2E run `36508857994`：**测试全过**（`Panel E2E (Playwright)` success），红的**只有证据步**，原文就是我写的护栏：
+> ```
+> ##[error] no Playwright JSON report at /home/runner/work/_temp/t65/playwright.json
+>          -- this leg cannot name a skipped spec. The run step must pass --reporter=json with
+>          PLAYWRIGHT_JSON_OUTPUT_NAME (t110): a skip that cannot be named must never be reported as green.
+> ```
+> ⇒ **护栏按设计工作**（没有写成假绿，CI 也没放过它），但它红在「取数腿」上 —— 这正是 §9.8(e) 第①条「未真跑」的代价：**本机通、CI 不通**。
+
+### (a) 用**与 CI 相同的形状**在本机复现「JSON 缺失」
+
+上一轮本地验证漏过去的唯一原因是形状不同：我没有设 `CI=true`。补上之后（同样临时 root + 临时端口 + 真 suite）：
+
+| 形状（真跑） | `…_OUTPUT_NAME`（绝对路径） | `…_OUTPUT_FILE`（绝对路径） | 结果 |
+| --- | --- | --- | --- |
+| 非 CI（我上一轮用的） | 设 | — | **文件出现在该路径** ✓ |
+| **CI=true（CI 的形状）** | 设 | — | **没有任何文件**（`panel/` + runner temp 全树搜索 0 命中）✗ |
+| **CI=true** | — | 设 | **仍然没有任何文件** ✗ |
+| **CI=true** | — | — | 无文件；但 `--reporter=json` **单独**用时 JSON 打到 **stdout** ✓ |
+
+⇒ **CI 的形状与本地不同**，这就是 CI 上取不到文件的直接原因（也是我上一轮该测而没测的那一项）。
+
+### (b) 机制（读已安装 Playwright 源码 + 实测，两者一致）
+
+`panel/node_modules/playwright/lib/runner/index.js`：
+```js
+function resolveFromEnv(name) { const v = process.env[name]; if (v) return path.resolve(process.cwd(), v); return void 0; }
+function resolveOutputFile(reporterName, options) {
+  let outputFile = resolveFromEnv(`PLAYWRIGHT_${name}_OUTPUT_FILE`);   // _FILE：绝对路径生效
+  ...
+  const reportName = process.env[`PLAYWRIGHT_${name}_OUTPUT_NAME`] ?? options.fileName ?? options.default?.fileName;
+  if (!reportName) return void 0;                                     // 名字缺失 ⇒ 该 reporter 没有输出文件
+  outputFile = path.resolve(outputDir, reportName);
+}
+async function createReporters(config, mode, descriptions) {
+  descriptions ??= config.config.reporter;                            // CLI reporters 与 config 清单的关系
+  for (const r of descriptions) { ... }                               // 在 CI 形状下叠加结果 ≠ 本地
+  if (process.env.PW_TEST_REPORTER) { ... reporters.push(...) }       // ← 无条件按名字再挂一个
+}
+```
+- **`PW_TEST_REPORTER` 是确定性那条腿**：它**无条件**再挂一个 reporter（`index.js:5221`），**不受** config 清单与 CLI `--reporter` 合并方式影响 —— 而那份合并正是「本地有文件、CI 没有」的分界。
+- `_FILE` = **绝对路径**（`path.resolve(cwd, value)`，绝对胜出）；`_NAME` = **相对 `outputDir` 的文件名**（`path.resolve(outputDir, name)`）⇒ **别再用 `_NAME` 给绝对路径**。
+- 实测（CI=true，真 suite）：`PW_TEST_REPORTER=json` + `PLAYWRIGHT_JSON_OUTPUT_FILE=<绝对路径>` ⇒ **文件精确落在该路径**（66–68 KB，可 `JSON.parse`）✓。
+
+### (c) 补丁（**在副本里验证，未落到 `e2e.yml`**：等 `t111` 推完）
+
+补丁副本 = `%TEMP%\e2e.t110-fix.yml`，diff = `%TEMP%\ra-t110-fix.diff`（三个 hunk）：
+
+1. **job 级 `env:` 一处定义路径**（写的人与读的人引用同一变量，杜绝字面量漂移）：
+   ```yaml
+   env:
+     PW_TEST_REPORTER: json
+     PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/t65/playwright.json
+   ```
+2. **run 步**去掉 `PLAYWRIGHT_JSON_OUTPUT_NAME=…` 前缀与 CLI 的 `--reporter=json`（避免同一文件被两个 json reporter 同时写），保留 `--reporter=list --reporter=html`。
+3. **证据步**改成 `json="${PLAYWRIGHT_JSON_OUTPUT_FILE:?}"`，缺失时的报错也指向这条事实。
+
+**三条护栏一条未削**：文件缺失 / 解析失败 / `stats.skipped ≠ named` 仍是 `::error::` + exit 1。
+
+### (d) 补丁验证（9/9，全部真跑真日志）
+
+| 用例 | 形状 | 读数 |
+| --- | --- | --- |
+| 真 suite ×3 | CI=true 武装 / CI=true 未武装 / 非 CI 未武装 | **三次 JSON 都精确落在 job-env 路径**（68,023 / 74,972 / 74,995 B），exit 0 |
+| **改前** | HEAD 的证据步 + CI 形状（无文件） | **exit 1**，`no Playwright JSON report at …` —— **与 CI 原文同形** ✓ |
+| **改后** | CI 武装（零跳过） | **exit 0**：`| JSON report stats.skipped | 0 |` · `| **named skipped specs** | **0** |` · **CONFIRMED** 行 · `JSON says 0 skipped / 0 named` ✓ |
+| **改后** | CI 未武装（6 跳过） | **exit 1**（registry 致命），并**点名** `consumption.spec.ts :: …` · `recall.spec.ts :: …` · `registry.spec.ts :: …`（带 skip 理由原文）✓ |
+| **改后** | 非 CI 未武装 | 同一取数在**没有 `CI=true`** 时同样可用 ⇒ 不是「只在 CI 成立的补丁」✓ |
+| 负控 ①–⑤ | 文件缺失 / 截断 / `stats=6` 但 0 named（t104 形状）/ `rc=1` / 无日志 | **红 4 例 + 通知 1 例**，全部按设计 ✓ |
+
+（全量：`%TEMP%\ra-t110-fixval2.log`。）
+
+### (e) 第 19 条口径更新（事实版，不再只写「未测」）
+
+- ~~「ubuntu + chromium 上 `--reporter=json` + `PLAYWRIGHT_JSON_OUTPUT_NAME` 组合我没真跑」~~ ⇒ **CI 已证明该组合不工作**（`5c0bc8f`，E2E 判定步 FAILED，原文见上）⇒ **已定位机制、已在本机以同形状复现、补丁已在副本验证 9/9** ⇒ **待下次 CI 验证**（下一次 E2E 证据步应出现 §9.8(d) 那几行，且 `stats.skipped` 安静为 0）。
+- 仍开放：判定步依赖 job 里有 `node`（未显式断言；缺了表现为「文件缺失 ⇒ 红」，是失败而非假绿）。
+- 仍开放：**补丁尚未落到 `e2e.yml`**（按 captain 指令等 `t111` 推完，避免把半成品夹带进整文件推送）。
+
+### (f) 纪律（本节）
+
+- **未改仓库里的 `e2e.yml`**（`git status` 里它只有我 t110 的 7 行增量；补丁只在 `%TEMP%` 副本里）。
+- 真跑用临时守护进程：临时 root `%TEMP%\ra-t110-ci-root` + 端口 18789/18790/18791，自记 pid **46780 · 4328 · 93852 · 93392 · 94104 · 73828** —— **全部按自记 pid 停止**；**活 pid 79984 与活库未被触碰**（全程只读健康检查）。
+- 未 push / dispatch / rerun / cancel / tag。

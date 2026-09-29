@@ -54,6 +54,7 @@
 **门禁（本代加固后）**：`fmt --all --check` · `clippy --workspace --all-targets -- -D warnings` · `test --workspace --no-fail-fast`（**逐 target 计数 + 退出码**，0 reporting target = error）· `cd panel && npm run build`（内含 i18n-check / `tsc -b` / e2e tsconfig / vite）· F1 守卫（workflow 引用的路径必须已跟踪）· nested-Result 守卫 · ignored-instrument 清单对账。
 
 **纪律账（`gen2-integration-contract.md` 22 条 + 本代新增）**：读数只在**最终字节**上取 · **编译面/测试面/作用域三面分开写** · 负控必须能红 · 未测写成未测 · **门禁要么真跑要么明确拒绝**（`-CleanFirst` 空 SPEC 实例）· **跨 Windows→WSL 测退出码只能用 `$LASTEXITCODE`/`if`**（`echo $?` 会静默给 0）· **共享树不可编译必须立刻广播** · 跨文件前先确认树可编译 · **同一形状多处改动必须一起落地**。
+**本代末段新增（都是吃过亏换来的）**：**上界必须按「绿」的运行取，不能按红的**（红 run 早期失败、后面 `skipped` ⇒ 标定会得到荒谬小值）· **推的人必须用 `numstat` 证明「我推的正是我说的那些字节」**（否则会把同伴在途改动卷进提交）· **固定动作 ≠ 固定工具链**（`uses:` 钉 SHA 而 `toolchain: stable` 仍浮动 ⇒ 必须**行内写明**这层不对称）· **护栏把「静默绿」变成「红」时，不许为了让绿回来而削弱护栏**（`5c0bc8f` 的 E2E 红即此例：它换来的是「再也无法在拿不到名字时报绿」）· **未锚定的匹配会造出不存在的 finding**（「2 处裸 `#[ignore]`」实为文档散文 `` `#[ignore]`d ``；与 `Select-String 'FAILED'` 大小写不敏感同族）· **变异窗口的看门狗不能依赖同一个工具调用返回**（t98 窗口 1 被 600s 上限掐住 ⇒ 变异体留了 ~10 分钟；窗口 2 用独立看门狗 ⇒ 5.1 秒）。
 
 ---
 
@@ -85,7 +86,8 @@ cd panel && node tools/design-audit.mjs --self-test         # 495/495
 - `design-audit --check` 的**四计数**未取到（t97 只给 ≈6.5 min 估算）；t99 要补。
 - `release.yml` 的**六个 SHA 固定尚未被任何真实运行验证**；上一次真实发布（09-17）在 `Create release` 失败（`<!DOCTYPE html>`）⇒ 加固只保证「红的不会被发」。
 - 人工 gold（实体家族、真实蒸馏批次）与 `wiki_citations`/`episode_count`/`GRAPH_PATHS=3` 的依据仍在遗留清单。
-- 迁移可重放修复（t98）与状态机接线（t90，冻结）尚未落地 ⇒ 存储层与状态机仍是**能力缺口**，不是已修。
+- ~~迁移可重放修复（t98）与状态机接线（t90，冻结）尚未落地~~ ⇒ **t98 已落地**（读数见 §2 存储层行）；**状态机接线（t90，冻结）仍未落地** ⇒ 状态机仍是**能力缺口**。
+- **新成本（本代自己制造的，如实记）**：t98 的「25 次迁移重放」集成测试让 **ubuntu 的 `Test` 从 156s 涨到 ≥7.9 分钟**（首次观测时仍在跑）⇒ 仍 **< `t111` 给的 30 分钟上界**，但余量**从 ×11 缩到 ×3.8**。⇒ 结论：**测试套件再长，上界必须重新标定**；`t111` 的判据（「按**绿** run 取」）依旧适用，但「绿 run」从此必须是**含 t98 之后**的那些。
 
 ---
 
@@ -126,7 +128,10 @@ E2E 36507120602 @b1e0e9f: completed/success（Doctor 7 ✅ · Panel E2E (Playwri
 
 **仍未闭合、不许因绿而掩盖**：**E2E 侧的「跳过点名」仍然失效**（`t110`）—— Rust 侧已做完（15=7+8），E2E 侧仍是「有数字没名字」；`t111`（无上界）与 `t112`（12 处浮动 `uses:`）也仍在排队。⇒ **本账不把「CI 绿」读成「纪律全部落地」**。
 
-**推后仍绿**（每次推送都取消前一条 run，故逐条记录）：`05755d0`（t109）E2E ✅；`b1e0e9f`（t108）CI+E2E ✅；`1516814`（t113：把「永不执行的覆盖」变成真跑）见 §7。
+**推后逐条记录（每次推送都会取消前一条 run，故必须逐条写）**：
+- `05755d0`（t109）E2E ✅ · `b1e0e9f`（t108）CI+E2E ✅ · `1516814`（t113）E2E ✅ **且算术闭合**：`51 passed`、零跳过（上一代是「46 passed + 1 skipped + 4 failed = 51」⇒ **同一批 51 个测试现在全过、一个不跳**）。
+- ⚠️ **`5c0bc8f`（t110 增量）E2E ❌** —— 而这次红是**护栏按设计工作**：`no Playwright JSON report at …/t65/playwright.json -- this leg cannot name a skipped spec … a skip that cannot be named must never be reported as green`（步骤链其余全绿，**含 `Panel E2E (Playwright)` success**）。根因（待证实）：`PLAYWRIGHT_JSON_OUTPUT_NAME` 是**相对 `outputDir` 的文件名**、`PLAYWRIGHT_JSON_OUTPUT_FILE` 才是绝对路径，而 t107 之后 `outputDir` **每次运行独占** ⇒ **写的人与读的人用了两个路径假设**。⇒ 处置：修复单（同一处 `env:` 定义路径 + 三条护栏一条不削弱 + 报告把「未真跑」更新成「CI 已证明不工作 → 已修 → 待验证」）。**不把这次红藏起来**：它换来的是「再也无法在拿不到名字时报绿」。
+- **待推**：`t111`（四个 job 超时上界；**判据「上界按『绿』的运行取，不能按红的」**）+ `t112`（12 处 `uses:` 固定 SHA，含 `dtolnay/rust-toolchain@stable` **移动分支**；**固定动作 ≠ 固定工具链**已行内写明）。
 
 **判据提醒**：上表的「结果」都要求**成对读数**（改前→改后）与**能红的负控**；「CI 绿」只有在**这六项**都有读数之后才允许宣称 —— 现在它们是：五项有读数、一项（t110）明确写着**未完成**。
 

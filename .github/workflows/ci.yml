@@ -40,12 +40,19 @@ jobs:
   rust-linux:
     name: Rust (ubuntu)
     runs-on: ubuntu-latest
+    # BOUND THE HANG, NOT THE SPEED (t111; report: docs/design/reviews/gen3-ci-timeouts.md).
+    # Longest real observation: 542s (9.0 min, the first GREEN run 36507120586); the red runs
+    # exit in 25-265s, so nothing near this is ever legitimate. 30 min = 3.3x the worst and
+    # leaves room for a cold rust-cache (a full workspace compile on top of the 9-minute green
+    # workload). Without this key GitHub applies its 360-minute default, which is what made
+    # "hung" and "slow" indistinguishable in run 36508184462.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       # lancedb's lance-encoding needs protoc at build time
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -276,12 +283,20 @@ jobs:
     name: Rust (windows)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    # 60 min (t111). The longest real observation is 1310s = 21.8 min (run 36486678888), and
+    # that single number ALREADY contains one test pass; `Test attempt 2` runs a second
+    # near-full pass when attempt 1 fails at the test level, and a cold rust-cache adds a
+    # whole workspace compile on the slowest platform. No bound here may kill a legitimately
+    # slow run (measured spread: 25s cancelled .. 1310s), so this is deliberately generous --
+    # a hang must become a bounded failure instead of 6 hours of an `in_progress` run. What it
+    # does NOT say is WHICH test hung: report §19 / t111's out-of-scope list.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc
         run: choco install -y protoc
 
@@ -394,9 +409,14 @@ jobs:
   panel:
     name: Panel (node)
     runs-on: ubuntu-latest
+    # 15 min (t111): observed 23-37s across 20+ runs (this job is `npm ci` + the audit
+    # self-test + the typecheck/build). The only part with no local reading is the network
+    # install on a cold runner, so the bound is a floor, not 3x the measurement: it exists to
+    # turn a hang into a 15-minute failure, never to hurry a real install.
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 (2025-04-02)
         with:
           node-version: 22
           cache: npm

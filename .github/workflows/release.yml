@@ -98,6 +98,17 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: gate
     runs-on: ${{ matrix.os }}
+    # 180 min PER MATRIX ENTRY (t114; report: docs/design/reviews/gen3-ci-timeouts.md §8).
+    # The bound comes from the only GREEN release run (34849294052, 2026-09-14): the
+    # windows entry took 7677s = 128 min, of which `Build release binary` alone was 7243s
+    # (a --release workspace compile; the rust-cache restore was 4s, i.e. it ran COLD).
+    # 180 = 1.4x that worst observation: deliberately the smallest multiplier in this
+    # repo, because a real release build is already ~2h and a bound near 360 min would
+    # not bound anything. The margin is the cold/warm spread that is already measured:
+    # the next run's warm windows entry took 3537s (59 min, 2.2x faster), so a false red
+    # here is recoverable by re-running -- unlike a silent 6-hour hang, which is what this
+    # replaces. `fail-fast: false` is why each entry needs its own bound.
+    timeout-minutes: 180
     # `actions: write` is required by upload-artifact (it writes to artifact
     # storage). It is NOT `contents: write`: this job cannot touch repository
     # contents or create releases.
@@ -165,6 +176,13 @@ jobs:
     name: Create release
     needs: build
     runs-on: ubuntu-latest
+    # 30 min (t114). This job is `gh`/API only: on the green run (34849294052) the whole
+    # job was 21s and `Create GitHub release` itself was 8s; the longest this leg has ever
+    # taken is 612s (10.2 min, in the 2026-09-17 run, where the step then FAILED -- i.e.
+    # even a failing API leg burns ~10 min). 30 min = 3x that worst observation and ~85x
+    # the green one: it bounds a hung API/upload call without being near a real success.
+    # What it does NOT name is WHICH command hung -- report §8 / t114's §19 note.
+    timeout-minutes: 30
     # The ONE job that writes: creating the release. `actions: read` is what
     # download-artifact needs; nothing else is granted.
     permissions:

@@ -27,10 +27,32 @@ jobs:
   smoke:
     name: Daemon + doctor + panel smoke
     runs-on: ubuntu-latest
+    # 30 min (t111; report: docs/design/reviews/gen3-ci-timeouts.md). Observed 222-499s across
+    # 8 runs -- the slow legs are the daemon boot, `doctor`, the panel build and the whole
+    # Playwright suite (now including the JSON skip-naming verdict from t110). 3.6x the worst
+    # observation, and it bounds a hang (in the daemon, the browser or a spec) to 30 minutes
+    # instead of GitHub's 360-minute default. It does NOT name what hung.
+    timeout-minutes: 30
+    # t110 follow-up: the JSON evidence path lives HERE, once, and BOTH steps below
+    # read this same variable. The previous shape wrote a literal in the run step and
+    # read a literal in the evidence step, and CI showed they did not agree (`5c0bc8f`:
+    # "no Playwright JSON report at /home/runner/work/_temp/t65/playwright.json").
+    #
+    # `PW_TEST_REPORTER` is the deterministic carrier: `createReporters()` appends it
+    # unconditionally (playwright/lib/runner/index.js:5221), independent of how the
+    # config's reporter list and the CLI `--reporter` flags get merged -- and that
+    # merge is what made the file appear locally and vanish on the runner. CI=true
+    # swaps the config's reporters (panel/playwright.config.ts:81); measured in that
+    # exact shape: `--reporter=json` + `_NAME`/`_FILE` produced NO file at all, while
+    # `PW_TEST_REPORTER=json` + `PLAYWRIGHT_JSON_OUTPUT_FILE` produced it at the named
+    # absolute path (66-68 KB, JSON.parse-able) in all three shapes tested.
+    env:
+      PW_TEST_REPORTER: json
+      PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/t65/playwright.json
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
@@ -149,8 +171,11 @@ jobs:
           # title), so it is written to a file here and read by the evidence step,
           # which FAILS when it counts a skip it cannot name -- so this cannot rot
           # back into a green no-op. `html` keeps feeding the upload-artifact step.
-          PLAYWRIGHT_JSON_OUTPUT_NAME="$RUNNER_TEMP/t65/playwright.json" \
-            npm run test:e2e -- --reporter=list --reporter=json --reporter=html 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
+          # No output-file path here: `PW_TEST_REPORTER: json` (job env) carries the
+          # reporter and `PLAYWRIGHT_JSON_OUTPUT_FILE` (same env block) carries the
+          # absolute path both steps agree on. `--reporter=json` is dropped from the CLI
+          # so the json reporter cannot be instantiated twice against one file.
+          npm run test:e2e -- --reporter=list --reporter=html 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
           rc=${PIPESTATUS[0]}
           set -e
           # t104: the state comes from the command (`PIPESTATUS[0]`, since `tee`
@@ -171,7 +196,7 @@ jobs:
         shell: bash
         run: |
           log="$RUNNER_TEMP/t65/playwright.log"; rcfile="$RUNNER_TEMP/t65/playwright.rc"
-          json="$RUNNER_TEMP/t65/playwright.json"; names="$RUNNER_TEMP/t65/skipped-names.txt"
+          json="${PLAYWRIGHT_JSON_OUTPUT_FILE:?}"; names="$RUNNER_TEMP/t65/skipped-names.txt"
           upstream="Panel E2E (Playwright)"
           if [ ! -r "$log" ] || [ ! -r "$rcfile" ]; then
             {
@@ -191,7 +216,7 @@ jobs:
 
           # ---- the NAMED skips, from the JSON report ------------------------------
           if [ ! -r "$json" ]; then
-            echo "::error::no Playwright JSON report at $json -- this leg cannot name a skipped spec. The run step must pass --reporter=json with PLAYWRIGHT_JSON_OUTPUT_NAME (t110): a skip that cannot be named must never be reported as green."
+            echo "::error::no Playwright JSON report at $json (\$PLAYWRIGHT_JSON_OUTPUT_FILE, defined once in the job env) -- this leg cannot name a skipped spec. It is written by `PW_TEST_REPORTER=json` in the run step (t110; CI 5c0bc8f proved a CLI-specified path is not reliable): a skip that cannot be named must never be reported as green."
             exit 1
           fi
           set +e
@@ -272,7 +297,7 @@ jobs:
         # they are uploaded even on success: 'which tests were skipped' is
         # exactly the question a green run gets asked.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (2025-03-19)
         with:
           name: playwright-artifacts
           path: |
