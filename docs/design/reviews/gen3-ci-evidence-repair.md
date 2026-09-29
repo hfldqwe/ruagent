@@ -227,3 +227,64 @@ NAMED skipped specs: 6
 - **未** push / dispatch / rerun / cancel / tag。临时守护进程用**自记 pid**（76352）在 18787 上启停；**活守护进程 pid 79984 与活库未被触碰**（只读健康检查 `{"status":"ok","service":"ruagent"}`；db mtime 收尾仍是 `2026-09-29T04:54:56`，与本轮开始前一致 —— 本轮没有任何写活库动作，Run A/B 全打临时 root）。
 - 临时自清：**已删** `%TEMP%\ra-t110-root`（临时数据根）与 `%TEMP%\ra-t110-nc`（负控夹具）；**保留证据**：`ra-t110-runA.log` · `ra-t110-runB.log` · `ra-t110-pwA.json` · `ra-t110-pwB.json` · `ra-t110-nc.txt` · `ra-t110-phase1.log` · 两个 daemon 输出；仓内零临时文件。
 - 复核：三份 workflow 仍可解析（`ci.yml` / `e2e.yml` / `release.yml` = OK）；`job.status` 命中 **3**，**全部是注释里的历史说明**，`${{ … job.status … }}` **表达式 0 处**。
+
+## §9.8 追加（t110 收尾修订）：探针变了 —— CI 现在**零跳过**，读数改由本地真实日志承担
+
+> §9.1–§9.7 已随 `76bb7a0` 入库。本节记录两件事：**探针变了**（CI 已无 skip）与**「两个世界同一个读数」的分离**。
+
+### (a) CI 的事实更新：`51 passed`、零跳过 ⇒ 别再等 CI 的 skip
+
+`1516814`（t113）把 `recall.spec.ts` 从「永远不会执行的覆盖」改成**自带夹具真跑**，CI 随即给出 `51 passed (41.1s)` + `| summary N skipped lines | 0 |`、**零跳过**。⇒ §9.6「CI 那个 `1 skipped` 到底是谁」这条悬案**已被 t113 消解**（不是被解释，而是**那个 skip 本身没了**）；同时**「等下一次 CI 真跑去点名」这条路不再存在**。
+
+**所以本单的读数口径明确如下（写进结论）**：本单的成对读数、`list` 形状、负控**全部来自本地真实日志**（同一套件、临时 root + 临时端口的干净守护进程，A/B/C 三次真跑）；**CI 侧给本单的贡献只是「表里的 0 与事实一致」** —— 不能把「CI 绿」当成这一单的验证（它连一个 skip 都没有，压根没验到点名路径）。
+
+### (b) 第三种真实 skip：captain 给的路线（入口点 + 显式关闸门）
+
+```
+RUAGENT_E2E_ALLOW_WRITES=0 E2E_BASE_URL=http://127.0.0.1:18788 npm run test:e2e -- --reporter=list --reporter=json
+⇒ Running 51 tests ; 8 skipped ; 43 passed (13.6s) ; exit 0
+```
+`run-e2e.mjs:51-54` 本来就支持这条路（它打印 `writes UNARMED on request: RUAGENT_E2E_ALLOW_WRITES=0`），所以这不是绕过入口点。JSON 报告 **8 条全部点名**，而且**两种真实 skip 形状都拿到了**：
+
+| skip 形状 | 真实条目 |
+| --- | --- |
+| **闸门型**（`writeAccess()`；理由原文进 report） | `consumption.spec.ts`×4 · `recall.spec.ts :: conservative recall stubs expand to the full memory` · `registry.spec.ts :: runtimes and roles can be created and deleted from the panel` |
+| **前置条件型**（`test.skip(pages.length === 0, …)`） | **`wiki.spec.ts :: recall returns wiki hits as their own labeled section`** · **`wiki.spec.ts :: the page viewer renders pages without leaking frontmatter`** |
+
+真日志里与 skip 有关的仍然**只有汇总行** `  8 skipped` ⇒ 与 run B 的结论一致：**`list` 不给 skip 起名字**（两次不同场景、同一个结论）。
+
+### (c) 「零跳过」与「机制失效」不再同形（captain 的第 2 点）
+
+改前：两种情况在表里**都是 `0 / 0`**（`skip markers…` 与 `distinct skipped SPECS`），读者无法区分。改后两处显式分离：
+
+1. **汇总段**：当 `stats.skipped == 0` 时多打一行
+   `**CONFIRMED: no spec was skipped in this run** -- the JSON report itself says stats.skipped = 0, which is a different fact from "a skip existed and could not be named"`；
+2. **收尾行**（机器可判定的形状）：`playwright: exit 0, JSON says N skipped / M named, none of them registry.spec.ts` —— 两个数**同时出现**，所以「0 skipped」（N=0 且 M=0）与「读不到名字」（N>0、M=0）在**任何一行输出里都不再可能长得一样**；后者还会直接 `::error::` + exit 1（§9.4 护栏③）。
+
+**实跑对照（真实夹具）**：
+| 情形 | 真实来源 | 表/收尾读数 | 退出码 |
+| --- | --- | --- | --- |
+| 零跳过（CI 同形） | run A 真报告（`stats.skipped=0`） | `(none: no spec was skipped)` + `**CONFIRMED: no spec was skipped in this run**` + `JSON says 0 skipped / 0 named` | **0** |
+| 机制失效（t104 形状） | 真报告把 spec 的 skipped 状态去掉、`stats.skipped` 保持 6 | `(none: no spec was skipped)` 但 `::error::the JSON report says 6 skipped spec(s) but 0 could be NAMED` | **1** |
+
+⇒ 同样一句 `(none: no spec was skipped)`，**一个绿一个红，且原因行写在红的那一侧**。
+
+### (d) 负控更新：10/10（新增 ①c 与 ④b）
+
+抽出的是**修订后的** run-body（4410 字符），全部用真实日志/报告：
+
+```
+[OK ] NC①c real run-C (entry point, writes UNARMED): 8 skips NAMED incl. wiki.spec.ts
+[OK ] NC④b zero-skip run explicitly CONFIRMS zero (not an unnameable 0)
+[OK ] NC①a run-B as-is: 6 skips NAMED, registry fatal          [OK ] NC①b registry ran, 5 others skipped: NAMED, NOT red
+[OK ] NC②  ONLY registry skipped: still fatal                  [OK ] NC③a no JSON report: refuses green
+[OK ] NC③b JSON says 6 but 0 NAMED (t104 shape): refuses      [OK ] NC④  run-A zero-skip: green
+[OK ] NC⑤  rc=1 forced: red                                    [OK ] NC⑥  no log (upstream skipped): notice, exit 0
+[t110] negative controls: 10/10 behaved as required
+```
+
+### (e) 本轮增量与纪律
+
+- 增量：`.github/workflows/e2e.yml` = **7 insertions(+), 1 deletion(-)**（CONFIRMED 行 + 收尾行两数并列）；本报告本节。
+- 真实运行（run C）：临时 root `%TEMP%\ra-t110-root2` + 端口 **18788**、自记 pid **83836**（已停、root 已删）；**活 pid 79984 与活库未触碰**。
+- 未测仍开放两条（并新增一条）：① ubuntu + chromium 上 `--reporter=json` + `PLAYWRIGHT_JSON_OUTPUT_NAME` 的组合**我没真跑**（下一条 CI run 是它的读数；若缺 JSON ⇒ 立即红，不会静默）；② 判定步依赖 job 里存在 `node`（未显式断言，缺了也是红而非绿）；③ **修订后的这张表（CONFIRMED 行 + 两数收尾行）本身还没在 ubuntu 上跑过** —— 它下一次 CI 的运行读数才算落地。

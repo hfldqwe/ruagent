@@ -239,6 +239,12 @@ jobs:
             echo ""
             echo "skipped specs, by NAME (file :: title :: reason):"
             if [ "$named" -gt 0 ]; then printf '%s\n' "$skip_list"; else echo "(none: no spec was skipped)"; fi
+            if [ "$json_skipped" = "0" ]; then
+              echo ""
+              echo "**CONFIRMED: no spec was skipped in this run** -- the JSON report itself says"
+              echo "\`stats.skipped = 0\`, which is a different fact from \"a skip existed and could not"
+              echo "be named\" (t110: that case is an \`::error::\` below, never a green)."
+            fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
           # A skip we counted but cannot name is exactly the t104 failure shape
@@ -255,7 +261,7 @@ jobs:
             echo "::error::Playwright run failed (exit $rc)"
             exit 1
           fi
-          echo "playwright: exit 0, $named skipped spec(s) named, none of them registry.spec.ts"
+          echo "playwright: exit 0, JSON says $json_skipped skipped / $named named, none of them registry.spec.ts"
 
       - name: Upload Playwright artefacts
         # An E2E red must be readable from the run itself. An E2E failure once
