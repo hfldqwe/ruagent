@@ -345,35 +345,56 @@ async fn the_gold_seed_is_idempotent_only_because_0025_makes_it_so() {
 /// The seed WRITES, so it must not be able to write the live root. The decision
 /// is a pure function of two paths, so it is testable without going near the
 /// user's database.
+///
+/// PLATFORM-NEUTRAL FIXTURE ON PURPOSE (t108). The fixture used to be built from
+/// Windows literals (`r"C:\Users\x\.ruagent"` and friends). On Linux a backslash is
+/// an ordinary character, not a separator, so every one of those paths collapsed
+/// into a SINGLE component: `C:\Users\x\.ruagent\data\ruagent.db` did not start with
+/// `C:\Users\x\.ruagent`, and the first case -- "the live database itself" -- failed.
+/// The guard was green on the machine it was written on (Windows) and went red the
+/// first time CI ran it on ubuntu; that is a statement about the FIXTURE, not about
+/// the property. Nothing here is platform-specific: `Path::starts_with` is
+/// component-wise on every platform, GIVEN that the fixture's separators are the
+/// platform's own -- so the paths are assembled with `join`, and the four cases mean
+/// exactly the same thing on both sides. (No `#[cfg(windows)]`: skipping Linux would
+/// turn a platform split into a platform blind spot, which is the failure being fixed.)
 #[test]
 fn the_seed_guard_tells_a_copy_from_the_live_root() {
-    let live = PathBuf::from(r"C:\Users\x\.ruagent");
-    for (path, inside, note) in [
+    // Deliberately RELATIVE: an absolute prefix would drag in the platform's root
+    // syntax (drive letters on Windows, `/` on unix), which is what made the old
+    // fixture platform-dependent in the first place.
+    let live = Path::new("home").join("x").join(".ruagent");
+    let cases = [
         (
-            r"C:\Users\x\.ruagent\data\ruagent.db",
+            live.join("data").join("ruagent.db"),
             true,
             "the live database itself",
         ),
         (
-            r"C:\Users\x\.ruagent\data\ra-t29.db",
+            live.join("data").join("ra-t29.db"),
             true,
             "any file under the live root, not just the one name",
         ),
         (
-            r"C:\Users\x\.ruagent-other\data\ruagent.db",
+            Path::new("home")
+                .join("x")
+                .join(".ruagent-other")
+                .join("data")
+                .join("ruagent.db"),
             false,
-            "a SIBLING directory: component-wise containment must not confuse it",
+            "a SIBLING directory: component-wise containment must not confuse it (a string-prefix \
+             check would report this as inside, which is why the case exists)",
         ),
         (
-            r"C:\Users\x\AppData\Local\Temp\ra-t29-post\data\ruagent.db",
+            Path::new("tmp")
+                .join("ra-t29-post")
+                .join("data")
+                .join("ruagent.db"),
             false,
-            "the copy this instrument uses",
+            "the copy this instrument uses (a different tree entirely)",
         ),
-    ] {
-        assert_eq!(
-            common::is_inside(Path::new(path), &live),
-            inside,
-            "{note}: {path}"
-        );
+    ];
+    for (path, inside, note) in cases {
+        assert_eq!(common::is_inside(&path, &live), inside, "{note}: {path:?}");
     }
 }

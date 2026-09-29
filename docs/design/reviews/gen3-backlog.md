@@ -370,6 +370,25 @@ test.skip(true, "recall matched no memories in this database");
 - **windows 的真实测试判定从未取得** ⇒ 目标②的「CI 绿」在 windows 面**没有依据**（本代之前最后一次 windows `success` 是 09-26 的 `663983d`）。⇒ 处置：**在它出结论前不再推送**（这是本轮采用的做法）。
 - **`ci.yml`/`e2e.yml` 没有 `timeout-minutes`** ⇒ 一个**挂住**的测试会让 runner 静默占满 **360 分钟**（GitHub 默认），run 一直 `in_progress`。⇒ 已立 `t111`（超时上界；我已把上述标定数据与陷阱一并交给 owner）。**这也是「挂住」与「慢」在读数上不可区分的根因**：没有上界时，沉默与正常工作长得一样。
 
+## B24. t108 完成（平台幼稚夹具）+ 两条新 finding（R-11/R-12 登记）
+
+**改动**（1 file，+35/−14）：`live` 从 `PathBuf::from(r"C:\Users\x\.ruagent")` 改成 **`Path::new("home").join("x").join(".ruagent")`**（相对 + join）；**无 `#[cfg(windows)]`、无 `#[ignore]`**（0 命中，只在注释里说明「故意不用」）；**四个 case 与理由注释一条不少**；被验语义未变（`common::is_inside` = `Path::starts_with` 的**逐组件**包含，`crates/knowledge/tests/common/mod.rs:413`）。
+**为什么本机一直绿**（第 19 条实例）：探针显示旧夹具 `live = 5 组件 / candidate = 7 组件` ⇒ 本机成立；**Linux 上反斜杠是普通字符** ⇒ 两边各自坍缩成 **1 个组件且不相等** ⇒ 期望 true 得 false，报错文案正是 `the live database itself`（与 CI 原文逐字吻合）⇒ **CI ubuntu 是它第一次在 Linux 上执行**。
+**负控（C22 推荐路径：完全隔离）**：`git stash create` → `git archive` → `%TEMP%\ra-t108-pre`，**只在那里**把 `is_inside` 改成字符串前缀比较 + 私有 `-TargetDir` ⇒
+```
+panicked at …gold-seed-idempotence.rs:398:9: assertion `left == right` failed:
+a SIBLING directory: component-wise containment must not confuse it
+"home\\x\\.ruagent-other\\data\\ruagent.db"   →  FAILED. 2 passed; 1 failed → exit=101 (130.1s)
+```
+⇒ **恰红在 case ③，且是在改后的平台中立夹具上** ⇒ **修复没有削弱判别力**（这一点比「负控能红」本身更重要）。共享树零变异（`git status` 只有 inScope 文件、`git stash list` 空）。
+**门禁**：`rustfmt --check` exit 0 · 该测试 **exit 0**（ok 3 / FAILED 0 / panicked 0）· `test -p ruagent-knowledge` **exit 0**（10 个 `test result:` 行、FAILED 0；`retrieval-gold-{live,copy}` = `0 passed; 1 ignored` ⇒ **碰活库的两条没跑**）· `clippy … -DenyWarnings -CleanFirst` **exit 0 + 两件证据**（`Checking ruagent-store`/`ruagent-knowledge` 都出现 = 清缓存后真重编；`^warning`/`^error` 0 行 + `Finished 7.49s`）。
+**未覆盖（作者自陈）**：改后夹具的 **Linux 侧没有真跑**（本机 Windows；Linux 行为是分析必然 + 旧夹具的 CI 原文提供失败侧证据）⇒ **以 CI ubuntu 的下一次真跑为准**。
+
+**两条新 finding（captain 登记）**：
+- **R-11（`daemon/src/api.rs:4856`）**：`PathBuf::from("C:\\")` 被 `if set_current_dir(&second).is_ok()` 守卫 ⇒ **Linux 上该分支静默不执行** ⇒「答案不随 cwd 移动」这条断言在 Linux 上**从未被验过**，而测试照样绿 —— 属**静默平台跳过**形状。**未立单**：`crates/daemon/src/api.rs` 属**被冻结的 `t96`**（消费面收口第 4 轮，其依赖链上有 failed 单）⇒ 按 R-10 的先例只登记，待 t96 解冻后并入。
+- **R-12（`daemon/sessions.rs` + `acp/adapter.rs` 共 7 处往返断言）**：**现在中性**（原样回显），但若将来改用 `file_name()`/`parent()` 推导，同一夹具在 Linux 上会给出**另一个**答案 ⇒ 建议加备注或换平台中立夹具。**登记，不立单**（当前不构成缺陷）。
+- **方法学结论（比清单本身更有用）**：全仓 19 处同类命中里，**真问题不是「有没有 `C:\`」，而是「断言的真值是否依赖宿主的分隔符语义」**。19 处中只有这一处踩上。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
