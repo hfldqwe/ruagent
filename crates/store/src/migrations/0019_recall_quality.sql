@@ -35,7 +35,7 @@
 -- whether the harness may still edit it: NULL = still being assembled,
 -- non-NULL = read-only, and a metric is only comparable to another metric taken
 -- over the same (set name, version).
-CREATE TABLE query_eval_sets (
+CREATE TABLE IF NOT EXISTS query_eval_sets (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,
     version    TEXT NOT NULL,
@@ -56,7 +56,7 @@ CREATE TABLE query_eval_sets (
 -- `answerable = 0` is a first-class row, not a missing one: an unanswerable
 -- query belongs in the denominator, or the score inflates (the harness's own
 -- metrics() already holds this rule, retrieval-quality.rs:280-295).
-CREATE TABLE query_eval_gold (
+CREATE TABLE IF NOT EXISTS query_eval_gold (
     id               INTEGER PRIMARY KEY,
     set_id           INTEGER NOT NULL REFERENCES query_eval_sets(id),
     query            TEXT NOT NULL,
@@ -67,13 +67,13 @@ CREATE TABLE query_eval_gold (
     judged_by        TEXT NOT NULL,
     note             TEXT
 );
-CREATE INDEX idx_query_eval_gold_set ON query_eval_gold(set_id, class);
+CREATE INDEX IF NOT EXISTS idx_query_eval_gold_set ON query_eval_gold(set_id, class);
 
 -- One run of the harness over a set. Every field that makes two readings
 -- INCOMPARABLE is stored: the embedder (a model switch moves every distance),
 -- the leg window (widening it re-orders the fusion), the fusion expression, and
 -- the raw artifact path.
-CREATE TABLE query_eval_runs (
+CREATE TABLE IF NOT EXISTS query_eval_runs (
     id           INTEGER PRIMARY KEY,
     ts           TEXT NOT NULL,
     set_id       INTEGER NOT NULL REFERENCES query_eval_sets(id),
@@ -111,7 +111,7 @@ ALTER TABLE recall_log ADD COLUMN scoring_version              INTEGER;
 -- (fts::han_bigrams) and by Db::backfill_chunk_grams.
 ALTER TABLE chunks ADD COLUMN grams TEXT;
 
-CREATE VIRTUAL TABLE chunks_fts_cjk USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_cjk USING fts5(
     grams,
     content='chunks',
     content_rowid='id',
@@ -126,21 +126,21 @@ CREATE VIRTUAL TABLE chunks_fts_cjk USING fts5(
 -- FTS5 'delete' command for a row that was never inserted. Splitting the update
 -- path by whether `old.grams` existed keeps every 'delete' paired with a real
 -- earlier insert.
-CREATE TRIGGER chunks_cjk_ai AFTER INSERT ON chunks
+CREATE TRIGGER IF NOT EXISTS chunks_cjk_ai AFTER INSERT ON chunks
 WHEN new.grams IS NOT NULL
 BEGIN
     INSERT INTO chunks_fts_cjk(rowid, grams) VALUES (new.id, new.grams);
 END;
 
 -- The backfill case: nothing was indexed before, so there is nothing to delete.
-CREATE TRIGGER chunks_cjk_au_fill AFTER UPDATE OF grams ON chunks
+CREATE TRIGGER IF NOT EXISTS chunks_cjk_au_fill AFTER UPDATE OF grams ON chunks
 WHEN old.grams IS NULL AND new.grams IS NOT NULL
 BEGIN
     INSERT INTO chunks_fts_cjk(rowid, grams) VALUES (new.id, new.grams);
 END;
 
 -- A real change of an already-indexed value.
-CREATE TRIGGER chunks_cjk_au_change AFTER UPDATE OF grams ON chunks
+CREATE TRIGGER IF NOT EXISTS chunks_cjk_au_change AFTER UPDATE OF grams ON chunks
 WHEN old.grams IS NOT NULL AND new.grams IS NOT NULL AND new.grams <> old.grams
 BEGIN
     INSERT INTO chunks_fts_cjk(chunks_fts_cjk, rowid, grams)
@@ -148,7 +148,7 @@ BEGIN
     INSERT INTO chunks_fts_cjk(rowid, grams) VALUES (new.id, new.grams);
 END;
 
-CREATE TRIGGER chunks_cjk_ad AFTER DELETE ON chunks
+CREATE TRIGGER IF NOT EXISTS chunks_cjk_ad AFTER DELETE ON chunks
 WHEN old.grams IS NOT NULL
 BEGIN
     INSERT INTO chunks_fts_cjk(chunks_fts_cjk, rowid, grams)

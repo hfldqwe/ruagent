@@ -2,7 +2,7 @@
 
 -- Episodes: the non-lossy base layer. Raw turns/documents land here first,
 -- content-hash deduped; everything derived references back to an episode.
-CREATE TABLE episodes (
+CREATE TABLE IF NOT EXISTS episodes (
     id           INTEGER PRIMARY KEY,
     kind         TEXT NOT NULL,          -- run_turn | document | manual | mcp_write
     content      TEXT NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE episodes (
 
 -- Memories: typed, namespaced, supersessible (design SS6.1 six stores;
 -- entities/edges live in the graph tables, decisions below).
-CREATE TABLE memories (
+CREATE TABLE IF NOT EXISTS memories (
     id             INTEGER PRIMARY KEY,
     store          TEXT NOT NULL,        -- profile | observation | procedure | lesson
     namespace      TEXT NOT NULL,         -- user | global | project:<x> | agent:<x>
@@ -29,25 +29,25 @@ CREATE TABLE memories (
     updated_at     TEXT NOT NULL,
     UNIQUE (store, namespace, content_hash)
 );
-CREATE INDEX idx_memories_current ON memories(store, namespace, superseded_at);
+CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(store, namespace, superseded_at);
 
 -- Full-text search over current memories (hybrid retrieval leg 1).
-CREATE VIRTUAL TABLE memories_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
     content='memories',
     content_rowid='id',
     tokenize='unicode61'
 );
 -- keep the index in sync
-CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
 END;
-CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
 END;
 
 -- Audit log: every write path decision is recorded (design SS6.6 #7).
-CREATE TABLE memory_diffs (
+CREATE TABLE IF NOT EXISTS memory_diffs (
     id        INTEGER PRIMARY KEY,
     ts        TEXT NOT NULL,
     op        TEXT NOT NULL,              -- insert | supersede | skip_dedupe | reject
@@ -59,7 +59,7 @@ CREATE TABLE memory_diffs (
 );
 
 -- Session context snapshots: replaced, never appended (design SS6.1).
-CREATE TABLE session_contexts (
+CREATE TABLE IF NOT EXISTS session_contexts (
     run_id     TEXT PRIMARY KEY,
     goal       TEXT,
     plan       TEXT,
@@ -68,7 +68,7 @@ CREATE TABLE session_contexts (
 );
 
 -- Decision log with outcomes (design SS6.1; feeds capability stats/evals).
-CREATE TABLE decisions (
+CREATE TABLE IF NOT EXISTS decisions (
     id              INTEGER PRIMARY KEY,
     run_id          TEXT,
     decision        TEXT NOT NULL,

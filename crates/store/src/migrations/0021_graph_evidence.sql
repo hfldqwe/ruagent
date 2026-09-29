@@ -43,7 +43,7 @@ ALTER TABLE entity_edges ADD COLUMN fact_hash TEXT;
 -- ---------------------------------------------------------------------------
 
 -- New tables: no history, so the NOT NULLs here are honest.
-CREATE TABLE entity_aliases (
+CREATE TABLE IF NOT EXISTS entity_aliases (
     id         INTEGER PRIMARY KEY,
     entity_id  INTEGER NOT NULL REFERENCES entities(id),
     alias      TEXT NOT NULL,
@@ -51,12 +51,12 @@ CREATE TABLE entity_aliases (
     source     TEXT NOT NULL,   -- where the alias came from (extraction | human | ...)
     created_at TEXT NOT NULL
 );
-CREATE INDEX idx_entity_aliases_entity ON entity_aliases(entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity ON entity_aliases(entity_id);
 
 -- The undecided queue: a pair the mechanical judge would not merge, kept so a
 -- human/LLM pass can decide later. Keeping the pair is what makes "we did not
 -- merge these two" a recorded decision instead of a silent one.
-CREATE TABLE resolution_pending (
+CREATE TABLE IF NOT EXISTS resolution_pending (
     entity_a   INTEGER NOT NULL REFERENCES entities(id),
     entity_b   INTEGER NOT NULL REFERENCES entities(id),
     reason     TEXT,
@@ -68,23 +68,23 @@ CREATE TABLE resolution_pending (
 -- Community summaries (E8). Built lazily; a community with no summary row yet
 -- is not an error state.
 -- ---------------------------------------------------------------------------
-CREATE TABLE communities (
+CREATE TABLE IF NOT EXISTS communities (
     id         INTEGER PRIMARY KEY,
     level      INTEGER NOT NULL,
     parent_id  INTEGER REFERENCES communities(id),
     summary    TEXT,
     built_at   TEXT
 );
-CREATE INDEX idx_communities_level ON communities(level);
+CREATE INDEX IF NOT EXISTS idx_communities_level ON communities(level);
 
-CREATE TABLE community_entities (
+CREATE TABLE IF NOT EXISTS community_entities (
     community_id INTEGER NOT NULL REFERENCES communities(id),
     entity_id    INTEGER NOT NULL REFERENCES entities(id),
     weight       REAL NOT NULL DEFAULT 1.0,
     PRIMARY KEY (community_id, entity_id)
 );
 -- The direction retrieval needs: given a seed entity, its communities.
-CREATE INDEX idx_community_entities_entity ON community_entities(entity_id);
+CREATE INDEX IF NOT EXISTS idx_community_entities_entity ON community_entities(entity_id);
 
 -- ---------------------------------------------------------------------------
 -- entities: the vector seed leg (E10, P2).

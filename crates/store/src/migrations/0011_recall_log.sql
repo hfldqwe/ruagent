@@ -3,7 +3,7 @@
 -- top scores BEFORE the relevance filters — the pair answers "are the
 -- thresholds dropping near-misses" offline.
 
-CREATE TABLE recall_log (
+CREATE TABLE IF NOT EXISTS recall_log (
     id                  INTEGER PRIMARY KEY,
     ts                  TEXT NOT NULL,
     query               TEXT NOT NULL,          -- capped at 200 chars by the writer

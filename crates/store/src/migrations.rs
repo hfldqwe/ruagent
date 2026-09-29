@@ -63,11 +63,52 @@ pub fn apply(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
              applied_at TEXT NOT NULL
          );",
     )?;
-    let current: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |row| row.get(0),
-    )?;
+    let versions = ledger_versions(conn)?;
+    let current = versions.last().copied().unwrap_or(0);
+
+    // t98/S2: THE LEDGER IS A CLAIM, AND IT IS ONLY LOAD-BEARING WHILE COMPLETE.
+    //
+    // `MAX(version)` alone reads a HOLE as "everything up to here was applied":
+    // deleting the row for v3 left rows 1..2, 4..25 and the next boot skipped v3
+    // for ever -- the objects v3 creates were then permanently absent while every
+    // later migration ran on top of them. A hole is refused by name instead, and
+    // refused BEFORE anything is applied: re-applying a MIDDLE migration on top of
+    // later ones can rewrite tables (0024 drops and rebuilds `distill_log`), so the
+    // honest answer is to stop and name what is missing.
+    // The range is bounded by what THIS binary knows: a version ABOVE
+    // `SCHEMA_VERSION` is a newer schema (the warn below), not a hole -- without
+    // the bound, a single future row turns every version under it into a "hole"
+    // and the downgrade path would be refused instead of warned about.
+    let known_max = current.min(SCHEMA_VERSION);
+    let missing: Vec<i64> = (1..=known_max).filter(|v| !versions.contains(v)).collect();
+    if !missing.is_empty() {
+        return Err(DbError::Ledger(format!(
+            "schema_migrations is not contiguous: version(s) {missing:?} are missing while \
+             version {current} is recorded ({} row(s) present). The objects those migrations \
+             create were never applied, and re-applying a middle migration on top of later \
+             ones can rewrite tables, so this boot refuses instead of guessing. Restore the \
+             lost row(s) (or the database file) and start again.",
+            versions.len()
+        )));
+    }
+
+    // A database migrated by a NEWER binary is a superset, not a hole: continue,
+    // but say so (this is the downgrade path, and silence here would be the same
+    // "ledger as fact" mistake in the other direction).
+    let unknown: Vec<i64> = versions
+        .iter()
+        .copied()
+        .filter(|v| *v > SCHEMA_VERSION)
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            ?unknown,
+            known = SCHEMA_VERSION,
+            "schema_migrations records versions this binary does not know: the database was \
+             migrated by a NEWER ruagent. Continuing (the schema is a superset), but this \
+             binary cannot reason about the newer objects."
+        );
+    }
 
     for (i, script) in MIGRATIONS.iter().enumerate() {
         let version = (i + 1) as i64;
@@ -80,19 +121,234 @@ pub fn apply(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Every recorded version, ascending.
+fn ledger_versions(conn: &rusqlite::Connection) -> Result<Vec<i64>, DbError> {
+    let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Apply exactly one migration and record its version ATOMICALLY.
 ///
 /// Split out of `apply` so the rollback property is testable without a
 /// deliberately broken entry in `MIGRATIONS`.
 fn apply_one(conn: &mut rusqlite::Connection, version: i64, script: &str) -> Result<(), DbError> {
     let tx = conn.transaction()?;
-    tx.execute_batch(script)?;
+    apply_script(&tx, version, script)?;
     tx.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         rusqlite::params![version, chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Run one migration's script, statement by statement, SKIPPING the statements
+/// whose object is already present.
+///
+/// WHY THIS EXISTS (t98/S1). Every migration row can be lost (a restored backup,
+/// a merged database, a hand-edited ledger) while its objects are still there,
+/// and then the script runs a second time. Pure SQLite DDL cannot express that:
+/// `CREATE TABLE`/`INDEX`/`VIEW`/`TRIGGER` take `IF NOT EXISTS` (the .sql files
+/// now do), but there is NO `ADD COLUMN IF NOT EXISTS` -- the ~35 `ALTER TABLE
+/// ... ADD COLUMN` statements in 0003..0023 can only be guarded here.
+///
+/// The guard is a PROBE, not an error swallow: `already_present` answers a
+/// question about the object graph before the statement runs, and anything the
+/// probe does not recognise (or any real error) still aborts the migration --
+/// `a_non_reappliable_statement_is_still_an_error` pins that down.
+fn apply_script(conn: &rusqlite::Connection, version: i64, script: &str) -> Result<(), DbError> {
+    // One migration (0024) rebuilds a table by DROP + RENAME, which cannot be
+    // made safe statement by statement: re-applying it would DROP the live table
+    // and re-copy from the staging table. It declares a whole-script probe.
+    if rebuild_already_done(conn, version)? {
+        tracing::debug!(version, "migration rebuild already done: script skipped");
+        return Ok(());
+    }
+    for statement in statements(script) {
+        if statement_already_present(conn, &statement)? {
+            tracing::debug!(version, "statement already present: skipped");
+            continue;
+        }
+        conn.execute_batch(&statement)?;
+    }
+    Ok(())
+}
+
+/// True when the one rebuild migration (0024) has already replaced `distill_log`.
+///
+/// The probe is a FACT about the object graph, not a guess: 0024 creates
+/// `idx_distill_log_session` only AFTER it renames the staging table, so that
+/// index exists exactly when the rebuild is complete. Before it, on a fresh
+/// database, it does not.
+fn rebuild_already_done(conn: &rusqlite::Connection, version: i64) -> Result<bool, DbError> {
+    if version != 24 {
+        return Ok(false);
+    }
+    let done: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                        WHERE type = 'index' AND name = 'idx_distill_log_session')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(done == 1)
+}
+
+/// Split a migration script into executable statements.
+///
+/// A statement ends at a line ending in `;`, EXCEPT inside a trigger body
+/// (`CREATE TRIGGER … BEGIN … END;`), where the statement continues until the
+/// `END;` line -- this repo's triggers all have that shape. Whole-line comments
+/// are dropped; trailing `--` comments stay, because SQLite accepts them.
+fn statements(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_trigger = false;
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+        let head = current.trim_start().to_ascii_uppercase();
+        if !in_trigger && head.starts_with("CREATE TRIGGER") && head.contains("BEGIN") {
+            in_trigger = true;
+        }
+        if in_trigger {
+            if trimmed.eq_ignore_ascii_case("END;") {
+                in_trigger = false;
+                out.push(current.trim().to_string());
+                current.clear();
+            }
+            continue;
+        }
+        if trimmed.ends_with(';') {
+            out.push(current.trim().to_string());
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out
+}
+
+/// The object a guarded statement creates (or drops): `None` means "not a shape
+/// this guard understands", and then the statement runs unguarded -- an error it
+/// produces is a real error.
+enum Guard {
+    /// `CREATE TABLE|VIRTUAL TABLE|INDEX|UNIQUE INDEX|VIEW|TRIGGER [IF NOT EXISTS] <name>`
+    Create(String, String), // (sqlite_master.type, name)
+    /// `ALTER TABLE <table> ADD [COLUMN] <column>`
+    Column(String, String),
+    /// `DROP TABLE|VIEW|INDEX [IF EXISTS] <name>`
+    Drop(String, String), // (type, name)
+}
+
+fn parse_guard(statement: &str) -> Option<Guard> {
+    let tokens: Vec<&str> = statement.split_whitespace().collect();
+    let up = |i: usize| -> String {
+        tokens
+            .get(i)
+            .map(|t| t.to_ascii_uppercase())
+            .unwrap_or_default()
+    };
+    // The object name sits after the DDL keywords, or after `IF [NOT] EXISTS`.
+    let name_at = |mut i: usize| -> Option<String> {
+        if up(i) == "IF" {
+            i += 1;
+            if up(i) == "NOT" {
+                i += 1;
+            }
+            if up(i) == "EXISTS" {
+                i += 1;
+            }
+        }
+        tokens.get(i).map(|t| clean_name(t))
+    };
+
+    if up(0) == "CREATE" {
+        let (kind, skip) = match (up(1).as_str(), up(2).as_str()) {
+            ("TABLE", _) => ("table", 2),
+            ("VIRTUAL", "TABLE") => ("table", 3),
+            ("INDEX", _) => ("index", 2),
+            ("UNIQUE", "INDEX") => ("index", 3),
+            ("VIEW", _) => ("view", 2),
+            ("TRIGGER", _) => ("trigger", 2),
+            _ => return None,
+        };
+        return name_at(skip).map(|n| Guard::Create(kind.to_string(), n));
+    }
+
+    if up(0) == "DROP" {
+        let kind = match up(1).as_str() {
+            "TABLE" => "table",
+            "VIEW" => "view",
+            "INDEX" => "index",
+            _ => return None,
+        };
+        return name_at(2).map(|n| Guard::Drop(kind.to_string(), n));
+    }
+
+    if up(0) == "ALTER" && up(1) == "TABLE" {
+        let table = tokens.get(2).map(|t| clean_name(t))?;
+        let add = tokens.iter().position(|t| t.eq_ignore_ascii_case("ADD"))?;
+        let column = tokens.get(add + 1)?;
+        let column = if column.eq_ignore_ascii_case("COLUMN") {
+            tokens.get(add + 2)?
+        } else {
+            column
+        };
+        return Some(Guard::Column(table, clean_name(column)));
+    }
+
+    None
+}
+
+/// A DDL object/column name as written here: bare, but tolerate quotes and a
+/// trailing `(` / `;` so a hand-written statement cannot silently parse wrong.
+fn clean_name(word: &str) -> String {
+    word.trim_end_matches(';')
+        .trim_end_matches('(')
+        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+        .to_string()
+}
+
+/// True when the statement's effect is already in the database.
+///
+/// `Create` means "the object exists" -- but `CREATE VIRTUAL TABLE IF NOT
+/// EXISTS` is a no-op either way, so this is an optimisation for the log, while
+/// `Column` and `Drop` are the cases SQLite cannot express at all.
+fn statement_already_present(
+    conn: &rusqlite::Connection,
+    statement: &str,
+) -> Result<bool, DbError> {
+    let (query, arg) = match parse_guard(statement) {
+        // The object exists: IF NOT EXISTS would no-op, so skip without running it.
+        Some(Guard::Create(kind, name)) => (
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)".to_string(),
+            vec![kind, name],
+        ),
+        // SQLite has no ADD COLUMN IF NOT EXISTS: probe the column.
+        Some(Guard::Column(table, column)) => (
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)".to_string(),
+            vec![table, column],
+        ),
+        // A drop whose object is absent would abort: skip it (nothing to drop).
+        Some(Guard::Drop(kind, name)) => (
+            "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)"
+                .to_string(),
+            vec![kind, name],
+        ),
+        None => return Ok(false),
+    };
+    let present: i64 = conn.query_row(&query, rusqlite::params![arg[0], arg[1]], |r| r.get(0))?;
+    Ok(present == 1)
 }
 
 #[cfg(test)]
@@ -1306,8 +1562,30 @@ mod tests {
         );
 
         // ---- B: `live_copy_upgrades_…`, the historical half ----------------
-        assert!(distill_rows >= distill_rows); // after >= before, 0 >= 0
-        assert_eq!(distill_rows, distill_rows); // after == before, 0 == 0
+        //
+        // t98 (the t77 residue): these two lines used to compare `distill_rows`
+        // WITH ITSELF -- `assert!(distill_rows >= distill_rows)` and
+        // `assert_eq!(distill_rows, distill_rows)` -- assertions that CANNOT
+        // fail, inside the one test whose job is to show that the pre-t33
+        // predicate sets were vacuous. The pair is now two REAL readings taken
+        // around a second migration pass on this copy: `before` on the migrated
+        // input, `after` once `apply` has run again. The invariant (a migration
+        // pass may neither lose historical rows nor invent them) is the pure
+        // predicate `upgrade_preserved_rows`, and
+        // `the_upgrade_row_invariant_can_fail` proves that predicate CAN fail.
+        let before = distill_rows;
+        let after = {
+            let mut pass = rusqlite::Connection::open(&path).unwrap();
+            pass.pragma_update(None, "foreign_keys", "ON").unwrap();
+            apply(&mut pass).unwrap();
+            count_ok(&pass, "SELECT COUNT(*) FROM distill_log").unwrap()
+        };
+        assert!(
+            upgrade_preserved_rows(before, after).is_ok(),
+            "the historical half of the pre-t33 predicate set does NOT hold: {}",
+            upgrade_preserved_rows(before, after).unwrap_err()
+        );
+        println!("[t98] B before/after around a second `apply`: distill_log {before} -> {after}");
         assert_eq!(distinct_ids, 0); // ids unique: COUNT(DISTINCT id) == COUNT(*)
         println!(
             "[t36] B live_copy_upgrades_…: the HISTORICAL half of its pre-t33 predicate set also \
@@ -1350,6 +1628,296 @@ mod tests {
         println!(
             "[t36] vacuum input ready for the instrument runs: {path:?} (point RUAGENT_T6_LIVE_COPY \
              / RUAGENT_T25_LIVE_COPY at it)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // t98: THE LEDGER IS A CLAIM -- guards that keep it from being taken on
+    // faith. Three readings, each with the negative control it needs.
+    // ---------------------------------------------------------------------
+
+    /// The pre-t33 "historical half" predicate, as a pure predicate: a migration
+    /// pass may neither LOSE historical rows nor INVENT them.
+    ///
+    /// `Result` rather than `assert!` on purpose: a test can then show the
+    /// predicate CAN fail. "An assertion that has never been shown to fail is not
+    /// yet known to be an assertion" (the same rule this test module states above).
+    fn upgrade_preserved_rows(before: i64, after: i64) -> Result<(), String> {
+        if after < before {
+            return Err(format!(
+                "lost {} row(s): before={before} after={after}",
+                before - after
+            ));
+        }
+        if after > before {
+            return Err(format!(
+                "invented {} row(s): before={before} after={after}",
+                after - before
+            ));
+        }
+        Ok(())
+    }
+
+    /// The invariant above is FALSIFIABLE, shown on synthetic pairs: losing a row
+    /// and inventing a row must both fail, and the vacuum input's 0 -> 0 holds.
+    #[test]
+    fn the_upgrade_row_invariant_can_fail() {
+        assert!(upgrade_preserved_rows(0, 0).is_ok());
+        assert!(upgrade_preserved_rows(3, 3).is_ok());
+        assert!(
+            upgrade_preserved_rows(3, 2).is_err(),
+            "losing a historical row must fail"
+        );
+        assert!(
+            upgrade_preserved_rows(3, 4).is_err(),
+            "inventing a row must fail"
+        );
+    }
+
+    /// `sqlite_master` as a comparable snapshot: (type, name, sql) in a stable
+    /// order, so "re-applying changed the schema" is decidable.
+    fn schema_snapshot(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// **S1, as a reading the gate can repeat**: EVERY migration can be applied a
+    /// second time without changing the schema.
+    ///
+    /// This is the mechanical form of "delete any version row and the daemon must
+    /// still start": a lost version row means exactly this -- the script runs
+    /// against a database that already has its objects. Before t98, 20 of 25
+    /// scripts aborted here (`table tasks already exists`, `duplicate column name:
+    /// result`, `index ux_query_eval_gold_set_query already exists`, …); the raw
+    /// per-version census was `re-appliable = 5 -> [7, 13, 14, 16, 17]`.
+    #[test]
+    fn every_migration_can_be_reapplied_without_changing_the_schema() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        let before = schema_snapshot(&conn);
+
+        for (i, script) in MIGRATIONS.iter().enumerate() {
+            let version = (i + 1) as i64;
+            apply_script(&conn, version, script).unwrap_or_else(|e| {
+                panic!("migration {version} is not re-appliable: {e}");
+            });
+        }
+
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "re-applying every migration must leave the schema IDENTICAL (an \
+             object appearing or disappearing here is a re-apply guard that \
+             changed behaviour instead of skipping)"
+        );
+        assert_eq!(
+            count_ok(&conn, "SELECT COUNT(*) FROM schema_migrations").unwrap(),
+            SCHEMA_VERSION,
+            "re-applying scripts must not add ledger rows (that is `apply`'s job)"
+        );
+    }
+
+    /// The re-apply guard is **not** an error swallow: a statement the guard does
+    /// not understand must still abort when it fails.
+    ///
+    /// This is the guard's own negative control, and writing it found the
+    /// distinction it documents: a duplicate `CREATE TABLE` is UNDERSTOOD (the
+    /// object exists ⇒ the statement is skipped, which is the whole point), so
+    /// the unguarded shape has to be something else -- here an `INSERT` with a
+    /// colliding primary key, which the runner must let fail.
+    #[test]
+    fn a_non_reappliable_statement_is_still_an_error() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+
+        // Understood shape: skipped, no error (the guard doing its job).
+        apply_script(&conn, 999, "CREATE TABLE tasks (id INTEGER);")
+            .expect("a duplicate CREATE whose object exists must be skipped, not re-run");
+
+        // Ununderstood shape: it RUNS, and the duplicate key must abort.
+        let err = apply_script(
+            &conn,
+            999,
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, 't98');",
+        );
+        assert!(
+            matches!(err, Err(DbError::Sqlite(_))),
+            "a statement the guard does not understand must still abort the migration, \
+             not be swallowed: {err:?}"
+        );
+    }
+
+    /// **S2, as a reading**: a HOLE in the ledger is refused BY NAME, and refused
+    /// before anything is applied.
+    ///
+    /// Before t98 the hole was invisible: `MAX(version)` read rows {1,2,4..25} as
+    /// "everything up to 25 is applied", so v3's objects were never created and
+    /// every later migration ran on top of the gap.
+    #[test]
+    fn a_ledger_hole_is_refused_by_name() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version = 3", [])
+            .unwrap();
+
+        let err = apply(&mut conn).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains('3'),
+            "the refusal must name the missing version: {text}"
+        );
+        assert!(
+            text.contains("contiguous"),
+            "the refusal must say what is wrong with the ledger: {text}"
+        );
+        assert!(
+            matches!(err, DbError::Ledger(_)),
+            "it must be the ledger variant, not a generic SQL error: {err:?}"
+        );
+        assert_eq!(
+            count_ok(&conn, "SELECT COUNT(*) FROM schema_migrations").unwrap(),
+            SCHEMA_VERSION - 1,
+            "a refused boot must not have applied anything"
+        );
+    }
+
+    /// A hole in the MIDDLE is refused; a ledger that is COMPLETE is a silent
+    /// no-op (the second clause of S2: no per-boot noise), and the missing
+    /// highest version is simply re-applied -- that is the S1 path.
+    #[test]
+    fn an_intact_ledger_is_a_silent_no_op_and_a_lost_maximum_is_reapplied() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        let before = schema_snapshot(&conn);
+
+        // intact: applying again is Ok and changes nothing
+        apply(&mut conn).unwrap();
+        assert_eq!(before, schema_snapshot(&conn));
+        assert_eq!(
+            count_ok(&conn, "SELECT COUNT(*) FROM schema_migrations").unwrap(),
+            SCHEMA_VERSION
+        );
+
+        // the HIGHEST row lost: still contiguous (1..24), so the runner re-applies
+        // migration 25 -- which is the acceptance reading "delete version=MAX and
+        // the daemon must still start", in test form.
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)",
+            [],
+        )
+        .unwrap();
+        apply(&mut conn).unwrap();
+        assert_eq!(
+            count_ok(&conn, "SELECT MAX(version) FROM schema_migrations").unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "re-applying the lost maximum must restore the ledger, not alter the schema"
+        );
+    }
+
+    /// A re-apply must not rewrite POST-migration data.
+    ///
+    /// 0012 backfills `selected_by = 'human'` for the rows that predate the
+    /// column. Its first version had no `selected_by IS NULL` guard, so
+    /// re-applying it (a lost version row) rewrote EVERY row that has a
+    /// `selected_run_id` -- turning a judge's `agent:<name>` provenance into
+    /// `human`. `store::set_selected_run` writes both columns together, so that
+    /// is a silent loss of the very provenance 0012 exists to record.
+    #[test]
+    fn reapplying_0012_does_not_clobber_a_judges_provenance() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, intent, status, creator, created_at, updated_at, \
+             selected_run_id, selected_by) \
+             VALUES ('t1', 'x', 'x', 'done', '{}', 'now', 'now', 'run-1', 'agent:judge')",
+            [],
+        )
+        .unwrap();
+
+        apply_script(&conn, 12, MIGRATIONS[11]).unwrap();
+
+        let after: Option<String> = conn
+            .query_row("SELECT selected_by FROM tasks WHERE id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            after.as_deref(),
+            Some("agent:judge"),
+            "a re-applied backfill must not rewrite a later provenance"
+        );
+    }
+
+    /// The statement splitter keeps every trigger body WHOLE and leaves no
+    /// fragment behind. A split that cut a trigger body in half would still
+    /// "work" for the fresh path (an `execute_batch` chunk may hold several
+    /// statements), which is exactly why the property is asserted instead of
+    /// inferred from a green migration.
+    #[test]
+    fn statements_splits_trigger_bodies_whole_and_leaves_no_fragment() {
+        for (i, script) in MIGRATIONS.iter().enumerate() {
+            let version = i + 1;
+            let parts = statements(script);
+            assert!(!parts.is_empty(), "script {version} produced no statements");
+            for part in &parts {
+                assert!(
+                    part.trim_end().ends_with(';'),
+                    "script {version} left a fragment without a terminator: {part:?}"
+                );
+                assert!(
+                    !part.trim().is_empty(),
+                    "script {version} produced an empty statement"
+                );
+            }
+            let whole_triggers = parts
+                .iter()
+                .filter(|p| p.to_ascii_uppercase().contains("CREATE TRIGGER"))
+                .count();
+            assert_eq!(
+                whole_triggers,
+                script.matches("CREATE TRIGGER").count(),
+                "script {version} split or merged a trigger body"
+            );
+        }
+    }
+
+    /// The guard's parser is the thing the whole re-apply property rests on, so
+    /// every shape it claims to know is pinned here -- including that a shape it
+    /// does NOT know stays unguarded (it must run, and fail loudly if it fails).
+    #[test]
+    fn the_guard_parses_the_shapes_it_claims_to() {
+        let table = parse_guard("CREATE TABLE t (id INTEGER);");
+        assert!(matches!(table, Some(Guard::Create(ref k, ref n)) if k == "table" && n == "t"));
+        let virtual_table = parse_guard("CREATE VIRTUAL TABLE IF NOT EXISTS t USING fts5(x);");
+        assert!(
+            matches!(virtual_table, Some(Guard::Create(ref k, ref n)) if k == "table" && n == "t")
+        );
+        let index = parse_guard("CREATE INDEX idx ON t(x);");
+        assert!(matches!(index, Some(Guard::Create(ref k, _)) if k == "index"));
+        let unique = parse_guard("CREATE UNIQUE INDEX IF NOT EXISTS ux ON t(x);");
+        assert!(matches!(unique, Some(Guard::Create(ref k, ref n)) if k == "index" && n == "ux"));
+        let view = parse_guard("CREATE VIEW IF NOT EXISTS v AS SELECT 1;");
+        assert!(matches!(view, Some(Guard::Create(ref k, ref n)) if k == "view" && n == "v"));
+        let trigger = parse_guard("CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON t BEGIN");
+        assert!(
+            matches!(trigger, Some(Guard::Create(ref k, ref n)) if k == "trigger" && n == "tr")
+        );
+        let column = parse_guard("ALTER TABLE t ADD COLUMN c TEXT;");
+        assert!(matches!(column, Some(Guard::Column(ref t, ref c)) if t == "t" && c == "c"));
+        let drop = parse_guard("DROP TABLE IF EXISTS t;");
+        assert!(matches!(drop, Some(Guard::Drop(ref k, ref n)) if k == "table" && n == "t"));
+        assert!(
+            parse_guard("INSERT INTO t (id) VALUES (1);").is_none(),
+            "an INSERT must stay unguarded: the runner has to run it and report its error"
         );
     }
 }

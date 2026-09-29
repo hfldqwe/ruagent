@@ -140,7 +140,17 @@ jobs:
           npx playwright install chromium --with-deps
           mkdir -p "$RUNNER_TEMP/t65"
           set +e
-          npm run test:e2e -- --reporter=list --reporter=html 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
+          # t110: `--reporter=list` is NOT enough for skips, and the CI run proved it
+          # (`5d3adfd`: "1 skipped", "0 named"). Measured on a real local run against
+          # a temp-root daemon: with SIX skipped tests, `--reporter=list` printed
+          # exactly one relevant line, `6 skipped` -- the list reporter names the
+          # tests it RUNS, but a skip is only counted. The JSON reporter does carry
+          # them (stats.skipped + per-spec tests[].status == "skipped" with file and
+          # title), so it is written to a file here and read by the evidence step,
+          # which FAILS when it counts a skip it cannot name -- so this cannot rot
+          # back into a green no-op. `html` keeps feeding the upload-artifact step.
+          PLAYWRIGHT_JSON_OUTPUT_NAME="$RUNNER_TEMP/t65/playwright.json" \
+            npm run test:e2e -- --reporter=list --reporter=json --reporter=html 2>&1 | tee "$RUNNER_TEMP/t65/playwright.log"
           rc=${PIPESTATUS[0]}
           set -e
           # t104: the state comes from the command (`PIPESTATUS[0]`, since `tee`
@@ -151,16 +161,17 @@ jobs:
           exit "$rc"
         working-directory: panel
 
-      # Skipped specs are the silent-success shape of this suite. The names are
-      # printed, not just the count (rule 19), and only a skipped registry.spec.ts
-      # is an error: that spec runs only when the write guard is armed, so its
-      # absence from the run means the daemon's real config path was never
-      # exercised.
-      - name: E2E evidence (spec counts + exit code, skips visible)
+      # Skipped specs are the silent-success shape of this suite, so they must be
+      # NAMED, not counted (rule 19). The names come from the JSON report -- the
+      # text log's `N skipped` line is a number, and a number is not a reading.
+      # Only a skipped registry.spec.ts is fatal: that spec arms the write guard, so
+      # its absence means the daemon's real config path was never exercised.
+      - name: E2E evidence (spec counts + exit code, skips named)
         if: always()
         shell: bash
         run: |
           log="$RUNNER_TEMP/t65/playwright.log"; rcfile="$RUNNER_TEMP/t65/playwright.rc"
+          json="$RUNNER_TEMP/t65/playwright.json"; names="$RUNNER_TEMP/t65/skipped-names.txt"
           upstream="Panel E2E (Playwright)"
           if [ ! -r "$log" ] || [ ! -r "$rcfile" ]; then
             {
@@ -177,10 +188,42 @@ jobs:
           failed=$(grep -cE '^ *[0-9]+ failed' "$log" || true)
           flaky=$(grep -cE '^ *[0-9]+ flaky' "$log" || true)
           skipped=$(grep -cE '^ *[0-9]+ skipped' "$log" || true)
-          # Names, from the `list` reporter's skip markers (`  -  [chromium] ›
-          # path/to/x.spec.ts:12:3 › title`).
-          skipped_names=$(grep -E '^ *- .*\.spec\.ts' "$log" || true)
-          skipped_specs=$(printf '%s\n' "$skipped_names" | grep -oE '[A-Za-z0-9_./-]+\.spec\.ts' | sort -u || true)
+
+          # ---- the NAMED skips, from the JSON report ------------------------------
+          if [ ! -r "$json" ]; then
+            echo "::error::no Playwright JSON report at $json -- this leg cannot name a skipped spec. The run step must pass --reporter=json with PLAYWRIGHT_JSON_OUTPUT_NAME (t110): a skip that cannot be named must never be reported as green."
+            exit 1
+          fi
+          set +e
+          node - "$json" > "$names" 2>"$RUNNER_TEMP/t65/json-err.txt" <<'NODE'
+          const fs = require("fs");
+          const r = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const out = [];
+          const walk = (s) => {
+            for (const sp of s.specs || []) {
+              const statuses = (sp.tests || []).map((t) => t.status);
+              if (statuses.includes("skipped")) {
+                const reasons = (sp.tests || [])
+                  .flatMap((t) => (t.annotations || []).filter((a) => a.type === "skip").map((a) => a.description))
+                  .filter(Boolean);
+                out.push(`${sp.file} :: ${sp.title}${reasons.length ? " :: " + reasons[0] : ""}`);
+              }
+            }
+            for (const c of s.suites || []) walk(c);
+          };
+          for (const s of r.suites || []) walk(s);
+          console.log("JSON_REPORTED_SKIPPED=" + ((r.stats || {}).skipped ?? "unknown"));
+          for (const n of out) console.log("SKIPPED_SPEC|" + n);
+          NODE
+          node_rc=$?
+          set -e
+          if [ "$node_rc" -ne 0 ]; then
+            echo "::error::the Playwright JSON report at $json could not be parsed (exit $node_rc): $(cat "$RUNNER_TEMP/t65/json-err.txt" | head -3 | tr '\n' ' ') -- without it a skip cannot be named, so this leg cannot be green."
+            exit 1
+          fi
+          json_skipped=$(sed -n 's/^JSON_REPORTED_SKIPPED=//p' "$names" || true)
+          named=$(grep -c '^SKIPPED_SPEC|' "$names" || true)
+          skip_list=$(sed -n 's/^SKIPPED_SPEC|//p' "$names" || true)
           {
             echo "### E2E smoke -- Playwright evidence"
             echo ""
@@ -189,18 +232,22 @@ jobs:
             echo "| summary \`N passed\` lines | $passed |"
             echo "| summary \`N failed\` lines | $failed |"
             echo "| summary \`N flaky\` lines | $flaky |"
-            echo "| summary \`N skipped\` lines | $skipped |"
-            echo "| skip markers with a spec name | $(printf '%s\n' "$skipped_names" | grep -c . || true) |"
-            echo "| distinct skipped SPECS (named) | $(printf '%s\n' "$skipped_specs" | grep -c . || true) |"
+            echo "| summary \`N skipped\` lines (text log, a NUMBER only) | $skipped |"
+            echo "| JSON report \`stats.skipped\` | $json_skipped |"
+            echo "| **named skipped specs** | **$named** |"
             echo "| exit code | $rc |"
             echo ""
-            echo "skipped specs, by NAME:"
-            if [ -n "$skipped_specs" ]; then printf '%s\n' "$skipped_specs"; else echo "(none: no spec was skipped)"; fi
-            echo ""
-            echo "raw skip lines:"
-            if [ -n "$skipped_names" ]; then printf '%s\n' "$skipped_names"; else grep -E '^ *[0-9]+ (skipped|did not run)' "$log" || echo "(no skip line printed)"; fi
+            echo "skipped specs, by NAME (file :: title :: reason):"
+            if [ "$named" -gt 0 ]; then printf '%s\n' "$skip_list"; else echo "(none: no spec was skipped)"; fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          if printf '%s\n' "$skipped_specs" | grep -qx 'registry\.spec\.ts'; then
+
+          # A skip we counted but cannot name is exactly the t104 failure shape
+          # (CI: "1 skipped" / "0 named"): refuse it rather than report green.
+          if [ "$json_skipped" = "unknown" ] || [ "$json_skipped" != "$named" ]; then
+            echo "::error::the JSON report says $json_skipped skipped spec(s) but $named could be NAMED. An unnamed skip is not a reading (t110/t104): fix the reporter/parser rather than accept a green."
+            exit 1
+          fi
+          if printf '%s\n' "$skip_list" | grep -q 'registry\.spec\.ts'; then
             echo "::error::registry.spec.ts was SKIPPED: that spec writes the daemon's real agents.toml and only runs when RUAGENT_E2E_ALLOW_WRITES=1, i.e. through npm run test:e2e. A skip here means the write path was not exercised (t65)."
             exit 1
           fi
@@ -208,7 +255,7 @@ jobs:
             echo "::error::Playwright run failed (exit $rc)"
             exit 1
           fi
-          echo "playwright: exit 0, no skipped registry.spec.ts"
+          echo "playwright: exit 0, $named skipped spec(s) named, none of them registry.spec.ts"
 
       - name: Upload Playwright artefacts
         # An E2E red must be readable from the run itself. An E2E failure once

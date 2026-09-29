@@ -9,7 +9,7 @@
 -- DDL-1: derived page state.
 -- ---------------------------------------------------------------------------
 -- New table, no history: the NOT NULLs are honest.
-CREATE TABLE wiki_pages (
+CREATE TABLE IF NOT EXISTS wiki_pages (
     slug              TEXT PRIMARY KEY,
     title             TEXT NOT NULL DEFAULT '',
     summary           TEXT NOT NULL DEFAULT '',
@@ -44,7 +44,7 @@ CREATE TABLE wiki_pages (
 -- a page is being built, and forcing the page row to exist first would impose a
 -- write order on I-D that its own code does not have. The spec's DDL has no FK
 -- either; this note records that it was a decision, not an oversight.
-CREATE TABLE wiki_citations (
+CREATE TABLE IF NOT EXISTS wiki_citations (
     page_slug  TEXT NOT NULL,
     section    TEXT NOT NULL,
     document   TEXT NOT NULL,
@@ -53,8 +53,8 @@ CREATE TABLE wiki_citations (
     build_id   INTEGER,
     PRIMARY KEY (page_slug, section, chunk_id)
 );
-CREATE INDEX idx_wiki_citations_chunk ON wiki_citations(chunk_id);
-CREATE INDEX idx_wiki_citations_doc   ON wiki_citations(document);
+CREATE INDEX IF NOT EXISTS idx_wiki_citations_chunk ON wiki_citations(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_wiki_citations_doc   ON wiki_citations(document);
 
 -- ---------------------------------------------------------------------------
 -- DDL-3 + DDL-4 (route B): one vocabulary, and a constraint that holds.
@@ -116,7 +116,7 @@ UPDATE wiki_builds SET finished_at = COALESCE(finished_at, started_at)
 -- `status='planned'` trigger would abort every dry-run build between this
 -- migration and t10. The narrowing to one value is a follow-up migration, to be
 -- taken with I-D's change in hand.
-CREATE TRIGGER wiki_builds_plan_pairing_ins BEFORE INSERT ON wiki_builds
+CREATE TRIGGER IF NOT EXISTS wiki_builds_plan_pairing_ins BEFORE INSERT ON wiki_builds
 WHEN (new.status IN ('planned', 'planned_only')) <> (new.dry_run = 1)
 BEGIN
     SELECT RAISE(ABORT, 'wiki_builds: plan-only status and dry_run must agree');
@@ -126,7 +126,7 @@ END;
 -- is already non-conforming (a legacy row this migration did not normalise) must
 -- stay repairable: an unconditional trigger would make it impossible to update
 -- such a row back into conformance, i.e. it would freeze the very defect.
-CREATE TRIGGER wiki_builds_plan_pairing_upd BEFORE UPDATE ON wiki_builds
+CREATE TRIGGER IF NOT EXISTS wiki_builds_plan_pairing_upd BEFORE UPDATE ON wiki_builds
 WHEN ((old.status IN ('planned', 'planned_only')) = (old.dry_run = 1))
  AND ((new.status IN ('planned', 'planned_only')) <> (new.dry_run = 1))
 BEGIN
@@ -135,7 +135,7 @@ END;
 
 -- The reading that stands in for the unimplementable second CHECK. Required
 -- value on a healthy database: 0 rows.
-CREATE VIEW wiki_builds_unfinished_plans AS
+CREATE VIEW IF NOT EXISTS wiki_builds_unfinished_plans AS
 SELECT id, scope, status, dry_run, started_at, finished_at
   FROM wiki_builds
  WHERE dry_run = 1 AND finished_at IS NULL;
@@ -146,7 +146,7 @@ SELECT id, scope, status, dry_run, started_at, finished_at
 -- Without this row, "did this build make the graph better or worse" had no
 -- answer: the numbers were computed and thrown away. One row per completed
 -- build, keyed by it, so the reading is bounded by the number of builds.
-CREATE TABLE wiki_graph_readings (
+CREATE TABLE IF NOT EXISTS wiki_graph_readings (
     build_id    INTEGER PRIMARY KEY REFERENCES wiki_builds(id),
     nodes       INTEGER NOT NULL,
     edges       INTEGER NOT NULL,
@@ -163,7 +163,7 @@ CREATE TABLE wiki_graph_readings (
 -- `reason` and `author` are NOT NULL with a non-empty CHECK: this is the one
 -- place in the wiki pipeline where a human action gets recorded, and an empty
 -- reason would make "记下为什么改" optional in the only table meant to enforce it.
-CREATE TABLE wiki_corrections (
+CREATE TABLE IF NOT EXISTS wiki_corrections (
     id     INTEGER PRIMARY KEY,
     slug   TEXT NOT NULL,
     kind   TEXT NOT NULL CHECK (kind IN ('pin', 'release', 'note')),
@@ -171,7 +171,7 @@ CREATE TABLE wiki_corrections (
     author TEXT NOT NULL CHECK (length(trim(author)) > 0),
     at     TEXT NOT NULL
 );
-CREATE INDEX idx_wiki_corrections_slug ON wiki_corrections(slug, at);
+CREATE INDEX IF NOT EXISTS idx_wiki_corrections_slug ON wiki_corrections(slug, at);
 
 -- ---------------------------------------------------------------------------
 -- NO SCHEMA CHANGE: asks whose answer is "already allowed".

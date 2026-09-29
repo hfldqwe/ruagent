@@ -5,7 +5,7 @@
 
 -- A section = one heading + its paragraphs; the retrieval unit stays the
 -- chunk, the RETURN unit becomes the section (parent block).
-CREATE TABLE chunk_sections (
+CREATE TABLE IF NOT EXISTS chunk_sections (
     id          INTEGER PRIMARY KEY,
     document_id INTEGER NOT NULL REFERENCES documents(id),
     idx         INTEGER NOT NULL,
@@ -23,7 +23,7 @@ ALTER TABLE chunks ADD COLUMN section_id INTEGER REFERENCES chunk_sections(id);
 -- chunk (a reindex replaces chunk ids) and the document (rollback may
 -- happen after a delete + re-save); `document_name` is denormalized so
 -- history stays readable either way.
-CREATE TABLE chunk_revisions (
+CREATE TABLE IF NOT EXISTS chunk_revisions (
     id            INTEGER PRIMARY KEY,
     chunk_id      INTEGER NOT NULL,
     document_id   INTEGER NOT NULL,

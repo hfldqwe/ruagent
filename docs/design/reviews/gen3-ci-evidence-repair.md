@@ -129,3 +129,101 @@ PRE-SUBMIT COMMAND (t104): bash .github/workflows/scripts/check-workflow-refs.sh
 - **未** push / dispatch / rerun / cancel / 建 tag；**未**动 `panel/**`、`crates/**`、`cli/**`。
 - 临时残留：`%TEMP%\ra-t104\`（NC 夹具与抽取出的 run-body）、`%TEMP%\ra-t104-nc.txt`（完整 NC 输出）、`%TEMP%\ra_t104_nc.py`（驱动的探针）—— 都在 `%TEMP%`，仓库内**零临时文件**（`git status --porcelain -- .github` 只有 3 个被我修改的跟踪文件）。
 - 不涉及 `.rs` ⇒ 无需 fmt/clippy（本单未碰任何 Rust 文件）。
+
+---
+
+# §9 t110 追加：真实日志推翻了 t104 的取数 —— 「跳过点名」的收口
+
+> 这一节替换 §6.1 里那条「未用真跑验证」的未测项。t104 的诚实标注是对的，**现在有了反证**：CI run `36485138690`（`5d3adfd`）打出 `| summary N skipped lines | 1 |` + `| skip markers with a spec name | 0 |` ⇒ **有 1 个 skip，0 个名字**。
+
+## 9.1 真实运行怎么做的（临时 root + 临时端口，活库只读）
+
+按 t107 的新规则显式命名目标：`ruagent serve --addr 127.0.0.1:18787 --root %TEMP%\ra-t110-root`（**不是** 8787、**不是** `~/.ruagent`），config/agents.toml 按 CI 的 `Register e2e mock agents` 步镜像。两次真跑：
+
+| 运行 | 命令 | 真实结果 |
+| --- | --- | --- |
+| **A** | `E2E_BASE_URL=http://127.0.0.1:18787 npm run test:e2e -- --reporter=list --reporter=json`（入口点 ⇒ **写入闸门武装**） | `Running 51 tests` ⇒ **`51 passed (18.3s)`，0 skipped**，exit 0 |
+| **B** | `npx playwright test --reporter=list --reporter=json`（**无** `RUAGENT_E2E_ALLOW_WRITES`） | `Running 51 tests` ⇒ **`6 skipped / 45 passed (14.6s)`**，exit 0 |
+
+⇒ A/B 的差别正是闸门：那 6 条**受写入闸门保护的 spec** 在 B 里自己 skip。**这也说明 CI 那个 `1 skipped` 不是这 6 条里的**（CI 走入口点 ⇒ 闸门武装 ⇒ 它们会跑）；它到底是哪一条，**下一次 CI 就会点名说出**。
+
+## 9.2 ① `--reporter=list` 的真实形状：**它不给 skip 起名字**
+
+run B 真日志里与 skip 有关的**全部**内容（原文，`%TEMP%\ra-t110-runB.log`）：
+```
+Running 51 tests using 8 workers
+[6/51] e2e\failure-visibility.spec.ts:190:1 › P3: a failed mount probe says so on the CHIP, ...
+[9/51] e2e\failure-visibility.spec.ts:292:1 › F1 (t103): with EVERY probe failed the models readout carries no number
+...
+  6 skipped
+  45 passed (14.6s)
+```
+`grep -c skipped` = **1 行**（就是 `6 skipped`）；`grep -E '^ *- .*\.spec\.ts'` = **0 命中**。
+⇒ **`list` 只给「它跑过的」测试打名字；被 skip 的只进汇总计数。** 我 t104 写的 `skip markers with a spec name` / `distinct skipped SPECS (named)` 两行在这份真日志上必然是 `0` —— 与 CI 现象**逐字一致**。**这是取数口径选错，不是 CI 环境问题。**
+
+## 9.3 ② 换成可判定的取数：JSON reporter（以真日志为准）
+
+run 步加 `PLAYWRIGHT_JSON_OUTPUT_NAME=$RUNNER_TEMP/t65/playwright.json` 与 `--reporter=json`（与 `list` + `html` 并存）。**同一份真日志**下 JSON 报告给出：
+
+```
+stats.skipped = 6 | expected = 45 | unexpected = 0 | flaky = 0
+NAMED skipped specs: 6
+   consumption.spec.ts :: Wiki page: a page with no build reading shows coverage unknown :: [skipped]
+   consumption.spec.ts :: Memory page: the recall log labels each score with its dimension :: [skipped]
+   consumption.spec.ts :: Knowledge page: a hit's score carries its dimension :: [skipped]
+   consumption.spec.ts :: Graph page: an entity reaches the DOM :: [skipped]
+   recall.spec.ts :: conservative recall stubs expand to the full memory :: [skipped]
+   registry.spec.ts :: runtimes and roles can be created and deleted from the panel :: [skipped]
+```
+⇒ **每一条都能点名**（`file :: title`），而且 `annotations[].description` 还带**为什么**（这里是 write-guard 的理由原文）。**captain 猜的探针也对上了**：`recall.spec.ts :: conservative recall stubs expand to the full memory` 正是 6 条之一（它是**闸门条件 skip**，不是无条件 skip —— 走入口点时会真跑）。
+
+**成对读数（同一套件、同一临时守护进程，只换取数方式）**：
+
+| | 改前（list 取数；CI `5d3adfd` / 本地 run B 同形） | 改后（JSON 取数；本地 run B 真日志） |
+| --- | --- | --- |
+| 有 skip？ | 有（`1 skipped` / `6 skipped`） | 有（`stats.skipped = 6`） |
+| **点出几个名字** | **0** | **6** |
+| 名字内容 | — | `consumption ×4` · `recall.spec.ts` · `registry.spec.ts`（逐字来自报告） |
+| registry 被 skip 时 | index 取不到名字 ⇒ **静默放过**（t104 的真实后果） | `::error::registry.spec.ts was SKIPPED` + exit 1 |
+
+## 9.4 ③ 判定步的新形状（**不允许任何「永远绿」**）
+
+- 取数：`node - "$json"`（本 job 必然有 node）递归读 `suites[].specs[]`，`tests[].status === "skipped"` ⇒ `file :: title :: reason`；同时回读 `stats.skipped`。
+- **三条拒绝绿的护栏**：
+  1. **JSON 报告缺失** ⇒ `::error::… this leg cannot name a skipped spec` + **exit 1**（不是警告）；
+  2. **JSON 解析失败** ⇒ `::error::… could not be parsed` + **exit 1**；
+  3. **`stats.skipped` 与实际点出的名字数不一致** ⇒ `::error::the JSON report says N skipped spec(s) but M could be NAMED` + **exit 1** —— **这条正是 t104 那个形状的守卫**：从此「有 skip 却点不出名字」**不可能报绿**。
+- 原语义保留：**只有 `registry.spec.ts` 被 skip 才致命**（`::error::` + exit 1）；其它 skip **点名打印 + 计入表**，不红；`rc≠0` 仍红；上游被短路时仍是「指向上游的通知 + exit 0」（t104 形状不变）。
+- 汇总表改为语义可判定的两行：`| summary \`N skipped\` lines (text log, a NUMBER only) |` 与 `| JSON report \`stats.skipped\` |` + `| **named skipped specs** |`。
+
+## 9.5 负控（**全部用真实日志 / 真实 JSON 报告**，8/8）
+
+方法同 t104：把 `e2e.yml` 那一步的 `run:` 体（**即将被推送的那段字节**，4071 字符）抽出来执行；夹具 = 本机真跑的 `ra-t110-runA/B.log` 与 `ra-t110-pwA/B.json`；需要「只含 registry skip」等形状时，对**真实报告**做一处声明过的字段改动（`stats.skipped` 同步改，保持自洽）。
+
+| # | 用例（真实夹具） | 期望 | 实测 |
+| --- | --- | --- | --- |
+| ①a | run B 真报告**原样**（6 skip，含 registry） | 点名 6 + registry 致命 | **exit 1** + 6 行 `file :: title :: reason` + `::error::registry.spec.ts was SKIPPED` ✓ |
+| ①b | 真报告，registry 的 status 改 passed（`stats.skipped` 6→5） | 点名 5、**不红** | **exit 0** + 5 行名字 + `playwright: exit 0, 5 skipped spec(s) named, none of them registry.spec.ts` ✓ |
+| ② | 真报告，**只有** registry 是 skip | 仍致命 | **exit 1** + 唯一名字 `registry.spec.ts :: runtimes and roles…` ✓ |
+| ③a | 有真日志、**无** JSON 报告 | 拒绝绿 | **exit 1** + `cannot name a skipped spec` ✓ |
+| ③b | 真报告 `stats.skipped=6` 但无任何 spec 带 skipped（**t104 的失败形状**） | 拒绝绿 | **exit 1** + `says 6 … but 0 could be NAMED` ✓ |
+| ④ | run A 真报告（0 skip） | 绿并说明 | **exit 0** + `(none: no spec was skipped)` ✓ |
+| ⑤ | 真日志 + 强制 `rc=1` | 真红 | **exit 1** + `::error::Playwright run failed (exit 1)` ✓ |
+| ⑥ | 无日志（上游被短路） | 上游通知、不叠加红 | **exit 0** + `NO READING … Derivative notice` ✓ |
+
+⇒ `[t110] negative controls: 8/8 behaved as required`（全量输出：`%TEMP%\ra-t110-nc.txt`）。
+
+## 9.6 未测项更新
+
+- **[已结清]** t104 §6.1「真实 `list` reporter 的 skip 行格式未用真跑验证」⇒ 现在用真跑验证了，**结论是「它不点名」**，改法按真日志换成 JSON 取数。
+- **[仍开放 · 1]** CI 上那个 `1 skipped` **到底是谁**：本机 A 组（闸门武装）是 0 skip，所以它不是那 6 条闸门 spec；**答案要等下一次 CI** —— 新判定步会**直接点名**它（这条未测项是自证的：机制生效后它自己会报出来）。
+- **[仍开放 · 2]** `PLAYWRIGHT_JSON_OUTPUT_NAME` + 多 `--reporter` 并存是在 **Windows/git-bash + node** 上验的；reporter 格式属于 reporter 层（与平台无关），但 ubuntu + chromium 上的组合我**没有真跑** —— 判定步会给它的读数（若 JSON 缺失 ⇒ 立即红，不会被静默吞掉）。
+- **[仍开放 · 3]** 判定步依赖这个 job 里有 `node`（Playwright 自身需要它 ⇒ 实际必然满足），但这是一条**未显式断言**的前提；若将来 job 换掉 node 安装方式，表现是「JSON 缺失 ⇒ 红」，仍然是**失败而不是假绿**。
+
+## 9.7 纪律回执（t110）
+
+- 写入集合：`.github/workflows/e2e.yml`（取证段）+ 本报告（**都在 inScope**）。`panel/**`（含 `panel/src/**`、`panel/e2e/run-e2e.mjs`）、`crates/**` **零改动**。
+- `git diff --stat`（本轮）：`.github/workflows/e2e.yml` = **68 insertions(+), 21 deletions(-)**。
+- **未** push / dispatch / rerun / cancel / tag。临时守护进程用**自记 pid**（76352）在 18787 上启停；**活守护进程 pid 79984 与活库未被触碰**（只读健康检查 `{"status":"ok","service":"ruagent"}`；db mtime 收尾仍是 `2026-09-29T04:54:56`，与本轮开始前一致 —— 本轮没有任何写活库动作，Run A/B 全打临时 root）。
+- 临时自清：**已删** `%TEMP%\ra-t110-root`（临时数据根）与 `%TEMP%\ra-t110-nc`（负控夹具）；**保留证据**：`ra-t110-runA.log` · `ra-t110-runB.log` · `ra-t110-pwA.json` · `ra-t110-pwB.json` · `ra-t110-nc.txt` · `ra-t110-phase1.log` · 两个 daemon 输出；仓内零临时文件。
+- 复核：三份 workflow 仍可解析（`ci.yml` / `e2e.yml` / `release.yml` = OK）；`job.status` 命中 **3**，**全部是注释里的历史说明**，`${{ … job.status … }}` **表达式 0 处**。

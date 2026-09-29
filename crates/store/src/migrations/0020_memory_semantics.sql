@@ -61,7 +61,7 @@ ALTER TABLE memories ADD COLUMN valid_to   TEXT;
 -- episode, which memories were derived from it" had no answer before.
 --
 -- New table: no history, so the NOT NULLs are honest.
-CREATE TABLE memory_sources (
+CREATE TABLE IF NOT EXISTS memory_sources (
     memory_id   INTEGER NOT NULL REFERENCES memories(id),
     source_kind TEXT NOT NULL,   -- 'memory' | 'episode'
     source_id   INTEGER NOT NULL,
@@ -69,7 +69,7 @@ CREATE TABLE memory_sources (
     PRIMARY KEY (memory_id, source_kind, source_id)
 );
 -- The residue-scan direction: given a source, which memories claim it.
-CREATE INDEX idx_memory_sources_source ON memory_sources(source_kind, source_id);
+CREATE INDEX IF NOT EXISTS idx_memory_sources_source ON memory_sources(source_kind, source_id);
 
 -- ---------------------------------------------------------------------------
 -- distill_log: three-state outcome + prompt attribution (E.7; asked by BOTH

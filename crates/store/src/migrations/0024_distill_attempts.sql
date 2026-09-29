@@ -33,7 +33,7 @@
 -- a stale writer that silently collapsed six attempts into one row is exactly
 -- the defect this migration exists to end.
 
-CREATE TABLE distill_log_attempts (
+CREATE TABLE IF NOT EXISTS distill_log_attempts (
     -- Per-ATTEMPT identity. `INTEGER PRIMARY KEY` == rowid, so an insert that
     -- does not name it still gets one, in insertion order.
     id                INTEGER PRIMARY KEY,
@@ -65,17 +65,17 @@ SELECT session_key, distilled_at, memories_written, entities_written,
 FROM distill_log
 ORDER BY distilled_at, session_key;
 
-DROP TABLE distill_log;
+DROP TABLE IF EXISTS distill_log;
 ALTER TABLE distill_log_attempts RENAME TO distill_log;
 
 -- "This session's attempts, newest last" -- the read that the old key made
 -- impossible.
-CREATE INDEX idx_distill_log_session ON distill_log(session_key, id);
+CREATE INDEX IF NOT EXISTS idx_distill_log_session ON distill_log(session_key, id);
 
 -- The failure rate's index. Partial on purpose: rows whose outcome nobody
 -- recorded (the pre-0024 history) are NOT part of a rate's denominator, and an
 -- index that included them would invite counting them.
-CREATE INDEX idx_distill_log_status ON distill_log(status) WHERE status IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_distill_log_status ON distill_log(status) WHERE status IS NOT NULL;
 
 -- The reading rule, in one place, so no reader has to remember it:
 -- the denominator of a distillation success/failure rate is
@@ -83,5 +83,5 @@ CREATE INDEX idx_distill_log_status ON distill_log(status) WHERE status IS NOT N
 -- an attempt whose outcome was never recorded (all 33 pre-0024 rows), and
 -- folding it into "ok" would assert successes nobody observed -- the same
 -- mistake `0020` refused to make with `NOT NULL DEFAULT 'ok'`.
-CREATE VIEW distill_recorded_outcomes AS
+CREATE VIEW IF NOT EXISTS distill_recorded_outcomes AS
     SELECT * FROM distill_log WHERE status IS NOT NULL;

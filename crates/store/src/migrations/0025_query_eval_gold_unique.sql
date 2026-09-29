@@ -40,5 +40,5 @@
 DELETE FROM query_eval_gold
 WHERE id NOT IN (SELECT MIN(id) FROM query_eval_gold GROUP BY set_id, query);
 
-CREATE UNIQUE INDEX ux_query_eval_gold_set_query
+CREATE UNIQUE INDEX IF NOT EXISTS ux_query_eval_gold_set_query
     ON query_eval_gold(set_id, query);

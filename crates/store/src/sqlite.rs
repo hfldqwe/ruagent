@@ -15,6 +15,14 @@ pub enum DbError {
     Closed,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The migration ledger contradicts itself or the schema (t98).
+    ///
+    /// A row of `schema_migrations` is a CLAIM that a migration was applied; a
+    /// hole in the ledger makes that claim false for everything after it, and
+    /// this variant is how the store refuses to guess. The message names the
+    /// missing version(s) so the reader can act on it.
+    #[error("schema ledger is not usable: {0}")]
+    Ledger(String),
 }
 
 type Op = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;

@@ -1,6 +1,6 @@
 [package]
 name = "ruagent-store"
-description = "Repository traits and SQLite/LanceDB/JSONL implementations"
+description = "SQLite repositories (single-writer actor + migrations) and JSONL transcripts; the LanceDB vector layer lives in ruagent-knowledge (t98)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -3,7 +3,7 @@
 -- markdown files under knowledge/wiki/ (source of truth, indexed by
 -- the scanner); these tables are derived state.
 
-CREATE TABLE wiki_builds (
+CREATE TABLE IF NOT EXISTS wiki_builds (
     id            INTEGER PRIMARY KEY,
     scope         TEXT NOT NULL,          -- "all" | "changed" | comma-separated names
     status        TEXT NOT NULL,          -- planned|running|done|failed
@@ -18,7 +18,7 @@ CREATE TABLE wiki_builds (
     finished_at   TEXT
 );
 
-CREATE TABLE wiki_build_pages (
+CREATE TABLE IF NOT EXISTS wiki_build_pages (
     build_id INTEGER NOT NULL REFERENCES wiki_builds(id),
     slug     TEXT NOT NULL,
     action   TEXT NOT NULL,               -- create|update|delete|keep
@@ -30,7 +30,7 @@ CREATE TABLE wiki_build_pages (
 -- §13-3 ruling: the content hash each page had when a build wrote it.
 -- A page whose on-disk hash differs was hand-edited and is skipped by
 -- later builds unless the plan explicitly says otherwise.
-CREATE TABLE wiki_page_hashes (
+CREATE TABLE IF NOT EXISTS wiki_page_hashes (
     slug     TEXT PRIMARY KEY,
     hash     TEXT NOT NULL,
     build_id INTEGER NOT NULL
