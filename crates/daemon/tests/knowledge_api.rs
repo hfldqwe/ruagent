@@ -751,3 +751,466 @@ async fn recall_calls_are_logged() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// t5: per-leg recall configuration over the real HTTP surface
+// (docs/plans/capability-plugins-design.md §11.5)
+// ---------------------------------------------------------------------------
+
+/// The load-bearing keys of one recall response, as ONE comparable value.
+///
+/// WHY NOT the whole body: the response is a projection of the same ranking, and
+/// these are the keys that carry it — the four sections in order, the per-leg
+/// memory evidence, the graph counts and the scoring provenance. A ranking that
+/// moved shows up here; nothing call-relative does.
+fn recall_ranking(v: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "memories": v["memories"],
+        "knowledge": v["knowledge"],
+        "wiki": v["wiki"],
+        "entities": v["entities"],
+        "memory_legs": v["memory_legs"],
+        "graph": v["graph"],
+        "scoring": v["scoring"],
+    })
+}
+
+/// The chunk ids of the `knowledge` section, in the page's order.
+fn knowledge_order(v: &serde_json::Value) -> Vec<i64> {
+    v["knowledge"]
+        .as_array()
+        .expect("knowledge is a list")
+        .iter()
+        .filter_map(|h| h["chunk_id"].as_i64())
+        .collect()
+}
+
+/// Replace the whole `[capabilities]` table through the API (design §14.2) — the
+/// same door a user has, and the one that installs the live plane.
+async fn put_capabilities(
+    http: &reqwest::Client,
+    daemon_url: &str,
+    capabilities: serde_json::Value,
+) -> serde_json::Value {
+    let resp = http
+        .put(format!("{daemon_url}/api/v1/capabilities"))
+        .json(&serde_json::json!({ "capabilities": capabilities }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "PUT capabilities was rejected: {body:?}");
+    assert_eq!(body["table_present"], serde_json::json!(true), "{body:?}");
+    body
+}
+
+/// Every recall leg the registry knows, switched on at its default weight.
+fn all_recall_legs_on() -> serde_json::Value {
+    serde_json::json!({
+        "recall_leg_memory_semantic": { "enabled": true, "weight": 1.0 },
+        "recall_leg_memory_fts": { "enabled": true, "weight": 1.0 },
+        "recall_leg_knowledge_semantic": { "enabled": true, "weight": 2.0 },
+        "recall_leg_knowledge_fts": { "enabled": true, "weight": 1.0 },
+        "recall_leg_wiki": { "enabled": true },
+        "recall_leg_graph": { "enabled": true },
+    })
+}
+
+/// The six recall capability ids, sorted — the wire order of `legs_disabled`.
+const ALL_RECALL_LEG_IDS: [&str; 6] = [
+    "recall_leg_graph",
+    "recall_leg_knowledge_fts",
+    "recall_leg_knowledge_semantic",
+    "recall_leg_memory_fts",
+    "recall_leg_memory_semantic",
+    "recall_leg_wiki",
+];
+
+async fn recall_get(
+    http: &reqwest::Client,
+    daemon_url: &str,
+    query: &str,
+    strategy: Option<&str>,
+) -> serde_json::Value {
+    let mut req = http
+        .get(format!("{daemon_url}/api/v1/recall"))
+        .query(&[("q", query), ("top_n", "5")]);
+    if let Some(strategy) = strategy {
+        req = req.query(&[("strategy", strategy)]);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "recall for {query:?} failed: {body:?}");
+    body
+}
+
+/// THE FIXTURE, chosen so a toggle or a weight is OBSERVABLE: the two legs disagree
+/// about the order. `both-terms-long` holds both query terms (keyword rank 0) and is
+/// the semantic leg's rank 1; `one-term-short` repeats one term, so it is the
+/// semantic leg's rank 0 and is in NO keyword leg — the precision stage (both terms
+/// ANDed) succeeds, so the degradation never reaches the OR-ed prefix stage.
+async fn seed_t5_fixture(http: &reqwest::Client, daemon_url: &str) {
+    for (name, body) in [
+        (
+            "both-terms-long",
+            "kettle descaling zzz yyy xxx www vvv uuu ttt sss rrr",
+        ),
+        ("one-term-short", "kettle kettle kettle kettle kettle"),
+    ] {
+        let resp: serde_json::Value = http
+            .put(format!("{daemon_url}/api/v1/knowledge/raw/{name}"))
+            .json(&serde_json::json!({ "content": body }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(resp["chunks"].as_i64().unwrap_or(0) >= 1, "{resp:?}");
+    }
+}
+
+/// DEFAULT EQUIVALENCE (§11.5 item 2): a `[capabilities]` table with all six legs
+/// enabled at their default weights must produce the SAME recall as the absent
+/// table — same ids, same order, same scores, same per-leg evidence.
+#[tokio::test]
+async fn the_default_leg_configuration_reproduces_the_legacy_recall() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+
+    // (a) NO `[capabilities]` table (the harness writes a policy.toml without one):
+    // today's behaviour, by construction.
+    let legacy = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    assert_eq!(legacy["legs_disabled"], serde_json::json!([]));
+    assert!(
+        !knowledge_order(&legacy).is_empty(),
+        "the fixture must return knowledge hits: {legacy:?}"
+    );
+    println!(
+        "READING t5 http legacy: knowledge={:?} fusion={} graph={:?}",
+        knowledge_order(&legacy),
+        legacy["scoring"]["fusion"],
+        legacy["graph"]
+    );
+
+    // (b) the table PRESENT, every leg on at its default weight.
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+    let configured = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    println!(
+        "READING t5 http default table: knowledge={:?} fusion={} graph={:?}",
+        knowledge_order(&configured),
+        configured["scoring"]["fusion"],
+        configured["graph"]
+    );
+    assert_eq!(
+        recall_ranking(&legacy),
+        recall_ranking(&configured),
+        "the default leg configuration moved the recall ranking"
+    );
+    assert_eq!(configured["legs_disabled"], serde_json::json!([]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// §11.3's wiki and graph rows: OFF ⇒ `"wiki": []`, `graph.entities == 0`,
+/// `graph.paths == 0`, `graph.empty_reason == "leg disabled"`, `entities: []` — and
+/// the OTHER legs are undisturbed (the gates do not leak into the ranking).
+#[tokio::test]
+async fn a_disabled_wiki_or_graph_leg_is_reported_and_leaves_its_section_empty() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+    let on = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    assert!(!knowledge_order(&on).is_empty(), "{on:?}");
+    let on_top_score = on["scoring"]["top_knowledge_score"].clone();
+
+    let mut table = all_recall_legs_on();
+    table["recall_leg_wiki"] = serde_json::json!({ "enabled": false });
+    table["recall_leg_graph"] = serde_json::json!({ "enabled": false });
+    put_capabilities(&http, &daemon_url, table).await;
+    let off = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    println!(
+        "READING t5 http wiki/graph off: legs_disabled={:?} wiki={:?} graph={:?} entities={:?}",
+        off["legs_disabled"], off["wiki"], off["graph"], off["entities"]
+    );
+    assert_eq!(
+        off["legs_disabled"],
+        serde_json::json!(["recall_leg_graph", "recall_leg_wiki"])
+    );
+    assert_eq!(off["wiki"], serde_json::json!([]));
+    assert_eq!(off["entities"], serde_json::json!([]));
+    assert_eq!(off["graph"]["entities"], serde_json::json!(0));
+    assert_eq!(off["graph"]["paths"], serde_json::json!(0));
+    assert_eq!(
+        off["graph"]["empty_reason"],
+        serde_json::json!("leg disabled"),
+        "a new state needs a NEW literal, not one of EmptyReason's"
+    );
+    assert_eq!(off["graph"]["truncated_by"], serde_json::Value::Null);
+    // The knowledge and memory sections are untouched: neither leg feeds them.
+    assert_eq!(knowledge_order(&off), knowledge_order(&on));
+    assert_eq!(off["scoring"]["top_knowledge_score"], on_top_score);
+    assert_eq!(off["memory_legs"], on["memory_legs"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// §11.3's last row: ALL SIX legs off is a legal, EMPTY, 200 answer that NAMES every
+/// leg it did not query — never a 500 and never an empty success that reads like
+/// "nothing matched".
+///
+/// The same test asserts the section was non-empty with the legs ON, so the empty
+/// answer is attributable to the configuration and not to an empty fixture.
+#[tokio::test]
+async fn all_six_legs_off_is_an_empty_success_that_names_every_leg() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+    let on = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    assert!(
+        !knowledge_order(&on).is_empty(),
+        "the fixture must be non-empty with the legs on: {on:?}"
+    );
+
+    let off_table = serde_json::json!({
+        "recall_leg_memory_semantic": { "enabled": false },
+        "recall_leg_memory_fts": { "enabled": false },
+        "recall_leg_knowledge_semantic": { "enabled": false },
+        "recall_leg_knowledge_fts": { "enabled": false },
+        "recall_leg_wiki": { "enabled": false },
+        "recall_leg_graph": { "enabled": false },
+    });
+    put_capabilities(&http, &daemon_url, off_table).await;
+    let off = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    println!(
+        "READING t5 http all-off: legs_disabled={:?} sections={:?} scoring={:?} graph={:?}",
+        off["legs_disabled"],
+        serde_json::json!({
+            "memories": off["memories"].as_array().map(|v| v.len()),
+            "knowledge": off["knowledge"].as_array().map(|v| v.len()),
+            "wiki": off["wiki"].as_array().map(|v| v.len()),
+            "entities": off["entities"].as_array().map(|v| v.len()),
+        }),
+        off["scoring"],
+        off["graph"]
+    );
+    assert_eq!(
+        off["legs_disabled"],
+        serde_json::json!(ALL_RECALL_LEG_IDS.to_vec()),
+        "every leg this call did not query is named, from the registry's own ids"
+    );
+    for section in ["memories", "knowledge", "wiki", "entities"] {
+        assert_eq!(
+            off[section],
+            serde_json::json!([]),
+            "{section} must be empty with every leg off"
+        );
+    }
+    assert_eq!(off["scoring"]["candidates"], serde_json::json!(0));
+    assert_eq!(off["memory_legs"]["semantic"], serde_json::json!(0));
+    assert_eq!(off["memory_legs"]["keyword"], serde_json::json!(0));
+    assert_eq!(
+        off["memory_legs"]["top_semantic_score"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        off["graph"]["empty_reason"],
+        serde_json::json!("leg disabled")
+    );
+    assert_eq!(off["graph"]["entities"], serde_json::json!(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Both STRATEGIES still work over the toggleable legs (the existing recall
+/// assertions stay green), and with the memory semantic leg off the two strategies
+/// necessarily agree on memories — the cosine floor is that leg's own gate, and with
+/// nothing measured it cannot separate anything.
+#[tokio::test]
+async fn both_strategies_answer_over_the_toggleable_legs() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+
+    for strategy in ["aggressive", "conservative"] {
+        let body = recall_get(&http, &daemon_url, "kettle descaling", Some(strategy)).await;
+        println!(
+            "READING t5 http strategy {strategy}: knowledge={:?} fusion={}",
+            knowledge_order(&body),
+            body["scoring"]["fusion"]
+        );
+        assert_eq!(body["strategy"], serde_json::json!(strategy));
+        assert!(
+            !knowledge_order(&body).is_empty(),
+            "the knowledge legs must answer for {strategy}"
+        );
+        assert_eq!(body["legs_disabled"], serde_json::json!([]));
+    }
+
+    let mut table = all_recall_legs_on();
+    table["recall_leg_memory_semantic"] = serde_json::json!({ "enabled": false });
+    put_capabilities(&http, &daemon_url, table).await;
+    let aggressive = recall_get(&http, &daemon_url, "kettle descaling", Some("aggressive")).await;
+    let conservative =
+        recall_get(&http, &daemon_url, "kettle descaling", Some("conservative")).await;
+    assert_eq!(
+        aggressive["memories"], conservative["memories"],
+        "a floor nothing is measured against"
+    );
+    assert_eq!(
+        aggressive["legs_disabled"],
+        serde_json::json!(["recall_leg_memory_semantic"])
+    );
+    assert_eq!(aggressive["memory_legs"]["semantic"], serde_json::json!(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A NON-DEFAULT weight moves the page: at the default 2:1 the keyword-ranked chunk
+/// leads, and with a nearly-zero keyword weight the semantic-ranked chunk takes the
+/// top — the weights are the fusion's input, not decoration.
+#[tokio::test]
+async fn a_non_default_leg_weight_reorders_the_recall_page() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+
+    let default = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    let default_order = knowledge_order(&default);
+    let default_fusion = default["scoring"]["fusion"].clone();
+    println!(
+        "READING t5 http weights default: order={default_order:?} fusion={default_fusion} \
+         top_keyword_rank={:?} top_semantic_rank={:?}",
+        default["knowledge"][0]["keyword_rank"], default["knowledge"][0]["semantic_rank"]
+    );
+    assert!(default_order.len() >= 2, "{default:?}");
+
+    let mut table = all_recall_legs_on();
+    table["recall_leg_knowledge_fts"] = serde_json::json!({ "enabled": true, "weight": 0.000001 });
+    put_capabilities(&http, &daemon_url, table).await;
+    let reordered = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    println!(
+        "READING t5 http weights w_kw=1e-6: order={:?} fusion={} top_keyword_rank={:?} \
+         top_semantic_rank={:?}",
+        knowledge_order(&reordered),
+        reordered["scoring"]["fusion"],
+        reordered["knowledge"][0]["keyword_rank"],
+        reordered["knowledge"][0]["semantic_rank"]
+    );
+    let reordered_order = knowledge_order(&reordered);
+    assert_ne!(
+        default_order, reordered_order,
+        "a non-default weight must move the page, not just be stored"
+    );
+    assert_eq!(
+        reordered["legs_disabled"],
+        serde_json::json!([]),
+        "a weight change is not a toggle"
+    );
+    assert!(
+        reordered["scoring"]["fusion"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("w_keyword=0.000001"),
+        "the reported fusion must carry the weights that produced the ranking: {}",
+        reordered["scoring"]["fusion"]
+    );
+    assert_ne!(
+        default_fusion, reordered["scoring"]["fusion"],
+        "the fusion label must differ when the weights do"
+    );
+    // With a nearly-zero keyword weight the page follows the SEMANTIC leg, so the
+    // top hit is the semantic rank 0 row (which carries no keyword evidence).
+    assert_eq!(
+        reordered["knowledge"][0]["semantic_rank"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        reordered["knowledge"][0]["keyword_rank"],
+        serde_json::Value::Null
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The `query_keyword_stage` label each knowledge hit carries, in page order.
+fn keyword_stages(v: &serde_json::Value) -> Vec<String> {
+    v["knowledge"]
+        .as_array()
+        .expect("knowledge is a list")
+        .iter()
+        .filter_map(|h| h["query_keyword_stage"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// t12: the stage label distinguishes a leg that was SWITCHED OFF from one that ran
+/// and matched nothing — the whole point of the item (design §11.3).
+///
+/// Three readings, one per state the label can be in:
+/// * ENABLED and matched (`kettle descaling`) -> the construction, `"precision"`;
+/// * ENABLED and nothing matched (`zebra xylophone` is in no document) -> `"empty"`;
+/// * DISABLED -> `"disabled"`.
+/// The last two MUST differ, so a future change that collapsed them fails here.
+#[tokio::test]
+async fn a_disabled_keyword_leg_reports_disabled_not_empty() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+
+    // ENABLED, and the query matches lexically.
+    let matched = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    let matched_stages = keyword_stages(&matched);
+    // ENABLED, and the query matches NOTHING lexically: the leg RUNS and comes back
+    // empty, which is the state the label must keep saying "empty".
+    let empty = recall_get(&http, &daemon_url, "zebra xylophone", None).await;
+    let empty_stages = keyword_stages(&empty);
+
+    // DISABLED: the same no-lexical-match query, with the leg switched off.
+    let mut table = all_recall_legs_on();
+    table["recall_leg_knowledge_fts"] = serde_json::json!({ "enabled": false });
+    put_capabilities(&http, &daemon_url, table).await;
+    let disabled = recall_get(&http, &daemon_url, "zebra xylophone", None).await;
+    let disabled_stages = keyword_stages(&disabled);
+
+    println!(
+        "READING t12 stages: enabled+matched={matched_stages:?} enabled+empty={empty_stages:?} \
+         disabled={disabled_stages:?} leg_disabled={:?}",
+        disabled["legs_disabled"]
+    );
+    assert!(
+        !matched_stages.is_empty() && !empty_stages.is_empty() && !disabled_stages.is_empty(),
+        "each state must have knowledge hits to label: matched={matched:?} empty={empty:?} \
+         disabled={disabled:?}"
+    );
+    assert!(
+        matched_stages.iter().all(|s| s == "precision"),
+        "an ENABLED leg that matched reports its construction: {matched_stages:?}"
+    );
+    assert!(
+        empty_stages.iter().all(|s| s == "empty"),
+        "an ENABLED leg that ran and matched NOTHING reports \"empty\": {empty_stages:?}"
+    );
+    assert!(
+        disabled_stages.iter().all(|s| s == "disabled"),
+        "a DISABLED leg reports \"disabled\", not \"empty\": {disabled_stages:?}"
+    );
+    assert_ne!(
+        empty_stages, disabled_stages,
+        "\"you turned this off\" must be distinguishable from \"this ran and found nothing\""
+    );
+    // ... and the disabled leg contributed nothing, so the label is not the only
+    // evidence a reader has.
+    assert_eq!(
+        disabled["legs_disabled"],
+        serde_json::json!(["recall_leg_knowledge_fts"])
+    );
+    for hit in disabled["knowledge"].as_array().unwrap() {
+        assert_eq!(hit["legs"], serde_json::json!(["semantic"]), "{hit:?}");
+        assert!(hit["keyword_rank"].is_null(), "{hit:?}");
+        assert!(hit["keyword_score"].is_null(), "{hit:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

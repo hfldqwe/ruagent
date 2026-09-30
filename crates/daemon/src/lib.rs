@@ -4,9 +4,12 @@
 //! ids → recover interrupted runs → serve the API.
 
 pub mod api;
+pub mod capability;
 pub mod chat;
 pub mod config;
 pub mod distill;
+pub mod extract_plane;
+pub mod knowledge_graph;
 pub mod mcphealth;
 pub mod memembed;
 pub mod orphans;
@@ -222,31 +225,6 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
     // sources of truth.
     let knowledge = std::sync::Arc::new(knowledge);
 
-    // Knowledge markdown sync (design-study memsearch/EverOS): the
-    // `.md` files under <root>/knowledge are the source of truth, the
-    // SQLite+LanceDB index a derived shadow. This scan — boot + every
-    // 60s, SHA-256-incremental — picks up out-of-band edits (editor,
-    // git checkout) and deletions, and reindexes what changed.
-    {
-        let kb_scanner = knowledge.clone();
-        tokio::spawn(async move {
-            loop {
-                match kb_scanner.scan().await {
-                    Ok(report) if report.changed() > 0 => tracing::info!(
-                        indexed = report.indexed,
-                        unchanged = report.unchanged,
-                        removed = report.removed,
-                        errors = report.errors,
-                        "knowledge scan"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "knowledge scan failed"),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            }
-        });
-    }
-
     // Chats (terminal-like sessions) share the permission inbox with runs:
     // every chat ask parks in the same inbox (rules → human), keyed by the
     // chat id.
@@ -269,6 +247,49 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
             enabled: agents_cards.iter().filter(|c| c.enabled).cloned().collect(),
         },
     );
+
+    // t8: THE LIVE-PLANE INSTALL. The registry is assembled ONCE, from the
+    // config `DaemonConfig::load` already validated (an unknown id, an
+    // undeclared option key or an out-of-range value fails the boot there,
+    // naming what was refused), and handed to BOTH managers as one shared
+    // handle. Three consequences, and each is a requirement of this increment:
+    //   * a `[capabilities]` table in policy.toml takes effect AT BOOT — before
+    //     this line the live plane was `legacy()`, so the file had no effect
+    //     until someone happened to PUT;
+    //   * `PUT /api/v1/capabilities` writes through this Arc, so a toggle is
+    //     seen by the chat prompt path, the run prompt path, the 60 s knowledge
+    //     sweep and the recall/ingest/distill routes at once, with no restart;
+    //   * no consumer re-reads policy.toml or invents a default of its own.
+    chats.set_capabilities(config.capabilities.clone());
+    mgr.set_capabilities(chats.capabilities_handle());
+
+    {
+        let kb_scanner = knowledge.clone();
+        // t4: the KB → graph sweep rides THIS loop (design §13.1) — no new
+        // background job. The plane is read from the shared handle on every pass,
+        // so turning `knowledge_ingest_graph` on or off takes effect at the next
+        // scan without a restart; with it off (the default) the sweep is a no-op
+        // that touches neither the graph nor the ledger.
+        let caps = chats.capabilities_handle();
+        let db_for_ingest = db.clone();
+        tokio::spawn(async move {
+            loop {
+                match kb_scanner.scan().await {
+                    Ok(report) if report.changed() > 0 => tracing::info!(
+                        indexed = report.indexed,
+                        unchanged = report.unchanged,
+                        removed = report.removed,
+                        errors = report.errors,
+                        "knowledge scan"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "knowledge scan failed"),
+                }
+                knowledge_graph::sweep_if_enabled(&db_for_ingest, &kb_scanner, &caps).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
 
     // Chat asks die with the chat (issue #40): closing a chat drops its
     // parked asks — the agent side fails closed and the inbox stays clean.

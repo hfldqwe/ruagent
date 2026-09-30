@@ -31,6 +31,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0023_recall_telemetry.sql"),
     include_str!("migrations/0024_distill_attempts.sql"),
     include_str!("migrations/0025_query_eval_gold_unique.sql"),
+    include_str!("migrations/0026_capability_ingest.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.

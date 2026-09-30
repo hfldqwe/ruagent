@@ -129,6 +129,36 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   tests, expected duration), keep it **time-boxed**, and report the **window start/end plus the
   restored-green reading**. A control that is *not* announced is indistinguishable, to every other
   member, from the bug it is meant to catch.
+- **An isolated `git worktree` build gets its OWN `CARGO_TARGET_DIR`** (t19, from the increment-2
+  verification). A worktree at HEAD carries **pre-change sources**, so a build that shares the main
+  target dir (`D:\rust_cache`) leaves artifacts that contradict the main tree -- and that is how
+  this phantom was made, not a theory: the worktree baseline builds of this effort are the likely
+  origin. The symptom is a binary build failing on symbols the source plainly declares: `cargo rustc
+  -p ruagent --bin ruagent -o <private path>` failed with **7 bogus errors** --
+  `cannot find type CapabilityFile in crate ruagent_policy`
+  (`crates/daemon/src/capability.rs`), `struct PolicyConfig has no field named capabilities` --
+  **immediately after a GREEN `cargo clippy`**, because the stale `libruagent_policy-*.rlib` in the
+  shared dir had been built from the other tree. Read that as an artifact problem, not a source
+  regression: it is the same class as the two surprises this effort already hit -- a compiled
+  `ruagent-store` reporting `MIGRATIONS=25` while the source declared 26, and a compiled
+  `ruagent-mcp` listing 14 tools while the source declared 18. **The shared target dir is the
+  leading explanation for all three**, so clean and rebuild before believing a red, a missing symbol
+  or a surprising count.
+  * Remedy: `cargo clean -p <package>` (for the policy case above, `ruagent-policy`), or `-p` over
+    the workspace packages when several are suspect; measured ~1m24s, after which the same
+    `cargo rustc ... -o <private path>` succeeds. `cargo build -p ruagent --bin ruagent` compiles
+    the same units and can hit the same artifact; it also cannot replace
+    `D:\rust_cache\debug\ruagent.exe` while a resident daemon holds that image open (`failed to
+    remove file ... os error 5`), which is why `-o <private path>` is the shape to use on this
+    machine.
+  * Rule: `$env:CARGO_TARGET_DIR='D:\rust_cache_wt\<name>'` for every worktree build. Never point a
+    worktree build at the shared dir.
+  * A FRESH target dir also loses the cached build script that was finding `protoc`: the
+    prerequisite above assumes the shared dir. Set it explicitly
+    (`$env:PROTOC="$env:USERPROFILE\.protoc\bin\protoc.exe"` -- on this machine
+    `C:\Users\19410\.protoc\bin\protoc.exe` -- or that `bin` on `PATH`), or the cold build dies on
+    prost-build's `Could not find protoc` message. Measured: a cold baseline build of the daemon
+    binary in its own target dir, dependencies from scratch, took **9m03s**.
 - **Binding is loopback by default** (t76). `ruagent serve` binds `127.0.0.1:8787` unless
   `--addr` says otherwise; a non-loopback address additionally requires **explicit consent**
   (`--allow-remote`, or `RUAGENT_ALLOW_REMOTE=1|true|TRUE|yes`), and without it startup fails

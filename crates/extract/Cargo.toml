@@ -1,0 +1,16 @@
+[package]
+name = "ruagent-extract"
+description = "Zero-token deterministic extraction: session transcripts -> memory candidates, knowledge documents -> entity/relation candidates (pure, no I/O, no model)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# There is deliberately no dependencies table: purity is this crate's defining
+# property (docs/plans/capability-plugins-design.md §7.2). No runtime, no HTTP
+# client, no database, no internal ruagent crate — only the dev-dependency below.
+# `tests/bounded.rs` asserts this mechanically by scanning this file and every
+# source file.
+[dev-dependencies]
+serde_json = "1"

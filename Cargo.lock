@@ -6348,6 +6348,7 @@ dependencies = [
  "rfd",
  "ruagent-acp",
  "ruagent-core",
+ "ruagent-extract",
  "ruagent-graph",
  "ruagent-knowledge",
  "ruagent-mcp",
@@ -6369,6 +6370,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "ruagent-extract"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

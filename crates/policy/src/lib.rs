@@ -141,6 +141,41 @@ pub struct PolicyConfig {
     pub distill: DistillConfig,
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
+    /// `[capabilities]`: `None` = the table is ABSENT (legacy mode — every
+    /// gate passes through, so the default configuration behaves exactly as
+    /// it did before the plane existed). `Some({})` = present and empty
+    /// (every registry default applies, which switches the llm tier off).
+    /// The `Option` is what keeps "absent" distinguishable from "present but
+    /// empty" — a `BTreeMap` with `#[serde(default)]` cannot. The ids and
+    /// option keys are validated by the daemon's registry
+    /// (`ruagent_daemon::capability`), which owns the closed set.
+    #[serde(default)]
+    pub capabilities: Option<std::collections::BTreeMap<String, CapabilityFile>>,
+}
+
+/// `[capabilities.<id>]` — the typed option set of ONE capability
+/// (docs/plans/capability-plugins-design.md §5.1).
+///
+/// An unknown KEY inside the table is refused here by serde
+/// (`deny_unknown_fields`), which names the key it refused. An unknown ID
+/// (the table name itself) cannot be refused by this crate — the key is a
+/// free-form string — so the registry refuses it and lists the known ids.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityFile {
+    /// Explicit on/off. `None` = "no key in the file" = the registry default
+    /// for this capability, which is a DIFFERENT state from `Some(false)`.
+    pub enabled: Option<bool>,
+    /// RRF weight of a recall leg (finite, 0.0..=100.0).
+    pub weight: Option<f64>,
+    /// Cosine floor override for a semantic recall leg (finite, 0.0..=1.0).
+    pub min_score: Option<f64>,
+    /// Cap on extracted candidates per input (1..=10_000).
+    pub max_per_input: Option<u32>,
+    /// Confidence floor of a deterministic extractor (finite, 0.0..=1.0).
+    pub min_confidence: Option<f64>,
+    /// Cap on documents per ingestion sweep (1..=1000).
+    pub max_docs_per_pass: Option<u32>,
 }
 
 /// `[concurrency]` — per-harness run gates (design §8.3).
@@ -410,5 +445,44 @@ action = "explode"
         let config = PolicyConfig::parse("[distill]\nauto = true\nmode = \"rules\"\n").unwrap();
         assert!(config.distill.auto);
         assert_eq!(config.distill.graph, None);
+    }
+
+    #[test]
+    fn capabilities_absent_empty_and_present_are_three_states() {
+        // The Option is the whole mechanism (design
+        // docs/plans/capability-plugins-design.md §5.1): "absent" is legacy
+        // mode, "present but empty" means every registry default applies, and a
+        // BTreeMap with serde(default) could not tell them apart.
+        let absent = PolicyConfig::parse("[permissions]\ndefault = \"ask\"\n").unwrap();
+        assert!(absent.capabilities.is_none(), "absent = legacy mode");
+        let empty = PolicyConfig::parse("[capabilities]\n").unwrap();
+        assert_eq!(
+            empty.capabilities.as_ref().map(|m| m.len()),
+            Some(0),
+            "present and empty"
+        );
+        let one = PolicyConfig::parse(
+            "[capabilities.session_extract_rules]\nenabled = true\nmax_per_input = 8\n",
+        )
+        .unwrap();
+        let table = one.capabilities.expect("present");
+        let file = table.get("session_extract_rules").expect("the named id");
+        assert_eq!(file.enabled, Some(true));
+        assert_eq!(file.max_per_input, Some(8));
+        assert_eq!(file.weight, None, "an absent option key stays None");
+        assert_eq!(file.min_score, None);
+        assert_eq!(file.min_confidence, None);
+        assert_eq!(file.max_docs_per_pass, None);
+    }
+
+    #[test]
+    fn capability_table_refuses_an_unknown_option_key() {
+        // L3, and deliberately stricter than `[distill]` above: the capability
+        // option set is CLOSED, so a key nobody declares is a hard error rather
+        // than a silently ignored field (the key is echoed for the reader).
+        let err = PolicyConfig::parse("[capabilities.distill_session]\nweigth = 1.0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weigth"), "{err}");
     }
 }

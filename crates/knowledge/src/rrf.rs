@@ -44,6 +44,73 @@ pub fn rrf_weighted(rankings: &[(&[i64], f32)], k: u32) -> Vec<(i64, f32)> {
     out
 }
 
+/// Why a configured leg weight cannot be used (t5).
+///
+/// A typed error, not a bool: the message has to name the leg and the value,
+/// because the leg is a configuration key a user (!) typed into `policy.toml`
+/// and "invalid weight" alone does not say which one.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum WeightError {
+    #[error("leg `{leg}` has a non-finite weight ({weight})")]
+    NonFinite { leg: &'static str, weight: f32 },
+    #[error(
+        "leg `{leg}` is enabled with weight {weight}: an enabled leg must have a weight > 0 (disable the leg instead of zeroing it)"
+    )]
+    NonPositive { leg: &'static str, weight: f32 },
+}
+
+/// THE weight rule, in one place (t5), so no call site has to invent a reading.
+///
+/// The three clauses, stated because they ARE the contract:
+///
+/// 1. **A non-finite weight is always rejected** (`NaN`, `±inf`), enabled or
+///    not. `NaN` in the fusion would not merely produce a wrong number: the
+///    final `sort_by` compares fused scores, and a `NaN` makes that comparison
+///    non-transitive, so the ORDER of unrelated documents would become
+///    unspecified. `+inf` on one leg would silently erase the other.
+/// 2. **An enabled leg must weigh more than zero.** Zero and negative are
+///    rejected. This is the clause that makes the all-zero table a CONFIG
+///    ERROR: an enabled-leg set of weights summing to zero produces an empty
+///    ranking, and an empty ranking is indistinguishable from "the corpus has
+///    nothing" — the failure would read as a retrieval miss instead of as a
+///    broken configuration. Dropping a leg is what `enabled = false` is for.
+/// 3. **A disabled leg's weight is ignored and normalized to 0.0.** Disabling is
+///    the supported way to drop a leg, so a stale weight left next to
+///    `enabled = false` is not an error; it contributes exactly nothing (see
+///    [`normalized_weight`]).
+pub fn check_weights(legs: &[(&'static str, bool, f32)]) -> Result<(), WeightError> {
+    for (leg, enabled, weight) in legs {
+        if !weight.is_finite() {
+            return Err(WeightError::NonFinite {
+                leg,
+                weight: *weight,
+            });
+        }
+        if *enabled && *weight <= 0.0 {
+            return Err(WeightError::NonPositive {
+                leg,
+                weight: *weight,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The weight a DISABLED leg contributes: exactly nothing.
+///
+/// The arithmetic half of clause 3 of [`check_weights`]: a leg that is off must
+/// contribute `0.0` to the fusion whatever number the file carried, so the
+/// pipeline cannot be re-awakened by a stale weight. Non-finite values are
+/// normalized here too — this function is the last line of defence before the
+/// `sort_by`, and the config boundary is where they are REJECTED.
+pub fn normalized_weight(enabled: bool, weight: f32) -> f32 {
+    if enabled && weight.is_finite() && weight > 0.0 {
+        weight
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +198,73 @@ mod tests {
     fn empty_input() {
         assert!(rrf(&[], 60).is_empty());
         assert!(rrf(&[vec![]], 60).is_empty());
+    }
+
+    // ── t5: the weight rule ────────────────────────────────────────────────
+
+    /// Clause 2: an enabled leg at zero or below is a CONFIG ERROR, and the
+    /// error names the leg so a user who typed the key can find it.
+    ///
+    /// The all-zero case is asserted as its own reading because it is the one
+    /// that used to look like a retrieval miss rather than a misconfiguration.
+    #[test]
+    fn an_enabled_leg_at_zero_or_below_is_rejected() {
+        let zeroed = check_weights(&[("recall_leg_a", true, 0.0), ("recall_leg_b", true, 0.0)]);
+        println!("READING t5 weights: all-zero -> {zeroed:?}");
+        assert_eq!(
+            zeroed,
+            Err(WeightError::NonPositive {
+                leg: "recall_leg_a",
+                weight: 0.0
+            }),
+            "an all-zero enabled pair must be rejected, not silently empty"
+        );
+        assert_eq!(
+            check_weights(&[("recall_leg_a", true, 1.0), ("recall_leg_b", true, -2.5)]),
+            Err(WeightError::NonPositive {
+                leg: "recall_leg_b",
+                weight: -2.5
+            })
+        );
+        assert!(check_weights(&[("recall_leg_a", true, 0.001)]).is_ok());
+    }
+
+    /// Clause 1: non-finite is rejected EVEN for a leg that contributes
+    /// nothing, because `NaN` would also poison the fused sort's ordering.
+    ///
+    /// Matched structurally, not by equality: `NaN != NaN`, so an `assert_eq!` on
+    /// the error value would fail on its own fixture (caught by this suite's first
+    /// run) and would have to be written as the weaker `is_err()`.
+    #[test]
+    fn a_non_finite_weight_is_rejected_even_when_the_leg_is_off() {
+        for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let rejected = check_weights(&[("recall_leg_a", false, weight)]);
+            assert!(
+                matches!(
+                    rejected,
+                    Err(WeightError::NonFinite {
+                        leg: "recall_leg_a",
+                        ..
+                    })
+                ),
+                "{weight} must be rejected whatever the leg's state, got {rejected:?}"
+            );
+        }
+    }
+
+    /// Clause 3: a disabled leg's weight is ignored, so leaving a stale (or
+    /// nonsense) number beside `enabled = false` is legal and contributes zero.
+    #[test]
+    fn a_disabled_legs_weight_is_ignored_and_contributes_exactly_nothing() {
+        assert!(check_weights(&[("recall_leg_a", false, -3.0)]).is_ok());
+        assert_eq!(normalized_weight(false, -3.0), 0.0);
+        assert_eq!(normalized_weight(false, 7.0), 0.0);
+        assert_eq!(normalized_weight(true, 0.25), 0.25);
+        // ... and the zero the normalizer produces really is nothing: the shape
+        // of the fuse-time gate is a zero-weight ranking.
+        let a = vec![1, 2];
+        let fused = rrf_weighted(&[(&a, normalized_weight(true, 1.0))], 60);
+        assert_eq!(fused[0].0, 1);
+        assert_eq!(rrf_weighted(&[], 60), Vec::<(i64, f32)>::new());
     }
 }

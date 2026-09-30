@@ -276,6 +276,66 @@ export interface DistillPolicy {
   builtin_prompt: string;
 }
 
+/** One capability's DECLARED options, resolved. `null` = the key is not set, so
+ *  the pipeline's own argument decides (design §4.2 `CapabilityOptions`). */
+export interface CapabilityOptions {
+  weight: number | null;
+  min_score: number | null;
+  max_per_input: number | null;
+  min_confidence: number | null;
+  max_docs_per_pass: number | null;
+}
+
+/** One row of `GET /api/v1/capabilities` (design §4.4/§14.1).
+ *
+ *  `tier` is "free" (zero tokens, deterministic) or "llm" (spends model
+ *  tokens). `configured` says where the CURRENT value comes from: "legacy" (the
+ *  `[capabilities]` table does not exist — today's behaviour), "default" (the
+ *  table exists but has no key for this id) or "file" (the key is in
+ *  policy.toml). `new` marks a capability introduced with the plane. */
+export interface CapabilityRow {
+  id: string;
+  tier: string;
+  description: string;
+  /** What this capability gates, as one human phrase from the daemon. */
+  gates: string;
+  default_enabled: boolean;
+  enabled: boolean;
+  configured: string;
+  new: boolean;
+  options: CapabilityOptions;
+}
+
+/** Work today's flags ask for that the current `[capabilities]` table
+ *  suppresses — empty when nothing is being narrowed. */
+export interface CapabilityConflict {
+  id: string;
+  legacy_key: string;
+  reason: string;
+}
+
+/** The `GET`/`PUT /api/v1/capabilities` payload. The daemon answers a `PUT`
+ *  with the same shape as a `GET`, so a client can re-render from its own
+ *  response instead of re-reading. */
+export interface CapabilitiesResponse {
+  table_present: boolean;
+  config_file: string;
+  capabilities: CapabilityRow[];
+  conflicts: CapabilityConflict[];
+}
+
+/** One `[capabilities.<id>]` table of a `PUT` body. The map REPLACES the whole
+ *  table, so every row the file already configures must be re-emitted with its
+ *  options (see `capabilitiesBody` in views/Settings.tsx). */
+export interface CapabilityFileEntry {
+  enabled?: boolean;
+  weight?: number;
+  min_score?: number;
+  max_per_input?: number;
+  min_confidence?: number;
+  max_docs_per_pass?: number;
+}
+
 export interface MemoryRow {
   id: number;
   store: string;
@@ -678,6 +738,35 @@ async function getChecked<T>(
   return expectShape<T>(path, await get<unknown>(path), spec, element);
 }
 
+/** `/api/v1/capabilities` answers the SAME payload to GET and PUT (design
+ *  §14.1/§14.2), so both wrappers assert one shape. Every field the settings
+ *  card reads is asserted: `tier`/`configured` are the strings it branches on,
+ *  the four booleans are checked as "present" (the shape kinds have no boolean)
+ *  and `options` is the object it renders and round-trips. A malformed 200 has
+ *  to reach the card's error state instead of blanking it (t265). */
+const capabilitiesShape = (data: unknown): CapabilitiesResponse =>
+  expectShape<CapabilitiesResponse>(
+    "/api/v1/capabilities",
+    data,
+    {
+      table_present: "present",
+      config_file: "string",
+      capabilities: "arrayOfObjects",
+      conflicts: "array",
+    },
+    {
+      id: "string",
+      tier: "string",
+      description: "string",
+      configured: "string",
+      gates: "present",
+      enabled: "present",
+      default_enabled: "present",
+      new: "present",
+      options: "present",
+    },
+  );
+
 async function send(method: string, path: string, body?: unknown): Promise<Response> {
   const resp = await fetch(`${BASE}${path}`, {
     method,
@@ -807,6 +896,20 @@ export const api = {
     language: string;
     prompt: string;
   }) => send("PUT", "/api/v1/distill", body),
+
+  // capabilities — the capability plane ([capabilities] of policy.toml)
+  /** Every capability with its tier, current/default state and resolved
+   *  options, plus what this configuration is narrowing (design §14.1). */
+  capabilities: () => get<unknown>("/api/v1/capabilities").then(capabilitiesShape),
+  /** REPLACE the whole `[capabilities]` table (design §14.2). The map is the
+   *  whole table, not a patch: an id left out goes back to its registry
+   *  default, and an EMPTY map removes the table (legacy mode). Enabling an
+   *  llm-tier capability from off needs `confirm_cost: true` or the daemon
+   *  answers 409 and writes nothing. */
+  setCapabilities: (body: { confirm_cost: boolean; capabilities: Record<string, CapabilityFileEntry> }) =>
+    put("/api/v1/capabilities", body)
+      .then((r) => r.json())
+      .then(capabilitiesShape),
   /** t265: `store` is optional so the t251 shape (memory/list without a store,
    *  every store at once) can be asked for without a second wrapper; the
    *  namespace stays required because the endpoint keys on it. */

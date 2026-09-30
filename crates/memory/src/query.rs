@@ -161,6 +161,17 @@ pub async fn search_fts(db: &Db, query: &str, limit: u32) -> Result<Vec<MemoryRo
 /// array was a concatenation, not a ranking. A leg that reports its own score
 /// can be fused on one scale and inspected afterwards.
 ///
+/// WHY THE SCORE COLUMN IS READ BY NAME (t16 — this was a live defect): the
+/// row closure used to read it as `r.get::<_, f64>(10)`, and index 10 of this
+/// SELECT is `source_episode`, not the score — `bm25(memories_fts)` is index
+/// 11. So the leg reported an EPISODE ID as its relevance score on every
+/// platform-written row (where `source_episode` is non-NULL), and failed
+/// outright on a row where that column was NULL (`Invalid column type Null at
+/// index: 10`, which the recall caller swallowed into an empty leg). The column
+/// is now aliased and read by NAME, like every other column `row_to_memory`
+/// reads: an index that was wrong once can be wrong again, a name cannot
+/// silently point at the column beside it.
+///
 /// Takes RAW text for the same reason as `search_fts` (t73 / F3); a caller that
 /// already built a phrase (the recall path) is unaffected because
 /// `fts_pattern` is idempotent.
@@ -175,7 +186,7 @@ pub async fn search_fts_scored(
             let mut stmt = conn.prepare(
                 "SELECT m.id, m.store, m.namespace, m.content, m.confidence, m.supersedes,
                     m.superseded_at, m.deleted_at, m.created_at, m.updated_at, m.source_episode,
-                    bm25(memories_fts)
+                    bm25(memories_fts) AS bm25
              FROM memories_fts f
              JOIN memories m ON m.id = f.rowid
              WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL AND m.deleted_at IS NULL
@@ -183,7 +194,7 @@ pub async fn search_fts_scored(
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![query, limit], |r| {
-                    Ok((row_to_memory(r)?, r.get::<_, f64>(10)?))
+                    Ok((row_to_memory(r)?, r.get::<_, f64>("bm25")?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)

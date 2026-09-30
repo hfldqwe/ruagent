@@ -14,6 +14,7 @@ rust-version = "1.95"
 ruagent-core = { path = "crates/core" }
 ruagent-acp = { path = "crates/acp" }
 ruagent-daemon = { path = "crates/daemon" }
+ruagent-extract = { path = "crates/extract" }
 ruagent-graph = { path = "crates/graph" }
 ruagent-knowledge = { path = "crates/knowledge" }
 ruagent-memory = { path = "crates/memory" }

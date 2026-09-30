@@ -75,7 +75,8 @@ async fn punch(db: &Db, sql: &str) {
 }
 
 /// The S1 acceptance reading: with the HIGHEST version row gone the ledger is
-/// still contiguous (1..24), so a boot must re-apply migration 25 and succeed.
+/// still contiguous (1..=SCHEMA_VERSION - 1, i.e. 1..=25 while the highest
+/// migration is 26), so a boot must re-apply that highest migration and succeed.
 /// Before t98 this was the case that left the daemon unable to start at all
 /// (`index ux_query_eval_gold_set_query already exists`).
 #[tokio::test]

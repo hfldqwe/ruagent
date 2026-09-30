@@ -17,6 +17,13 @@ pub struct DaemonConfig {
     pub mcp: McpConfig,
     pub policy: PolicyConfig,
     pub routing: RoutingFile,
+    /// The capability plane as the FILE defines it (design
+    /// docs/plans/capability-plugins-design.md §4.5). `load` is the only place
+    /// that turns an unknown id, an undeclared option key or an out-of-range
+    /// value into a boot failure, and the only place that warns when the
+    /// configuration narrows unattended distillation. The LIVE value lives on
+    /// `ChatManager` (one shared handle); boot installs this value into it.
+    pub capabilities: crate::capability::CapabilityPlane,
 }
 
 impl DaemonConfig {
@@ -64,12 +71,29 @@ impl DaemonConfig {
         let routing =
             parse_routing(&routing_text).with_context(|| format!("parsing {routing_path:?}"))?;
 
+        // The capability plane (L3: a name nobody recognises is a hard error
+        // here, never a silent default). An absent `[capabilities]` table is
+        // legacy mode, which is what the shipped policy.toml has.
+        let capabilities = crate::capability::CapabilityPlane::from_policy(&policy)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("parsing [capabilities] in {}", policy_path.display()))?;
+        if policy.distill.auto
+            && !capabilities.gate(crate::capability::CapabilityId::DistillSession, true)
+        {
+            tracing::warn!(
+                "capability `distill_session` is off while [distill].auto = true: unattended \
+                 distillation will not run. Add [capabilities.distill_session] enabled = true to \
+                 restore it (docs/plans/capability-plugins-design.md §5.4)."
+            );
+        }
+
         Ok(Self {
             root,
             agents,
             mcp,
             policy,
             routing,
+            capabilities,
         })
     }
 
@@ -603,6 +627,29 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 #                        # the transcript is still appended by the daemon)
 # graph = false          # memories only — skip entity/relation extraction
 #                        # (default true: memories + graph)
+#
+# Capability plane (docs/plans/capability-plugins-design.md).
+# ABSENT [capabilities] table = today's behaviour, every gate passes through.
+# The moment the table EXISTS, the registry defaults apply: llm-tier
+# capabilities default OFF (they cost model tokens), free-tier new ones too.
+# Unknown capability ids and unknown option keys are startup errors.
+#
+# [capabilities.session_extract_rules]
+# enabled = true                  # zero-token transcript -> memory candidates
+# max_per_input = 32
+#
+# [capabilities.knowledge_ingest_graph]
+# enabled = true                  # knowledge base -> knowledge graph, zero tokens
+# max_per_input = 96              # candidates per document
+# max_docs_per_pass = 20          # documents per sweep (rides the 60s scan)
+#
+# [capabilities.distill_session]
+# enabled = true                  # unattended ACP extraction on session close
+#
+# [capabilities.recall_leg_wiki]
+# enabled = false                 # switch one recall leg off
+# [capabilities.recall_leg_memory_semantic]
+# weight = 1.0                    # today's value; raise to prefer the leg
 # First matching rule wins; `default` applies otherwise. Actions:
 #   allow  — auto-select the first allow option
 #   reject — auto-select the first reject option
@@ -699,6 +746,192 @@ agent = \"dsh\"
     }
 
     use super::*;
+
+    #[test]
+    fn capabilities_editor_round_trips_preserving_comments() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruagent-cap-edit-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(
+            &path,
+            "# top comment
+[permissions]
+default = \"ask\"
+
+# distillation
+[distill]
+auto = true
+
+# the wiki leg is off
+[capabilities.recall_leg_wiki]
+enabled = false
+",
+        )
+        .unwrap();
+        // Replace the table with a DIFFERENT set: wiki leaves it, the graph leg
+        // joins it and the memory semantic leg gains options.
+        let mut next: BTreeMap<String, ruagent_policy::CapabilityFile> = BTreeMap::new();
+        next.insert(
+            "recall_leg_graph".into(),
+            ruagent_policy::CapabilityFile {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        next.insert(
+            "recall_leg_memory_semantic".into(),
+            ruagent_policy::CapabilityFile {
+                weight: Some(1.5),
+                min_score: Some(0.25),
+                ..Default::default()
+            },
+        );
+        CapabilitiesEditor::new(&path).update(&next).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        // Comments, ordering and other sections survive.
+        assert!(out.contains("# top comment"), "{out}");
+        assert!(out.contains("[permissions]"), "{out}");
+        assert!(out.contains("# distillation"), "{out}");
+        assert!(out.contains("auto = true"), "{out}");
+        assert!(
+            !out.contains("recall_leg_wiki"),
+            "the replaced table is gone: {out}"
+        );
+        assert!(out.contains("[capabilities.recall_leg_graph]"), "{out}");
+        assert!(out.contains("weight = 1.5"), "{out}");
+        assert!(out.contains("min_score = 0.25"), "{out}");
+        // ...and the result reparses into the plane it describes.
+        let policy = PolicyConfig::parse(&out).unwrap();
+        let plane = crate::capability::CapabilityPlane::from_policy(&policy).unwrap();
+        assert!(plane.table_present());
+        assert!(
+            !plane.gate(crate::capability::CapabilityId::RecallLegGraph, true),
+            "the graph leg the file names is off"
+        );
+        assert_eq!(
+            plane
+                .options(crate::capability::CapabilityId::RecallLegMemorySemantic)
+                .weight,
+            Some(1.5)
+        );
+        assert_eq!(
+            plane.configured(crate::capability::CapabilityId::RecallLegWiki),
+            "default",
+            "the id the replacement dropped is back at its registry default"
+        );
+        // A key set back to None is REMOVED, not written empty.
+        let mut fewer: BTreeMap<String, ruagent_policy::CapabilityFile> = BTreeMap::new();
+        fewer.insert(
+            "recall_leg_memory_semantic".into(),
+            ruagent_policy::CapabilityFile {
+                weight: Some(1.5),
+                ..Default::default()
+            },
+        );
+        CapabilitiesEditor::new(&path).update(&fewer).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("min_score"), "{out}");
+        assert!(!out.contains("recall_leg_graph"), "{out}");
+        let policy = PolicyConfig::parse(&out).unwrap();
+        let plane = crate::capability::CapabilityPlane::from_policy(&policy).unwrap();
+        let semantic = plane.options(crate::capability::CapabilityId::RecallLegMemorySemantic);
+        assert_eq!(semantic.weight, Some(1.5), "the kept key stays");
+        assert_eq!(semantic.min_score, None, "the removed key is really gone");
+        assert!(
+            plane.gate(crate::capability::CapabilityId::RecallLegGraph, true),
+            "an id the file no longer names is back at its registry default"
+        );
+        // An EMPTY map removes the table entirely: back to legacy mode (L1).
+        CapabilitiesEditor::new(&path)
+            .update(&BTreeMap::new())
+            .unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("[capabilities"), "{out}");
+        assert!(
+            out.contains("# top comment"),
+            "the rest of the file survives"
+        );
+        let policy = PolicyConfig::parse(&out).unwrap();
+        assert!(
+            !crate::capability::CapabilityPlane::from_policy(&policy)
+                .unwrap()
+                .table_present()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_policy_toml_ships_capabilities_commented_out() {
+        // The one failure mode this increment cannot ship with: an uncommented
+        // (even empty) `[capabilities]` header is a PRESENT table, and its
+        // registry defaults switch the llm tier off.
+        assert!(
+            !DEFAULT_POLICY_TOML
+                .lines()
+                .any(|l| l.trim_start().starts_with("[capabilities")),
+            "the shipped policy.toml must not carry an active [capabilities] table"
+        );
+        let policy = PolicyConfig::parse(DEFAULT_POLICY_TOML).unwrap();
+        assert!(policy.capabilities.is_none(), "absent table = legacy mode");
+        assert!(
+            !crate::capability::CapabilityPlane::from_policy(&policy)
+                .unwrap()
+                .table_present()
+        );
+        // The block that documents the plane is still there for a reader.
+        assert!(DEFAULT_POLICY_TOML.contains("# [capabilities.session_extract_rules]"));
+    }
+
+    #[test]
+    fn fresh_root_is_legacy_mode() {
+        let dir = std::env::temp_dir().join(format!("ruagent-cfg-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = DaemonConfig::load(&dir).unwrap();
+        assert!(
+            !cfg.capabilities.table_present(),
+            "a fresh root is legacy mode: every gate answers with today's behaviour (L1)"
+        );
+        assert!(
+            cfg.capabilities
+                .gate(crate::capability::CapabilityId::MemoryInjectChat, true)
+        );
+        assert!(
+            !cfg.capabilities
+                .gate(crate::capability::CapabilityId::MemoryInjectChat, false),
+            "and a legacy mode gate can only narrow, never create work (L2)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_capability_id_fails_the_load() {
+        // L3: a typo in a table name is a boot failure that names it, never a
+        // silently ignored section.
+        let dir = std::env::temp_dir().join(format!("ruagent-cfg-badcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("policy.toml"),
+            "[capabilities.session_extract_rule]\nenabled = true\n",
+        )
+        .unwrap();
+        let err = DaemonConfig::load(&dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("session_extract_rule"), "{msg}");
+        assert!(
+            msg.contains("session_extract_rules"),
+            "lists the known ids: {msg}"
+        );
+        assert!(msg.contains("policy.toml"), "names the file it read: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn default_agents_parse() {
@@ -814,10 +1047,101 @@ impl DistillEditor {
     }
 }
 
+/// Round-trip editor for the `[capabilities]` table of `policy.toml` — the
+/// same discipline as [`DistillEditor`] (toml_edit keeps comments, key order
+/// and every other section; temp file + rename is atomic; the mutex serialises
+/// interleaved writers), applied to the capability plane.
+///
+/// It deliberately does NOT validate ids, keys or ranges: validation belongs to
+/// `CapabilityPlane::from_policy`, which the `PUT` handler calls BEFORE this
+/// write, so a refused update leaves the file untouched (design §5.3).
+pub struct CapabilitiesEditor {
+    path: PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+impl CapabilitiesEditor {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// REPLACE the whole `[capabilities]` table with `entries`.
+    ///
+    /// * an entry whose table is empty writes `[capabilities.<id>]` with no
+    ///   keys (legal: every declared default applies);
+    /// * every key set to `None` is REMOVED from that table, not written empty
+    ///   (the `set_or_remove` rule);
+    /// * an EMPTY map REMOVES the `[capabilities]` table entirely, which is
+    ///   what returns the daemon to legacy mode (L1).
+    pub fn update(&self, entries: &BTreeMap<String, ruagent_policy::CapabilityFile>) -> Result<()> {
+        let _guard = self.lock.lock().expect("capabilities editor lock");
+        let text = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parsing {}", self.path.display()))?;
+        if entries.is_empty() {
+            doc.remove("capabilities");
+        } else {
+            doc["capabilities"] = toml_edit::Item::Table(toml_edit::Table::new());
+            let root = doc["capabilities"]
+                .as_table_mut()
+                .context("[capabilities] is not a table")?;
+            for (id, file) in entries {
+                if !root.contains_key(id) {
+                    root[id] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                let tbl = root[id]
+                    .as_table_mut()
+                    .with_context(|| format!("[capabilities.{id}] is not a table"))?;
+                set_or_remove_bool(tbl, "enabled", file.enabled);
+                set_or_remove_f64(tbl, "weight", file.weight);
+                set_or_remove_f64(tbl, "min_score", file.min_score);
+                set_or_remove_u32(tbl, "max_per_input", file.max_per_input);
+                set_or_remove_f64(tbl, "min_confidence", file.min_confidence);
+                set_or_remove_u32(tbl, "max_docs_per_pass", file.max_docs_per_pass);
+            }
+        }
+        let tmp = self.path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("renaming into {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
 fn set_or_remove(tbl: &mut toml_edit::Table, key: &str, v: &Option<String>) {
     match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
             tbl[key] = toml_edit::value(s);
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
+}
+
+/// The numeric twin of [`set_or_remove_bool`] for an `f64` option key.
+fn set_or_remove_f64(tbl: &mut toml_edit::Table, key: &str, v: Option<f64>) {
+    match v {
+        Some(v) => {
+            tbl[key] = toml_edit::value(v);
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
+}
+
+/// The numeric twin of [`set_or_remove_bool`] for a `u32` option key.
+fn set_or_remove_u32(tbl: &mut toml_edit::Table, key: &str, v: Option<u32>) {
+    match v {
+        Some(v) => {
+            tbl[key] = toml_edit::value(i64::from(v));
         }
         None => {
             tbl.remove(key);

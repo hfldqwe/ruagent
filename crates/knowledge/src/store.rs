@@ -14,7 +14,7 @@ use ruagent_store::Db;
 
 use crate::chunk::chunk_sections;
 use crate::embed::{EmbedError, Embedder, HashEmbedder};
-use crate::rrf::rrf_weighted;
+use crate::rrf::{WeightError, check_weights, normalized_weight, rrf_weighted};
 
 pub(crate) const TABLE: &str = "knowledge_chunks";
 
@@ -176,6 +176,157 @@ pub const FUSION: FusionKind = FusionKind::Rrf {
     w_semantic: 2.0,
     w_keyword: 1.0,
 };
+
+/// Which knowledge legs to run, and with what RRF weight (t5).
+///
+/// DEFAULT = TODAY EXACTLY: both legs on, weights from [`FUSION`] (2.0 : 1.0) and
+/// the same `k = 60`. [`LegConfig::default()`] is what the pre-t5 entry points
+/// (`search`, `search_legs`, `search_page`) delegate with, so their rankings
+/// cannot move: `fuse_with(x, default) == fuse(x)` is asserted by a test.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegConfig {
+    /// The LanceDB ANN leg -- it also owns the query EMBEDDING (see
+    /// [`Knowledge::compute_legs_with`] for why that makes it the expensive one).
+    pub semantic: bool,
+    /// The three-stage FTS/LIKE keyword leg.
+    pub keyword: bool,
+    /// Relative weight in the fusion. Only [`normalized_weight`]'s reading of an
+    /// ENABLED leg's weight is ever used; a disabled leg contributes 0.0.
+    pub w_semantic: f32,
+    pub w_keyword: f32,
+}
+
+/// The knowledge crate's own two retrieval legs, as TYPES.
+///
+/// DELIBERATELY NOT STRINGS (t5 convergence, captain's review handoff): this crate
+/// sits BELOW the daemon and cannot see `crate::capability`, so the registry's
+/// capability ids (`recall_leg_knowledge_semantic` / `recall_leg_knowledge_fts`)
+/// stay owned by the plane — `CapabilityId::as_str()` is the single source, and the
+/// daemon maps these variants onto it when it builds the wire answer. A second
+/// hardcoded copy of the ids here would be a shadow list that no test in this crate
+/// could keep honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KnowledgeLeg {
+    /// The LanceDB ANN leg (it also owns the query embedding).
+    Semantic,
+    /// The three-stage FTS/LIKE keyword leg.
+    Keyword,
+}
+
+impl KnowledgeLeg {
+    /// A HUMAN label for an error message or a log line — NOT a capability id and
+    /// not a wire value (see the type's note on why the ids live elsewhere).
+    pub const fn label(self) -> &'static str {
+        match self {
+            KnowledgeLeg::Semantic => "knowledge semantic",
+            KnowledgeLeg::Keyword => "knowledge keyword",
+        }
+    }
+}
+
+impl Default for LegConfig {
+    fn default() -> Self {
+        let (_, w_semantic, w_keyword) = FUSION.weights();
+        Self {
+            semantic: true,
+            keyword: true,
+            w_semantic,
+            w_keyword,
+        }
+    }
+}
+
+impl LegConfig {
+    /// Every leg OFF. Legal (the endpoint returns empty sections and says why),
+    /// and it must never be an error — "the configuration asked for nothing" is a
+    /// reading, not a failure (design §11.3).
+    pub fn all_off() -> Self {
+        Self {
+            semantic: false,
+            keyword: false,
+            w_semantic: 0.0,
+            w_keyword: 0.0,
+        }
+    }
+
+    /// THE ONE RESOLVER: `(enabled, configured weight)` per leg -> a usable
+    /// configuration. `None` takes this leg's default ([`FUSION`]'s weight) —
+    /// never zero, which would silently drop an enabled leg.
+    ///
+    /// The result is validated AND normalized, so a caller cannot hold a config
+    /// whose disabled half still carries a weight: there is no second place to
+    /// remember the rule.
+    pub fn resolve(
+        semantic: (bool, Option<f64>),
+        keyword: (bool, Option<f64>),
+    ) -> Result<Self, WeightError> {
+        let (_, d_semantic, d_keyword) = FUSION.weights();
+        let cfg = Self {
+            semantic: semantic.0,
+            keyword: keyword.0,
+            // `as f32` is checked, not trusted: a value too large for f32 becomes
+            // infinite and `validate` rejects it (clause 1).
+            w_semantic: semantic.1.map_or(d_semantic, |w| w as f32),
+            w_keyword: keyword.1.map_or(d_keyword, |w| w as f32),
+        };
+        cfg.validate()?;
+        Ok(cfg.normalized())
+    }
+
+    /// The weight rule of [`check_weights`] over this configuration.
+    pub fn validate(&self) -> Result<(), WeightError> {
+        check_weights(&[
+            (
+                KnowledgeLeg::Semantic.label(),
+                self.semantic,
+                self.w_semantic,
+            ),
+            (KnowledgeLeg::Keyword.label(), self.keyword, self.w_keyword),
+        ])
+    }
+
+    /// Zero every disabled leg's weight. Total (never fails) — the algebraic half
+    /// of the rule; [`LegConfig::validate`] is the rejecting half.
+    pub fn normalized(self) -> Self {
+        Self {
+            w_semantic: normalized_weight(self.semantic, self.w_semantic),
+            w_keyword: normalized_weight(self.keyword, self.w_keyword),
+            ..self
+        }
+    }
+
+    /// The legs this configuration turns OFF, in a stable order. THE ONE PLACE the
+    /// disabled-leg reading comes from: the endpoint reports exactly this list (as
+    /// capability ids, which it maps), and §11.3's per-leg response shapes follow
+    /// from it rather than from a second set of conditions.
+    pub fn disabled_legs(&self) -> Vec<KnowledgeLeg> {
+        let mut out = Vec::new();
+        if !self.semantic {
+            out.push(KnowledgeLeg::Semantic);
+        }
+        if !self.keyword {
+            out.push(KnowledgeLeg::Keyword);
+        }
+        out
+    }
+
+    pub fn all_disabled(&self) -> bool {
+        !self.semantic && !self.keyword
+    }
+
+    /// The fusion expression this configuration asks for, so the evidence a
+    /// caller receives reports the weights that PRODUCED the ranking: a row
+    /// scored under other weights is not comparable with this one (t7 / C5).
+    pub fn fusion(&self) -> FusionKind {
+        let (k, _, _) = FUSION.weights();
+        let cfg = self.normalized();
+        FusionKind::Rrf {
+            k,
+            w_semantic: cfg.w_semantic,
+            w_keyword: cfg.w_keyword,
+        }
+    }
+}
 
 /// Bump when the fusion OR the relevance calibration changes.
 ///
@@ -393,6 +544,11 @@ pub struct KnowledgeDocument {
     pub source: String,
     pub chunk_count: i64,
     pub created_at: String,
+    /// The sha256 of the markdown this revision was indexed from
+    /// (`crate::sha256_hex`, written by `index_doc`). Exposed because the
+    /// knowledge → graph ingestion ledger keys on it "is this exact text
+    /// already in the graph?"; today no other caller reads it.
+    pub content_hash: String,
 }
 
 /// The knowledge base handle. Cheap to clone.
@@ -762,38 +918,91 @@ impl Knowledge {
         query: &str,
         leg_k: usize,
     ) -> Result<(Vec<(i64, f32)>, Vec<(i64, f32)>, KeywordStage), KnowledgeError> {
+        self.compute_legs_with(query, leg_k, &LegConfig::default())
+            .await
+    }
+
+    /// [`Knowledge::compute_legs`] under an explicit leg configuration (t5).
+    ///
+    /// THE COST BOUNDARY, and the reason this function exists at all: a DISABLED
+    /// leg is never QUERIED — the gate wraps the call, not its results.
+    ///
+    /// * `semantic = false` skips the query EMBEDDING (a model forward pass on the
+    ///   fastembed path) *and* the LanceDB ANN scan. Both are paid per query, and
+    ///   neither is recoverable afterwards.
+    /// * `keyword = false` skips up to four SQL statements — two FTS5 `MATCH`es
+    ///   and, on the paths that need them, the Han-bigram probe and the `LIKE`
+    ///   fallback, which is a FULL-TABLE SCAN (`fts_like`, t7's measurement:
+    ///   6.80–10.47 ms per query).
+    ///
+    /// Filtering the legs' RESULTS afterwards would return the same answer while
+    /// paying every one of those costs, which is exactly the economy this
+    /// configuration exists to deliver (design §11.3). A leg that is off must be
+    /// free, not merely ignored.
+    async fn compute_legs_with(
+        &self,
+        query: &str,
+        leg_k: usize,
+        legs: &LegConfig,
+    ) -> Result<(Vec<(i64, f32)>, Vec<(i64, f32)>, KeywordStage), KnowledgeError> {
         // Leg 1: semantic ANN. LanceDB reports its own distance column.
-        let qvec = self.embedder.embed_query(query)?;
-        let mut ann: Vec<(i64, f32)> = Vec::new();
-        let table = self.lance.open_table(TABLE).execute().await?;
-        let batches = table
-            .query()
-            .limit(leg_k)
-            .nearest_to(qvec.clone())?
-            .execute()
-            .await?;
-        for batch in batches.try_collect::<Vec<_>>().await? {
-            let ids = batch
-                .column_by_name("id")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-            let dist = batch
-                .column_by_name("_distance")
-                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-            let Some(ids) = ids else { continue };
-            for (i, id) in ids.iter().enumerate() {
-                if let Some(id) = id {
-                    // NAN if LanceDB stops reporting the column: a caller can
-                    // test for that, where a silent 0.0 would hide it.
-                    let d = dist.map(|d| d.value(i)).unwrap_or(f32::NAN);
-                    ann.push((id, d));
+        let ann: Vec<(i64, f32)> = if legs.semantic {
+            let qvec = self.embedder.embed_query(query)?;
+            let mut ann: Vec<(i64, f32)> = Vec::new();
+            let table = self.lance.open_table(TABLE).execute().await?;
+            let batches = table
+                .query()
+                .limit(leg_k)
+                .nearest_to(qvec.clone())?
+                .execute()
+                .await?;
+            for batch in batches.try_collect::<Vec<_>>().await? {
+                let ids = batch
+                    .column_by_name("id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+                let dist = batch
+                    .column_by_name("_distance")
+                    .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+                let Some(ids) = ids else { continue };
+                for (i, id) in ids.iter().enumerate() {
+                    if let Some(id) = id {
+                        // NAN if LanceDB stops reporting the column: a caller can
+                        // test for that, where a silent 0.0 would hide it.
+                        let d = dist.map(|d| d.value(i)).unwrap_or(f32::NAN);
+                        ann.push((id, d));
+                    }
                 }
             }
-        }
+            ann
+        } else {
+            Vec::new()
+        };
 
         // Leg 2: keyword FTS, three stages (t261). The construction lives in
         // ruagent_store::fts so this crate and the graph crate cannot drift
         // apart again: t247 measured two copies of it plus a third variant.
-        let (fts, keyword_stage) = self.keyword_leg(query, leg_k).await?;
+        //
+        // A disabled leg reports `KeywordStage::Empty`, which is the producer's
+        // own state for "this leg produced nothing". Adding a `Disabled` variant
+        // would push a CONSUMER's concern (why nothing came back) into a
+        // producer's state enum with 13 use sites; the endpoint composes
+        // "disabled" from the configuration it passed (design §11.3), because
+        // only the endpoint knows a leg was switched off.
+        //
+        // WHERE, exactly (t12 — this sentence is checkable, so it must stay true):
+        // `crates/daemon/src/api.rs`'s `keyword_stage_label(stage,
+        // keyword_leg_enabled)` returns `"disabled"` whenever the label's second
+        // argument is false, and the `recall` handler passes
+        // `legs.knowledge.keyword` — the SAME config it handed to
+        // `Knowledge::search_page_with`. So for that endpoint `"empty"` means the
+        // leg ran and matched nothing, and `"disabled"` means the leg was switched
+        // off; the two are distinguishable on the wire. This crate never invents
+        // that label: it cannot see a configuration.
+        let (fts, keyword_stage) = if legs.keyword {
+            self.keyword_leg(query, leg_k).await?
+        } else {
+            (Vec::new(), KeywordStage::Empty)
+        };
         Ok((ann, fts, keyword_stage))
     }
 
@@ -940,10 +1149,38 @@ impl Knowledge {
     /// ranking a caller gets from `search()` cannot drift from the ranking
     /// `search_legs()` reports and `search_page()` annotates.
     fn fuse(&self, ann: &[(i64, f32)], fts: &[(i64, f32)]) -> Vec<(i64, f32)> {
+        self.fuse_with(ann, fts, &LegConfig::default())
+    }
+
+    /// [`Knowledge::fuse`] under an explicit leg configuration (t5).
+    ///
+    /// The weights come from the configuration instead of from the [`FUSION`]
+    /// constant, and a DISABLED leg enters the fusion with weight 0.0 (its id list
+    /// is empty anyway, so both halves of "off" are enforced here). `k` is NOT a
+    /// weight: it is the rank scale of RRF and stays [`FUSION`]'s 60 — a caller may
+    /// re-weight the evidence, never re-define the scale two scores are compared
+    /// on.
+    fn fuse_with(
+        &self,
+        ann: &[(i64, f32)],
+        fts: &[(i64, f32)],
+        legs: &LegConfig,
+    ) -> Vec<(i64, f32)> {
         let ann_ids: Vec<i64> = ann.iter().map(|(id, _)| *id).collect();
         let fts_ids: Vec<i64> = fts.iter().map(|(id, _)| *id).collect();
-        let (k, w_sem, w_kw) = FUSION.weights();
-        rrf_weighted(&[(&ann_ids, w_sem), (&fts_ids, w_kw)], k)
+        let (k, _, _) = FUSION.weights();
+        let cfg = legs.normalized();
+        // A disabled leg is dropped from the input list as well as zero-weighted:
+        // a caller that hands in a stale leg list cannot inject documents into the
+        // ranking through a leg the configuration turned off.
+        let mut inputs: Vec<(&[i64], f32)> = Vec::new();
+        if cfg.semantic {
+            inputs.push((&ann_ids, cfg.w_semantic));
+        }
+        if cfg.keyword {
+            inputs.push((&fts_ids, cfg.w_keyword));
+        }
+        rrf_weighted(&inputs, k)
     }
 
     /// Hydrate chunk ids into hits (the one place that SQL lives).
@@ -1050,8 +1287,37 @@ impl Knowledge {
     /// [`LEG_WINDOW`] — so the top of page 2 cannot differ from the top of
     /// page 1.
     pub async fn search_page(&self, query: &str, limit: u32) -> Result<SearchPage, KnowledgeError> {
-        let (ann, fts, keyword_stage) = self.compute_legs(query, LEG_WINDOW).await?;
-        let fused = self.fuse(&ann, &fts);
+        self.search_page_with(query, limit, &LegConfig::default())
+            .await
+    }
+
+    /// [`Knowledge::search_page`] under an explicit leg configuration (t5).
+    ///
+    /// Everything else is unchanged on purpose: the default configuration goes
+    /// through this same body, so the recall endpoint's page cannot differ
+    /// between "no `[capabilities]` table" and "a table with every leg enabled at
+    /// its default weight". A disabled leg shows up as
+    ///
+    /// * `evidence.semantic` / `evidence.keyword` empty,
+    /// * `RankedHit::semantic` / `RankedHit::keyword` `None` (NOT a zero — see
+    ///   [`RankedHit`]: 0.0 is a legal distance and would read as a perfect match
+    ///   on a leg that never ran), and
+    /// * `evidence.fusion` reporting the weights actually used.
+    ///
+    /// `evidence.candidates == 0` with an all-off configuration is the explicit
+    /// "nothing was asked for" reading: `LegConfig::disabled_legs()` names the
+    /// legs that were switched off (the endpoint maps those legs to the registry's
+    /// capability ids), which is what distinguishes it from "the corpus has no
+    /// match" (design §11.3).
+    pub async fn search_page_with(
+        &self,
+        query: &str,
+        limit: u32,
+        legs: &LegConfig,
+    ) -> Result<SearchPage, KnowledgeError> {
+        let legs = legs.normalized();
+        let (ann, fts, keyword_stage) = self.compute_legs_with(query, LEG_WINDOW, &legs).await?;
+        let fused = self.fuse_with(&ann, &fts, &legs);
         let top: Vec<i64> = fused
             .iter()
             .take(limit as usize)
@@ -1079,7 +1345,7 @@ impl Knowledge {
             keyword_stage,
             candidates: fused.len(),
             fused: fused.clone(),
-            fusion: FUSION,
+            fusion: legs.fusion(),
             leg_window: LEG_WINDOW,
         };
         // The relevance is a within-query display score: its background is the
@@ -1301,7 +1567,8 @@ impl Knowledge {
             .db
             .call(|conn| -> Result<Vec<KnowledgeDocument>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, name, COALESCE(source, ''), chunk_count, created_at
+                    "SELECT id, name, COALESCE(source, ''), chunk_count, created_at,
+                            COALESCE(content_hash, '')
                      FROM documents ORDER BY created_at DESC",
                 )?;
                 let rows = stmt
@@ -1312,6 +1579,7 @@ impl Knowledge {
                             source: row.get(2)?,
                             chunk_count: row.get(3)?,
                             created_at: row.get(4)?,
+                            content_hash: row.get(5)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1556,5 +1824,147 @@ mod tests {
         );
         drop(kb);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── t5: the leg configuration ──────────────────────────────────────────
+
+    /// `fuse` is exactly `fuse_with(default)`, and a configured weight really
+    /// drives the ranking rather than being stored and ignored.
+    ///
+    /// The fixture is HAND-BUILT — two ranked id lists, no corpus — because this
+    /// is the fusion's own arithmetic: with `ann = [1, 2]` and `fts = [2, 3]`,
+    /// id 3 is keyword-only (fts rank 1) and id 1 is semantic-only (ann rank 0).
+    /// At the default 2:1 the both-legs row 2 leads; at 1:10 the keyword-only row
+    /// climbs above the semantic-only one. That flip cannot happen if the weights
+    /// are constants.
+    #[tokio::test]
+    async fn the_default_fusion_is_frozen_and_a_weight_reorders_it() {
+        let root = test_root("t5-fuse");
+        let db = Db::open_in_memory().unwrap();
+        let kb = Knowledge::open(&root, db).await.unwrap();
+
+        let ann = vec![(1i64, 0.10f32), (2, 0.20)];
+        let fts = vec![(2i64, -3.0f32), (3, -1.0)];
+
+        let frozen = kb.fuse(&ann, &fts);
+        let default = kb.fuse_with(&ann, &fts, &LegConfig::default());
+        println!("READING t5 fuse: frozen={frozen:?} default={default:?}");
+        assert_eq!(
+            frozen, default,
+            "the default configuration must be bit-identical to the frozen fuse"
+        );
+        assert_eq!(
+            frozen.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+
+        let keyword_heavy = LegConfig {
+            w_semantic: 1.0,
+            w_keyword: 10.0,
+            ..LegConfig::default()
+        };
+        let reordered = kb.fuse_with(&ann, &fts, &keyword_heavy);
+        println!("READING t5 fuse: keyword_heavy(1:10)={reordered:?}");
+        assert_eq!(
+            reordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2, 3, 1],
+            "a non-default weight must move the fusion"
+        );
+
+        // A DISABLED leg contributes nothing even when a caller hands in its id
+        // list: the weight is normalized to 0 AND the list is dropped, so "off"
+        // has no way back into the ranking.
+        let semantic_off = LegConfig {
+            semantic: false,
+            ..LegConfig::default()
+        };
+        let keyword_only = kb.fuse_with(&ann, &fts, &semantic_off);
+        println!("READING t5 fuse: semantic_off={keyword_only:?}");
+        assert_eq!(keyword_only, kb.fuse_with(&[], &fts, &LegConfig::default()));
+        assert!(
+            keyword_only.iter().all(|(id, _)| *id != 1),
+            "the disabled leg's document must not appear at all: {keyword_only:?}"
+        );
+        let all_off = kb.fuse_with(&ann, &fts, &LegConfig::all_off());
+        assert!(all_off.is_empty(), "no leg, no ranking: {all_off:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The configuration surface: defaults, the resolvers, the weight rule and
+    /// the disabled-leg reading (all of it in one place, so a caller never has to
+    /// re-derive any of it).
+    #[test]
+    fn the_leg_configuration_is_one_place_with_one_rule() {
+        let default = LegConfig::default();
+        let (_, w_sem, w_kw) = FUSION.weights();
+        println!(
+            "READING t5 config: default={default:?} fusion={:?}",
+            default.fusion()
+        );
+        assert_eq!(
+            (
+                default.semantic,
+                default.keyword,
+                default.w_semantic,
+                default.w_keyword
+            ),
+            (true, true, w_sem, w_kw)
+        );
+        assert_eq!(default.disabled_legs(), Vec::<KnowledgeLeg>::new());
+        assert!(!default.all_disabled());
+        assert_eq!(default.fusion(), FUSION);
+        assert_eq!(default.fusion().label(), "rrf(k=60,w_sem=2,w_kw=1)");
+
+        // `resolve`: None takes the leg's default, an explicit zero is refused.
+        assert_eq!(
+            LegConfig::resolve((true, None), (true, None)).unwrap(),
+            default
+        );
+        assert_eq!(
+            LegConfig::resolve((true, Some(0.5)), (true, Some(0.25))).unwrap(),
+            LegConfig {
+                semantic: true,
+                keyword: true,
+                w_semantic: 0.5,
+                w_keyword: 0.25
+            }
+        );
+        assert_eq!(
+            LegConfig::resolve((true, Some(0.0)), (true, Some(0.0))),
+            Err(WeightError::NonPositive {
+                leg: KnowledgeLeg::Semantic.label(),
+                weight: 0.0
+            }),
+            "an all-zero enabled pair must be rejected, not silently empty"
+        );
+        assert!(matches!(
+            LegConfig::resolve((true, Some(-1.0)), (true, None)),
+            Err(WeightError::NonPositive { .. })
+        ));
+        assert!(matches!(
+            LegConfig::resolve((true, Some(f64::MAX)), (true, None)),
+            Err(WeightError::NonFinite { .. })
+        ));
+        assert_eq!(
+            LegConfig::resolve((false, Some(-2.0)), (true, Some(1.0)))
+                .unwrap()
+                .w_semantic,
+            0.0,
+            "a disabled leg's weight is ignored and normalized to nothing"
+        );
+
+        let off = LegConfig::all_off();
+        assert!(off.all_disabled());
+        assert_eq!(
+            off.disabled_legs(),
+            vec![KnowledgeLeg::Semantic, KnowledgeLeg::Keyword],
+            "the legs are TYPES, not strings: the capability ids stay in the plane"
+        );
+        assert_eq!(
+            off.fusion().label(),
+            "rrf(k=60,w_sem=0,w_kw=0)",
+            "the reported fusion follows the configuration, so a reader can see \
+             which weights produced a ranking"
+        );
     }
 }

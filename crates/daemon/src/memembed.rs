@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use ruagent_knowledge::embed::Embedder;
+use ruagent_knowledge::rrf::{WeightError, check_weights, normalized_weight};
+use ruagent_knowledge::store::LegConfig;
 use ruagent_store::Db;
 
 fn to_blob(v: &[f32]) -> Vec<u8> {
@@ -161,7 +163,7 @@ pub struct MemoryHit {
 }
 
 /// Both legs, and the fused result already bounded by top_n.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecallLegs {
     /// Rows the semantic leg returned (already thresholded and cut to top_n).
     pub semantic: usize,
@@ -548,6 +550,260 @@ pub async fn judge_merge(
     (decision.verdict, reason)
 }
 
+/// One recall leg, as a TYPE.
+///
+/// THE CAPABILITY IDS ARE NOT SPELLED HERE (t5 convergence, captain's review
+/// handoff): the registry owns them — `crate::capability::CapabilityId::as_str()`
+/// (`recall_leg_memory_semantic`, `recall_leg_wiki`, …) is the single source — and
+/// the recall endpoint maps each variant onto its id when it builds the wire
+/// answer's `legs_disabled` (design §11.4). A second hardcoded copy of those six
+/// strings in this file would be a shadow list no test here could keep honest; a
+/// mapping function is what stays checkable, and the endpoint owns it because the
+/// endpoint is what speaks capability ids.
+///
+/// DECLARATION ORDER IS THE REPORT ORDER of [`RecallLegConfig::disabled_legs`], and
+/// it is also the order of the ids each variant maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecallLeg {
+    Graph,
+    KnowledgeFts,
+    KnowledgeSemantic,
+    MemoryFts,
+    MemorySemantic,
+    Wiki,
+}
+
+impl RecallLeg {
+    /// A HUMAN label for a log line or a reason sentence — NOT a capability id and
+    /// never a wire value (see the type's note on where the ids live).
+    pub const fn label(self) -> &'static str {
+        match self {
+            RecallLeg::Graph => "graph",
+            RecallLeg::KnowledgeFts => "knowledge fts",
+            RecallLeg::KnowledgeSemantic => "knowledge semantic",
+            RecallLeg::MemoryFts => "memory fts",
+            RecallLeg::MemorySemantic => "memory semantic",
+            RecallLeg::Wiki => "wiki",
+        }
+    }
+}
+
+/// Which memory legs to run, and with what RRF weight (t5).
+///
+/// DEFAULT = TODAY EXACTLY: both legs on, weight 1.0 each. At 1.0/1.0 the fusion
+/// is `rrf` itself — `rrf_weighted` is pinned bit-identical to `rrf` at equal
+/// weights (crates/knowledge/src/rrf.rs, `unweighted_is_the_1_1_special_case`),
+/// which is what lets this struct be threaded in without moving one rank.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemoryLegs {
+    /// The cosine leg (`semantic_search`). It owns the query EMBEDDING.
+    pub semantic: bool,
+    /// The bm25 leg (`search_fts_scored`).
+    pub keyword: bool,
+    pub w_semantic: f32,
+    pub w_keyword: f32,
+}
+
+impl Default for MemoryLegs {
+    fn default() -> Self {
+        Self {
+            semantic: true,
+            keyword: true,
+            w_semantic: 1.0,
+            w_keyword: 1.0,
+        }
+    }
+}
+
+impl MemoryLegs {
+    /// Every memory leg off: legal, returns empty evidence, and queries nothing.
+    pub fn all_off() -> Self {
+        Self {
+            semantic: false,
+            keyword: false,
+            w_semantic: 0.0,
+            w_keyword: 0.0,
+        }
+    }
+
+    /// THE ONE RESOLVER for the memory pair: `(enabled, configured weight)` per
+    /// leg -> a usable configuration, `None` meaning "no weight configured" and
+    /// taking 1.0 (never zero, which would silently drop an enabled leg).
+    ///
+    /// Validation and normalization both happen here, so the daemon never holds a
+    /// config whose disabled half still carries a weight.
+    pub fn resolve(
+        semantic: (bool, Option<f64>),
+        keyword: (bool, Option<f64>),
+    ) -> Result<Self, WeightError> {
+        let cfg = Self {
+            semantic: semantic.0,
+            keyword: keyword.0,
+            w_semantic: semantic.1.map_or(1.0, |w| w as f32),
+            w_keyword: keyword.1.map_or(1.0, |w| w as f32),
+        };
+        cfg.validate()?;
+        Ok(cfg.normalized())
+    }
+
+    /// The weight rule of [`ruagent_knowledge::rrf::check_weights`]: non-finite
+    /// weights are rejected, an ENABLED leg at weight <= 0 is rejected (that is
+    /// what makes two enabled legs at all-zero weights a configuration error
+    /// rather than an empty ranking that reads like "nothing matched"), and a
+    /// disabled leg's weight is ignored.
+    pub fn validate(&self) -> Result<(), WeightError> {
+        check_weights(&[
+            (
+                RecallLeg::MemorySemantic.label(),
+                self.semantic,
+                self.w_semantic,
+            ),
+            (RecallLeg::MemoryFts.label(), self.keyword, self.w_keyword),
+        ])
+    }
+
+    /// Zero every disabled leg's weight — the total half of the rule.
+    pub fn normalized(self) -> Self {
+        Self {
+            w_semantic: normalized_weight(self.semantic, self.w_semantic),
+            w_keyword: normalized_weight(self.keyword, self.w_keyword),
+            ..self
+        }
+    }
+
+    /// The memory legs this configuration turns OFF, in a stable order (types, not
+    /// capability ids — see [`RecallLeg`]).
+    pub fn disabled_legs(&self) -> Vec<RecallLeg> {
+        let mut out = Vec::new();
+        if !self.semantic {
+            out.push(RecallLeg::MemorySemantic);
+        }
+        if !self.keyword {
+            out.push(RecallLeg::MemoryFts);
+        }
+        out.sort_unstable();
+        out
+    }
+
+    pub fn all_disabled(&self) -> bool {
+        !self.semantic && !self.keyword
+    }
+}
+
+/// THE ONE PLACE the six recall legs are configured (t5).
+///
+/// The four legs this file and `ruagent_knowledge` execute live in `memory` and
+/// `knowledge`; the two legs the recall ENDPOINT executes (wiki stubs, entity
+/// graph) are booleans here, so a caller reads all six from one value and reports
+/// one `legs_disabled` list instead of re-deriving the same conditions at each
+/// call site. Wiki and graph carry no weight: neither is a ranked fusion input
+/// (wiki is a partition of the knowledge hits, and the graph's `retrieve` has its
+/// own path budget) — inventing a weight for them would be a number nothing
+/// reads.
+///
+/// `Default` = today: every leg on, every weight at today's value. A caller must
+/// build this from the capability plane and pass it in; nothing here reads
+/// configuration, so this struct is also the seam that keeps the pipeline
+/// testable without a daemon.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallLegConfig {
+    pub memory: MemoryLegs,
+    pub knowledge: LegConfig,
+    pub wiki: bool,
+    pub graph: bool,
+}
+
+impl Default for RecallLegConfig {
+    fn default() -> Self {
+        Self {
+            memory: MemoryLegs::default(),
+            knowledge: LegConfig::default(),
+            wiki: true,
+            graph: true,
+        }
+    }
+}
+
+impl RecallLegConfig {
+    /// Resolve all six legs from the plane's `(enabled, weight)` readings in one
+    /// call, so no call site invent their own combination. Wiki and graph are
+    /// switches only (see the type's note on weights).
+    pub fn resolve(
+        memory_semantic: (bool, Option<f64>),
+        memory_keyword: (bool, Option<f64>),
+        knowledge_semantic: (bool, Option<f64>),
+        knowledge_keyword: (bool, Option<f64>),
+        wiki: bool,
+        graph: bool,
+    ) -> Result<Self, WeightError> {
+        Ok(Self {
+            memory: MemoryLegs::resolve(memory_semantic, memory_keyword)?,
+            knowledge: LegConfig::resolve(knowledge_semantic, knowledge_keyword)?,
+            wiki,
+            graph,
+        })
+    }
+
+    /// Every leg off. Legal: a recall that was asked for nothing must answer
+    /// "nothing was asked for", not an error and not a bare empty list.
+    pub fn all_disabled(&self) -> bool {
+        self.memory.all_disabled() && self.knowledge.all_disabled() && !self.wiki && !self.graph
+    }
+
+    /// Every leg this configuration turns OFF, in [`RecallLeg`]'s declaration
+    /// order — which is also the id order of the wire array the endpoint builds
+    /// (design §11.4). THE ONE PLACE the disabled-leg reading comes from: the
+    /// endpoint reports exactly this list instead of re-deriving six conditions.
+    ///
+    /// NO ID IS SPELLED HERE: the endpoint maps each variant onto
+    /// `crate::capability::CapabilityId` (the registry's `as_str()` is the single
+    /// source of the strings). The mapping is the endpoint's because the endpoint is
+    /// what speaks capability ids.
+    pub fn disabled_legs(&self) -> Vec<RecallLeg> {
+        let mut out: Vec<RecallLeg> = self
+            .memory
+            .disabled_legs()
+            .into_iter()
+            .chain(
+                self.knowledge
+                    .disabled_legs()
+                    .into_iter()
+                    .map(|leg| match leg {
+                        ruagent_knowledge::store::KnowledgeLeg::Semantic => {
+                            RecallLeg::KnowledgeSemantic
+                        }
+                        ruagent_knowledge::store::KnowledgeLeg::Keyword => RecallLeg::KnowledgeFts,
+                    }),
+            )
+            .collect();
+        if !self.wiki {
+            out.push(RecallLeg::Wiki);
+        }
+        if !self.graph {
+            out.push(RecallLeg::Graph);
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The explicit reason an ALL-OFF configuration returns an empty result.
+    ///
+    /// `None` whenever at least one leg is on. This is the answer to "empty
+    /// because nothing matched" vs "empty because nothing was asked for": the
+    /// endpoint puts this sentence (and the mapped `legs_disabled`) in the
+    /// response, so an all-off recall can never read as a retrieval miss.
+    pub fn disabled_reason(&self) -> Option<String> {
+        if !self.all_disabled() {
+            return None;
+        }
+        let labels: Vec<&'static str> = self.disabled_legs().iter().map(|l| l.label()).collect();
+        Some(format!(
+            "every recall leg is disabled by configuration ({})",
+            labels.join(", ")
+        ))
+    }
+}
+
 /// Recall memories across BOTH legs, fused on one scale and bounded by top_n.
 ///
 /// THE BUG THIS REPLACES (t246): the handler took the semantic leg, seeded a
@@ -562,6 +818,10 @@ pub async fn judge_merge(
 /// bm25), because bm25 has no absolute scale to threshold on. The two ranked
 /// lists are then fused with RRF, which is the only scale that is honestly
 /// comparable across a cosine leg and a bm25 leg.
+///
+/// This is the DEFAULT entry point (t5): it delegates to
+/// [`recall_memories_with`] with [`MemoryLegs::default`], so a caller that knows
+/// nothing about leg configuration gets exactly the pre-t5 behaviour.
 pub async fn recall_memories(
     db: &Db,
     embedder: Arc<dyn Embedder>,
@@ -569,16 +829,97 @@ pub async fn recall_memories(
     top_n: u32,
     min_score: f32,
 ) -> RecallLegs {
-    let semantic = semantic_search(db, embedder, query, top_n, min_score).await;
-    let keyword = ruagent_memory::query::search_fts_scored(db, &keyword_pattern(query), top_n)
-        .await
-        .unwrap_or_default();
+    recall_memories_with(
+        db,
+        embedder,
+        query,
+        top_n,
+        min_score,
+        &MemoryLegs::default(),
+    )
+    .await
+}
+
+/// THE MEMORY FUSION, as a pure function: the one place the two memory weights
+/// become a ranking.
+///
+/// Extracted from [`recall_memories_with`] for two reasons: the weights' effect is
+/// then decidable without a database (and the acceptance's "a non-default weight
+/// reorders the fixture" observable does not depend on a fixture that happens to
+/// have both legs alive), and the equivalence with the frozen unweighted `rrf`
+/// becomes ONE assertion instead of an argument.
+///
+/// A DISABLED leg is dropped from the input list as well as zero-weighted: a
+/// caller cannot re-inject documents through a leg the configuration turned off.
+fn fuse_memory_legs(sem_ids: &[i64], kw_ids: &[i64], legs: &MemoryLegs) -> Vec<(i64, f32)> {
+    let legs = legs.normalized();
+    let mut inputs: Vec<(&[i64], f32)> = Vec::new();
+    if legs.semantic {
+        inputs.push((sem_ids, legs.w_semantic));
+    }
+    if legs.keyword {
+        inputs.push((kw_ids, legs.w_keyword));
+    }
+    ruagent_knowledge::rrf_weighted(&inputs, RRF_K)
+}
+
+/// [`recall_memories`] under an explicit leg configuration (t5).
+///
+/// THE COST BOUNDARY, and the whole point of the parameter: a DISABLED leg is
+/// never QUERIED — the gate wraps the call, not its result.
+///
+/// * `memory.semantic = false` skips the query EMBEDDING (`embed_query`, a model
+///   forward pass on the fastembed path) and the brute-force cosine scan over
+///   every embedded memory row.
+/// * `memory.keyword = false` skips the FTS5 `MATCH` over `memories_fts`, which
+///   is a scan of the whole memory index for this query.
+///
+/// Filtering the legs' results afterwards would return the same answer while
+/// still paying every one of those costs — including the model call, which is the
+/// user's token/time budget, not an implementation detail (design §11.3).
+///
+/// The caller that owns the HTTP response reports the disabled legs from
+/// [`RecallLegConfig::disabled_legs`] / [`RecallLegConfig::disabled_reason`]: with
+/// both memory legs off the evidence below is all-zero, which is identical to "the
+/// corpus has nothing" unless the configuration says which legs were asked for.
+pub async fn recall_memories_with(
+    db: &Db,
+    embedder: Arc<dyn Embedder>,
+    query: &str,
+    top_n: u32,
+    min_score: f32,
+    legs: &MemoryLegs,
+) -> RecallLegs {
+    let legs = legs.normalized();
+    if legs.all_disabled() {
+        tracing::info!(
+            legs = ?legs.disabled_legs(),
+            "memory recall: every leg is disabled by configuration — returning empty evidence \
+             without querying anything"
+        );
+    }
+    let semantic = if legs.semantic {
+        semantic_search(db, embedder, query, top_n, min_score).await
+    } else {
+        Vec::new()
+    };
+    let keyword = if legs.keyword {
+        ruagent_memory::query::search_fts_scored(db, &keyword_pattern(query), top_n)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let sem_ids: Vec<i64> = semantic.iter().map(|m| m.0).collect();
     let kw_ids: Vec<i64> = keyword.iter().map(|(row, _)| row.id).collect();
     let keyword_new = kw_ids.iter().filter(|id| !sem_ids.contains(id)).count();
 
-    let fused = ruagent_knowledge::rrf(&[sem_ids, kw_ids], RRF_K);
+    // The weights come from the configuration. At the default 1.0/1.0 this is
+    // `rrf` itself, bit for bit (crates/knowledge/src/rrf.rs pins the identity);
+    // a disabled leg arrives with weight 0.0 AND an empty id list, so both halves
+    // of "off" are enforced here.
+    let fused = fuse_memory_legs(&sem_ids, &kw_ids, &legs);
     let dropped_by_top_n = fused.len().saturating_sub(top_n as usize);
 
     // Row data from either leg: the semantic leg's tuple, the keyword leg's row.
@@ -771,6 +1112,868 @@ pub fn graph_evidence_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The t5 recall fixture ──────────────────────────────────────────────
+    //
+    // A FIXED, deterministic corpus with no model in the loop (the offline
+    // `HashEmbedder`), built so the two memory legs DISAGREE. That is what makes
+    // a per-leg toggle or a weight change observable: if both legs ranked the
+    // same rows the same way, every assertion below would pass on a pipeline
+    // that ignored the configuration entirely.
+    //
+    //   row                                    semantic            keyword
+    //   M1 "alpha beta"                        1.000  (rank 0)     rank 0
+    //   M2 "beta beta alpha alpha"             1.000  (rank 1)     absent
+    //   M3 "alpha beta gamma delta eps zeta"   0.577  (rank 2)     rank 1
+    //   M4 "alpha zeta eta theta iota kappa"   0.289  (rank 3)     absent
+    //   M5 "zebra xylophone marmalade"         0.000               absent
+    //
+    // The keyword leg's pattern is the WHOLE query as one phrase (memembed's
+    // `keyword_pattern`, deliberately unchanged), so only M1 and M3 contain
+    // "alpha beta" adjacent; M2 is the same bag of words in another order, which
+    // is exactly the semantic-leg-only row a weight can lift.
+    //
+    // WHICH BRANCH OF THE `search_fts_scored` DEFECT THIS FIXTURE EXERCISED (t13): it
+    // writes `source_episode: None`, so the rows were all NULL in that column and that
+    // call ERRED (see `memory_fts_leg_error`). REAL rows are not null there (t9 measured
+    // 3 rows, 0 nulls) — the OTHER branch, where the leg ran and returned an EPISODE ID
+    // as its score. Both branches were pinned by t13's tripwire and are pinned in the
+    // corrected state by `the_source_episode_index_repair_reports_bm25_for_both_shapes`;
+    // t16 repaired the read (§21.1), so the NULL branch reads real bm25 now.
+    async fn fixture() -> (Db, Arc<dyn Embedder>, Vec<i64>) {
+        let db = Db::open_in_memory().unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(ruagent_knowledge::HashEmbedder::new(1024));
+        let mut ids = Vec::new();
+        for content in [
+            "alpha beta",
+            "beta beta alpha alpha",
+            "alpha beta gamma delta epsilon zeta",
+            "alpha zeta eta theta iota kappa",
+            "zebra xylophone marmalade tapestry",
+        ] {
+            let out = ruagent_memory::write::write_memory(
+                &db,
+                &ruagent_memory::write::MemoryWrite {
+                    store: ruagent_memory::MemoryStore::Lesson,
+                    namespace: ruagent_memory::Namespace::parse("project:t5")
+                        .expect("test namespace parses"),
+                    content: content.to_string(),
+                    confidence: 0.9,
+                    source_episode: None,
+                    supersedes: None,
+                },
+            )
+            .await
+            .expect("fixture row is writable");
+            let id = match out {
+                ruagent_memory::write::WriteOutcome::Inserted(id) => id,
+                other => panic!("fixture write must insert, got {other:?}"),
+            };
+            embed_row(&db, embedder.clone(), id, content).await;
+            ids.push(id);
+        }
+        (db, embedder, ids)
+    }
+
+    /// THE REGRESSION BAR (t5). Written FIRST, against the pre-configuration
+    /// entry point, so it can only stay green if making the legs configurable is
+    /// a no-op at the default configuration: same ids, same order, same fused
+    /// scores, same per-leg evidence.
+    ///
+    /// The expected values are a PINNED reading of this fixture, not a
+    /// recomputation — a test that recomputed them would ratify any change.
+    ///
+    /// RE-DERIVED BY t16 (the `source_episode` index repair), NOT hand-edited until
+    /// green: this fixture's rows have a NULL `source_episode`, so before the repair the
+    /// keyword leg ERRORED here and contributed nothing, and the pinned order was
+    /// `[1, 2, 3, 4]` with fused scores `0.016393 / 0.016129 / 0.015873 / 0.015625`.
+    /// With the leg reading real bm25 it contributes rows 1 and 3, and the measured page
+    /// is `[1, 3, 2, 4]` with `0.032787 / 0.032002 / 0.016129 / 0.015625`. That move is
+    /// the INTENDED delta of increment 2 (see `the_source_episode_index_repair_...` and
+    /// the design document's §21.1); nothing was re-tuned to keep the old order.
+    #[tokio::test]
+    async fn default_memory_recall_is_pinned_on_the_fixed_fixture() {
+        let (db, embedder, ids) = fixture().await;
+        let legs = recall_memories(&db, embedder.clone(), "alpha beta", 5, 0.25).await;
+        let keyword_error = memory_fts_leg_error(&db, "alpha beta").await;
+        println!(
+            "READING t5 memory golden: ids={ids:?} hits={:?}",
+            legs.hits
+                .iter()
+                .map(|h| (h.id, h.score, h.legs.clone()))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "READING t5 memory golden: semantic={} keyword={} keyword_new={} dropped_by_top_n={} \
+             top_semantic_score={:?} keyword_leg_error={:?}",
+            legs.semantic,
+            legs.keyword,
+            legs.keyword_new,
+            legs.dropped_by_top_n,
+            legs.top_semantic_score,
+            keyword_error
+        );
+
+        let got: Vec<(i64, String)> = legs
+            .hits
+            .iter()
+            .map(|h| (h.id, format!("{:.6}", h.score)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (ids[0], "0.032787".to_string()),
+                (ids[2], "0.032002".to_string()),
+                (ids[1], "0.016129".to_string()),
+                (ids[3], "0.015625".to_string()),
+            ],
+            "the fixed fixture's default ranking moved (re-derived by t16: the keyword leg now \
+             contributes rows 1 and 3 instead of erroring on this fixture's NULL source_episode)"
+        );
+        assert_eq!(legs.semantic, 4);
+        assert_eq!(
+            legs.keyword, 2,
+            "this fixture's rows have a NULL `source_episode`, which used to make \
+             `search_fts_scored` ERROR (no keyword rows at all); since the t16 repair the column is \
+             read by name and the leg returns the two rows whose text contains the query phrase \
+             ({keyword_error:?})"
+        );
+        assert_eq!(
+            legs.keyword_new, 0,
+            "both keyword rows are in the semantic leg too"
+        );
+        assert_eq!(legs.dropped_by_top_n, 0);
+        assert!(
+            (legs.top_semantic_score.unwrap_or(0.0) - 1.0).abs() < 1e-5,
+            "{:?}",
+            legs.top_semantic_score
+        );
+        assert_eq!(
+            legs.hits[0].legs,
+            vec!["semantic", "keyword"],
+            "the leading row is found by BOTH legs now"
+        );
+
+        // THE EQUIVALENCE BAR, re-derived from today's OWN primitives rather than
+        // from the pinned numbers above: rebuild the pre-t5 algorithm — both legs,
+        // the frozen unweighted `rrf`, the same top_n cut — and require the
+        // configured pipeline to agree with it exactly. This is what makes the
+        // golden a regression bar and not a snapshot of whatever the new code does.
+        let sem = semantic_search(&db, embedder.clone(), "alpha beta", 5, 0.25).await;
+        let kw = ruagent_memory::query::search_fts_scored(&db, &keyword_pattern("alpha beta"), 5)
+            .await
+            .unwrap_or_default();
+        let sem_ids: Vec<i64> = sem.iter().map(|m| m.0).collect();
+        let kw_ids: Vec<i64> = kw.iter().map(|(row, _)| row.id).collect();
+        let frozen = ruagent_knowledge::rrf(&[sem_ids.clone(), kw_ids.clone()], RRF_K);
+        let configured = fuse_memory_legs(&sem_ids, &kw_ids, &MemoryLegs::default());
+        println!("READING t5 memory golden: frozen_rrf={frozen:?}");
+        assert_eq!(
+            frozen, configured,
+            "at the default weights the configured fusion must BE the frozen `rrf`"
+        );
+        assert_eq!(
+            legs.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            frozen.iter().take(5).map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+        for (hit, (id, score)) in legs.hits.iter().zip(frozen.iter()) {
+            assert_eq!(hit.id, *id);
+            assert_eq!(hit.score, *score as f64, "the score must be the frozen one");
+        }
+    }
+
+    // ── t5: the leg configuration ──────────────────────────────────────────
+
+    /// An `Embedder` that counts the calls it receives: the only honest way to
+    /// assert that a disabled leg was never QUERIED (a result-shaped assertion
+    /// cannot tell "skipped" from "queried and empty").
+    struct CountingEmbedder {
+        inner: ruagent_knowledge::HashEmbedder,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingEmbedder {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    inner: ruagent_knowledge::HashEmbedder::new(1024),
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, ruagent_knowledge::embed::EmbedError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed(texts)
+        }
+        fn embed_query(
+            &self,
+            text: &str,
+        ) -> Result<Vec<f32>, ruagent_knowledge::embed::EmbedError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed_query(text)
+        }
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+    }
+
+    /// A probe over `search_fts_scored` that SURFACES an error instead of swallowing it the
+    /// way `recall_memories_with` does — it returns `None` when the leg's SQL ran.
+    ///
+    /// WHY IT STILL EXISTS AFTER THE t16 REPAIR: it is how the repair's own test asserts the
+    /// NULL branch no longer fails (`assert!(null_error.is_none())`), so a regression back to
+    /// a failing read is caught by name rather than as a mysterious empty leg. The fixture's
+    /// rows all carry `source_episode: None`, and before t16 that made this call error with
+    /// `Invalid column type Null at index: 10` — the shape that once made this effort believe
+    /// the leg was dead (§21.1). REAL rows carry a non-NULL `source_episode`, and there the
+    /// old code silently reported an episode id as the score instead.
+    async fn memory_fts_leg_error(db: &Db, query: &str) -> Option<String> {
+        ruagent_memory::query::search_fts_scored(db, &keyword_pattern(query), 5)
+            .await
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// Give every fixture row a NON-NULL `source_episode` — the state REAL rows are
+    /// in (t9 measured 3 rows, 0 nulls) and the branch the fixture does not cover.
+    ///
+    /// Returns `id -> episode id`. EVERY matching row needs one when the OLD read is being
+    /// reproduced: that read mapped its rows one by one, so a single NULL row failed the
+    /// whole statement. After the t16 repair the episode id is exactly what the score must
+    /// NOT be, which is why the returned ids are the assertion's comparison point.
+    async fn attach_episodes(db: &Db, ids: &[i64]) -> std::collections::HashMap<i64, i64> {
+        let ids = ids.to_vec();
+        db.call(
+            move |conn| -> Result<std::collections::HashMap<i64, i64>, rusqlite::Error> {
+                let mut out = std::collections::HashMap::new();
+                for (i, memory_id) in ids.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO episodes (kind, content, content_hash, ref_time, ingested_at)
+                     VALUES ('manual', 't13 episode', ?1, '2026-01-01T00:00:00Z',
+                             '2026-01-01T00:00:00Z')",
+                        rusqlite::params![format!("t13-episode-{i}")],
+                    )?;
+                    let episode_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "UPDATE memories SET source_episode = ?1 WHERE id = ?2",
+                        rusqlite::params![episode_id, memory_id],
+                    )?;
+                    out.insert(*memory_id, episode_id);
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .expect("writer is alive")
+        .expect("the episodes attach")
+    }
+
+    /// The TRUE bm25 per row, read with the column NAMED — the same reading the repaired
+    /// `search_fts_scored` performs, kept INDEPENDENT of it (a second statement, not a call
+    /// to the production function) so that a future change to either cannot move both sides
+    /// at once. It is also what the t13 tripwire used to show the defect's number was not
+    /// this one.
+    async fn real_bm25_by_memory(db: &Db, query: &str) -> std::collections::HashMap<i64, f64> {
+        let query = keyword_pattern(query);
+        db.call(
+            move |conn| -> Result<std::collections::HashMap<i64, f64>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, bm25(memories_fts) FROM memories_fts f
+                     JOIN memories m ON m.id = f.rowid
+                     WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL AND m.deleted_at IS NULL
+                     ORDER BY rank LIMIT 5",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![query], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+                })?;
+                rows.collect()
+            },
+        )
+        .await
+        .expect("writer is alive")
+        .expect("the index-11 reading runs")
+    }
+
+    /// The default entry point and the explicit default configuration are the
+    /// SAME call: `recall_memories` is a delegation, not a second pipeline.
+    #[tokio::test]
+    async fn the_default_entry_point_is_the_default_configuration() {
+        let (db, embedder, _ids) = fixture().await;
+        let today = recall_memories(&db, embedder.clone(), "alpha beta", 5, 0.25).await;
+        let configured =
+            recall_memories_with(&db, embedder, "alpha beta", 5, 0.25, &MemoryLegs::default())
+                .await;
+        assert_eq!(
+            today, configured,
+            "the default configuration must reproduce the pre-t5 entry point exactly"
+        );
+        assert_eq!(
+            MemoryLegs::default().disabled_legs(),
+            Vec::<RecallLeg>::new()
+        );
+    }
+
+    /// ACCEPTANCE: a DISABLED leg is never queried, and (since t16) the switch is also
+    /// VISIBLE in the response.
+    ///
+    /// The proof of "never queried" is a counting `Embedder`, and it is the strongest
+    /// available here: the semantic leg owns the query EMBEDDING (a model forward pass on
+    /// the fastembed path) and the brute-force cosine scan, and with the leg off the
+    /// counter does not move while the same call still returns an answer. The leg-ON
+    /// control shows the counter DOES move, so the probe cannot pass by observing nothing.
+    ///
+    /// The keyword leg COULD NOT be observed at all when t5 wrote this: `search_fts_scored`
+    /// failed on the fixture's NULL `source_episode` (the [`memory_fts_leg_error`] branch of
+    /// the index defect), so the leg returned nothing whether or not it was switched off,
+    /// and t5 recorded that unobservability rather than pretending to test it. t16 repaired
+    /// the read, so the leg's on/off state IS observable now, and this test asserts the new
+    /// observable instead of the old unobservability.
+    #[tokio::test]
+    async fn a_disabled_memory_semantic_leg_is_never_queried() {
+        let (db, _setup_embedder, ids) = fixture().await;
+        let (embedder, calls) = CountingEmbedder::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(embedder);
+
+        // CONTROL, both legs on: exactly one embedding.
+        let both = recall_memories_with(
+            &db,
+            embedder.clone(),
+            "alpha beta",
+            5,
+            0.25,
+            &MemoryLegs::default(),
+        )
+        .await;
+        let on_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+        println!(
+            "READING t5 leg-off CONTROL: embed_calls={on_calls} semantic={} keyword={} hits={:?}",
+            both.semantic,
+            both.keyword,
+            both.hits.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            on_calls, 1,
+            "the semantic leg embeds the query exactly once"
+        );
+        assert_eq!(both.semantic, 4);
+
+        // SEMANTIC OFF: no embedding at all — and the keyword leg, now that it reads real
+        // bm25, still answers. That IS the observable t5 could not have: the switch changes
+        // the response.
+        let semantic_off = MemoryLegs {
+            semantic: false,
+            ..MemoryLegs::default()
+        };
+        let off =
+            recall_memories_with(&db, embedder.clone(), "alpha beta", 5, 0.25, &semantic_off).await;
+        let after_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+        println!(
+            "READING t5 semantic-off: embed_calls={} (was {on_calls}) semantic={} keyword={} \
+             top_semantic_score={:?} hits={:?}",
+            after_calls - on_calls,
+            off.semantic,
+            off.keyword,
+            off.top_semantic_score,
+            off.hits
+                .iter()
+                .map(|h| (h.id, h.score, h.legs.clone(), h.keyword_score))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after_calls - on_calls,
+            0,
+            "a disabled semantic leg must not embed the query at all"
+        );
+        assert_eq!(off.semantic, 0);
+        assert_eq!(off.top_semantic_score, None);
+        assert_eq!(
+            off.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[2]],
+            "with the semantic leg off, the keyword leg's own bm25 order is the answer"
+        );
+        assert_eq!(off.keyword, 2);
+        assert_eq!(off.keyword_new, 2, "neither row came from the semantic leg");
+        assert!(
+            off.hits
+                .iter()
+                .all(|h| !h.legs.contains(&"semantic") && h.semantic_score.is_none()),
+            "no row may carry semantic evidence when that leg was never queried: {:?}",
+            off.hits
+        );
+        assert!(
+            off.hits
+                .iter()
+                .all(|h| h.keyword_score.is_some_and(|s| s < 0.0)),
+            "each row carries the keyword leg's own (now correct) bm25: {:?}",
+            off.hits
+        );
+        assert_ne!(
+            both.hits, off.hits,
+            "THE OBSERVABILITY PIN (t16): before the repair the keyword leg contributed nothing, so \
+             this switch changed nothing at all; now the two configurations must differ"
+        );
+    }
+
+    /// THE `source_episode` INDEX REPAIR, POSITIVE FORM (t16).
+    ///
+    /// THE DEFECT AND ITS FIX, kept named so the history stays readable:
+    /// `crates/memory/src/query.rs` read the FTS5 relevance score with
+    /// `r.get::<_, f64>(10)`. Index 10 of that SELECT is `source_episode` and
+    /// `bm25(memories_fts)` is index 11, so the leg reported a row's EPISODE ID as
+    /// its relevance score whenever `source_episode` was non-NULL — the shape
+    /// platform-written rows have (t9 measured 3 rows, 0 nulls) — and failed with
+    /// `Invalid column type Null at index: 10` when it was NULL, which
+    /// `recall_memories_with` swallowed into an empty leg. That NULL shape is what
+    /// `fixture()` writes, and it is why this effort first believed the leg was dead.
+    /// The repair aliases the column (`bm25(memories_fts) AS bm25`) and reads it BY NAME.
+    ///
+    /// t13's `characterizes_defect_both_branches_of_the_source_episode_index_bug` was the
+    /// TRIPWIRE for that defect: it asserted the BROKEN behaviour on both branches, so
+    /// this repair turned it red by design. This test is its positive replacement and
+    /// pins both branches in the corrected state; the tripwire's readings are recorded in
+    /// the design document's §21.1 (CLOSED by t16).
+    ///
+    /// THE RANKING QUESTION t13 LEFT OPEN, answered by the readings below: the wrong
+    /// score never reached the ORDER. Both branches produce the leg's bm25 order (the
+    /// SELECT says `ORDER BY rank`) and the memory fusion consumes ID LISTS, so:
+    /// * on the NON-NULL branch (platform rows) the fused page is UNCHANGED — only the
+    ///   reported `keyword_score` was wrong;
+    /// * on the NULL branch the leg contributed NOTHING before, so the page DID move once
+    ///   it started contributing. That is the intended delta, and the golden above has
+    ///   been re-derived for it.
+    #[tokio::test]
+    async fn the_source_episode_index_repair_reports_bm25_for_both_shapes() {
+        let (db, embedder, ids) = fixture().await;
+
+        // ── Branch 1: the fixture's NULL `source_episode`. BEFORE: the whole leg errored. ──
+        let null_legs = recall_memories(&db, embedder.clone(), "alpha beta", 5, 0.25).await;
+        let null_error = memory_fts_leg_error(&db, "alpha beta").await;
+        let null_kw =
+            ruagent_memory::query::search_fts_scored(&db, &keyword_pattern("alpha beta"), 5)
+                .await
+                .expect("the NULL branch must read after the repair");
+        let null_truth = real_bm25_by_memory(&db, "alpha beta").await;
+        println!(
+            "READING t16 branch NULL: leg={:?} fused={:?} counters=(semantic={} keyword={} \
+             keyword_new={} top_semantic={:?}) leg_was_error={:?}",
+            null_kw.iter().map(|(r, s)| (r.id, *s)).collect::<Vec<_>>(),
+            null_legs
+                .hits
+                .iter()
+                .map(|h| (h.id, h.score, h.legs.clone(), h.keyword_score))
+                .collect::<Vec<_>>(),
+            null_legs.semantic,
+            null_legs.keyword,
+            null_legs.keyword_new,
+            null_legs.top_semantic_score,
+            null_error
+        );
+        assert!(
+            null_error.is_none(),
+            "the NULL branch no longer errors — that error WAS the defect: {null_error:?}"
+        );
+        assert!(
+            !null_kw.is_empty(),
+            "the keyword leg contributes rows on this shape now"
+        );
+        for (row, score) in &null_kw {
+            assert_eq!(
+                score,
+                null_truth.get(&row.id).expect("the index-11 reading"),
+                "row {} must carry SQLite's bm25",
+                row.id
+            );
+            assert!(*score < 0.0, "bm25 is negative for a match");
+        }
+        assert_eq!(null_legs.keyword as usize, null_kw.len());
+        assert!(
+            null_legs.keyword > 0,
+            "BEFORE this repair the leg contributed nothing on this fixture (keyword == 0); it does \
+             now, and that is the deliberate, documented delta"
+        );
+
+        // ── Branch 2: NON-NULL `source_episode` — what live rows look like. BEFORE: these same
+        // ids came back with the EPISODE ID as the score (t13 measured `rows=[(1, 1.0, Some(1)),
+        // (3, 3.0, Some(3))]`). ──
+        let episodes = attach_episodes(&db, &ids).await;
+        let non_null_legs = recall_memories(&db, embedder, "alpha beta", 5, 0.25).await;
+        let non_null_kw =
+            ruagent_memory::query::search_fts_scored(&db, &keyword_pattern("alpha beta"), 5)
+                .await
+                .expect("the NON-NULL branch must read");
+        let non_null_truth = real_bm25_by_memory(&db, "alpha beta").await;
+        println!(
+            "READING t16 branch NON-NULL: leg={:?} episodes={:?} fused={:?} keyword={}",
+            non_null_kw
+                .iter()
+                .map(|(r, s)| (r.id, *s))
+                .collect::<Vec<_>>(),
+            non_null_kw
+                .iter()
+                .map(|(r, _)| (r.id, episodes.get(&r.id).copied()))
+                .collect::<Vec<_>>(),
+            non_null_legs
+                .hits
+                .iter()
+                .map(|h| (h.id, h.score, h.legs.clone(), h.keyword_score))
+                .collect::<Vec<_>>(),
+            non_null_legs.keyword
+        );
+        for (row, score) in &non_null_kw {
+            let episode_id = episodes
+                .get(&row.id)
+                .copied()
+                .expect("every matched row got an episode");
+            assert_eq!(
+                row.source_episode,
+                Some(episode_id),
+                "this really is the non-NULL branch"
+            );
+            assert_eq!(
+                score,
+                non_null_truth.get(&row.id).expect("the index-11 reading"),
+                "row {} must carry SQLite's bm25",
+                row.id
+            );
+            assert_ne!(
+                *score, episode_id as f64,
+                "the score must NOT be the row's episode id — that WAS the defect"
+            );
+            assert!(*score < 0.0, "bm25 is negative for a match");
+        }
+
+        // ── THE ANSWER: the leg's ID order is identical on both branches, and the fusion
+        // consumes that order — so the page does not move for the shape that already worked. ──
+        assert_eq!(
+            non_null_legs.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            null_legs.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            "the leg's ID order never depended on the score"
+        );
+        assert_eq!(
+            non_null_legs
+                .hits
+                .iter()
+                .map(|h| h.score)
+                .collect::<Vec<_>>(),
+            null_legs.hits.iter().map(|h| h.score).collect::<Vec<_>>(),
+            "RRF consumes ranks, not raw bm25 values"
+        );
+        assert_eq!(
+            non_null_legs
+                .hits
+                .iter()
+                .map(|h| h.keyword_score)
+                .collect::<Vec<_>>(),
+            null_legs
+                .hits
+                .iter()
+                .map(|h| h.keyword_score)
+                .collect::<Vec<_>>(),
+            "and the reported keyword_score is the same on both branches"
+        );
+    }
+
+    /// Every leg off: an empty result with NO query issued — never an error, and
+    /// never a silently-empty success (the configuration names the legs).
+    #[tokio::test]
+    async fn all_memory_legs_off_queries_nothing_and_says_why() {
+        let (db, _setup, _ids) = fixture().await;
+        let (embedder, calls) = CountingEmbedder::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(embedder);
+
+        let empty =
+            recall_memories_with(&db, embedder, "alpha beta", 5, 0.25, &MemoryLegs::all_off())
+                .await;
+        println!("READING t5 all-off: {empty:?}");
+        assert_eq!(empty, RecallLegs::default(), "all-off evidence is all-zero");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no embedding when both legs are off"
+        );
+
+        // ... and the CONFIGURATION is what makes that empty result readable.
+        let cfg = RecallLegConfig {
+            memory: MemoryLegs::all_off(),
+            ..RecallLegConfig::default()
+        };
+        assert!(!cfg.all_disabled(), "the wiki and graph legs are still on");
+        assert_eq!(
+            cfg.disabled_legs(),
+            vec![RecallLeg::MemoryFts, RecallLeg::MemorySemantic],
+            "the disabled memory legs are named (typed), in report order"
+        );
+        assert_eq!(cfg.disabled_reason(), None);
+
+        let nothing = RecallLegConfig {
+            memory: MemoryLegs::all_off(),
+            knowledge: LegConfig::all_off(),
+            wiki: false,
+            graph: false,
+        };
+        assert!(nothing.all_disabled());
+        let reason = nothing
+            .disabled_reason()
+            .expect("an all-off config states why");
+        println!("READING t5 all-off reason: {reason}");
+        for label in [
+            RecallLeg::Graph.label(),
+            RecallLeg::KnowledgeFts.label(),
+            RecallLeg::KnowledgeSemantic.label(),
+            RecallLeg::MemoryFts.label(),
+            RecallLeg::MemorySemantic.label(),
+            RecallLeg::Wiki.label(),
+        ] {
+            assert!(
+                reason.contains(label),
+                "the reason must name `{label}`: {reason}"
+            );
+        }
+        assert!(
+            reason.contains("disabled by configuration"),
+            "the reason must not read as a retrieval miss: {reason}"
+        );
+    }
+
+    /// The disabled-leg list is COMPLETE and STABLE over the six legs, and it is a
+    /// list of TYPES: the registry's capability ids are not respelled here.
+    ///
+    /// WHY THAT MATTERS (t5 convergence): `crate::capability::CapabilityId::as_str()`
+    /// is the single source of the ids, and the endpoint maps these variants onto it
+    /// when it builds the response's `legs_disabled`. A second hardcoded copy of the
+    /// strings in this file would be a shadow list that no test here could keep
+    /// honest — so what is asserted is the SHAPE (six legs, stable order, typed),
+    /// and the id mapping is checked where the ids live.
+    #[test]
+    fn the_six_recall_legs_are_typed_complete_and_stably_ordered() {
+        let all_off = RecallLegConfig {
+            memory: MemoryLegs::all_off(),
+            knowledge: LegConfig::all_off(),
+            wiki: false,
+            graph: false,
+        };
+        let legs = all_off.disabled_legs();
+        println!("READING t5 recall legs: {legs:?}");
+        assert_eq!(
+            legs,
+            vec![
+                RecallLeg::Graph,
+                RecallLeg::KnowledgeFts,
+                RecallLeg::KnowledgeSemantic,
+                RecallLeg::MemoryFts,
+                RecallLeg::MemorySemantic,
+                RecallLeg::Wiki,
+            ],
+            "the six recall legs, one entry each, in declaration order"
+        );
+        assert_eq!(
+            RecallLegConfig::default().disabled_legs(),
+            Vec::<RecallLeg>::new()
+        );
+        // The knowledge crate reports its own two legs as TYPES, and the daemon
+        // maps them into this enum (the mapping under test on the line above).
+        let kb_off = LegConfig::all_off();
+        assert_eq!(
+            kb_off.disabled_legs(),
+            vec![
+                ruagent_knowledge::store::KnowledgeLeg::Semantic,
+                ruagent_knowledge::store::KnowledgeLeg::Keyword,
+            ]
+        );
+    }
+
+    /// Weights feed the memory fusion as configured: the same leg fixture reorders
+    /// under a non-default weight, and the DEFAULT is the frozen unweighted `rrf`
+    /// bit for bit.
+    ///
+    /// The fixture is expressed as RANKS (sem `[1,2,3,4]`, kw `[1,3]` — the shape
+    /// the DB fixture has), so this is pure fusion arithmetic and does not depend on
+    /// the keyword leg being alive in the database.
+    #[test]
+    fn a_non_default_memory_weight_reorders_the_fusion() {
+        let sem = vec![1i64, 2, 3, 4];
+        let kw = vec![1i64, 3];
+        let default = fuse_memory_legs(&sem, &kw, &MemoryLegs::default());
+        println!("READING t5 memory weights: default={default:?}");
+        assert_eq!(
+            default,
+            ruagent_knowledge::rrf(&[sem.clone(), kw.clone()], RRF_K),
+            "1:1 must be the frozen `rrf`, not merely similar"
+        );
+        assert_eq!(
+            default.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 3, 2, 4],
+            "the both-legs row 1 leads, then 3 (kw rank 1) over 2 (sem rank 1)"
+        );
+
+        // A tiny keyword weight (legal: > 0) drops the keyword-only row 3 below the
+        // row only the semantic leg finds (row 2) — the flip 3 > 2 requires
+        // w_kw >= w_sem/63. (Both rows reach this test as ids handed to the fusion,
+        // so the ranking effect of the keyword leg's NUMBERS is not what is measured
+        // here — see the source_episode defect's open question.)
+        let semantic_leaning = MemoryLegs {
+            w_semantic: 1.0,
+            w_keyword: 0.01,
+            ..MemoryLegs::default()
+        };
+        let reordered = fuse_memory_legs(&sem, &kw, &semantic_leaning);
+        println!("READING t5 memory weights: w_kw=0.01 -> {reordered:?}");
+        assert_eq!(
+            reordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "a non-default weight must move the memory fusion, not just be stored"
+        );
+
+        // The keyword-heavy direction keeps 1 on top and lifts its score, so the
+        // weight is visibly in the number and not only in the order.
+        let keyword_heavy = MemoryLegs {
+            w_semantic: 1.0,
+            w_keyword: 10.0,
+            ..MemoryLegs::default()
+        };
+        let heavy = fuse_memory_legs(&sem, &kw, &keyword_heavy);
+        println!("READING t5 memory weights: w_kw=10 -> {heavy:?}");
+        assert_eq!(
+            heavy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 3, 2, 4]
+        );
+        assert!(heavy[0].1 > default[0].1);
+
+        // A DISABLED leg contributes nothing even when a caller hands in its id
+        // list, so "off" has no way back into the ranking.
+        let semantic_off = MemoryLegs {
+            semantic: false,
+            ..MemoryLegs::default()
+        };
+        assert_eq!(
+            fuse_memory_legs(&sem, &kw, &semantic_off)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(fuse_memory_legs(&sem, &kw, &MemoryLegs::all_off()).is_empty());
+    }
+
+    /// The weight rule, at the layer that rejects it: negative and all-zero are
+    /// refused for ENABLED legs, and a disabled leg's weight is ignored.
+    #[test]
+    fn the_configured_weights_are_validated() {
+        assert_eq!(
+            MemoryLegs::resolve((true, Some(0.0)), (true, Some(0.0))),
+            Err(WeightError::NonPositive {
+                leg: RecallLeg::MemorySemantic.label(),
+                weight: 0.0
+            }),
+            "an all-zero enabled pair is a configuration error, not an empty ranking"
+        );
+        assert!(matches!(
+            MemoryLegs::resolve((true, Some(-1.0)), (true, None)),
+            Err(WeightError::NonPositive { .. })
+        ));
+        assert!(matches!(
+            MemoryLegs::resolve((true, Some(f64::NAN)), (true, None)),
+            Err(WeightError::NonFinite { .. })
+        ));
+        // A weight a disabled leg carries is ignored, and normalized to nothing.
+        let resolved = MemoryLegs::resolve((false, Some(-3.0)), (true, None)).expect("legal");
+        assert_eq!(resolved.w_semantic, 0.0);
+        assert_eq!(resolved.w_keyword, 1.0);
+        // `None` takes the leg's own default — never zero.
+        assert_eq!(
+            MemoryLegs::resolve((true, None), (true, None)).expect("legal"),
+            MemoryLegs::default()
+        );
+        // The whole six-leg config resolves (and validates) in one call.
+        assert!(
+            RecallLegConfig::resolve(
+                (true, None),
+                (true, None),
+                (true, None),
+                (true, Some(0.5)),
+                false,
+                true
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            RecallLegConfig::resolve(
+                (true, None),
+                (true, None),
+                (true, None),
+                (true, None),
+                false,
+                true
+            )
+            .expect("legal")
+            .disabled_legs(),
+            vec![RecallLeg::Wiki]
+        );
+    }
+
+    /// Both STRATEGIES still work over the toggleable legs: the caller's cosine
+    /// floor (0.30 conservative / 0.25 aggressive, api.rs) keeps deciding which
+    /// semantic rows are admissible, and with the semantic leg off it decides
+    /// nothing at all because nothing is embedded.
+    #[tokio::test]
+    async fn both_strategies_work_over_the_toggleable_legs() {
+        let (db, embedder, ids) = fixture().await;
+        let aggressive = recall_memories(&db, embedder.clone(), "alpha beta", 5, 0.25).await;
+        let conservative = recall_memories(&db, embedder.clone(), "alpha beta", 5, 0.30).await;
+        println!(
+            "READING t5 strategies: aggressive={:?} conservative={:?}",
+            aggressive.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            conservative.hits.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+        // The 0.289 row sits between the two floors: admissible for the aggressive
+        // one, not for the conservative one. (Re-derived by t16: the keyword leg now
+        // contributes rows 1 and 3, so both pages lead with the two rows BOTH legs found,
+        // in fused order, before the semantic-only tail.)
+        assert_eq!(
+            aggressive.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[2], ids[1], ids[3]]
+        );
+        assert_eq!(
+            conservative.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[2], ids[1]],
+            "the conservative floor drops the row between the two floors"
+        );
+        assert_eq!(aggressive.semantic, 4);
+        assert_eq!(conservative.semantic, 3);
+        assert_eq!(aggressive.keyword, 2);
+        assert_eq!(conservative.keyword, 2, "the floor is the semantic leg's");
+
+        // With the semantic leg off the floor decides nothing (nothing is embedded
+        // or measured), and both strategies agree — the leg configuration, not the
+        // strategy, is what removed the rows. The keyword leg still answers, with the
+        // same rows for both floors (t16: before the repair both were empty here, which
+        // is why t5 could only record that the two agreed).
+        let keyword_only = MemoryLegs {
+            semantic: false,
+            ..MemoryLegs::default()
+        };
+        let a =
+            recall_memories_with(&db, embedder.clone(), "alpha beta", 5, 0.25, &keyword_only).await;
+        let c = recall_memories_with(&db, embedder, "alpha beta", 5, 0.30, &keyword_only).await;
+        assert_eq!(a.hits, c.hits, "a floor nothing is measured against");
+        assert_eq!(a.semantic, 0);
+        assert_eq!(
+            a.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[2]],
+            "the keyword leg's rows are what remains"
+        );
+    }
 
     #[test]
     fn blob_roundtrip() {

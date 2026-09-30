@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "name": "a_document_states_its_terms",
+      "text": "# ruagent-extract\n\n`ruagent-extract` is a `workspace` member since 2026-09-14.\n\n`ruagent-extract` uses `serde_json` for the fixtures.\n\n`ruagent-extract` uses `serde_json` again in the golden test.\n\n`ruagent-extract` includes `rules` only once.\n\n`ruagent-extract` runs on `wasm` on a good day.\n\n## 知识库\n\n知识库 是 知识图谱 的入口。\n知识库 是 召回 的数据源。\n召回 的速度决定体验。\n召回 也依赖 知识库。\n",
+      "expect_entities": [
+        {
+          "rule": "heading_entity",
+          "name": "ruagent-extract",
+          "kind": "tool",
+          "score": 0.5,
+          "aliases": [],
+          "summary": "`ruagent-extract` is a `workspace` member since 2026-09-14."
+        },
+        {
+          "rule": "heading_entity",
+          "name": "知识库",
+          "kind": "concept",
+          "score": 0.5,
+          "aliases": [],
+          "summary": "知识库 是 知识图谱 的入口。"
+        },
+        {
+          "rule": "chinese_term_run",
+          "name": "召回",
+          "kind": "concept",
+          "score": 0.5,
+          "aliases": [],
+          "summary": "知识库 是 召回 的数据源。"
+        },
+        {
+          "rule": "inline_code_identifier",
+          "name": "serde_json",
+          "kind": "concept",
+          "score": 0.4,
+          "aliases": ["serde-json"],
+          "summary": "`ruagent-extract` uses `serde_json` for the fixtures."
+        },
+        {
+          "rule": "inline_code_identifier",
+          "name": "workspace",
+          "kind": "concept",
+          "score": 0.25,
+          "aliases": [],
+          "summary": "`ruagent-extract` is a `workspace` member since 2026-09-14."
+        },
+        {
+          "rule": "inline_code_identifier",
+          "name": "rules",
+          "kind": "concept",
+          "score": 0.25,
+          "aliases": [],
+          "summary": "`ruagent-extract` includes `rules` only once."
+        },
+        {
+          "rule": "inline_code_identifier",
+          "name": "wasm",
+          "kind": "tool",
+          "score": 0.25,
+          "aliases": [],
+          "summary": "`ruagent-extract` runs on `wasm` on a good day."
+        }
+      ],
+      "expect_relations": [
+        {
+          "rule": "relation_uses",
+          "src": "ruagent-extract",
+          "dst": "serde_json",
+          "relation": "uses",
+          "score": 1.0,
+          "valid_at": null,
+          "fact": "`ruagent-extract` uses `serde_json` for the fixtures."
+        },
+        {
+          "rule": "relation_is_a",
+          "src": "ruagent-extract",
+          "dst": "workspace",
+          "relation": "is_a",
+          "score": 0.5,
+          "valid_at": "2026-09-14",
+          "fact": "`ruagent-extract` is a `workspace` member since 2026-09-14."
+        },
+        {
+          "rule": "relation_is_a",
+          "src": "知识库",
+          "dst": "召回",
+          "relation": "is_a",
+          "score": 0.5,
+          "valid_at": null,
+          "fact": "知识库 是 召回 的数据源。"
+        }
+      ]
+    }
+  ]
+}

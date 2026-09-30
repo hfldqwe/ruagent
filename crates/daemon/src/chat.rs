@@ -150,6 +150,10 @@ pub struct Chat {
     /// The chat path needs it to put knowledge/wiki hits into the FIRST
     /// prompt's context; without it there is simply no knowledge block.
     knowledge: Option<Arc<ruagent_knowledge::Knowledge>>,
+    /// The capability plane, as a HANDLE rather than a snapshot (t8): the same
+    /// Arc the manager holds, so a `PUT /api/v1/capabilities` narrows the next
+    /// first prompt without a restart. `Chat` is `Clone` and this is an Arc.
+    capabilities: std::sync::Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>,
 }
 
 impl Chat {
@@ -172,9 +176,21 @@ impl Chat {
         {
             None
         } else {
-            let mut ctx =
-                ChatManager::injection_context(db, self.knowledge.as_deref(), embedder, &text)
-                    .await;
+            // `memory_inject_chat` gates the RETRIEVAL block only (design §12):
+            // the role and handoff blocks below still ride, because they are the
+            // agent's identity rather than evidence pulled from the stores. The
+            // LIVE plane is read here, so a runtime PUT takes effect on the next
+            // chat whose first prompt goes out, with no restart.
+            let inject = self
+                .capabilities
+                .read()
+                .expect("capability plane")
+                .gate(crate::capability::CapabilityId::MemoryInjectChat, true);
+            let mut ctx = if inject {
+                ChatManager::injection_context(db, self.knowledge.as_deref(), embedder, &text).await
+            } else {
+                None
+            };
             // A handoff tail rides first: the conversation the new
             // agent is taking over.
             if let Some(h) = &self.handoff {
@@ -361,6 +377,15 @@ pub struct ChatManager {
     /// reports them. Seeded from the `agent_options` table at boot —
     /// what the panel pickers show, with no probe spawn on cold start.
     model_cache: Arc<Mutex<HashMap<String, CachedOptions>>>,
+    /// The capability plane (design §4.5). ONE shared handle: boot installs the
+    /// plane `policy.toml` defines, `PUT /api/v1/capabilities` writes the new
+    /// value through it, and every consumer that reads `capabilities()` sees
+    /// the swap at once.
+    ///
+    /// `new` initialises it to legacy mode — a constructor default must not be
+    /// able to change behaviour (L1), so every existing `ChatManager::new` call
+    /// site keeps compiling and keeps today's behaviour.
+    capabilities: std::sync::Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>,
 }
 
 /// How many turns this chat's transcript holds. ZERO IS NORMAL: a chat opened
@@ -394,11 +419,17 @@ enum DistillAttempt {
 
 /// The background half of `maybe_auto_distill`, split out so a test can drive it
 /// without a live ChatManager (t313).
+///
+/// `plan` is the UNATTENDED plan the capability plane resolved (t8): it decides
+/// whether this pass runs the free rule extractor, the ACP one, or both, and it
+/// is never empty here — the caller returns early on an empty plan, so no agent
+/// is selected and no turn is spent when nothing is enabled.
 async fn auto_distill_now(
     distiller: &crate::distill::Distiller,
     key: &str,
     agent: Option<&str>,
     turns: usize,
+    plan: crate::extract_plane::ExtractPlan,
 ) -> DistillAttempt {
     if turns == 0 {
         // debug, not warn: nothing went wrong, and the caller asked for
@@ -406,12 +437,34 @@ async fn auto_distill_now(
         tracing::debug!(session = %key, "nothing to distill (this chat has no turns)");
         return DistillAttempt::NothingToDistill;
     }
-    match crate::distill::distill_with_agent(distiller, key, agent).await {
+    // THE CARD IS LAZY (t14). Only a plan that includes the ACP tier has any use
+    // for an agent, so a rules-only pass is handed `None` and runs with an EMPTY
+    // ENABLED SET — the environment the free tier exists for (no agents
+    // configured, no API key). Selecting an agent first made a rules-only pass
+    // fail with `no enabled agent available`, which was the one failure that
+    // could never be true: the rules extractor never touches the card.
+    let card = if plan.acp {
+        let agents = distiller.registry.list_enabled();
+        match crate::distill::select_agent(&agents, agent) {
+            Ok(card) => Some(card.clone()),
+            Err(e) => {
+                tracing::warn!(session = %key, error = %e, "auto-distill failed");
+                return DistillAttempt::Failed;
+            }
+        }
+    } else {
+        None
+    };
+    match distiller
+        .distill_plan(key, card.as_ref(), plan, false)
+        .await
+    {
         Ok(o) => {
             tracing::info!(
                 session = %key,
                 memories = o.memories_written,
                 entities = o.entities_written,
+                source = %o.source,
                 "auto-distilled"
             );
             DistillAttempt::Distilled {
@@ -463,6 +516,9 @@ impl ChatManager {
             registry,
             embedder,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
+            capabilities: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::capability::CapabilityPlane::legacy(),
+            )),
         });
         this.spawn_idle_reaper();
         this
@@ -883,6 +939,7 @@ impl ChatManager {
             last_active: Arc::new(Mutex::new(Instant::now())),
             generating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_injected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            capabilities: std::sync::Arc::clone(&self.capabilities),
             agent_prompt: card.prompt.clone(),
             handoff,
             knowledge: self.knowledge_handle(),
@@ -1049,10 +1106,21 @@ impl ChatManager {
     }
 
     /// Spawn a background distillation for a closed chat (policy-gated).
+    ///
+    /// THE GATE (design §6, §10.3): the effective condition is
+    /// `[distill].auto AND gate(distill_session, true)`, plus the free
+    /// `session_extract_rules` tier, which is opt-in and needs no legacy flag.
+    /// Both are resolved ONCE into an `ExtractPlan` from the live plane; an
+    /// empty plan returns before the spawn, so no agent is selected, no chat
+    /// turn is spent and no `distill_log` row is written.
     fn maybe_auto_distill(&self, id: RunId) {
         let Some(distiller) = self.auto_distiller() else {
             return;
         };
+        let plan = self.unattended_plan();
+        if plan.is_empty() {
+            return;
+        }
         let key = crate::sessions::session_key_of(&self.transcript_path(id));
         let agent = self
             .distill_policy
@@ -1065,8 +1133,19 @@ impl ChatManager {
         // produced the false WARNs (t313).
         let turns = transcript_turns(&self.transcript_path(id));
         tokio::spawn(async move {
-            auto_distill_now(&distiller, &key, agent.as_deref(), turns).await;
+            auto_distill_now(&distiller, &key, agent.as_deref(), turns, plan).await;
         });
+    }
+
+    /// The UNATTENDED extraction plan, resolved from the LIVE plane (t4's seam,
+    /// t8's wiring): `session_extract_rules` is an `enabled` opt-in with no
+    /// legacy flag to narrow, `distill_session` may only narrow `[distill].auto`
+    /// (law L2). Reading the plane per call is what lets a toggle take effect
+    /// without a restart.
+    fn unattended_plan(&self) -> crate::extract_plane::ExtractPlan {
+        let policy_auto = self.distill_policy.read().expect("distill policy").auto;
+        let plane = self.capabilities.read().expect("capability plane").clone();
+        crate::extract_plane::ExtractPlan::unattended(&plane, policy_auto)
     }
 
     /// Switch model. Prefers a live switch (`session/set_config_option`
@@ -1476,11 +1555,18 @@ impl ChatManager {
             .collect()
     }
 
+    /// The distiller for the UNATTENDED path, or `None` when no agent registry
+    /// handle exists.
+    ///
+    /// It deliberately does NOT return `None` for `[distill].auto == false`
+    /// any more (t8): the auto flag is one INPUT to the plan, not the decision.
+    /// `session_extract_rules` is a free, opt-in capability with no legacy flag
+    /// to narrow, so with `auto = false` an operator who enables it still gets
+    /// the deterministic tier — and with the shipped configuration the plan is
+    /// empty, so `maybe_auto_distill` returns before the spawn exactly as
+    /// before.
     fn auto_distiller(&self) -> Option<crate::distill::Distiller> {
         let policy = self.distill_policy.read().expect("distill policy").clone();
-        if !policy.auto {
-            return None;
-        }
         Some(crate::distill::Distiller {
             db: self.db.clone(),
             root: self.root.clone(),
@@ -1501,6 +1587,27 @@ impl ChatManager {
     /// The current live distillation policy (manual distill shares it).
     pub fn distill_policy_now(&self) -> crate::distill::AutoDistill {
         self.distill_policy.read().expect("distill policy").clone()
+    }
+
+    /// The live capability plane. Read it, clone it, drop the guard — never
+    /// hold it across an `.await` (a `std::sync::RwLock`, the same discipline
+    /// `distill_policy` follows).
+    pub fn capabilities(&self) -> crate::capability::CapabilityPlane {
+        self.capabilities.read().expect("capability plane").clone()
+    }
+
+    /// Install/swap the live plane (boot installs what `policy.toml` defines;
+    /// `PUT /api/v1/capabilities` swaps it after writing the file).
+    pub fn set_capabilities(&self, plane: crate::capability::CapabilityPlane) {
+        *self.capabilities.write().expect("capability plane") = plane;
+    }
+
+    /// The shared handle itself, so boot can install the ONE Arc on the
+    /// RunManager (design §4.5) instead of keeping a second copy in sync.
+    pub fn capabilities_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::RwLock<crate::capability::CapabilityPlane>> {
+        std::sync::Arc::clone(&self.capabilities)
     }
 
     /// Chat transcripts live next to run transcripts.
@@ -2169,10 +2276,14 @@ mod t313_tests {
     #[tokio::test]
     async fn a_no_op_is_not_a_failure_and_a_real_one_still_fails() {
         let distiller = distiller_without_agents().await;
-        let quiet = auto_distill_now(&distiller, "ruagent:t313-empty", None, 0).await;
+        // The plan is what the caller resolved from the plane; this test drives
+        // the turn-count and agent-selection paths, so it passes today's
+        // ACP-only plan.
+        let plan = crate::extract_plane::ExtractPlan::acp_only();
+        let quiet = auto_distill_now(&distiller, "ruagent:t313-empty", None, 0, plan).await;
         println!("READING turns=0 => {quiet:?}");
         assert_eq!(quiet, DistillAttempt::NothingToDistill);
-        let real = auto_distill_now(&distiller, "ruagent:t313-real", None, 3).await;
+        let real = auto_distill_now(&distiller, "ruagent:t313-real", None, 3, plan).await;
         println!("READING turns=3 with no enabled agent => {real:?}");
         assert_eq!(real, DistillAttempt::Failed);
     }
@@ -2186,4 +2297,321 @@ mod t313_tests {
     // level itself is a standalone reading recorded in the task output
     // (DEBUG nothing to distill for the no-op; WARN auto-distill failed for the
     // real failure).
+}
+
+/// t8: the UNATTENDED gate, driven through the real `maybe_auto_distill` on a
+/// real ChatManager, in both directions, with `distill_log` as the observable.
+///
+/// WHY THE AGENT CARD POINTS AT A BINARY THAT DOES NOT EXIST: it is the
+/// zero-token proof. If the ACP tier ran, the spawn would fail and the row would
+/// be `failed` (that is exactly what case 4 asserts). Case 2 getting an `ok` row
+/// therefore means the rules tier ran with no agent at all — zero tokens, no
+/// child process, no network.
+#[cfg(test)]
+mod t8_tests {
+    use super::*;
+
+    /// One transcript turn pair, at the path `close` reads for a chat id. The
+    /// sentence carries a PREF marker (`记住`/`以后`), so the deterministic tier
+    /// has something to extract and the row is a real write, not an "empty".
+    const TRANSCRIPT: &str = "{\"ts\":\"2026-09-26T14:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"记住：以后回答都要简洁，不要长篇大论。\"}}\n{\"ts\":\"2026-09-26T14:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"text\":\"understood\"}}\n";
+
+    /// `(home, root)` for one test: `root` is the daemon's home
+    /// (`<home>/.ruagent`), which is also the layout `SessionIndexer` scans
+    /// (`<home>/.ruagent/data/transcripts`), so the transcript below is
+    /// indexable exactly as a real one is.
+    fn t8_root(tag: &str) -> (PathBuf, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let home =
+            std::env::temp_dir().join(format!("ruagent-t8-{tag}-{}-{n}", std::process::id()));
+        let root = home.join(".ruagent");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("data").join("transcripts")).unwrap();
+        std::fs::write(
+            root.join("config").join("agents.toml"),
+            // A real card, an imaginary command: the rules tier never spawns it,
+            // the ACP tier cannot succeed with it.
+            "[agent.t8mock]\nharness = \"mock\"\ncommand = \"definitely-not-a-real-t8-binary\"\ndescription = \"t8\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config").join("mcp.toml"),
+            "[profile.default]\nservers = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config").join("policy.toml"),
+            "[permissions]\ndefault = \"ask\"\n",
+        )
+        .unwrap();
+        (home, root)
+    }
+
+    /// `(session_key, status, failure_reason)` per `distill_log` row, in write
+    /// order. The reason rides along because "failed" without it is exactly the
+    /// opaque reading this repo refuses to ship.
+    async fn rows(db: &ruagent_store::Db) -> Vec<(String, String, String)> {
+        db.call_flat(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT session_key, status, COALESCE(failure_reason, '') FROM distill_log ORDER BY rowid")?;
+            let out = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        })
+        .await
+        .expect("distill_log is readable")
+    }
+
+    async fn wait_for_rows(db: &ruagent_store::Db, want: usize) -> Vec<(String, String, String)> {
+        for _ in 0..60 {
+            let got = rows(db).await;
+            if got.len() >= want {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        rows(db).await
+    }
+
+    #[tokio::test]
+    async fn the_unattended_plan_decides_and_the_default_spends_nothing() {
+        let (home, root) = t8_root("unattended");
+        let cfg = crate::config::DaemonConfig::load(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let card = cfg.agent("t8mock").expect("the card").clone();
+        let manager = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            cfg.mcp.clone(),
+            // TODAY: `[distill].auto` defaults to false.
+            crate::distill::AutoDistill {
+                auto: false,
+                graph: false,
+                ..Default::default()
+            },
+            None,
+            crate::distill::AgentRegistry {
+                enabled: vec![card],
+            },
+        );
+        let id = RunId::generate();
+        let transcript = transcript_path(root.join("data").join("transcripts"), &id);
+        std::fs::write(&transcript, TRANSCRIPT).unwrap();
+        // The distiller reads the SESSION INDEX, not the file: index it the way
+        // boot's scanner does, or every pass fails with "Query returned no rows".
+        crate::sessions::SessionIndexer::new(db.clone(), home.clone())
+            .scan()
+            .await
+            .expect("the transcript indexes");
+        assert!(
+            transcript_turns(&transcript) > 0,
+            "the fixture must have turns, or case 1 would pass for the wrong reason"
+        );
+
+        // (1) THE DEFAULT — legacy plane, auto = false: nothing runs at all,
+        //     not even a failed attempt (a failed attempt WOULD log a row).
+        manager.maybe_auto_distill(id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            rows(&db).await.is_empty(),
+            "the default configuration must distill nothing: {:?}",
+            rows(&db).await
+        );
+
+        // (2) THE FREE TIER, opted in: `session_extract_rules` alone runs the
+        //     deterministic extractor. The row is `ok` although the card's
+        //     command cannot be spawned, so this pass spent zero tokens.
+        manager.set_capabilities(
+            crate::capability::CapabilityPlane::from_policy(
+                &ruagent_policy::PolicyConfig::parse(
+                    "[capabilities.session_extract_rules]\nenabled = true\n",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(manager.unattended_plan().label(), "rules");
+        manager.maybe_auto_distill(id);
+        let got = wait_for_rows(&db, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].1, "ok", "a rules pass needs no agent: {got:?}");
+        // (3) OFF AGAIN — the same close writes nothing new: the capability has
+        //     an observable effect in BOTH directions.
+        manager.set_capabilities(crate::capability::CapabilityPlane::legacy());
+        assert!(manager.unattended_plan().is_empty());
+        manager.maybe_auto_distill(id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(rows(&db).await.len(), 1, "off means no new row");
+
+        // (4) THE LLM TIER IS THE ONLY ACP TRIGGER: with `[distill].auto = true`
+        //     and no table, the ACP turn IS attempted (and fails against a
+        //     command that does not exist) — the paid path is reachable and
+        //     gated by the legacy flag, never by the free tier.
+        manager.set_distill_policy(crate::distill::AutoDistill {
+            auto: true,
+            graph: false,
+            ..Default::default()
+        });
+        assert_eq!(manager.unattended_plan().label(), "acp");
+        manager.maybe_auto_distill(id);
+        let got = wait_for_rows(&db, 2).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1].1, "failed", "the ACP tier was attempted: {got:?}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The other free-tier capability this file owns the gate for: the chat
+    /// injection. The DECISION is `plane.gate(MemoryInjectChat, true)` and it is
+    /// read inside `send_prompt`; the end-to-end proof (a real chat whose
+    /// `context_injected` event carries the memory marker with the capability on
+    /// and not with it off) lives in the t8 live probe and in
+    /// `tests/injection_e2e.rs`, which needs the mock-agent binary.
+    #[test]
+    fn the_chat_injection_gate_reads_the_plane_in_both_directions() {
+        use crate::capability::{CapabilityId, CapabilityPlane};
+        let legacy = CapabilityPlane::legacy();
+        assert!(legacy.gate(CapabilityId::MemoryInjectChat, true));
+        let off = CapabilityPlane::from_policy(
+            &ruagent_policy::PolicyConfig::parse(
+                "[capabilities.memory_inject_chat]\nenabled = false\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!off.gate(CapabilityId::MemoryInjectChat, true));
+        assert_eq!(off.configured(CapabilityId::MemoryInjectChat), "file");
+        // The gate is per-capability: switching injection off does not touch the
+        // run path's own gate.
+        assert!(off.gate(CapabilityId::MemoryInjectRuns, true));
+    }
+
+    /// `memories` row count, so "the free tier WROTE something" is a reading and
+    /// not an inference from a status string.
+    async fn memories_count(db: &ruagent_store::Db) -> i64 {
+        db.call_flat(|conn| conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)))
+            .await
+            .expect("the memories table is readable")
+    }
+
+    /// The one key the indexer produced for the fixture above.
+    async fn only_session_key(db: &ruagent_store::Db) -> String {
+        db.call_flat(|conn| conn.query_row("SELECT key FROM sessions LIMIT 1", [], |r| r.get(0)))
+            .await
+            .expect("the fixture is indexed")
+    }
+
+    /// t14: THE FREE TIER NEEDS NO AGENT AT ALL — not merely "does not spawn the
+    /// one it was handed".
+    ///
+    /// The t8 test above proved a rules pass does not SPAWN its card (the card's
+    /// command does not exist and the row is still `ok`). That is a different
+    /// claim from the one the feature makes: the zero-token tier exists for the
+    /// machine with NO agents configured and no API key, so the shape that matters
+    /// is an EMPTY ENABLED SET. With the agent selected before the plan, exactly
+    /// that machine got `no enabled agent available` — and the auto path did not
+    /// even reach the extractor.
+    #[tokio::test]
+    async fn the_rules_pass_writes_with_every_agent_disabled() {
+        let (home, root) = t8_root("noagent");
+        let cfg = crate::config::DaemonConfig::load(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let manager = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            cfg.mcp.clone(),
+            crate::distill::AutoDistill {
+                auto: false,
+                graph: false,
+                ..Default::default()
+            },
+            None,
+            // EVERY AGENT `enabled = false`: this is the registry the daemon
+            // builds, and it is empty.
+            crate::distill::AgentRegistry::default(),
+        );
+        assert!(
+            manager.registry.list_enabled().is_empty(),
+            "the premise of this test: not one enabled agent"
+        );
+
+        let id = RunId::generate();
+        let transcript = transcript_path(root.join("data").join("transcripts"), &id);
+        std::fs::write(&transcript, TRANSCRIPT).unwrap();
+        crate::sessions::SessionIndexer::new(db.clone(), home.clone())
+            .scan()
+            .await
+            .expect("the transcript indexes");
+        let key = only_session_key(&db).await;
+
+        manager.set_capabilities(
+            crate::capability::CapabilityPlane::from_policy(
+                &ruagent_policy::PolicyConfig::parse(
+                    "[capabilities.session_extract_rules]\nenabled = true\n",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(manager.unattended_plan().label(), "rules");
+
+        manager.maybe_auto_distill(id);
+        let got = wait_for_rows(&db, 1).await;
+        assert_eq!(got.len(), 1, "the pass must record one attempt: {got:?}");
+        assert_eq!(
+            got[0].1, "ok",
+            "a rules pass must SUCCEED with no enabled agent: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|r| r.1 == "failed"),
+            "no failed row may appear: {got:?}"
+        );
+        assert!(
+            memories_count(&db).await > 0,
+            "the free tier must WRITE a memory row, not just log an attempt"
+        );
+
+        // THE OTHER HALF, AND IT MUST NOT REGRESS: a plan that DOES need a model
+        // still fails, visibly, on the same empty registry. Lazy resolution is
+        // not "no agent is fine everywhere".
+        let distiller = crate::distill::Distiller {
+            db: db.clone(),
+            root: root.clone(),
+            embedder: None,
+            registry: crate::distill::AgentRegistry::default(),
+            language: None,
+            prompt_override: None,
+            graph: false,
+        };
+        let before = memories_count(&db).await;
+        let attempt = auto_distill_now(
+            &distiller,
+            &key,
+            None,
+            1,
+            crate::extract_plane::ExtractPlan::acp_only(),
+        )
+        .await;
+        assert_eq!(
+            attempt,
+            DistillAttempt::Failed,
+            "an ACP-only plan with no enabled agent must still fail visibly"
+        );
+        assert_eq!(
+            memories_count(&db).await,
+            before,
+            "a plan that needs an agent must not write anything when it has none"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

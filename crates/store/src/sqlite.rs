@@ -30,7 +30,60 @@ type Op = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
 /// Handle to the single-writer SQLite actor. Cheap to clone.
 #[derive(Clone)]
 pub struct Db {
-    tx: tokio::sync::mpsc::UnboundedSender<Op>,
+    inner: std::sync::Arc<DbInner>,
+}
+
+/// The shared half of a [`Db`]: the channel to the writer thread, plus the means
+/// to shut that thread down IN ORDER when the last handle goes away.
+struct DbInner {
+    /// `Option` so the `Drop` below can CLOSE the channel before joining: a
+    /// struct's fields are dropped only after its `Drop::drop` body runs, so a
+    /// plain sender here would keep the writer's `blocking_recv` alive and the
+    /// join would wait forever.
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Op>>,
+    /// The writer thread. Joined by the `Drop` below.
+    writer: Option<std::thread::JoinHandle<()>>,
+    /// The writer's own id, so the `Drop` can refuse to join itself.
+    writer_id: std::thread::ThreadId,
+}
+
+impl Drop for DbInner {
+    /// ORDERED SHUTDOWN (t8; the race is older than t8 — migration 26 exposed
+    /// it). Closing the channel ends the writer loop, whose last act is a
+    /// best-effort `wal_checkpoint(TRUNCATE)`; the `rusqlite::Connection` — and
+    /// with it the file handle and any WAL lock — lives until that thread
+    /// RETURNS. Before this `Drop`, the last `Db` handle could be dropped and the
+    /// same path reopened while the checkpoint was still running, and the reopen
+    /// failed with `SQLITE_BUSY ... database is locked`
+    /// (`crates/store/tests/ledger_reopen.rs:100`). The window only mattered when
+    /// the reopen had WORK to do: a ledger whose MAX row is gone re-applies the
+    /// highest migration, i.e. it writes, while a reopen with nothing to apply
+    /// only reads. That is why adding migration 26 turned a green test into a
+    /// red one without touching either file.
+    ///
+    /// This is a PRODUCT fix, not a test accommodation: the same window exists
+    /// for any second opener in this process (the CLI opening the database a
+    /// daemon holds is that shape one process over).
+    ///
+    /// NOT on the writer thread itself: an op closure can hold the last `Db`
+    /// clone (`Db::call` hands the closure to the writer), and joining self
+    /// would deadlock. There the join is unnecessary — the thread has already
+    /// passed the point where anyone could race it.
+    fn drop(&mut self) {
+        // CLOSE THE CHANNEL FIRST. The writer loop ends when its receiver sees
+        // the last sender gone; joining before that would wait for ever (and a
+        // queued op is still drained — the receiver ends only after the queue is
+        // empty).
+        self.tx.take();
+        if std::thread::current().id() == self.writer_id {
+            return;
+        }
+        if let Some(handle) = self.writer.take() {
+            // Best effort by design: a writer that panicked must not panic its
+            // last owner, and there is nothing left to report to.
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Db {
@@ -61,7 +114,7 @@ impl Db {
 
     fn spawn_thread(mut conn: rusqlite::Connection) -> Result<Self, DbError> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Op>();
-        std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name("ruagent-db-writer".into())
             .spawn(move || {
                 while let Some(op) = rx.blocking_recv() {
@@ -70,7 +123,14 @@ impl Db {
                 // All handles dropped: best-effort checkpoint before exit.
                 let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
             })?;
-        Ok(Self { tx })
+        let writer_id = writer.thread().id();
+        Ok(Self {
+            inner: std::sync::Arc::new(DbInner {
+                tx: Some(tx),
+                writer: Some(writer),
+                writer_id,
+            }),
+        })
     }
 
     /// Run a closure with the connection on the writer thread and await
@@ -91,7 +151,8 @@ impl Db {
         F: FnOnce(&mut rusqlite::Connection) -> T + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
+        let sender = self.inner.tx.as_ref().ok_or(DbError::Closed)?;
+        sender
             .send(Box::new(move |conn| {
                 let _ = tx.send(f(conn));
             }))
@@ -163,6 +224,45 @@ mod tests {
             let db = Db::open(&path).unwrap();
             let all = db.list_tasks(None).await.unwrap();
             assert_eq!(all.len(), 1);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE WINDOW THIS CRATE USED TO LEAVE OPEN (t8). Dropping the last `Db`
+    /// handle returned before the writer thread's checkpoint had finished, so an
+    /// immediate reopen of the same path raced it. The race only bit when the
+    /// reopen had WORK to do — a ledger whose MAX row is gone re-applies the
+    /// highest migration, i.e. it writes — which is exactly what migration 26
+    /// turned from a read into a write, reddening
+    /// `crates/store/tests/ledger_reopen.rs` with `SQLITE_BUSY ... database is
+    /// locked` while this crate's own code was unchanged.
+    ///
+    /// The fix is the ordered shutdown in `DbInner::drop`, so a reopen after a
+    /// drop must ALWAYS work, not usually: this drives the shape 20 times rather
+    /// than once, because a single pass is what passed before the fix too.
+    #[tokio::test]
+    async fn a_reopen_after_the_last_handle_drops_never_races_the_writer() {
+        let dir = std::env::temp_dir().join(format!("ruagent-db-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reopen.db");
+        for round in 0..20 {
+            let db = Db::open(&path).unwrap_or_else(|e| panic!("round {round}: open failed: {e}"));
+            // The damaged-ledger shape: the MAXIMUM version row is missing, so
+            // the next open must re-apply that migration (a WRITE, not a read).
+            let punched = db
+                .call_flat(|conn| {
+                    conn.execute(
+                        "DELETE FROM schema_migrations
+                          WHERE version = (SELECT MAX(version) FROM schema_migrations)",
+                        [],
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: punch failed: {e}"));
+            assert_eq!(punched, 1, "round {round}: the MAX row must be gone");
+            // No sleep, no retry: the drop itself must make the file reusable.
+            drop(db);
         }
         std::fs::remove_dir_all(&dir).ok();
     }

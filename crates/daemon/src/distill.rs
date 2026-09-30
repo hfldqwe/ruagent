@@ -35,53 +35,57 @@ Respond with ONLY a JSON object, no markdown fences, no commentary:
 Empty arrays are valid. Quality over quantity.
 "#;
 
+/// The extraction agent's wire shape. UNCHANGED by the extractor seam (t4):
+/// the prompt and the JSON contract are the same, and `extract_plane` maps this
+/// onto the seam's candidates. `pub(crate)` so that mapping lives next to the
+/// seam instead of here.
 #[derive(Debug, Default, Deserialize)]
-struct Extraction {
+pub(crate) struct Extraction {
     #[serde(default)]
-    memories: Vec<ExtractedMemory>,
+    pub(crate) memories: Vec<ExtractedMemory>,
     #[serde(default)]
-    entities: Vec<ExtractedEntity>,
+    pub(crate) entities: Vec<ExtractedEntity>,
     #[serde(default)]
-    relations: Vec<ExtractedRelation>,
+    pub(crate) relations: Vec<ExtractedRelation>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ExtractedMemory {
-    store: String,
-    namespace: String,
-    content: String,
+pub(crate) struct ExtractedMemory {
+    pub(crate) store: String,
+    pub(crate) namespace: String,
+    pub(crate) content: String,
     /// 0.5–1.0, from answer-quality signals in the transcript.
     #[serde(default)]
-    confidence: Option<f64>,
+    pub(crate) confidence: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ExtractedEntity {
-    name: String,
+pub(crate) struct ExtractedEntity {
+    pub(crate) name: String,
     #[serde(default)]
-    kind: Option<String>,
+    pub(crate) kind: Option<String>,
     #[serde(default)]
-    summary: Option<String>,
+    pub(crate) summary: Option<String>,
     /// Other spellings of the SAME real-world object. They are written into
     /// `entity_aliases` so a later query for any of them resolves to one node
     /// (gen2: the graph had no alias table, and 4 pairs of live rows were the
     /// same object under two names).
     #[serde(default)]
-    aliases: Vec<String>,
+    pub(crate) aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ExtractedRelation {
-    src: String,
-    dst: String,
-    relation: String,
-    fact: String,
+pub(crate) struct ExtractedRelation {
+    pub(crate) src: String,
+    pub(crate) dst: String,
+    pub(crate) relation: String,
+    pub(crate) fact: String,
     /// T: the EVENT time, when the transcript stated one. `None` means "no event
     /// time is known" and is written as a NULL valid_at source, never as now()
     /// (measured before gen2: 66 of 67 live edges had valid_at == created_at, so
     /// the event-time axis carried no information at all).
     #[serde(default)]
-    valid_at: Option<String>,
+    pub(crate) valid_at: Option<String>,
 }
 
 /// What a memory write pass did, including the episode it attached the writes to.
@@ -104,7 +108,43 @@ pub struct DistillOutcome {
     pub memories_skipped: u32,
     pub entities_written: u32,
     pub relations_written: u32,
+    /// The agent this pass used. EMPTY when none did — a rules-only extraction
+    /// (t14) never touches the registry, so naming an agent here would claim a
+    /// spawn that did not happen; `source` says which tier produced the row.
     pub agent: String,
+    /// WHICH implementation produced this outcome (t4's seam): `"rules"` (zero
+    /// tokens), `"acp"` (one chat turn) or `"rules+acp"`. Additive on the wire —
+    /// the panel reads the six keys above and ignores this one — and it is the
+    /// only way a reader can tell a free extraction from a paid one.
+    pub source: String,
+    /// True when an input was cut to its bound: "we stopped reading" is a
+    /// different fact from "there was nothing there".
+    pub truncated: bool,
+    /// True for a `dry_run`: the extraction ran and the counts are what WOULD be
+    /// written. A dry run writes nothing at all — no memory, no graph row, no
+    /// episode and no `distill_log` row — which is what makes it safe to call at
+    /// any time (§14.3). It is a QUERY about the extraction, not an attempt.
+    pub dry_run: bool,
+}
+
+impl Default for DistillOutcome {
+    fn default() -> Self {
+        Self {
+            session_key: String::new(),
+            memories_written: 0,
+            memories_skipped: 0,
+            entities_written: 0,
+            relations_written: 0,
+            agent: String::new(),
+            // Today's only implementation, and the one every pre-seam caller
+            // asked for; a plan that runs something else says so explicitly.
+            source: crate::extract_plane::ExtractSource::Acp
+                .as_str()
+                .to_string(),
+            truncated: false,
+            dry_run: false,
+        }
+    }
 }
 
 /// The [distill] policy from policy.toml. The graph flag arrives
@@ -190,25 +230,65 @@ impl AgentRegistry {
 impl Distiller {
     /// The full extraction prompt: base (built-in or `[distill] prompt`
     /// override) + the optional language clause + the transcript tail.
-    fn compose_prompt(&self) -> String {
+    ///
+    /// `pub(crate)` because the ACP half of the extractor seam lives in
+    /// `crate::extract_plane` (t4); the prompt itself is unchanged.
+    pub(crate) fn compose_prompt(&self) -> String {
         extraction_prompt(self.language.as_deref(), self.prompt_override.as_deref())
     }
-    /// Distill one session: run the extraction prompt through the given
-    /// agent (one ACP chat turn), then write the results into memory
-    /// and — unless graph extraction is off — the entity graph.
+
+    /// Distill one session with TODAY'S single implementation: one ACP chat turn.
     ///
-    /// EVERY attempt now leaves a row in `distill_log`, including a failed one
-    /// (gen2 G9/D4). Measured before this change: in one daemon.log window there
-    /// were 22 distillation attempts and 21 of them failed, while the DATABASE
-    /// held exactly one row for that same window -- the failure rate lived only
-    /// in the log file, so no query could read it.
+    /// Every pre-seam caller (auto-distill on session close, the manual route
+    /// with no body) goes through here, and through `distill_plan` with
+    /// `ExtractPlan::acp_only()`, so its behaviour is exactly what it was.
     pub async fn distill(
         &self,
         session_key: &str,
         card: &ruagent_core::AgentCard,
     ) -> Result<DistillOutcome> {
+        self.distill_plan(
+            session_key,
+            Some(card),
+            crate::extract_plane::ExtractPlan::acp_only(),
+            false,
+        )
+        .await
+    }
+
+    /// Distill one session through the extractor seam with the plan the CALLER
+    /// resolved from the capability plane (t4).
+    ///
+    /// The plan is data, so this function does not branch on which
+    /// implementation runs — that is the whole point of the seam. `dry_run`
+    /// extracts and reports without writing anything anywhere (no memory, no
+    /// graph row, no episode, no `distill_log` row): it prices the extraction.
+    ///
+    /// THE CARD IS OPTIONAL, AND `None` IS NOT A DEGRADED MODE (t14): only a
+    /// plan that includes the ACP tier has anything to do with an agent, so a
+    /// rules-only plan is handed `None` and never looks at the registry. Before
+    /// t14 every caller selected an agent FIRST, which made the free tier
+    /// unusable in the exact environment it exists for — no agents configured,
+    /// no API key — and answered `no enabled agent available` for a pass that
+    /// would not have spawned anything. A plan that DOES enable the ACP tier
+    /// with `None` is a programming error and is refused by name, never
+    /// silently degraded to the free tier (see `extract_plane::extract`).
+    pub async fn distill_plan(
+        &self,
+        session_key: &str,
+        card: Option<&ruagent_core::AgentCard>,
+        plan: crate::extract_plane::ExtractPlan,
+        dry_run: bool,
+    ) -> Result<DistillOutcome> {
         let prompt_hash = ruagent_memory::write::content_hash(&self.compose_prompt());
-        match self.distill_once(session_key, card).await {
+        if dry_run {
+            // A price is not a purchase: no episode is created either, because a
+            // `run_turn` episode is what the panel reads as "this session was
+            // distilled".
+            let (outcome, _status) = self.distill_once(session_key, card, plan, true).await?;
+            return Ok(outcome);
+        }
+        match self.distill_once(session_key, card, plan, false).await {
             Ok((outcome, status)) => {
                 self.log_outcome(&outcome, status, &prompt_hash, None)
                     .await?;
@@ -224,11 +304,13 @@ impl Distiller {
                     .log_outcome(
                         &DistillOutcome {
                             session_key: session_key.to_string(),
-                            memories_written: 0,
-                            memories_skipped: 0,
-                            entities_written: 0,
-                            relations_written: 0,
-                            agent: card.name.clone(),
+                            // Empty when no card was resolved: a rules-only pass
+                            // has no agent to name, and inventing one would be a
+                            // worse lie than the absence. `source` says which
+                            // tier produced the row.
+                            agent: card.map(|c| c.name.clone()).unwrap_or_default(),
+                            source: plan.label().to_string(),
+                            ..DistillOutcome::default()
                         },
                         "failed",
                         &prompt_hash,
@@ -246,47 +328,84 @@ impl Distiller {
         }
     }
 
-    /// The body of one distillation, split out so `distill` can record the
+    /// The body of one distillation, split out so `distill_plan` can record the
     /// outcome of every path through it (including the error path).
+    ///
+    /// THE SEAM IS HERE: this function builds the context, hands it to
+    /// `crate::extract_plane::extract` together with the plan, and writes the
+    /// resulting bundle. It never asks which implementation ran — a
+    /// rule-derived candidate and an LLM-derived one are the same three
+    /// vectors by the time they arrive.
     async fn distill_once(
         &self,
         session_key: &str,
-        card: &ruagent_core::AgentCard,
+        card: Option<&ruagent_core::AgentCard>,
+        plan: crate::extract_plane::ExtractPlan,
+        dry_run: bool,
     ) -> Result<(DistillOutcome, &'static str)> {
-        let transcript = self.render_transcript(session_key).await?;
+        let messages = self.load_messages(session_key).await?;
+        let transcript = render_transcript(&messages);
         if transcript.is_empty() {
             anyhow::bail!("session has no messages to distill");
         }
-
-        let full_prompt = self.compose_prompt();
-        let raw = self
-            .ask_agent(card, &format!("{full_prompt}{transcript}"))
-            .await
-            .context("distillation agent run failed")?;
-        let extraction = parse_extraction(&raw)?;
-
-        let mem = self
-            .write_memories(&extraction.memories, Some((session_key, &transcript)))
-            .await?;
-        // graph = false: memories only; entities/relations count 0 and
-        // the log still records the run.
-        let (ent_w, rel_w) = if self.graph {
-            self.write_extraction(&extraction, mem.episode).await?
+        // The free tier reads turns; the ACP tier reads the rendered transcript.
+        // Loading turns only when the plan asks for them keeps today's path free
+        // of work it did not do before.
+        let turns: Vec<ruagent_extract::Turn> = if plan.rules {
+            turns_of(&messages)
         } else {
-            (0, 0)
+            Vec::new()
+        };
+        let cx = crate::extract_plane::ExtractCtx {
+            session_key,
+            transcript: &transcript,
+            turns: &turns,
+            limits: plan.limits,
+        };
+        // THE ACP IMPLEMENTATION EXISTS ONLY WHEN A CARD DOES (t14): a
+        // rules-only plan passes `None` here, so no agent card is needed to run
+        // it. A plan that enables the llm tier without a card is refused by the
+        // seam itself (`ExtractError::Acp`, "the plan enables the ACP tier but
+        // no extractor was supplied"), which is why this is a mapping and not a
+        // second guard to keep in step.
+        let acp = card.map(|card| crate::extract_plane::AcpExtractor {
+            distiller: self,
+            card,
+        });
+        let bundle = crate::extract_plane::extract(&cx, plan, acp)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // A dry run reports what WOULD be written and writes nothing: no
+        // episode, no memory, no graph row.
+        let (mem, ent_w, rel_w) = if dry_run {
+            (
+                MemoryWriteOutcome {
+                    written: bundle.memories.len() as u32,
+                    skipped: 0,
+                    episode: None,
+                },
+                bundle.entities.len() as u32,
+                bundle.relations.len() as u32,
+            )
+        } else {
+            let mem = self
+                .write_memories(&bundle.memories, Some((session_key, &transcript)))
+                .await?;
+            // graph = false: memories only; entities/relations count 0 and
+            // the log still records the run.
+            let (ent_w, rel_w) = if self.graph {
+                self.write_extraction(&bundle, mem.episode).await?
+            } else {
+                (0, 0)
+            };
+            (mem, ent_w, rel_w)
         };
 
         // Three states, not two (D5): an extraction that returned NOTHING is a
         // different fact from one whose memories were all duplicates of rows
         // that already existed.
-        let status = if extraction.memories.is_empty()
-            && extraction.entities.is_empty()
-            && extraction.relations.is_empty()
-        {
-            "empty"
-        } else {
-            "ok"
-        };
+        let status = if bundle.is_empty() { "empty" } else { "ok" };
         Ok((
             DistillOutcome {
                 session_key: session_key.to_string(),
@@ -294,7 +413,13 @@ impl Distiller {
                 memories_skipped: mem.skipped,
                 entities_written: ent_w,
                 relations_written: rel_w,
-                agent: card.name.clone(),
+                // Empty when no agent card was resolved, i.e. on a rules-only
+                // pass (t14): the free tier has no agent, and `source` is the
+                // field that says which implementation produced this row.
+                agent: card.map(|c| c.name.clone()).unwrap_or_default(),
+                source: plan.label().to_string(),
+                truncated: bundle.truncated,
+                dry_run,
             },
             status,
         ))
@@ -335,10 +460,10 @@ impl Distiller {
     /// rather than asserting the log writer and calling the claim proved.
     async fn write_extraction(
         &self,
-        extraction: &Extraction,
+        bundle: &crate::extract_plane::ExtractBundle,
         episode: Option<i64>,
     ) -> Result<(u32, u32)> {
-        match self.write_graph(extraction, episode).await {
+        match self.write_graph(bundle, episode).await {
             Ok(counts) => Ok(counts),
             Err(e) => {
                 if let Some(ep) = episode {
@@ -516,25 +641,6 @@ impl Distiller {
         ))
     }
 
-    /// The transcript rendered as plain turns for the extraction prompt.
-    async fn render_transcript(&self, session_key: &str) -> Result<String> {
-        let messages = self.load_messages(session_key).await?;
-        Ok(messages
-            .iter()
-            .map(|m| {
-                format!(
-                    "[{}] {}: {}",
-                    chrono::DateTime::from_timestamp_millis(m.ts)
-                        .map(|d| d.format("%m-%d %H:%M").to_string())
-                        .unwrap_or_default(),
-                    if m.role == "user" { "User" } else { "Agent" },
-                    m.text
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"))
-    }
-
     /// One-shot ACP run: spawn the agent, ask, collect the reply.
     /// Shared with the wiki builder (design §6.1: same single-call
     /// discipline, no tool loops for unattended jobs).
@@ -635,7 +741,7 @@ impl Distiller {
     /// session reuses the same episode.
     async fn write_memories(
         &self,
-        memories: &[ExtractedMemory],
+        memories: &[ruagent_extract::MemoryCandidate],
         provenance: Option<(&str, &str)>,
     ) -> Result<MemoryWriteOutcome> {
         let episode = match provenance {
@@ -662,7 +768,7 @@ impl Distiller {
         let mut written = 0u32;
         let mut skipped = 0u32;
         for m in memories {
-            let store = normalize_store(&m.store);
+            let store = normalize_store(m.store.as_str());
             let namespace = if m.namespace.is_empty() {
                 default_namespace(&store).to_string()
             } else {
@@ -726,17 +832,31 @@ impl Distiller {
                     store: store_t,
                     namespace: ns_t,
                     content: content.clone(),
-                    // ONE RULE, IN ONE PLACE (t8 contract): the value the
-                    // extraction reported is kept VERBATIM, and this writer no
-                    // longer silently raises it to a floor of 0.5. Before this
-                    // change `clamp(0.5, 1.0)` made `< 0.5` unreachable on every
-                    // production path (live reading: 0 of 157 rows), so the
-                    // hedged-confidence signal the prompt asks for (0.4) could
-                    // never appear in the data. `None` = the extraction said
-                    // nothing, which is the unconfirmed default.
+                    // ONE RULE, IN ONE PLACE (t8 contract): the SIGNAL the
+                    // extraction reported is turned into a number HERE and
+                    // nowhere else, and this writer no longer silently raises it
+                    // to a floor of 0.5. Before this change `clamp(0.5, 1.0)`
+                    // made `< 0.5` unreachable on every production path (live
+                    // reading: 0 of 157 rows), so the hedged-confidence signal
+                    // the prompt asks for (0.4) could never appear in the data.
+                    // `Unconfirmed` is the "the extraction said nothing" signal
+                    // and is exactly the old `None` branch (0.8).
                     confidence: ruagent_memory::confidence::confidence(&match m.confidence {
-                        Some(v) => ruagent_memory::confidence::ConfidenceSignals::explicit(v),
-                        None => ruagent_memory::confidence::ConfidenceSignals::unconfirmed(),
+                        ruagent_extract::CandidateConfidence::Confirmed => {
+                            ruagent_memory::confidence::ConfidenceSignals::confirmed()
+                        }
+                        ruagent_extract::CandidateConfidence::Corrected => {
+                            ruagent_memory::confidence::ConfidenceSignals::corrected()
+                        }
+                        ruagent_extract::CandidateConfidence::Hedged => {
+                            ruagent_memory::confidence::ConfidenceSignals::hedged()
+                        }
+                        ruagent_extract::CandidateConfidence::Unconfirmed => {
+                            ruagent_memory::confidence::ConfidenceSignals::unconfirmed()
+                        }
+                        ruagent_extract::CandidateConfidence::Explicit(v) => {
+                            ruagent_memory::confidence::ConfidenceSignals::explicit(v)
+                        }
                     }),
                     source_episode: episode,
                     supersedes,
@@ -775,7 +895,11 @@ impl Distiller {
     /// `episode` is the id `write_memories` attached to this run's memories: the
     /// SAME raw session material backs both stores, so an edge can answer "which
     /// session said this" (before gen2: 0 of 67 edges had any source at all).
-    async fn write_graph(&self, ex: &Extraction, episode: Option<i64>) -> Result<(u32, u32)> {
+    async fn write_graph(
+        &self,
+        bundle: &crate::extract_plane::ExtractBundle,
+        episode: Option<i64>,
+    ) -> Result<(u32, u32)> {
         // ONE transaction for the whole graph half (t81, audit #1). Building the
         // graph item by item -- an `upsert_entity_with_aliases` per entity and an
         // `upsert_fact` per relation, each its own closure through the
@@ -786,23 +910,23 @@ impl Distiller {
         // `run_turn_failed`: the badge was honest and the graph was not.
         // `apply_extraction` drives the SAME per-item rules inside one
         // transaction, so a failure now leaves the graph exactly as it was.
-        let entities: Vec<ruagent_graph::ExtractEntity> = ex
+        let entities: Vec<ruagent_graph::ExtractEntity> = bundle
             .entities
             .iter()
             .map(|e| ruagent_graph::ExtractEntity {
                 name: e.name.clone(),
-                kind: e.kind.clone(),
+                kind: e.kind.map(str::to_string),
                 summary: e.summary.clone(),
                 aliases: e.aliases.clone(),
             })
             .collect();
-        let facts: Vec<ruagent_graph::ExtractFact> = ex
+        let facts: Vec<ruagent_graph::ExtractFact> = bundle
             .relations
             .iter()
             .map(|r| ruagent_graph::ExtractFact {
                 src: r.src.clone(),
                 dst: r.dst.clone(),
-                relation: r.relation.clone(),
+                relation: r.relation.relation_literal().to_string(),
                 fact_text: r.fact.clone(),
                 valid_at: r.valid_at.clone(),
                 event_time_source: if r.valid_at.is_some() {
@@ -854,12 +978,49 @@ fn normalize_store(s: &str) -> String {
     }
 }
 
+/// The transcript rendered as plain turns for the extraction prompt — the exact
+/// string the ACP tier appends to its prompt and the free tier reads as text.
+fn render_transcript(messages: &[crate::sessions::SessionMessage]) -> String {
+    messages
+        .iter()
+        .map(|m| {
+            format!(
+                "[{}] {}: {}",
+                chrono::DateTime::from_timestamp_millis(m.ts)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default(),
+                if m.role == "user" { "User" } else { "Agent" },
+                m.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The same messages as the free tier's [`ruagent_extract::Turn`]s. The role is
+/// normalised here, at the boundary (`user` / everything else is the agent),
+/// because the extractor's rule table filters on the role.
+fn turns_of(messages: &[crate::sessions::SessionMessage]) -> Vec<ruagent_extract::Turn> {
+    messages
+        .iter()
+        .map(|m| ruagent_extract::Turn {
+            role: if m.role == "user" {
+                ruagent_extract::Role::User
+            } else {
+                ruagent_extract::Role::Assistant
+            },
+            text: m.text.clone(),
+            ts_ms: m.ts,
+        })
+        .collect()
+}
+
 fn default_namespace(store: &str) -> &'static str {
     if store == "profile" { "user" } else { "global" }
 }
 
 /// Strip markdown fences / commentary the agent may have added.
-fn parse_extraction(raw: &str) -> Result<Extraction> {
+pub(crate) fn parse_extraction(raw: &str) -> Result<Extraction> {
     let trimmed = raw.trim();
     let body = if let Some(start) = trimmed.find('{') {
         let end = trimmed
@@ -1023,12 +1184,15 @@ mod t329_tests {
         }
     }
 
-    fn mem(content: &str) -> ExtractedMemory {
-        ExtractedMemory {
-            store: "profile".to_string(),
+    fn mem(content: &str) -> ruagent_extract::MemoryCandidate {
+        ruagent_extract::MemoryCandidate {
+            store: ruagent_extract::CandidateStore::Profile,
             namespace: "user".to_string(),
             content: content.to_string(),
-            confidence: None,
+            confidence: ruagent_extract::CandidateConfidence::Unconfirmed,
+            rule: "acp",
+            origin: Default::default(),
+            source: String::new(),
         }
     }
 
@@ -1202,32 +1366,38 @@ mod t329_tests {
     /// tuple here turns into a red gate for whoever owns that command).
     type EdgeRow = (String, Option<i64>, Option<String>, Option<String>);
 
+    /// The ACP wire shape, mapped through the extractor seam's own mapping — so
+    /// these graph tests exercise the SAME conversion the production path uses
+    /// (t4), instead of a second copy that could drift from it.
     fn extraction(
         entities: &[(&str, &[&str])],
         relations: &[(&str, &str, &str, &str, Option<&str>)],
-    ) -> Extraction {
-        Extraction {
-            memories: Vec::new(),
-            entities: entities
-                .iter()
-                .map(|(name, aliases)| ExtractedEntity {
-                    name: name.to_string(),
-                    kind: Some("tool".to_string()),
-                    summary: Some(format!("{name} summary")),
-                    aliases: aliases.iter().map(|a| a.to_string()).collect(),
-                })
-                .collect(),
-            relations: relations
-                .iter()
-                .map(|(src, relation, dst, fact, valid_at)| ExtractedRelation {
-                    src: src.to_string(),
-                    dst: dst.to_string(),
-                    relation: relation.to_string(),
-                    fact: fact.to_string(),
-                    valid_at: valid_at.map(str::to_string),
-                })
-                .collect(),
-        }
+    ) -> crate::extract_plane::ExtractBundle {
+        crate::extract_plane::bundle_of_acp(
+            &Extraction {
+                memories: Vec::new(),
+                entities: entities
+                    .iter()
+                    .map(|(name, aliases)| ExtractedEntity {
+                        name: name.to_string(),
+                        kind: Some("tool".to_string()),
+                        summary: Some(format!("{name} summary")),
+                        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                    })
+                    .collect(),
+                relations: relations
+                    .iter()
+                    .map(|(src, relation, dst, fact, valid_at)| ExtractedRelation {
+                        src: src.to_string(),
+                        dst: dst.to_string(),
+                        relation: relation.to_string(),
+                        fact: fact.to_string(),
+                        valid_at: valid_at.map(str::to_string),
+                    })
+                    .collect(),
+            },
+            "ruagent:test",
+        )
     }
 
     /// G3/E5: the edges of one distillation point at the SAME episode its
@@ -1335,6 +1505,7 @@ mod t329_tests {
             entities_written: 2,
             relations_written: 1,
             agent: "dsh".into(),
+            ..DistillOutcome::default()
         };
         d.log_outcome(&ok, "ok", "hash-a", None).await.unwrap();
         d.log_outcome(
@@ -1345,6 +1516,7 @@ mod t329_tests {
                 entities_written: 0,
                 relations_written: 0,
                 agent: "dsh".into(),
+                ..DistillOutcome::default()
             },
             "failed",
             "hash-a",
@@ -1439,6 +1611,7 @@ mod t329_tests {
                 entities_written: 0,
                 relations_written: 0,
                 agent: "dsh".into(),
+                ..DistillOutcome::default()
             },
             "failed",
             "hash-b",
@@ -1482,6 +1655,7 @@ mod t329_tests {
                 entities_written: 0,
                 relations_written: 0,
                 agent: "dsh".into(),
+                ..DistillOutcome::default()
             },
             "empty",
             "hash-c",
@@ -1784,9 +1958,9 @@ mod t329_tests {
         let root = root("t9-confidence");
         let d = distiller(&root).await;
         let mut hedged = mem("用户可能偏好简体中文。");
-        hedged.confidence = Some(0.4);
+        hedged.confidence = ruagent_extract::CandidateConfidence::Explicit(0.4);
         let mut unstated = mem("用户使用双屏显示器。");
-        unstated.confidence = None;
+        unstated.confidence = ruagent_extract::CandidateConfidence::Unconfirmed;
         let out = d
             .write_memories(
                 &[hedged, unstated],

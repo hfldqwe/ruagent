@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "name": "correction_beats_the_agents_wrong_answer",
+      "turns": [
+        {"role": "user", "text": "Rust 的 async 是怎么调度的？"},
+        {"role": "assistant", "text": "可能是用 green thread 实现的，我觉得大概是这样。"},
+        {"role": "user", "text": "不对，应该是用 work-stealing 的 executor。"}
+      ],
+      "expect": [
+        {"rule": "user_correction", "store": "observation", "content": "不对，应该是用 work-stealing 的 executor。", "confidence": "Corrected"}
+      ],
+      "expect_suppressed": ["hedged_statement"]
+    },
+    {
+      "name": "confirmed_preference",
+      "turns": [
+        {"role": "user", "text": "以后统一用简体中文回复我。"},
+        {"role": "user", "text": "对，就是这样。"}
+      ],
+      "expect": [
+        {"rule": "user_preference", "store": "profile", "content": "以后统一用简体中文回复我。", "confidence": "Unconfirmed"},
+        {"rule": "user_preference", "store": "profile", "content": "对，就是这样。", "confidence": "Confirmed"}
+      ]
+    },
+    {
+      "name": "assistant_how_to_becomes_procedures",
+      "turns": [
+        {"role": "assistant", "text": "安装步骤很简单。首先要配置 Cargo.toml，然后执行 cargo build。"}
+      ],
+      "expect": [
+        {"rule": "procedure_note", "store": "procedure", "content": "安装步骤很简单。", "confidence": "Unconfirmed"},
+        {"rule": "procedure_note", "store": "procedure", "content": "首先要配置 Cargo.toml，然后执行 cargo build。", "confidence": "Unconfirmed"}
+      ]
+    },
+    {
+      "name": "a_hedged_procedure_carries_both_signals",
+      "turns": [
+        {"role": "assistant", "text": "可能要执行 cargo test，不过我不确定。"}
+      ],
+      "expect": [
+        {"rule": "hedged_statement", "store": "observation", "content": "可能要执行 cargo test，不过我不确定。", "confidence": "Hedged"},
+        {"rule": "procedure_note", "store": "procedure", "content": "可能要执行 cargo test，不过我不确定。", "confidence": "Hedged"}
+      ]
+    },
+    {
+      "name": "a_question_is_not_a_candidate",
+      "turns": [
+        {"role": "user", "text": "记住 zip 工具的用法？"}
+      ],
+      "expect": []
+    },
+    {
+      "name": "suppression_is_one_turn_only",
+      "turns": [
+        {"role": "assistant", "text": "教训是要先跑 cargo fmt。那个坑很容易踩。"},
+        {"role": "assistant", "text": "可能要执行 cargo test。"},
+        {"role": "user", "text": "不对，应该是先跑 clippy。"}
+      ],
+      "expect": [
+        {"rule": "lesson_learned", "store": "lesson", "content": "教训是要先跑 cargo fmt。", "confidence": "Unconfirmed"},
+        {"rule": "lesson_learned", "store": "lesson", "content": "那个坑很容易踩。", "confidence": "Unconfirmed"},
+        {"rule": "user_correction", "store": "observation", "content": "不对，应该是先跑 clippy。", "confidence": "Corrected"}
+      ],
+      "expect_suppressed": ["hedged_statement", "procedure_note"]
+    },
+    {
+      "name": "a_preference_without_a_first_person_marker_is_an_observation",
+      "turns": [
+        {"role": "user", "text": "以后统一用 pnpm 安装依赖。"}
+      ],
+      "expect": [
+        {"rule": "user_preference", "store": "observation", "content": "以后统一用 pnpm 安装依赖。", "confidence": "Unconfirmed"}
+      ]
+    },
+    {
+      "name": "a_decision_about_a_tool_is_a_procedure",
+      "turns": [
+        {"role": "user", "text": "决定就用 cargo 做构建工具。"}
+      ],
+      "expect": [
+        {"rule": "user_decision", "store": "procedure", "content": "决定就用 cargo 做构建工具。", "confidence": "Unconfirmed"}
+      ]
+    },
+    {
+      "name": "english_markers_are_case_insensitive_and_content_stays_verbatim",
+      "turns": [
+        {"role": "user", "text": "Please remember that I prefer tabs over spaces."}
+      ],
+      "expect": [
+        {"rule": "user_preference", "store": "profile", "content": "Please remember that I prefer tabs over spaces.", "confidence": "Unconfirmed"}
+      ]
+    }
+  ]
+}

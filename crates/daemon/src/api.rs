@@ -88,6 +88,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/memory/search", get(memory_search))
         .route("/api/v1/memory/list", get(memory_list))
         .route("/api/v1/knowledge/ingest", post(knowledge_ingest))
+        // KB -> graph ingestion (t4): a REAL ingest needs the free
+        // `knowledge_ingest_graph` capability (OFF by default); `dry_run` prices
+        // it and is always allowed.
+        .route(
+            "/api/v1/knowledge/graph/ingest",
+            post(knowledge_graph_ingest),
+        )
+        .route(
+            "/api/v1/knowledge/graph/ingest/status",
+            get(knowledge_graph_ingest_status),
+        )
         .route("/api/v1/knowledge/search", get(knowledge_search))
         .route("/api/v1/knowledge/documents", get(knowledge_documents))
         .route(
@@ -145,6 +156,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/distill",
             get(distill_policy_get).put(distill_policy_put),
+        )
+        // The capability plane (docs/plans/capability-plugins-design.md §14).
+        // The handlers live in `crate::capability` so this file keeps only the
+        // route lines; `GET` lists every capability, `PUT` replaces the whole
+        // `[capabilities]` table and swaps the live plane.
+        .route(
+            "/api/v1/capabilities",
+            get(crate::capability::list_capabilities).put(crate::capability::update_capabilities),
         )
         .route("/api/v1/directory/pick", post(pick_directory))
         .route("/api/v1/chat", post(chat_start).get(chat_list))
@@ -328,7 +347,10 @@ impl ApiError {
         }
     }
 
-    fn bad_request(msg: impl Into<String>) -> Self {
+    /// 400 with a message that names the field, id or key that was refused.
+    /// `pub(crate)` because the capability handlers live in their own module
+    /// (`crate::capability`) and must answer with this daemon's error shape.
+    pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
@@ -344,7 +366,9 @@ impl ApiError {
         }
     }
 
-    fn conflict(msg: impl Into<String>) -> Self {
+    /// 409: understood and permitted, but refused on a cost/consent ground
+    /// (the llm-tier capability gate, design §14.2).
+    pub(crate) fn conflict(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: msg.into(),
@@ -2722,10 +2746,58 @@ async fn distill_policy_put(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// The optional body of `POST /api/v1/sessions/{key}/distill` (t4, §14.3).
+#[derive(Deserialize)]
+struct DistillBody {
+    #[serde(default)]
+    extractor: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Read the distill request's body EXPLICITLY.
+///
+/// WHY NOT `Option<Json<DistillBody>>`: that shape swallows every rejection, so
+/// a malformed body would silently become "no body" — a silent default, which is
+/// exactly what the capability contract forbids. An empty body still means
+/// today's behaviour (one ACP turn, no dry run), and an unknown `extractor`
+/// value is a 400 naming the value and the accepted ones.
+fn distill_request(body: &[u8]) -> Result<(crate::extract_plane::ExtractPlan, bool), ApiError> {
+    if body.is_empty() {
+        return Ok((
+            crate::extract_plane::ExtractPlan::explicit(crate::extract_plane::Extractor::Acp),
+            false,
+        ));
+    }
+    let parsed: DistillBody = serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("distill body is not JSON: {e}")))?;
+    let extractor = match parsed.extractor.as_deref() {
+        None => crate::extract_plane::Extractor::Acp,
+        Some(value) => crate::extract_plane::Extractor::parse(value)
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?,
+    };
+    // MANUAL distillation is NOT capability-gated (§3.7): it is an explicit
+    // human/agent instruction, so `ExtractPlan::explicit` runs what was asked
+    // for. `extractor: "rules"` is the zero-token choice.
+    Ok((
+        crate::extract_plane::ExtractPlan::explicit(extractor),
+        parsed.dry_run,
+    ))
+}
+
+/// `POST /api/v1/sessions/{key}/distill` with the optional body of §14.3 (t4).
+///
+/// The body is OPTIONAL and read as raw bytes: an empty body is today's
+/// behaviour — one ACP chat turn, through the extractor seam with
+/// `ExtractPlan::explicit(Acp)` — and `{"extractor":"rules"|"acp"|"both",
+/// "dry_run":bool}` names the implementation. `dry_run` extracts and reports
+/// without writing anything at all.
 async fn session_distill(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (plan, dry_run) = distill_request(&body)?;
     // The live policy decides: its agent, else dsh, else the first
     // enabled; its language/prompt ride the extraction prompt.
     let policy = state.chats.distill_policy_now();
@@ -2738,12 +2810,25 @@ async fn session_distill(
         prompt_override: policy.prompt,
         graph: policy.graph,
     };
-    let agents = state.mgr.agents();
-    let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
-    let card = crate::distill::select_agent(&enabled, policy.agent.as_deref())
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // THE AGENT CARD IS RESOLVED LAZILY (t14): it is the ACP tier's business, so a
+    // plan the caller built from `{"extractor":"rules"}` must NOT need one. Until
+    // this, the free tier was unreachable on a machine with no enabled agent —
+    // the exact machine it is for — and answered 400 to a request that was never
+    // going to spawn anything. An ACP plan with no enabled agent still fails
+    // here, visibly, naming the reason; that requirement is unchanged.
+    let card = if plan.acp {
+        let agents = state.mgr.agents();
+        let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
+        Some(
+            crate::distill::select_agent(&enabled, policy.agent.as_deref())
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+                .clone(),
+        )
+    } else {
+        None
+    };
     let out = distiller
-        .distill(&key, card)
+        .distill_plan(&key, card.as_ref(), plan, dry_run)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({ "distilled": out })))
@@ -2767,6 +2852,27 @@ struct RecallQuery {
     /// x-ruagent-recall-source header). Omitted = unknown, recorded as NULL.
     #[serde(default)]
     source: Option<String>,
+}
+
+/// One recall leg's capability id, for the response and the log (t5).
+///
+/// THE ONE MAPPING from the engine's typed legs to the registry's ids, and the only
+/// place the ids are spelled in this flow — `CapabilityId::as_str()` supplies the
+/// strings, so a rename in the registry cannot leave a stale literal behind here
+/// (a second hardcoded list is what t10's "no second list shadowing the registry"
+/// item rejects). The engine deliberately names no id at all.
+fn recall_leg_id(leg: crate::memembed::RecallLeg) -> &'static str {
+    use crate::capability::CapabilityId;
+    use crate::memembed::RecallLeg;
+    match leg {
+        RecallLeg::MemorySemantic => CapabilityId::RecallLegMemorySemantic,
+        RecallLeg::MemoryFts => CapabilityId::RecallLegMemoryFts,
+        RecallLeg::KnowledgeSemantic => CapabilityId::RecallLegKnowledgeSemantic,
+        RecallLeg::KnowledgeFts => CapabilityId::RecallLegKnowledgeFts,
+        RecallLeg::Wiki => CapabilityId::RecallLegWiki,
+        RecallLeg::Graph => CapabilityId::RecallLegGraph,
+    }
+    .as_str()
 }
 
 /// `GET /api/v1/recall?q=...&top_n=N[&strategy=...][&min_score=...][&source=...]`
@@ -2799,16 +2905,62 @@ async fn recall(
     // correctly, and "probe" would stop meaning anything.
     let source = declared_source(&q.source, &headers)?;
 
+    // t5: THE RECALL LEG CONFIGURATION, read from the live plane ONCE.
+    //
+    // One read, one value, passed into every leg producer below: a leg cannot be
+    // half-off because two call sites resolved it differently, and a leg that is off
+    // is never queried (`recall_memories_with` / `search_page_with` gate the CALL,
+    // not the results — the embedding and the SQL are the costs).
+    //
+    // `legacy = true` for all six: every one of them is today's behaviour (design
+    // L1/L2), so the plane can only NARROW what this handler does.
+    let plane = state.chats.capabilities();
+    let leg =
+        |id: crate::capability::CapabilityId| (plane.gate(id, true), plane.options(id).weight);
+    let legs = match crate::memembed::RecallLegConfig::resolve(
+        leg(crate::capability::CapabilityId::RecallLegMemorySemantic),
+        leg(crate::capability::CapabilityId::RecallLegMemoryFts),
+        leg(crate::capability::CapabilityId::RecallLegKnowledgeSemantic),
+        leg(crate::capability::CapabilityId::RecallLegKnowledgeFts),
+        plane.gate(crate::capability::CapabilityId::RecallLegWiki, true),
+        plane.gate(crate::capability::CapabilityId::RecallLegGraph, true),
+    ) {
+        Ok(legs) => legs,
+        Err(e) => {
+            return Err(ApiError::bad_request(format!(
+                "recall leg configuration is invalid: {e}"
+            )));
+        }
+    };
+    // The capability ids of the legs this call did NOT query, sorted — the ONE
+    // reason a response can be empty for a reason other than "nothing matched".
+    // The ids come from the registry (`CapabilityId::as_str`), never from a second
+    // list spelled here or in the engine.
+    let legs_disabled: Vec<&'static str> = legs
+        .disabled_legs()
+        .into_iter()
+        .map(recall_leg_id)
+        .collect();
+    // `recall_leg_memory_semantic.min_score` (design §11.2): unset ⇒ today's
+    // per-strategy floor; set ⇒ it overrides BOTH strategies, because a caller who
+    // names a number means it.
+    let mem_min_score = plane
+        .options(crate::capability::CapabilityId::RecallLegMemorySemantic)
+        .min_score
+        .map(|v| v as f32)
+        .unwrap_or(if conservative { 0.30 } else { 0.25 });
+
     // Memories: BOTH legs, fused on one scale, bounded by top_n. Before t251
     // the handler took the semantic leg, seeded a seen-set from it and APPENDED
     // keyword rows that were not in that set -- a concatenation, bounded by
     // 2 * top_n, with no score at all on the keyword rows.
-    let mem_legs = crate::memembed::recall_memories(
+    let mem_legs = crate::memembed::recall_memories_with(
         state.mgr.db(),
         state.knowledge.embedder(),
         &q.q,
         top_n,
-        if conservative { 0.30 } else { 0.25 },
+        mem_min_score,
+        &legs.memory,
     )
     .await;
 
@@ -2829,7 +2981,7 @@ async fn recall(
     // (two passes that could disagree) and had no scale to report at all.
     let page = state
         .knowledge
-        .search_page(&q.q, search_n)
+        .search_page_with(&q.q, search_n, &legs.knowledge)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
     let leg_window = page.evidence.leg_window as i64;
@@ -2841,7 +2993,13 @@ async fn recall(
             w_keyword,
         } => format!("rrf:k={k},w_semantic={w_semantic},w_keyword={w_keyword}"),
     };
-    let kw_stage = Some(keyword_stage_label(&page.evidence.keyword_stage));
+    // The stage label is composed from the page's producer state AND the leg
+    // configuration this call passed: with the keyword leg off the label is
+    // "disabled", never "empty" (t12 / design §11.3).
+    let kw_stage = Some(keyword_stage_label(
+        &page.evidence.keyword_stage,
+        legs.knowledge.keyword,
+    ));
     let ranked: Vec<ruagent_knowledge::store::RankedHit> = page.hits;
     // The scale of the top score, its window and the calibration version, taken
     // from the SAME page the score came from (H-2: a score without its scale is
@@ -2872,7 +3030,14 @@ async fn recall(
         .partition(|h| h.document.starts_with("wiki/"));
     let wiki_hits: Vec<_> = wiki_hits.into_iter().take(top_n as usize).collect();
     let hits: Vec<_> = hits.into_iter().take(top_n as usize).collect();
-    let out_wiki = crate::wiki::recall_stubs(state.knowledge.as_ref(), &wiki_hits);
+    // The wiki leg (§11.3): OFF ⇒ `"wiki": []` and `wiki::recall_stubs` is never
+    // called. The partition above still keeps `wiki/…` documents out of
+    // `knowledge` (that is a filter over hits already retrieved, not a query).
+    let out_wiki = if legs.wiki {
+        crate::wiki::recall_stubs(state.knowledge.as_ref(), &wiki_hits)
+    } else {
+        Vec::new()
+    };
     let parents = state
         .knowledge
         .parents_for(&hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>())
@@ -2886,41 +3051,54 @@ async fn recall(
     // legs), followed by one retrieval so the counts below are the production
     // path's own reading — and they are what lands in `recall_log.graph_entities`
     // / `graph_paths` (DEP-3).
-    let seeds = ruagent_graph::resolve_seeds(state.mgr.db(), &q.q, top_n)
+    //
+    // t5: the whole block is gated. OFF ⇒ `resolve_seeds`, `retrieve` and the
+    // per-entity `current_facts` pass are NOT called (four SQL paths per entity,
+    // and the `search`/`fts_related` probes under them), and the response reports
+    // the NEW literal `"leg disabled"` — deliberately not one of `EmptyReason`'s
+    // values, which mean "the walk ran and found nothing".
+    let (graph_edges_total, graph_paths, graph_empty_reason, graph_truncated_by, entities) = if legs
+        .graph
+    {
+        let seeds = ruagent_graph::resolve_seeds(state.mgr.db(), &q.q, top_n)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+        let graph_evidence = ruagent_graph::retrieve(
+            state.mgr.db(),
+            &ruagent_graph::GraphQuery::for_text(q.q.clone()),
+        )
         .await
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    let graph_evidence = ruagent_graph::retrieve(
-        state.mgr.db(),
-        &ruagent_graph::GraphQuery::for_text(q.q.clone()),
-    )
-    .await
-    .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    // NOT "the edge count at the instant": the graph's total size, constant
-    // across `as_of` (RV-C). Recorded for provenance, never read as temporal.
-    let graph_edges_total = graph_evidence.stats.graph_edges as i64;
-    let graph_paths = graph_evidence.stats.paths_emitted as i64;
-    let graph_truncated_by = graph_evidence
-        .stats
-        .truncated_by
-        .map(|t| format!("{t:?}").to_lowercase());
-    let graph_empty_reason = graph_evidence
-        .stats
-        .empty_reason
-        .map(|r| format!("{r:?}").to_lowercase());
+        // NOT "the edge count at the instant": the graph's total size, constant
+        // across `as_of` (RV-C). Recorded for provenance, never read as temporal.
+        let edges_total = graph_evidence.stats.graph_edges as i64;
+        let paths = graph_evidence.stats.paths_emitted as i64;
+        let truncated_by = graph_evidence
+            .stats
+            .truncated_by
+            .map(|t| format!("{t:?}").to_lowercase());
+        let empty_reason = graph_evidence
+            .stats
+            .empty_reason
+            .map(|r| format!("{r:?}").to_lowercase());
+        let mut seen_entities: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let entities: Vec<ruagent_graph::Entity> = seeds
+            .into_iter()
+            .filter(|s| seen_entities.insert(s.entity.id))
+            .map(|s| s.entity)
+            .collect();
+        (edges_total, paths, empty_reason, truncated_by, entities)
+    } else {
+        (0, 0, Some("leg disabled".to_string()), None, Vec::new())
+    };
     // The telemetry closure is `move`, so the response keeps its own copies of
     // these two (they are reported in BOTH places on purpose).
     let graph_empty_resp = graph_empty_reason.clone();
     let graph_truncated_resp = graph_truncated_by.clone();
-    let mut seen_entities: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let entities: Vec<ruagent_graph::Entity> = seeds
-        .into_iter()
-        .filter(|s| seen_entities.insert(s.entity.id))
-        .map(|s| s.entity)
-        .collect();
     let graph_entities = entities.len() as i64;
     let mut entity_facts: std::collections::HashMap<i64, Vec<(String, String, String)>> =
         std::collections::HashMap::new();
-    {
+    if legs.graph {
         // id -> name for rendering edge endpoints.
         let names: std::collections::HashMap<i64, String> = state
             .mgr
@@ -3020,11 +3198,18 @@ async fn recall(
         ));
     }
     // §12-2: the entity→wiki soft link, computed once for all hits
-    // (one pass over the wiki dir, not one per entity).
-    let related_wiki = crate::wiki::entity_related_pages(
-        state.knowledge.as_ref(),
-        &entities.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
-    );
+    // (one pass over the wiki dir, not one per entity). With the graph leg OFF
+    // there are no entities to link, so the pass is skipped rather than run over
+    // an empty list — the cost of a leg that is off must be zero, and it reads the
+    // same either way.
+    let related_wiki = if legs.graph {
+        crate::wiki::entity_related_pages(
+            state.knowledge.as_ref(),
+            &entities.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+        )
+    } else {
+        std::collections::HashMap::new()
+    };
     let mut out_entities: Vec<serde_json::Value> = Vec::new();
     for e in entities {
         let facts = entity_facts
@@ -3179,6 +3364,12 @@ async fn recall(
             "leg_window": leg_window,
             "fusion": fusion_label.clone(),
             "ranked_page": ranked.len(),
+            // t5: which legs this call did NOT query. NOT on `top_legs_json`: that
+            // column is a JSON ARRAY (one entry per ranked hit), so a key would
+            // change its shape for every existing reader — a default-config wire
+            // change, which is what this increment forbids. The object it lands in
+            // is the log's candidate-provenance row, which grows with the fusion.
+            "disabled_legs": legs_disabled.clone(),
         })
         .to_string();
         let selected_json = serde_json::json!({
@@ -3283,6 +3474,11 @@ async fn recall(
             "empty_reason": graph_empty_resp,
             "truncated_by": graph_truncated_resp,
         },
+        // t5: the legs this call did not query, sorted, config-derived. A reader can
+        // now tell "nothing matched" from "nothing was asked for" — without it an
+        // all-off recall is an empty success that looks like a retrieval miss
+        // (design §11.3/§11.4).
+        "legs_disabled": legs_disabled,
         "memories": out_memories,
         // What each memory leg did. Before t251 the response could not
         // distinguish "the keyword leg added nothing" from "the keyword leg was
@@ -3524,8 +3720,26 @@ fn declared_source(
 /// Round for display without inventing precision: RRF scores live around 1/61,
 /// so two decimals would collapse every fused row onto the same number.
 /// The keyword leg's construction, as a stable lower-case label
-/// (t261: precision -> prefix -> substring; "empty" = nothing matched).
-fn keyword_stage_label(stage: &ruagent_knowledge::store::KeywordStage) -> String {
+/// (t261: precision -> prefix -> bigram -> substring; "empty" = the leg RAN and
+/// found nothing).
+///
+/// t12: `keyword_leg_enabled` is the CONFIGURATION the endpoint holds, not a
+/// producer state. A deliberately switched-off leg reports `"disabled"`, so "you
+/// turned this off" cannot be read as "this ran and found nothing" — the whole
+/// point of a switch being visibly a switch (design §11.3).
+///
+/// WHY THE OVERRIDE LIVES HERE AND NOT IN THE ENUM: `KeywordStage` is the
+/// producer's own state, and `crates/knowledge` never sees a configuration — it
+/// only knows what the legs it ran produced. Adding a `Disabled` variant would put
+/// a CONSUMER's concern into a producer's state enum, so the label is composed at
+/// the endpoint, from the leg config it passed to `search_page_with`.
+fn keyword_stage_label(
+    stage: &ruagent_knowledge::store::KeywordStage,
+    keyword_leg_enabled: bool,
+) -> String {
+    if !keyword_leg_enabled {
+        return "disabled".to_string();
+    }
     format!("{stage:?}").to_lowercase()
 }
 
@@ -4570,6 +4784,97 @@ async fn knowledge_ingest(
     ))
 }
 
+/// `POST /api/v1/knowledge/graph/ingest?document=NAME[&dry_run=true]`
+///
+/// Knowledge base → knowledge graph ingestion (docs/plans §13), behind the free
+/// `knowledge_ingest_graph` capability. THE CAPABILITY IS OFF BY DEFAULT, so
+/// with the shipped configuration a REAL ingest is REFUSED (409, naming the id
+/// and both remedies) instead of writing entities behind the user's back; the
+/// knowledge base keeps behaving exactly as it does today (file + chunks).
+///
+/// * no `document` → a sweep, bounded by the capability's `max_docs_per_pass`
+///   (default 20), in `(created_at DESC, id ASC)` order;
+/// * `document=NAME` → that one document; `NAME` is the markdown path under
+///   `<root>/knowledge` with the `.md` suffix removed, and either spelling works;
+/// * `dry_run=true` → extract and count, write nothing, record nothing. ALWAYS
+///   allowed, capability or not: pricing the ingestion before turning it on is
+///   what `dry_run` exists for (§13.4).
+///
+/// NOTHING ON THIS PATH CALLS A MODEL. The capability is free tier and the
+/// extraction is `ruagent_extract::graph_candidates` — a pure function. There is
+/// no ACP run, no agent spawn and no network call to be found here; the writes
+/// are SQLite and `crates/graph` only.
+#[derive(Deserialize)]
+struct GraphIngestQuery {
+    #[serde(default)]
+    document: Option<String>,
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+async fn knowledge_graph_ingest(
+    State(state): State<AppState>,
+    Query(q): Query<GraphIngestQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let plane = state.chats.capabilities();
+    let dry_run = q.dry_run.unwrap_or(false);
+    let opts = crate::knowledge_graph::IngestOptions {
+        dry_run,
+        ..crate::knowledge_graph::options_of(&plane)
+    };
+    if !dry_run && !plane.enabled(crate::capability::CapabilityId::KnowledgeIngestGraph) {
+        let id = crate::capability::CapabilityId::KnowledgeIngestGraph.as_str();
+        return Err(ApiError::conflict(format!(
+            "capability `{id}` is off: a real ingest writes entities and relations for the \
+             knowledge documents. Add `[capabilities.{id}] enabled = true` (free tier, zero \
+             tokens), or resend with `dry_run=true` to price it first."
+        )));
+    }
+    let db = state.mgr.db().clone();
+    let report = match q
+        .document
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(name) => crate::knowledge_graph::ingest_document(&db, &state.knowledge, name, &opts)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?,
+        None => crate::knowledge_graph::sweep(&db, &state.knowledge, &opts)
+            .await
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?,
+    };
+    let mut body = serde_json::to_value(&report).unwrap_or_default();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("dry_run".into(), serde_json::Value::Bool(dry_run));
+    }
+    Ok(Json(serde_json::json!({ "ingest": body })))
+}
+
+/// `GET /api/v1/knowledge/graph/ingest/status?limit=N`
+///
+/// "Is my knowledge base in the graph?" — the ledger's totals plus its newest
+/// rows (one per document, so this is also the list of documents already
+/// ingested). Read-only: it works whether or not the capability is enabled and
+/// never triggers extraction.
+#[derive(Deserialize)]
+struct GraphIngestStatusQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn knowledge_graph_ingest_status(
+    State(state): State<AppState>,
+    Query(q): Query<GraphIngestStatusQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db = state.mgr.db().clone();
+    let limit = q.limit.unwrap_or(20).clamp(1, 500);
+    let ledger = crate::knowledge_graph::ledger_status(&db, limit)
+        .await
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "ledger": ledger })))
+}
+
 /// `GET /api/v1/knowledge/search?q=...&limit=N[&legs=false]`
 ///
 /// Every hit carries the per-leg evidence (t290): `legs`, `semantic_rank`,
@@ -4628,7 +4933,10 @@ async fn knowledge_search(
             w_keyword,
         } => format!("rrf:k={k},w_semantic={w_semantic},w_keyword={w_keyword}"),
     };
-    let kw_stage = Some(keyword_stage_label(&page.evidence.keyword_stage));
+    // This endpoint runs the DEFAULT leg configuration (`search_page`), so the
+    // keyword leg always ran: `true` here is not an assumption but the config this
+    // request used. Only the recall endpoint can report "disabled" (t12).
+    let kw_stage = Some(keyword_stage_label(&page.evidence.keyword_stage, true));
     let scoring_version = page
         .hits
         .first()
@@ -4747,6 +5055,51 @@ fn sse_end(status: RunStatus) -> Result<Event, Infallible> {
 
 #[cfg(test)]
 mod tests {
+    use crate::extract_plane::{ExtractPlan, Extractor};
+
+    /// t4: the manual distill route's optional body (§14.3). An EMPTY body is
+    /// today's behaviour — one ACP turn, no dry run — and a malformed or unknown
+    /// value is refused by name, never swallowed into "no body".
+    #[test]
+    fn the_distill_body_names_the_extractor_and_refuses_what_it_does_not_know() {
+        // `ApiError` is not `Debug` (it is rendered by `IntoResponse`), so a
+        // refused body is unwrapped through its message.
+        fn ok(body: &[u8]) -> (ExtractPlan, bool) {
+            match distill_request(body) {
+                Ok(parsed) => parsed,
+                Err(e) => panic!("expected a parsed distill body, got: {}", e.message),
+            }
+        }
+
+        assert_eq!(ok(b""), (ExtractPlan::explicit(Extractor::Acp), false));
+        assert_eq!(
+            ok(br#"{"extractor":"rules"}"#),
+            (ExtractPlan::explicit(Extractor::Rules), false)
+        );
+        assert_eq!(
+            ok(br#"{"extractor":"both","dry_run":true}"#),
+            (ExtractPlan::explicit(Extractor::Both), true)
+        );
+        assert_eq!(
+            ok(br#"{"dry_run":true}"#),
+            (ExtractPlan::explicit(Extractor::Acp), true),
+            "an omitted extractor is the documented default, not a silent one"
+        );
+
+        let err = distill_request(br#"{"extractor":"llm"}"#).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("llm"), "{}", err.message);
+        assert!(
+            err.message.contains("rules"),
+            "lists the values: {}",
+            err.message
+        );
+
+        let err = distill_request(b"{not json").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("JSON"), "{}", err.message);
+    }
+
     /// t350: the badge is derived from the episode KIND. The two kinds that
     /// exist on this machine are the two that matter: a session distillation
     /// (RunTurn) and the episode the t347 prefix migration created (Manual,
@@ -4903,8 +5256,20 @@ mod tests {
     }
 
     async fn harness() -> (Router, ruagent_store::Db, std::path::PathBuf) {
+        harness_with_agents(None).await
+    }
+
+    /// `agents_toml`: written BEFORE the config is loaded, so the registry the
+    /// state is built from is exactly this text (t14 drives a registry whose
+    /// every agent is `enabled = false`).
+    async fn harness_with_agents(
+        agents_toml: Option<&str>,
+    ) -> (Router, ruagent_store::Db, std::path::PathBuf) {
         let root = harness_root();
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        if let Some(text) = agents_toml {
+            std::fs::write(root.join("config").join("agents.toml"), text).unwrap();
+        }
         let cfg = DaemonConfig::load(&root).unwrap();
         let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
         let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
@@ -4986,6 +5351,125 @@ mod tests {
             .iter()
             .find(|s| s["key"] == key)
             .cloned()
+    }
+
+    /// Index one session whose transcript is a REAL file, the way the indexer
+    /// does (`seed` above points at a path that does not exist, which is fine for
+    /// a listing test and useless for a route that reads the file).
+    async fn seed_transcript(db: &ruagent_store::Db, key: &str, path: &std::path::Path) {
+        let key = key.to_string();
+        let path = path.to_string_lossy().into_owned();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                     (key, source, title, project, ref_path, started_at, updated_at,
+                      mtime_ms, size_bytes, message_count, preview)
+                 VALUES (?1,'ruagent',?2,'/w',?3,1,2,2,3,4,'p')",
+                rusqlite::params![key, "t14", path],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    /// The `distill_log` status of every attempt for one session, in write order.
+    async fn distill_statuses(db: &ruagent_store::Db, key: &str) -> Vec<String> {
+        let key = key.to_string();
+        db.call_flat(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT status FROM distill_log WHERE session_key = ?1 ORDER BY id")?;
+            let rows = stmt.query_map([&key], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn memories_written_count(db: &ruagent_store::Db) -> i64 {
+        db.call_flat(|conn| conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    /// t14: THE MANUAL ROUTE'S FREE TIER MUST NOT NEED AN AGENT.
+    ///
+    /// `{"extractor":"rules"}` names the zero-token implementation, which never
+    /// touches an agent card; the machine it exists for is the one with NO agent
+    /// enabled and no API key. Until the card was made lazy, this route selected
+    /// an agent BEFORE consulting the plan and answered 400 `no enabled agent
+    /// available` to a request that would have spawned nothing — the free tier
+    /// was unreachable exactly where it was meant to work.
+    ///
+    /// The other half is asserted in the same drive: `{"extractor":"acp"}` on the
+    /// SAME registry still refuses, by name. Lazy resolution must not become a
+    /// silent success for a plan that does need a model.
+    #[tokio::test]
+    async fn the_manual_rules_route_runs_with_every_agent_disabled() {
+        // One agent exists and is DISABLED: the registry the daemon builds from
+        // `enabled = false` is empty, which is the shape this test is about.
+        let (app, db, root) = harness_with_agents(Some(
+            "[agent.t14none]\nharness = \"mock\"\ncommand = \"definitely-not-a-real-t14-binary\"\ndescription = \"t14: exists, disabled\"\nenabled = false\n",
+        ))
+        .await;
+
+        let key = "ruagent:t14-no-agent";
+        let file = root.join("data").join("transcripts").join("run-t14.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // A PREF marker (`记住`/`以后`) is what the deterministic tier extracts;
+        // without one the pass would be `empty` and prove nothing.
+        std::fs::write(
+            &file,
+            "{\"ts\":\"2026-09-26T14:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"记住：以后回答都要简洁，不要长篇大论。\"}}\n\
+             {\"ts\":\"2026-09-26T14:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"text\":\"understood\"}}\n",
+        )
+        .unwrap();
+        seed_transcript(&db, key, &file).await;
+
+        let (st, json, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/sessions/{key}/distill"),
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(json["distilled"]["source"], "rules", "{raw}");
+        assert_eq!(
+            json["distilled"]["agent"], "",
+            "a rules pass names no agent: {raw}"
+        );
+        assert!(
+            json["distilled"]["memories_written"].as_u64().unwrap_or(0) > 0,
+            "the free tier must WRITE, not just answer 200: {raw}"
+        );
+        assert!(
+            memories_written_count(&db).await > 0,
+            "a memory row must exist after the rules pass"
+        );
+        let statuses = distill_statuses(&db, key).await;
+        assert_eq!(statuses, vec!["ok".to_string()], "{statuses:?}");
+
+        // THE CONTROL: the ACP tier on the same empty registry still refuses, and
+        // says why. It must NOT turn into a success just because the free tier now
+        // runs cardless.
+        let (st, _json, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/sessions/{key}/distill"),
+            Some(serde_json::json!({ "extractor": "acp" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+        assert!(
+            raw.contains("no enabled agent available"),
+            "the refusal must name the reason: {raw}"
+        );
+        assert_eq!(
+            distill_statuses(&db, key).await,
+            vec!["ok".to_string()],
+            "a refused request writes no log row"
+        );
     }
 
     /// POST/GET with a JSON body, for routes that take one.

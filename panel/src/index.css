@@ -1930,6 +1930,11 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
 /* Distillation settings card (Memory → 蒸馏 tab) ----------------------- */
 .distill-settings { max-width: 760px; display: flex; flex-direction: column; gap: 16px; }
 .distill-settings .chat-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+
+/* Capability plane card (#settings, below the distillation card) — the SAME
+   plate, not a second layout: one narrow column at the 760px readability cap,
+   so the two cards of this page read as one page (view-settings §2). */
+.capabilities-settings { max-width: 760px; display: flex; flex-direction: column; gap: 10px; }
 /* t243: the prompt's opener. The same box as the old <details> summary (8px
    block padding keeps the row at 32px - row 18 measured 26px at 4px), but a
    button: the prompt opens in a dialog now instead of unfolding inside the

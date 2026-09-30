@@ -227,6 +227,15 @@ pub struct RunManager {
     /// in tests that do not need retrieval, which yields no knowledge block
     /// rather than a second embedder decision.
     knowledge: Mutex<Option<Arc<ruagent_knowledge::Knowledge>>>,
+    /// The daemon's ONE capability-plane handle (t8), shared with the
+    /// ChatManager: `lib.rs` installs `chats.capabilities_handle()` here, so a
+    /// runtime `PUT /api/v1/capabilities` narrows the next run prompt too and
+    /// there is still exactly one plane in the process.
+    ///
+    /// `None` — a test harness that never installs one — is LEGACY: every gate
+    /// answers with today's behaviour (law L1). Optional by construction, the
+    /// same reason `knowledge` is.
+    capabilities: Mutex<Option<Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>>>,
 }
 
 impl RunManager {
@@ -284,6 +293,7 @@ impl RunManager {
                 })
                 .collect(),
             knowledge: Mutex::new(None),
+            capabilities: Mutex::new(None),
         }
     }
 
@@ -310,6 +320,24 @@ impl RunManager {
     /// The handle, if one was set.
     fn knowledge_handle(&self) -> Option<Arc<ruagent_knowledge::Knowledge>> {
         self.knowledge.lock().expect("knowledge lock").clone()
+    }
+
+    /// Hand the manager the ONE capability-plane handle the daemon built at
+    /// boot (t8). A setter, not a `new()` parameter, for exactly the reason
+    /// `set_knowledge` is one: `RunManager::new` is called from eleven places,
+    /// and the handle is delivered once, at boot.
+    pub fn set_capabilities(
+        &self,
+        caps: Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>,
+    ) {
+        *self.capabilities.lock().expect("capabilities lock") = Some(caps);
+    }
+
+    /// The shared capability handle, if boot installed one.
+    fn capabilities_handle(
+        &self,
+    ) -> Option<Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>> {
+        self.capabilities.lock().expect("capabilities lock").clone()
     }
 
     /// The agents.toml editor (registry write API).
@@ -710,6 +738,11 @@ impl RunManager {
         // Resolved OUTSIDE the spawned task: the supervisor is a 'static task,
         // so it cannot borrow self. One Arc clone, captured by the closure.
         let knowledge = self.knowledge_handle();
+        // The capability handle rides the same way (t8). The gate is evaluated
+        // when the prompt is COMPOSED, not when the run was accepted: a run that
+        // waited on its harness gate must see the configuration that is in force
+        // when it actually starts.
+        let capabilities = self.capabilities_handle();
         // The gate permit rides the supervisor: it releases when the
         // run reaches any terminal state (design §8.3). A queued run
         // waits for the gate here — cancellable — before it consumes
@@ -768,7 +801,20 @@ impl RunManager {
             };
             run.workspace = Some(cwd.to_string_lossy().into_owned());
 
-            let mut injection = render_run_injection(&db, &task, knowledge.as_deref()).await;
+            // `memory_inject_runs` gates the retrieval block of a run prompt
+            // (design §6, §12): off means the injected string is empty and the
+            // stores are not queried at all — the role identity and the retry
+            // prefix below still ride, because they are the run's own context,
+            // not evidence pulled from memory/knowledge/graph.
+            let mut injection = if gate_of(
+                &capabilities,
+                crate::capability::CapabilityId::MemoryInjectRuns,
+                true,
+            ) {
+                render_run_injection(&db, &task, knowledge.as_deref()).await
+            } else {
+                String::new()
+            };
             // Attempt-history context (a retry's crash snapshot) rides
             // as context — visible in the ContextInjected render, never
             // as user speech.
@@ -1849,6 +1895,24 @@ const RUN_KNOWLEDGE_SEARCH_N: u32 = 12;
 /// context_injected events in the transcripts carried a knowledge block -- the
 /// retrieval was built and nothing injected it. This is the injection half.
 ///
+/// The capability gate for one id, given the shared handle (t8).
+///
+/// NO HANDLE = LEGACY: a manager that was never given the process's one plane
+/// answers with what today's code would do, which is law L1 and the reason the
+/// handle is optional. This is the only place in this module that turns the
+/// handle into a decision, so the "read it, drop the guard" discipline lives in
+/// one line rather than at every call site.
+fn gate_of(
+    handle: &Option<Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>>,
+    id: crate::capability::CapabilityId,
+    legacy: bool,
+) -> bool {
+    match handle {
+        Some(h) => h.read().expect("capability plane").gate(id, legacy),
+        None => legacy,
+    }
+}
+
 /// The knowledge argument is None when the daemon never handed the manager a
 /// handle (tests, or a boot with no knowledge base). Then the render has no
 /// knowledge block, which is honest -- the alternative would be a second
