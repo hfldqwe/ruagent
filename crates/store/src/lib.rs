@@ -10,7 +10,7 @@ pub mod migrations;
 pub mod sqlite;
 pub mod transcript;
 
-pub use sqlite::{Db, DbError};
+pub use sqlite::{Db, DbError, WriterState};
 pub use transcript::{TranscriptWriter, read_transcript, transcript_path};
 
 use chrono::{DateTime, Utc};

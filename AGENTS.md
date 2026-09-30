@@ -192,6 +192,28 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   machine until the baseline says otherwise. Do not bypass a gate that is red for a reason that might
   be yours, and never report a gate as green when you ran it only with the bypass (or did not run it):
   say which command produced which reading.
+- **With `CARGO_NET_OFFLINE=true`, this workspace fails to LINK on ONNX — so it reads as a source
+  regression in a crate you never touched** (ruagent-close-the-gaps t14, from the increment-7 migration
+  work). `cargo test --workspace` dies at link time with `link.exe` **error 1120** and unresolved
+  `OrtGetApiBase` inside `ruagent-knowledge`, `ruagent-daemon` and siblings, on a diff that touches
+  none of them — the shape a source regression has, not a configuration one. Cause, from `ort-sys`'s own
+  build-script output: with the flag set it emits `cargo:rustc-cfg=link_error_generic` and **never emits
+  its `rustc-link-search`** for the prebuilt ONNX Runtime, so the linker never sees the library even
+  though it is PRESENT at `C:\Users\19410\AppData\Local\ort.pyke.io` (~341 MB `onnxruntime.lib`) — the
+  red is not a missing download. Remedy, measured as a before/after pair rather than inferred: **do not
+  set `CARGO_NET_OFFLINE` for this workspace** — unset it if a shell or wrapper sets it. The same command
+  that died at link with the flag set linked in 14.96 s once it was removed. If you see this link error,
+  suspect the environment before the diff: it is the same class as the proxy red above — the red names
+  code the change does not touch — and the same discipline applies, but the tell is HERE rather than
+  there: a link error in an ONNX-dependent crate outranks a baseline diff. **The obvious next move for
+  that red makes it look like a different bug, so it is recorded here too:** pointing `ort-sys` at a
+  library yourself with `ORT_LIB_LOCATION` makes it **skip its DirectML link directives**, and the
+  link then dies with `LNK2019` on `DMLCreateDevice1` inside onnxruntime's DirectML provider
+  factory — a DIFFERENT unresolved symbol, for a DIFFERENT reason, on the same untouched diff.
+  The configuration that works is the plain one: **no ort environment override at all, with
+  `CARGO_NET_OFFLINE` unset** (measured, not inferred: the same command links in ~16 s).
+  Both shapes are environment, not source — a second unresolved symbol is not evidence that the first
+  reading was wrong.
 - **Cite a task by concept, or qualify the id with its team generation** (recall-dev, increment 3).
   Comments in this repo cite team task ids — `t5:` alone has 23 references in
   `crates/daemon/src/memembed.rs` — but the runtime allocates ids PER GENERATION, so this generation's
@@ -230,23 +252,29 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
 ## E2E specs that write the daemon's real config
 
 Most of panel/e2e/ is read-only: it drives the panel and the HTTP API and changes nothing.
-**One spec writes real data**, and running it against a daemon whose config matters is a
-data-loss-shaped mistake:
+**Two specs write the daemon's own CONFIG files** (and two more write run-scoped data —
+`panel/e2e/write-guard.ts` carries the complete list). Running any of them against a daemon
+whose config matters is a data-loss-shaped mistake:
 
 | spec | what it writes |
 | --- | --- |
 | panel/e2e/registry.spec.ts | creates a **runtime** and a **role** in the daemon's own config (agents.toml), through the UI, and deletes them again |
+| panel/e2e/settings-capabilities.spec.ts | edits the `[capabilities]` table of the daemon's own **policy.toml** (a `weight`), through the `#settings` option editor, and restores the table |
 
 Two protections, because one was not enough:
 
 1. **It cannot run by accident.** panel/e2e/write-guard.ts exposes writeAccess(), true only when
    RUAGENT_E2E_ALLOW_WRITES=1. That flag is set by the suite's single entry point,
    npm run test:e2e -> panel/e2e/run-e2e.mjs, and by nothing else. A bare npx playwright test
-   does **not** set it, so the spec skips itself and prints why.
+   does **not** set it, so the spec skips itself and prints why — and each spec passes
+   writeAccess() what IT writes, so the skip reason names the right damage.
 2. **It cannot leave residue.** The cleanup runs from a finally block and calls the API directly
-   (DELETE /api/v1/agents/{name}, DELETE /api/v1/runtimes/{name}) instead of clicking through the
-   UI. The UI path is what failed in practice: the cleanup lived in a later step, so a failure in
-   an earlier step skipped it and left [runtime.e2e-rt] and [agent.e2e-role] behind.
+   instead of clicking through the UI. The UI path is what failed in practice: the cleanup lived
+   in a later step, so a failure in an earlier step skipped it and left [runtime.e2e-rt] and
+   [agent.e2e-role] behind. registry.spec.ts deletes the runtime and the role;
+   settings-capabilities.spec.ts PUTs back the whole `[capabilities]` table it snapshotted
+   (restoring only the row it edited would still leave an empty `[capabilities]` table behind,
+   and the mere presence of that table changes daemon behaviour).
 
 When adding a spec that writes anything, call writeAccess() and test.skip() on it, and add the
 spec to the table above.

@@ -400,7 +400,19 @@ impl ExtractLimits {
 pub struct GraphCandidates {
     pub entities: Vec<EntityCandidate>,
     pub relations: Vec<RelationCandidate>,
-    /// True when the input was cut to `max_text_bytes`.
+    /// True when the pass DROPPED something the caller would otherwise have
+    /// seen. TWO different losses raise it, and it is not a description of
+    /// either one alone:
+    ///
+    /// * the input text was cut to `max_text_bytes` (`bytes_skipped > 0`), and
+    /// * a candidate was dropped at `max_per_input` — the entity cap and the
+    ///   shared entity+relation budget (ruagent-close-the-gaps t17).
+    ///
+    /// It stays `false` when the output merely FILLS the cap with nothing left
+    /// to drop: `exactly 96` is not the same reading as `capped at 96`, and a
+    /// caller deciding whether it saw everything needs the second one.
+    /// `min_score` is not a loss (it is the caller's own ranking setting), so it
+    /// never raises this flag.
     pub truncated: bool,
     pub bytes_skipped: usize,
 }

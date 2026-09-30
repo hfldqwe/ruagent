@@ -380,3 +380,80 @@ fn the_shared_mechanics_are_deterministic() {
         Some("ACP")
     );
 }
+
+/// THE PROPERTY THE PANIC VIOLATED (the full-width-parenthetical panic,
+/// ruagent-close-the-gaps t8). Every string below is well-formed text,
+/// and no well-formed text may panic this crate — so the table is run through the
+/// PUBLIC entry points, not only through the function that was fixed.
+///
+/// What it sweeps: each opener/closer combination of `(`/`）` in each arrangement
+/// (the corpus shape was full-width open + full-width close; the mixed pairs were
+/// never seen in the corpus but are one keystroke away), with a multi-byte body
+/// and a multi-byte outer name, at a document heading and as plain prose; plus
+/// timestamps whose seconds or offset are followed by multi-byte text, wiki
+/// links and code spans next to multi-byte characters.
+///
+/// Bounded and honest about it: this is a hand-built table of the positions where
+/// a byte index can land inside a character, NOT a fuzz corpus over arbitrary
+/// text. It pins the shapes this task found and the neighbours of them.
+#[test]
+fn no_well_formed_multibyte_text_panics_the_extractor() {
+    let mut inputs: Vec<String> = Vec::new();
+    for opener in ['(', '（'] {
+        for closer in [')', '）'] {
+            for body in ["", "x", "中", "😀", "a b", "`code`"] {
+                for outer in ["术语", "Term", "字 词"] {
+                    inputs.push(format!("{outer}{opener}{body}{closer}"));
+                    inputs.push(format!("# {outer}{opener}{body}{closer}\n\n正文。\n"));
+                    inputs.push(format!("[[{outer}{opener}{body}{closer}]] 是 概念。\n"));
+                }
+            }
+        }
+    }
+    inputs.extend(
+        [
+            // The seconds and the offset advanced by a byte count.
+            "2026-09-14T21:39:中文",
+            "2026-09-14T21:39:08中文",
+            "2026-09-14T21:39+中文字",
+            "2026-09-14T21:39+08:00",
+            "2026-09-14T21:39:08+08:00",
+            "2026-09-14T21:39:08.123+08:00",
+            "2026-09-14T21:39:08Z",
+            "2026-09-14T21:39:中",
+            "2026-09-14T21:39:😀",
+            "2026-09-14T21:39+😀😀",
+            "截至 2026-09-14T21:39:08+08:00 有效。",
+            // The same characters next to the other scanners.
+            "`代码`（注释） 是 一种 术语。",
+            "术语（注释） 使用 `代码`。",
+            "字 是 字。字 是 字。",
+            "（前括号）和（后括号）",
+            "😀（emoji）",
+            "（😀）",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+
+    for input in &inputs {
+        let _ = graph_candidates(input, &ExtractLimits::graph_default());
+        let turns = vec![
+            Turn {
+                role: Role::User,
+                text: input.clone(),
+                ts_ms: 0,
+            },
+            Turn {
+                role: Role::Assistant,
+                text: input.clone(),
+                ts_ms: 0,
+            },
+        ];
+        let _ = memory_candidates_with(&turns, &ExtractLimits::default());
+        // The derived identity shapes, which is where the panic surfaced.
+        let _ = text::base_name(input);
+        let _ = text::variants_of(input);
+        let _ = text::iso_datetime(input);
+    }
+}

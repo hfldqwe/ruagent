@@ -47,17 +47,18 @@ property is pinned by `distill_editor_round_trips_preserving_comments`
 **same discipline** (§5).
 
 **2. "`crates/daemon/src/distill.rs` has exactly one extraction path (ACP agent + `EXTRACTION_PROMPT`)" — CONFIRMED for automatic extraction, with two named exceptions.**
-One path: `distill_once` renders the transcript (`render_transcript`, distill.rs:520-536),
+One path: `distill_once` renders the transcript
+(`render_transcript`, distill.rs:1046),
 composes prompt + service-language clause + `"TRANSCRIPT:\n"` (distill.rs:890-902), runs
 **one ACP chat turn** (`ask_agent`, distill.rs:541-625; call at distill.rs:262-265), parses
-one JSON object (`parse_extraction`, distill.rs:862-876) and writes memories then graph
+one JSON object (`parse_extraction`, distill.rs:1086) and writes memories then graph
 (distill.rs:268-277). The prompt is `EXTRACTION_PROMPT` (distill.rs:16-36).
 Exceptions, both outside the automatic path: (a) the wiki builder reuses
 `Distiller::ask_agent` directly (crates/daemon/src/wiki.rs:2373) and never calls
 `distill()` — so `graph: true` in that call site's `Distiller` literal
 (crates/daemon/src/api.rs:945-956, the flag at 955) is inert, as its own comment says (950-952); (b) the graph has
-two *manual* write entry points (`graph_create_entity` api.rs:1165-1189,
-`graph_add_fact` api.rs:1190-1206) served by `POST /api/v1/graph/entity` and
+two *manual* write entry points (`graph_create_entity` api.rs:1271,
+`graph_add_fact` api.rs:1296) served by `POST /api/v1/graph/entity` and
 `POST /api/v1/graph/fact` (api.rs:53-54).
 
 **3. "`knowledge_ingest` writes the markdown file and chunks but never touches `crates/graph`" — CONFIRMED, and it is stronger than it looks.**
@@ -70,7 +71,8 @@ crates/daemon/src/distill.rs:817** (verified by grep: `apply_extraction` appears
 distill.rs:817, in graph/src/lib.rs itself and in graph's own tests only). So no document,
 and no knowledge chunk, has ever written an entity or a relation.
 Nuance not to be confused with this: the wiki has *its own* graph, a link graph between
-generated pages (`link_graph` wiki.rs:2787, `record_graph_reading` wiki.rs:3589, table
+generated pages (`link_graph` wiki.rs:2787,
+`record_graph_reading` wiki.rs:3589, table
 `wiki_graph_readings`). That is not `crates/graph` and must not be counted as KB→graph
 ingestion.
 
@@ -104,7 +106,7 @@ it is **18** (§14).
 `harness_skill_dirs` maps a harness to its skills directory (skills.rs:20-27),
 `parse_skill_md` reads `name`/`description` out of YAML frontmatter (skills.rs:30-52),
 `discover` merges platform-then-project with project winning on name collision
-(skills.rs:56-87), `install_skill` skips on identical `SKILL.md` and otherwise
+(skills.rs:91), `install_skill` skips on identical `SKILL.md` and otherwise
 **wipes and re-copies** the directory (skills.rs:91-109), `sync` fans that out over the
 harnesses (skills.rs:128-144). There is no registry, no version, no enable/disable and no
 lifecycle: skills are files that get copied. The bundled operator skill
@@ -119,7 +121,7 @@ lifecycle: skills are files that get copied. The bundled operator skill
 | G1 | **No capability/plugin mechanism exists at all.** No registry, no enable/disable, no `[capabilities]`, no plugin crate. | `grep -i capabilit` over the tree returns 25 hits, all of them prose comments, docs, `AgentCapabilities` in the mock agent (crates/mock-agent/src/main.rs:43) or the *agent card* comment (crates/daemon/src/config.rs:530). `grep -i plugin` returns 12 hits, all unrelated (test comments, an example `[agent.plugin-dev]` at config.rs:903). `crates/` holds exactly the 11 crates of Cargo.toml:3's `crates/*` glob; there is no `crates/extract`. |
 | G2 | **Knowledge ingest never touches the graph.** | api.rs:4557-4571 (handler), and `apply_extraction`'s only production caller is distill.rs:817. |
 | G3 | **Auto-distill gating is a single boolean with no per-capability control.** | `auto_distiller` returns `None` when `policy.auto` is false (chat.rs:1479-1493, the check at 1481); the spawn is `maybe_auto_distill` (chat.rs:1052-1070) from `close` (chat.rs:997) and the idle reaper (chat.rs:1515-1530, `IDLE_TIMEOUT = 60 min` at chat.rs:438); the background half is `auto_distill_now` (chat.rs:397-427). |
-| G4 | **Memory digest injection is unconditional.** | The first prompt always builds the context (chat.rs:161-237; the once-only flag `memory_injected` at chat.rs:141, swapped at 169-171), through `ChatManager::injection_context` (chat.rs:521-629), whose memory block comes from `memembed::select_injection_memories` (chat.rs:540-550), knowledge from `k.search_page` (chat.rs:562-602) and graph evidence from `ruagent_graph::retrieve` (chat.rs:604-616). The runs path is the same contract with no gate (`render_run_injection`, runs.rs:1856-1930). Note: no symbol named `digest` exists anywhere in the tree (`grep -i digest` = 0 hits) — "memory digest injection" is the requester's name for *this* block. |
+| G4 | **Memory digest injection is unconditional.** | The first prompt always builds the context (chat.rs:161-237; the once-only flag `memory_injected` at chat.rs:141, swapped at 169-171), through `ChatManager::injection_context` (chat.rs:521-629), whose memory block comes from `memembed::select_injection_memories` (chat.rs:540-550), knowledge from `k.search_page` (chat.rs:562-602) and graph evidence from `ruagent_graph::retrieve` (chat.rs:604-616). The runs path is the same contract with no gate (`render_run_injection`, runs.rs:1920). Note: no symbol named `digest` exists anywhere in the tree (`grep -i digest` = 0 hits) — "memory digest injection" is the requester's name for *this* block. |
 | G5 | **Recall legs are always on and are not individually addressable.** | §2.1 claim 4: six always-on legs; `recall_memories` fuses unweighted (memembed.rs:581) and `compute_legs` embeds the query unconditionally (store.rs:766). |
 | G6 | **There is no zero-token extractor.** Every extraction is an ACP chat turn (distill.rs:262) that costs model tokens; the only deterministic machinery in the tree is the graph's *resolution/normalisation* layer (`variants` graph/src/lib.rs:909-926, `acronym` 930-944, `judge_against` 994-1024, `normalize_fact`/`fact_hash` 539-562), which consumes candidates, never produces them. |
 | G7 | **The router's deps understate the real order.** t2…t7 each depend on *this* document only, yet t4/t5 need t2's registry and t3's crate, and t2/t4/t5 all edit `crates/daemon/src/api.rs`. §17 lays the real order out; a task that starts early must stop and report instead of inventing a private interface. |
@@ -136,7 +138,7 @@ lifecycle: skills are files that get copied. The bundled operator skill
    thing permitted is `tokio::spawn` inside an already-existing loop.
 3. **No per-leg switches on the injection paths.** The six recall toggles govern
    `/api/v1/recall` (and therefore MCP `memory_recall`) only. `ChatManager::injection_context`
-   (chat.rs:521) and `render_run_injection` (runs.rs:1856) call the knowledge search with
+   (chat.rs:521) and `render_run_injection` (runs.rs:1920) call the knowledge search with
    `LegConfig::default()`; they are governed by the on/off capabilities `memory_inject_chat`
    and `memory_inject_runs`. Wiring per-leg config into injection is a *named follow-up*, not
    part of this increment.
@@ -425,7 +427,7 @@ impl ChatManager {
   chat.rs:1679/1804/1950/2046, and the 9 test harnesses) therefore keeps compiling
   and keeps today's behaviour — the constructor default *is* law L1.
 * `RunManager` gets the same handle through a `set_capabilities` setter mirroring
-  `set_knowledge` (runs.rs:299-309) — that setter pattern exists precisely because widening
+  `set_knowledge` (runs.rs:316) — that setter pattern exists precisely because widening
   `new()` would edit five files (see the comment at chat.rs:969-976).
 * `DaemonConfig` gains one field, `pub capabilities: CapabilityPlane`, filled in
   `DaemonConfig::load` (config.rs:67-73) from `policy.capabilities`; a load error bails the
@@ -433,7 +435,7 @@ impl ChatManager {
   site is config.rs:67).
 
 `PUT` writes the file **and** swaps the live value, in that order, like
-`distill_policy_put` does (api.rs:2712-2721).
+`distill_policy_put` does (api.rs:2805).
 
 ---
 
@@ -577,11 +579,11 @@ the result re-parses through `PolicyConfig::parse` with the same plane. Then upd
 | capability id | tier | registry default | legacy input (today's switch) | with the table absent | with the table present but no key for it |
 | --- | --- | --- | --- | --- | --- |
 | `memory_inject_chat` | free | `true` | none — always on (chat.rs:169-203) | on (today) | on |
-| `memory_inject_runs` | free | `true` | none — always on (runs.rs:1856) | on (today) | on |
+| `memory_inject_runs` | free | `true` | none — always on (runs.rs:1920) | on (today) | on |
 | `recall_leg_memory_semantic` | free | `true` | none — always on (memembed.rs:572) | on (today) | on |
 | `recall_leg_memory_fts` | free | `true` | none — always on (memembed.rs:573) | on (today) | on |
 | `recall_leg_knowledge_semantic` | free | `true` | none — always on (store.rs:766) | on (today) | on |
-| `recall_leg_knowledge_fts` | free | `true` | none — always on (store.rs:796) | on (today) | on |
+| `recall_leg_knowledge_fts` | free | `true` | none — always on (store.rs:1002) | on (today) | on |
 | `recall_leg_wiki` | free | `true` | none — always on (api.rs:2870-2875) | on (today) | on |
 | `recall_leg_graph` | free | `true` | none — always on (api.rs:2889-2897) | on (today) | on |
 | `session_extract_rules` | free | `false` | **new** — no legacy behaviour | off (nothing runs; today nothing ran) | off |
@@ -620,11 +622,11 @@ Two consequences to state out loud, because a reviewer will look for them:
 | id | tier | default | options declared | what it gates (today's code) |
 | --- | --- | --- | --- | --- |
 | `memory_inject_chat` | free | on | — | The first-prompt context of a chat: `chat.rs:169-203` → `ChatManager::injection_context` (chat.rs:521-629). Off ⇒ `injection_context` returns `None`, so the prompt carries the role/handoff blocks only and no memory block. |
-| `memory_inject_runs` | free | on | — | The run prompt's injected block: `render_run_injection` (runs.rs:1856-1930, called at runs.rs:771). Off ⇒ the injected string is empty. |
+| `memory_inject_runs` | free | on | — | The run prompt's injected block: `render_run_injection` (runs.rs:1920, called at runs.rs:814). Off ⇒ the injected string is empty. |
 | `recall_leg_memory_semantic` | free | on | `weight`, `min_score` | The cosine leg of `recall_memories` (memembed.rs:572). `min_score` default `None` ⇒ today's per-strategy floor 0.25/0.30 (api.rs:2811). |
 | `recall_leg_memory_fts` | free | on | `weight` | The bm25 leg (memembed.rs:573). |
 | `recall_leg_knowledge_semantic` | free | on | `weight` (default 2.0) | The LanceDB ANN leg + the query embedding (store.rs:766-791), fused at `w_semantic` (store.rs:174-178). |
-| `recall_leg_knowledge_fts` | free | on | `weight` (default 1.0) | The three-stage keyword leg (store.rs:796 → `keyword_leg`, store.rs:825-865). |
+| `recall_leg_knowledge_fts` | free | on | `weight` (default 1.0) | The three-stage keyword leg (store.rs:1002 → `keyword_leg`, store.rs:1034). |
 | `recall_leg_wiki` | free | on | — | The `wiki/` partition of the knowledge hits and the stubs (api.rs:2870-2875 → `wiki::recall_stubs`). Off ⇒ `"wiki": []`, and a `wiki/…` document never appears in `knowledge` either (today it is partitioned out at api.rs:2870-2874). |
 | `recall_leg_graph` | free | on | — | `resolve_seeds` + `retrieve` + the entity-facts pass (api.rs:2889-2897, 2942). Off ⇒ `graph.entities == 0`, `graph.paths == 0`, `entities: []`, and neither call is made. |
 | `session_extract_rules` | free | **off** | `max_per_input` (32), `min_confidence` (0.0) | **NEW**: the deterministic transcript → memory extractor of §8, on the unattended path only. |
@@ -1110,13 +1112,13 @@ impl ExtractBundle {
 }
 
 /// What an extraction pass may read. Every field is already available at the
-/// call site today (transcript rendering: distill.rs:520-536).
+/// call site today (transcript rendering: distill.rs:1046).
 pub struct ExtractCtx<'a> {
     pub db: &'a ruagent_store::Db,
     pub session_key: &'a str,
     pub turns: &'a [ruagent_extract::Turn],
     /// The rendered transcript, in the exact form `render_transcript` produces
-    /// (distill.rs:520-536) — the ACP prompt appends it verbatim
+    /// (distill.rs:1046) — the ACP prompt appends it verbatim
     /// (distill.rs:263, `extraction_prompt` at 890-902).
     pub transcript: &'a str,
     pub limits: ruagent_extract::ExtractLimits,
@@ -1131,7 +1133,7 @@ pub struct ExtractCtx<'a> {
 pub enum ExtractError {
     NoSourceEnabled,
     Acp { agent: String, reason: String },
-    /// The ACP reply carried no JSON object (`parse_extraction`, distill.rs:862-876).
+    /// The ACP reply carried no JSON object (`parse_extraction`, distill.rs:1086).
     Malformed(String),
     Db(String),
 }
@@ -1158,12 +1160,12 @@ instead of extracting. The landed shape therefore makes the card OPTIONAL and re
 `Distiller::distill_plan(.., card: Option<&ruagent_core::AgentCard>, ..)` (`distill.rs:276-279`)
 maps a card into `AcpExtractor` only when one was resolved and otherwise passes `None`
 (`distill.rs:371`), `auto_distill_now` selects an agent only `if plan.acp` (`chat.rs:440-459`), and
-`session_distill` builds the card only for the plans that include the ACP tier (`api.rs:2813-2833`).
+`session_distill` builds the card only for the plans that include the ACP tier (`api.rs:2902`).
 A plan that DOES enable the llm tier with no card is still refused **by name** by the seam
 (`ExtractError::Acp`, "the plan enables the ACP tier but no extractor was supplied",
 `extract_plane.rs:469-478`): laziness is not a silent success. Pinned in both directions by
 `chat::t8_tests::the_rules_pass_writes_with_every_agent_disabled` (`chat.rs:2524`) and
-`api::tests::the_manual_rules_route_runs_with_every_agent_disabled` (`api.rs:5408`), which also
+`api::tests::the_manual_rules_route_runs_with_every_agent_disabled` (`api.rs:5628`), which also
 assert that an ACP-only plan on the same empty registry still fails visibly; both go red under a
 mutation control that restores the eager selection (`if plan.acp` → `if true`, run in an isolated
 worktree).
@@ -1171,9 +1173,9 @@ worktree).
 ### 10.2 How today's ACP distillation becomes one implementation
 * `extract_acp` **is** today's code path: `Distiller::ask_agent` (distill.rs:541-625) with
   `extraction_prompt(language, prompt_override)` + the transcript (distill.rs:890-902 and
-  the call at 261-265), then `parse_extraction` (distill.rs:862-876).
+  the call at 261-265), then `parse_extraction` (distill.rs:1086).
 * Its private wire structs keep their exact names and fields — `Extraction`/`ExtractedMemory`
-  /`ExtractedEntity`/`ExtractedRelation` (distill.rs:38-85) and the JSON contract in
+  /`ExtractedEntity`/`ExtractedRelation` (distill.rs:63-89) and the JSON contract in
   `EXTRACTION_PROMPT` (distill.rs:29-35) are **unchanged**, so no prompt changes and no
   extraction-value drift. The only new code is a mapping:
 
@@ -1181,7 +1183,7 @@ worktree).
   | --- | --- |
   | `ExtractedMemory { store, namespace, content, confidence: Option<f64> }` | `MemoryCandidate { store: parse_store(&store)?, namespace, content, confidence: match confidence { Some(v) => Explicit(v), None => Unconfirmed }, rule: "acp", origin: CandidateOrigin::Document { section: None } }` |
   | `ExtractedEntity { name, kind, summary, aliases }` | `EntityCandidate { name, kind: kind.as_deref(), summary, aliases, score: 1.0, rule: "acp", .. }` |
-  | `ExtractedRelation { src, dst, relation, fact, valid_at }` | `RelationCandidate { src, dst, relation: "", fact, score: 1.0, rule: "acp", .. }` + keep `valid_at` on a daemon-side `AcpFact` wrapper (the write path needs it: `event_time_source` is decided from it at distill.rs:808-812) |
+  | ExtractedRelation { src, dst, relation, fact, valid_at } | `RelationCandidate { src, dst, relation: "", fact, score: 1.0, rule: "acp", .. }` + keep `valid_at` on a daemon-side `AcpFact` wrapper (the write path needs it: `event_time_source` is decided from it at distill.rs:949) |
 
   `None` confidence maps to `Unconfirmed` (0.8) — byte-identical to today, because that is
   already what distill.rs:737-740 does.
@@ -1195,7 +1197,7 @@ worktree).
     concept`, EXTRACTION_PROMPT distill.rs:32) becomes **no kind** (`None`), never an invented
     one — a candidate's kind is a `&'static str` and the graph then stores no kind for that row
     (`extract_plane.rs:358-361`, `393`, `438-440`, pinned by
-    `an_unknown_acp_kind_becomes_no_kind`, `extract_plane.rs:772-785`). For a compliant model —
+    `an_unknown_acp_kind_becomes_no_kind`, `extract_plane.rs:1313`). For a compliant model —
     the only kind the prompt asks for — nothing changes.
   * A **`dry_run` distill writes nothing at all**: it reports what WOULD be written and
     creates no episode, no memory row, no graph row and **no `distill_log` row**
@@ -1240,15 +1242,15 @@ This increment follows it exactly:
 | today | new twin | who calls the twin |
 | --- | --- | --- |
 | `memembed::recall_memories(db, embedder, q, top_n, min_score)` (memembed.rs:825, a one-line delegation with `MemoryLegs::default()`) | `recall_memories_with(db, embedder, q, top_n, min_score, &MemoryLegs)` (memembed.rs:885) | `recall` handler only (api.rs:2950) |
-| `Knowledge::compute_legs(q, leg_k)` (store.rs:916, private, delegates) | `compute_legs_with(q, leg_k, &LegConfig)` (store.rs:942) | via `search_page_with` |
-| `Knowledge::fuse(ann, fts)` (store.rs:1141, private, delegates) | `fuse_with(ann, fts, &LegConfig)` (store.rs:1153) | via `search_page_with` |
-| `Knowledge::search_page(q, limit)` (store.rs:1279) | `Knowledge::search_page_with(q, limit, &LegConfig)` (store.rs:1302) | `recall` handler only (api.rs:2971) |
+| `Knowledge::compute_legs(q, leg_k)` (store.rs:916, private, delegates) | `compute_legs_with(q, leg_k, &LegConfig)` (store.rs:942) | via search_page_with |
+| `Knowledge::fuse(ann, fts)` (store.rs:1151, private, delegates) | `fuse_with(ann, fts, &LegConfig)` (store.rs:1163) | via search_page_with |
+| `Knowledge::search_page(q, limit)` (store.rs:1289) | `Knowledge::search_page_with(q, limit, &LegConfig)` (store.rs:1312) | `recall` handler only (api.rs:2971) |
 
 The old functions become one-line delegations with the default configuration
 (`LegConfig::default()`, `MemoryLegs::default()`), and a test asserts the equivalence
 (`fuse(x) == fuse_with(x, default)`, `recall_memories == recall_memories_with(.., default)`).
 **No existing caller changes**: `chat.rs:563` and `runs.rs:1889` keep calling `search_page`
-(they are injection paths, §3.3), `knowledge_search` (api.rs:4617) keeps calling it too, and
+(they are injection paths, §3.3), `knowledge_search` (api.rs:5128) keeps calling it too, and
 `search`/`search_legs` (store.rs:986/1013) are untouched.
 
 ```rust
@@ -1297,7 +1299,7 @@ overrides **both** strategies (documented in the option's API description).
 | `recall_leg_memory_semantic` | no `semantic_search`, no `embed_query` for memories (`recall_memories_with`, memembed.rs:885-910; the semantic call at 902 — the delegating `recall_memories` is at 825) | `memory_legs.semantic == 0`, no hit has `"semantic"` in `legs`, `semantic_score` is `null` |
 | `recall_leg_memory_fts` | no `search_fts_scored` (memembed.rs:907) | `memory_legs.keyword == 0`, `keyword_new == 0`, no hit has `"keyword"` in `legs`, `keyword_score` is `null` |
 | `recall_leg_knowledge_semantic` | no `embed_query`, no LanceDB ANN query — the whole block sits inside `if legs.semantic` (`compute_legs_with`, store.rs:942-979; the embed at 950) | every knowledge hit has `semantic_rank: null`, `semantic_score: null`; `scoring.leg_window` unchanged |
-| `recall_leg_knowledge_fts` | no `keyword_leg` (store.rs:999-1003; `keyword_leg` itself at 1032) | `keyword_rank`/`keyword_score` `null`, and `query_keyword_stage` is **`"disabled"`** — the endpoint composes it from the leg configuration it passed (landed at `api.rs:3723`, `keyword_stage_label(stage, keyword_leg_enabled)`, called from the `recall` handler at `api.rs:2986` with `legs.knowledge.keyword`). An ENABLED leg that ran and matched nothing still reports `"empty"`, so the two states are distinguishable — both are pinned by `crates/daemon/tests/knowledge_api.rs::a_disabled_keyword_leg_reports_disabled_not_empty` (`:1157`). Do **not** add a variant to `KeywordStage` (store.rs:492): that enum is the producer's own state, and `crates/knowledge` never sees a configuration |
+| `recall_leg_knowledge_fts` | no `keyword_leg` (store.rs:999-1003; `keyword_leg` itself at 1034) | `keyword_rank`/`keyword_score` `null`, and `query_keyword_stage` is **`"disabled"`** — the endpoint composes it from the leg configuration it passed (landed at `api.rs:3951`, `keyword_stage_label(stage, keyword_leg_enabled)`, called from the `recall` handler at `api.rs:3152` with `legs.knowledge.keyword`). An ENABLED leg that ran and matched nothing still reports `"empty"`, so the two states are distinguishable — both are pinned by `crates/daemon/tests/knowledge_api.rs::a_disabled_keyword_leg_reports_disabled_not_empty` (`:1157`). Do **not** add a variant to `KeywordStage`: that enum is the producer's own state, and `crates/knowledge` never sees a configuration |
 | `recall_leg_wiki` | no `wiki::recall_stubs` call (api.rs:3014-3021) | `"wiki": []`; `wiki/…` documents still stay out of `knowledge` (the partition at api.rs:3009-3013 is a filter over hits already retrieved, not a query) |
 | `recall_leg_graph` | no `resolve_seeds`, no `retrieve`, no `current_facts` pass (api.rs:3041-3073; the per-entity facts pass at 3101) | `graph.entities == 0`, `graph.paths == 0`, `graph.empty_reason` is `"leg disabled"` (landed at api.rs:3073 — a literal deliberately NOT one of `EmptyReason`'s values), `entities: []` |
 
@@ -1310,7 +1312,7 @@ asked for nothing" is a reading, not an error.
   exactly as specified here (landed at `api.rs:3462`, built from `RecallLegConfig::disabled_legs`
   at `api.rs:2926-2930`).
 * `recall_log`'s existing JSON column **`candidates_json`** gains the key
-  `"disabled_legs": [...]` (landed at `api.rs:3343-3355`). **Corrected by §21 item 2:** this
+  `"disabled_legs": [...]` (landed at `api.rs:3525`). **Corrected by §21 item 2:** this
   document first said `top_legs_json`, which is a JSON **array** (one entry per ranked hit,
   built at api.rs:3318-3337) — a key there would change the shape every existing reader sees,
   i.e. a default-configuration wire change, which law L1 forbids. `candidates_json` is an
@@ -1564,7 +1566,7 @@ write that touches a different row — the shape of §11.5's closure test, run l
    `all_six_legs_off_is_an_empty_success_that_names_every_leg` (:967),
    `both_strategies_answer_over_the_toggleable_legs` (:1032) and
    `a_non_default_leg_weight_reorders_the_recall_page` (:1075), and in the crate as
-   `a_disabled_memory_semantic_leg_is_never_queried` (`memembed.rs:1350`). That last pin's
+   `a_disabled_memory_semantic_leg_is_never_queried` (`memembed.rs:1490`). That last pin's
    OBSERVABLE was re-derived by increment 2 (t16): it used to assert the unobservability of the
    memory-FTS leg's on/off state (the leg returned nothing either way because of the bm25 index
    defect), and it now asserts the leg's contribution and the difference the switch makes —
@@ -1599,7 +1601,7 @@ what §11 implied — **§21 item 8** records it as the design:
 The checkable chain a reviewer can follow without re-deriving anything:
 `RecallLegConfig::disabled_legs` (6 typed entries when all six are off) →
 `recall_leg_id` (6 arms, ids from the registry) → the response's `legs_disabled`
-(`api.rs:2926-2930`, `3462`) and `candidates_json.disabled_legs` (`api.rs:3343-3355`).
+(`api.rs:2926-2930`, `3462`) and `candidates_json.disabled_legs` (`api.rs:3525`).
 
 ---
 
@@ -1611,8 +1613,8 @@ The checkable chain a reviewer can follow without re-deriving anything:
   The honest implementation: `let ctx = if plane.gate(MemoryInjectChat, true) { …existing… }
   else { None };` and leave everything else (the sentinel logic at chat.rs:226-229, the
   handoff/role blocks at 178-201) exactly as it is.
-* `memory_inject_runs` gates `render_run_injection` (runs.rs:1856) at its call site
-  (runs.rs:771): off ⇒ the injected string is empty.
+* `memory_inject_runs` gates `render_run_injection` (runs.rs:1920) at its call site
+  (runs.rs:814): off ⇒ the injected string is empty.
 * Both default **on** with the table absent (L1), so no default behaviour changes.
 
 ---
@@ -1707,7 +1709,7 @@ upsert. Both are stated once in
 (`0026_capability_ingest.sql:12-40`); the code is the spec for them.
 
 `KnowledgeDocument` (store.rs:389-396) gains `pub content_hash: String`, selected in
-`list_documents` (store.rs:1303-1315). This is an **additive JSON field** on
+`list_documents` (store.rs:1565). This is an **additive JSON field** on
 `GET /api/v1/knowledge/documents`; the existing tests index that response by name
 (crates/daemon/tests/knowledge_api.rs:205-220, 321-336), so nothing breaks. Supporting
 `source`-less legacy rows is out of scope: the sweep skips a document whose `read_raw`
@@ -1758,7 +1760,7 @@ As landed (§21 item 10): the four tools exist and the surface is **18 tools**; 
 `crates/mcp/src/lib.rs:431-433`), which is the intent of this column, not a divergence from
 it. The ingest tool sends `document`/`dry_run` in the **query string on a POST**
 (`mcp/src/lib.rs:439-441`, `ingest_query` at 955), matching the daemon handler's
-`Query<GraphIngestQuery>` (`api.rs:4770-4781`).
+`Query<GraphIngestQuery>` (`api.rs:5023`).
 
 Rules for t6:
 
@@ -2008,7 +2010,7 @@ the tests at `crates/daemon/tests/capabilities.rs:66` / `graph_ingest.rs:626,701
 | file | remaining change |
 | --- | --- |
 | `crates/daemon/src/lib.rs` | **the live-plane install at boot** — `chats.set_capabilities(config.capabilities.clone())`, so a `[capabilities]` table in `policy.toml` takes effect on a restart. Today it is parsed and validated (`DaemonConfig.capabilities`, config.rs:20-26, 74-96) but never applied to the live manager: after a restart the plane would be legacy and the file would be ignored. Everything else in this file is done. |
-| `crates/daemon/src/runs.rs` | `set_capabilities` on the RunManager (`capabilities_handle()`, mirroring `set_knowledge`, runs.rs:299-309) + the injection gate at runs.rs:771 |
+| `crates/daemon/src/runs.rs` | `set_capabilities` on the RunManager (`capabilities_handle()`, defined at runs.rs:337, mirroring `set_knowledge`, runs.rs:316) + the injection gate that guards `render_run_injection` (runs.rs:814) |
 | `crates/daemon/src/chat.rs` | the auto-distill gate in `maybe_auto_distill`/`auto_distiller` (chat.rs:1052-1070, 1479-1493) and the injection gate in `send_prompt` (chat.rs:169-203) |
 | `crates/daemon/tests/capability_defaults.rs` | NEW: the exhaustive L1/L2/L4 test (§18) |
 | `crates/daemon/tests/capabilities.rs` | extend t2's file with the live-swap + restart-install tests |
@@ -2036,7 +2038,7 @@ Shared files: `lib.rs`, `chat.rs`, `tests/capabilities.rs` (all t2-owned first).
 | --- | --- | --- |
 | Registry conformance | `crates/daemon/tests/capability_defaults.rs` | one row per `CapabilityId::ALL`; ids are unique and non-empty; `tier == Llm ⇒ !default_enabled`; `new_in_this_increment ⇒ !default_enabled`; `!new_in_this_increment && tier == Free ⇒ default_enabled` (L4) |
 | Exhaustive pass-through | same file | for every id and both legacy values, `CapabilityPlane::legacy().gate(id, legacy) == legacy`; `options(id) == spec(id).defaults` (L1/L2) |
-| Fresh-root default | `crates/daemon/tests/capabilities.rs` | `DaemonConfig::load` on an empty root yields `table_present() == false`, and `DEFAULT_POLICY_TOML` still parses (mirroring `config_load_creates_defaults`, config.rs:736-745) |
+| Fresh-root default | `crates/daemon/tests/capabilities.rs` | `DaemonConfig::load` on an empty root yields `table_present() == false`, and `DEFAULT_POLICY_TOML` still parses (mirroring `config_load_creates_defaults`, config.rs:969) |
 | Hard errors | same file | unknown id in the file ⇒ boot fails with a message containing the id and the known ids; unknown key ⇒ serde error naming id + key; `max_per_input = 0` ⇒ the range message (L3) |
 | Recall equivalence | `crates/daemon/tests/knowledge_api.rs` | absent table vs explicit all-defaults table: identical load-bearing fields (§11.5.2) |
 | Legs never queried | `knowledge_api.rs` + `crates/knowledge/tests/retrieval-legs.rs` | counting `Embedder`; per-row assertions of §11.3 |
@@ -2246,7 +2248,7 @@ softened here; only the divergences are listed.
    `api.rs:3318-3337`), so adding a key there changes the shape every existing reader sees —
    a default-configuration wire change, which law L1 forbids. `candidates_json` is an object
    that already grows with the fusion (`candidates`, `leg_window`, `fusion`, `ranked_page`),
-   and the key landed there with that reason written next to it (`api.rs:3343-3355`). The
+   and the key landed there with that reason written next to it (`api.rs:3525`). The
    response's `legs_disabled` **is exactly as specified** (`api.rs:3462`).
    Corrected in §11.4.
 
@@ -2292,7 +2294,7 @@ softened here; only the divergences are listed.
 7. **Two behaviour narrowings the design did not state (§10.2).**
    * An ACP entity `kind` **outside the prompt's vocabulary** becomes **no kind** (`None`),
      never an invented string: `extract_plane.rs:358-361`, `438-440`, pinned by
-     `an_unknown_acp_kind_becomes_no_kind` (`extract_plane.rs:772-785`). For a compliant model
+     `an_unknown_acp_kind_becomes_no_kind` (`extract_plane.rs:1313`). For a compliant model
      nothing changes.
    * A **`dry_run` distill writes nothing at all** — no memory, no graph row, no episode, and
      **no `distill_log` row** (`distill.rs:256-277`, counts at `356-367`). The design only said
@@ -2316,12 +2318,12 @@ softened here; only the divergences are listed.
    `KeywordStage::Empty` (`store.rs:999-1003`), so "you turned this off" and "this ran and
    found nothing" were the same wire value. Repairing it was **chosen over documenting the
    loss** — `legs_disabled` (`api.rs:3462`) and `candidates_json.disabled_legs`
-   (`api.rs:3343-3355`) do say *which* legs did not run, but a switch that is not visible on the
+   (`api.rs:3525`) do say *which* legs did not run, but a switch that is not visible on the
    leg's OWN field is exactly the confusion §11.3 exists to prevent. The repaired code composes
    the label from the configuration the endpoint holds:
-   `keyword_stage_label(stage, keyword_leg_enabled)` (`api.rs:3723`) returns `"disabled"` when
+   `keyword_stage_label(stage, keyword_leg_enabled)` (`api.rs:3951`) returns `"disabled"` when
    the leg is off and the stage's own lower-case name otherwise, and the `recall` handler passes
-   `legs.knowledge.keyword` (`api.rs:2986`) — the same config it handed to
+   `legs.knowledge.keyword` (`api.rs:3152`) — the same config it handed to
    `Knowledge::search_page_with`. No variant was added to `KeywordStage`; the knowledge-search
    endpoint, which runs the default configuration, passes `true` (`api.rs:4926`). Both states
    are pinned by `crates/daemon/tests/knowledge_api.rs::a_disabled_keyword_leg_reports_disabled_not_empty`
@@ -2334,7 +2336,7 @@ softened here; only the divergences are listed.
     improvement, recorded so a verifier does not read it as a mismatch); `knowledge_graph_ingest`
     sends its arguments in the **query string of a POST** (`crates/mcp/src/lib.rs:439-441`,
     `ingest_query` at 955) against the daemon's `Query<GraphIngestQuery>`
-    (`api.rs:4770-4781`); and the **pre-existing** `memory_recall` tool gained a
+    (`api.rs:5023`); and the **pre-existing** `memory_recall` tool gained a
     `strategy?: "aggressive"|"conservative"` argument next to `conservative`, with the two
     spellings refused when they disagree (`crates/mcp/src/lib.rs:1080-1094`) — a widening of an
     existing tool, not one of this increment's four, and not covered by §14's table.
@@ -2355,7 +2357,7 @@ softened here; only the divergences are listed.
     retry loop, no sleep, and the checkpoint still happens — the next opener, in this process,
     simply cannot start before the previous one has let the file go. `ledger_reopen.rs` was not
     touched; the shape is pinned by
-    `sqlite::tests::a_reopen_after_the_last_handle_drops_never_races_the_writer` (`sqlite.rs:244`),
+    `sqlite::tests::a_reopen_after_the_last_handle_drops_never_races_the_writer` (`sqlite.rs:513`),
     and the isolated-worktree control (unfixed `Db` + migration 26) fails at round 1. Corrected in
     §19.
 
@@ -2424,3 +2426,242 @@ both branches, so this repair turned it red **by design**. It is replaced by
 stays readable), backed by `crates/memory/tests/search_fts_scored.rs`, which pins the read from
 outside the crate — a NULL row, a non-NULL row, the mixed case (one NULL row used to fail the whole
 statement), and the invariant that the scored and score-less legs agree on rows and order.
+
+---
+
+## 22. Increment 7 (`ruagent-close-the-gaps`, revision `94aed37`): what the span MEASURED
+
+This section records measurements, not changes. §11.5, §20 and §21 did that for earlier increments;
+the span that ran on revision `94aed3722653a41e0e74f8bd60589256fc971a8f` had no record, and its
+numbers are the part that is easiest to lose. Every figure below names its instrument — which
+corpus, which root, which revision — because a rate without its instrument is not a finding of
+fact. Anything unfinished when this was written is marked **IN FLIGHT** rather than described as
+done. The span's review of record (`ruagent-close-the-gaps t5`) judged the three measurements as
+instruments, judged the e2e reading as the first one taken on the delivered panel, and passed the
+increment with findings; the substance worth carrying forward is below.
+
+### 22.1 The write door covers exactly what the runtime weighs — by DERIVATION, not by a list
+
+The property the next person needs (adding a leg must not require remembering a second file) is
+structural, and it was re-read on the current bytes rather than restated from §11.5:
+
+* The accepted key set is **generated from the registry**: `options_schema(s)` builds one entry per
+  DECLARED key from `spec(id).options` + `spec(id).defaults` (`crates/daemon/src/capability.rs:474`,
+  emitted into every row at `:686`), so a key the runtime weighs cannot be absent from what the door
+  advertises. §11.5 is the surface; this is why it cannot drift.
+* There is **one validator, not two**: the write path synthesizes a `PolicyConfig` and calls the
+  same `CapabilityPlane::from_policy` the boot path calls (`capability.rs:601`, write-side call at
+  `:1069`; §21 item 5), so the door's rules and the runtime's rules are the same code.
+* The MCP surface renders the DECLARED set too — `declared_options` → `options_to_text`
+  (`crates/mcp/src/lib.rs:680`, `:714`) — and an undeclared field is **refused, not ignored**
+  (`additionalProperties: false`, derived into the tool's `inputSchema`, `:1384`).
+
+Consequence to rely on: a new capability or option is covered by its registry row, and the surfaces
+that accept it are derived from that row rather than enumerated beside it.
+
+### 22.2 The SQLite boundary, MEASURED — the first numbers it has had
+
+**Instrument:** an external temporary crate that calls the REAL `ruagent_store::Db::open` (not a
+synthetic raw connection), a private binary (sha256 `1C0B06D2…517B`), a private `RUAGENT_HOME`
+(`<temp>\rootD`), a private daemon on `127.0.0.1:8931`, revision `94aed37`
+(`ruagent-close-the-gaps t3`; re-taken on the real opener by `t7`). Findings:
+
+* **Benign under short writes — 383 cross-process writes, 0 failures.** 150 of them came from 6
+  concurrent second-process writers (6 × 25 `Db::open`+write) while the daemon served **142/142**
+  `POST /api/v1/tasks` with 200; another window added 233 daemon requests, 0 errors either side.
+  Reliable, not intermittent.
+* **The 5 s `busy_timeout` is PER CONNECTION** — `crates/store/src/sqlite.rs:275`, inside
+  `configure_and_spawn`, inherited by the `ruagent-db-writer` thread (`:301`), which is why the
+  daemon's own writes wait at all.
+* **It covers** a single statement acquiring the write lock for the first time: against a 2 s
+  holder the write waited **1.986 s and SUCCEEDED**.
+* **It cannot cover a lock held beyond the budget:** against a 9 s holder the same write waited
+  **5.5858–5.6145 s** and then failed with `sqlite error: database is locked`
+  (`SqliteFailure(DatabaseBusy, extended=5)`).
+* **It cannot cover a read-then-write UPGRADE**, and that failure is not a wait: a DEFERRED
+  transaction that reads before writing failed in **71–87 µs**, and a pinned-snapshot upgrade in
+  **17–20 µs** with **`extended=517` (`SQLITE_BUSY_SNAPSHOT`)**. The store's own migration was
+  exactly that shape (`migrations.rs` deferred transaction with the ledger read before the write),
+  so the store took the branch the timeout cannot help with by construction. **Landed
+  (`ruagent-close-the-gaps t7`):** `conn.transaction_with_behavior(TransactionBehavior::Immediate)`
+  (`crates/store/src/migrations.rs:173`), re-measured on the real opener — 8/8 rounds against a
+  2.5 s holder waited ~2.55 s and SUCCEEDED, 15/15 against a 1.2 s holder waited ~1.22 s and
+  SUCCEEDED, **0 fast failures in 29 contention rounds** (pre-change: 2 of 3 failed fast); the
+  budget still binds at 6.5 s (`FAILED` at ~5.64 s). This is the shape to prefer over a retry: it
+  moves lock acquisition to the start and needs no new failure mode.
+* **No retry exists anywhere** (grep over `crates/*/src` and `cli/src`: no `DatabaseBusy` /
+  `SQLITE_BUSY` retry logic), so the timeout is the only recovery and its expiry is terminal for
+  that statement.
+* **The single-writer rule is DOCUMENTED, NOT ENFORCED.** `Db::open` (`sqlite.rs:260`) has no lock,
+  pid file or single-instance check and returns `Ok` to a second writer: in the measurement 150
+  foreign task writes landed and a second process wrote **217 rows into the daemon's own
+  `schema_migrations`**. A rule-ignoring caller gets success, or (only under a >5 s lock) an error
+  after ~5.6 s — never a refusal. Both the CLI and MCP are HTTP clients (`no Db::open` in `cli/src`
+  or `crates/mcp/src`), so today's real second-writer shape is a test, a tool or a future
+  subcommand.
+* **Pragmas / WAL / `synchronous`: measured, and NO WORK WARRANTED.** Short cross-process writes are
+  benign (383 writes, 0 failures) and this actor is the single writer for every store in the
+  process, so a blind pragma change trades a measured non-problem for an unmeasured durability
+  risk. Recorded as a decision, not as an omission. (The file carrying the pragmas was not modified
+  by this span.)
+
+### 22.3 The panel e2e suite's real SCOPE — a green suite over a feature it never opened
+
+**Instrument:** the repo entry point `node e2e/run-e2e.mjs` (never a bare `npx playwright test`),
+against a private daemon (throwaway root, non-default port), serving the repo `panel/dist`;
+`panel/` was unmodified, and the option-editor rewrite (`a0f1eae`, `6fa0000`, `4677912`,
+2026-09-30) postdates the last `panel/e2e` commit (`1516814`, 2026-09-29) — so this was the FIRST
+reading of the suite on the delivered panel (`ruagent-close-the-gaps t4`).
+
+* **Before:** `49 passed / 2 skipped / exit 0`. **The suite had no spec that opens `#settings`**:
+  `settings` matched nothing under `panel/e2e/*.spec.ts`, `views.spec.ts` walked 12 views without
+  it, and `responsive.spec.ts`'s route list stopped at `graph`. The green therefore certified the
+  panel *without* the capability option editor this effort had rewritten — the most transferable
+  lesson of the span: **a green suite over a feature it never opens is a green about the harness,
+  not about the feature.** (The 2 skips were named and environment-conditional: `chat.spec.ts`
+  needs a mock runtime, `judge.spec.ts` needs two mock members plus a judge; CI registers them.)
+* **The model for the fix** (`ruagent-close-the-gaps t13`):
+  `panel/e2e/settings-capabilities.spec.ts` (2 tests, `:195` and `:340`) asserts the value typed
+  into the editor reaches the daemon's OWN answer AND its `policy.toml` on disk, that Reset REMOVES
+  the key instead of persisting the default (`:291`, `:317` — asserted from the file, not from a
+  value), and that an out-of-range value is refused locally with zero PUT requests observed. It is
+  gated by `writeAccess(writes)` (now a required argument, so a skip reason names the right damage)
+  and restores the whole `[capabilities]` table from a pre-click snapshot in a `finally`.
+  **After: `51 passed / 2 skipped / exit 0`.**
+* **A spec that cannot fail is worse than no spec**, so the three claims were shown to go RED
+  against private daemons serving MUTATED COPIES of `panel/dist` (no shared source, dist or root
+  touched): editor removed → 2 failed (and the view-level assertion stayed green, so the spec is
+  not a "the page renders" test); save silently did nothing (read-only `policy.toml`) → red at
+  `:291`, green again once writable; Reset wrote the default instead of removing the key → red at
+  `:317` with the Apply half still green.
+
+### 22.4 The zero-token tier's real output — the baseline any future rules pass must beat
+
+**Instrument:** a COPY of the live corpus (`%TEMP%\ruagent-t2-measure`: 936 knowledge `.md`, 147
+`ruagent` transcripts + 91 `claude` + 402 `dsh` session files copied under the same base; 333
+copy-owned sessions = 91 `ruagent` / 180 `dsh` / 62 `claude-code`; the 640 index rows pointing at
+the live dirs were excluded), a private binary built with `-o <temp>\bin\ruagent-t2.exe`, a private
+daemon on `127.0.0.1:18787`, `RUAGENT_EMBEDDER=hash`, revision `94aed37`
+(`ruagent-close-the-gaps t2`). The live roots and the daemon on 8787 were never written to.
+
+* **Memory half:** **1222 candidates** (3.67/session; 239 sessions ≥1, 94 zero). Per rule
+  `procedure_note` 457 · `user_preference` 350 · `lesson_learned` 129 · `hedged_statement` 128 ·
+  `user_correction` 124 · `user_decision` 34. Origin role: assistant 634 (51.9%).
+  **Junk:** 42.7% of candidates are categorically not a durable statement, **19.9% are the
+  extractor's OWN PROMPT TEXT** (its few-shot examples contain the very markers the rules match),
+  and 37.4% come from injected-prompt turns. A 62-item hand read found **4 durable user facts
+  (6.5%)**. The rules do not fire on everything — 9.4% of eligible user sentences and 7.9% of
+  assistant ones match any marker — so the problem is *what* the 8–9% are, not that everything
+  matches. Fidelity: harness vs the daemon's own dry run agreed 1220/1220 candidates over 332/332
+  sessions, 0 disagreements.
+* **What it misses:** the markers are *reaction*-shaped (`对`/`不对`/`我喜欢`) and miss
+  *requirement*-shaped Chinese (`我要`/`需要`/`应该`/`不能`/`不要`/`我建议`): ~10 durable statements
+  in a 53-turn bounded read, of which ~3–4 were caught and every catch was by accident of wording,
+  in the wrong store. Two wire-level blind spots were measured with it: `truncated` was `false` for
+  all 333 sessions while **15 had hit the 32-candidate cap** (the flag was computed from
+  `max_turns`, default **2000**, `crates/extract/src/lib.rs:383`), and 16 sessions reported exactly
+  32 — "exactly 32" and "capped at 32" were indistinguishable on the wire.
+* **Knowledge half:** 936 documents → **820 extracted, 116 PANICKED (12.4%)**; 16 053 entity
+  candidates, 7212 distinct identities, **44 relations** (`is_a` 43, `uses` 1, `runs_on` 0,
+  `includes` 0); 16 documents hit the 96-entity cap. The panic was not a data loss but a silent
+  failure: through `POST /api/v1/knowledge/graph/ingest` the connection dropped with no error body.
+* **The span's own follow-up, on the same copy** (`ruagent-close-the-gaps t11`, same harness AND
+  the real distill route): after dropping turns that are the platform's own job prompts, candidates
+  fell **1222 → 885 (−27.6%)**, non-prose shapes **42.7% → 31.3%**, prompt-text candidates
+  **243 → 46**, embedded-transcript lines **44 → 0**, boilerplate-marker candidates **457 → 197**,
+  and 333/333 sessions still agreed with the harness (`truncated=true` for 10). Per rule the drop
+  is concentrated exactly where the noise was: `user_correction` 124 → 9, `user_decision` 34 → 9,
+  `user_preference` 350 → 175, `hedged_statement` 128 → 56. **The baseline to compare a future
+  rules pass against is the post-hygiene 885, not the 1222** — and the measurement's own
+  recommendation was AGAINST a marker-tuning pass until the hygiene landed, which is the order in
+  which both happened.
+
+### 22.5 The two patterns this span found (what a reader should take away)
+
+A record that lists seven fixes teaches less than one that names the pattern, because the pattern
+is what the next defect will look like.
+
+**(a) One byte-width assumption, two crates — found by SWEEPING it, not by waiting for it.** The
+defect is a slice that assumes a delimiter is one byte:
+`crates/extract/src/text.rs` computed `name[open + 1..close]`, which is inside a multi-byte
+character when the opener is the full-width `（` (3 bytes) — it panicked on **116 of 936** real
+documents and was silent through the API. After it was fixed (`ruagent-close-the-gaps t8`, now
+`text.rs:234`/`:237`, advancing by the matched delimiter's own `len_utf8()`), the assumption was
+**swept one crate over** and found in the graph's `variants` (`crates/graph/src/lib.rs`, then
+`:916`), where a real ingest of `特质（trait）` panicked and **killed the store's writer actor**
+(`ruagent-close-the-gaps t15`, fixed at `graph/src/lib.rs:1040`/`:1047`). Both sites now advance by
+`len_utf8()` and neither file contains `open + 1` outside its explanatory comment. **Rule:** when
+the defect is a byte-index assumption, grep the assumption, not the crash site.
+
+**(b) The message-that-lies family — a surface asserting a state nobody checked.** Six instances in
+this span, four of them named before it started and two found by looking for the shape:
+
+1. **The operator script's success line.** `install-task` printed "registered" over a real
+   `拒绝访问。` — and `$ErrorActionPreference='Stop'` was already set, so the guard was not the fix:
+   the denial terminates the script only under `pwsh -File`; invoked with `&`, the script ran on to
+   the success line with exit 0. Fixed by tying the message to a **read-back**: the line is printed
+   only after `Get-ScheduledTask` returns the task and its state, principal, logon-trigger user,
+   repetition AND action are compared against what was wanted
+   (`scripts/ruagent-daemon.ps1:375`/`:386`/`:397`, action built at `:203`; `ruagent-close-the-gaps
+   t1`, extended by `t12`). The same fix removed the wrapper's false exit 0.
+2. **The memory cap's `truncated` flag** was derived from a quantity the pass never measured
+   (`cx.turns.len() > cx.limits.max_turns`, default 2000) — **15 sessions hit the 32 cap and all
+   333 reported `false`**. Fixed by taking the flag from the producing pass's own counters
+   (`crates/daemon/src/extract_plane.rs:456`; `ruagent-close-the-gaps t9`).
+3. **The knowledge cap's flag** covered only the input-text cut, so a document that dropped
+   entities at the 96 cap reported `0`: measured through the real route, `over-120 → 96/96/0`
+   before, `96/96/1` after, while `exact-96` stays `0` — **a filled cap is not a cut**
+   (`crates/extract/src/graph.rs:46`; `ruagent-close-the-gaps t17`).
+4. **The swallowed evidence write.** Under a lock the timeout cannot absorb, `GET /api/v1/recall`
+   answered **200 with a valid 608-byte body while its `recall_log` row was dropped** through
+   `let _ = db.call(...)`, and nothing was written to any daemon log. The fire-and-forget choice is
+   deliberate and kept; the SILENCE was not, and the row is now announced on failure
+   (`crates/daemon/src/api.rs:3575`/`:3648`; `ruagent-close-the-gaps t6`).
+5. **`health` was a constant.** It answered `{"status":"ok"}` while every store-backed route
+   answered 400/500 — and stayed that way until a restart — because a panic in one write unwound
+   the single writer thread and every later call got `DbError::Closed`. Worse than the panic: the
+   watchdog this repository installs at logon would have seen a healthy daemon and done nothing
+   forever. Fixed by catching at the writer boundary and making health report the data plane's
+   state (`crates/store/src/sqlite.rs:117`, `crates/daemon/src/api.rs:458`/`:473`;
+   `ruagent-close-the-gaps t16`).
+6. **A refusal that named the wrong reason.** 305 indexed `opencode` sessions answered a bare
+   `400 session has no messages to distill` although their messages were always parseable (all 305
+   rows shared one `ref_path`, so `(source, ref_path)` could not name ONE session). Fixed to
+   HTTP 200, with unknown families still refused but with a WARN naming the family
+   (`ruagent-close-the-gaps t10`).
+
+**The rule the family argues for:** a status, flag or claim must be DERIVED from the state it
+describes — read the thing back (1), take the number from the pass that produced it (2, 3), make a
+dropped write announce itself (4), make health reflect the data plane (5), and make a refusal name
+the real reason (6). **And the sweep:** after finding one instance, look for the shape — that is how
+(5), (6) and the second panic (a) were found, and how two of the lies turned out to be the same
+`truncated` field on two different caps.
+
+A third shape sits beside them without being a lie: **a write whose result no read path can
+observe.** Of 257 distinct full-width-parenthetical names in the ingested corpus, 116 are entity
+names, 38 are found by the strict entity search without being names, and **103 are reachable by NO
+read API** — not because they were dropped (103/103 have a row in `entity_aliases`) but because
+aliases are not in `entities_fts` and no route reads that table
+(`ruagent-close-the-gaps t18`; instrument: the t15-after ingest DB, private daemon on `18811`).
+That is an observability gap, not data loss — and it is **IN FLIGHT** (see §22.6).
+
+### 22.6 In flight, and not claimed done
+
+* **`ruagent-close-the-gaps t21`** — candidates coming from a job prompt's EMBEDDED transcript are
+  still attributed to the user in the daemon's session (the hygiene pass of §22.4 removed whole
+  prompt turns; this is the residual it did not cover). Claimed, not completed.
+* **`ruagent-close-the-gaps t22`** — expose `entity_aliases` so the 103 names of §22.5 can be
+  reached by a read API at all (and the search's unverifiable candidate list can be checked against
+  it). Claimed, not completed.
+* **A dated reading of this document's own integrity, recorded because the alternative is a
+  claim nobody checked.** `scripts/spec-anchors.ps1 -Spec docs/plans/capability-plugins-design.md`
+  reads, on three revisions of the same document: **41 drifts at HEAD `94aed37`** (an isolated
+  worktree, i.e. pre-span code), **42 on the working tree before this section was added**, and
+  **42 after it**. So the check was already red BEFORE this increment — the span's own code edits
+  account for the +1 (definition lines moved in `api.rs`, `extract_plane.rs`, `sqlite.rs`,
+  `distill.rs`) — and this section adds none of them (**0 of the 42 point into it**). The script's
+  DEFAULT spec set is red too (9 drifts). This task was bounded to adding a record and does not
+  rewrite earlier sections, so those pre-existing coordinates were left alone; a coordinate-repair
+  pass is its own task, and it is mechanical because the checker prints the correct line for every
+  DRIFT. What this section guarantees is that its own citations were read back against the current
+  bytes before being written down.

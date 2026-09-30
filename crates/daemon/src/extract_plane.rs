@@ -170,8 +170,13 @@ pub struct ExtractBundle {
     /// The source that produced the LAST non-empty part of this bundle. `None`
     /// only for an empty, default bundle.
     pub source: Option<ExtractSource>,
-    /// True when an input was cut to its bound (`ExtractLimits::max_text_bytes`
-    /// for a document, `max_turns` for a transcript).
+    /// True when the pass that produced this bundle DROPPED something at a bound:
+    /// the candidate cap (`ExtractLimits::max_per_input`), the transcript window
+    /// (`max_turns`) or the document window (`max_text_bytes`). False means "this
+    /// is everything the pass produced". Derived from the producing pass's own
+    /// counters (t9), never from a quantity that pass did not measure — so a
+    /// candidate list cut at the cap reports true while a list that legitimately
+    /// fills it reports false.
     pub truncated: bool,
 }
 
@@ -309,13 +314,185 @@ impl std::error::Error for ExtractError {}
 /// knowledge-document half of the free tier (`graph_candidates`) is called
 /// directly by `crate::knowledge_graph`, which is a different producer with its
 /// own switch.
+/// The heads of the daemon's OWN job prompts, as LITERALS, plus the reason they
+/// are literals.
+///
+/// **THE RULE IS THE MARKER, NOT THIS LIST** (t23). Every unattended prompt this daemon
+/// sends goes through `Distiller::ask_agent`, which appends `chat::USER_TEXT_SENTINEL`
+/// (t21); a turn that carries that marker with nothing of the user's after it is
+/// platform text WHATEVER IT SAYS. Keying on the marker is strictly better than
+/// enumerating our own prompts, because the marker is applied where a prompt is SENT —
+/// so the next unattended prompt is covered with nobody remembering anything. That is
+/// the property this list cannot have, and it is not hypothetical: the list held the
+/// extraction prompt and `WIKI PLANNER`, and the wiki PAGE WRITER prompt — sent through
+/// the same `ask_agent` — was not on it, so that whole family was still read as the
+/// user's words. Measured on the corpus copy (t23): `WIKI PAGE WRITER` appears in 63
+/// lines across 16 session files.
+///
+/// **THIS LIST IS THE RESIDUE PATH, NOT A SECOND RULE.** It exists only for turns
+/// ALREADY ON DISK, written before the marker did: the daemon cannot rewrite a
+/// transcript an agent CLI logged months ago, and such a turn carries nothing else that
+/// distinguishes it from the user's own paste. It is kept honest by
+/// `every_agent_prompt_sender_is_covered_or_marked`, which walks the SENDERS instead of
+/// relying on whoever adds the next prompt to update this comment.
+///
+/// Each string below is the first line of a prompt THIS platform composes to run one of
+/// its own unattended jobs, stored one module over as a private `const`:
+///
+/// * `"You are a memory distillation engine"` — `distill.rs` `EXTRACTION_PROMPT`, the
+///   prompt the ACP tier sends and the prompt a `workspaces/distill` job run records.
+/// * `"WIKI PLANNER"` — `wiki.rs` `PLANNER_PROMPT`, the wiki build's planner.
+/// * `"WIKI PAGE WRITER"` — `wiki.rs` `writer_prompt(slug)`, the wiki build's page
+///   writer, whose prompt embeds the source documents in `<sources>`. Added by t23.
+///
+/// WHY LITERALS AND NOT THE CONSTANTS: both live in files this change does not own, and
+/// neither is visible outside its module (a private `const` is not reachable from a
+/// sibling). Naming them here instead of widening their visibility keeps this change
+/// inside its two files, and the drift risk that copying a literal normally carries is
+/// closed by `the_registered_prompt_heads_are_still_our_own_prompts`, which reads those
+/// files at compile time and fails if a registered head stops matching the prompt it
+/// names.
+const OUR_JOB_PROMPT_HEADS: [&str; 3] = [
+    "You are a memory distillation engine",
+    "WIKI PLANNER",
+    "WIKI PAGE WRITER",
+];
+
+/// Is this turn the PLATFORM's own text rather than something the user wrote?
+///
+/// STRUCTURAL, in the same sense `sessions::is_injected_title` documents for
+/// titles: it matches text the daemon itself emits, by a registered head, with
+/// `starts_with` and never `contains` — a user who pastes one of our prompts IS
+/// talking to us, and dropping their message for mentioning ours would be the
+/// substring mistake this codebase has already paid for once ("end" matching
+/// "end_turn"). A message that merely quotes a head inside its own words is
+/// untouched.
+///
+/// WHY THIS EXISTS AT ALL, measured on the 333 sessions of the real corpus copy
+/// (ruagent-close-the-gaps t11): the free tier was reading OUR OWN PROMPTS back
+/// as the user's words. 63 of the 501 user turns are a job prompt — 56 of them
+/// the extraction prompt, 7 the wiki planner — and they produced 337 of the 1222
+/// candidates, including nearly every `user_correction` (124 -> 9) and
+/// `user_decision` (34 -> 9): the extraction prompt quotes its own examples
+/// (`If the user CORRECTED …`), so the rules matched the scaffolding around the
+/// conversation instead of the conversation.
+///
+/// The injected-block heads are `chat::INJECTED_HEADERS` — the same registry
+/// `is_injected_title` uses, read from its one source rather than re-spelled. They
+/// fire 0 times on that corpus (no session there carried an injected context
+/// block); the registry is consulted anyway, because the mechanism that emits
+/// those blocks is live and the next corpus will contain them, and a turn that is
+/// ONLY such a block has nothing of the user's in it.
+fn is_platform_text(text: &str) -> bool {
+    let head = text.trim_start();
+    OUR_JOB_PROMPT_HEADS
+        .iter()
+        .chain(crate::chat::INJECTED_HEADERS.iter())
+        .any(|h| head.starts_with(h))
+}
+
+/// The turn as the free tier may read it, or `None` when there is nothing of the
+/// user's in it.
+///
+/// TWO STEPS, in this order, and the order is the whole point:
+///
+/// 1. `sessions::user_text` splits off the injected prefix the daemon emits
+///    (`chat::USER_TEXT_SENTINEL`) — the SAME structural split the session title
+///    uses, from its one definition. That is what keeps a turn that carries BOTH
+///    an injected block and the user's words: the user's part is kept, not
+///    dropped with the scaffolding.
+/// 2. What is left is checked against the platform's own prompt heads. A job
+///    prompt has no sentinel (the job runner sends it as the prompt), so it
+///    reaches this step intact and is dropped here.
+///
+/// A message that never carried injection and does not start with one of our
+/// heads comes back unchanged.
+fn turn_for_extraction(t: &Turn) -> Option<Turn> {
+    // THE TWO RULES, in the order that matters (t23):
+    //
+    // 1. `sessions::user_text` cuts at the marker the daemon appends when it SENDS an
+    //    unattended prompt. A platform prompt is all of the text BEFORE that marker, so
+    //    its user side is empty -- and that is true of prompts nobody has written yet,
+    //    which is why this arm, not the head list below, is the rule.
+    // 2. The head list is the residue: a turn already on disk, written before the
+    //    marker existed, has no marker to cut at, so the only handle left is the head
+    //    of a prompt this build can compose.
+    //
+    // BOTH arms read the SPLIT text and never the raw one: a turn where the daemon
+    // injected context and the USER's words follow it keeps those words (they are
+    // non-empty after the split), and a user who merely pastes one of our prompts
+    // mid-message is untouched -- `is_platform_text` matches `starts_with`, never
+    // `contains`.
+    let user_side = crate::sessions::user_text(&t.text);
+    if user_side.trim().is_empty() || is_platform_text(user_side) {
+        return None;
+    }
+    Some(Turn {
+        role: t.role,
+        text: user_side.to_string(),
+        ts_ms: t.ts_ms,
+    })
+}
+
 pub fn extract_rules(cx: &ExtractCtx<'_>) -> ExtractBundle {
+    // TURN SELECTION, BEFORE THE PASS (t11). The seam is deliberate:
+    //
+    // * NOT in `sessions::parse_file_messages`: that parser is shared with the
+    //   session VIEWER, so dropping messages there would hide the user's own
+    //   transcript from the panel — the wrong fix for a problem in the free tier.
+    // * NOT at candidate shaping (filtering what the pass returned): the pass
+    //   applies `max_per_input` (32) to what it READ, so candidates made of our
+    //   own prompt text would still consume the cap and squeeze the user's real
+    //   candidates out of it. Measured on the corpus: with the filter here rather
+    //   than after the pass, `procedure_note` 457 -> 491 and `lesson_learned`
+    //   129 -> 145 RISE, because sessions that had been filled with prompt text
+    //   now report what the user actually said. A post-pass filter cannot produce
+    //   that, and the `max_turns` window (reported as `turns_skipped`) likewise
+    //   counts the turns this tier is willing to read.
+    //
+    // The clone is the pass's own API (`&[Turn]`): it clones only what survives
+    // the selection, and the allocation is per session, not per candidate.
+    let turns: Vec<Turn> = cx.turns.iter().filter_map(turn_for_extraction).collect();
+    let pass = ruagent_extract::memory_candidates_with(&turns, &cx.limits);
+    // THE FLAG IS THE PASS'S OWN READING, NOT A RECOMPUTATION (t9).
+    //
+    // This used to be `truncated: cx.turns.len() > cx.limits.max_turns` — a
+    // different quantity from the one it described. `max_turns` defaults to 2000
+    // (`ExtractLimits::default`), so the flag was FALSE for a session whose
+    // candidate list had been cut at `max_per_input` (32 by default). Measured on
+    // 333 real sessions: 15 had hit the cap and all 333 reported `false`, with 16
+    // reporting exactly 32 candidates — nothing in the response distinguished
+    // "this session really has 32" from "this session was cut off at 32". A caller
+    // that cannot tell those apart cannot decide whether to fall back to the model
+    // tier, which is the decision this tier exists to inform.
+    //
+    // `memory_candidates_with` is the SAME pass `memory_candidates` runs (it is
+    // literally that function with its counters kept: `.candidates` is their
+    // candidates), so this reads what the pass did instead of asking a second
+    // question beside it. The predicate is:
+    //
+    //     truncated = pass.truncated || pass.turns_skipped > 0
+    //
+    // * `pass.truncated` is set by the pass only when a deduped candidate was
+    //   DROPPED because `out.len() >= max_per_input` (crates/extract/src/memory.rs)
+    //   — "the cap actually cut something". That is what makes `exactly 32`
+    //   distinguishable from `capped at 32`: a session that legitimately yields 32
+    //   leaves it false.
+    // * `pass.turns_skipped` is the number of LEADING turns the pass did not read
+    //   (the `max_turns` window), counted over the turns SELECTED above. It is the
+    //   same fact the old expression approximated, TAKEN FROM THE PASS rather than
+    //   recomputed at the call site, so the two cannot disagree about what the pass
+    //   did — and it is kept, because dropping it would make this flag newly false
+    //   for a genuinely cut transcript, the same class of lie in the other
+    //   direction.
+    //
+    // NOT changed here: the cap and the rules. This is a reporting fix.
     ExtractBundle {
-        memories: ruagent_extract::memory_candidates(cx.turns, &cx.limits),
+        memories: pass.candidates,
         entities: Vec::new(),
         relations: Vec::new(),
         source: Some(ExtractSource::Rules),
-        truncated: cx.turns.len() > cx.limits.max_turns,
+        truncated: pass.truncated || pass.turns_skipped > 0,
     }
 }
 
@@ -507,6 +684,367 @@ mod tests {
             text: text.to_string(),
             ts_ms: 0,
         }
+    }
+
+    /// t11: a turn that IS one of the platform's own job prompts is not read as
+    /// the user's words.
+    ///
+    /// The markers in the two prompt turns below are the point: the extraction
+    /// prompt's own few-shot examples are what the rules were matching
+    /// (`If the user CORRECTED …` became a `user_correction`), so the test puts the
+    /// same marker in all three turns and asserts that only the user's own turn
+    /// reaches the extractor.
+    #[test]
+    fn a_job_prompt_turn_is_not_the_users_words() {
+        let extraction_prompt = format!(
+            "{}. Analyze the agent session transcript below. If the user CORRECTED the agent \
+             (\"不对\"), extract the corrected fact. 以后统一用工具A处理这件事。",
+            OUR_JOB_PROMPT_HEADS[0]
+        );
+        let planner_prompt = format!(
+            "{}\n\nYou are a wiki planning engine. 以后统一用工具B处理这件事。",
+            OUR_JOB_PROMPT_HEADS[1]
+        );
+        let user_turn = "以后统一用工具C处理这件事。";
+        assert!(
+            is_platform_text(&extraction_prompt) && is_platform_text(&planner_prompt),
+            "both job prompts are the platform's own text"
+        );
+        assert!(!is_platform_text(user_turn), "the user's turn is not");
+
+        let turns = vec![
+            turn(ruagent_extract::Role::User, &extraction_prompt),
+            turn(ruagent_extract::Role::User, &planner_prompt),
+            turn(ruagent_extract::Role::User, user_turn),
+        ];
+        let limits = ExtractLimits::default();
+        let raw = ruagent_extract::memory_candidates_with(&turns, &limits);
+        assert!(
+            raw.candidates.len() > 1,
+            "the prompt turns DO produce candidates on their own — {} of them — which is why the \
+             rule cannot be a marker rule",
+            raw.candidates.len()
+        );
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+        assert_eq!(
+            bundle.memories.len(),
+            1,
+            "only the user's own turn is read: {:#?}",
+            bundle
+                .memories
+                .iter()
+                .map(|c| c.content.chars().take(40).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            bundle.memories[0].content.contains("工具C"),
+            "the surviving candidate is the user's"
+        );
+    }
+
+    /// The case that must NOT be a drop: a turn carrying an injected block AND
+    /// the user's own words. `sessions::user_text` splits the block off and the
+    /// user's part is read — dropping the whole turn here would be the "junk-rate
+    /// win bought by losing user text" this change must not make.
+    #[test]
+    fn the_user_side_of_an_injected_turn_is_still_read() {
+        let injected_with_user_text = format!(
+            "{HDR}] You are the platform role. [memory context — what the platform remembers]\n\
+             remembered things\n{}\n---\n以后统一用工具G处理这件事。",
+            crate::chat::USER_TEXT_SENTINEL,
+            HDR = crate::chat::HDR_ROLE
+        );
+        assert!(
+            is_platform_text(&injected_with_user_text),
+            "the turn DOES start with our injected block"
+        );
+        let turns = vec![turn(ruagent_extract::Role::User, &injected_with_user_text)];
+        let limits = ExtractLimits::default();
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+        assert_eq!(
+            bundle.memories.len(),
+            1,
+            "the user's words after the sentinel are still read"
+        );
+        assert!(
+            bundle.memories[0].content.contains("工具G"),
+            "and they are the user's, without the injected block: {:?}",
+            bundle.memories[0].content
+        );
+        assert!(
+            !bundle.memories[0].content.contains("remembered things"),
+            "the injected body is gone"
+        );
+    }
+
+    /// A turn that is ONLY an injected block has nothing of the user's in it and
+    /// is skipped.
+    #[test]
+    fn an_injected_block_with_no_user_text_is_skipped() {
+        let injected_only = format!(
+            "{HDR}] You are the platform role. 以后统一用工具H处理这件事。",
+            HDR = crate::chat::HDR_ROLE
+        );
+        let turns = vec![turn(ruagent_extract::Role::User, &injected_only)];
+        let limits = ExtractLimits::default();
+        let raw = ruagent_extract::memory_candidates_with(&turns, &limits);
+        assert!(!raw.candidates.is_empty(), "the raw pass would extract it");
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+        assert!(bundle.memories.is_empty(), "the injected block is skipped");
+    }
+
+    /// STATS-WITH, NEVER CONTAINS: a user who quotes one of our prompts is
+    /// talking to us. Dropping their message for mentioning ours is the substring
+    /// mistake this codebase has already paid for once.
+    #[test]
+    fn a_message_that_only_mentions_our_prompt_is_left_alone() {
+        let quoted = format!(
+            "以后统一用工具D处理这件事，就像 {} 里说的那样。",
+            OUR_JOB_PROMPT_HEADS[0]
+        );
+        assert!(
+            !is_platform_text(&quoted),
+            "the head is inside the user's sentence, not at its start"
+        );
+        let turns = vec![turn(ruagent_extract::Role::User, &quoted)];
+        let limits = ExtractLimits::default();
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+        assert_eq!(bundle.memories.len(), 1, "the user's message is still read");
+    }
+
+    /// The OTHER registry: the injected context blocks `chat.rs` emits. They fire
+    /// 0 times on the measured corpus, and this pins that the seam consults them
+    /// from their one source (`chat::INJECTED_HEADERS`) rather than re-spelling
+    /// them.
+    #[test]
+    fn the_injected_context_blocks_are_ours_too() {
+        for head in crate::chat::INJECTED_HEADERS {
+            let injected = format!("{head}] body the daemon injected. 以后统一用工具E处理这件事。");
+            assert!(is_platform_text(&injected), "not recognised: {head}");
+            let turns = vec![
+                turn(ruagent_extract::Role::User, &injected),
+                turn(ruagent_extract::Role::User, "以后统一用工具F处理这件事。"),
+            ];
+            let limits = ExtractLimits::default();
+            let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+            assert_eq!(
+                bundle.memories.len(),
+                1,
+                "the injected block is skipped, the user's turn is not ({head})"
+            );
+            assert!(bundle.memories[0].content.contains("工具F"));
+        }
+    }
+
+    /// The common case: a session that carries none of our text is read EXACTLY as
+    /// the pass would have read it. This is the assertion that would go red if the
+    /// exclusion ever widened beyond the registry.
+    #[test]
+    fn a_session_without_our_text_is_read_unchanged() {
+        let turns: Vec<Turn> = (0..8)
+            .map(|i| {
+                turn(
+                    ruagent_extract::Role::User,
+                    &format!("以后统一用工具{i}处理这件事。"),
+                )
+            })
+            .collect();
+        let limits = ExtractLimits::default();
+        let raw = ruagent_extract::memory_candidates_with(&turns, &limits);
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+        assert_eq!(raw.candidates.len(), 8);
+        assert_eq!(
+            bundle.memories.len(),
+            raw.candidates.len(),
+            "nothing was dropped from a session with no platform text"
+        );
+        assert_eq!(bundle.truncated, raw.truncated || raw.turns_skipped > 0);
+    }
+
+    /// The literals above live in files this change does not own, and a private
+    /// `const` is not reachable from a sibling module — so the drift risk that
+    /// copying a head normally carries is closed here instead: this reads both
+    /// prompt files at COMPILE time and fails the moment either prompt stops
+    /// starting with its registered head (a reworded prompt would otherwise
+    /// silently stop being excluded).
+    #[test]
+    fn the_registered_prompt_heads_are_still_our_own_prompts() {
+        let distill = include_str!("distill.rs");
+        let wiki = include_str!("wiki.rs");
+        assert!(
+            distill.contains(&format!("{}. ", OUR_JOB_PROMPT_HEADS[0])),
+            "distill.rs's EXTRACTION_PROMPT no longer starts with the registered head: {}",
+            OUR_JOB_PROMPT_HEADS[0]
+        );
+        assert!(
+            wiki.contains(&format!("{}\n", OUR_JOB_PROMPT_HEADS[1])),
+            "wiki.rs's PLANNER_PROMPT no longer starts with the registered head: {}",
+            OUR_JOB_PROMPT_HEADS[1]
+        );
+        // t23: the page writer's prompt is the third member, and it is the one the
+        // registry was missing until this task -- it is built by `writer_prompt(slug)`,
+        // so the literal to look for is its template head.
+        assert!(
+            wiki.contains("WIKI PAGE WRITER (slug:"),
+            "wiki.rs's writer_prompt no longer starts with the registered head: {}",
+            OUR_JOB_PROMPT_HEADS[2]
+        );
+        assert!(
+            !OUR_JOB_PROMPT_HEADS.iter().any(|h| h.trim().is_empty()),
+            "an empty head would match every turn"
+        );
+    }
+
+    /// t23: **the marker is the rule.** A prompt nobody registered a head for -- the NEXT
+    /// unattended prompt -- is dropped because `ask_agent` marked it when it was sent, so
+    /// coverage does not depend on anyone remembering to edit the registry.
+    ///
+    /// The other half is asserted too, because it is the way this rule could do harm: a
+    /// turn where the USER's words FOLLOW a platform prompt keeps those words.
+    #[test]
+    fn a_marked_prompt_is_dropped_even_with_an_unregistered_head() {
+        let sentinel = crate::chat::USER_TEXT_SENTINEL;
+        let durable = "以后统一用工具D处理这件事。";
+        // A prompt this build has never heard of: an unregistered head, sent through
+        // `ask_agent` (which appends the marker), logged by the agent CLI.
+        let future_prompt =
+            format!("FUTURE UNATTENDED JOB v2\nDo the job.\n\nINPUT:\n{durable}\n{sentinel}");
+        assert!(
+            !is_platform_text(crate::sessions::user_text(&future_prompt)),
+            "the head must really be unregistered, otherwise this test proves nothing"
+        );
+        assert!(
+            !ruagent_extract::memory_candidates_with(
+                &[turn(ruagent_extract::Role::User, &future_prompt)],
+                &ExtractLimits::default()
+            )
+            .candidates
+            .is_empty(),
+            "the unread prompt WOULD yield candidates, so dropping it is a real change"
+        );
+        assert!(
+            turn_for_extraction(&turn(ruagent_extract::Role::User, &future_prompt)).is_none(),
+            "a marked platform prompt must not reach the tier, whatever it says"
+        );
+
+        // REGRESSION GUARD (t21's control): the marker must not strip the user's words
+        // when they FOLLOW a platform prompt -- injected block, marker, then the user.
+        let mixed = format!("[memory context — 3 items]\n\n{sentinel}\n---\n{durable}");
+        assert_eq!(
+            turn_for_extraction(&turn(ruagent_extract::Role::User, &mixed)).map(|k| k.text),
+            Some(durable.to_string()),
+            "the user's words after the marker must survive the split"
+        );
+
+        // RESIDUE (rule 2): the wiki PAGE WRITER prompt, as it was written to disk
+        // BEFORE the marker existed, is covered by the registry -- the family t23 closes.
+        let writer = "WIKI PAGE WRITER (slug: x)\n\nYou are a wiki page writer.\n\n<sources>\n\
+                      <chunk id=\"1\">\n以后统一用工具E处理这件事。\n</chunk>\n</sources>";
+        assert!(
+            turn_for_extraction(&turn(ruagent_extract::Role::User, writer)).is_none(),
+            "the writer family must not reach the tier (residue rule)"
+        );
+    }
+
+    /// Lines that send an agent prompt WITHOUT the daemon's marker. t23's drift guard is
+    /// built on this, and it is a function so the CONTROL below can prove it can fail.
+    fn unmarked_prompt_sends(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("ChatCommand::Prompt") {
+                continue;
+            }
+            let window = lines[i..(i + 3).min(lines.len())].join("\n");
+            if !window.contains("platform_prompt(") {
+                out.push(i + 1);
+            }
+        }
+        out
+    }
+
+    /// t23: **every unattended prompt is covered, and the CHECK does not lean on memory.**
+    ///
+    /// Two invariants over the daemon's SOURCES, so a new prompt added later is covered
+    /// without anyone editing a list:
+    ///
+    /// 1. THE MARKER CANNOT BE BYPASSED. Outside `chat.rs` (the user's OWN chat, which
+    ///    composes injected blocks + the marker + the user's text, so it is not a sender
+    ///    of unattended prompts), every prompt that reaches an agent is sent by
+    ///    `ask_agent`, and that one send carries `platform_prompt(`. A new module that
+    ///    talks to an agent directly fails here -- including a new FILE, because the scan
+    ///    walks the directory rather than a list of names.
+    /// 2. THE RESIDUE REGISTRY still names the prompts the senders compose, so the family
+    ///    already written to disk stays covered.
+    ///
+    /// The scan is over the real sources; step 3 is the control that shows what failure
+    /// looks like, without planting anything in the shared tree.
+    #[test]
+    fn every_agent_prompt_sender_is_covered_or_marked() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&dir)
+            .expect("the daemon's source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            // chat.rs is the user's own path, by name and for a stated reason.
+            if name == "chat.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable source");
+            // Only the code that SHIPS: a test module's own literals mention
+            // `ChatCommand::Prompt` (the control at the end of this test does), and none
+            // of them is a sender. Truncating at the test module keeps the check about
+            // the daemon.
+            let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
+            let bad = unmarked_prompt_sends(production);
+            assert!(
+                bad.is_empty(),
+                "{name} sends an agent prompt the daemon's marker does not cover, at line(s) {bad:?} \
+                 -- an unattended prompt must go through `ask_agent`, which marks it"
+            );
+            scanned += 1;
+        }
+        assert!(
+            scanned > 10,
+            "the scan must actually walk the daemon's sources; it walked {scanned}"
+        );
+
+        // 2. the registry's members are still the senders' prompts.
+        for (file, src, needle) in [
+            (
+                "distill.rs",
+                include_str!("distill.rs"),
+                OUR_JOB_PROMPT_HEADS[0],
+            ),
+            ("wiki.rs", include_str!("wiki.rs"), OUR_JOB_PROMPT_HEADS[1]),
+            ("wiki.rs", include_str!("wiki.rs"), OUR_JOB_PROMPT_HEADS[2]),
+        ] {
+            assert!(
+                src.contains(needle),
+                "{file} no longer composes the registered prompt head {needle:?}"
+            );
+        }
+
+        // 3. THE CONTROL: a bypassing sender IS detected, so an empty result above means
+        //    something. (Planted here, never in the tree.)
+        let planted = "fn a_new_unattended_sender() -> Result<()> {\n    \
+                       session.send(ChatCommand::Prompt {\n        \
+                       text: prompt.to_string(),\n        context: None,\n    })?;\n    Ok(())\n}\n";
+        assert_eq!(
+            unmarked_prompt_sends(planted),
+            vec![2],
+            "the scanner must fail on a sender that skips the marker, otherwise the check is vacuous"
+        );
     }
 
     /// A distiller that CANNOT run an agent: a `root` that is a FILE, so the
@@ -789,5 +1327,88 @@ mod tests {
     #[test]
     fn the_shipped_distill_policy_is_off() {
         assert!(!AutoDistill::default().auto);
+    }
+
+    // -----------------------------------------------------------------------
+    // t9: the truncation flag tells the truth about the MEMORY PASS
+    // -----------------------------------------------------------------------
+
+    /// One user turn the memory rules fire on, with content unique per `n` so the
+    /// pass cannot dedup two of them into one candidate.
+    fn memory_turn(n: usize) -> Turn {
+        turn(
+            ruagent_extract::Role::User,
+            &format!("记住：约定编号 {n}，发布流程使用 scripts/release-{n}.sh 这一步。"),
+        )
+    }
+
+    /// THE t9 REGRESSION, and it is also the test that fails if the flag goes back
+    /// to `turns.len() > max_turns`: 60 turns is far below `max_turns` (2000), so
+    /// that expression is false while the pass really did drop candidates at the
+    /// 32 cap. The measurement found exactly this shape on 333 real sessions.
+    #[test]
+    fn a_session_cut_at_the_candidate_cap_reports_truncated() {
+        let limits = ExtractLimits::default();
+        let turns: Vec<Turn> = (0..60).map(memory_turn).collect();
+        let pass = ruagent_extract::memory_candidates_with(&turns, &limits);
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+
+        assert!(
+            turns.len() < limits.max_turns,
+            "the turn-count predicate had to be false here, or this test proves nothing"
+        );
+        assert_eq!(
+            pass.candidates.len(),
+            limits.max_per_input,
+            "the pass fills the cap: {pass:?}"
+        );
+        assert!(
+            pass.truncated,
+            "…and it dropped candidates to get there: {pass:?}"
+        );
+        assert_eq!(bundle.memories.len(), limits.max_per_input);
+        assert!(
+            bundle.truncated,
+            "a candidate list cut at the cap must say so: {bundle:?}"
+        );
+    }
+
+    /// `exactly N candidates` stays DISTINGUISHABLE from `capped at N`: filling the
+    /// cap exactly drops nothing, so the flag stays false. This is the case the
+    /// measurement could not separate (16 sessions reported exactly 32).
+    #[test]
+    fn a_session_that_fills_the_cap_exactly_is_not_truncated() {
+        let limits = ExtractLimits::default();
+        let turns: Vec<Turn> = (0..limits.max_per_input).map(memory_turn).collect();
+        let pass = ruagent_extract::memory_candidates_with(&turns, &limits);
+        let bundle = extract_rules(&ctx(&turns, "transcript", limits));
+
+        assert_eq!(pass.candidates.len(), limits.max_per_input, "{pass:?}");
+        assert!(!pass.truncated, "nothing was dropped: {pass:?}");
+        assert_eq!(bundle.memories.len(), limits.max_per_input);
+        assert!(
+            !bundle.truncated,
+            "32 candidates from 32 turns is everything the pass produced"
+        );
+    }
+
+    /// The OTHER loss the old expression stood for is still reported, and now it
+    /// comes from the pass's own `turns_skipped` rather than a recomputation.
+    #[test]
+    fn a_transcript_window_that_drops_turns_is_still_reported() {
+        let limits = ExtractLimits {
+            max_turns: 4,
+            ..ExtractLimits::default()
+        };
+        let turns: Vec<Turn> = (0..10).map(memory_turn).collect();
+        let pass = ruagent_extract::memory_candidates_with(&turns, &limits);
+        assert_eq!(
+            pass.turns_skipped, 6,
+            "the window read only the last 4 turns"
+        );
+        assert!(
+            extract_rules(&ctx(&turns, "transcript", limits)).truncated,
+            "6 leading turns were not read, so this is not everything the session had"
+        );
     }
 }

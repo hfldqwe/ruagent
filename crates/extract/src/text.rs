@@ -17,6 +17,14 @@
 //! and asserted by the gold tests; it is not a second opinion about identity —
 //! the graph's judge remains the referee (graph/src/lib.rs:994-1024).
 //!
+//! ONE asymmetry, deliberate and reported: the mirror's OTHER side is not
+//! byte-safe. `ruagent_graph::variants` (graph/src/lib.rs:916) carries the same
+//! `n[open + 1..close]` assumption this module used to carry, so a name with a
+//! full-width parenthetical would panic there too. graph/ is outside this
+//! crate's scope; the site is named in the write-up for the
+//! full-width-parenthetical fix (ruagent-close-the-gaps t8) rather than
+//! silently left behind.
+//!
 //! Nothing here reads a clock, an environment variable, a file or a network
 //! socket, and nothing iterates an unordered collection.
 
@@ -177,17 +185,59 @@ pub fn contains_any(hay_lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| contains_marker(hay_lower, m))
 }
 
+/// The last of `ascii` / `wide` in `s`, with the character that matched, so a
+/// caller can advance past the delimiter by ITS OWN byte length.
+fn last_delimiter(s: &str, ascii: char, wide: char) -> Option<(usize, char)> {
+    match (s.rfind(ascii), s.rfind(wide)) {
+        (Some(i), Some(j)) => Some(if i > j { (i, ascii) } else { (j, wide) }),
+        (Some(i), None) => Some((i, ascii)),
+        (None, Some(j)) => Some((j, wide)),
+        (None, None) => None,
+    }
+}
+
 /// The content of ONE trailing parenthetical group, as `(outer, inner)`:
-/// `DeepSeek Harness (dsh)` -> `("deepseek harness", "dsh")`. Mirrors the shape
-/// of `ruagent_graph::variants` (graph/src/lib.rs:909-926).
+/// `DeepSeek Harness (dsh)` -> `("deepseek harness", "dsh")`, and
+/// `基础知识（准备）` -> `("基础知识", "准备")`.
+///
+/// # Why this is not `open + 1`
+///
+/// It used to be. `（` is THREE bytes, so `name[open + 1..close]` landed inside
+/// the character and panicked: "start byte index 13 is not a char boundary; it
+/// is inside '（' (bytes 12..15) of `基础知识（准备）`" (text.rs:190). Measured on
+/// the user's real knowledge base: 116 of 936 documents panicked there, and the
+/// live ingest route answered a dropped connection with no error body. Full-width
+/// punctuation is ordinary Chinese text, so the assumption "a parenthesis is one
+/// byte" — not the input — was the bug.
+///
+/// Now every index is either produced by `rfind` (a character boundary) or
+/// advanced by the matched delimiter's own `len_utf8()` (1 for `(`/`)`, 3 for
+/// `（`/`）`), so no byte-width assumption remains anywhere in the function.
+///
+/// # Mixed delimiters: paired by POSITION
+///
+/// `矩阵（matrix)` and `Matrix (矩阵）` each yield one group. Width is a
+/// keyboard/encoding artifact, not a semantic one, so refusing to pair across
+/// widths would silently drop a real alias and would leave two spellings of the
+/// same construct with different answers. The tie-break for a name holding both
+/// closer forms is also positional: the LAST delimiter wins, which is what
+/// "trailing" means. (The old code preferred an ASCII `)` anywhere over a later
+/// `）`; that is the only shape whose answer could move, and the corpus
+/// measurement for ruagent-close-the-gaps t8 found no document where it does.)
+///
+/// # Mirror
+///
+/// The shape is still mirrored from `ruagent_graph::variants`
+/// (graph/src/lib.rs:909-926). That function carries the SAME one-byte
+/// assumption at graph/src/lib.rs:916 and is out of this crate's scope; it is
+/// named in the t8 write-up so the same panic cannot be rediscovered later.
 pub fn trailing_parenthetical(name: &str) -> Option<(String, String)> {
-    let close = name.rfind(')').or_else(|| name.rfind('）'))?;
-    let open = name[..close]
-        .rfind('(')
-        .or_else(|| name[..close].rfind('（'))?;
+    let (close, _) = last_delimiter(name, ')', '）')?;
+    let (open, opener) = last_delimiter(&name[..close], '(', '（')?;
+    let inner_start = open + opener.len_utf8();
     Some((
         name[..open].trim().to_string(),
-        name[open + 1..close].trim().to_string(),
+        name[inner_start..close].trim().to_string(),
     ))
 }
 
@@ -366,7 +416,15 @@ pub fn iso_datetime(s: &str) -> Option<String> {
                     && b[t + 4].is_ascii_digit();
                 if has_time {
                     end = t + 5;
-                    if b.get(end) == Some(&b':') && end + 3 <= b.len() {
+                    // `:SS`. The two bytes after the colon are consumed as a byte
+                    // COUNT, so they are required to be single-byte first:
+                    // `21:39:中文` used to slice inside '中' and panic at
+                    // text.rs:388 ("end byte index 19 is not a char boundary").
+                    // ASCII-only input behaves exactly as before.
+                    if b.get(end) == Some(&b':')
+                        && end + 3 <= b.len()
+                        && b[end + 1..end + 3].iter().all(u8::is_ascii)
+                    {
                         end += 3;
                     }
                     if b.get(end) == Some(&b'.') {
@@ -378,7 +436,14 @@ pub fn iso_datetime(s: &str) -> Option<String> {
                     }
                     match b.get(end) {
                         Some(&b'Z') => end += 1,
-                        Some(&sign) if (sign == b'+' || sign == b'-') && end + 6 <= b.len() => {
+                        // `±HH:MM`: five bytes consumed as a byte count, so they
+                        // must be single-byte (`+中文字`, `+😀😀` used to panic
+                        // here for the same reason as the seconds above).
+                        Some(&sign)
+                            if (sign == b'+' || sign == b'-')
+                                && end + 6 <= b.len()
+                                && b[end + 1..end + 6].iter().all(u8::is_ascii) =>
+                        {
                             end += 6;
                         }
                         _ => {}
@@ -390,4 +455,110 @@ pub fn iso_datetime(s: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // The full-width parenthetical (ruagent-close-the-gaps t8). Measured on the
+    // user's real knowledge base: 116 of 936 documents made `graph_candidates`
+    // panic here, and the connection of the live ingest route simply dropped
+    // with no error body. Full-width punctuation is ordinary Chinese text, so
+    // this is the shape to pin, not an edge case.
+    // -----------------------------------------------------------------------
+
+    /// The EXACT shape found in the corpus: a Han term whose trailing group uses
+    /// the full-width pair.
+    #[test]
+    fn a_full_width_parenthetical_is_one_group() {
+        let (outer, inner) = trailing_parenthetical("基础知识（准备）").expect("one group");
+        assert_eq!(outer, "基础知识");
+        assert_eq!(inner, "准备");
+        // The two derived shapes the write path merges on.
+        assert_eq!(base_name("基础知识（准备）"), "基础知识");
+        assert_eq!(
+            variants_of("基础知识（准备）"),
+            vec![
+                "基础知识".to_string(),
+                "基础知识（准备）".to_string(),
+                "准备".to_string()
+            ]
+        );
+    }
+
+    /// A one-byte parenthesis is unchanged: `base_name`/`variants_of` keep the
+    /// gold behaviour (`DeepSeek Harness (dsh)` shares a base with `dsh`).
+    #[test]
+    fn a_one_byte_parenthetical_is_unchanged() {
+        let (outer, inner) = trailing_parenthetical("deepseek harness (dsh)").expect("one group");
+        assert_eq!(outer, "deepseek harness");
+        assert_eq!(inner, "dsh");
+        assert_eq!(base_name("DeepSeek Harness (dsh)"), "deepseek harness");
+        assert_eq!(
+            variants_of("DeepSeek Harness (dsh)"),
+            vec![
+                "deepseek harness".to_string(),
+                "deepseek harness (dsh)".to_string(),
+                "dsh".to_string()
+            ]
+        );
+    }
+
+    /// Width is a keyboard/encoding artifact, not a semantic one: a group is
+    /// paired by POSITION, so the mixed shapes each yield one group instead of
+    /// being dropped (or crashing).
+    #[test]
+    fn mixed_width_delimiters_are_paired_by_position() {
+        assert_eq!(
+            trailing_parenthetical("矩阵（matrix)"),
+            Some(("矩阵".to_string(), "matrix".to_string()))
+        );
+        assert_eq!(
+            trailing_parenthetical("Matrix (矩阵）"),
+            Some(("Matrix".to_string(), "矩阵".to_string()))
+        );
+    }
+
+    /// A closer with no opener before it, and an opener with no closer, are both
+    /// "no group" — the function is total.
+    #[test]
+    fn unmatched_delimiters_yield_no_group() {
+        assert_eq!(trailing_parenthetical("没有开括号）"), None);
+        assert_eq!(trailing_parenthetical("没有闭括号（"), None);
+        assert_eq!(
+            trailing_parenthetical("空组（）"),
+            Some(("空组".to_string(), String::new())),
+            "an empty group is a group: the outer name survives, the inner is empty"
+        );
+    }
+
+    /// The other index in this file that advanced by a byte count without
+    /// checking the bytes were single-byte: `iso_datetime`'s `:SS` and its
+    /// `±HH:MM` offset. Both are reachable from a document's text.
+    #[test]
+    fn iso_datetime_does_not_slice_into_a_multibyte_suffix() {
+        // `:中` is three bytes, so `end += 3` used to land inside it.
+        assert_eq!(
+            iso_datetime("2026-09-14T21:39:中文"),
+            Some("2026-09-14T21:39".to_string())
+        );
+        // `+中文字` is nine bytes, so `end += 6` used to land inside a character.
+        assert_eq!(
+            iso_datetime("2026-09-14T21:39+中文字"),
+            Some("2026-09-14T21:39".to_string())
+        );
+        // A four-byte character after the offset sign: `end += 6` lands inside it.
+        assert_eq!(
+            iso_datetime("2026-09-14T21:39+😀😀"),
+            Some("2026-09-14T21:39".to_string())
+        );
+        // The shapes the function exists for are untouched.
+        assert_eq!(
+            iso_datetime("as of 2026-09-14T21:39:08+08:00 ok"),
+            Some("2026-09-14T21:39:08+08:00".to_string())
+        );
+        assert_eq!(iso_datetime("2026-09-14"), Some("2026-09-14".to_string()));
+    }
 }

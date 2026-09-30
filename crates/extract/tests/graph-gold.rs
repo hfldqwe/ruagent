@@ -322,3 +322,37 @@ fn entity_dedup_keys_ignore_case_and_one_parenthetical() {
         "a two-letter acronym is refused (see rules::MIN_ACRONYM_CHARS)"
     );
 }
+
+/// REGRESSION (full-width-parenthetical panic, ruagent-close-the-gaps t8): the
+/// document-level shape that panicked the extractor on the user's real corpus —
+/// a heading whose trailing group uses the full-width pair.
+///
+/// Measured (t2): 116 of 936 knowledge documents in that corpus hit this, and
+/// through `POST /api/v1/knowledge/graph/ingest` the caller saw the connection
+/// drop with no error body. The panic was `text.rs:190`, `name[open + 1..close]`
+/// with a three-byte `（`.
+///
+/// This pins ONE shape: the full-width pair with Han content. Mixed widths and
+/// the one-byte pair are pinned in `src/text.rs`'s unit tests; the shapes the
+/// corpus did NOT contain are not claimed to be covered by this test.
+#[test]
+fn a_full_width_parenthetical_heading_is_an_entity_not_a_panic() {
+    let document = "# 基础知识（准备）\n\n正文一句话。\n";
+    let got = graph_candidates(document, &ExtractLimits::graph_default());
+    let heading = got
+        .entities
+        .iter()
+        .find(|e| e.name == "基础知识（准备）")
+        .unwrap_or_else(|| panic!("the heading is an entity: {:#?}", got.entities));
+    assert_eq!(
+        heading.dedup_key(),
+        "基础知识",
+        "the trailing full-width group is one group: {heading:?}"
+    );
+    assert_eq!(heading.kind, Some("concept"));
+    assert!(
+        heading.aliases.contains(&"准备".to_string()),
+        "the group content is an alias candidate, not part of the name: {:?}",
+        heading.aliases
+    );
+}

@@ -29,7 +29,7 @@ const FIXTURE = {
 };
 
 test("conservative recall stubs expand to the full memory", async ({ page, request }) => {
-  const access = writeAccess();
+  const access = writeAccess("writes ONE memory fixture (and deletes it again, which is also a write)");
   test.skip(!access.allowed, access.reason);
 
   // ── fixture: ONE memory, written through the API (not the UI) ────────────

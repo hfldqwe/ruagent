@@ -137,8 +137,40 @@ fn ledger_versions(conn: &rusqlite::Connection) -> Result<Vec<i64>, DbError> {
 ///
 /// Split out of `apply` so the rollback property is testable without a
 /// deliberately broken entry in `MIGRATIONS`.
+///
+/// **THE WRITE LOCK IS TAKEN UP FRONT (IMMEDIATE, not the rusqlite default
+/// DEFERRED).** This is not a durability change and not a retry: it is which
+/// branch of SQLite's own locking the transaction takes, and only one of the two
+/// is covered by the `busy_timeout` the store configures at `sqlite.rs:107`.
+///
+/// MEASURED (private root, second process holding `BEGIN IMMEDIATE`, 5s
+/// busy_timeout): a DEFERRED transaction that reads before it writes *pins a
+/// read snapshot*, and the later write must UPGRADE to a write lock. When
+/// another writer commits in that window — or holds the lock — the upgrade
+/// cannot be satisfied by waiting, and SQLite returns `SQLITE_BUSY` /
+/// `SQLITE_BUSY_SNAPSHOT` (extended 5 / 517) essentially at once instead of
+/// letting the busy handler spend its 5 seconds. Re-taken on the real path with
+/// the opener's step sequence instrumented separately (2026-10-01, this worktree
+/// at 94aed3722653a41e0e74f8bd60589256fc971a8f, `t7-measure probe`): every step of
+/// `Db::open` succeeded under contention — `journal_mode=WAL` waited 1.98s and
+/// completed, the ledger read took 25µs — and then the DEFERRED transaction's
+/// INSERT failed in **54/50/30µs** with `database is locked`. A single statement
+/// that asks for the write lock while it holds none waits the full timeout
+/// instead (1.986s wait, then SUCCESS, when the lock was held 2s).
+///
+/// WHAT THIS COSTS: the write lock is now held from the transaction's start
+/// rather than from its first write. A genuinely concurrent writer therefore
+/// waits from `BEGIN IMMEDIATE` instead of being able to read alongside us until
+/// our first write — for the duration of one migration, which is a handful of
+/// DDL statements and a single ledger row. The trade is right because the
+/// single-writer rule is documentation rather than enforcement (measured: a
+/// second process can `Db::open` the same file and write freely), so a
+/// concurrent writer is exactly what must not be able to make the migration fail
+/// in a way the configured timeout cannot absorb. What we give up is a window
+/// nobody was promised; what we buy is that contention becomes an ordinary wait
+/// and that a wait exceeding the timeout becomes a clean, explainable failure.
 fn apply_one(conn: &mut rusqlite::Connection, version: i64, script: &str) -> Result<(), DbError> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     apply_script(&tx, version, script)?;
     tx.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",

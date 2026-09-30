@@ -275,6 +275,13 @@ impl SessionIndexer {
     }
 
     /// Load one session's turns, parsed from the source file on demand.
+    ///
+    /// ONE definition with [`parse_file_messages`], which the distiller uses (t10).
+    /// This used to carry its own `match source` with the same three arms, so the
+    /// viewer and the distiller could drift apart about a family — and both were
+    /// SILENT about any family they did not know, which is how 305 indexed
+    /// `opencode` sessions became unreachable while the index held them happily.
+    /// Delegating makes "what a session is" a single answer.
     pub async fn messages(&self, key: &str) -> Result<Vec<SessionMessage>, ruagent_store::DbError> {
         let key = key.to_string();
         let (source, ref_path): (String, String) = self
@@ -287,14 +294,7 @@ impl SessionIndexer {
                 )
             })
             .await??;
-        let path = PathBuf::from(&ref_path);
-        let parsed = match source.as_str() {
-            "claude-code" => parse_claude_code(&std::fs::read_to_string(&path).unwrap_or_default()),
-            "dsh" => parse_dsh(&std::fs::read(&path).unwrap_or_default()),
-            "ruagent" => parse_ruagent(&std::fs::read_to_string(&path).unwrap_or_default()),
-            _ => Parsed::default(),
-        };
-        Ok(parsed.messages)
+        Ok(parse_file_messages(&source, Path::new(&ref_path)))
     }
 }
 
@@ -590,15 +590,85 @@ pub fn session_key_of(transcript: &std::path::Path) -> String {
     make_key("ruagent", transcript)
 }
 
+/// Every family this build can read, and what it does with one it cannot.
+///
+/// THE FAMILIES ARE THE INDEXER'S OWN (see [`SessionIndexer::scan`]): it indexes
+/// `claude-code`, `dsh`, `ruagent`, `codex` and `opencode`, and every one of them
+/// is readable here — a family the index CAN hold but this function cannot read
+/// is a session the user can see and cannot use, which is exactly the defect this
+/// closed for `opencode` (305 indexed sessions, every one answering a bare 400).
+///
+/// AN UNKNOWN FAMILY IS STILL REFUSED, and refused out loud: guessing at a format
+/// turns a mis-parsed session into silently wrong distillation input, which is
+/// worse than a clear refusal. The daemon-log WARN names the family; the HTTP
+/// wording is produced by the caller (`distill.rs`, "session has no messages to
+/// distill"), so from here the refusal is legible in the log rather than in the
+/// response body.
 pub fn parse_file_messages(source: &str, path: &Path) -> Vec<SessionMessage> {
-    let bytes = std::fs::read(path).unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
     match source {
-        "claude-code" => parse_claude_code(&text).messages,
-        "dsh" => parse_dsh(&bytes).messages,
-        "ruagent" => parse_ruagent(&text).messages,
-        _ => Vec::new(),
+        "claude-code" => {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            parse_claude_code(&text).messages
+        }
+        "dsh" => parse_dsh(&std::fs::read(path).unwrap_or_default()).messages,
+        "ruagent" => {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            parse_ruagent(&text).messages
+        }
+        // t10: the codex rollout parser already existed and is what the indexer
+        // uses; only this seam had no branch for it, so those sessions were
+        // indexed and unreadable.
+        "codex" => {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            parse_codex(&text).messages
+        }
+        // t10: opencode keeps EVERY session in one SQLite database, so the row's
+        // ref_path carries the session id after a '#' — see `parse_opencode_ref`.
+        "opencode" => parse_opencode_ref(path),
+        other => {
+            tracing::warn!(
+                source = %other,
+                path = %path.display(),
+                "no parser for this session family: refusing rather than guessing (the session will read as having no messages)"
+            );
+            Vec::new()
+        }
     }
+}
+
+/// One opencode session's turns, from the ref_path the index recorded.
+///
+/// WHY THE ID IS IN THE ref_path (t10): the opencode family stores all of its
+/// sessions in ONE database (`~/.local/share/opencode/opencode.db`), and both
+/// readers of a session are handed nothing but `(source, ref_path)` — the db path
+/// alone is shared by all 305 rows, so the id is the only thing that can say WHICH
+/// session a row is. `index_opencode` therefore writes `"<db path>#<session id>"`.
+///
+/// READING THE WHOLE DATABASE INSTEAD IS NOT AN OPTION: it would concatenate every
+/// session into one transcript, i.e. silently wrong distillation input — the guess
+/// this refuses to make. A ref_path in the old bare-db shape (an index written
+/// before the id was recorded) is refused the same way, and a rescan heals it.
+fn parse_opencode_ref(path: &Path) -> Vec<SessionMessage> {
+    let raw = path.to_string_lossy();
+    let Some((db_path, session_id)) = raw.rsplit_once('#') else {
+        tracing::warn!(
+            path = %path.display(),
+            "opencode ref_path carries no session id (indexed before t10): refusing rather than reading every session into one transcript; a rescan rewrites it"
+        );
+        return Vec::new();
+    };
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        Path::new(db_path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        tracing::warn!(
+            path = db_path,
+            session = session_id,
+            "opencode database could not be opened read-only"
+        );
+        return Vec::new();
+    };
+    opencode_session_messages(&conn, session_id)
 }
 
 fn make_key(source: &str, path: &Path) -> String {
@@ -667,7 +737,11 @@ pub fn usable_title(title: Option<&str>, preview: Option<&str>) -> Option<String
 /// The ACP layer joins context and text with a separator, so the marker is
 /// followed by it; a leading separator line is dropped when present, which
 /// keeps the split correct whether or not that join format changes.
-fn user_text(raw: &str) -> &str {
+///
+/// `pub(crate)` since ruagent-close-the-gaps t11: the same split is what the
+/// free tier needs before it reads a turn, so it has ONE definition rather than
+/// a copy in `extract_plane`.
+pub(crate) fn user_text(raw: &str) -> &str {
     let sentinel = crate::chat::USER_TEXT_SENTINEL;
     let Some(idx) = raw.rfind(sentinel) else {
         return raw;
@@ -754,24 +828,39 @@ impl SessionIndexer {
         let sessions = read_opencode_sessions(db_path);
         for s in sessions {
             let key = format!("opencode:{}", s.session_id);
-            let known: Option<(i64, i64)> = {
+            // THE ref_path CARRIES THE SESSION ID (t10). Every opencode session
+            // lives in this one database, so the db path alone cannot tell the
+            // viewer or the distiller WHICH session a row is — both are handed
+            // nothing but (source, ref_path). `<db>#<id>` is that answer, and it
+            // is why the 305 rows indexed before this change are refused until
+            // the rescan below rewrites them.
+            let ref_path = format!("{db_ref}#{}", s.session_id);
+            let known: Option<(i64, i64, String)> = {
                 let db = self.db.clone();
                 let key = key.clone();
                 db.call(move |conn| {
                     conn.query_row(
-                        "SELECT mtime_ms, size_bytes FROM sessions WHERE key = ?1",
+                        "SELECT mtime_ms, size_bytes, ref_path FROM sessions WHERE key = ?1",
                         [&key],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .ok()
                 })
                 .await?
             };
-            if known == Some((mtime, size)) {
+            // Skip only when the row is unchanged AND already in this shape: a row
+            // written before the id was recorded holds the bare db path, and
+            // (mtime, size) alone would leave it unreadable for ever on a database
+            // that never changes. The same self-healing shape as
+            // `preview_is_injected` in `index_file`.
+            if known
+                .as_ref()
+                .is_some_and(|(m, sz, rp)| *m == mtime && *sz == size && *rp == ref_path)
+            {
                 continue;
             }
             let record = s.clone();
-            let db_ref = db_ref.clone();
+            let ref_path_for_row = ref_path.clone();
             self.db
                 .call(move |conn| {
                     conn.execute(
@@ -784,7 +873,7 @@ impl SessionIndexer {
                             "opencode",
                             usable_title(record.title.as_deref(), record.preview.as_deref()),
                             record.project,
-                            db_ref,
+                            ref_path_for_row,
                             record.started_at,
                             record.updated_at,
                             mtime,
@@ -838,55 +927,12 @@ fn read_opencode_sessions(db_path: &Path) -> Vec<OpencodeSession> {
     let Some(rows) = rows else { return Vec::new() };
     for row in rows.flatten() {
         let (id, title, directory, created, updated) = row;
-        // text parts in order; message.data.role carries the turn role.
-        let Ok(mut parts) = conn.prepare(
-            "SELECT m.data, p.data FROM part p
-               JOIN message m ON m.id = p.message_id
-              WHERE p.session_id = ?1 ORDER BY p.time_created",
-        ) else {
-            continue;
-        };
-        let turns = parts
-            .query_map([&id], |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                ))
-            })
-            .ok();
-        let mut messages: Vec<SessionMessage> = Vec::new();
-        if let Some(turns) = turns {
-            for (msg_data, part_data) in turns.flatten() {
-                let (Some(msg_data), Some(part_data)) = (msg_data, part_data) else {
-                    continue;
-                };
-                let Ok(md) = serde_json::from_str::<serde_json::Value>(&msg_data) else {
-                    continue;
-                };
-                let Ok(pd) = serde_json::from_str::<serde_json::Value>(&part_data) else {
-                    continue;
-                };
-                if pd.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    continue;
-                }
-                let Some(text) = pd.get("text").and_then(|t| t.as_str()) else {
-                    continue;
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let role = if md.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    "user"
-                } else {
-                    "assistant"
-                };
-                messages.push(SessionMessage {
-                    role: role.into(),
-                    text: text.to_string(),
-                    ts: pd.get("time").and_then(|t| t.as_i64()).unwrap_or(0),
-                });
-            }
-        }
+        // text parts in order; message.data.role carries the turn role. The
+        // extraction is ONE definition shared with the viewer/distill reader
+        // (t10), so the two routes cannot disagree about what this session's
+        // messages are — the disagreement that let 305 rows be indexed here and
+        // unreadable everywhere else.
+        let messages = opencode_session_messages(&conn, &id);
         if messages.is_empty() {
             continue; // spawn noise
         }
@@ -905,6 +951,69 @@ fn read_opencode_sessions(db_path: &Path) -> Vec<OpencodeSession> {
         });
     }
     sessions
+}
+
+/// The text turns of ONE opencode session, from an open read-only handle (t10).
+///
+/// ONE definition, TWO routes: the index counts messages and picks a preview with
+/// it, and the viewer/distill path renders the transcript with it. It used to live
+/// inline in the indexing loop, which is how the family ended up indexed but
+/// undeliverable — a reader with no branch for `opencode` cannot call it, and a
+/// second copy of these rules could drift.
+///
+/// Only `type == "text"` parts are messages: `reasoning`, `step-start` and `tool`
+/// parts are the agent's machinery, not the conversation. `message.data.role`
+/// carries the turn role; anything that is not exactly `user` is the agent.
+fn opencode_session_messages(conn: &rusqlite::Connection, session_id: &str) -> Vec<SessionMessage> {
+    let Ok(mut parts) = conn.prepare(
+        "SELECT m.data, p.data FROM part p
+           JOIN message m ON m.id = p.message_id
+          WHERE p.session_id = ?1 ORDER BY p.time_created",
+    ) else {
+        return Vec::new();
+    };
+    let turns = parts
+        .query_map([session_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .ok();
+    let mut messages: Vec<SessionMessage> = Vec::new();
+    if let Some(turns) = turns {
+        for (msg_data, part_data) in turns.flatten() {
+            let (Some(msg_data), Some(part_data)) = (msg_data, part_data) else {
+                continue;
+            };
+            let Ok(md) = serde_json::from_str::<serde_json::Value>(&msg_data) else {
+                continue;
+            };
+            let Ok(pd) = serde_json::from_str::<serde_json::Value>(&part_data) else {
+                continue;
+            };
+            if pd.get("type").and_then(|t| t.as_str()) != Some("text") {
+                continue;
+            }
+            let Some(text) = pd.get("text").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let role = if md.get("role").and_then(|r| r.as_str()) == Some("user") {
+                "user"
+            } else {
+                "assistant"
+            };
+            messages.push(SessionMessage {
+                role: role.into(),
+                text: text.to_string(),
+                ts: pd.get("time").and_then(|t| t.as_i64()).unwrap_or(0),
+            });
+        }
+    }
+    messages
 }
 
 /// Parse a codex rollout file: response_item message events carry the
@@ -1238,5 +1347,195 @@ mod tests {
         let p = parse_ruagent(jsonl);
         assert_eq!(p.message_count, 1);
         assert_eq!(p.messages[0].text, "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // t10: every family the index holds is readable here (or refused OUT LOUD)
+    // -----------------------------------------------------------------------
+
+    /// A tiny opencode database shaped like the REAL one.
+    ///
+    /// WHERE THE SAMPLE COMES FROM: the schema and the JSON key shapes were read
+    /// from the user's live `~/.local/share/opencode/opencode.db` — through a
+    /// COPY (`%TEMP%\t10\opencode-copy.db`), never the live file. Observed there:
+    /// `part` JOIN `message` ON `m.id = p.message_id`, filtered by
+    /// `p.session_id` and ordered by `p.time_created`, with
+    /// `message.data = {"role":"user"|"assistant", ...}` and
+    /// `part.data = {"type":"text"|"reasoning"|"tool"|..., "text": ...}`.
+    ///
+    /// EVERY STRING BELOW IS REDACTED: the session ids, message ids, part ids and
+    /// turn texts are written for this test; no session content is copied into
+    /// the tree.
+    fn opencode_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ruagent-t10-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                                time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        put_store_turn(
+            &conn,
+            "ses-a",
+            "msg-a1",
+            "prt-a1",
+            1,
+            "user",
+            "redacted turn A1",
+        );
+        put_store_turn(
+            &conn,
+            "ses-a",
+            "msg-a2",
+            "prt-a2",
+            2,
+            "assistant",
+            "redacted turn A2",
+        );
+        put_store_turn(
+            &conn,
+            "ses-b",
+            "msg-b1",
+            "prt-b1",
+            3,
+            "user",
+            "redacted turn B1",
+        );
+        // A non-text part is the agent's machinery, never a message.
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, data)
+             VALUES ('prt-a3','msg-a2','ses-a',4,'{\"type\":\"reasoning\",\"text\":\"machinery\"}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        (dir, db)
+    }
+
+    fn put_store_turn(
+        conn: &rusqlite::Connection,
+        sid: &str,
+        msg: &str,
+        part: &str,
+        ts: i64,
+        role: &str,
+        text: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1,?2,?3)",
+            rusqlite::params![
+                msg,
+                sid,
+                format!("{{\"role\":\"{role}\",\"time\":{{\"created\":{ts}}}}}")
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, data)
+             VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                part,
+                msg,
+                sid,
+                ts,
+                format!("{{\"type\":\"text\",\"text\":\"{text}\"}}")
+            ],
+        )
+        .unwrap();
+    }
+
+    /// t10 REGRESSION: an `opencode` session parses — and only ITS OWN turns.
+    /// Before the branch, this seam returned an empty vec for the family, which is
+    /// what made all 305 indexed opencode sessions answer a bare 400.
+    #[test]
+    fn an_opencode_ref_parses_only_its_own_session() {
+        let (dir, db) = opencode_fixture("own");
+        let a = parse_file_messages(
+            "opencode",
+            &std::path::PathBuf::from(format!("{}#ses-a", db.display())),
+        );
+        assert_eq!(
+            a.len(),
+            2,
+            "the id in ref_path selects exactly that session's TEXT parts: {a:?}"
+        );
+        assert_eq!(a[0].role, "user");
+        assert_eq!(a[0].text, "redacted turn A1");
+        assert_eq!(a[1].role, "assistant");
+        assert!(
+            a.iter().all(|m| !m.text.contains("B1")),
+            "another session's turns leaked into this one: {a:?}"
+        );
+        // The sibling still reads as itself, so the id is doing the selecting.
+        let b = parse_file_messages(
+            "opencode",
+            &std::path::PathBuf::from(format!("{}#ses-b", db.display())),
+        );
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!(b[0].text, "redacted turn B1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shape the 305 rows indexed BEFORE t10 hold (the bare database path)
+    /// must refuse: reading the shared database would concatenate every session
+    /// into one transcript, which is the guess this must never make.
+    #[test]
+    fn an_opencode_ref_without_an_id_refuses_instead_of_reading_every_session() {
+        let (dir, db) = opencode_fixture("noid");
+        let msgs = parse_file_messages("opencode", &db);
+        assert!(
+            msgs.is_empty(),
+            "without a session id there is no way to know WHICH session this is: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The codex family was indexed but unreadable at this seam; the parser
+    /// already existed, so the branch is the indexer's own parser.
+    #[test]
+    fn a_codex_rollout_parses_at_this_seam() {
+        let dir = std::env::temp_dir().join(format!("ruagent-t10-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-redacted.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"redacted codex user turn\"}]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"redacted codex reply\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let msgs = parse_file_messages("codex", &path);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A family nobody has taught this seam stays REFUSED rather than guessed at:
+    /// the index holding a family is not permission to invent its format.
+    #[test]
+    fn an_unknown_family_is_refused_not_guessed() {
+        let dir = std::env::temp_dir().join(format!("ruagent-t10-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plausible-but-unknown.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"user\",\"content\":\"a format this build was never taught\"}\n",
+        )
+        .unwrap();
+        assert!(
+            parse_file_messages("some-future-agent", &path).is_empty(),
+            "an unknown family must produce no messages: a wrong guess becomes silently wrong distillation input"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

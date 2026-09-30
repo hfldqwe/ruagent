@@ -40,7 +40,10 @@ pub fn graph_candidates_for(source: &str, input: &str, limits: &ExtractLimits) -
     // §7.4.1 windowing: keep the first max_text_bytes, cut at a paragraph
     // boundary — a document's head states its terms.
     let (window, bytes_skipped) = window_text(input, limits.max_text_bytes);
-    let truncated = bytes_skipped > 0;
+    // The flag is the LOSS bit, not a description of one loss: it starts as the
+    // input-text cut and each place below that DROPS a candidate raises it too.
+    // Two caps, one truth (see the `truncated` field docs in lib.rs).
+    let mut truncated = bytes_skipped > 0;
 
     let headings = scan_headings(window);
     let heading_offsets: Vec<usize> = headings.iter().map(|h| h.offset).collect();
@@ -158,8 +161,19 @@ pub fn graph_candidates_for(source: &str, input: &str, limits: &ExtractLimits) -
             .then(a.name.cmp(&b.name))
     });
     // §9.3: the ranking cut (`min_confidence` in the capability options). Memory
-    // candidates are never filtered this way — only truncated.
+    // candidates are never filtered this way — only truncated. A score cut is
+    // the caller's own setting applied to every input, so it is NOT a loss and
+    // must not raise the flag; the candidate cap below is, and does.
     raw.retain(|e| e.score >= limits.min_score);
+    if raw.len() > limits.max_per_input {
+        // The sibling of the memory cap's defect (crates/extract/src/memory.rs
+        // sets its flag at exactly this kind of drop): `raw.truncate` below
+        // silently discards the candidates past the cap, and a flag that only
+        // reported the input-text cut answered `false` while doing it — the one
+        // direction a caller cannot guard against. `exactly 96` (nothing to
+        // drop) stays `false`: the test is the drop, not the length.
+        truncated = true;
+    }
     raw.truncate(limits.max_per_input);
 
     let entities: Vec<EntityCandidate> = raw
@@ -189,6 +203,11 @@ pub fn graph_candidates_for(source: &str, input: &str, limits: &ExtractLimits) -
     // §9.5: the two lists share one budget, entities first (dropping an entity
     // would orphan the relations that name it).
     let budget = limits.max_per_input.saturating_sub(entities.len());
+    if relations.len() > budget {
+        // The same loss at the same cap: a relation dropped here is a candidate
+        // the caller will never see, so the flag has to say so.
+        truncated = true;
+    }
     relations.truncate(budget);
 
     GraphCandidates {
@@ -949,5 +968,110 @@ impl RelAccum {
     /// §9.3: `score = min(1.0, 0.5 x support)`.
     fn score(&self) -> f32 {
         (0.5 * self.offsets.len() as f32).min(1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // The truncation flag (ruagent-close-the-gaps t17). It lives here, next to
+    // the cap it describes, rather than in tests/bounded.rs: the value under
+    // test is the pass's own drop bookkeeping, and the property is stated over
+    // the pass's output, not over a helper.
+    //
+    // The flag is the DROP bit, not the list length — the same property the
+    // memory pass gained in the same increment (`memory.rs` sets its flag where
+    // it drops, not from `out.len()`). Before the fix, `truncated` came from
+    // `bytes_skipped` alone, so a document that overflowed the 96-candidate cap
+    // reported `truncated = false` while dropping everything past 96: through
+    // the real route, 300 headings + 300 spans and 120 + 120 both answered
+    // `entities=96 candidates=96 truncated=0`.
+    //
+    // Both directions are pinned, because the fix WIDENS the flag:
+    // * the candidate drop must raise it (fails if the flag reverts to
+    //   text-cut-only), and
+    // * the input-text cut must keep raising it (fails if someone replaces the
+    //   text cut with the drop bit and trades one silent truncation for another).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_truncation_flag_reports_the_candidate_drop_not_only_the_text_cut() {
+        // A probe far BELOW the text window, so `bytes_skipped == 0` and the
+        // input cut cannot be the cause of whatever the flag says: 200 ASCII
+        // headings, one entity each.
+        let document: String = (1..=200).map(|i| format!("## Qm{i:04}\n\n")).collect();
+        let open = ExtractLimits {
+            max_per_input: 1_000,
+            ..ExtractLimits::graph_default()
+        };
+        assert!(
+            document.len() < open.max_text_bytes,
+            "the text cut must not be in play for this probe"
+        );
+        let all = graph_candidates(&document, &open);
+        assert_eq!(all.bytes_skipped, 0, "no byte of the input was skipped");
+        assert!(!all.truncated, "the whole document fits an open cap");
+        let total = all.entities.len();
+        assert!(
+            total > 96,
+            "the probe must exceed the default cap, got {total}"
+        );
+        assert!(
+            all.relations.is_empty(),
+            "the probe must state no relation, so the drop bit measures entities only"
+        );
+
+        // CAPPED AT 96: candidates past the cap are dropped, so the flag must
+        // say so.
+        let capped = graph_candidates(&document, &ExtractLimits::graph_default());
+        assert_eq!(capped.entities.len(), 96, "the cap is the cap");
+        assert_eq!(
+            capped.bytes_skipped, 0,
+            "this loss is the candidate drop, not the text cut"
+        );
+        assert!(
+            capped.truncated,
+            "a dropped candidate must be reported — this is the t17 defect"
+        );
+
+        // EXACTLY at the cap, with nothing left to drop, is NOT a cut.
+        let exact = ExtractLimits {
+            max_per_input: total,
+            ..ExtractLimits::graph_default()
+        };
+        let at_cap = graph_candidates(&document, &exact);
+        assert_eq!(at_cap.entities.len(), total, "the cap is filled exactly");
+        assert!(
+            !at_cap.truncated,
+            "filling the cap is not dropping from it: `exactly {total}` must stay distinguishable from `capped at {total}`"
+        );
+
+        // One candidate beyond the cap is a cut again.
+        let minus_one = ExtractLimits {
+            max_per_input: total - 1,
+            ..ExtractLimits::graph_default()
+        };
+        let dropped = graph_candidates(&document, &minus_one);
+        assert_eq!(dropped.entities.len(), total - 1);
+        assert!(dropped.truncated, "one candidate beyond the cap is a cut");
+
+        // The loss the flag ALREADY covered must survive: a document larger than
+        // the text window holding almost no candidates is cut in the INPUT, and
+        // nothing is dropped by the cap — so only `bytes_skipped` can raise the
+        // flag here.
+        let huge = format!("## Only\n\n{}", "x".repeat(400 * 1024));
+        let cut = graph_candidates(&huge, &ExtractLimits::graph_default());
+        assert!(cut.bytes_skipped > 0, "the window cut real bytes");
+        assert!(
+            cut.entities.len() < 96,
+            "nothing was dropped by the candidate cap here: {}",
+            cut.entities.len()
+        );
+        assert!(
+            cut.truncated,
+            "the input-text cut must still raise the flag (do not trade one silent truncation for another)"
+        );
     }
 }

@@ -15,22 +15,41 @@
 // themselves and say why.
 //
 // WHICH SPECS WRITE REAL DATA (kept next to the code, not in a report):
-//   registry.spec.ts   CREATES a runtime and a role in the daemon config.
-//   every other spec   read-only over the API and the panel.
+//   registry.spec.ts              CREATES a runtime and a role in the daemon config
+//                                 (agents.toml), and deletes them again.
+//   settings-capabilities.spec.ts edits the `[capabilities]` table of the daemon's
+//                                 own policy.toml (a weight), and restores it.
+//   consumption.spec.ts           writes a wiki page, a memory, a `recall_log` row,
+//                                 a document and a graph entity. It removes the
+//                                 wiki page and the document; the memory and the
+//                                 `recall_log` row are left behind on purpose
+//                                 (on a throwaway root they are the evidence the
+//                                 run happened).
+//   recall.spec.ts                writes ONE memory fixture and deletes it again
+//                                 (the cleanup is a write too, so it is gated as
+//                                 well).
+//   every other spec              read-only over the API and the panel.
 //
-// ADDING A SPEC THAT WRITES? Import writeAccess() and test.skip() on it, then
-// add the spec to the list above.
+// ADDING A SPEC THAT WRITES? Import writeAccess(), pass it what YOUR spec writes,
+// and test.skip() on the result -- then add the spec to the list above.
 import type { APIRequestContext } from "@playwright/test";
 
 export const WRITE_ACCESS_ENV = "RUAGENT_E2E_ALLOW_WRITES";
 
-export function writeAccess(): { allowed: boolean; reason: string } {
+/** The gate. `writes` is what THIS spec does to the daemon, in its own words.
+ *
+ *  It is a required argument on purpose: the reason a skip prints is the only
+ *  thing a reader sees of a spec that did not run, so it has to describe the
+ *  thing being skipped. One shared sentence naming registry.spec.ts's runtime and
+ *  role, printed for a spec that edits policy.toml, is a skip reason that
+ *  misinforms about the very damage it exists to prevent. */
+export function writeAccess(writes: string): { allowed: boolean; reason: string } {
   if (process.env[WRITE_ACCESS_ENV] === "1") return { allowed: true, reason: "" };
   return {
     allowed: false,
     reason:
-      "this spec CREATES entries in the daemon's real config (a runtime and a role), so it " +
-      "must not run against a daemon whose config matters, and it must not run by accident. " +
+      `this spec ${writes} -- the daemon's REAL config -- so it must not run ` +
+      "against a daemon whose config matters, and it must not run by accident. " +
       "Run it through the suite entry point instead: npm run test:e2e sets " +
       WRITE_ACCESS_ENV + "=1. A bare npx playwright test deliberately does not.",
   };

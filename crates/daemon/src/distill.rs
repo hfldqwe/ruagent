@@ -344,6 +344,21 @@ impl Distiller {
         dry_run: bool,
     ) -> Result<(DistillOutcome, &'static str)> {
         let messages = self.load_messages(session_key).await?;
+        // WHAT IS DISTILLED IS THE USER'S OWN WORDS (t21). One filter, before BOTH
+        // tiers: the rules tier used to drop platform turns inside the extraction
+        // plane while the ACP tier rendered them into the prompt it asked the model to
+        // summarise, so the two tiers disagreed about whose words these are. A session
+        // that has nothing of the user's in it is refused with the reason instead of
+        // being distilled into memories attributed to a session the user never spoke in.
+        let raw_turns = messages.len();
+        let messages = user_turns(messages);
+        if messages.is_empty() && raw_turns > 0 {
+            anyhow::bail!(
+                "session {session_key} carries no user text: every turn is platform \
+                 text (an injected block, or one of our own job prompts) or the agent's \
+                 own output — there is nothing of the user's in it to distil"
+            );
+        }
         let transcript = render_transcript(&messages);
         if transcript.is_empty() {
             anyhow::bail!("session has no messages to distill");
@@ -711,9 +726,11 @@ impl Distiller {
         });
 
         // No context payload: distillation must not feed the memory
-        // layer back into itself.
+        // layer back into itself. The prompt carries the platform marker (t21), so the
+        // session the agent CLI logs for this job does not present our own text — a
+        // machine copy of another session's transcript — as the user's words.
         session.send(ChatCommand::Prompt {
-            text: prompt.to_string(),
+            text: platform_prompt(prompt),
             context: None,
         })?;
         let reply = match tokio::time::timeout(std::time::Duration::from_secs(300), done_rx).await {
@@ -978,6 +995,52 @@ fn normalize_store(s: &str) -> String {
     }
 }
 
+/// One of OUR prompts, carrying the marker that says so (ruagent-close-the-gaps t21).
+///
+/// Every unattended job prompt this daemon sends goes out through `ask_agent`, and the
+/// agent CLI it spawns writes that prompt into its OWN session log — where a later
+/// distillation reads it as the first "user" turn of that session. That text is a
+/// MACHINE COPY of something else (the extraction prompt embeds another session's
+/// rendered transcript; the wiki page writer embeds the source documents), so a
+/// candidate extracted from it claims the user said it in the session where the daemon
+/// ran the job.
+///
+/// MEASURED, on a private root with the real routes (t21): distilling a wiki WRITER job
+/// session wrote a memory for a sentence the user never said there, and the row's
+/// provenance pointed at the JOB — `memories.source_episode` -> `episodes.source_run =
+/// claude-code:<writer job>` — while the user's own session held the same sentence as a
+/// DIFFERENT episode that nothing pointed at.
+///
+/// The marker is the daemon's own, not a new convention: `chat::USER_TEXT_SENTINEL` plus
+/// its one reader `sessions::user_text` define "the user's words" as what FOLLOWS the
+/// sentinel. Appending it to a prompt WE wrote states the truth about that turn — there
+/// is no user text in it — and every reader that already speaks this convention (the
+/// session title, `user_turns` below, the extraction seam) classifies it correctly.
+///
+/// It also closes the class STRUCTURALLY rather than by a list: the hygiene fix
+/// recognises two prompt HEADS, and the wiki PAGE WRITER prompt is not one of them,
+/// which is how this channel was still reachable.
+fn platform_prompt(prompt: &str) -> String {
+    format!("{prompt}{}", crate::chat::USER_TEXT_SENTINEL)
+}
+
+/// The messages a distillation may read: the ones that carry something of the USER's.
+///
+/// ONE definition, applied ONCE before either tier reads the session, so the rules tier
+/// and the ACP transcript cannot disagree about whose words these are —
+/// `sessions::user_text` is the same split the session title and the extraction seam
+/// use. A turn that carries only platform text (an injected block, or one of our own job
+/// prompts, which `ask_agent` marks with `platform_prompt`) has nothing of the user's in
+/// it and is dropped here. A user turn is untouched, with or without a marker.
+fn user_turns(
+    messages: Vec<crate::sessions::SessionMessage>,
+) -> Vec<crate::sessions::SessionMessage> {
+    messages
+        .into_iter()
+        .filter(|m| !crate::sessions::user_text(&m.text).trim().is_empty())
+        .collect()
+}
+
 /// The transcript rendered as plain turns for the extraction prompt — the exact
 /// string the ACP tier appends to its prompt and the free tier reads as text.
 fn render_transcript(messages: &[crate::sessions::SessionMessage]) -> String {
@@ -1194,6 +1257,85 @@ mod t329_tests {
             origin: Default::default(),
             source: String::new(),
         }
+    }
+
+    fn msg(role: &str, text: &str) -> crate::sessions::SessionMessage {
+        crate::sessions::SessionMessage {
+            role: role.to_string(),
+            text: text.to_string(),
+            ts: 0,
+        }
+    }
+
+    /// t21: a job prompt's EMBEDDED render must not become a memory in the session where
+    /// the daemon ran the job. The prompt is a MACHINE COPY of another session's text --
+    /// and the wiki PAGE WRITER prompt is not one of the two heads the hygiene fix
+    /// knows, so this is the channel that was still open when the defect was measured.
+    ///
+    /// THE ASSERTION THAT FAILS IF THE ATTRIBUTION RETURNS: the third one, `no candidate
+    /// mentions the embedded sentence`. It goes red the moment a marked job prompt
+    /// reaches either tier again: drop `platform_prompt` from `ask_agent`'s send, or
+    /// stop filtering with `user_turns`, and the sentence comes back as a candidate of
+    /// the JOB session.
+    #[test]
+    fn a_marked_job_prompt_is_not_the_users_words() {
+        let user_sentence = "记住：发布流程统一使用 scripts/release.sh 这一步，不要再手动打 tag。";
+        let writer_prompt = format!(
+            "WIKI PAGE WRITER (slug: t21)\n\nWrite ONE wiki page.\n\n<sources>\n\
+             <document name=\"release-notes\">\n<chunk id=\"1\">\n{user_sentence}\n</chunk>\n\
+             </document>\n</sources>\n"
+        );
+        // What the agent CLI logs for the job: the marked prompt, then the agent's reply.
+        let job = vec![
+            msg("user", &platform_prompt(&writer_prompt)),
+            msg("assistant", "好的，已按这个约定记录。"),
+        ];
+        // 1. the marker states the truth about that turn, in the daemon's own vocabulary.
+        assert!(
+            crate::sessions::user_text(&job[0].text).trim().is_empty(),
+            "a job prompt must carry no user text"
+        );
+        // 2. neither tier sees the embedded render.
+        let kept = user_turns(job);
+        let transcript = render_transcript(&kept);
+        assert!(
+            !transcript.contains(user_sentence),
+            "the embedded render reached the ACP transcript: {transcript}"
+        );
+        let turns = turns_of(&kept);
+        let cx = crate::extract_plane::ExtractCtx {
+            session_key: "claude-code:t21-writer-job",
+            transcript: &transcript,
+            turns: &turns,
+            limits: ruagent_extract::ExtractLimits::default(),
+        };
+        let bundle = crate::extract_plane::extract_rules(&cx);
+        // 3. THE PIN: no candidate carries the machine copy's text.
+        assert!(
+            bundle
+                .memories
+                .iter()
+                .all(|m| !m.content.contains("release.sh")),
+            "a candidate was extracted from a machine copy: {:?}",
+            bundle.memories
+        );
+        // CONTROL: the same sentence on the USER's own turn is still extracted, so the
+        // filter drops platform text and not the user.
+        let own = user_turns(vec![msg("user", user_sentence)]);
+        let own_transcript = render_transcript(&own);
+        let own_turns = turns_of(&own);
+        let own_cx = crate::extract_plane::ExtractCtx {
+            session_key: "claude-code:t21-user",
+            transcript: &own_transcript,
+            turns: &own_turns,
+            limits: ruagent_extract::ExtractLimits::default(),
+        };
+        assert!(
+            !crate::extract_plane::extract_rules(&own_cx)
+                .memories
+                .is_empty(),
+            "the control must still extract the user's own sentence"
+        );
     }
 
     /// t347 acceptance 1: what a distillation WRITES must not carry the

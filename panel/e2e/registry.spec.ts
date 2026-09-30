@@ -18,7 +18,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { removeResidue, writeAccess } from "./write-guard";
 
 // The gate. Skipped -- with a named reason -- unless e2e/run-e2e.mjs armed it.
-const access = writeAccess();
+const access = writeAccess("CREATES a runtime and a role");
 test.skip(!access.allowed, access.reason);
 
 test("runtimes and roles can be created and deleted from the panel", async ({ page, request, baseURL }) => {

@@ -31,15 +31,19 @@
 // purpose -- on a throwaway root they are the evidence that the run happened, and
 // deleting rows out of the operator's data is not this suite's business.
 //
-// (The `write-guard.ts` header still lists only registry.spec.ts as a writer; that
-// list becoming complete is a one-line edit in a file this task does not own --
-// registered in the report rather than made silently.)
+// (The `write-guard.ts` header listed only registry.spec.ts as a writer until
+// ruagent-close-the-gaps t13, which added this spec, recall.spec.ts and
+// settings-capabilities.spec.ts to that list -- the edit this note used to ask
+// for, registered here rather than made silently when it was not this file's to
+// make.)
 
 import { expect, test } from "@playwright/test";
 
 import { writeAccess } from "./write-guard";
 
-const access = writeAccess();
+const access = writeAccess(
+  "writes a wiki page, a memory, a `recall_log` row, a document and a graph entity",
+);
 test.skip(!access.allowed, access.reason);
 
 const WIKI_SLUG = "e2e-consumption-probe";

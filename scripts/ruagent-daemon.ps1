@@ -13,7 +13,11 @@
 #           which status/watch/stop all share (t340, discipline 7.92)
 #   status  health check + pid + log tail
 #   watch   start it only if the health check fails (this is what the task runs)
-#   install-task  register a scheduled task: at logon, and every 5 minutes
+#   install-task  register a scheduled task: at logon, and every 5 minutes, FOR THE
+#                 CURRENT USER (a per-user principal needs no elevation, where an
+#                 all-users one is denied in an ordinary shell). The success line is
+#                 printed only after reading the task back and checking its shape
+#                 (increment 7, t1: it used to claim 'registered' for a denied run)
 #
 # Logging: <root>/logs/daemon.log, appended, rotated to daemon.log.1 at 5 MB.
 # Stop:    refuses to run without -Force (a script cannot post to the team channel, so
@@ -169,12 +173,277 @@ switch ($Action) {
     }
   }
   'install-task' {
+    # ── TWO SEPARATE DEFECTS used to live in this block (increment 7, t1) ───────
+    # (a) SHAPE. It registered with no principal -- an ALL-USERS task at logon --
+    #     which needs elevation, so an ordinary shell was denied. Measured on this
+    #     machine from a non-elevated shell: Register-ScheduledTask -> '拒绝访问。'
+    #     / 'Access is denied.', HRESULT 0x80070005, with Get-ScheduledTask finding
+    #     nothing afterwards.
+    # (b) REPORTING. The success line was printed unconditionally, so that same
+    #     denied run still read as 'registered'. $ErrorActionPreference='Stop' does
+    #     NOT cover this path, and that too is measured rather than assumed: the
+    #     denial is terminating only when this file is pwsh's TOP-LEVEL command
+    #     (`pwsh -File scripts/ruagent-daemon.ps1 install-task`); invoked the way a
+    #     human in a session invokes it (`& scripts/ruagent-daemon.ps1 install-task`)
+    #     the same denial left the script running to the success line, exit 0, with
+    #     the error on the error stream. The guard was an accident of invocation
+    #     shape, so the message below is tied to a READ-BACK instead -- the standard
+    #     `stop` already follows by refusing to be silent.
+    #
+    # The shape is the one verified by hand on this machine: state=Ready, an explicit
+    # principal for the CURRENT user (LogonType Interactive, RunLevel Limited), a
+    # logon trigger scoped to that user, and a 5-minute repetition trigger. None of
+    # that needs elevation. -Force keeps it idempotent: a second run updates the same
+    # task instead of leaving two. The action keeps the script's OWN -Root/-Exe/-Addr
+    # (dropping them would make `install-task -Exe <other>` register a watchdog that
+    # ignores where it was pointed).
+    $taskName = 'ruagent-daemon-watchdog'
+    $userId = "$env:USERDOMAIN\$env:USERNAME"
     $scriptPath = $PSCommandPath
     $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" watch -Root `"$Root`" -Exe `"$Exe`" -Addr `"$Addr`""
     $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
-    $t1 = New-ScheduledTaskTrigger -AtLogOn
+    $t1 = New-ScheduledTaskTrigger -AtLogOn -User $userId
     $t2 = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
-    Register-ScheduledTask -TaskName 'ruagent-daemon-watchdog' -Action $a -Trigger @($t1, $t2) -Force | Out-Null
-    Write-Output 'scheduled task ruagent-daemon-watchdog registered (at logon + every 5 min)'
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
+
+    # Account comparison that survives the domain-spelling difference: the request
+    # says 'HFLD\19410' while Get-ScheduledTask reports the principal as '19410' and
+    # the XML stores a SID. Resolve to a SID, and fall back to the bare account name
+    # when the account cannot be resolved at all.
+    function Get-AccountKey {
+      param([string]$Account)
+      if (-not $Account) { return '' }
+      try { return ([System.Security.Principal.NTAccount]$Account).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { return $Account.Split('\')[-1] }
+    }
+
+    # ── The ACTION helpers (t12). The action is the one field that decides WHAT
+    # runs, and it was the one field this read-back never looked at: during t4's
+    # verification an instrumented COPY of this script ran install-task and, because
+    # the action is built from $PSCommandPath, re-pointed the machine's watchdog at
+    # `%TEMP%\t4-scripts\ruagent-daemon.ps1` -- the copy's `watch` then fired from a
+    # temp file -- and this read-back's success line blessed it. WHO (principal) and
+    # WHEN (triggers) were right; WHAT was another file.
+
+    # The script a registered action would run, pulled out of its `-File "..."`.
+    function Get-ActionScriptPath {
+      param([string]$Arguments)
+      if ($Arguments -match '-File\s+"([^"]+)"') { return $Matches[1] }
+      if ($Arguments -match '-File\s+(\S+)') { return $Matches[1] }
+      return ''
+    }
+
+    # Is this file the REPOSITORY's copy of the script (as opposed to a copy someone
+    # dropped in a temp directory)? A checkout of this repository has Cargo.toml next
+    # to a crates\daemon directory. Deliberately structural rather than
+    # content-based: the incident's copy was instrumented, so comparing bytes would
+    # have flagged the instrumentation and missed the point -- what matters is that
+    # the file is not the repo's script at all.
+    function Test-RepoScript {
+      param([string]$Script)
+      if (-not $Script) { return $false }
+      $root = Split-Path (Split-Path $Script -Parent) -Parent
+      if (-not $root) { return $false }
+      return ((Test-Path (Join-Path $root 'Cargo.toml')) -and (Test-Path (Join-Path $root 'crates\daemon')))
+    }
+
+    # The same invocation written with different whitespace/case is the same
+    # invocation: the comparison is about what would run, not about spelling.
+    function Get-ArgShape {
+      param([string]$Arguments)
+      if (-not $Arguments) { return '' }
+      return (($Arguments -replace '\s+', ' ').Trim().ToLowerInvariant())
+    }
+
+    # ONE formatter for both sides (t12/V4): same keys, same order, same rendering,
+    # so `observed:` and `wanted:` differ ONLY where a value differs.
+    function Format-TaskShape {
+      param([System.Collections.IDictionary]$Shape)
+      $parts = foreach ($k in $Shape.Keys) { "$k=$($Shape[$k])" }
+      return ($parts -join ' ')
+    }
+
+    # V3 (t12): a failure must be non-zero HOWEVER the caller invoked this file.
+    # `exit 1` is not: measured through a wrapper (`wrapper.ps1` -> `& this.ps1`) it
+    # leaves the wrapper's process at exit 0, while -File/-Command report 1 -- which
+    # is what t4's verifier measured and what a CI wrapper would silently swallow.
+    # A TERMINATING ERROR is invocation-shape independent; measured 1 via -File,
+    # -Command, a wrapper WITHOUT $LASTEXITCODE propagation, a wrapper that
+    # propagates, and a wrapper reached through -Command; and 0 for the ok path.
+    function Fail-InstallTask {
+      param([string]$Summary)
+      throw [System.Management.Automation.RuntimeException]::new($Summary)
+    }
+
+    # WHAT THE MACHINE RUNS RIGHT NOW, read BEFORE the attempt (t12): this run may be
+    # about to change it, and an action that changes target silently is the incident
+    # this read-back exists to catch.
+    $prevTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    $prevArgs = ''
+    if ($prevTask) { $prevArgs = [string]@($prevTask.Actions)[0].Arguments }
+
+    # The call below is only an ATTEMPT; the read-back is what decides the message.
+    $errorsBefore = $Error.Count
+    $registerError = $null
+    try {
+      Register-ScheduledTask -TaskName $taskName -Action $a -Trigger @($t1, $t2) -Principal $principal -Force -ErrorAction Stop | Out-Null
+    } catch {
+      $registerError = $_.Exception.Message
+    }
+    # Explicit -ErrorAction Stop is not always enough for this cmdlet (measured:
+    # under `&` invocation the error stayed non-terminating), so take the engine's
+    # own record of the failure rather than inventing a reason.
+    if (-not $registerError -and $Error.Count -gt $errorsBefore) {
+      $registerError = $Error[0].Exception.Message
+      if (-not $registerError) { $registerError = $Error[0].ToString() }
+    }
+
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+      Write-Output "FAILED: scheduled task '$taskName' was NOT registered -- Get-ScheduledTask cannot find it, so nothing here protects this machine across a reboot."
+      if ($registerError) { Write-Output ('reason: ' + $registerError) }
+      Write-Output "what to do: re-run this from your own (non-elevated) session -- the task it installs is for $userId only, which needs no elevation, so a denial means the registration itself failed and should be reported rather than worked around by registering for all users. Act on the reason above."
+      Fail-InstallTask "install-task FAILED: '$taskName' was NOT registered (Get-ScheduledTask cannot find it)$(if ($registerError) { ' -- ' + $registerError } else { '' })"
+    }
+
+    # ── The read-back: WHAT it compares, and what it deliberately does not ──────
+    # COMPARED (11 checks): state; principal account (by SID key); LogonType;
+    # RunLevel; trigger count; logon-trigger user (by SID key); repeat interval; and
+    # -- t12 -- the ACTION: Execute, Arguments, and that the action's script is inside
+    # a checkout of this repository (a copy must never become the machine's watchdog).
+    #
+    # THE WANTED ACTION IS ANCHORED, NOT copied from this run. Normally the wanted
+    # script is this file ($PSCommandPath). But when this file is NOT the repo's copy
+    # -- a temp-dir copy, which is the incident's shape -- the wanted target is the
+    # script the machine's watchdog ALREADY runs (when that one is the repo's), because
+    # a copy running install-task must not be able to certify that it should replace
+    # the machine's watchdog: the copy's own read-back is otherwise SELF-CONSISTENT
+    # (it registers the copy, then agrees with itself), which is exactly how t4's
+    # verification blessed `%TEMP%\t4-scripts\ruagent-daemon.ps1`.
+    #
+    # NOT COMPARED, and why. An unstated omission is how this defect happened:
+    #  * the action's WorkingDirectory -- this script registers none, and the action is
+    #    a -File invocation of an absolute path, so a cwd cannot change what runs;
+    #  * the arguments as raw bytes -- compared NORMALIZED (trim, collapse whitespace,
+    #    case-insensitive): quote/spacing spelling is not behaviour, and byte equality
+    #    would report a healthy task as broken after a hand-edit that means the same;
+    #  * the raw account spelling ('HFLD\19410' vs '19410') -- the comparison is by SID
+    #    (Get-AccountKey) and the maps print the CANONICAL spelling of the compared
+    #    value, so the human diff is the comparison rather than a passing difference;
+    #  * the time trigger's StartBoundary -- it is built from `Get-Date`, so it differs
+    #    on every run by construction; the interval is the load-bearing half;
+    #  * a script installed from a DIFFERENT legitimate checkout of this repository: it
+    #    IS a repo script, so this read-back accepts it and the machine's watchdog moves
+    #    to that checkout. Deliberate: refusing it would make a moved or renamed
+    #    checkout uninstallable, and the target is a repo script either way. STATED
+    #    rather than silent -- the case that was ever observed is the temp COPY, which
+    #    is not a checkout and IS refused below;
+    #  * Description/Author/Version/XML encoding -- nothing reads them and they do not
+    #    change what runs.
+    function Get-AccountDisplay {
+      param([string]$Account)
+      $key = Get-AccountKey $Account
+      if (-not $key) { return '' }
+      try { return ([System.Security.Principal.SecurityIdentifier]$key).Translate([System.Security.Principal.NTAccount]).Value } catch { return $key }
+    }
+    $p = $task.Principal
+    # NB: not `$action` -- PowerShell variable names are case-insensitive, so that
+    # would bind to this script's own validated `$Action` parameter and the read-back
+    # would die with "MSFT_TaskExecAction is not a valid value for the Action variable"
+    # AFTER registering (measured, then renamed).
+    $taskAction = @($task.Actions)[0]
+    $obsExec = ''
+    $obsArgs = ''
+    if ($taskAction) {
+      $obsExec = [string]$taskAction.Execute
+      $obsArgs = [string]$taskAction.Arguments
+    }
+    $wantExec = 'powershell.exe'
+    $wantedScript = $scriptPath
+    if (-not (Test-RepoScript $scriptPath)) {
+      $prevScript = Get-ActionScriptPath $prevArgs
+      if ($prevScript -and (Test-RepoScript $prevScript)) { $wantedScript = $prevScript }
+    }
+    $wantedArg = "-NoProfile -ExecutionPolicy Bypass -File `"$wantedScript`" watch -Root `"$Root`" -Exe `"$Exe`" -Addr `"$Addr`""
+    $logonTriggers = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
+    $repeatTriggers = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and $_.Repetition.Interval })
+    $logonUser = 'none'
+    if ($logonTriggers.Count -gt 0) { $logonUser = $logonTriggers[0].UserId }
+    $every = 'none'
+    if ($repeatTriggers.Count -gt 0) { $every = $repeatTriggers[0].Repetition.Interval }
+    $accountKey = Get-AccountKey $userId
+    $triggerCount = @($task.Triggers).Count
+    $observedMap = [ordered]@{
+      state     = [string]$task.State
+      principal = (Get-AccountDisplay $p.UserId)
+      LogonType = [string]$p.LogonType
+      RunLevel  = [string]$p.RunLevel
+      triggers  = "$triggerCount"
+      logon     = (Get-AccountDisplay $logonUser)
+      repeat    = "$every"
+      execute   = $obsExec
+      arguments = $obsArgs
+    }
+    $wantedMap = [ordered]@{
+      state     = 'Ready'
+      principal = (Get-AccountDisplay $userId)
+      LogonType = 'Interactive'
+      RunLevel  = 'Limited'
+      triggers  = '2'
+      logon     = (Get-AccountDisplay $userId)
+      repeat    = 'PT5M'
+      execute   = $wantExec
+      arguments = $wantedArg
+    }
+    $observed = Format-TaskShape $observedMap
+    $wanted = Format-TaskShape $wantedMap
+
+    $problems = @()
+    if ($task.State -ne 'Ready' -and $task.State -ne 'Running') { $problems += "state=$($task.State)" }
+    if ((Get-AccountKey $p.UserId) -ne $accountKey) { $problems += "principal=$($p.UserId)" }
+    if ($p.LogonType -notin @('Interactive', 'InteractiveToken')) { $problems += "LogonType=$($p.LogonType)" }
+    if ($p.RunLevel -ne 'Limited') { $problems += "RunLevel=$($p.RunLevel)" }
+    if ($logonTriggers.Count -eq 0) { $problems += 'no logon trigger' }
+    elseif ((Get-AccountKey $logonUser) -ne $accountKey) { $problems += "logon trigger is for $logonUser" }
+    if ($every -ne 'PT5M') { $problems += "repetition=$every" }
+    if ($triggerCount -ne 2) { $problems += "triggers=$triggerCount" }
+    if ($obsExec -ne $wantExec) { $problems += "action execute=$obsExec" }
+    $obsScript = Get-ActionScriptPath $obsArgs
+    if ((Get-ArgShape $obsArgs) -ne (Get-ArgShape $wantedArg)) {
+      if ($obsScript -and $wantedScript -and ($obsScript -ne $wantedScript)) {
+        # The incident's shape: the action would run a DIFFERENT script from the one
+        # the machine's watchdog is supposed to run.
+        $problems += "action runs a DIFFERENT script: $obsScript (the watchdog should run $wantedScript)"
+      } else {
+        $problems += 'action arguments'
+      }
+    }
+    # A COPY MUST NOT BECOME THE MACHINE'S WATCHDOG, whatever the task pointed at
+    # before. The anchor above can only name the repo's script while the task still
+    # runs it; after one copy run the task points at that copy, and without this check
+    # a second copy run would agree with itself and bless it -- measured: the first
+    # copy run reported the mismatch, the following ones printed `verified by read-back`
+    # until this check existed.
+    if ($obsScript -and -not (Test-RepoScript $obsScript)) {
+      $problems += "action runs a COPY of this script, from outside any repo checkout: $obsScript"
+    }
+
+    if ($problems.Count -gt 0) {
+      Write-Output "FAILED: scheduled task '$taskName' exists but is NOT the shape this script installs -- it would not keep the daemon alive as advertised."
+      Write-Output ('problems: ' + ($problems -join '; '))
+      Write-Output ('observed: ' + $observed)
+      Write-Output ('wanted:   ' + $wanted)
+      if ($registerError) { Write-Output ("reason from this run's registration attempt: " + $registerError) }
+      Write-Output "what to do: inspect it (Get-ScheduledTask -TaskName $taskName), then Unregister-ScheduledTask -TaskName $taskName -Confirm:`$false and re-run install-task FROM THE REPO CHECKOUT ($wantedScript) -- the per-user shape it installs needs no elevation. If the problems line names another script, this copy must not stay the machine's watchdog."
+      Fail-InstallTask "install-task FAILED: '$taskName' is not the shape this script installs ($($problems -join '; '))"
+    }
+    if ($registerError) {
+      Write-Output "FAILED to (re)register scheduled task '$taskName': this run did NOT update it."
+      Write-Output ('reason: ' + $registerError)
+      Write-Output ('observed (what is there, and it is in the wanted shape): ' + $observed)
+      Write-Output 'what to do: the machine is still protected by the task that is already there, but this run did not do what it was asked; fix the reason above and re-run.'
+      Fail-InstallTask "install-task FAILED to (re)register '$taskName': $registerError"
+    }
+    Write-Output "scheduled task $taskName registered for $userId (at logon + every 5 min)"
+    Write-Output "verified by read-back: $observed"
   }
 }

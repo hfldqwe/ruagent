@@ -434,8 +434,47 @@ pub(crate) fn leg_config_error(e: WeightError) -> String {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "service": "ruagent" }))
+/// Liveness of the process AND of its data plane (ruagent-close-the-gaps t16).
+///
+/// `health` used to be a CONSTANT: `{status: ok}` whatever the store was doing.
+/// When the single-writer actor died — one panicking store operation was enough —
+/// every store-backed route (sessions, tasks, stats, memory, ingest) failed while
+/// this endpoint kept answering ok, so a supervisor, the watchdog installed by
+/// `scripts/ruagent-daemon.ps1` (at logon, every 5 minutes) and any human all
+/// believed the machine was fine. That answer was worse than a crash, because a
+/// crash is visible.
+///
+/// WHAT IT CHECKS NOW, and what a caller learns:
+///   * `status: "ok"` / 200 — the writer actor is Running, so store-backed routes
+///     can be served.
+///   * `status: "degraded"` / **503** — the writer is Stopped: there is nothing to
+///     serve store-backed routes. A supervisor should restart the daemon; a human
+///     should read the log. This is the state that used to be reported as ok.
+///   * `db.writer_panics` / `db.last_panic` — always present, and NON-ZERO even
+///     while status is ok. The actor survives a panic raised inside a caller's
+///     closure (that is the design), so `ok` stays honest — but the operation that
+///     panicked did NOT happen, and this is where that is visible. Reported rather
+///     than hidden: a silent recovery is the same defect one level up.
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let db = state.mgr.db();
+    let running = matches!(db.writer_state(), ruagent_store::WriterState::Running);
+    let (code, status, writer) = if running {
+        (StatusCode::OK, "ok", "running")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "degraded", "stopped")
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "service": "ruagent",
+            "db": {
+                "writer": writer,
+                "writer_panics": db.writer_panics(),
+                "last_panic": db.last_writer_panic(),
+            },
+        })),
+    )
 }
 
 async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -782,12 +821,41 @@ async fn knowledge_expand(
 // Graph (M4: the graph crate finally gets its REST surface)
 // ---------------------------------------------------------------------------
 
+/// `/graph/entities` query — this route's OWN struct, so the opt-in below cannot
+/// leak into the many routes that share `LimitQuery`.
+///
+/// `aliases=true` adds a top-level `"aliases"` map (`{ "<entity id>": ["…"] }`) for
+/// the rows in THIS page. ADDITIVE, and the row shape is untouched: a consumer that
+/// never sends the flag — or that ignores the field — sees byte-identical rows, and
+/// the rows stay the `[entity, fact_count]` arrays they have always been.
+#[derive(Deserialize)]
+struct GraphEntitiesQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Absent = off. Named for what it turns on, not for the mechanism.
+    #[serde(default)]
+    aliases: Option<bool>,
+}
+
 async fn graph_entities(
     State(state): State<AppState>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<GraphEntitiesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let entities = ruagent_graph::list_entities(state.mgr.db(), q.limit.unwrap_or(50)).await?;
-    Ok(Json(serde_json::json!({ "entities": entities })))
+    let db = state.mgr.db();
+    let entities = ruagent_graph::list_entities(db, q.limit.unwrap_or(50)).await?;
+    let mut body = serde_json::json!({ "entities": entities });
+    if q.aliases == Some(true) {
+        let ids: Vec<i64> = body["entities"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get(0).and_then(|e| e.get("id")).and_then(|i| i.as_i64()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        body["aliases"] = serde_json::json!(ruagent_graph::aliases_for(db, &ids).await?);
+    }
+    Ok(Json(body))
 }
 
 /// The whole edge list in ONE request. A canvas that draws the graph must not
@@ -1242,6 +1310,21 @@ async fn graph_add_fact(
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
+/// The entity, its aliases and its facts.
+///
+/// `name`, `kind` and `aliases` are ADDITIVE (ruagent-close-the-gaps t22): a caller
+/// that reads only `facts` keeps working, and a caller holding an id can now read
+/// back what it is looking at. `aliases` is the ONLY response that carries the alias
+/// text, and that text is what makes a search answer verifiable rather than a guess.
+///
+/// THE COUNT THIS EXISTS FOR, measured on the ingested corpus copy (t18), because
+/// the earlier premise said something else: of 257 distinct parenthetical entity
+/// names, **116 are an `entities.name`, 141 are alias-only** — 103 that no strict
+/// `/graph/search` returns at all, and 38 whose `match="exact"` is a FALSE POSITIVE
+/// on a DIFFERENT entity (the strict pass matches each token against
+/// `entities_fts(name, summary)`, so a name can "hit" through another entity's
+/// summary). All 141 are rows in `entity_aliases`; none are lost. A verification
+/// judged against "116 visible + 38 found" would be measuring a different quantity.
 async fn graph_entity(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1249,8 +1332,18 @@ async fn graph_entity(
     let id: i64 = id
         .parse()
         .map_err(|_| ApiError::bad_request("invalid entity id"))?;
-    let facts = ruagent_graph::current_facts(state.mgr.db(), id).await?;
-    Ok(Json(serde_json::json!({ "facts": facts })))
+    let db = state.mgr.db();
+    let entity = ruagent_graph::entity_by_id(db, id).await?;
+    let aliases = ruagent_graph::aliases_of(db, id).await?;
+    let facts = ruagent_graph::current_facts(db, id).await?;
+    // An id that is not in the graph keeps today's answer (HTTP 200 with empty
+    // collections) rather than becoming a 404: this response only gained fields.
+    Ok(Json(serde_json::json!({
+        "name": entity.as_ref().map(|e| e.name.clone()),
+        "kind": entity.as_ref().and_then(|e| e.kind.clone()),
+        "aliases": aliases,
+        "facts": facts,
+    })))
 }
 
 /// Hard-delete an entity, its edges and its facts (t276). The graph page has
@@ -3458,8 +3551,28 @@ async fn recall(
         .to_string();
         // The closure is `move`: keep the response's own copy of the fusion label.
         let fusion_for_row = fusion_label.clone();
-        let _ = db
-            .call(move |conn| -> Result<(), rusqlite::Error> {
+        // ...and the log's own copy of the query, which the closure takes by move.
+        // Same 200-char cap the row itself would have stored, so the announcement
+        // below and the row describe the same call.
+        let evidence_query = query.clone();
+        // FIRE-AND-FORGET BY DESIGN, AND ANNOUNCED WHEN IT FAILS (t6).
+        //
+        // Recording must never break recall: the response is returned whether or not
+        // this row lands, and this is deliberately NOT a propagation point (the task
+        // path answers 500 for the same contention — a different decision for a
+        // different write). That choice is kept.
+        //
+        // What was NOT deliberate is the SILENCE. This call used to be
+        // `let _ = db.call(...)`, which discards the nested `Result` the store's own
+        // docs warn about (t324/t327): its outer layer only reports a dead writer, so
+        // a failed statement and a successful call were the same reading. Measured
+        // under a write lock the 5s `busy_timeout` cannot absorb: recall answered 200
+        // with a normal body while the `recall_log` row was dropped and NOTHING was
+        // written to the daemon log — a hole in exactly the row increment 3 made the
+        // fusion weights auditable through. `call_flat` collapses both layers into the
+        // real error, which is announced below.
+        if let Err(e) = db
+            .call_flat(move |conn| -> Result<(), rusqlite::Error> {
                 conn.execute(
                     "INSERT INTO recall_log
                         (ts, query, strategy, top_n, memories, knowledge, wiki, entities,
@@ -3502,13 +3615,39 @@ async fn recall(
                 // (t247), and unbounded growth turns "the recent calls" into
                 // "every call ever". Keep the newest RECALL_LOG_KEEP; a no-op
                 // while the table is smaller than that.
-                conn.execute(
+                if let Err(e) = conn.execute(
                     "DELETE FROM recall_log WHERE id <= (SELECT MAX(id) FROM recall_log) - ?1",
                     [RECALL_LOG_KEEP],
-                )?;
+                ) {
+                    // A failed SWEEP is a DIFFERENT loss from a failed INSERT: the
+                    // evidence row landed, only the cap was not enforced. Announcing
+                    // it with the dropped-row wording below would overstate the hole,
+                    // so it gets its own line instead of propagating.
+                    tracing::warn!(
+                        error = %e,
+                        "recall_log retention sweep failed (rows kept past the cap)",
+                    );
+                }
                 Ok(())
             })
-            .await;
+            .await
+        {
+            // ONE line per dropped row, at WARN: the request was still served, so this
+            // is a degraded audit trail rather than a request failure. No collapsing
+            // and no rate limit — the attempt happens once per recall request, so the
+            // line rate is bounded by the request rate, and the NUMBER of recalls that
+            // lost their evidence is the property being announced (deduplicating
+            // repeats would hide exactly that count). The fields are what identifies
+            // the call, plus the SQLite error that stopped the row.
+            tracing::warn!(
+                error = %e,
+                query = %evidence_query,
+                strategy = %strategy,
+                top_n = top_n,
+                source = ?source,
+                "recall evidence row was NOT recorded (recall still answered)",
+            );
+        }
     }
     Ok(Json(serde_json::json!({
         "strategy": if conservative { "conservative" } else { "aggressive" },
@@ -6113,6 +6252,97 @@ mod tests {
         assert_eq!(st2, StatusCode::NOT_FOUND, "{raw2}");
     }
 
+    /// ruagent-close-the-gaps t22: the alias text is reachable, and only additively.
+    ///
+    /// WHAT THIS PINS, and what fails if the exposure is removed: the `aliases`
+    /// assertion on the entity route and the opt-in assertion on the list route.
+    /// Without them the folded name goes back to being a row in `entity_aliases`
+    /// that no response contains — the state t18 measured, where a search for a term
+    /// the graph knew answered `match="candidate"` with a list nobody could verify
+    /// (for the entity used here the owning id IS among the candidates, and the
+    /// reader still cannot tell, because the alias text is absent).
+    #[tokio::test]
+    async fn the_entity_route_exposes_the_alias_text_and_the_list_opt_in_is_additive() {
+        let (app, db, root) = harness().await;
+        let keeper = ruagent_graph::upsert_entity(&db, "AMBIGUOUS", Some("concept"), None)
+            .await
+            .unwrap();
+        assert!(
+            ruagent_graph::add_alias(&db, keeper, "AMBIGUOUS（模糊）", "knowledge")
+                .await
+                .unwrap()
+        );
+
+        // 1. the detail route: name/kind/aliases BESIDE the facts it already had.
+        let (st, v, raw) = hit(&app, "GET", &format!("/api/v1/graph/entity/{keeper}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let aliases: Vec<&str> = v["aliases"]
+            .as_array()
+            .expect("aliases array")
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        let facts_len = v["facts"].as_array().map(Vec::len).unwrap_or(usize::MAX);
+        println!(
+            "READING t22 /graph/entity/{keeper} -> HTTP {} name={} kind={} aliases={aliases:?} facts={facts_len}",
+            st.as_u16(),
+            v["name"],
+            v["kind"]
+        );
+        assert_eq!(v["name"], "AMBIGUOUS", "{raw}");
+        assert_eq!(v["kind"], "concept", "{raw}");
+        assert!(v["facts"].is_array(), "the old field is still there: {raw}");
+        assert!(
+            aliases.contains(&"AMBIGUOUS（模糊）"),
+            "the merged name must be in the response: {raw}"
+        );
+
+        // 2. the list route: same rows, and the alias map only when asked for.
+        let (st, plain, raw) = hit(&app, "GET", "/api/v1/graph/entities?limit=10").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert!(
+            plain.get("aliases").is_none(),
+            "no flag, no field — the opt-in must stay opt-in: {raw}"
+        );
+        assert!(
+            plain["entities"][0].is_array(),
+            "rows keep the [entity, fact_count] shape a consumer already parses: {raw}"
+        );
+        let (st, opted, raw) =
+            hit(&app, "GET", "/api/v1/graph/entities?limit=10&aliases=true").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let got = opted["aliases"]
+            .as_object()
+            .and_then(|m| m.get(&keeper.to_string()))
+            .and_then(|a| a.as_array())
+            .expect("the entity's aliases in the opt-in map");
+        println!(
+            "READING t22 /graph/entities?aliases=true -> HTTP {} field present={} aliases={:?}",
+            st.as_u16(),
+            opted.get("aliases").is_some(),
+            got
+        );
+        assert!(
+            got.iter().any(|a| a == "AMBIGUOUS（模糊）"),
+            "the opt-in map carries the alias text: {raw}"
+        );
+
+        // 3. an id that is not in the graph keeps today's 200-with-empty answer.
+        let (st, missing, raw) = hit(
+            &app,
+            "GET",
+            &format!("/api/v1/graph/entity/{}", keeper + 999),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert!(missing["name"].is_null(), "{raw}");
+        assert!(
+            missing["facts"].as_array().is_some_and(Vec::is_empty),
+            "{raw}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// t276: `?purge=true` really removes the row; the default stays the t251
     /// soft delete (row still there, second plain DELETE 409).
     #[tokio::test]
@@ -6287,6 +6517,78 @@ mod tests {
             db.archived_session_keys().await.unwrap(),
             Vec::<String>::new()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `health` must NOT answer ok while the data plane is dead
+    /// (ruagent-close-the-gaps t16).
+    ///
+    /// WHAT THIS WOULD HAVE CAUGHT. Before this task, `health` was
+    /// `Json(json!({"status":"ok","service":"ruagent"}))` — a constant that never
+    /// touched the store. Measured on a private daemon: after ONE store-backed
+    /// operation panicked (which used to unwind the single-writer thread), the
+    /// route set was `health` 200 ok / `/api/v1/sessions` 500 / `/api/v1/tasks`
+    /// 500 / `/api/v1/stats` 500 / `/api/v1/memory/list` 500, all with body
+    /// `database writer is shut down`, and `daemon.out` gained nothing. A
+    /// supervisor watching `health` saw a healthy daemon for ever. The positive
+    /// half of this test pins the CONTRACT (a live actor MUST report ok); the
+    /// negative half pins the DEFECT directly and would have failed loudly on the
+    /// old body, which was literally `{"status":"ok"}` with no `db` field at all.
+    #[tokio::test]
+    async fn health_reports_the_state_of_the_data_plane_not_a_constant() {
+        let (app, db, root) = harness().await;
+
+        let (status, body, _raw) = hit(&app, "GET", "/api/v1/health").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a daemon whose writer is running must be ok"
+        );
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            body["db"]["writer"], "running",
+            "the caller must be able to see WHAT was checked, not just the verdict"
+        );
+        assert_eq!(
+            body["db"]["writer_panics"], 0,
+            "a fresh daemon has caught no panics"
+        );
+
+        // THE DEFECT, PINNED: the old handler answered exactly `{"status":"ok"}`
+        // for a store that could not serve. That document must not be what a
+        // caller gets any more.
+        assert_ne!(
+            body,
+            serde_json::json!({ "status": "ok", "service": "ruagent" }),
+            "health must no longer be the constant it was: the old body answered ok while every \
+             store-backed route failed, which is worse than a crash because a crash is visible"
+        );
+
+        // A panic inside a store-backed closure is ANNOUNCED by health while the
+        // actor survives -- the reading that used to be lost entirely.
+        let _ = db
+            .call(|_conn| -> i64 { panic!("t16: route-level panic") })
+            .await;
+        let (status, body, _raw) = hit(&app, "GET", "/api/v1/health").await;
+        assert_eq!(status, StatusCode::OK, "the actor survived by design");
+        assert_eq!(
+            body["db"]["writer_panics"], 1,
+            "a panic the actor survived must still be visible to a health check"
+        );
+        let last = body["db"]["last_panic"].as_str().unwrap_or_default();
+        assert!(
+            last.contains("t16: route-level panic"),
+            "health must carry the panic text, got {last:?}"
+        );
+
+        // And the route set still answers, which is the whole point of surviving.
+        let (st, _h, _b) = hit(&app, "GET", "/api/v1/sessions").await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "store-backed routes must keep working after a caught panic"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

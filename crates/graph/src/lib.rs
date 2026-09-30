@@ -395,6 +395,99 @@ pub async fn list_entities(db: &Db, limit: u32) -> Result<Vec<(Entity, i64)>, Db
     .map_err(DbError::from)
 }
 
+/// One entity by id, or `None` when the id is not in the graph.
+///
+/// The detail route needs the name and kind BESIDE the facts: `/graph/entity/{id}`
+/// used to answer `{"facts": […]}` alone, so a caller holding an id could not read
+/// back what it was looking at (ruagent-close-the-gaps t22).
+pub async fn entity_by_id(db: &Db, id: i64) -> Result<Option<Entity>, DbError> {
+    db.call(move |conn| -> Result<Option<Entity>, rusqlite::Error> {
+        conn.query_row(
+            "SELECT id, name, kind, summary FROM entities WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(Entity {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    summary: row.get(3)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
+/// The aliases recorded for one entity, oldest first.
+///
+/// This table is where a folded name goes when resolution merges it onto an entity
+/// it did not create (`resolve_entity_in`'s `MergeVerdict::SameObject` arm calls
+/// `add_alias_in`). Measured on the ingested corpus copy (ruagent-close-the-gaps
+/// t18): of 257 distinct parenthetical names, **116 are an `entities.name` and 141
+/// live ONLY here** — 103 that no strict search returns at all, and 38 whose
+/// `exact` verdict is a FALSE POSITIVE on a DIFFERENT entity, because
+/// `entities_fts` indexes `name, summary` and never this table. Before this read
+/// existed, the alias text appeared in no response at all, so a search for a term
+/// the graph knows answered with a candidate list nobody could verify.
+///
+/// READ-ONLY. Indexing aliases in the FTS table is a SEPARATE change: it alters
+/// every existing query's results and needs its own before/after over a corpus.
+pub async fn aliases_of(db: &Db, entity: i64) -> Result<Vec<String>, DbError> {
+    db.call(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt =
+            conn.prepare("SELECT alias FROM entity_aliases WHERE entity_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([entity], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+    })
+    .await?
+    .map_err(DbError::from)
+}
+
+/// The aliases of MANY entities in ONE query, keyed by entity id.
+///
+/// A list route that opted into aliases must not fan out one query per row: the
+/// single-writer actor is the bottleneck, so the whole page is read with one
+/// statement (the same reasoning `list_edges` follows for the canvas). Entities
+/// with no alias are ABSENT from the map rather than present-and-empty, so the
+/// caller can tell "no aliases" from "not in this page".
+pub async fn aliases_for(
+    db: &Db,
+    ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<String>>, DbError> {
+    let ids: Vec<i64> = ids.to_vec();
+    if ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    db.call(
+        move |conn| -> Result<std::collections::BTreeMap<i64, Vec<String>>, rusqlite::Error> {
+            let marks = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT entity_id, alias FROM entity_aliases
+                  WHERE entity_id IN ({marks}) ORDER BY entity_id, id"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out: std::collections::BTreeMap<i64, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for r in rows {
+                let (id, alias) = r?;
+                out.entry(id).or_default().push(alias);
+            }
+            Ok(out)
+        },
+    )
+    .await?
+    .map_err(DbError::from)
+}
+
 /// FTS over entity names/summaries (the keyword candidate leg of
 /// resolution and retrieval). Punctuated tokens (scripts/release.sh,
 /// node.js) are FTS5 syntax errors as raw input — quote each token
@@ -898,6 +991,17 @@ pub fn base_name(name: &str) -> String {
     variants(name).first().cloned().unwrap_or_default()
 }
 
+/// The last of `ascii` / `wide` in `s`, with the character that matched, so a
+/// caller can advance past the delimiter by ITS OWN byte length.
+fn last_delimiter(s: &str, ascii: char, wide: char) -> Option<(usize, char)> {
+    match (s.rfind(ascii), s.rfind(wide)) {
+        (Some(i), Some(j)) => Some(if i > j { (i, ascii) } else { (j, wide) }),
+        (Some(i), None) => Some((i, ascii)),
+        (None, Some(j)) => Some((j, wide)),
+        (None, None) => None,
+    }
+}
+
 /// Every spelling a name carries: the base, plus the content of ONE trailing
 /// parenthetical group.
 ///
@@ -906,14 +1010,41 @@ pub fn base_name(name: &str) -> String {
 /// that relation is only visible if the abbreviation inside the parentheses is
 /// still available to the judge. Dropping it (which `base_name` alone does) is
 /// what made the first version of this judge miss 4 of the 8 gold pairs.
+///
+/// # Why the inner slice is not `open + 1`
+///
+/// It used to be, and `（` is THREE bytes. A name carrying a full-width group —
+/// `特质（trait）`, `栈帧（jvm stacks 虚拟机栈）`, ordinary text in a Chinese corpus —
+/// panicked the caller inside this function: "start byte index 7 is not a char
+/// boundary; it is inside '（' (bytes 6..9) of `特质（trait）`" (lib.rs:916). That
+/// panic lands on the store's single-writer actor, because `apply_extraction`
+/// resolves names inside the write closure, so ONE such name in ONE document took
+/// the daemon's whole data plane down (`/api/v1/sessions` then answers 500 while
+/// `/api/v1/health` still says ok). Measured on the real corpus: 113 of 936
+/// knowledge documents carry at least one such name, and with
+/// `knowledge_ingest_graph` enabled the boot sweep dies on the first one with no
+/// HTTP request involved.
+///
+/// Now every index is either produced by `rfind` (a character boundary) or
+/// advanced by the matched delimiter's own `len_utf8()` (1 for `(`/`)`, 3 for
+/// `（`/`）`), so no byte-width assumption remains.
+///
+/// # Mixed delimiters: paired by POSITION
+///
+/// `矩阵（matrix)` and `Matrix (矩阵）` each yield one group, which is the SAME rule
+/// `ruagent_extract::text::trailing_parenthetical` chose (crates/extract/src/
+/// text.rs, the sibling fix of ruagent-close-the-gaps t8): the extractor hands
+/// this function the pair it derived, so the two crates must not disagree about
+/// what `（x)` means. Width is a keyboard/encoding artifact, not a semantic one;
+/// refusing to pair across widths would silently drop a real alias.
 pub fn variants(name: &str) -> Vec<String> {
     let n = name.trim().to_lowercase();
     let mut out = vec![n.clone()];
-    if let Some(close) = n.rfind(')').or_else(|| n.rfind('）'))
-        && let Some(open) = n[..close].rfind('(').or_else(|| n[..close].rfind('（'))
+    if let Some((close, _)) = last_delimiter(&n, ')', '）')
+        && let Some((open, opener)) = last_delimiter(&n[..close], '(', '（')
     {
         let outer = n[..open].trim().to_string();
-        let inner = n[open + 1..close].trim().to_string();
+        let inner = n[open + opener.len_utf8()..close].trim().to_string();
         if !outer.is_empty() {
             out.insert(0, outer);
         }
