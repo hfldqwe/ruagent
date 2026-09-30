@@ -772,6 +772,10 @@ fn recall_ranking(v: &serde_json::Value) -> serde_json::Value {
         "memory_legs": v["memory_legs"],
         "graph": v["graph"],
         "scoring": v["scoring"],
+        // t2: the memory fusion's effective weights are part of the ranking's
+        // provenance now, so the default-equivalence reading covers them too (the
+        // pair compared below both run at 1:1 — no golden is re-derived).
+        "memory_fusion": v["memory_fusion"],
     })
 }
 
@@ -870,6 +874,112 @@ async fn seed_t5_fixture(http: &reqwest::Client, daemon_url: &str) {
             .unwrap();
         assert!(resp["chunks"].as_i64().unwrap_or(0) >= 1, "{resp:?}");
     }
+}
+
+/// One memory row, written the way an external CLI would: the recall path's memory
+/// legs read the `memories` table, so a test that needs memory EVIDENCE has to put
+/// rows there. The content repeats the two query terms ADJACENTLY, which is what
+/// the memory keyword leg's phrase query (`"kettle descaling"`) matches.
+async fn seed_memory_row(http: &reqwest::Client, daemon_url: &str, content: &str) {
+    let resp = http
+        .post(format!("{daemon_url}/api/v1/memory/write"))
+        .json(&serde_json::json!({
+            "store": "observation", "namespace": "user", "content": content,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "the memory write must land: {body:?}");
+}
+
+/// The newest recall_log row, as the log endpoint publishes it (newest first).
+async fn newest_recall_log_row(http: &reqwest::Client, daemon_url: &str) -> serde_json::Value {
+    let log: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/recall/log"))
+        .query(&[("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    log["log"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("the recall log has no rows: {log:?}"))
+}
+
+/// `candidates_json`, PARSED: the log endpoint publishes that column as a JSON
+/// string, and it is the OBJECT the additive recorder keys land in — `disabled_legs`
+/// from the leg-configuration work, `memory_fusion` from the memory-weight work.
+/// This is also the check that the column is still an object.
+fn candidates_of(row: &serde_json::Value) -> serde_json::Value {
+    let raw = row["candidates_json"]
+        .as_str()
+        .expect("candidates_json is published as a JSON string");
+    serde_json::from_str(raw).expect("candidates_json must be a JSON object")
+}
+
+/// The memory row ids a recall response returned, in page order: the CORPUS-side
+/// reading, which must not move when only a weight does.
+fn memory_ids(v: &serde_json::Value) -> Vec<i64> {
+    v["memories"]
+        .as_array()
+        .expect("memories is a list")
+        .iter()
+        .filter_map(|m| m["id"].as_i64())
+        .collect()
+}
+
+/// PARSE the response's RRF-label spelling: `rrf:k=<k>,w_semantic=<ws>,w_keyword=<wk>`
+/// -> `(k, w_semantic, w_keyword)`.
+///
+/// ONE parser for BOTH labels a recall payload carries — `scoring.fusion` (the
+/// knowledge fusion) and `memory_fusion` (the memory fusion). That is the point of
+/// this alignment: a reader must not have to learn `w_sem` for one label and
+/// `w_semantic` for the other, so this test fails rather than adapts if either label
+/// drifts to another shape — including the shape the knowledge TYPE publishes for the
+/// same information, `rrf(k=60,w_sem=2,w_kw=1)` (`FusionKind::label()`,
+/// crates/knowledge/src/store.rs:151), which `api.rs` deliberately does not emit.
+fn parse_rrf_label(label: &str) -> (u32, f32, f32) {
+    let rest = label
+        .strip_prefix("rrf:k=")
+        .unwrap_or_else(|| panic!("not the response's RRF spelling: {label}"));
+    let parts: Vec<&str> = rest.split(',').collect();
+    assert_eq!(parts.len(), 3, "three fields in {label}");
+    let k: u32 = parts[0]
+        .parse()
+        .unwrap_or_else(|e| panic!("k in {label}: {e}"));
+    let w_semantic = parts[1]
+        .strip_prefix("w_semantic=")
+        .unwrap_or_else(|| panic!("w_semantic in {label}"))
+        .parse::<f32>()
+        .unwrap_or_else(|e| panic!("w_semantic value in {label}: {e}"));
+    let w_keyword = parts[2]
+        .strip_prefix("w_keyword=")
+        .unwrap_or_else(|| panic!("w_keyword in {label}"))
+        .parse::<f32>()
+        .unwrap_or_else(|e| panic!("w_keyword value in {label}: {e}"));
+    (k, w_semantic, w_keyword)
+}
+
+/// The two fusion labels of ONE response, through the SAME parser, as one comparable
+/// value: `(knowledge (k,w_semantic,w_keyword), memory (k,w_semantic,w_keyword))`.
+fn both_fusion_labels(v: &serde_json::Value) -> ((u32, f32, f32), (u32, f32, f32)) {
+    let knowledge = parse_rrf_label(
+        v["scoring"]["fusion"]
+            .as_str()
+            .expect("scoring.fusion is a string"),
+    );
+    let memory = parse_rrf_label(
+        v["memory_fusion"]
+            .as_str()
+            .expect("memory_fusion is a string"),
+    );
+    (knowledge, memory)
 }
 
 /// DEFAULT EQUIVALENCE (§11.5 item 2): a `[capabilities]` table with all six legs
@@ -1212,5 +1322,318 @@ async fn a_disabled_keyword_leg_reports_disabled_not_empty() {
         assert!(hit["keyword_rank"].is_null(), "{hit:?}");
         assert!(hit["keyword_score"].is_null(), "{hit:?}");
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// The MEMORY fusion's effective weights over the real HTTP surface
+// (docs/plans/capability-plugins-design.md §20.2, the memory half)
+//
+// The alignment half: the labels of BOTH fusions in one payload are read here by ONE
+// parser, `parse_rrf_label` — `memory_fusion` uses the spelling the response already
+// emits for the knowledge fusion (`rrf:k=..,w_semantic=..,w_keyword=..`), NOT the
+// different string `FusionKind::label()` renders (`rrf(k=..,w_sem=..,w_kw=..)`),
+// which `api.rs` deliberately does not call.
+// ---------------------------------------------------------------------------
+
+/// t2 (§20.2, memory half): the weights the MEMORY fusion actually used reach BOTH
+/// records — the response and `recall_log` — so a weight change is distinguishable
+/// from a corpus change.
+///
+/// The demonstration is TWO runs over the SAME corpus at two weights: the corpus
+/// reading (the memory row ids) is identical, the knowledge fusion is untouched, and
+/// the only thing that moved is the memory fusion label. Before t2 the two runs were
+/// the same record in every respect that mentions the memory legs — the complaint
+/// §20.2 is about.
+#[tokio::test]
+async fn the_memory_fusion_weights_are_recorded_in_the_response_and_the_log() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    seed_memory_row(
+        &http,
+        &daemon_url,
+        "kettle descaling kettle descaling kettle",
+    )
+    .await;
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+
+    // RUN 1 — the default memory weights (1:1).
+    let default = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    let default_row = newest_recall_log_row(&http, &daemon_url).await;
+    let default_candidates = candidates_of(&default_row);
+    println!(
+        "READING t2 memory weights default: response={} log={} memories={:?} leg_counts={:?}",
+        default["memory_fusion"],
+        default_candidates["memory_fusion"],
+        memory_ids(&default),
+        default["memory_legs"]
+    );
+    assert!(
+        !memory_ids(&default).is_empty(),
+        "the fixture must produce memory evidence for a weight to be worth recording: {default:?}"
+    );
+    assert_eq!(
+        default["memory_fusion"],
+        serde_json::json!("rrf:k=60,w_semantic=1,w_keyword=1"),
+        "the default must read as the 1:1 fusion that reproduces the frozen `rrf`, \
+         in the response's own spelling"
+    );
+    assert_eq!(
+        default_candidates["memory_fusion"], default["memory_fusion"],
+        "the response and the log must carry the SAME label"
+    );
+    // The DEFAULT payload's two labels are parsed by one parser, so a reader does
+    // not have to learn `w_sem` for one label and `w_semantic` for the other.
+    let (knowledge_weights, memory_weights) = both_fusion_labels(&default);
+    println!(
+        "READING both labels parsed at default: knowledge={knowledge_weights:?} memory={memory_weights:?}"
+    );
+    assert_eq!(knowledge_weights, (60, 2.0, 1.0));
+    assert_eq!(memory_weights, (60, 1.0, 1.0));
+
+    // RUN 2 — the SAME corpus, one memory weight moved.
+    let mut table = all_recall_legs_on();
+    table["recall_leg_memory_semantic"] = serde_json::json!({ "enabled": true, "weight": 3.0 });
+    put_capabilities(&http, &daemon_url, table).await;
+    let weighted = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    let weighted_row = newest_recall_log_row(&http, &daemon_url).await;
+    let weighted_candidates = candidates_of(&weighted_row);
+    println!(
+        "READING t2 memory weights w_sem=3: response={} log={} memories={:?} leg_counts={:?}",
+        weighted["memory_fusion"],
+        weighted_candidates["memory_fusion"],
+        memory_ids(&weighted),
+        weighted["memory_legs"]
+    );
+    assert_eq!(
+        weighted["memory_fusion"],
+        serde_json::json!("rrf:k=60,w_semantic=3,w_keyword=1"),
+        "the reported weights must be the EFFECTIVE ones the ranking used, in the response's own spelling"
+    );
+    assert_eq!(
+        weighted_candidates["memory_fusion"],
+        weighted["memory_fusion"]
+    );
+    // BOTH labels of one payload go through ONE parser, and the knowledge label
+    // — an existing key — is byte-for-byte what it was (2:1, `w_semantic` spelling).
+    let (knowledge_weights, memory_weights) = both_fusion_labels(&weighted);
+    println!(
+        "READING both labels parsed at w_sem=3: knowledge={knowledge_weights:?} memory={memory_weights:?}"
+    );
+    assert_eq!(
+        knowledge_weights,
+        (60, 2.0, 1.0),
+        "the knowledge label is untouched by this change"
+    );
+    assert_eq!(memory_weights, (60, 3.0, 1.0));
+    assert_eq!(
+        weighted["scoring"]["fusion"],
+        serde_json::json!("rrf:k=60,w_semantic=2,w_keyword=1"),
+        "the existing key keeps its exact string"
+    );
+
+    // THE READING THE WHOLE ITEM IS ABOUT: same corpus (same memory rows), different
+    // recorded weight — so "the weight changed" no longer looks like "the corpus
+    // changed".
+    assert_eq!(
+        memory_ids(&weighted),
+        memory_ids(&default),
+        "the corpus did not change between the two runs"
+    );
+    assert_ne!(
+        weighted["memory_fusion"], default["memory_fusion"],
+        "the recorded label must move when the weight does"
+    );
+    // The KNOWLEDGE fusion is a different recording and did not move: the memory
+    // weight is not smuggled into the knowledge side's key.
+    assert_eq!(
+        weighted["scoring"]["fusion"], default["scoring"]["fusion"],
+        "a memory weight change is not a knowledge weight change"
+    );
+    assert_eq!(
+        weighted_candidates["fusion"], default_candidates["fusion"],
+        "the log's knowledge `fusion` label is separate from `memory_fusion`"
+    );
+    // `top_legs_json` is a JSON ARRAY (one entry per ranked hit) and stays one: the
+    // additive key went to `candidates_json`, which is an OBJECT (the reason
+    // `disabled_legs` lives there too).
+    let top_legs_json = weighted_row["top_legs_json"].as_str().unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(top_legs_json)
+        .unwrap_or_else(|e| panic!("top_legs_json must parse: {e}: {top_legs_json}"));
+    assert!(
+        parsed.is_array(),
+        "top_legs_json must keep its array shape: {top_legs_json}"
+    );
+    assert!(
+        !top_legs_json.contains("memory_fusion"),
+        "the additive key must not land in the per-hit array: {top_legs_json}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// t2 (§20.2): a DISABLED memory leg contributes 0.0 — never the stale weight the
+/// file kept next to `enabled = false` — and it is NAMED in `legs_disabled`, so
+/// "off" cannot be read as "weighted to zero". The second half is what makes that
+/// reading sound rather than convenient: an ENABLED leg at 0.0 is REFUSED by the
+/// daemon's own weight rule, so 0.0 is a value the fusion can never be handed and an
+/// effective 0.0 in the record can only mean the leg was off.
+#[tokio::test]
+async fn a_disabled_memory_leg_records_zero_not_its_stale_weight() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    seed_memory_row(
+        &http,
+        &daemon_url,
+        "kettle descaling kettle descaling kettle",
+    )
+    .await;
+
+    // A stale weight beside `enabled = false` is what makes this a test: a label
+    // built from the CONFIGURED values would say 3.
+    let mut table = all_recall_legs_on();
+    table["recall_leg_memory_semantic"] = serde_json::json!({ "enabled": false, "weight": 3.0 });
+    put_capabilities(&http, &daemon_url, table).await;
+    let off = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    let off_candidates = candidates_of(&newest_recall_log_row(&http, &daemon_url).await);
+    println!(
+        "READING t2 memory leg off with a stale weight=3: legs_disabled={:?} response={} log={}",
+        off["legs_disabled"], off["memory_fusion"], off_candidates["memory_fusion"]
+    );
+    assert_eq!(
+        off["legs_disabled"],
+        serde_json::json!(["recall_leg_memory_semantic"]),
+        "the disabled leg is named, so the 0 below is attributable to a toggle"
+    );
+    assert_eq!(
+        off["memory_fusion"],
+        serde_json::json!("rrf:k=60,w_semantic=0,w_keyword=1"),
+        "a disabled leg contributes 0.0, never its stale configured weight"
+    );
+    assert_eq!(off_candidates["memory_fusion"], off["memory_fusion"]);
+
+    // The other half: 0.0 with the leg ENABLED is refused, not silently accepted as
+    // "a leg weighted to zero" — so off and zero-weight cannot be confused.
+    let mut zeroed = all_recall_legs_on();
+    zeroed["recall_leg_memory_semantic"] = serde_json::json!({ "enabled": true, "weight": 0.0 });
+    put_capabilities(&http, &daemon_url, zeroed).await;
+    let resp = http
+        .get(format!("{daemon_url}/api/v1/recall"))
+        .query(&[("q", "kettle descaling"), ("top_n", "5")])
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    println!("READING t2 memory leg enabled with weight=0: status={status} body={body}");
+    assert_eq!(
+        status, 400,
+        "an ENABLED leg at weight 0 is a configuration error, not an empty ranking: {body}"
+    );
+    assert!(
+        body.contains("memory semantic"),
+        "the refusal names the leg it is about: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// t2 (§20.2): the new evidence is ADDITIVE, and the default run is unchanged.
+///
+/// With NO `[capabilities]` table — the harness's own default configuration, over
+/// the EXISTING fixed fixture — every pre-existing key keeps its name, type and
+/// meaning: `memory_legs` still has exactly the six keys it had, and the additions
+/// are the new top-level `memory_fusion` and `candidates_json.memory_fusion`. No
+/// golden is re-derived; the only frozen value asserted here is the NEW key's, whose
+/// default 1:1 reading is exactly the configuration the frozen unweighted `rrf`
+/// identity is pinned to (unit-tested bit for bit in `memembed.rs`).
+#[tokio::test]
+async fn the_memory_fusion_label_is_additive_at_the_default_configuration() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    seed_t5_fixture(&http, &daemon_url).await;
+    let body = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    let row = newest_recall_log_row(&http, &daemon_url).await;
+    let candidates = candidates_of(&row);
+    println!(
+        "READING t2 default payload: memory_fusion={} candidates={} memory_legs={:?}",
+        body["memory_fusion"], candidates, body["memory_legs"]
+    );
+
+    // (a) the addition carries the DEFAULT weights, in the response's own spelling
+    // (the same shape `scoring.fusion` uses, so one parser reads both).
+    assert_eq!(
+        body["memory_fusion"],
+        serde_json::json!("rrf:k=60,w_semantic=1,w_keyword=1")
+    );
+    assert_eq!(candidates["memory_fusion"], body["memory_fusion"]);
+    let (knowledge_weights, memory_weights) = both_fusion_labels(&body);
+    assert_eq!(knowledge_weights, (60, 2.0, 1.0));
+    assert_eq!(memory_weights, (60, 1.0, 1.0));
+    assert_eq!(
+        body["scoring"]["fusion"],
+        serde_json::json!("rrf:k=60,w_semantic=2,w_keyword=1"),
+        "the existing knowledge label is not part of this change"
+    );
+
+    // (b) additive only: `memory_legs` is the object it was before t2 — the same six
+    // keys, untouched (a documented response key must not grow a member and silently
+    // change shape for a reader that enumerates it).
+    let mut leg_keys: Vec<&str> = body["memory_legs"]
+        .as_object()
+        .expect("memory_legs is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    leg_keys.sort_unstable();
+    assert_eq!(
+        leg_keys,
+        [
+            "dropped_by_top_n",
+            "keyword",
+            "keyword_new",
+            "returned",
+            "semantic",
+            "top_semantic_score",
+        ],
+        "the memory evidence object is not the place for the addition"
+    );
+    // ... and the recorder's addition is exactly one new key in the OBJECT column,
+    // beside the ones the `disabled_legs` key established there.
+    let mut candidate_keys: Vec<&str> = candidates
+        .as_object()
+        .expect("candidates_json is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    candidate_keys.sort_unstable();
+    assert_eq!(
+        candidate_keys,
+        [
+            "candidates",
+            "disabled_legs",
+            "fusion",
+            "leg_window",
+            "memory_fusion",
+            "ranked_page",
+        ]
+    );
+    // `top_legs_json` is a JSON ARRAY of per-hit entries and stays exactly that.
+    let top_legs_json = row["top_legs_json"].as_str().unwrap_or_default();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(top_legs_json).is_ok_and(|v| v.is_array()),
+        "top_legs_json must keep its array shape: {top_legs_json}"
+    );
+
+    // (c) the default run with the `[capabilities]` table PRESENT at its default
+    // values is the same recall, the new key included (the helper now compares it).
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+    let configured = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    assert_eq!(
+        recall_ranking(&body),
+        recall_ranking(&configured),
+        "the default leg configuration moved the recall ranking"
+    );
+    assert_eq!(body["memory_fusion"], configured["memory_fusion"]);
     let _ = std::fs::remove_dir_all(&root);
 }

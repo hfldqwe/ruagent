@@ -2941,6 +2941,16 @@ async fn recall(
         .into_iter()
         .map(recall_leg_id)
         .collect();
+    // t2 (design §20.2, the MEMORY half): the memory fusion's EFFECTIVE weights, in
+    // the same shape the knowledge side already publishes (`scoring.fusion` /
+    // `candidates_json.fusion`). The knowledge half was auditable; the memory half
+    // recorded only hit COUNTS, so a `recall_leg_memory_semantic.weight` change left
+    // no trace at all — "the weight changed" and "the corpus changed" were the same
+    // record. Read from the SAME `MemoryLegs` handed to the fusion below, through
+    // the same normalizer that feeds it (`MemoryLegs::effective`), never from the raw
+    // configured values: a weight the ranking did not use is not evidence about the
+    // ranking.
+    let memory_fusion_label = legs.memory.fusion_label();
     // `recall_leg_memory_semantic.min_score` (design §11.2): unset ⇒ today's
     // per-strategy floor; set ⇒ it overrides BOTH strategies, because a caller who
     // names a number means it.
@@ -2986,6 +2996,18 @@ async fn recall(
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
     let leg_window = page.evidence.leg_window as i64;
     let candidates = page.evidence.candidates as i64;
+    // WHY THIS IS SPELLED OUT HERE INSTEAD OF CALLING `FusionKind::label()`
+    // (the memory-label alignment):
+    // the knowledge type's own `label()` renders a DIFFERENT string for the same
+    // information — `"rrf(k=60,w_sem=2,w_kw=1)"` (crates/knowledge/src/store.rs:151,
+    // pinned by that type's own test). `scoring.fusion` / `recall_log.fusion` have
+    // emitted THIS spelling (`rrf:k=...,w_semantic=...,w_keyword=...`) since the key
+    // was introduced, and they are EXISTING wire values: unifying the pre-existing
+    // pair would be a non-additive change to a key readers already parse, so it is
+    // deliberately NOT done here. What IS done: the memory label added by t2
+    // (`MemoryLegs::fusion_label`, returned as `memory_fusion`) is built with THIS
+    // spelling, so one payload never carries two shapes for one concept — a reader
+    // that can parse `scoring.fusion` can parse `memory_fusion` with the same code.
     let fusion_label = match page.evidence.fusion {
         ruagent_knowledge::store::FusionKind::Rrf {
             k,
@@ -3370,6 +3392,13 @@ async fn recall(
             // change, which is what this increment forbids. The object it lands in
             // is the log's candidate-provenance row, which grows with the fusion.
             "disabled_legs": legs_disabled.clone(),
+            // t2: the memory fusion's effective weights, beside the knowledge
+            // `fusion` label above. Same object, same reason the `disabled_legs`
+            // key above lives here: the recorder's additive keys belong in an
+            // OBJECT, not in the per-hit ARRAY. The key is prefixed because `fusion`
+            // is already the knowledge label in this row — a reader gets both
+            // fusions, neither shadowing the other.
+            "memory_fusion": memory_fusion_label.clone(),
         })
         .to_string();
         let selected_json = serde_json::json!({
@@ -3479,6 +3508,15 @@ async fn recall(
         // all-off recall is an empty success that looks like a retrieval miss
         // (design §11.3/§11.4).
         "legs_disabled": legs_disabled,
+        // t2 (§20.2, memory half): the weights that produced the `memories` section
+        // above, as the knowledge side's `scoring.fusion` publishes its own. A
+        // top-level, additive key next to `legs_disabled` — no existing key changes
+        // type, meaning or shape. Without it the memory half of a tuning change was
+        // unauditable: the response carried hit COUNTS, so a reader could not tell a
+        // different weight from a different corpus. A disabled leg reads 0 here
+        // (and is named in `legs_disabled`), so "off" is never confused with a
+        // weight the fusion used.
+        "memory_fusion": memory_fusion_label,
         "memories": out_memories,
         // What each memory leg did. Before t251 the response could not
         // distinguish "the keyword leg added nothing" from "the keyword leg was
@@ -4926,6 +4964,11 @@ async fn knowledge_search(
         .map_err(|e| ApiError::bad_request(format!("{e}")))?;
     let leg_window = page.evidence.leg_window as i64;
     let candidates = page.evidence.candidates as i64;
+    // The same re-spelling as the recall endpoint's (so both endpoints emit one
+    // shape, and the recall response's `memory_fusion` — see the note at the recall
+    // site — is parsed by the same code as this label). `FusionKind::label()` is
+    // deliberately not called: its string is a different one, and these keys are
+    // existing wire values.
     let fusion_label = match page.evidence.fusion {
         ruagent_knowledge::store::FusionKind::Rrf {
             k,

@@ -1317,8 +1317,219 @@ asked for nothing" is a reading, not an error.
   object that already grows with the fusion (`candidates`, `leg_window`, `fusion`,
   `ranked_page`). No schema change either way: the column already exists, and `recall_log`'s
   retention (`RECALL_LOG_KEEP`, api.rs:3247-3250) is untouched.
+* t2 (**increment 3**) adds the memory fusion's EFFECTIVE weights — the response key
+  `"memory_fusion"` and the recorder key `candidates_json.memory_fusion`, both
+  `"rrf:k=60,w_semantic=<n>,w_keyword=<n>"`, read from the same `MemoryLegs` the fusion
+  consumes through `MemoryLegs::effective` (= `normalized`) — so a memory-weight change is
+  distinguishable from a corpus change. The EXISTING `scoring.fusion` /
+  `candidates_json.fusion` keys keep their bytes: the memory key follows the RESPONSE's
+  spelling, not `FusionKind::label()`'s (`rrf(k=..,w_sem=..,w_kw=..)`, `store.rs:151`).
+  §20 item 2 is closed by this; see §11.5 for the declared-option surface added on top.
 
-### 11.5 The regression bar (pinned, testable)
+### 11.5 The declared-option schema and the file's own key set (`t6`, additive)
+
+Two defects in the increment-3 panel are one change apart, and one of them writes to the user's
+file. Both are fixed by making the API report the two facts the panel is currently inferring.
+
+**Measurements (file:line, taken on `a0f1eae` + increment-3 paths).**
+
+1. **The unreachable declared key is exactly ONE, and it is reachable in NO surface.** The
+   registry declares each capability's accepted keys and their defaults at
+   `crates/daemon/src/capability.rs:198-330` (`options: &'static [OptionKey]`,
+   `defaults: CapabilityOptions`). Reading those rows: `recall_leg_memory_semantic` declares
+   `[Weight, MinScore]` with `weight: Some(1.0)` and **no `min_score`** (`:226-230`);
+   `recall_leg_memory_fts`, `recall_leg_knowledge_semantic`, `recall_leg_knowledge_fts` declare
+   `weight` only, all with a default; `session_extract_rules` declares `max_per_input: Some(32)`
+   + `min_confidence: Some(0.0)` (`:298-303`); `knowledge_ingest_graph` declares
+   `max_per_input: Some(96)` + `max_docs_per_pass: Some(20)` (`:312-317`); the remaining five
+   rows declare `&[]`. **`min_score` on `recall_leg_memory_semantic` is the ONLY declared key
+   with a `None` default** — confirmed independently of the registry by reading a fresh
+   daemon's `GET /api/v1/capabilities`, which reports `{weight: 1, min_score: null, …}` for
+   that row and non-null values for every other declared key. The API reports RESOLVED values
+   only (`CapabilityPlane::options`, `capability.rs:472-484`; `options: self.options(s.id)` in
+   `rows()`, `:510`), and the panel renders an input per key whose value is non-null
+   (`reportedOptions`, `panel/src/capability-options.ts:118-120`), so that row renders
+   `["weight"]` and never `min_score` — measured. The panel's own comment discloses the hole
+   at `capability-options.ts:113-117`. **The MCP surface has the same hole for the same
+   reason**: `capability_set` has the parameter, but `capabilities_list` renders
+   `options_to_text` from RESOLVED values (`crates/mcp/src/lib.rs:621-631`), so an agent
+   reading the list cannot discover the key either. What is unreachable is not cosmetic: the
+   handler reads that key and it changes recall (`api.rs:2957-2961`, `.map(|v| v as f32)
+   .unwrap_or(if conservative { 0.30 } else { 0.25 })`, used as `min_score` at
+   `api.rs:2967-2975` -> `memembed.rs:949`). Without it the override is dead code learned of
+   only from a comment or this document.
+2. **A write materializes registry defaults as if the user had typed them** (the reason this is
+   worth doing for more than one key). The panel preserves a row's keys by re-emitting
+   `row.options` — the RESOLVED values — for every row whose `configured === "file"`
+   (`capabilitiesBody`, `panel/src/capability-options.ts:173-187`; `optionValues`, `:130-141`).
+   `configured` says the row's ID is in the file, NOT which of its keys are
+   (`CapabilityPlane::configured`, `capability.rs:489-495`), and `options()` cannot tell a key
+   the file carries from one that is merely defaulted (`:472-484`). So the next write about ANY
+   row re-emits `weight = 1.0` for a row whose file body was `enabled = true`. Measured on my
+   own daemon, via the file: `[capabilities.recall_leg_memory_semantic]` went
+   `enabled = true` (after a Reset) -> `enabled = true` + `weight = 1` on the next write.
+   `set_or_remove_f64` WRITES what the body carries (`config.rs:1100-1105`), so the default the
+   API reported BECOMES a key in the user's config file — a persisted change, not a display
+   artefact, exactly the class of silent rewrite this effort exists to remove. It is in
+   `a0f1eae` and it is live.
+
+**The surface: two ADDITIVE fields per row, no existing field redefined.** `options` keeps
+meaning "RESOLVED values" (`capability.rs:155-164`, `:472-484`) because three callers already
+read it that way: the panel (`panel/src/capability-options.ts:118-141`), the MCP list
+(`crates/mcp/src/lib.rs:621-631`) and the MCP write's re-emit (`:744-758`, `:785-805`). Per
+`CapabilityRow` (`capability.rs:542-553`):
+
+```json
+"options_schema": [
+  { "key": "weight", "kind": "float", "min": 0, "max": 100,
+    "default": 1.0, "expectation": "finite and 0.0..=100.0" },
+  { "key": "min_score", "kind": "float", "min": 0, "max": 1,
+    "default": null, "expectation": "finite and 0.0..=1.0" }
+],
+"options_set": { "enabled": true, "weight": false, "min_score": true }
+```
+
+* `options_schema` — one entry per key the capability DECLARES, in registry order, generated
+  from `spec(id).options` + `spec(id).defaults`. `kind` is `"float"` (`OptionKey::Weight`,
+  `MinScore`, `MinConfidence`) or `"uint"` (`MaxPerInput`, `MaxDocsPerPass`, i.e. the
+  `CapabilityFile` fields typed `Option<u32>`, `crates/policy/src/lib.rs:165-179`); `min`/`max`
+  are the bounds `validate` already enforces (`capability.rs:608-657`); `default` is
+  `null` ONLY for a key the registry leaves unset, which is the one key in (1) — so the panel
+  knows a key MAY be unset without learning the count; `expectation` is the daemon's OWN
+  phrase from the same table (the string a 400 already carries), so the range text a user reads
+  is the daemon's and not a second wording. `options_schema` is `[]` for the five rows that
+  declare nothing — their current "no editor at all" behaviour is preserved rather than
+  replaced by an empty editor claiming a knob.
+* `options_set` — for every declared key (plus `enabled`), whether the FILE carries it now:
+  `true` = the row's `[capabilities.<id>]` body has this key, `false` = it does not and the
+  resolved value comes from the registry default or the pipeline. Derived from the plane's own
+  `CapabilityFile` for the id, the same value `configured` is derived from
+  (`capability.rs:489-495`, `535-537`). When the table is absent every entry is `false`,
+  `enabled` included. Read the example as ONE ROW's state, not a whole file's: the file names
+  this id, carries `min_score = 0.4`, and carries neither `weight` nor `enabled` — so the row
+  resolves `weight = 1.0` from the registry and `enabled = true` from `default_enabled`, and a
+  write about another row must preserve exactly that. `enabled` is in this object because it has
+  the same present-or-defaulted ambiguity as an option value.
+
+**Do NOT redefine `options`, and do not widen `configured`.** `configured` keeps its three
+values and its meaning ("legacy" | "default" | "file"); a client that reads only `options` and
+`configured` sees a byte-identical payload. **Why additive rather than "just expose the schema
+in `options`":** `options` is what three existing callers parse as resolved values (the panel,
+the MCP list, the MCP write's re-emit), and the MCP writer's read-modify-write loop is the one
+that keeps a single toggle from resetting every other capability — redefining the field it
+re-emits through would break the write path of a surface that was just verified, and this
+increment's law is additive-only. Two new fields cost a client that ignores them exactly
+nothing.
+
+**The panel side, down to the symbols removed** (`panel/src/capability-options.ts`, 187 lines
+today). REMOVE: the `OPTION_KEYS` array (`:35-41`), the `OptionRule` interface (`:45-54`), the
+`OPTION_RULES` table (`:56-67`) — the copy of `capability.rs:608-657` — and the `OptionKey`
+type (`:33`, a `keyof CapabilityOptions`), which becomes `string` derived from the response.
+KEEP, changed to read the schema instead of the table: `validateOptionValue` (`:89-101`) takes
+the schema entry for the key and applies the same order — the `DECIMAL` shape test (`:82`),
+then finiteness, then `kind === "uint"` => integer, then `min`/`max`; `reportedOptions` becomes
+`row.options_schema.map(e => e.key)` (every DECLARED key, so the key with a `null` default
+renders an input, pre-filled with the resolved value or empty); the refusal text uses the
+entry's `expectation` instead of `OPTION_RULES[key].expectation`
+(`panel/src/views/Settings.tsx:305-316`). KEEP `RESET_OPTIONS` (`{}`, `:146`), `RowEdit`
+(`:149-155`) and `capabilitiesBody` (`:173-187`) — the read-modify-write discipline is
+correct — with the non-edited branch re-emitting each row's `options_set` keys (plus `enabled`
+when `options_set.enabled`) instead of every resolved value, which is what removes defect (2).
+`panel/src/api.ts` gains the two fields on `CapabilityRow` (`:296-307`) and the schema type
+next to `CapabilityOptions` (`:281-287`); the shape guard (`:747-768`) does not need them
+(absent fields must not fail the guard, or an older daemon becomes a client-side error). The
+MCP's own copy of the key list (`crates/mcp/src/lib.rs:613-619`) is a THIRD spelling of the
+same fact and should be removed in the same change by iterating the row's `options_schema`;
+that is `crates/mcp`, outside this document's file set, so it is named here as the follow-up
+rather than folded in.
+
+**The cross-field invariant: resolve it at the WRITE door, not at boot (option 3 of three).**
+Measured today: `PUT` accepts `{"<recall leg>": {"enabled": true, "weight": 0.0}}` with 200,
+and the NEXT `GET /api/v1/recall` is refused 400 — `` recall leg configuration is invalid: leg
+`memory semantic` is enabled with weight 0: an enabled leg must have a weight > 0 (disable the
+leg instead of zeroing it) `` (`memembed.rs:654-663` -> `check_weights`,
+`crates/knowledge/src/rrf.rs:81-97`, which refuses `enabled && weight <= 0.0`; the negative half
+is already refused at the door by the range check, so the runtime-refused case is exactly
+`weight == 0.0`). The three candidates and why the third wins:
+
+* *Enforce in `CapabilityPlane::from_policy`* (so `PUT` AND boot both refuse): **rejected.** It
+  makes a `policy.toml` that boots today fail to start after the upgrade — a daemon that
+  refuses to start cannot show the user which line to fix. Trading a loud refusal at read time
+  for a dead daemon is worse than the defect.
+* *Stop refusing at read time* (an enabled leg at 0.0 just contributes nothing): **rejected.**
+  That refusal is what makes `w_semantic=0` in a recall record mean "off" rather than "weighted
+  to zero" — the reading §11.4's `memory_fusion` evidence depends on — and `check_weights` is
+  the shared, knowledge-side guard, not a daemon local.
+* *Refuse NEW writes that create the state; leave load and read exactly as they are* (the
+  `unconfirmed_llm_enable` shape, `capability.rs:724-736`): **chosen.** The `PUT` handler
+  already builds `before` and `after` planes for the cost gate; add the mirrored check over the
+  memory leg pair on the SAME two values, after `from_policy` and before the write, and refuse
+  with a body that reuses the runtime's sentence verbatim (`says "disable the leg instead of
+  zeroing it"`, naming the id and the key). Consequences, stated: a `policy.toml` that ALREADY
+  contains `enabled = true, weight = 0.0` still boots and still falls back to today's behaviour
+  (recall 400s, loudly, naming the leg) — no migration, no dead daemon; the panel can no longer
+  CREATE it, and because the rule is now enforced at the write door the panel can mirror it
+  FROM DATA (the schema cannot express it, so the refusal comes back as the daemon's own
+  message, verbatim, exactly as every other daemon refusal is rendered today,
+  `Settings.tsx:311-316`); and an agent has no way to create it in the first place
+  (`capability_set` takes `Option<f64>`, so `0.0` is expressed as an omitted key = "keep the
+  current value", `crates/mcp/src/lib.rs:1183-1189`). The write-door rule is stated for the
+  MEMORY legs, which is where that rule is enforced and where I measured it; whether
+  `recall_leg_knowledge_*` gets the same guard is a separate, unverified question and is NOT
+  asserted here.
+
+**What must NOT change.** No existing key's value moves and no key is redefined
+(`options`, `configured`, `table_present`, `config_file`, `conflicts` and every recall key keep
+their bytes; the two new fields are absent-before, present-after). The whole-table
+read-modify-write discipline stays (`config.rs:1071-1114`): the body is still the complete
+table, a row it omits is still DELETED, and `set_or_remove_*` still removes every key the entry
+omits — the change only makes the panel emit the keys the file ACTUALLY carries. That cuts both
+ways and the ORIGINAL behaviour is the one preserved here: for a row this write is not about,
+the rule is "do not invent keys": for a row this write is not about, an option key is emitted
+only when `options_set` says the file already carries it, and the `enabled` key is emitted only
+when `options_set.enabled` says the same — so a file body that is `{enabled}` (the shape a Reset
+leaves) does not gain a `weight` back on the next unrelated write. `enabled` is still always
+emitted for the row the write IS about (it is the switch this card writes). Reset still REMOVES
+the row's keys (`RESET_OPTIONS = {}`, `capability-options.ts:146`) rather than writing defaults
+in, and an emptied field still means unset rather than a written default.
+
+**The closure test — named.**
+`crates/daemon/tests/knowledge_api.rs`, next to the existing capability tests:
+`the_panel_sees_every_declared_key_and_a_write_does_not_materialize_defaults`. It seeds a
+`policy.toml` whose `[capabilities]` table configures TWO rows — `knowledge_ingest_graph` with
+its keys, and `recall_leg_memory_semantic` with `enabled` + `weight` ONLY (the row shape after
+a Reset) — then: (a) asserts the second row's `options_schema` contains `min_score` with
+`default: null` and its `options_set` says `min_score: false`; (b) PUTs the panel's body with
+`min_score = 0.4` added to that row and asserts the key lands in policy.toml and reads back as
+`0.4` while the OTHER row's keys are byte-identical in the file; (c) PUTs an unrelated change
+(toggling `recall_leg_wiki`) and asserts the file's second row still carries ONLY
+`enabled`/`weight`/`min_score` — i.e. `weight = 1.0` was NOT materialized by a write about a
+different row (the exact regression of §11.5 (2)); (d) PUTs `enabled: true, weight: 0.0` on a
+memory leg and asserts 400 naming the leg, with the file byte-identical and the next recall
+still succeeding. Steps (a)-(c) mirror the existing partial-PUT precedent
+`crates/daemon/tests/capabilities.rs:239` ("an option key the request did not name keeps its
+declared default") and the write-door refusal is a new case beside
+`put_refuses_an_undeclared_option_key_and_an_out_of_range_value` (`:294`).
+
+**Cost, and the honest case for not doing it.** One additive struct + one projection in
+`capability.rs` (schema entries built from `spec(id).options`/`defaults`, `options_set` from
+`file_of`) and the write-door check; `panel/src/capability-options.ts` loses its table and its
+`OptionKey` type and gains two readers; `Settings.tsx` loses one import and one
+`OPTION_RULES[key].expectation`; `api.ts` gains two fields. No migration, no new route, no
+config-surface change beyond the misconfiguration refusal. Against: the ONE unreachable key
+would be cheaper to fix by giving `min_score` a declared default — and that is rejected on its
+own merits, not on cost: a default IS a behaviour, and inventing one for a key whose whole
+point is "the caller's strategy floor decides when unset" (`api.rs:2957-2961`) would change
+recall for people who never asked. The change is therefore justified by (2), which is live in
+`a0f1eae` and rewrites the user's file on an unrelated write; exposing the unreachable key is
+what the same field buys. **'Do nothing' is the wrong call here** for that reason, and it is
+recorded as wrong rather than left open.
+
+**Follow-up (not performed here):** a spike that boots the daemon with the two fields, GETs the
+rows, renders the editor from `options_schema` alone, and diffs `policy.toml` before/after a
+write that touches a different row — the shape of §11.5's closure test, run live.
+
+### 11.6 The regression bar (pinned, testable)
 
 1. `cargo test --workspace` green, including the existing recall assertions:
    crates/daemon/tests/knowledge_api.rs:133/154 (both strategies), 616-660 (wiki stubs are
@@ -1351,7 +1562,7 @@ asked for nothing" is a reading, not an error.
    defect), and it now asserts the leg's contribution and the difference the switch makes —
    §21.1.
 
-### 11.6 The id-convergence shape as landed (the engine names no capability id)
+### 11.7 The id-convergence shape as landed (the engine names no capability id)
 
 §11.1/§11.2 said the recall engines would take the leg configuration from the plane, which left
 open *where* a capability id is spelled. The landed shape answers that, and it is better than
@@ -1856,11 +2067,20 @@ Live probe for t9 (not a substitute for the tests): start the daemon with
 
 1. Whether the injection paths should eventually take per-leg config (§3.3) — a follow-up
    task with its own measurement, not a widening of this one.
-2. Whether `recall_leg_*` weights should be *shared* with the knowledge fusion's calibration
+2. ~~Whether `recall_leg_*` weights should be *shared* with the knowledge fusion's calibration
    version (`SCORING_VERSION`, store.rs:338) — a weight change today is not recorded in
-   `recall_log`, so a reader cannot tell a different weight from a different corpus. The
-   honest next step is to fold the leg weights into `fusion`'s label (the label is built at
-   `api.rs:2974-2982`).
+   `recall_log`, so a reader cannot tell a different weight from a different corpus.~~ The
+   second half is **CLOSED (increment 3)**: the memory half landed as the additive
+   `memory_fusion` key in the response and in `candidates_json`, carrying the EFFECTIVE weights
+   (design §11.4), and a disabled leg reads `0` rather than its stale configured weight. The
+   original recommendation — *"the honest next step is to fold the leg weights into `fusion`'s
+   label (the label is built at `api.rs:2974-2982`)"* — is **superseded, not implemented**:
+   `scoring.fusion` is an existing wire value, so folding a memory weight into it would have
+   been a non-additive change, which is why a NEW key was added instead and why the new key
+   follows the response's spelling rather than the knowledge TYPE's (`FusionKind::label()`,
+   `store.rs:151`, still a different string and still not emitted). Still open: **sharing** a
+   calibration version between the two fusions (the `SCORING_VERSION` half). See §11.5 for the
+   declared-option surface added on top of this.
 3. Whether skills need a lifecycle (`skills.rs` copies files; §2.1 claim 6). Out of this
    increment's scope; the operator-skill edit is documentation only.
 
@@ -1945,7 +2165,7 @@ softened here; only the divergences are listed.
      because a `run_turn` episode is what the panel reads as "this session was distilled".
 
 8. **§11.1/§11.2 — the id-convergence shape is better than what §11 implied, and is now the
-   design (§11.6).** The recall engines name **no capability id**: `memembed` exposes a typed
+   design (§11.7).** The recall engines name **no capability id**: `memembed` exposes a typed
    `RecallLeg` (six variants, declaration order = report order, `memembed.rs:564-589`) and
    `crates/knowledge` a typed `KnowledgeLeg` (`store.rs:209-222`). The **single** id mapping is
    `crates/daemon/src/api.rs::recall_leg_id(RecallLeg) -> &'static str`

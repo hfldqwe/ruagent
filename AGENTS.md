@@ -174,6 +174,35 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   That attribute is **intentional, not leftover debt**: when `cli/` gets an owner, the move is
   the better fix, and the comment is the marker for exactly that. Do not delete the comment and
   do not "fix" the allow by moving code as a drive-by.
+- **A red loopback test can be the machine's proxy, not your change** (recall-dev, increment 3).
+  The Windows system proxy is enabled on this machine pointing at `127.0.0.1:7890` with nothing
+  listening, and `reqwest` honours it because its `ProxyOverride` is not applied to loopback. Every
+  in-test loopback call is therefore dialled at the PROXY address, and the panic names a socket the
+  test never mentioned: `reqwest::Error { kind: Request, url: "http://127.0.0.1:62523/api/v1/recall?q=..." }`
+  whose `source` is `ConnectError("tcp connect error", 127.0.0.1:7890, Os { code: 10061, ... })`.
+  Observed instances: `recall_calls_are_logged` failing at `crates/daemon/tests/knowledge_api.rs:720`,
+  and (increment-3 verification) 9 failures in `crates/daemon/tests/capabilities.rs` taking
+  `cargo test --workspace` to **exit 101** on a tree whose diff touches neither file. Remedy: put the
+  loopback hosts in `NO_PROXY` — `NO_PROXY=127.0.0.1,localhost,::1 cargo test --workspace` took the
+  same run from exit 101 to exit 0 (66 targets, 587 passed, 0 failed). **The discipline matters more
+  than the remedy:** reproduce the red on an UNTOUCHED baseline — a `git worktree` at HEAD with its
+  OWN `CARGO_TARGET_DIR` (the worktree/`CARGO_TARGET_DIR` entry above) — before believing it, which is
+  how this was diagnosed as the environment rather than reported as a regression. A red that names a
+  test your change does not touch, panicking at a connect error to a port you did not bind, is the
+  machine until the baseline says otherwise. Do not bypass a gate that is red for a reason that might
+  be yours, and never report a gate as green when you ran it only with the bypass (or did not run it):
+  say which command produced which reading.
+- **Cite a task by concept, or qualify the id with its team generation** (recall-dev, increment 3).
+  Comments in this repo cite team task ids — `t5:` alone has 23 references in
+  `crates/daemon/src/memembed.rs` — but the runtime allocates ids PER GENERATION, so this generation's
+  `t5` is a DIFFERENT task from the previous generation's `t5`. A bare `tN` in a comment therefore
+  points at an authority a later reader cannot resolve, and two generations of the same number read as
+  one task. Convention: name the CONCEPT the comment protects (which behaviour, which invariant) and,
+  when the id is worth keeping, qualify it with the team generation —
+  `ruagent-tunable-capabilities t5`, the shape the generation ledger uses. Honest note: `AGENTS.md`'s
+  own entries above cite bare ids from earlier generations (t66, t93/t81, t76, t45/t54, t188), so this
+  is an improvement on current practice rather than a description of it; apply it to new comments and
+  do not rewrite the old ones as a drive-by.
 
 ## E2E specs that write the daemon's real config
 

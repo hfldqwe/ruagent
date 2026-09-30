@@ -671,6 +671,49 @@ impl MemoryLegs {
         }
     }
 
+    /// THE EFFECTIVE WEIGHTS of this configuration: what each leg actually
+    /// contributes to the fusion, after normalization. [`fuse_memory_legs`] builds
+    /// its inputs from THIS value and [`Self::fusion_label`] renders the same value,
+    /// so the label a record carries cannot describe a fusion other than the one
+    /// that ran.
+    pub fn effective(&self) -> Self {
+        self.normalized()
+    }
+
+    /// The fusion expression as a LABEL: `"rrf:k=60,w_semantic=3,w_keyword=1"`.
+    ///
+    /// THE SPELLING IS THE RECALL RESPONSE'S, not the knowledge type's. Two strings
+    /// already exist for this one concept and they are NOT the same:
+    /// [`ruagent_knowledge::store::FusionKind::label`] renders
+    /// `"rrf(k=60,w_sem=3,w_kw=1)"`, while the recall endpoint re-spells the
+    /// knowledge label as `"rrf:k=...,w_semantic=...,w_keyword=..."` and does not
+    /// call that `label()` (see the note at the construction site in `api.rs`). The
+    /// endpoint's spelling is the one a reader of a payload meets in
+    /// `scoring.fusion`, and `memory_fusion` sits in the SAME payload: emitting the
+    /// type's shape here would ask one reader to learn two formats for one idea.
+    /// Unifying the pre-existing pair by changing `scoring.fusion` would be a
+    /// non-additive change to an existing wire value, so only this NEW key follows
+    /// the response it lives in. The format is pinned by
+    /// `the_memory_fusion_label_carries_the_effective_weights` here and, over HTTP,
+    /// by `parse_rrf_label`, which parses BOTH labels of one payload.
+    ///
+    /// WHY THIS EXISTS (t2, the memory half of §20.2): the fusion's weights reached
+    /// the ranking but NOT the record, so a reader of a recall response or of
+    /// `recall_log` could see the hit COUNTS and not the numbers that produced them
+    /// — "the weight changed" and "the corpus changed" were the same row.
+    ///
+    /// The numbers are the EFFECTIVE ones (`normalized_weight`), never the raw
+    /// configured ones: a weight the ranking did not use is not evidence about the
+    /// ranking. A DISABLED leg therefore reads `0` whatever the file carried next to
+    /// `enabled = false` — and that `0` unambiguously means "off", because an
+    /// ENABLED leg at weight <= 0 is REFUSED by [`Self::validate`] ("disable the leg
+    /// instead of zeroing it"), so it is a value the fusion can never be given.
+    pub fn fusion_label(&self) -> String {
+        let effective = self.effective();
+        let (w_semantic, w_keyword) = (effective.w_semantic, effective.w_keyword);
+        format!("rrf:k={RRF_K},w_semantic={w_semantic},w_keyword={w_keyword}")
+    }
+
     /// The memory legs this configuration turns OFF, in a stable order (types, not
     /// capability ids — see [`RecallLeg`]).
     pub fn disabled_legs(&self) -> Vec<RecallLeg> {
@@ -851,8 +894,12 @@ pub async fn recall_memories(
 ///
 /// A DISABLED leg is dropped from the input list as well as zero-weighted: a
 /// caller cannot re-inject documents through a leg the configuration turned off.
+///
+/// The weights come from [`MemoryLegs::effective`] — the same value
+/// [`MemoryLegs::fusion_label`] renders into the record (t2), so the reported label
+/// and the arithmetic here cannot drift apart.
 fn fuse_memory_legs(sem_ids: &[i64], kw_ids: &[i64], legs: &MemoryLegs) -> Vec<(i64, f32)> {
-    let legs = legs.normalized();
+    let legs = legs.effective();
     let mut inputs: Vec<(&[i64], f32)> = Vec::new();
     if legs.semantic {
         inputs.push((sem_ids, legs.w_semantic));
@@ -1864,6 +1911,72 @@ mod tests {
             vec![1, 3]
         );
         assert!(fuse_memory_legs(&sem, &kw, &MemoryLegs::all_off()).is_empty());
+    }
+
+    /// t2 / design §20.2 (memory half): the label a record carries states the
+    /// EFFECTIVE weights — the numbers the fusion above actually consumed — so a
+    /// weight change is readable even when the corpus alone cannot show it.
+    ///
+    /// The string is also the FROZEN wire spelling, so it cannot drift back to the
+    /// knowledge type's `rrf(k=...,w_sem=...,w_kw=...)` form: that form is a
+    /// different string for the same information, and one payload must not carry
+    /// both — see [`MemoryLegs::fusion_label`].
+    ///
+    /// The last assertion is the one that makes the label evidence rather than
+    /// decoration: the ranking those weights produce, computed by hand through the
+    /// frozen `rrf_weighted`, is the ranking `fuse_memory_legs` produces from the
+    /// same configuration the label was rendered from.
+    #[test]
+    fn the_memory_fusion_label_carries_the_effective_weights() {
+        assert_eq!(
+            MemoryLegs::default().fusion_label(),
+            "rrf:k=60,w_semantic=1,w_keyword=1",
+            "the default must read as the 1:1 fusion that reproduces the frozen `rrf`"
+        );
+        let weighted = MemoryLegs {
+            w_semantic: 3.0,
+            w_keyword: 1.0,
+            ..MemoryLegs::default()
+        };
+        assert_eq!(weighted.fusion_label(), "rrf:k=60,w_semantic=3,w_keyword=1");
+        println!(
+            "READING memory fusion label: default={} w_sem=3={} all_off={}",
+            MemoryLegs::default().fusion_label(),
+            weighted.fusion_label(),
+            MemoryLegs::all_off().fusion_label()
+        );
+        // A DISABLED leg's weight does not appear: a stale 3.0 beside
+        // `enabled = false` normalizes to 0.0 (`normalized_weight`), exactly as t5
+        // established for the knowledge side.
+        let stale = MemoryLegs {
+            semantic: false,
+            w_semantic: 3.0,
+            ..MemoryLegs::default()
+        };
+        assert_eq!(stale.fusion_label(), "rrf:k=60,w_semantic=0,w_keyword=1");
+        assert_eq!(
+            MemoryLegs::all_off().fusion_label(),
+            "rrf:k=60,w_semantic=0,w_keyword=0"
+        );
+        // The string pinned above is the response's OWN spelling, byte for byte —
+        // the same shape `api.rs` builds for the knowledge label, so a reader parses
+        // both with one parser (asserted over HTTP by `parse_rrf_label`). The
+        // knowledge TYPE's `label()` renders a DIFFERENT string for the same
+        // information, and no payload carries it.
+        assert_ne!(
+            weighted.fusion_label(),
+            "rrf(k=60,w_sem=3,w_kw=1)",
+            "the knowledge TYPE's label() spelling is not what a payload carries"
+        );
+
+        // The label and the fusion read the SAME weights.
+        let sem = vec![1i64, 2, 3, 4];
+        let kw = vec![1i64, 3];
+        assert_eq!(
+            fuse_memory_legs(&sem, &kw, &weighted),
+            ruagent_knowledge::rrf_weighted(&[(&sem, 3.0), (&kw, 1.0)], RRF_K),
+            "the weights the label reports are the weights the fusion used"
+        );
     }
 
     /// The weight rule, at the layer that rejects it: negative and all-zero are

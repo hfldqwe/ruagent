@@ -1935,6 +1935,24 @@ html[data-mode="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0,
    plate, not a second layout: one narrow column at the 760px readability cap,
    so the two cards of this page read as one page (view-settings §2). */
 .capabilities-settings { max-width: 760px; display: flex; flex-direction: column; gap: 10px; }
+
+/* The option editor of one capability: one line per knob — the key's own name,
+   the input, then the daemon's range phrase (and a refusal when one applies) —
+   followed by the row's Apply/Reset. */
+.capability-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 4px 6px;
+}
+.capability-options > .row { gap: 8px; padding: 2px 0 0; }
+.capability-option { display: flex; align-items: center; gap: 8px; }
+/* The key names are the API's own and they are not all the same length
+   (`weight` … `max_docs_per_pass`): a fixed label column keeps the inputs
+   aligned, so the rows read as one table instead of a ragged list. */
+.capability-option > .mono { flex: 0 0 124px; }
+.capability-option-input { width: 132px; }
+
 /* t243: the prompt's opener. The same box as the old <details> summary (8px
    block padding keeps the row at 32px - row 18 measured 26px at 4px), but a
    button: the prompt opens in a dialog now instead of unfolding inside the

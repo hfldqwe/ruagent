@@ -41,6 +41,21 @@ export const zh: Record<string, string> = {
   "settings.capabilities.saveFailed": "保存失败——开关保持服务端的值，daemon 的原文如下。",
   "settings.capabilities.conflictTitle": "有行为被你的能力配置抑制",
 
+  // The option editor. The KEY names (weight, min_score, …) are the API's own
+  // and are shown verbatim, like the daemon's description/gates phrases: they
+  // are what the user would otherwise type into policy.toml. Only the panel's
+  // own words live here.
+  "settings.capabilities.options.title": "选项",
+  "settings.capabilities.options.apply": "应用",
+  "settings.capabilities.options.reset": "恢复默认值",
+  "settings.capabilities.options.resetHint":
+    "把这一行的选项键从 policy.toml 里删掉，让注册表默认值重新生效——不是把默认值写成你的意见。",
+  "settings.capabilities.options.unapplied": "有未应用的修改",
+  "settings.capabilities.options.notFinite": "必须是有限数字",
+  "settings.capabilities.options.notInteger": "必须是整数",
+  "settings.capabilities.options.outOfRange": "超出范围（{expectation}）",
+  "settings.capabilities.options.refused": "有输入未通过校验，这一行没有发送任何请求。",
+
   "settings.capabilities.name.memory_inject_chat": "会话首轮记忆注入",
   "settings.capabilities.name.memory_inject_runs": "运行提示词注入",
   "settings.capabilities.name.recall_leg_memory_semantic": "召回腿 · 记忆语义",
@@ -83,6 +98,19 @@ export const en: Record<string, string> = {
   "settings.capabilities.saveFailed":
     "Save failed — the switches keep the server's value; the daemon's own message is below.",
   "settings.capabilities.conflictTitle": "This capability config suppresses behaviour you had",
+
+  // The option editor (see the zh block above for why the KEY names are not
+  // translated: they are the API's own).
+  "settings.capabilities.options.title": "Options",
+  "settings.capabilities.options.apply": "Apply",
+  "settings.capabilities.options.reset": "Reset to defaults",
+  "settings.capabilities.options.resetHint":
+    "Removes this row's option keys from policy.toml so the registry defaults apply again — it does not write the defaults in as your opinion.",
+  "settings.capabilities.options.unapplied": "unapplied changes",
+  "settings.capabilities.options.notFinite": "must be a finite number",
+  "settings.capabilities.options.notInteger": "must be a whole number",
+  "settings.capabilities.options.outOfRange": "out of range ({expectation})",
+  "settings.capabilities.options.refused": "An input failed validation; no request was sent for this row.",
 
   "settings.capabilities.name.memory_inject_chat": "Chat first-prompt injection",
   "settings.capabilities.name.memory_inject_runs": "Run prompt injection",

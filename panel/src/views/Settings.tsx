@@ -10,11 +10,20 @@ import { useEffect, useState } from "react";
 import {
   api,
   type CapabilitiesResponse,
-  type CapabilityFileEntry,
-  type CapabilityOptions,
   type CapabilityRow,
   type DistillPolicy,
 } from "../api";
+import {
+  capabilitiesBody,
+  OPTION_RULES,
+  optionValues,
+  reportedOptions,
+  RESET_OPTIONS,
+  validateOptionValue,
+  type OptionKey,
+  type OptionRefusal,
+  type RowEdit,
+} from "../capability-options";
 import { ErrorState, Modal, Spinner } from "../ui";
 import { useI18n } from "../i18n";
 
@@ -276,17 +285,6 @@ function DistillSettings() {
 // The capability plane (the [capabilities] table of policy.toml)
 // ---------------------------------------------------------------------------
 
-/** The option keys a capability may declare, in the registry's order (design
- *  §4.2). A key a capability does not declare never appears in its `options` —
- *  the daemon refuses it as an unknown key rather than ignoring it. */
-const OPTION_KEYS: (keyof CapabilityOptions)[] = [
-  "weight",
-  "min_score",
-  "max_per_input",
-  "min_confidence",
-  "max_docs_per_pass",
-];
-
 /** The localised NAME of one capability, or the raw id for an id this build has
  *  never heard of (a daemon that grew a capability after this panel was built):
  *  `t` falls back to the key itself, which is right for a missing string and
@@ -296,77 +294,81 @@ function capabilityName(t: (key: string) => string, id: string): string {
   return name.startsWith("settings.capabilities.name.") ? id : name;
 }
 
-/** A row's resolved options, as the `[capabilities.<id>]` keys it declared.
- *  Only non-null ones: `null` means "not set", and re-writing it as an explicit
- *  value would turn a default into an opinion. */
-function declaredOptions(row: CapabilityRow): CapabilityFileEntry {
-  const out: CapabilityFileEntry = {};
-  const o = row.options;
-  if (!o) return out;
-  for (const k of OPTION_KEYS) {
-    const v = o[k];
-    if (v != null) out[k] = v;
-  }
+/** The state key of one input: the row id and the option key, separated by a
+ *  character no capability id contains, so "drop this row's drafts" is a prefix
+ *  test rather than a second nested map. */
+function draftKey(rowId: string, key: OptionKey): string {
+  return `${rowId}\u0000${key}`;
+}
+
+/** A draft/refusal map without one row's entries. After a write the inputs must
+ *  render the daemon's ANSWER; after a FAILED write nothing is dropped, so a
+ *  typo the daemon refused is still in front of the user. */
+function dropRow<V>(map: Record<string, V>, rowId: string): Record<string, V> {
+  const prefix = `${rowId}\u0000`;
+  const out: Record<string, V> = {};
+  for (const [k, v] of Object.entries(map)) if (!k.startsWith(prefix)) out[k] = v;
   return out;
 }
 
-/** The same values as one line — "weight 1.5 · min_score 0.25". The keys are
- *  the API's own names, shown verbatim: they are exactly what the user would
- *  otherwise be editing in policy.toml. */
-function optionsLine(row: CapabilityRow): string {
-  const o = row.options;
-  if (!o) return "";
-  return OPTION_KEYS.filter((k) => o[k] != null)
-    .map((k) => `${k} ${o[k]}`)
-    .join(" · ");
+/** The daemon's OWN message, verbatim: `String(err)` would prefix "Error: ",
+ *  which is the panel's word, not the daemon's. A `PUT` 400 names the
+ *  capability, the key and the range it wanted, and that sentence is the one
+ *  worth reading — it is not summarised or reworded anywhere in this card. */
+function daemonMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
-/** The `PUT /api/v1/capabilities` body for ONE switch flip.
- *
- *  READ-MODIFY-WRITE, because the daemon's `CapabilitiesEditor::update`
- *  (crates/daemon/src/config.rs:1079-1114) REPLACES the whole `[capabilities]`
- *  table: a row absent from this body is DELETED from policy.toml, and inside a
- *  row `set_or_remove_*` (:1100-1105) removes every key the body omits. A body
- *  carrying only the flipped row would therefore reset every other configured
- *  row's `weight`/`min_score` and drop its `enabled` key — one switch flip, a
- *  silently edited config file.
- *
- *  So every row the file already configures (`configured === "file"`) is
- *  re-emitted with its resolved options, and only the flipped row changes
- *  value. A row nobody has written (`configured !== "file"`) is left OUT on
- *  purpose: it resolves to its registry default, which is the value `GET`
- *  reported and the value the switch shows. */
-function capabilitiesBody(
-  data: CapabilitiesResponse,
-  id: string,
-  enabled: boolean,
-): Record<string, CapabilityFileEntry> {
-  const out: Record<string, CapabilityFileEntry> = {};
-  for (const row of data.capabilities) {
-    const changing = row.id === id;
-    if (!changing && row.configured !== "file") continue;
-    out[row.id] = { enabled: changing ? enabled : row.enabled, ...declaredOptions(row) };
-  }
-  return out;
+/** Why one input was refused, in the reader's language. The RANGE in the
+ *  message is the daemon's own expectation phrase (mirrored in
+ *  capability-options.ts), never a re-worded one. */
+function refusalText(
+  t: (key: string, params?: Record<string, string | number>) => string,
+  key: OptionKey,
+  refusal: OptionRefusal,
+): string {
+  if (refusal === "notFinite") return t("settings.capabilities.options.notFinite");
+  if (refusal === "notInteger") return t("settings.capabilities.options.notInteger");
+  return t("settings.capabilities.options.outOfRange", {
+    expectation: OPTION_RULES[key].expectation,
+  });
 }
 
-/** One switch per capability.
+/** One row per capability: the enable switch, the regression warning, and an
+ *  editor for every option value the API reports for it.
  *
- *  There is no Save button here, unlike the distill card above: a capability is
- *  one independent boolean and the daemon's cost gate is per capability
- *  (enabling an llm-tier one has to be confirmed on its own). Each flip is ONE
- *  `PUT`, and the switches render the daemon's ANSWER — never a local guess —
- *  so a refused write leaves the switch where the config file is and shows the
- *  daemon's own message. */
+ *  There is no Save button for the SWITCHES, unlike the distill card above: a
+ *  capability is one independent boolean and the daemon's cost gate is per
+ *  capability (enabling an llm-tier one has to be confirmed on its own). Each
+ *  flip is ONE `PUT`, and the switches render the daemon's ANSWER — never a
+ *  local guess — so a refused write leaves the switch where the config file is
+ *  and shows the daemon's own message.
+ *
+ *  The OPTION inputs work the same way, with one addition: Apply validates the
+ *  touched fields against the daemon's own rules BEFORE the request, so a value
+ *  that could not be stored is never sent, and a 400 that happens anyway is
+ *  printed verbatim. Every write here is a whole-table read-modify-write (see
+ *  `capabilitiesBody`): the same body shape the switches already send, because
+ *  the daemon's editor DELETES what a body omits. */
 function CapabilitiesSettings() {
   const { t } = useI18n();
   const [data, setData] = useState<CapabilitiesResponse | null>(null);
   const [err, setErr] = useState<unknown>(null);
-  /** The row whose PUT is in flight; all switches are locked meanwhile, so two
-   *  whole-table writes can never interleave and lose one another's change. */
+  /** The row whose PUT is in flight; all switches AND all option editors are
+   *  locked meanwhile, so two whole-table writes can never interleave and lose
+   *  one another's change. */
   const [pending, setPending] = useState<string | null>(null);
   /** The llm-tier row waiting for the cost confirmation. Not applied yet. */
   const [armed, setArmed] = useState<CapabilityRow | null>(null);
+  /** Draft TEXT per input (`draftKey`), for fields the user has touched but not
+   *  applied. Text, not numbers: a half-typed "0." must not be normalised under
+   *  the cursor, and `type="number"` would turn an unrepresentable literal into
+   *  an EMPTY value — which this card reads as "unset", i.e. "remove the key". */
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  /** The refusal per input, filled by Apply BEFORE any request: a value the
+   *  daemon would reject never reaches the wire, so there is no HTTP error to
+   *  show for it — the field itself carries the reason. */
+  const [refusals, setRefusals] = useState<Record<string, OptionRefusal>>({});
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
@@ -399,23 +401,28 @@ function CapabilitiesSettings() {
     return <Spinner label={t("common.loading")} />;
   }
 
-  const apply = async (row: CapabilityRow, enabled: boolean, confirmCost: boolean) => {
+  const apply = async (row: CapabilityRow, edit: RowEdit, confirmCost: boolean) => {
     setPending(row.id);
     setSaveErr(null);
     try {
       const next = await api.setCapabilities({
         confirm_cost: confirmCost,
-        capabilities: capabilitiesBody(data, row.id, enabled),
+        capabilities: capabilitiesBody(data, row.id, edit),
       });
       // The daemon answers a PUT with the same payload as the GET, so the
-      // response — not an optimistic local edit — is what the switches show.
+      // response — not an optimistic local edit — is what the card shows.
       setData(next);
+      // Only a SUCCESSFUL write drops this row's drafts: the fields then show
+      // the values policy.toml really holds. A refused write keeps them, so
+      // nothing the user typed is lost by the refusal.
+      setDrafts((d) => dropRow(d, row.id));
+      setRefusals((r) => dropRow(r, row.id));
       setSavedAt(new Date().toLocaleTimeString());
     } catch (e) {
       // The daemon's message, verbatim: 400 for an id/key/value it refuses,
       // 409 for an llm-tier enable without the cost confirmation, and the
-      // write error otherwise. The switch keeps the server's value.
-      setSaveErr(String(e));
+      // write error otherwise. The row keeps the server's values.
+      setSaveErr(daemonMessage(e));
     } finally {
       setPending(null);
     }
@@ -424,14 +431,79 @@ function CapabilitiesSettings() {
   const flip = (row: CapabilityRow, next: boolean) => {
     // Spending tokens is a deliberate act: an llm-tier row goes through the
     // cost confirmation (and the daemon refuses the PUT without confirm_cost
-    // anyway), while every free-tier flip is immediate.
+    // anyway), while every free-tier flip is immediate. The row's options are
+    // re-emitted unchanged: a flip is not a reason to reset them.
     if (next && row.tier === "llm") {
       setSaveErr(null);
       setArmed(row);
       return;
     }
-    void apply(row, next, false);
+    void apply(row, { enabled: next, options: optionValues(row) }, false);
   };
+
+  /** Apply the touched inputs of ONE row as one write.
+   *
+   *  Validation runs here, before the request, mirroring the daemon's own rules
+   *  (`validateOptionValue`): every touched field must pass or the whole row is
+   *  refused locally and NOTHING is sent — a partial write would be worse than
+   *  no write, because the daemon's body is the whole table. */
+  const applyOptions = async (row: CapabilityRow) => {
+    const overrides: Partial<Record<OptionKey, number | null>> = {};
+    const refused: Record<string, OptionRefusal> = {};
+    let touched = false;
+    for (const key of reportedOptions(row)) {
+      const text = drafts[draftKey(row.id, key)];
+      if (text === undefined) continue;
+      touched = true;
+      const checked = validateOptionValue(key, text);
+      if (checked.ok) overrides[key] = checked.value;
+      else refused[draftKey(row.id, key)] = checked.refusal;
+    }
+    if (Object.keys(refused).length) {
+      setRefusals(refused);
+      setSaveErr(null);
+      return;
+    }
+    if (!touched) return;
+    await apply(row, { enabled: row.enabled, options: optionValues(row, overrides) }, false);
+  };
+
+  /** Record one keystroke. The refusal for THAT field is cleared — it was about
+   *  a value that is now gone — while every other field keeps its message, so
+   *  fixing one number does not hide the reason another was refused. */
+  const editDraft = (row: CapabilityRow, key: OptionKey, text: string) => {
+    const dk = draftKey(row.id, key);
+    setDrafts((d) => ({ ...d, [dk]: text }));
+    setRefusals((r) => {
+      if (r[dk] === undefined) return r;
+      const next = { ...r };
+      delete next[dk];
+      return next;
+    });
+  };
+
+  /** Restore the registry defaults for one row.
+   *
+   *  It does NOT write the default VALUES in: it sends the row with no option
+   *  keys at all, and the daemon's `set_or_remove_*` REMOVES each one from
+   *  policy.toml, so the file says "unset" rather than stating the default as an
+   *  opinion of the user's. A row the file does not configure has no key to
+   *  remove: the values the inputs show already ARE the registry defaults, so
+   *  there is nothing to write and no row is created. */
+  const resetOptions = async (row: CapabilityRow) => {
+    setDrafts((d) => dropRow(d, row.id));
+    setRefusals((r) => dropRow(r, row.id));
+    if (row.configured !== "file") return;
+    await apply(row, { enabled: row.enabled, options: RESET_OPTIONS }, false);
+  };
+
+  /** The inputs of one row whose text differs from the value the daemon
+   *  reported — what there is to apply. */
+  const dirtyKeys = (row: CapabilityRow): OptionKey[] =>
+    reportedOptions(row).filter((key) => {
+      const text = drafts[draftKey(row.id, key)];
+      return text !== undefined && text !== String(row.options?.[key] ?? "");
+    });
 
   return (
     <div className="card capabilities-settings">
@@ -474,7 +546,13 @@ function CapabilitiesSettings() {
       {data.capabilities.map((row) => {
         const name = capabilityName(t, row.id);
         const differs = row.enabled !== row.default_enabled;
-        const options = optionsLine(row);
+        /** The knobs this row really has: one input per option key the API
+         *  reports a value for. An empty list means the capability declares no
+         *  options — then this card shows no editor at all, rather than an
+         *  empty one claiming a knob that does not exist. */
+        const keys = reportedOptions(row);
+        const dirty = dirtyKeys(row);
+        const locked = pending !== null;
         return (
           <div key={row.id} data-capability={row.id}>
             <div className="row" style={{ justifyContent: "space-between" }}>
@@ -519,10 +597,78 @@ function CapabilitiesSettings() {
                 <span className="tag warn">{t("settings.capabilities.costWarning")}</span>
               </p>
             ) : null}
-            {options ? (
-              <p className="muted micro" style={{ margin: "0 4px 6px" }}>
-                {options}
-              </p>
+            {/* The option editor, where the values used to be DISPLAYED. One
+                numeric input per reported key, labelled with the key's own name
+                (`weight`, `min_score`, … — the exact names the user would
+                otherwise be typing into policy.toml) and with the capability's
+                declared description and gates in the tooltip.
+
+                Apply validates first and writes ONCE for the whole row; Reset
+                removes the row's keys instead of writing defaults in. Both go
+                through `capabilitiesBody`, which re-emits every other configured
+                row — the daemon's PUT replaces the whole table. */}
+            {keys.length ? (
+              <div className="capability-options" data-options-for={row.id}>
+                <span className="muted micro">{t("settings.capabilities.options.title")}</span>
+                {keys.map((key) => {
+                  const dk = draftKey(row.id, key);
+                  const refusal = refusals[dk];
+                  return (
+                    <label key={key} className="capability-option" data-option={key}>
+                      <span className="mono micro">{key}</span>
+                      <Tooltip
+                        title={
+                          <>
+                            <div className="mono">{key}</div>
+                            <div>{row.description}</div>
+                            <div className="muted micro">{row.gates}</div>
+                          </>
+                        }
+                      >
+                        <Input
+                          size="small"
+                          className="capability-option-input"
+                          aria-label={`${name} ${key}`}
+                          value={drafts[dk] ?? String(row.options?.[key] ?? "")}
+                          disabled={locked}
+                          status={refusal ? "error" : undefined}
+                          onChange={(e) => editDraft(row, key, e.target.value)}
+                          onPressEnter={() => void applyOptions(row)}
+                        />
+                      </Tooltip>
+                      <span className="muted micro">{OPTION_RULES[key].expectation}</span>
+                      {refusal ? (
+                        <span className="tag err" data-refusal={refusal}>
+                          {refusalText(t, key, refusal)}
+                        </span>
+                      ) : null}
+                    </label>
+                  );
+                })}
+                <div className="row tight" style={{ padding: 0 }}>
+                  <span data-apply-options={row.id}>
+                    <Button
+                      size="small"
+                      type="primary"
+                      loading={pending === row.id}
+                      disabled={locked || !dirty.length}
+                      onClick={() => void applyOptions(row)}
+                    >
+                      {t("settings.capabilities.options.apply")}
+                    </Button>
+                  </span>
+                  <Tooltip title={t("settings.capabilities.options.resetHint")}>
+                    <span data-reset-options={row.id}>
+                      <Button size="small" disabled={locked} onClick={() => void resetOptions(row)}>
+                        {t("settings.capabilities.options.reset")}
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  {dirty.length ? (
+                    <span className="tag">{t("settings.capabilities.options.unapplied")}</span>
+                  ) : null}
+                </div>
+              </div>
             ) : null}
           </div>
         );
@@ -535,6 +681,14 @@ function CapabilitiesSettings() {
           </span>
         ) : null}
       </div>
+
+      {/* A refusal is local, so the daemon never saw it: say so, next to the
+          field that carries the reason. */}
+      {Object.keys(refusals).length > 0 && !saveErr ? (
+        <p className="muted micro" style={{ margin: 0 }}>
+          {t("settings.capabilities.options.refused")}
+        </p>
+      ) : null}
 
       {saveErr ? (
         <ErrorState title={t("settings.capabilities.saveFailed")} hint={saveErr} />
@@ -553,7 +707,7 @@ function CapabilitiesSettings() {
                 onClick={() => {
                   const row = armed;
                   setArmed(null);
-                  void apply(row, true, true);
+                  void apply(row, { enabled: true, options: optionValues(row) }, true);
                 }}
               >
                 {t("settings.capabilities.costConfirm")}
