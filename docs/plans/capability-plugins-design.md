@@ -2083,6 +2083,134 @@ Live probe for t9 (not a substitute for the tests): start the daemon with
    declared-option surface added on top of this.
 3. Whether skills need a lifecycle (`skills.rs` copies files; §2.1 claim 6). Out of this
    increment's scope; the operator-skill edit is documentation only.
+4. **The MCP `capability_set` parameter schema's own key list — DECIDED (increment 4;
+   `ruagent-tunable-capabilities` t14): the fields stay, the prose bounds go, and the one silent
+   path is to be made loud.** `t13`
+   removed the option-key enumeration from the tool DESCRIPTION and pinned that with a test;
+   two spellings remained, and this item decides what they are. It also records the one edge of
+   the write-door rule that §11.5 chose (last paragraph).
+
+   *THE QUESTION.* `CapabilitySetParams` carries one typed field per declared option key, and
+   each field's `schemars` description repeats the daemon's bounds in prose. Is that the
+   interface a static tool schema cannot avoid, or a stale-able list worth replacing with an
+   open options map?
+
+   *MEASUREMENTS* (from the live server and from `crates/mcp/src/lib.rs` at `4677912`; the
+   published schema was read through `tools/list` against a daemon built from this tree).
+
+   * **What the parameter struct declares** (`crates/mcp/src/lib.rs:1305-1337`): `id: String`,
+     `enabled: bool`, then one field per option key — `weight: Option<f64>`, `min_score:
+     Option<f64>`, `max_per_input: Option<u32>`, `min_confidence: Option<f64>`,
+     `max_docs_per_pass: Option<u32>` — plus `confirm_cost: Option<bool>`. Those five names are
+     TODAY exactly `OptionKey::ALL` (`capability.rs:164-170`) name for name, which is why the
+     duplication is invisible while the two sets coincide.
+   * **What is published**: `capability_set.inputSchema.properties` is exactly those eight
+     names, `required = ["id", "enabled"]`, and `additionalProperties` is **not set** — so the
+     published schema does not forbid extra properties. The five prose bounds live in the
+     descriptions: `weight` "Fusion weight (0.0..=100.0) …" (`:1314`), `min_score` "… 0.0..=1.0
+     …" (`:1318`), `max_per_input` "… 1..=10000 …" (`:1322`), `min_confidence` "… 0.0..=1.0 …"
+     (`:1326`), `max_docs_per_pass` "… 1..=1000 …" (`:1330`). Those numbers are the ONLY
+     statement of range in the published schema: schemars emits `minimum: 0` for the two `u32`
+     fields and no maximum, and nothing numeric at all for the three `f64` fields.
+   * **What the bridge does with them** (`apply_params`, `:892-912`): inserts `enabled` always,
+     then inserts each option ONLY when its `Option<T>` is `Some` — so the field list is exactly
+     the set of keys this tool can TRANSMIT.
+   * **Can a key the list lacks be sent? MEASURED, and this is the decisive reading: NO — and
+     the attempt is SILENT.** `capability_set(id="recall_leg_memory_semantic", enabled=true,
+     decay_half_life=5.0)` answers with a SUCCESS reply ("`recall_leg_memory_semantic` is now
+     enabled=true … policy.toml and the live plane were updated together"), `isError` false, and
+     `decay_half_life` appears nowhere: not in the reply, not in `policy.toml`. Serde discards
+     the unlisted field before the bridge sees it. A key the registry declares LATER would
+     therefore be not merely unsendable but silently unsendable.
+   * **Who validates**: the DAEMON. A key the target capability does not declare, sent through a
+     field the list HAS (`id="memory_inject_chat", weight=3.0`), comes back in the daemon's own
+     words — ``capability_set refused by the ruagent daemon (HTTP 400): capability
+     `memory_inject_chat` does not accept the option `weight` (it accepts: none)`` — with
+     `policy.toml` unchanged. The tool decides wire-ability; legality is the daemon's, which is
+     §11.5's rule for the panel applied to the second caller.
+
+   *THE DECISION — the typed fields ARE the interface; keep them.* (i) An MCP tool's input
+   schema is static by construction: schemars derives it at compile time and clients cache and
+   validate against it, so the field names and types are what a caller writes against — the
+   same category as `id` and `enabled`, not a cache of the daemon's registry. (ii) They cannot
+   be REMOVED without a breaking change to a surface this increment was required to keep
+   stable, and removing them is the only way to actually delete the duplication: an open
+   `options` map would ADD a second path BESIDE the fields (`apply_params`'s arms must stay for
+   existing clients), so the code grows and needs a conflict rule rather than shrinking. (iii)
+   Today the two sets coincide exactly (measured), so there is no live defect in the field list
+   itself. What is NOT acceptable is the silent discard, the unguarded prose, and a recovery
+   path that is only remembered — so the decision carries three non-breaking follow-ups:
+
+   1. **Make the unsendable key LOUD.** `#[serde(deny_unknown_fields)]` on `CapabilitySetParams`,
+      so a key this tool cannot transmit is refused with a message naming the field instead of
+      vanishing. This IS an interface change (the published schema gains
+      `additionalProperties: false` — schemars' shape for a `deny_unknown_fields` struct:
+      expected, not measured here, because the attribute is not on the struct yet), so it must be
+      recorded the way `t13` recorded its
+      description change and the way the write-door refusal was recorded — as a deliberate
+      tightening with a before/after, not as a bug fix. If the team prefers zero interface
+      change, the honest alternative is to accept the silent drop and write that down; the
+      recommendation is the refusal, because a caller that believes a write landed is worse off
+      than one told it cannot be made.
+   2. **Delete the prose bounds and point at the schema**, exactly as `t13` did for the tool
+      description: `weight` → "for the capabilities that declare it (read the row's
+      `options_schema` for the accepted range); omitted = keep the current value", and the same
+      shape for the other four. Nothing parses those strings, and they are the only place the
+      published schema states the `f64` ranges — so they look authoritative while being a copy.
+   3. **Add the guard, because the recovery path is otherwise a memory.** When the registry
+      declares a sixth key the MCP crate must gain a field, and nothing fails today if that is
+      forgotten. `crates/mcp`'s dev-dependencies ALREADY carry `ruagent-daemon`
+      (`crates/mcp/Cargo.toml:25-27`), so a test in `crates/mcp/tests/` can assert the tool's
+      option-field name set EQUALS `OptionKey::ALL`'s names without touching any `Cargo.toml` —
+      a registry addition then fails a test whose message names the tool to update. That is the
+      recovery path, stated as a check rather than as a convention.
+
+   *WHICH SIDE OF THE RULE THIS FALLS ON* — the rule being: a list with NO PARSER that can
+   silently go stale is the thing worth deleting, while a list that IS the interface is a
+   different thing. This case SPLITS, and saying which half is which is the answer. The FIELD
+   LIST is on the interface side: serde and schemars parse it, the published schema carries it,
+   and a mismatch with the wire is a deserialization error rather than a stale appearance — the
+   same side as `id` and `enabled`. The PROSE BOUNDS are on the delete side: no parser, no
+   test, and a string that would lie the day `OptionKey::bounds()` (`capability.rs:200`) moved
+   (it fails closed — the daemon still refuses — but it lies to the agent that read it). So:
+   keep the fields, delete the numbers, and make the one silent path loud.
+
+   *COST, AND 'DO NOTHING'.* Keeping the field list is the cheap half and is what this item
+   recommends. The three follow-ups are small and each is bounded: one serde attribute plus a
+   metadata record; one description rewrite (the same shape as `t13`'s change, which was one
+   file and one pinned test); one test in `crates/mcp/tests/`, in a crate that already depends
+   on the daemon for its harness. 'Do nothing AT ALL' — list, prose and silent drop all left as
+   they are — is rejected for exactly one reason: the silent discard is a caller-visible FALSE
+   SUCCESS, measured above, and a false success is the failure mode this whole effort exists to
+   remove. If that reading is judged not worth an interface change, the fallback is to record it
+   as accepted with the reason; what must not happen is leaving it unstated.
+
+   *THE ONE EDGE OF THE WRITE-DOOR RULE (§11.5), recorded with its rule.* The transition check in
+   `zero_weight_memory_leg` (crates/daemon/src/capability.rs — the `PUT`-door check, cited by
+   name because that file is being edited concurrently) compares the RESOLVED
+   weights of two planes — `before` is the LIVE PLANE, `after` is the body being written — and
+   never reads the file. CONDITION: `policy.toml` is edited behind the daemon's back (there is
+   no reload; the plane has never watched the file) so the file says `weight = 1.0` while the
+   plane still holds 0. OUTCOME: a `PUT` carrying `enabled = true, weight = 0.0` is ACCEPTED —
+   the transition is measured against a `before` that is already zeroed — and the file is
+   rewritten with the state the hand-edit had removed, even though the RUNNING configuration was
+   zeroed before and after, so no new state exists in the system and the discrepancy was created
+   by the out-of-band edit itself. ESTABLISHED by increment 4's independent verification and
+   confirmed independently by the review: it is **NOT reachable through the API alone** — every
+   API-only path into `enabled + weight 0.0` is refused (in one body, with `enabled` omitted, by
+   re-enabling a zeroed leg, by dropping `enabled` while the weight is 0.0, and even via the
+   `f64`→`f32` underflow `weight = 1e-300`), so the only sequence that reaches this edge needs a
+   hand-edit the daemon does not watch.
+
+   *AND ONE CLAUSE ON `panel/src/api.ts:283-289`.* The surviving five-name `CapabilityOptions`
+   interface is a redundant spelling, but its staleness is NOT self-revealing and NOT silently
+   wrong, so it belongs with neither class: its only reader (`resolved()`,
+   `panel/src/capability-options.ts:78-80`) reads through
+   `as unknown as Record<string, number | null>`, and nothing enumerates or `keyof`s the
+   interface, so a sixth key would produce no compile error and would still read correctly — it
+   is inert. That is why it is a LOW cleanliness item (an index signature, `Record<string, number
+   | null>`, removes it) rather than a hazard, and why it should not be listed beside the lists
+   that go silently stale.
 
 ---
 

@@ -796,10 +796,30 @@ fn key_value(file: &ruagent_policy::CapabilityFile, key: OptionKey) -> Option<f6
 }
 
 /// Validate a `[capabilities]` table exactly as the file would be validated.
-/// Order is deliberate: the id is checked first, so the later messages can name
-/// the capability the key or the value belongs to; then every key, then every
-/// value — so an undeclared key is always reported before an out-of-range value,
-/// whichever row carries it.
+///
+/// ORDER, stated per ROW because that is what the code has — and it is the order
+/// this surface has always had, not something this refactor introduced: the id is
+/// checked first (so the later messages can name the capability the key or the
+/// value belongs to), then every key this row carries, then every value in it. Rows
+/// are visited in the table's own order (`BTreeMap`, i.e. by id). WITHIN the row
+/// that is reported, an undeclared key always beats an out-of-range value, because
+/// the key loop runs to completion before the value loop.
+///
+/// It is NOT a global ordering across rows, and an earlier revision of this comment
+/// claimed it was ("an undeclared key is always reported before an out-of-range
+/// value, whichever row carries it"). That was false when written and is false
+/// here — the FIRST row with anything wrong is the row a user hears about
+/// (measured, increment-4 review and again for this repair:
+/// `[capabilities.knowledge_ingest_graph] max_per_input = 0` plus
+/// `[capabilities.session_extract_rules] weight = 1.0` reports the `BadValue` for
+/// the first row, while swapping the two rows reports the `UnknownKey` for the
+/// first). `from_policy` reports ONE problem — the first one — not all of them, so
+/// a user with two malformed rows fixes them one at a time.
+///
+/// The repair for that false sentence is THIS comment, not a reordering of the
+/// loops: moving every key check ahead of every value check would be a behaviour
+/// change to a surface three callers read, and this increment's law was
+/// additive-only.
 fn validate(
     table: Option<BTreeMap<String, ruagent_policy::CapabilityFile>>,
 ) -> Result<CapabilityPlane, CapabilityError> {
@@ -1395,9 +1415,26 @@ mod tests {
     }
 
     /// `[capabilities.<id>]` with ONE key set — the smallest file that exercises one
-    /// declared key's range. The literal is spelled in the key's own kind a `uint`
-    /// key cannot be given `1.0`, and a TOML integer in a float position is a parse
-    /// error rather than a coercion this test should rely on.
+    /// declared key's range. The literal is spelled in the key's own kind, because
+    /// the two directions of "wrong kind" are NOT symmetric (measured, t15; the
+    /// sentence this comment used to carry called the first one a parse error and
+    /// was false):
+    ///
+    /// * an INTEGER literal in a FLOAT key PARSES: `weight = 2` boots and resolves
+    ///   to `2.0`. The asymmetry is on the WRITE side — the editor re-emits the key
+    ///   from an `f64` (`CapabilitiesEditor::update` -> `set_or_remove_f64` ->
+    ///   `toml_edit::value(f64)`), so a write that re-emits such a row NORMALIZES
+    ///   the literal: `weight = 2` becomes `weight = 2.0` in the file. The VALUE is
+    ///   unchanged; only the bytes are. Nothing in this increment promises a
+    ///   byte-identical round trip of a hand-spelled integer.
+    /// * a FLOAT literal in a `uint` key IS REFUSED, before any write: the row does
+    ///   not deserialize into `Option<u32>`, so `max_per_input = 2.5` fails the
+    ///   parse ("invalid type: floating point `2.5`, expected u32") — the daemon
+    ///   does not boot on it and a `PUT` carrying it never reaches the file.
+    ///
+    /// So a `uint` boundary probe MUST spell an integer, while a float key accepts
+    /// either spelling; this helper uses the float spelling (`{v:?}`) so the literal
+    /// is the value a schema entry publishes.
     fn one_key(id: &str, key: OptionKey, v: f64) -> String {
         let literal = if key.kind() == "uint" {
             format!("{}", v as u32)
