@@ -31,15 +31,31 @@
 //! PRESENCE OF THE TABLE IS THE SWITCH. `[capabilities]` with no keys is a
 //! PRESENT table and applies every registry default, which switches the llm
 //! tier off. "Absent" is the only spelling of "exactly as before".
+//!
+//! DECLARED vs RESOLVED vs IN-THE-FILE (increment 4, design §11.5). A row answers
+//! three different questions and this module keeps them in three different fields:
+//! `options` is the RESOLVED value (registry default merged with the file — what
+//! the pipeline uses), `options_schema` is what the REGISTRY DECLARES (every key
+//! it accepts, with the daemon's own bounds and expectation phrase) and
+//! `options_set` is which keys the FILE carries right now. The first is what three
+//! callers already parse (the panel, the MCP list, the MCP write's re-emit), so it
+//! is NOT redefined; the other two are additive. The split is not cosmetic: a
+//! declared key whose registry default is `None` appears in NO resolved value, and
+//! `configured` says the row's id is in the file, not WHICH KEYS are — so without
+//! `options_schema` such a key is unreachable from every surface, and without
+//! `options_set` a read-modify-write client re-emits resolved defaults and writes
+//! them into the user's `policy.toml`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
 use axum::extract::State;
+use ruagent_knowledge::rrf::WeightError;
 
 use crate::api::{ApiError, AppState};
 use crate::config::CapabilitiesEditor;
+use crate::memembed::RecallLeg;
 
 // ---------------------------------------------------------------------------
 // The registry (§4.2)
@@ -141,6 +157,20 @@ pub enum OptionKey {
 }
 
 impl OptionKey {
+    /// Every declared option key, in registry order. This is the order
+    /// `options_schema` reports keys in, and the order `validate` refuses them in
+    /// — the FIRST offending key is the one a user is told about, so the order is
+    /// load-bearing and the two loops must stay in step.
+    pub const ALL: &'static [OptionKey] = &[
+        OptionKey::Weight,
+        OptionKey::MinScore,
+        OptionKey::MaxPerInput,
+        OptionKey::MinConfidence,
+        OptionKey::MaxDocsPerPass,
+    ];
+
+    /// The stable config/API id. NEVER rename one: it is a user-facing key in
+    /// `policy.toml` and in `options_set` / `options_schema`.
     pub fn as_str(self) -> &'static str {
         match self {
             OptionKey::Weight => "weight",
@@ -148,6 +178,44 @@ impl OptionKey {
             OptionKey::MaxPerInput => "max_per_input",
             OptionKey::MinConfidence => "min_confidence",
             OptionKey::MaxDocsPerPass => "max_docs_per_pass",
+        }
+    }
+
+    /// The JSON kind of this key's value in [`ruagent_policy::CapabilityFile`]:
+    /// `"float"` (an `Option<f64>` field) or `"uint"` (an `Option<u32>` field).
+    /// The panel needs it to know whether an INTEGER is required — the bounds
+    /// alone cannot say.
+    pub fn kind(self) -> &'static str {
+        match self {
+            OptionKey::Weight | OptionKey::MinScore | OptionKey::MinConfidence => "float",
+            OptionKey::MaxPerInput | OptionKey::MaxDocsPerPass => "uint",
+        }
+    }
+
+    /// The accepted range, in ONE place: `options_schema` publishes it as
+    /// `min`/`max` and `validate` enforces exactly it, so the range a panel shows
+    /// cannot be wider or narrower than the range the daemon accepts. For a
+    /// `uint` key the bounds are integral, which is what keeps `min - 1` a legal
+    /// probe on both kinds.
+    pub fn bounds(self) -> (f64, f64) {
+        match self {
+            OptionKey::Weight => (0.0, 100.0),
+            OptionKey::MinScore | OptionKey::MinConfidence => (0.0, 1.0),
+            OptionKey::MaxPerInput => (1.0, 10_000.0),
+            OptionKey::MaxDocsPerPass => (1.0, 1_000.0),
+        }
+    }
+
+    /// The daemon's OWN phrase for the accepted range — the exact string a 400
+    /// already carries ([`CapabilityError::BadValue::expectation`]), surfaced by
+    /// `options_schema` instead of being paraphrased. That is the point: the panel
+    /// shows the daemon's words and a second wording cannot drift from the first.
+    pub fn expectation(self) -> &'static str {
+        match self {
+            OptionKey::Weight => "finite and 0.0..=100.0",
+            OptionKey::MinScore | OptionKey::MinConfidence => "finite and 0.0..=1.0",
+            OptionKey::MaxPerInput => "1..=10000",
+            OptionKey::MaxDocsPerPass => "1..=1000",
         }
     }
 }
@@ -173,6 +241,59 @@ impl CapabilityOptions {
         min_confidence: None,
         max_docs_per_pass: None,
     };
+}
+
+/// One entry of a row's `options_schema`: what the REGISTRY DECLARES for one
+/// option key, generated from `spec(id).options` + `spec(id).defaults` (design
+/// §11.5).
+///
+/// WHY IT EXISTS (design §11.5, defect 1). The API reports RESOLVED values, and a
+/// client renders an input per key whose resolved value is non-null, so a declared
+/// key whose registry default is `None` renders NO input anywhere and can only be
+/// set by hand-editing `policy.toml`. Today that is exactly one key —
+/// `min_score` on `recall_leg_memory_semantic` — and it is live: the recall handler
+/// reads it (`api.rs`, `.map(|v| v as f32).unwrap_or(...)`). The schema is what
+/// makes every DECLARED key reachable without changing what `options` means.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OptionSchemaEntry {
+    pub key: &'static str,
+    /// `"float"` | `"uint"` ([`OptionKey::kind`]) — whether an integer is required.
+    pub kind: &'static str,
+    /// The accepted range, from the same table `validate` enforces.
+    pub min: f64,
+    pub max: f64,
+    /// The registry's declared default — `null` ONLY where the registry declares
+    /// none ([`CapabilityOptions`]'s field is `None`, the pipeline's own argument
+    /// decides). A declared ZERO is `0`, never `null`.
+    pub default: Option<f64>,
+    /// The daemon's own accepted-range phrase ([`OptionKey::expectation`]), i.e.
+    /// the string a 400 already carries.
+    pub expectation: &'static str,
+}
+
+/// One row's `options_set`: for `enabled` and for every key the capability
+/// DECLARES ([`OptionKey::ALL`] filtered by the spec), whether the FILE carries
+/// that key right now (design §11.5).
+///
+/// WHY IT EXISTS (design §11.5, defect 2). `configured` says the row's ID is in the
+/// file, not WHICH KEYS are, and `options` cannot tell a key the file carries from
+/// one that is merely defaulted. A read-modify-write client that re-emits `options`
+/// therefore writes registry DEFAULTS into the user's file: measured live on
+/// `a0f1eae`, `enabled = true` (the row shape a Reset leaves) became
+/// `enabled = true` + `weight = 1` on the next unrelated write, which is a PERSISTED
+/// rewrite of the user's configuration rather than a display artefact.
+///
+/// The source of every `true` here is the plane's own
+/// [`ruagent_policy::CapabilityFile`] for the id — the same value `configured` is
+/// derived from — never the resolved config. `enabled` is in this object because it
+/// has the SAME present-or-defaulted ambiguity as an option value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OptionSet {
+    /// true = the file carries `enabled` for this id.
+    pub enabled: bool,
+    /// One entry per DECLARED key of this capability, in registry order.
+    #[serde(flatten)]
+    pub keys: BTreeMap<&'static str, bool>,
 }
 
 /// The registry row. `description` is USER-FACING and is returned verbatim by
@@ -344,6 +465,43 @@ pub fn spec(id: CapabilityId) -> &'static CapabilitySpec {
         .expect("every CapabilityId has a registry row")
 }
 
+/// What the REGISTRY DECLARES for one capability: one entry per declared key, in
+/// registry order (design §11.5). A row that declares nothing reports `[]` — its
+/// "no editor at all" behaviour is preserved rather than replaced by an empty
+/// editor claiming a knob.
+///
+/// The bounds and the phrase come from `OptionKey` (`bounds`/`expectation`), i.e.
+/// from the same table `validate` enforces, and the default from the registry's
+/// own `defaults` — never from the resolved values of a particular plane.
+fn options_schema(s: &CapabilitySpec) -> Vec<OptionSchemaEntry> {
+    s.options
+        .iter()
+        .map(|k| OptionSchemaEntry {
+            key: k.as_str(),
+            kind: k.kind(),
+            min: k.bounds().0,
+            max: k.bounds().1,
+            default: declared_default(s.defaults, *k),
+            expectation: k.expectation(),
+        })
+        .collect()
+}
+
+/// The registry's declared default for one key: `None` ONLY where the registry
+/// leaves the key unset. That is the one key class this surface exists for — the
+/// design measures exactly one such key today (`min_score` on
+/// `recall_leg_memory_semantic`), and the count is pinned by a test so a new
+/// no-default key cannot arrive unnoticed.
+fn declared_default(defaults: CapabilityOptions, key: OptionKey) -> Option<f64> {
+    match key {
+        OptionKey::Weight => defaults.weight,
+        OptionKey::MinScore => defaults.min_score,
+        OptionKey::MaxPerInput => defaults.max_per_input.map(f64::from),
+        OptionKey::MinConfidence => defaults.min_confidence,
+        OptionKey::MaxDocsPerPass => defaults.max_docs_per_pass.map(f64::from),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors (§4.3): hard, and they name the thing
 // ---------------------------------------------------------------------------
@@ -483,6 +641,25 @@ impl CapabilityPlane {
         }
     }
 
+    /// Which of a row's DECLARED keys the FILE carries right now, plus `enabled`
+    /// (design §11.5). The source is the plane's own
+    /// [`ruagent_policy::CapabilityFile`] for the id — the same value
+    /// [`CapabilityPlane::configured`] is derived from — never the resolved
+    /// config: `configured == "file"` says the id is in the table, and this says
+    /// which of its keys are. With the table ABSENT every entry is `false`,
+    /// `enabled` included.
+    pub fn options_set(&self, id: CapabilityId) -> OptionSet {
+        let file = self.file_of(id);
+        OptionSet {
+            enabled: file.and_then(|f| f.enabled).is_some(),
+            keys: spec(id)
+                .options
+                .iter()
+                .map(|k| (k.as_str(), file.is_some_and(|f| key_in_file(f, *k))))
+                .collect(),
+        }
+    }
+
     /// Which state the file left this capability in: `"legacy"` (no table at
     /// all), `"file"` (the file names this id), `"default"` (the table exists
     /// and this id is not in it).
@@ -508,6 +685,8 @@ impl CapabilityPlane {
                 configured: self.configured(s.id),
                 new: s.new_in_this_increment,
                 options: self.options(s.id),
+                options_schema: options_schema(s),
+                options_set: self.options_set(s.id),
             })
             .collect()
     }
@@ -546,10 +725,31 @@ pub struct CapabilityRow {
     pub gates: &'static str,
     pub default_enabled: bool,
     pub enabled: bool,
-    /// "legacy" (table absent) | "default" (table present, no key) | "file"
+    /// "legacy" (table absent) | "default" (table present, no key) | "file".
+    /// NOT WIDENED by increment 4: its three values and its meaning are unchanged.
     pub configured: &'static str,
     pub new: bool,
+    /// The RESOLVED options (registry defaults merged with the file) — DO NOT
+    /// REDEFINE THIS FIELD, and the reason is in the code rather than in a review
+    /// comment: three callers already parse `options` as resolved values — the
+    /// panel's editor (`panel/src/capability-options.ts`), the MCP list
+    /// (`crates/mcp/src/lib.rs`, which renders its text from these values) and the
+    /// MCP write's re-emit, whose READ-MODIFY-WRITE LOOP is the only thing keeping
+    /// one toggle from resetting every other configured row. Redefining the field
+    /// that loop re-emits through would break the write path of a surface that was
+    /// just verified, so the declared schema is a SECOND field
+    /// ([`Self::options_schema`]) and not a richer `options`: two additive fields
+    /// cost a client that ignores them exactly nothing (design §11.5).
     pub options: CapabilityOptions,
+    /// ADDITIVE (increment 4, design §11.5): one entry per key the capability
+    /// DECLARES, in registry order, with the daemon's own bounds and expectation
+    /// phrase. `[]` for a row that declares nothing. This is what makes a declared
+    /// key with no registry default (no resolved value to render) reachable.
+    pub options_schema: Vec<OptionSchemaEntry>,
+    /// ADDITIVE (increment 4, design §11.5): which of those keys (plus `enabled`)
+    /// the FILE carries right now — the fact a read-modify-write client needs in
+    /// order to stop writing registry defaults into the user's file.
+    pub options_set: OptionSet,
 }
 
 /// One entry of the response's `conflicts[]`: work today's flags ask for that
@@ -574,9 +774,32 @@ pub struct CapabilitiesResponse {
 // Validation (§4.3, the one fallible door)
 // ---------------------------------------------------------------------------
 
+/// Whether the FILE carries this key at all. The file-side half of
+/// [`CapabilityPlane::options_set`] and the same question `validate` asks before
+/// refusing a key the capability does not declare — one mapping, so the two
+/// cannot disagree about which field a key name means.
+fn key_in_file(file: &ruagent_policy::CapabilityFile, key: OptionKey) -> bool {
+    key_value(file, key).is_some()
+}
+
+/// The file's value for one declared key, in `f64` form so the range check is one
+/// expression per key instead of one block per key (`u32` -> `f64` is exact for
+/// every `u32`, so no bound is distorted). `None` = the file does not carry it.
+fn key_value(file: &ruagent_policy::CapabilityFile, key: OptionKey) -> Option<f64> {
+    match key {
+        OptionKey::Weight => file.weight,
+        OptionKey::MinScore => file.min_score,
+        OptionKey::MaxPerInput => file.max_per_input.map(f64::from),
+        OptionKey::MinConfidence => file.min_confidence,
+        OptionKey::MaxDocsPerPass => file.max_docs_per_pass.map(f64::from),
+    }
+}
+
 /// Validate a `[capabilities]` table exactly as the file would be validated.
 /// Order is deliberate: the id is checked first, so the later messages can name
-/// the capability the key or the value belongs to.
+/// the capability the key or the value belongs to; then every key, then every
+/// value — so an undeclared key is always reported before an out-of-range value,
+/// whichever row carries it.
 fn validate(
     table: Option<BTreeMap<String, ruagent_policy::CapabilityFile>>,
 ) -> Result<CapabilityPlane, CapabilityError> {
@@ -587,14 +810,8 @@ fn validate(
             // A key the capability does not declare is refused, never ignored:
             // `weight` on a capability with no ranked leg would look honoured
             // in the file and change nothing at runtime.
-            for (key, present) in [
-                (OptionKey::Weight, file.weight.is_some()),
-                (OptionKey::MinScore, file.min_score.is_some()),
-                (OptionKey::MaxPerInput, file.max_per_input.is_some()),
-                (OptionKey::MinConfidence, file.min_confidence.is_some()),
-                (OptionKey::MaxDocsPerPass, file.max_docs_per_pass.is_some()),
-            ] {
-                if present && !s.options.contains(&key) {
+            for key in OptionKey::ALL {
+                if key_in_file(file, *key) && !s.options.contains(key) {
                     return Err(CapabilityError::UnknownKey {
                         id: name.clone(),
                         key: key.as_str().to_string(),
@@ -602,58 +819,24 @@ fn validate(
                     });
                 }
             }
-            // Ranges, one table, one message shape. `is_finite` is first
-            // because NaN is false against every bound and would otherwise
-            // slip through as "not out of range".
-            if let Some(v) = file.weight
-                && !(v.is_finite() && (0.0..=100.0).contains(&v))
-            {
-                return Err(CapabilityError::BadValue {
-                    id: name.clone(),
-                    key: OptionKey::Weight.as_str().to_string(),
-                    value: v.to_string(),
-                    expectation: "finite and 0.0..=100.0",
-                });
-            }
-            if let Some(v) = file.min_score
-                && !(v.is_finite() && (0.0..=1.0).contains(&v))
-            {
-                return Err(CapabilityError::BadValue {
-                    id: name.clone(),
-                    key: OptionKey::MinScore.as_str().to_string(),
-                    value: v.to_string(),
-                    expectation: "finite and 0.0..=1.0",
-                });
-            }
-            if let Some(v) = file.max_per_input
-                && !(1..=10_000).contains(&v)
-            {
-                return Err(CapabilityError::BadValue {
-                    id: name.clone(),
-                    key: OptionKey::MaxPerInput.as_str().to_string(),
-                    value: v.to_string(),
-                    expectation: "1..=10000",
-                });
-            }
-            if let Some(v) = file.min_confidence
-                && !(v.is_finite() && (0.0..=1.0).contains(&v))
-            {
-                return Err(CapabilityError::BadValue {
-                    id: name.clone(),
-                    key: OptionKey::MinConfidence.as_str().to_string(),
-                    value: v.to_string(),
-                    expectation: "finite and 0.0..=1.0",
-                });
-            }
-            if let Some(v) = file.max_docs_per_pass
-                && !(1..=1000).contains(&v)
-            {
-                return Err(CapabilityError::BadValue {
-                    id: name.clone(),
-                    key: OptionKey::MaxDocsPerPass.as_str().to_string(),
-                    value: v.to_string(),
-                    expectation: "1..=1000",
-                });
+            // Ranges, one table, one message shape — the range and the phrase both
+            // come from `OptionKey`, the SAME table `options_schema` publishes, so
+            // the range a panel shows is the range this refuses on. `is_finite` is
+            // checked first because NaN is false against every bound and would
+            // otherwise slip through as "not out of range".
+            for key in OptionKey::ALL {
+                let Some(v) = key_value(file, *key) else {
+                    continue;
+                };
+                let (min, max) = key.bounds();
+                if !(v.is_finite() && (min..=max).contains(&v)) {
+                    return Err(CapabilityError::BadValue {
+                        id: name.clone(),
+                        key: key.as_str().to_string(),
+                        value: v.to_string(),
+                        expectation: key.expectation(),
+                    });
+                }
             }
         }
     }
@@ -735,13 +918,74 @@ fn unconfirmed_llm_enable(
         .map(|s| s.id)
 }
 
+/// THE WRITE DOOR for the leg-weight invariant (design §11.5; increment 4).
+/// `Some(message)` = this request would leave a MEMORY leg enabled at weight 0.
+///
+/// THE INVARIANT. `check_weights` (`crates/knowledge/src/rrf.rs`) refuses an
+/// ENABLED leg at weight `<= 0.0`, and the recall handler turns that into a 400
+/// naming the leg. The negative half never reaches this door — `validate` already
+/// refuses a weight below `0.0` — so the state this checks is exactly
+/// `weight == 0.0` with the leg enabled. `CapabilityPlane::from_policy`
+/// deliberately does NOT enforce it: doing so would stop a `policy.toml` that
+/// boots today from booting at all, and a daemon that refuses to start cannot show
+/// the user which line to fix.
+///
+/// BEFORE/AFTER, the [`unconfirmed_llm_enable`] shape: the door fires on the
+/// TRANSITION (the state is new to this request), not on the resulting state. A
+/// file that ALREADY carries `enabled = true, weight = 0.0` still boots, its read
+/// path is untouched (recall still 400s, loudly, naming the leg), and — this is
+/// why the check is a transition — its panel can still save: refusing every write
+/// that merely carries the state forward would brick the UI of exactly the file
+/// the boot refusal was rejected for.
+///
+/// BEHAVIOUR CHANGE, recorded as one (a change, not a bug fix).
+/// * BEFORE (`a0f1eae`): `PUT {"recall_leg_memory_semantic": {"enabled": true,
+///   "weight": 0.0}}` answered **200** and wrote it; the NEXT `GET /api/v1/recall`
+///   answered **400**. The configuration was accepted by the door that owns the
+///   file and rejected by the path that reads it.
+/// * AFTER: the same `PUT` answers **400** with the recall path's own sentence, and
+///   the file is byte-identical. Load and read are unchanged.
+///
+/// SCOPE, bounded deliberately: enforced and measured for the MEMORY legs
+/// (`recall_leg_memory_semantic`, `recall_leg_memory_fts`). Whether
+/// `recall_leg_knowledge_*` gets the same guard is NOT asserted here — those legs
+/// are still refused at recall time by the same shared `check_weights`.
+///
+/// The SENTENCE is not spelled in this file: it is [`WeightError`]'s own `Display`
+/// under the prefix [`crate::api::leg_config_error`] builds, which the recall
+/// handler uses too, so the door and the read path answer with one sentence and
+/// neither can drift from the other.
+fn zero_weight_memory_leg(before: &CapabilityPlane, after: &CapabilityPlane) -> Option<String> {
+    for (id, leg) in [
+        (
+            CapabilityId::RecallLegMemorySemantic,
+            RecallLeg::MemorySemantic,
+        ),
+        (CapabilityId::RecallLegMemoryFts, RecallLeg::MemoryFts),
+    ] {
+        // The runtime's OWN conversion and comparison, so the door cannot be
+        // stricter or looser than read time at any edge: `MemoryLegs::resolve` maps
+        // an absent weight to 1.0 and casts to `f32`, and `check_weights` refuses
+        // `enabled && weight <= 0.0`.
+        let weight = |p: &CapabilityPlane| p.options(id).weight.map_or(1.0, |w| w as f32);
+        let zeroed = |p: &CapabilityPlane| p.enabled(id) && weight(p) <= 0.0;
+        if zeroed(after) && !zeroed(before) {
+            return Some(crate::api::leg_config_error(WeightError::NonPositive {
+                leg: leg.label(),
+                weight: weight(after),
+            }));
+        }
+    }
+    None
+}
+
 /// `PUT /api/v1/capabilities` — replace the whole `[capabilities]` table
 /// (design §14.2).
 ///
 /// Order is the DistillEditor discipline, and it matters: validate the body,
-/// refuse an unconfirmed cost, write the file, THEN swap the live plane. A
-/// refused request therefore leaves both the file and every running pipeline
-/// untouched.
+/// refuse a configuration the recall path is guaranteed to reject, refuse an
+/// unconfirmed cost, write the file, THEN swap the live plane. A refused request
+/// therefore leaves both the file and every running pipeline untouched.
 pub async fn update_capabilities(
     State(state): State<AppState>,
     Json(req): Json<CapabilitiesPutRequest>,
@@ -761,6 +1005,15 @@ pub async fn update_capabilities(
         ..Default::default()
     })
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // The cross-field invariant the recall path enforces (§11.5): a state the read
+    // path is GUARANTEED to reject is not accepted here either. This is a
+    // deliberate behaviour change — before it, this PUT answered 200 and wrote a
+    // configuration whose next read answered 400; see
+    // `zero_weight_memory_leg` for the before/after and for why it fires on the
+    // transition rather than on the resulting state.
+    if let Some(message) = zero_weight_memory_leg(&before, &after) {
+        return Err(ApiError::bad_request(message));
+    }
     if let Some(id) = unconfirmed_llm_enable(&before, &after, req.confirm_cost) {
         return Err(ApiError::conflict(format!(
             "capability `{}` is llm-tier: enabling it spends model tokens. \
@@ -1139,5 +1392,294 @@ mod tests {
         assert_eq!(v["config_file"], "/tmp/policy.toml");
         assert_eq!(v["capabilities"].as_array().map(Vec::len), Some(11));
         assert_eq!(v["conflicts"], serde_json::json!([]));
+    }
+
+    /// `[capabilities.<id>]` with ONE key set — the smallest file that exercises one
+    /// declared key's range. The literal is spelled in the key's own kind a `uint`
+    /// key cannot be given `1.0`, and a TOML integer in a float position is a parse
+    /// error rather than a coercion this test should rely on.
+    fn one_key(id: &str, key: OptionKey, v: f64) -> String {
+        let literal = if key.kind() == "uint" {
+            format!("{}", v as u32)
+        } else {
+            format!("{v:?}")
+        };
+        format!("[capabilities.{id}]\n{} = {literal}\n", key.as_str())
+    }
+
+    /// THE DECLARED SCHEMA IS THE DAEMON'S OWN TABLE (design §11.5). For every key
+    /// of every registry row: the entry's `min`/`max` are the bounds `validate`
+    /// ACTUALLY enforces (both bounds accepted, one step outside refused) and its
+    /// `expectation` is the phrase that 400 carries — so a panel that renders the
+    /// schema shows the range and the wording the daemon refuses on, and neither is
+    /// a second copy that could drift.
+    #[test]
+    fn the_declared_schema_is_the_range_validation_enforces() {
+        let mut declared = 0;
+        for s in specs() {
+            let schema = options_schema(s);
+            assert_eq!(
+                schema.len(),
+                s.options.len(),
+                "{}: one entry per declared key",
+                s.id.as_str()
+            );
+            for (entry, key) in schema.iter().zip(s.options) {
+                declared += 1;
+                assert_eq!(entry.key, key.as_str(), "registry order");
+                assert!(
+                    matches!(entry.kind, "float" | "uint"),
+                    "{}: kind is one of the two JSON kinds, not `{}`",
+                    entry.key,
+                    entry.kind
+                );
+                assert_eq!(entry.expectation, key.expectation());
+                assert_eq!(entry.default, declared_default(s.defaults, *key));
+                for (side, v) in [("min", entry.min), ("max", entry.max)] {
+                    assert!(
+                        try_plane(&one_key(s.id.as_str(), *key, v)).is_ok(),
+                        "{}={v} is the declared {side} and must be accepted",
+                        entry.key
+                    );
+                }
+                // `min - 1` is a legal probe on both kinds because a uint key's
+                // declared bounds are integral (`OptionKey::bounds`).
+                let below = if entry.kind == "uint" {
+                    entry.min - 1.0
+                } else {
+                    entry.min - 0.1
+                };
+                for (side, v) in [("below min", below), ("above max", entry.max + 1.0)] {
+                    match try_plane(&one_key(s.id.as_str(), *key, v)) {
+                        Err(CapabilityError::BadValue {
+                            key: refused,
+                            expectation,
+                            ..
+                        }) => {
+                            assert_eq!(refused, entry.key, "{side}");
+                            assert_eq!(
+                                expectation, entry.expectation,
+                                "{side} {v}: the 400 and the schema carry ONE phrase"
+                            );
+                        }
+                        other => panic!(
+                            "{side}: {} = {v} was not refused with the range error: {other:?}",
+                            entry.key
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(declared > 0, "the registry declares option keys");
+    }
+
+    /// THE ADDITIVE LAW of increment 4, pinned at the JSON boundary: the row's
+    /// pre-existing keys keep their names and their JSON types, `options` is still
+    /// the RESOLVED-values object, `configured` still carries its own string — and
+    /// `options_schema`/`options_set` are the ONLY additions. `options` may not be
+    /// redefined: three callers parse it as resolved values, including the MCP
+    /// write's read-modify-write loop (see `CapabilityRow`'s field docs).
+    #[test]
+    fn options_schema_and_options_set_are_the_only_new_row_fields() {
+        let json = serde_json::to_value(CapabilityPlane::legacy().rows()).expect("rows serialize");
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), CapabilityId::ALL.len());
+        for row in rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("a row is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "configured",
+                    "default_enabled",
+                    "description",
+                    "enabled",
+                    "gates",
+                    "id",
+                    "new",
+                    "options",
+                    "options_schema",
+                    "options_set",
+                    "tier",
+                ],
+                "the row's key set, additions included: {row}"
+            );
+            for pre_existing in ["id", "tier", "description", "gates", "configured"] {
+                assert!(
+                    row[pre_existing].is_string(),
+                    "{pre_existing} keeps its type: {row}"
+                );
+            }
+            for pre_existing in ["default_enabled", "enabled", "new"] {
+                assert!(
+                    row[pre_existing].is_boolean(),
+                    "{pre_existing} keeps its type: {row}"
+                );
+            }
+            let mut options: Vec<&str> = row["options"]
+                .as_object()
+                .expect("options is the resolved-values object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            options.sort_unstable();
+            assert_eq!(
+                options,
+                [
+                    "max_docs_per_pass",
+                    "max_per_input",
+                    "min_confidence",
+                    "min_score",
+                    "weight",
+                ],
+                "`options` is NOT redefined: {row}"
+            );
+            assert!(row["options_schema"].is_array(), "{row}");
+            assert!(row["options_set"].is_object(), "{row}");
+        }
+    }
+
+    /// `options_schema` is the REGISTRY's declaration and `options_set` is the
+    /// FILE's key set — two different facts from two different sources, neither of
+    /// them the resolved config (design §11.5):
+    ///
+    /// * the schema lists EVERY declared key, so the one key with no declared
+    ///   default is reachable even though no resolved value can show it;
+    /// * `options_set` reports what the file carries, which is how a write stops
+    ///   re-materializing a resolved default into a row the user never set.
+    #[test]
+    fn the_schema_is_the_registry_and_the_key_set_is_the_file() {
+        let plane = plane("[capabilities.recall_leg_memory_semantic]\nenabled = true\n");
+
+        let schema = options_schema(spec(CapabilityId::RecallLegMemorySemantic));
+        assert_eq!(
+            schema.iter().map(|e| e.key).collect::<Vec<_>>(),
+            ["weight", "min_score"],
+            "every DECLARED key, in registry order"
+        );
+        assert_eq!(
+            schema[0].default,
+            Some(1.0),
+            "the registry declares a weight"
+        );
+        assert_eq!(
+            schema[1].default, None,
+            "and declares NO min_score: the key no resolved value can render"
+        );
+        assert_eq!(schema[1].kind, "float");
+        assert_eq!((schema[1].min, schema[1].max), (0.0, 1.0));
+        assert_eq!(schema[1].expectation, "finite and 0.0..=1.0");
+        assert!(
+            options_schema(spec(CapabilityId::RecallLegWiki)).is_empty(),
+            "a row that declares nothing keeps its empty schema, not an empty editor"
+        );
+
+        let set = plane.options_set(CapabilityId::RecallLegMemorySemantic);
+        assert!(set.enabled, "the file carries `enabled`");
+        assert_eq!(set.keys.get("weight"), Some(&false));
+        assert_eq!(set.keys.get("min_score"), Some(&false));
+        assert_eq!(
+            plane.options(CapabilityId::RecallLegMemorySemantic).weight,
+            Some(1.0),
+            "RESOLVED: the default the file did NOT carry — the pair of facts (2) is about"
+        );
+        assert_eq!(
+            plane
+                .options(CapabilityId::RecallLegMemorySemantic)
+                .min_score,
+            None
+        );
+
+        // A row the table does not name, and a plane with no table at all: every
+        // entry false, `enabled` included.
+        for leg in [
+            plane.options_set(CapabilityId::RecallLegWiki),
+            CapabilityPlane::legacy().options_set(CapabilityId::RecallLegMemorySemantic),
+        ] {
+            assert!(!leg.enabled);
+            assert!(leg.keys.values().all(|present| !present), "{leg:?}");
+        }
+        assert!(
+            plane
+                .options_set(CapabilityId::RecallLegWiki)
+                .keys
+                .is_empty()
+        );
+
+        // The count the whole surface exists for: EXACTLY ONE declared key has no
+        // registry default. If this moves, a behaviour was invented (a default is a
+        // behaviour) or a reachable key was lost — both must be deliberate.
+        let no_default: Vec<(&str, &str)> = specs()
+            .iter()
+            .flat_map(|s| {
+                options_schema(s)
+                    .into_iter()
+                    .filter(|e| e.default.is_none())
+                    .map(move |e| (s.id.as_str(), e.key))
+            })
+            .collect();
+        assert_eq!(
+            no_default,
+            [(
+                CapabilityId::RecallLegMemorySemantic.as_str(),
+                OptionKey::MinScore.as_str()
+            )],
+            "design §11.5: the ONE declared key with no default, named"
+        );
+    }
+
+    /// THE WRITE DOOR (increment 4, §11.5). Before/after, the
+    /// `unconfirmed_llm_enable` shape: a `PUT` that CREATES an enabled memory leg at
+    /// weight 0.0 is refused; one that merely carries an existing one forward is not
+    /// (a file that already carries the state still boots, and its panel must still
+    /// be able to save).
+    #[test]
+    fn the_write_door_refuses_a_new_enabled_memory_leg_at_zero_weight() {
+        let healthy =
+            plane("[capabilities.recall_leg_memory_semantic]\nenabled = true\nweight = 1.0\n");
+        let zeroed =
+            plane("[capabilities.recall_leg_memory_semantic]\nenabled = true\nweight = 0.0\n");
+
+        let message = zero_weight_memory_leg(&healthy, &zeroed).expect("the transition is refused");
+        // The sentence IS the recall path's: claimed here against the runtime's own
+        // constructor (`RecallLegConfig::resolve` -> `check_weights`), so the door
+        // cannot grow a second wording.
+        let runtime = crate::memembed::RecallLegConfig::resolve(
+            (true, Some(0.0)),
+            (true, Some(1.0)),
+            (true, None),
+            (true, None),
+            true,
+            true,
+        )
+        .expect_err("the runtime refuses an enabled leg at weight 0");
+        assert_eq!(message, crate::api::leg_config_error(runtime));
+        assert!(
+            message.contains("disable the leg instead of zeroing it"),
+            "{message}"
+        );
+        assert!(message.contains("memory semantic"), "{message}");
+
+        // No transition, no refusal: an existing zero is not a NEW misconfiguration.
+        assert_eq!(zero_weight_memory_leg(&zeroed, &zeroed), None);
+        assert_eq!(
+            zero_weight_memory_leg(&zeroed, &healthy),
+            None,
+            "fixing it is a legal write"
+        );
+        // A DISABLED leg at 0.0 is legal at both doors: `check_weights` ignores a
+        // disabled leg's weight, and disabling is the supported way to drop one.
+        let off =
+            plane("[capabilities.recall_leg_memory_semantic]\nenabled = false\nweight = 0.0\n");
+        assert_eq!(zero_weight_memory_leg(&healthy, &off), None);
+        // The other memory leg, whose message names ITS leg.
+        let fts = plane("[capabilities.recall_leg_memory_fts]\nenabled = true\nweight = 0.0\n");
+        let fts_message = zero_weight_memory_leg(&healthy, &fts).expect("fts is refused too");
+        assert!(fts_message.contains("memory fts"), "{fts_message}");
     }
 }

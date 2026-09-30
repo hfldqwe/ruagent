@@ -37,6 +37,14 @@ fn call(name: &str, args: serde_json::Value) -> CallToolRequestParams {
 }
 
 async fn start_test_daemon() -> String {
+    start_test_daemon_with_policy("[permissions]\ndefault = \"ask\"\n")
+        .await
+        .0
+}
+
+/// The daemon PLUS the config root it serves, so a test can read `policy.toml`
+/// itself: for a capability write the FILE is the witness, not the tool's reply.
+async fn start_test_daemon_with_policy(policy_toml: &str) -> (String, std::path::PathBuf) {
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!("ruagent-mcp-e2e-{}-{seq}", std::process::id()));
@@ -53,11 +61,7 @@ async fn start_test_daemon() -> String {
         "[profile.default]\nservers = []\n",
     )
     .unwrap();
-    std::fs::write(
-        config_dir.join("policy.toml"),
-        "[permissions]\ndefault = \"ask\"\n",
-    )
-    .unwrap();
+    std::fs::write(config_dir.join("policy.toml"), policy_toml).unwrap();
 
     let cfg = DaemonConfig::load(&root).unwrap();
     let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
@@ -80,6 +84,11 @@ async fn start_test_daemon() -> String {
         None,
         ruagent_daemon::distill::AgentRegistry::default(),
     );
+    // t10: the LIVE-PLANE INSTALL the real `serve` performs (`daemon/src/lib.rs`).
+    // Without it this harness's plane is `legacy()` no matter what `policy.toml`
+    // says, so `/api/v1/capabilities` would describe a config nobody has: a
+    // `[capabilities]` table seeded into the file below would read as ABSENT.
+    chats.set_capabilities(cfg.capabilities.clone());
     let mgr = Arc::new(RunManager::new(
         db.clone(),
         root.clone(),
@@ -87,6 +96,7 @@ async fn start_test_daemon() -> String {
         cfg.policy.to_policy(),
         cfg.mcp.clone(),
     ));
+    mgr.set_capabilities(chats.capabilities_handle());
     let app = ruagent_daemon::api::router(AppState {
         mgr,
         config: Arc::new(cfg),
@@ -100,7 +110,7 @@ async fn start_test_daemon() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
-    format!("http://{addr}")
+    (format!("http://{addr}"), root)
 }
 
 #[tokio::test]
@@ -557,6 +567,242 @@ async fn mcp_knowledge_graph_ingest_reaches_the_daemon() {
     assert!(!ingested.contains("DRY RUN"), "{ingested}");
     // The ledger's idempotence is t4's own contract (its counts on a re-run);
     // this test asserts the MCP seam, not the extractor's bookkeeping.
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// The raw body of one `[capabilities.<id>]` section of `policy.toml` — the FILE,
+/// not the daemon's reply and not the tool's rendering of it.
+fn capability_section(text: &str, id: &str) -> String {
+    let header = format!("[capabilities.{id}]");
+    let mut body = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == header;
+            continue;
+        }
+        if inside && !trimmed.is_empty() {
+            body.push_str(trimmed);
+            body.push('\n');
+        }
+    }
+    body
+}
+
+/// The KEY SET of one `[capabilities.<id>]` section, sorted (the editor's
+/// insertion order is not the file's original order, so only the set is stable).
+fn capability_section_keys(text: &str, id: &str) -> Vec<String> {
+    let mut keys: Vec<String> = capability_section(text, id)
+        .lines()
+        .filter_map(|l| l.split('=').next())
+        .map(|k| k.trim().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// t10: the MCP capability write preserves the file's OWN key set.
+///
+/// Two properties are on trial here, and both were broken once elsewhere:
+///
+/// * the READ-MODIFY-WRITE — the daemon's PUT REPLACES the whole `[capabilities]`
+///   table and removes every row and key an entry omits, so a one-id write must
+///   carry every other configured row back (`CapabilitiesEditor::update`);
+/// * NO RE-MATERIALIZATION — re-emitting the RESOLVED values instead persists
+///   registry defaults into rows the user never set, which is the defect measured
+///   on the panel side (`enabled = true` alone became `enabled = true` +
+///   `weight = 1`).
+///
+/// The witness is `policy.toml`, read before and after each write: the file is what
+/// the user owns, and a tool reply cannot testify about it.
+#[tokio::test]
+async fn capability_set_preserves_the_files_own_key_set() {
+    let (daemon_url, root) = start_test_daemon_with_policy(
+        "[permissions]\ndefault = \"ask\"\n\
+         \n\
+         [capabilities.recall_leg_memory_fts]\n\
+         enabled = true\n\
+         \n\
+         [capabilities.recall_leg_memory_semantic]\n\
+         weight = 3.5\n\
+         \n\
+         [capabilities.recall_leg_wiki]\n",
+    )
+    .await;
+    let policy = root.join("config").join("policy.toml");
+    let before = std::fs::read_to_string(&policy).unwrap();
+    // The seed is the shape that exposes both defects: one row carries `enabled`
+    // only (so `weight` resolves to its registry default 1.0), one carries
+    // `weight` only (so `enabled` resolves to its default true), one is empty.
+    assert_eq!(
+        capability_section_keys(&before, "recall_leg_memory_fts"),
+        vec!["enabled"]
+    );
+    assert_eq!(
+        capability_section_keys(&before, "recall_leg_memory_semantic"),
+        vec!["weight"]
+    );
+
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    // The DECLARED key set is visible before anything is written. `min_score` on
+    // the memory semantic leg declares no registry default, so there is no
+    // resolved value to render — and the tool still names it, with the daemon's own
+    // accepted-range phrase, which is what keeps it reachable from this surface.
+    let out = client
+        .call_tool(call("capabilities_list", serde_json::json!({})))
+        .await
+        .unwrap();
+    let listed = text_of(&out);
+    assert!(
+        listed.contains(
+            "min_score=- (declared float; the file does not carry it and the registry \
+             declares no default; accepted finite and 0.0..=1.0)"
+        ),
+        "a declared key with no default must be nameable: {listed}"
+    );
+    assert!(
+        listed.contains("weight=1.0 (float default, the file does not)"),
+        "a defaulted value must not read as the file's: {listed}"
+    );
+    assert!(
+        listed.contains("weight=3.5 (the file carries it)"),
+        "a value the file carries must read as the file's: {listed}"
+    );
+
+    // Write about a capability the file does not mention at all.
+    let out = client
+        .call_tool(call(
+            "capability_set",
+            serde_json::json!({ "id": "knowledge_ingest_graph", "enabled": true }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&out).contains("`knowledge_ingest_graph` is now enabled=true"),
+        "{out:?}"
+    );
+
+    let after = std::fs::read_to_string(&policy).unwrap();
+    assert_eq!(
+        capability_section_keys(&after, "knowledge_ingest_graph"),
+        vec!["enabled"],
+        "the requested row landed: {after}"
+    );
+    for id in [
+        "recall_leg_memory_fts",
+        "recall_leg_memory_semantic",
+        "recall_leg_wiki",
+    ] {
+        assert_eq!(
+            capability_section(&after, id),
+            capability_section(&before, id),
+            "row `{id}` was rewritten by a write that did not name it: {after}"
+        );
+        assert_eq!(
+            capability_section_keys(&after, id),
+            capability_section_keys(&before, id),
+            "row `{id}` changed KEY SET: {after}"
+        );
+    }
+    assert!(
+        !capability_section(&after, "recall_leg_memory_fts").contains("weight"),
+        "a RESOLVED default (weight = 1.0) was materialized into the user's file: {after}"
+    );
+
+    // A SECOND write, this time with values, to the semantic leg: the declared key
+    // with no default becomes settable through MCP, the file's own `weight` is
+    // updated, and NOTHING else appears — `enabled` is written only because the
+    // caller set it (it is a required tool argument), never as a default.
+    let out = client
+        .call_tool(call(
+            "capability_set",
+            serde_json::json!({
+                "id": "recall_leg_memory_semantic",
+                "enabled": true,
+                "weight": 2.5,
+                "min_score": 0.4
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&out).contains("`recall_leg_memory_semantic` is now enabled=true"),
+        "{out:?}"
+    );
+    let after_two = std::fs::read_to_string(&policy).unwrap();
+    assert_eq!(
+        capability_section_keys(&after_two, "recall_leg_memory_semantic"),
+        vec!["enabled", "min_score", "weight"],
+        "only the keys the caller asked for: {after_two}"
+    );
+    let semantic = capability_section(&after_two, "recall_leg_memory_semantic");
+    assert!(semantic.contains("min_score = 0.4"), "{after_two}");
+    assert!(semantic.contains("weight = 2.5"), "{after_two}");
+    for id in ["recall_leg_memory_fts", "recall_leg_wiki"] {
+        assert_eq!(
+            capability_section(&after_two, id),
+            capability_section(&before, id),
+            "row `{id}` survived a second write untouched: {after_two}"
+        );
+    }
+    assert_eq!(
+        capability_section(&after_two, "knowledge_ingest_graph"),
+        capability_section(&after, "knowledge_ingest_graph"),
+        "the first write's row survived the second: {after_two}"
+    );
+
+    // The DAEMON's own refusal still reaches the caller verbatim: a key this
+    // capability does not declare is refused with the daemon's sentence and its
+    // accepted-key list, not with a locally invented message.
+    let err = refusal(
+        client
+            .call_tool(call(
+                "capability_set",
+                serde_json::json!({
+                    "id": "recall_leg_wiki",
+                    "enabled": true,
+                    "weight": 2.0
+                }),
+            ))
+            .await,
+    );
+    assert!(
+        err.contains("capability `recall_leg_wiki` does not accept the option `weight`"),
+        "the daemon's own words: {err}"
+    );
+    assert!(err.contains("it accepts: none"), "{err}");
+
+    // A VALUE the daemon refuses is likewise its own 400 phrase, verbatim: this
+    // bridge pre-validates nothing (a second range check here could drift from the
+    // registry's), so the range the agent reads is the range the daemon enforces.
+    let err = refusal(
+        client
+            .call_tool(call(
+                "capability_set",
+                serde_json::json!({
+                    "id": "session_extract_rules",
+                    "enabled": true,
+                    "max_per_input": 0
+                }),
+            ))
+            .await,
+    );
+    assert!(
+        err.contains(
+            "capability `session_extract_rules`: `max_per_input = 0` is out of range (1..=10000)"
+        ),
+        "the daemon's own range phrase: {err}"
+    );
+
+    // ... and the refused write left the file exactly as it was.
+    assert_eq!(
+        std::fs::read_to_string(&policy).unwrap(),
+        after_two,
+        "a refused write must not touch the file"
+    );
 
     shutdown_pair(client, server_task).await;
 }

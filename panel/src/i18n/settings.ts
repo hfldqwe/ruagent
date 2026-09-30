@@ -44,16 +44,20 @@ export const zh: Record<string, string> = {
   // The option editor. The KEY names (weight, min_score, …) are the API's own
   // and are shown verbatim, like the daemon's description/gates phrases: they
   // are what the user would otherwise type into policy.toml. Only the panel's
-  // own words live here.
+  // own words live here. The RANGE inside each refusal is the daemon's own
+  // `expectation` phrase, passed in from the schema — never re-worded here.
   "settings.capabilities.options.title": "选项",
   "settings.capabilities.options.apply": "应用",
   "settings.capabilities.options.reset": "恢复默认值",
   "settings.capabilities.options.resetHint":
     "把这一行的选项键从 policy.toml 里删掉，让注册表默认值重新生效——不是把默认值写成你的意见。",
   "settings.capabilities.options.unapplied": "有未应用的修改",
-  "settings.capabilities.options.notFinite": "必须是有限数字",
-  "settings.capabilities.options.notInteger": "必须是整数",
+  "settings.capabilities.options.defaultTag": "默认值",
+  "settings.capabilities.options.notFinite": "必须是有限数字（{expectation}）",
+  "settings.capabilities.options.notInteger": "必须是整数（{expectation}）",
   "settings.capabilities.options.outOfRange": "超出范围（{expectation}）",
+  "settings.capabilities.options.zeroWeight":
+    "启用中的权重不能为 0：请关掉这一项，而不是把权重归零。",
   "settings.capabilities.options.refused": "有输入未通过校验，这一行没有发送任何请求。",
 
   "settings.capabilities.name.memory_inject_chat": "会话首轮记忆注入",
@@ -100,16 +104,20 @@ export const en: Record<string, string> = {
   "settings.capabilities.conflictTitle": "This capability config suppresses behaviour you had",
 
   // The option editor (see the zh block above for why the KEY names are not
-  // translated: they are the API's own).
+  // translated: they are the API's own, and the RANGE inside a refusal is the
+  // daemon's own `expectation` phrase, passed in from the schema).
   "settings.capabilities.options.title": "Options",
   "settings.capabilities.options.apply": "Apply",
   "settings.capabilities.options.reset": "Reset to defaults",
   "settings.capabilities.options.resetHint":
     "Removes this row's option keys from policy.toml so the registry defaults apply again — it does not write the defaults in as your opinion.",
   "settings.capabilities.options.unapplied": "unapplied changes",
-  "settings.capabilities.options.notFinite": "must be a finite number",
-  "settings.capabilities.options.notInteger": "must be a whole number",
+  "settings.capabilities.options.defaultTag": "default",
+  "settings.capabilities.options.notFinite": "must be a finite number ({expectation})",
+  "settings.capabilities.options.notInteger": "must be a whole number ({expectation})",
   "settings.capabilities.options.outOfRange": "out of range ({expectation})",
+  "settings.capabilities.options.zeroWeight":
+    "An enabled weight cannot be 0: turn this capability off instead of zeroing the weight.",
   "settings.capabilities.options.refused": "An input failed validation; no request was sent for this row.",
 
   "settings.capabilities.name.memory_inject_chat": "Chat first-prompt injection",

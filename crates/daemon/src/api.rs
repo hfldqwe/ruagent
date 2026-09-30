@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ruagent_acp::chat::ChatCommand;
 use ruagent_core::{Run, RunId, RunStatus, Task, TaskCreator, TaskStatus};
+use ruagent_knowledge::rrf::WeightError;
 use ruagent_store::{DeleteSession, TranscriptLine, transcript_path};
 use serde::Deserialize;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -414,6 +415,19 @@ impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, self.message).into_response()
     }
+}
+
+/// THE daemon's ONE sentence for a refused recall-leg configuration (design
+/// §11.5): `recall leg configuration is invalid: <WeightError>`.
+///
+/// `pub(crate)` because TWO doors can meet this invariant and they must answer with
+/// the same words: the recall handler (read time) and the capability `PUT`
+/// (`crate::capability::zero_weight_memory_leg`, write time). The message is
+/// [`WeightError`]'s own `Display`, so the leg name and the rule — including
+/// "(disable the leg instead of zeroing it)" — are spelled in one place, the
+/// knowledge-side weight rule, and neither door can paraphrase them.
+pub(crate) fn leg_config_error(e: WeightError) -> String {
+    format!("recall leg configuration is invalid: {e}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2927,9 +2941,7 @@ async fn recall(
     ) {
         Ok(legs) => legs,
         Err(e) => {
-            return Err(ApiError::bad_request(format!(
-                "recall leg configuration is invalid: {e}"
-            )));
+            return Err(ApiError::bad_request(leg_config_error(e)));
         }
     };
     // The capability ids of the legs this call did NOT query, sorted — the ONE

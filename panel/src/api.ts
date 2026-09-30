@@ -276,14 +276,51 @@ export interface DistillPolicy {
   builtin_prompt: string;
 }
 
-/** One capability's DECLARED options, resolved. `null` = the key is not set, so
- *  the pipeline's own argument decides (design §4.2 `CapabilityOptions`). */
+/** One capability's DECLARED options, RESOLVED: registry defaults merged with
+ *  the file. `null` = nothing sets the key, so the pipeline's own argument
+ *  decides (design §4.2 `CapabilityOptions`). This is the value in effect — it
+ *  is NOT what the file carries; `options_set` says that. */
 export interface CapabilityOptions {
   weight: number | null;
   min_score: number | null;
   max_per_input: number | null;
   min_confidence: number | null;
   max_docs_per_pass: number | null;
+}
+
+/** One entry of a row's `options_schema` (ADDITIVE, design §11.5): what the
+ *  REGISTRY DECLARES for one option key. Every field comes from the daemon's own
+ *  per-key table — the same one `validate` enforces
+ *  (crates/daemon/src/capability.rs) — so the panel renders the range the daemon
+ *  accepts and prints the daemon's phrase instead of a second wording that could
+ *  drift. */
+export interface OptionSchemaEntry {
+  /** The key's stable id: its name in policy.toml and in a `PUT` body. */
+  key: string;
+  /** `"float"` | `"uint"` — whether the value must be a whole number. The
+   *  bounds alone cannot say (a uint's bounds are integral too). */
+  kind: string;
+  min: number;
+  max: number;
+  /** The registry's declared default; `null` ONLY where it declares none, i.e.
+   *  where the key is reachable but has no value to pre-fill. */
+  default: number | null;
+  /** The daemon's own accepted-range phrase, i.e. the string a 400 carries. */
+  expectation: string;
+}
+
+/** A row's `options_set` (ADDITIVE, design §11.5): `enabled` plus one boolean per
+ *  DECLARED key, true when the FILE carries that key right now.
+ *
+ *  `configured` says the row's ID is in the file; this says WHICH KEYS are. A
+ *  read-modify-write client needs it because the daemon's `PUT` removes every key
+ *  an entry omits: re-emitting RESOLVED values (from `options`) instead of these
+ *  keys writes registry DEFAULTS into the user's policy.toml — measured live
+ *  before this field existed (`enabled = true` became `enabled = true` +
+ *  `weight = 1` on the next unrelated write). */
+export interface OptionSet {
+  enabled: boolean;
+  [key: string]: boolean;
 }
 
 /** One row of `GET /api/v1/capabilities` (design §4.4/§14.1).
@@ -303,7 +340,15 @@ export interface CapabilityRow {
   enabled: boolean;
   configured: string;
   new: boolean;
+  /** The RESOLVED option values (what is in effect). */
   options: CapabilityOptions;
+  /** ADDITIVE: what the registry DECLARES, one entry per key it accepts, in
+   *  registry order. `[]` for a capability that declares none. This is what the
+   *  editor renders from — `options` alone cannot reach a declared key whose
+   *  registry default is `null` (today `min_score` on the semantic recall leg). */
+  options_schema: OptionSchemaEntry[];
+  /** ADDITIVE: which of those keys (plus `enabled`) the FILE carries. */
+  options_set: OptionSet;
 }
 
 /** Work today's flags ask for that the current `[capabilities]` table
@@ -325,15 +370,18 @@ export interface CapabilitiesResponse {
 }
 
 /** One `[capabilities.<id>]` table of a `PUT` body. The map REPLACES the whole
- *  table, so every row the file already configures must be re-emitted with its
- *  options (see `capabilitiesBody` in views/Settings.tsx). */
+ *  table and the daemon's editor REMOVES every row and every key an entry omits
+ *  (crates/daemon/src/config.rs:1071-1114), so the entry a client sends must be
+ *  "exactly the keys this row should end up with" —
+ *  see `capabilitiesBody` in panel/src/capability-options.ts.
+ *
+ *  The option keys are open-ended on purpose: their set is the REGISTRY's, the
+ *  daemon refuses an undeclared key rather than ignoring it, and the panel learns
+ *  it from `options_schema`. A closed list of five field names here would be a
+ *  second spelling of the registry. */
 export interface CapabilityFileEntry {
   enabled?: boolean;
-  weight?: number;
-  min_score?: number;
-  max_per_input?: number;
-  min_confidence?: number;
-  max_docs_per_pass?: number;
+  [key: string]: number | boolean | undefined;
 }
 
 export interface MemoryRow {
@@ -741,9 +789,14 @@ async function getChecked<T>(
 /** `/api/v1/capabilities` answers the SAME payload to GET and PUT (design
  *  §14.1/§14.2), so both wrappers assert one shape. Every field the settings
  *  card reads is asserted: `tier`/`configured` are the strings it branches on,
- *  the four booleans are checked as "present" (the shape kinds have no boolean)
- *  and `options` is the object it renders and round-trips. A malformed 200 has
- *  to reach the card's error state instead of blanking it (t265). */
+ *  the four booleans are checked as "present" (the shape kinds have no boolean),
+ *  `options` is the object it renders, and `options_schema`/`options_set` are the
+ *  two fields the increment-4 editor renders FROM. Those two are REQUIRED rather
+ *  than optional on purpose: without them the editor cannot tell a key the file
+ *  carries from one that is merely defaulted, and a write that guesses removes
+ *  keys the user set (or persists defaults they did not choose) — a malformed
+ *  200 must reach the card's error state instead of silently editing
+ *  policy.toml (t265). */
 const capabilitiesShape = (data: unknown): CapabilitiesResponse =>
   expectShape<CapabilitiesResponse>(
     "/api/v1/capabilities",
@@ -764,6 +817,8 @@ const capabilitiesShape = (data: unknown): CapabilitiesResponse =>
       default_enabled: "present",
       new: "present",
       options: "present",
+      options_schema: "arrayOfObjects",
+      options_set: "present",
     },
   );
 

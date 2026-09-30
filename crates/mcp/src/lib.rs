@@ -364,8 +364,19 @@ impl PlatformTools {
         capabilities_to_text(&resp, params.tier.as_deref())
     }
 
+    // DELIBERATE TOOL-METADATA CHANGE (ruagent-tunable-capabilities t13, the
+    // follow-up to t10). This description no longer ENUMERATES the option keys:
+    // which keys a capability declares is DATA (`options_schema` on every
+    // `capabilities_list` row), and a prose copy of that set has no parser and no
+    // test, so it would go stale silently the day the registry declares a different
+    // set — the fourth spelling of one fact and the only unguarded one.
+    //
+    // WHY IT DOES NOT BREAK THE "TOOL SURFACE STAYS STABLE" RULE: the PARAMETER
+    // schema — the fields a client sends (`CapabilitySetParams`, below) — is
+    // untouched, so no caller breaks; nothing parses a description, and no tool was
+    // added or removed. This removes a staleness source and changes no behaviour.
     #[tool(
-        description = "Enable, disable or re-weight ONE capability by id: id=distill_session, enabled=false stops unattended distillation; id=knowledge_ingest_graph, enabled=true lets knowledge documents feed the knowledge graph; id=recall_leg_wiki, enabled=false drops that recall leg. WHEN: the user asks to turn a pipeline on or off, or complains about the behaviour or the cost of one. COST: this call is free, but ENABLING an llm-tier capability (distill_session) makes the platform spend the user's model tokens from then on: say so out loud, and only then pass confirm_cost=true -- without it the daemon refuses the write (HTTP 409) and nothing changes. That check is on the CONFIGURATION, not on what is effectively running, so it is required even when [distill].auto is already true. The write goes to policy.toml and takes effect immediately; the reply is the full post-change state, so read it instead of calling capabilities_list again. Only the option keys a capability declares are accepted (weight, min_score, max_per_input, min_confidence, max_docs_per_pass); an option you omit keeps its current value, and an unknown id or undeclared key is refused with the known ids/keys named. This tool changes exactly one capability and KEEPS every capability policy.toml already configures, because the daemon's PUT replaces the whole [capabilities] table: a bare one-id write would silently reset every other capability to its registry default (and an llm-tier default is OFF). The first write on a root with no [capabilities] table creates one, which puts every capability at its registry default -- read the reply's conflicts[] list: it names any capability whose legacy switch is still on while the capability is now off, and prints the exact [capabilities.<id>] line that restores it."
+        description = "Enable, disable or re-weight ONE capability by id: id=distill_session, enabled=false stops unattended distillation; id=knowledge_ingest_graph, enabled=true lets knowledge documents feed the knowledge graph; id=recall_leg_wiki, enabled=false drops that recall leg. WHEN: the user asks to turn a pipeline on or off, or complains about the behaviour or the cost of one. COST: this call is free, but ENABLING an llm-tier capability (distill_session) makes the platform spend the user's model tokens from then on: say so out loud, and only then pass confirm_cost=true -- without it the daemon refuses the write (HTTP 409) and nothing changes. That check is on the CONFIGURATION, not on what is effectively running, so it is required even when [distill].auto is already true. The write goes to policy.toml and takes effect immediately; the reply is the full post-change state, so read it instead of calling capabilities_list again. OPTION KEYS ARE NOT LISTED HERE ON PURPOSE: which keys a capability accepts is declared per row by capabilities_list's options_schema (one entry per declared key, with its kind, its bounds and the daemon's own accepted-range phrase) -- read the row for the id you are about to change before setting an option; the parameter list below is what this tool can send. An option you omit keeps its current value, and an unknown id or undeclared key is refused with the known ids and the declared keys named. This tool changes exactly one capability and KEEPS every capability policy.toml already configures, because the daemon's PUT replaces the whole [capabilities] table: a bare one-id write would silently reset every other capability to its registry default (and an llm-tier default is OFF). The first write on a root with no [capabilities] table creates one, which puts every capability at its registry default -- read the reply's conflicts[] list: it names any capability whose legacy switch is still on while the capability is now off, and prints the exact [capabilities.<id>] line that restores it."
     )]
     async fn capability_set(
         &self,
@@ -598,6 +609,26 @@ fn field_bool(what: &str, obj: &serde_json::Value, key: &str) -> Result<bool, rm
         .ok_or_else(|| drift(what, key, obj))
 }
 
+/// [`field_bool`] for a key inside an object the caller already extracted (the
+/// daemon's `options_set`), so the drift message names WHICH object was
+/// incomplete rather than dumping the whole row under the key's name.
+fn map_bool(
+    what: &str,
+    obj_name: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<bool, rmcp::ErrorData> {
+    map.get(key).and_then(|v| v.as_bool()).ok_or_else(|| {
+        rmcp::ErrorData::internal_error(
+            format!(
+                "{what}: the daemon response carries no `{key}` in `{obj_name}`: {}",
+                serde_json::Value::Object(map.clone())
+            ),
+            None,
+        )
+    })
+}
+
 fn field_u64(what: &str, obj: &serde_json::Value, key: &str) -> Result<u64, rmcp::ErrorData> {
     obj.get(key)
         .and_then(|v| v.as_u64())
@@ -608,28 +639,95 @@ fn field_u64(what: &str, obj: &serde_json::Value, key: &str) -> Result<u64, rmcp
 // The capability plane
 // ---------------------------------------------------------------------------
 
-/// The option keys the registry declares, spelled exactly as the API, the
-/// config file and `CapabilityFile` spell them (§4.2/§5.1).
-const OPTION_KEYS: [&str; 5] = [
-    "weight",
-    "min_score",
-    "max_per_input",
-    "min_confidence",
-    "max_docs_per_pass",
-];
+/// One entry of the daemon's `options_schema`: a key the REGISTRY DECLARES for
+/// this capability, the kind of number it is, the daemon's own accepted-range
+/// phrase, the value the config currently resolves for it, and whether the FILE
+/// carries the key at all.
+///
+/// `value` and `carried` are deliberately kept apart: `value` is what `options`
+/// resolved (the file's value, else the registry default) while `carried` is what
+/// `options_set` reports (the file's own key set). A renderer that walks only
+/// resolved values cannot see a declared key with NO registry default, and a
+/// writer that re-emits resolved values writes registry defaults into the user's
+/// file (design §11.5).
+struct DeclaredOption<'a> {
+    key: &'a str,
+    kind: &'a str,
+    expectation: &'a str,
+    value: Option<&'a serde_json::Value>,
+    carried: bool,
+}
 
-fn options_to_text(row: &serde_json::Value) -> String {
-    OPTION_KEYS
-        .iter()
-        .map(|k| {
-            let v = row.get("options").and_then(|o| o.get(*k));
-            match v {
-                None | Some(serde_json::Value::Null) => format!("{k}=-"),
-                Some(v) => format!("{k}={v}"),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Read one row's declared options FROM THE DAEMON.
+///
+/// This is the ONE place the key set comes from. It replaces the local
+/// `const OPTION_KEYS: [&str; 5]` this bridge used to keep — the THIRD copy of
+/// that list in the tree, after the registry's own table and the panel's copy
+/// (design §11.5, the follow-up this increment closes). A local list cannot see a
+/// key the registry adds, and it cannot tell "the file carries this key" from "the
+/// config resolves a registry default for it"; the daemon reports both
+/// (`options_schema` / `options_set`) and this bridge no longer guesses either.
+///
+/// Missing either field is protocol drift, refused loudly like every other field
+/// this bridge depends on — reporting no options is exactly the failure mode
+/// (`facts_of`, t93).
+fn declared_options<'a>(
+    what: &str,
+    row: &'a serde_json::Value,
+) -> Result<Vec<DeclaredOption<'a>>, rmcp::ErrorData> {
+    let schema = row
+        .get("options_schema")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| drift(what, "options_schema", row))?;
+    let set = row
+        .get("options_set")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| drift(what, "options_set", row))?;
+    let mut out = Vec::with_capacity(schema.len());
+    for entry in schema {
+        let key = field_str(what, entry, "key")?;
+        out.push(DeclaredOption {
+            key,
+            kind: field_str(what, entry, "kind")?,
+            expectation: field_str(what, entry, "expectation")?,
+            value: row
+                .get("options")
+                .and_then(|o| o.get(key))
+                .filter(|v| !v.is_null()),
+            carried: map_bool(what, "options_set", set, key)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Render one row's options: every key the REGISTRY DECLARES, in registry order,
+/// with its current value and where that value comes from — so a declared key with
+/// no default (no resolved value to render) is visible AND actionable instead of
+/// absent, and so an agent can tell a value the user set from a default. A row
+/// that declares nothing says so rather than printing dead keys.
+fn options_to_text(row: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "capabilities_list";
+    let declared = declared_options(WHAT, row)?;
+    if declared.is_empty() {
+        return Ok("none declared (this capability accepts no option key)".to_string());
+    }
+    let mut parts = Vec::with_capacity(declared.len());
+    for o in &declared {
+        parts.push(match (o.value, o.carried) {
+            (Some(v), true) => format!("{}={v} (the file carries it)", o.key),
+            (Some(v), false) => format!("{}={v} ({} default, the file does not)", o.key, o.kind),
+            (None, false) => format!(
+                "{}=- (declared {}; the file does not carry it and the registry declares no \
+                 default; accepted {})",
+                o.key, o.kind, o.expectation
+            ),
+            // The daemon reports the file carries this key but resolved NO value
+            // for it. That is drift, and inventing a value here would write a
+            // wrong one into the user's config.
+            (None, true) => return Err(drift(WHAT, &format!("options.{}", o.key), row)),
+        });
+    }
+    Ok(parts.join(" "))
 }
 
 /// Render `GET /api/v1/capabilities` for an agent: what is on, what tier it
@@ -701,7 +799,7 @@ fn capabilities_to_text(
         if let Some(g) = row.get("gates").and_then(|v| v.as_str()) {
             out.push_str(&format!("    gates: {g}\n"));
         }
-        out.push_str(&format!("    options: {}\n", options_to_text(row)));
+        out.push_str(&format!("    options: {}\n", options_to_text(row)?));
     }
     if selected_count == 0
         && let Some(tier) = tier_filter
@@ -737,29 +835,60 @@ fn capabilities_to_text(
     Ok(out)
 }
 
-/// One `[capabilities.<id>]` entry rebuilt from an API row: `enabled` plus every
-/// RESOLVED option that has a value. The daemon's editor removes the keys an
-/// entry does not carry, so re-emitting the resolved values is what keeps a
-/// single toggle from silently resetting the row's weight or bounds.
+/// One `[capabilities.<id>]` entry rebuilt from an API row: EXACTLY the keys the
+/// FILE already carries — `enabled` when the file carries it, plus every declared
+/// option key `options_set` marks present, valued from `options` (for a key the
+/// file carries, the value `options` resolves IS the file's own value).
+///
+/// Two properties ride on this, and both have been broken once already:
+///
+/// * THE READ-MODIFY-WRITE. The daemon's PUT REPLACES the whole `[capabilities]`
+///   table and removes every row and every key an entry omits
+///   (`CapabilitiesEditor::update` in `crates/daemon/src/config.rs`), so re-emitting
+///   each `configured == "file"` row is the ONLY reason one toggle does not delete
+///   every other configured capability.
+/// * NO RE-MATERIALIZATION. Re-emitting the RESOLVED values instead persists
+///   registry DEFAULTS into rows the user never set (an `enabled = true`-only row
+///   became `enabled = true` + `weight = 1`), which is why a Reset was undone by
+///   the next unrelated write. `options_set` — the daemon's answer to "which keys
+///   does the file carry" — is the only source used here, so a key the file does
+///   not carry is not written, `enabled` included.
 fn entry_of_row(
     row: &serde_json::Value,
 ) -> Result<serde_json::Map<String, serde_json::Value>, rmcp::ErrorData> {
     const WHAT: &str = "capability_set";
-    let enabled = field_bool(WHAT, row, "enabled")?;
+    let set = row
+        .get("options_set")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| drift(WHAT, "options_set", row))?;
     let mut entry = serde_json::Map::new();
-    entry.insert("enabled".into(), serde_json::Value::Bool(enabled));
-    for key in OPTION_KEYS {
-        if let Some(v) = row.get("options").and_then(|o| o.get(key))
-            && !v.is_null()
-        {
-            entry.insert(key.into(), v.clone());
+    if map_bool(WHAT, "options_set", set, "enabled")? {
+        entry.insert(
+            "enabled".into(),
+            serde_json::Value::Bool(field_bool(WHAT, row, "enabled")?),
+        );
+    }
+    for o in declared_options(WHAT, row)? {
+        if !o.carried {
+            continue;
         }
+        let Some(v) = o.value else {
+            return Err(drift(WHAT, &format!("options.{}", o.key), row));
+        };
+        entry.insert(o.key.to_string(), v.clone());
     }
     Ok(entry)
 }
 
 /// The fields the caller actually set. An omitted option is "leave the current
 /// value", never "reset it".
+///
+/// This is the typed-argument half of the tool's INPUT SCHEMA and not a key list:
+/// a static MCP tool schema has one fixed field per option, so the arm per field is
+/// unavoidable and is not a second source of truth — it decides nothing. Whether a
+/// key is legal for the target capability, and whether its value is in range, is
+/// decided by the DAEMON, whose refusal this bridge surfaces verbatim
+/// ([`refusal_message`]) rather than inventing a local message that could drift.
 fn apply_params(
     entry: &mut serde_json::Map<String, serde_json::Value>,
     params: &CapabilitySetParams,
@@ -783,7 +912,9 @@ fn apply_params(
 }
 
 /// The `[capabilities]` table to PUT: every capability policy.toml already
-/// configures (`configured == "file"`), then the one requested row on top.
+/// configures (`configured == "file"`), then the one requested row on top. Each
+/// re-emitted row carries its OWN key set, never the values the config resolves
+/// for it ([`entry_of_row`]).
 ///
 /// `legacy` (no table at all) and `default` (table present, id absent) rows are
 /// deliberately NOT re-emitted: they already resolve to the registry default, so
@@ -1490,20 +1621,53 @@ mod tests {
 
     // -- capabilities_list ----------------------------------------------
 
+    /// A row of `GET /api/v1/capabilities`, in the shape the daemon actually
+    /// serves: `options` RESOLVED, `options_schema` what the registry declares
+    /// (registry order) and `options_set` the keys the FILE carries. The four rows
+    /// mirror the real registry: one that declares nothing, one whose declared
+    /// `min_score` has NO registry default, one whose declared keys are all
+    /// defaulted, and the llm-tier one.
     fn plane_response() -> serde_json::Value {
         serde_json::json!({
             "table_present": false,
             "config_file": "/home/u/.ruagent/config/policy.toml",
             "capabilities": [
                 { "id": "recall_leg_wiki", "tier": "free", "description": "Recall leg: agent-generated wiki pages (leads, not ground truth).", "gates": "the wiki/ partition of the knowledge hits", "default_enabled": true, "enabled": true, "configured": "legacy", "new": false,
-                  "options": { "weight": null, "min_score": null, "max_per_input": null, "min_confidence": null, "max_docs_per_pass": null } },
+                  "options": { "weight": null, "min_score": null, "max_per_input": null, "min_confidence": null, "max_docs_per_pass": null },
+                  "options_schema": [],
+                  "options_set": { "enabled": false } },
+                { "id": "recall_leg_memory_semantic", "tier": "free", "description": "Recall leg: cosine similarity over memory embeddings.", "gates": "the cosine leg of GET /api/v1/recall", "default_enabled": true, "enabled": true, "configured": "legacy", "new": false,
+                  "options": { "weight": 1.0, "min_score": null, "max_per_input": null, "min_confidence": null, "max_docs_per_pass": null },
+                  "options_schema": [
+                    { "key": "weight", "kind": "float", "min": 0.0, "max": 100.0, "default": 1.0, "expectation": "finite and 0.0..=100.0" },
+                    { "key": "min_score", "kind": "float", "min": 0.0, "max": 1.0, "default": null, "expectation": "finite and 0.0..=1.0" }
+                  ],
+                  "options_set": { "enabled": false, "weight": false, "min_score": false } },
                 { "id": "session_extract_rules", "tier": "free", "description": "Zero-token deterministic extraction of a closed session into memory candidates.", "gates": "the unattended transcript -> memory extractor", "default_enabled": false, "enabled": false, "configured": "default", "new": true,
-                  "options": { "weight": null, "min_score": null, "max_per_input": 32, "min_confidence": 0.0, "max_docs_per_pass": null } },
+                  "options": { "weight": null, "min_score": null, "max_per_input": 32, "min_confidence": 0.0, "max_docs_per_pass": null },
+                  "options_schema": [
+                    { "key": "max_per_input", "kind": "uint", "min": 1.0, "max": 10000.0, "default": 32.0, "expectation": "1..=10000" },
+                    { "key": "min_confidence", "kind": "float", "min": 0.0, "max": 1.0, "default": 0.0, "expectation": "finite and 0.0..=1.0" }
+                  ],
+                  "options_set": { "enabled": false, "max_per_input": false, "min_confidence": false } },
                 { "id": "distill_session", "tier": "llm", "description": "ACP-agent distillation when a session closes (spends model tokens).", "gates": "auto-distill on session close", "default_enabled": false, "enabled": false, "configured": "legacy", "new": false,
-                  "options": { "weight": null, "min_score": null, "max_per_input": null, "min_confidence": null, "max_docs_per_pass": null } }
+                  "options": { "weight": null, "min_score": null, "max_per_input": null, "min_confidence": null, "max_docs_per_pass": null },
+                  "options_schema": [],
+                  "options_set": { "enabled": false } }
             ],
             "conflicts": [],
         })
+    }
+
+    /// The fixture row with `id`, mutably, the way the daemon would report it once
+    /// the file names the row.
+    fn row_mut<'a>(resp: &'a mut serde_json::Value, id: &str) -> &'a mut serde_json::Value {
+        resp["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|r| r["id"] == serde_json::json!(id))
+            .expect("the fixture carries this id")
     }
 
     #[test]
@@ -1521,7 +1685,17 @@ mod tests {
         assert!(text.contains("(configured: legacy"), "{text}");
         assert!(text.contains("configured: default, new"), "{text}");
         assert!(text.contains("max_per_input=32"), "{text}");
-        assert!(text.contains("weight=-"), "{text}");
+        // A resolved, defaulted key says so — the file does not carry it.
+        assert!(
+            text.contains("max_per_input=32 (uint default, the file does not)"),
+            "{text}"
+        );
+        // A row that declares NOTHING says so instead of printing five dead keys:
+        // the keys are the registry's, not this bridge's.
+        assert!(
+            text.contains("options: none declared (this capability accepts no option key)"),
+            "{text}"
+        );
         assert!(
             text.contains("gates: auto-distill on session close"),
             "{text}"
@@ -1540,7 +1714,7 @@ mod tests {
         let text = capabilities_to_text(&plane_response(), Some("llm")).unwrap();
         assert!(text.contains("distill_session"), "{text}");
         assert!(!text.contains("recall_leg_wiki"), "{text}");
-        assert!(text.contains("1 of 3 capabilities"), "{text}");
+        assert!(text.contains("1 of 4 capabilities"), "{text}");
 
         let err = capabilities_to_text(&plane_response(), Some("cheap")).expect_err("bogus tier");
         let msg = err.to_string();
@@ -1570,6 +1744,88 @@ mod tests {
         let no_present = serde_json::json!({ "capabilities": [], "conflicts": [] });
         let err = capabilities_to_text(&no_present, None).expect_err("missing table_present");
         assert!(err.to_string().contains("table_present"), "{err}");
+
+        // The declared key set is the DAEMON's, so a row that does not report it is
+        // drift too: rendering nothing would read as "this capability has no
+        // options", which is a different (and wrong) statement.
+        let mut no_schema = plane_response();
+        row_mut(&mut no_schema, "recall_leg_wiki")
+            .as_object_mut()
+            .unwrap()
+            .remove("options_schema");
+        let err = capabilities_to_text(&no_schema, None).expect_err("missing options_schema");
+        assert!(err.to_string().contains("options_schema"), "{err}");
+
+        let mut no_set = plane_response();
+        row_mut(&mut no_set, "recall_leg_wiki")
+            .as_object_mut()
+            .unwrap()
+            .remove("options_set");
+        let err = capabilities_to_text(&no_set, None).expect_err("missing options_set");
+        assert!(err.to_string().contains("options_set"), "{err}");
+    }
+
+    /// The key set comes from `options_schema`, NOT from a list this bridge keeps:
+    /// a declared key the fixture never asked for is rendered, and one whose value
+    /// the config does not resolve is still rendered WITH the daemon's own
+    /// accepted-range phrase — which is how a declared key with no registry default
+    /// stays reachable (the hole this increment closes, design §11.5).
+    #[test]
+    fn capabilities_to_text_renders_every_key_the_daemon_declares() {
+        let mut resp = plane_response();
+        row_mut(&mut resp, "recall_leg_wiki")["options_schema"] = serde_json::json!([
+            { "key": "decay_half_life", "kind": "float", "min": 0.0, "max": 50.0,
+              "default": null, "expectation": "finite and 0.0..=50.0" }
+        ]);
+        row_mut(&mut resp, "recall_leg_wiki")["options_set"] =
+            serde_json::json!({ "enabled": false, "decay_half_life": false });
+        let text = capabilities_to_text(&resp, None).unwrap();
+        assert!(text.contains("decay_half_life"), "{text}");
+        assert!(text.contains("finite and 0.0..=50.0"), "{text}");
+        assert!(
+            text.contains("decay_half_life=- (declared float; the file does not carry it"),
+            "a declared key with no value is NAMED, not omitted: {text}"
+        );
+
+        // The live instance of that hole: `min_score` on the memory semantic leg
+        // has no registry default, and its declared phrase is the daemon's.
+        let text = capabilities_to_text(&plane_response(), None).unwrap();
+        assert!(
+            text.contains(
+                "min_score=- (declared float; the file does not carry it and the registry \
+                 declares no default; accepted finite and 0.0..=1.0)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("weight=1.0 (float default, the file does not)"),
+            "{text}"
+        );
+
+        // ... and a key the FILE carries is reported as the file's, not as a default.
+        let mut carried = plane_response();
+        row_mut(&mut carried, "recall_leg_memory_semantic")["options"]["weight"] =
+            serde_json::json!(3.5);
+        row_mut(&mut carried, "recall_leg_memory_semantic")["options_set"] =
+            serde_json::json!({ "enabled": false, "weight": true, "min_score": false });
+        let text = capabilities_to_text(&carried, None).unwrap();
+        assert!(text.contains("weight=3.5 (the file carries it)"), "{text}");
+    }
+
+    /// `options_set` saying the file carries a key must come with a resolved value:
+    /// a renderer that invented one would write it back on the next toggle.
+    #[test]
+    fn capabilities_to_text_refuses_a_carried_key_with_no_value() {
+        let mut resp = plane_response();
+        {
+            let row = row_mut(&mut resp, "recall_leg_memory_semantic");
+            row["options"]["weight"] = serde_json::json!(null);
+            row["options_set"] =
+                serde_json::json!({ "enabled": false, "weight": true, "min_score": false });
+        }
+        let err = capabilities_to_text(&resp, None).expect_err("carried but no value");
+        let msg = err.to_string();
+        assert!(msg.contains("options.weight"), "{msg}");
     }
 
     #[test]
@@ -1622,43 +1878,79 @@ mod tests {
         assert!(body.to_string().contains("recall_leg_graph"));
     }
 
+    /// THE READ-MODIFY-WRITE, with the KEY SET preserved. The daemon's PUT
+    /// replaces the whole table, so a one-id write must carry every other
+    /// `configured: "file"` row back — carrying the keys THAT ROW's file has, not
+    /// the values the config resolves for it. Re-emitting resolved values is the
+    /// measured defect (`enabled = true` alone became `enabled = true` +
+    /// `weight = 1`), and the third row here is the witness: its file carries
+    /// `weight` and NO `enabled`, so the entry must carry `weight` and no
+    /// `enabled`.
     #[test]
-    fn capability_set_keeps_every_configured_row_and_its_options() {
-        // The daemon's PUT replaces the whole table, so a one-id write must
-        // carry the other `configured: "file"` rows back — including their
-        // RESOLVED options, which the editor would otherwise remove.
-        let mut rows = plane_response()["capabilities"].as_array().unwrap().clone();
-        for row in &mut rows {
-            if row["id"] == serde_json::json!("recall_leg_wiki") {
-                row["configured"] = serde_json::json!("file");
-                row["enabled"] = serde_json::json!(true);
-            }
-            if row["id"] == serde_json::json!("session_extract_rules") {
-                row["configured"] = serde_json::json!("file");
-                row["enabled"] = serde_json::json!(true);
-            }
+    fn capability_set_preserves_every_other_rows_key_set_exactly() {
+        let mut resp = plane_response();
+        {
+            let row = row_mut(&mut resp, "recall_leg_wiki");
+            row["configured"] = serde_json::json!("file");
+            row["options_set"] = serde_json::json!({ "enabled": true });
         }
+        {
+            // The file carries `enabled` only: `weight`/`min_confidence` resolve to
+            // registry defaults and must NOT be written.
+            let row = row_mut(&mut resp, "session_extract_rules");
+            row["configured"] = serde_json::json!("file");
+            row["enabled"] = serde_json::json!(true);
+            row["options_set"] = serde_json::json!({
+                "enabled": true, "max_per_input": false, "min_confidence": false
+            });
+        }
+        {
+            // The file carries `weight` only: no `enabled` key may be added.
+            let row = row_mut(&mut resp, "recall_leg_memory_semantic");
+            row["configured"] = serde_json::json!("file");
+            row["options"]["weight"] = serde_json::json!(3.5);
+            row["options_set"] =
+                serde_json::json!({ "enabled": false, "weight": true, "min_score": false });
+        }
+        let rows = resp["capabilities"].as_array().unwrap().clone();
         let params = set_params("recall_leg_wiki", false);
         let table = merged_table(&rows, &params).unwrap();
+
         assert_eq!(
             table["recall_leg_wiki"]["enabled"],
             serde_json::json!(false)
         );
-        // the OTHER configured row survives, with the option values it resolves to
+        // the row the write did not name keeps its file's key set, `enabled` and
+        // nothing else
         assert_eq!(
-            table["session_extract_rules"]["enabled"],
-            serde_json::json!(true)
+            table["session_extract_rules"],
+            serde_json::json!({ "enabled": true })
         );
+        // ... and this one keeps `weight` and NO `enabled`
         assert_eq!(
-            table["session_extract_rules"]["max_per_input"],
-            serde_json::json!(32)
-        );
-        assert_eq!(
-            table["session_extract_rules"]["min_confidence"],
-            serde_json::json!(0.0)
+            table["recall_leg_memory_semantic"],
+            serde_json::json!({ "weight": 3.5 })
         );
         // `legacy`/`default` rows are not frozen into the file
         assert!(!table.contains_key("distill_session"));
+        assert!(!table.contains_key("recall_leg_memory_fts"));
+    }
+
+    /// A `configured == "file"` row whose `options_set` is missing cannot be told
+    /// apart from one whose file carries nothing, and guessing would DELETE the
+    /// user's weights on the next toggle. Loud, naming the field.
+    #[test]
+    fn capability_set_refuses_to_guess_which_keys_the_file_carries() {
+        let mut resp = plane_response();
+        {
+            let row = row_mut(&mut resp, "recall_leg_memory_semantic");
+            row["configured"] = serde_json::json!("file");
+            row.as_object_mut().unwrap().remove("options_set");
+        }
+        let rows = resp["capabilities"].as_array().unwrap().clone();
+        let err = merged_table(&rows, &set_params("recall_leg_wiki", false))
+            .expect_err("drift must be loud");
+        assert!(err.to_string().contains("options_set"), "{err}");
     }
 
     #[test]
@@ -1677,14 +1969,47 @@ mod tests {
 
     #[test]
     fn capability_set_keeps_an_existing_weight_when_only_enabled_is_toggled() {
-        let mut rows = plane_response()["capabilities"].as_array().unwrap().clone();
-        rows[0]["configured"] = serde_json::json!("file");
-        rows[0]["options"]["weight"] = serde_json::json!(3.5);
-        let table = merged_table(&rows, &set_params("recall_leg_wiki", false)).unwrap();
-        assert_eq!(table["recall_leg_wiki"]["weight"], serde_json::json!(3.5));
+        let mut resp = plane_response();
+        {
+            let row = row_mut(&mut resp, "recall_leg_memory_semantic");
+            row["configured"] = serde_json::json!("file");
+            row["enabled"] = serde_json::json!(false);
+            row["options"]["weight"] = serde_json::json!(3.5);
+            row["options_set"] =
+                serde_json::json!({ "enabled": true, "weight": true, "min_score": false });
+        }
+        let rows = resp["capabilities"].as_array().unwrap().clone();
+        let table = merged_table(&rows, &set_params("recall_leg_memory_semantic", false)).unwrap();
         assert_eq!(
-            table["recall_leg_wiki"]["enabled"],
+            table["recall_leg_memory_semantic"]["weight"],
+            serde_json::json!(3.5)
+        );
+        assert_eq!(
+            table["recall_leg_memory_semantic"]["enabled"],
             serde_json::json!(false)
+        );
+        // only the keys the file carries are re-emitted; the write added none
+        assert_eq!(
+            table["recall_leg_memory_semantic"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["enabled", "weight"]
+        );
+    }
+
+    /// The declared key with NO registry default is expressible: a caller that
+    /// wants it sets it like any other, and the entry carries it.
+    #[test]
+    fn capability_set_can_set_a_declared_key_the_file_does_not_carry() {
+        let rows = plane_response()["capabilities"].as_array().unwrap().clone();
+        let mut params = set_params("recall_leg_memory_semantic", true);
+        params.min_score = Some(0.4);
+        let table = merged_table(&rows, &params).unwrap();
+        assert_eq!(
+            table["recall_leg_memory_semantic"],
+            serde_json::json!({ "enabled": true, "min_score": 0.4 })
         );
     }
 
@@ -1714,8 +2039,11 @@ mod tests {
         );
 
         let mut resp = plane_response();
-        resp["capabilities"][2]["configured"] = serde_json::json!("file");
-        resp["capabilities"][2]["enabled"] = serde_json::json!(true);
+        {
+            let row = row_mut(&mut resp, "distill_session");
+            row["configured"] = serde_json::json!("file");
+            row["enabled"] = serde_json::json!(true);
+        }
         let text = capability_set_to_text(&resp, &params).unwrap();
         assert!(
             text.contains("`distill_session` is now enabled=true (tier llm"),
@@ -1941,6 +2269,52 @@ mod tests {
                 "tool `{}` does not name its cost tier: {d}",
                 tool.name
             );
+        }
+    }
+
+    /// ruagent-tunable-capabilities t13: after t10 deleted the CODE copy of the
+    /// option key list, this tool's description held the last spelling of it — and
+    /// it is the only one nothing parses, so it would go stale the day the registry
+    /// declares a different set. It now points at the authority instead
+    /// (`options_schema`, served by `capabilities_list`). This test is what makes a
+    /// list coming back loud; nothing else parses a description.
+    #[test]
+    fn the_capability_set_description_points_at_the_schema_instead_of_listing_keys() {
+        let tools = PlatformTools::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "capability_set")
+            .expect("capability_set is served");
+        let d = tool.description.as_deref().unwrap_or_default();
+
+        // It names where the answer lives.
+        assert!(d.contains("options_schema"), "{d}");
+        assert!(d.contains("capabilities_list"), "{d}");
+
+        // ... and it no longer ENUMERATES the keys. `re-weight` is the action verb
+        // for the fusion weight, not a key name, so the four names with no prose
+        // homograph are checked with `contains`, plus the old list's opening.
+        assert!(!d.contains("(weight"), "a key list is back: {d}");
+        for key in [
+            "min_score",
+            "max_per_input",
+            "min_confidence",
+            "max_docs_per_pass",
+        ] {
+            assert!(!d.contains(key), "the description enumerates `{key}`: {d}");
+        }
+
+        // The metadata change is surgical: the WHEN/COST gate, the cost flag and the
+        // read-modify-write paragraph are all still there.
+        for kept in [
+            "WHEN:",
+            "COST:",
+            "confirm_cost",
+            "policy.toml",
+            "replaces the whole [capabilities] table",
+            "conflicts[]",
+        ] {
+            assert!(d.contains(kept), "the description lost `{kept}`: {d}");
         }
     }
 

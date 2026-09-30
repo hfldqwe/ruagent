@@ -9,7 +9,20 @@ use ruagent_daemon::config::DaemonConfig;
 use ruagent_daemon::runs::RunManager;
 use ruagent_store::Db;
 
+/// The `policy.toml` every test in this file starts from unless it says otherwise:
+/// permissions only, so the `[capabilities]` table is ABSENT (legacy mode, L1).
+const DEFAULT_TEST_POLICY: &str = "[permissions]\ndefault = \"ask\"\n";
+
 async fn start_test_daemon() -> (String, std::path::PathBuf) {
+    start_test_daemon_with_policy(DEFAULT_TEST_POLICY).await
+}
+
+/// Boot the daemon with `policy_toml` as its `policy.toml`, and install the plane
+/// the FILE defines into the live handle — the same thing `ruagent serve` does at
+/// boot (`crates/daemon/src/lib.rs`), so a test can assert what a file that already
+/// carries a row does at LOAD time (design §11.5: load and read are unchanged by the
+/// write-door refusal).
+async fn start_test_daemon_with_policy(policy_toml: &str) -> (String, std::path::PathBuf) {
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!("ruagent-kbapi-{}-{seq}", std::process::id()));
@@ -26,11 +39,7 @@ async fn start_test_daemon() -> (String, std::path::PathBuf) {
         "[profile.default]\nservers = []\n",
     )
     .unwrap();
-    std::fs::write(
-        config_dir.join("policy.toml"),
-        "[permissions]\ndefault = \"ask\"\n",
-    )
-    .unwrap();
+    std::fs::write(config_dir.join("policy.toml"), policy_toml).unwrap();
 
     let cfg = DaemonConfig::load(&root).unwrap();
     let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
@@ -53,6 +62,8 @@ async fn start_test_daemon() -> (String, std::path::PathBuf) {
         None,
         ruagent_daemon::distill::AgentRegistry::default(),
     );
+    // The file's plane reaches the live handle exactly as it does in `serve`.
+    chats.set_capabilities(cfg.capabilities.clone());
     let mgr = Arc::new(RunManager::new(
         db.clone(),
         root.clone(),
@@ -809,6 +820,116 @@ async fn put_capabilities(
     body
 }
 
+/// The same `PUT` WITHOUT the 200 assertion: the write door's refusals are
+/// assertions of their own (status, body, and an untouched file).
+async fn put_capabilities_raw(
+    http: &reqwest::Client,
+    daemon_url: &str,
+    capabilities: serde_json::Value,
+) -> (reqwest::StatusCode, String) {
+    let resp = http
+        .put(format!("{daemon_url}/api/v1/capabilities"))
+        .json(&serde_json::json!({ "capabilities": capabilities }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.text().await.unwrap())
+}
+
+async fn capabilities_get(http: &reqwest::Client, daemon_url: &str) -> serde_json::Value {
+    let resp = http
+        .get(format!("{daemon_url}/api/v1/capabilities"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "GET capabilities failed: {body:?}");
+    body
+}
+
+/// One capability row of a `GET`/`PUT /api/v1/capabilities` payload.
+fn row_of<'a>(body: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    body["capabilities"]
+        .as_array()
+        .unwrap_or_else(|| panic!("capabilities is not an array: {body}"))
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap_or_else(|| panic!("no row for `{id}` in {body}"))
+}
+
+/// `policy.toml`, verbatim — the file the daemon writes, and the thing a write
+/// must leave alone when it is refused.
+fn policy_text(root: &std::path::Path) -> String {
+    std::fs::read_to_string(root.join("config").join("policy.toml")).unwrap()
+}
+
+/// The `[capabilities.<id>]` block of `policy.toml`, verbatim: its header line to
+/// the next table header. The bytes a write about ANOTHER row must not disturb.
+fn capability_block(text: &str, id: &str) -> String {
+    let header = format!("[capabilities.{id}]");
+    let mut out = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with('[') {
+            if line.trim() == header {
+                inside = true;
+                continue;
+            }
+            if inside {
+                break;
+            }
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    assert!(!out.is_empty(), "no `{header}` block in:\n{text}");
+    out
+}
+
+/// THE PANEL'S READ-MODIFY-WRITE BODY, built from what the API reports (design
+/// §11.5): for every row the FILE names (`configured == "file"`), emit ONLY the
+/// keys `options_set` says the file carries, plus `enabled` when it says the same —
+/// and nothing at all for a row the file does not name. That is the loop the two
+/// additive fields exist for: a body that re-emitted every RESOLVED value is exactly
+/// the defect (the registry default becomes a key in the user's file).
+fn panel_body(body: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for row in body["capabilities"].as_array().expect("rows is an array") {
+        if row["configured"] != "file" {
+            continue;
+        }
+        let set = row["options_set"].as_object().expect("options_set");
+        let mut entry = serde_json::Map::new();
+        if set.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
+            entry.insert("enabled".to_string(), row["enabled"].clone());
+        }
+        for schema in row["options_schema"].as_array().expect("options_schema") {
+            let key = schema["key"].as_str().expect("a schema entry has a key");
+            if set.get(key).and_then(|v| v.as_bool()) == Some(true) {
+                entry.insert(key.to_string(), row["options"][key].clone());
+            }
+        }
+        out.insert(
+            row["id"].as_str().expect("a row has an id").to_string(),
+            serde_json::Value::Object(entry),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// One key of one row of a simulated panel body: the edit a user's save performs.
+fn set_option(body: &mut serde_json::Value, id: &str, key: &str, value: serde_json::Value) {
+    let row = body
+        .get_mut(id)
+        .and_then(|row| row.as_object_mut())
+        .unwrap_or_else(|| panic!("the body has no row `{id}`"));
+    row.insert(key.to_string(), value);
+}
+
 /// Every recall leg the registry knows, switched on at its default weight.
 fn all_recall_legs_on() -> serde_json::Value {
     serde_json::json!({
@@ -1514,12 +1635,48 @@ async fn a_disabled_memory_leg_records_zero_not_its_stale_weight() {
     assert_eq!(off_candidates["memory_fusion"], off["memory_fusion"]);
 
     // The other half: 0.0 with the leg ENABLED is refused, not silently accepted as
-    // "a leg weighted to zero" — so off and zero-weight cannot be confused.
+    // "a leg weighted to zero" — so off and zero-weight cannot be confused. Since
+    // increment 4 it is refused at TWO doors, deliberately (design §11.5), and the
+    // first one MOVED: a PUT that would CREATE the state is now refused with the
+    // recall path's own sentence (before this change it answered 200 and wrote it,
+    // and only the next recall answered 400 — a recorded behaviour change, not a
+    // bug fix).
     let mut zeroed = all_recall_legs_on();
     zeroed["recall_leg_memory_semantic"] = serde_json::json!({ "enabled": true, "weight": 0.0 });
-    put_capabilities(&http, &daemon_url, zeroed).await;
-    let resp = http
-        .get(format!("{daemon_url}/api/v1/recall"))
+    let before_write = policy_text(&root);
+    let (status, refusal) = put_capabilities_raw(&http, &daemon_url, zeroed).await;
+    println!("READING t8 write door: enabled=true weight=0.0 -> {status}: {refusal}");
+    assert_eq!(
+        status, 400,
+        "the write door refuses the state the recall path is guaranteed to reject: {refusal}"
+    );
+    assert!(
+        refusal.contains("disable the leg instead of zeroing it"),
+        "with the recall path's own sentence: {refusal}"
+    );
+    assert_eq!(
+        policy_text(&root),
+        before_write,
+        "a refused write writes nothing"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    // READ/LOAD IS UNCHANGED: a policy.toml that ALREADY carries the row still boots
+    // and still 400s at recall, naming the leg — no migration, no dead daemon.
+    let (url2, root2) = start_test_daemon_with_policy(
+        "[permissions]\ndefault = \"ask\"\n\n[capabilities.recall_leg_memory_semantic]\n\
+         enabled = true\nweight = 0.0\n",
+    )
+    .await;
+    let http2 = reqwest::Client::new();
+    let booted = capabilities_get(&http2, &url2).await;
+    assert_eq!(
+        row_of(&booted, "recall_leg_memory_semantic")["enabled"],
+        true,
+        "the row is in the file and the daemon booted with it: {booted}"
+    );
+    let resp = http2
+        .get(format!("{url2}/api/v1/recall"))
         .query(&[("q", "kettle descaling"), ("top_n", "5")])
         .send()
         .await
@@ -1535,7 +1692,7 @@ async fn a_disabled_memory_leg_records_zero_not_its_stale_weight() {
         body.contains("memory semantic"),
         "the refusal names the leg it is about: {body}"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
 }
 
 /// t2 (§20.2): the new evidence is ADDITIVE, and the default run is unchanged.
@@ -1635,5 +1792,296 @@ async fn the_memory_fusion_label_is_additive_at_the_default_configuration() {
         "the default leg configuration moved the recall ranking"
     );
     assert_eq!(body["memory_fusion"], configured["memory_fusion"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// THE CLOSURE TEST of the declared-option surface (design §11.5, increment 4). It
+/// is the panel's whole loop, over HTTP: read the rows, see EVERY declared key, edit
+/// one, write the body back, and leave the rest of the user's file exactly as it was.
+///
+/// The seed is TWO configured rows, and the second one is the important shape:
+/// `recall_leg_memory_semantic` carries `enabled` ALONE — the row a Reset leaves. Its
+/// resolved `weight` is `1.0` (the registry default) while `options_set` says the file
+/// does not carry it, which is precisely the pair of facts that used to turn an
+/// unrelated save into `weight = 1` written into the user's config (measured on
+/// `a0f1eae`). Asserting that the row still carries only what the user set is only a
+/// test BECAUSE `weight` is absent here.
+///
+/// The four assertions, in the design's order (a)-(d).
+#[tokio::test]
+async fn the_panel_sees_every_declared_key_and_a_write_does_not_materialize_defaults() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+
+    // (0) THE DEFAULT CONFIGURATION — no `[capabilities]` table — read over HTTP
+    // before anything is written. This is the additive-ness diff the whole change
+    // rests on: every pre-existing row key keeps its name, its type and its value,
+    // `options` is still the resolved object, `configured` still says `legacy`, and
+    // `options_schema`/`options_set` are the ONLY additions.
+    let fresh = capabilities_get(&http, &daemon_url).await;
+    assert_eq!(fresh["table_present"], serde_json::json!(false));
+    let fresh_row = row_of(&fresh, "recall_leg_memory_semantic");
+    println!("READING §11.5 default-config row: {fresh_row}");
+    assert_eq!(fresh_row["configured"], serde_json::json!("legacy"));
+    assert_eq!(fresh_row["enabled"], serde_json::json!(true));
+    assert_eq!(fresh_row["default_enabled"], serde_json::json!(true));
+    assert_eq!(fresh_row["tier"], serde_json::json!("free"));
+    assert_eq!(fresh_row["new"], serde_json::json!(false));
+    assert_eq!(fresh_row["options"]["weight"], serde_json::json!(1.0));
+    assert_eq!(fresh_row["options"]["min_score"], serde_json::Value::Null);
+    assert!(
+        fresh_row["options_set"]["enabled"] == serde_json::json!(false)
+            && fresh_row["options_set"]["weight"] == serde_json::json!(false),
+        "the ABSENT table carries no key, `enabled` included: {fresh_row}"
+    );
+    let mut pre_existing: Vec<&str> = fresh_row
+        .as_object()
+        .expect("a row is an object")
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !matches!(*k, "options_schema" | "options_set"))
+        .collect();
+    pre_existing.sort_unstable();
+    assert_eq!(
+        pre_existing,
+        [
+            "configured",
+            "default_enabled",
+            "description",
+            "enabled",
+            "gates",
+            "id",
+            "new",
+            "options",
+            "tier",
+        ],
+        "the pre-existing row keys, unmoved"
+    );
+    assert_eq!(fresh["capabilities"].as_array().map(Vec::len), Some(11));
+    assert_eq!(fresh["conflicts"], serde_json::json!([]));
+
+    let seed = serde_json::json!({
+        "knowledge_ingest_graph": {
+            "enabled": true, "max_per_input": 96, "max_docs_per_pass": 20
+        },
+        "recall_leg_memory_semantic": { "enabled": true },
+    });
+    let body = put_capabilities(&http, &daemon_url, seed).await;
+    let other_before = capability_block(&policy_text(&root), "knowledge_ingest_graph");
+
+    // (a) EVERY declared key is visible, and the one the registry leaves unset says
+    // so with `null` — the key the resolved-values field cannot show at all.
+    let row = row_of(&body, "recall_leg_memory_semantic");
+    let schema = row["options_schema"]
+        .as_array()
+        .expect("options_schema is an array");
+    assert_eq!(
+        schema
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["weight", "min_score"],
+        "every DECLARED key, in registry order: {row}"
+    );
+    let weight = schema.iter().find(|e| e["key"] == "weight").unwrap();
+    let min_score = schema
+        .iter()
+        .find(|e| e["key"] == "min_score")
+        .unwrap_or_else(|| panic!("min_score is declared but not in the schema: {row}"));
+    assert_eq!(
+        min_score["default"],
+        serde_json::Value::Null,
+        "the registry declares NO default for this key: {min_score}"
+    );
+    assert_eq!(min_score["kind"], serde_json::json!("float"));
+    assert_eq!(min_score["min"], serde_json::json!(0.0));
+    assert_eq!(min_score["max"], serde_json::json!(1.0));
+    assert_eq!(
+        min_score["expectation"],
+        serde_json::json!("finite and 0.0..=1.0"),
+        "the daemon's OWN phrase — the string its 400 carries, not a second wording"
+    );
+    assert_eq!(weight["default"], serde_json::json!(1.0));
+    assert_eq!(weight["kind"], serde_json::json!("float"));
+    assert_eq!(
+        weight["expectation"],
+        serde_json::json!("finite and 0.0..=100.0")
+    );
+    println!(
+        "READING §11.5(a) schema={} options_set={} options={}",
+        row["options_schema"], row["options_set"], row["options"]
+    );
+    // `options` is still the RESOLVED values — which is why it cannot show the key:
+    assert_eq!(row["options"]["weight"], serde_json::json!(1.0));
+    assert_eq!(row["options"]["min_score"], serde_json::Value::Null);
+    // ...and `options_set` is the FILE's key set, not that resolved object.
+    assert_eq!(row["options_set"]["enabled"], serde_json::json!(true));
+    assert_eq!(
+        row["options_set"]["weight"],
+        serde_json::json!(false),
+        "the file carries `enabled` alone: {row}"
+    );
+    assert_eq!(row["options_set"]["min_score"], serde_json::json!(false));
+    // A row that declares nothing keeps an empty schema — no editor claiming a knob.
+    assert_eq!(
+        row_of(&body, "recall_leg_wiki")["options_schema"],
+        serde_json::json!([])
+    );
+    // The other configured row reports which of ITS keys the file carries.
+    let graph = row_of(&body, "knowledge_ingest_graph");
+    assert_eq!(graph["options_set"]["enabled"], serde_json::json!(true));
+    assert_eq!(
+        graph["options_set"]["max_per_input"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        graph["options_set"]["max_docs_per_pass"],
+        serde_json::json!(true)
+    );
+
+    // (b) the panel's body (built FROM what the API reports, not hand-written) with
+    // ONE edit: `min_score = 0.4` on the row (a) just made reachable.
+    let mut table = panel_body(&body);
+    set_option(
+        &mut table,
+        "recall_leg_memory_semantic",
+        "min_score",
+        serde_json::json!(0.4),
+    );
+    let body_b = put_capabilities(&http, &daemon_url, table).await;
+    let text_b = policy_text(&root);
+    println!("READING §11.5(b) policy.toml after saving min_score=0.4:\n{text_b}");
+    assert!(text_b.contains("min_score = 0.4"), "{text_b}");
+    let row_b = row_of(&body_b, "recall_leg_memory_semantic");
+    assert_eq!(row_b["options"]["min_score"], serde_json::json!(0.4));
+    assert_eq!(row_b["options_set"]["min_score"], serde_json::json!(true));
+    assert!(
+        !capability_block(&text_b, "recall_leg_memory_semantic").contains("weight"),
+        "the row the write was NOT about must not gain the resolved default: {}",
+        capability_block(&text_b, "recall_leg_memory_semantic")
+    );
+    assert_eq!(
+        capability_block(&text_b, "knowledge_ingest_graph"),
+        other_before,
+        "the other configured row round-trips byte-identical"
+    );
+
+    // (c) a write about a DIFFERENT row (the wiki toggle, the row this write IS
+    // about) must not materialize `weight = 1.0` into the memory row — the exact
+    // regression of §11.5 (2), measured live on `a0f1eae`.
+    let mut table_c = panel_body(&body_b);
+    table_c
+        .as_object_mut()
+        .expect("the body is an object")
+        .insert(
+            "recall_leg_wiki".to_string(),
+            serde_json::json!({ "enabled": false }),
+        );
+    let body_c = put_capabilities(&http, &daemon_url, table_c).await;
+    let text_c = policy_text(&root);
+    let memory_c = capability_block(&text_c, "recall_leg_memory_semantic");
+    println!("READING §11.5(c) the unrelated write left:\n{memory_c}");
+    assert!(memory_c.contains("enabled = true"), "{memory_c}");
+    assert!(
+        memory_c.contains("min_score = 0.4"),
+        "a key the file carries is preserved: {memory_c}"
+    );
+    assert!(
+        !memory_c.contains("weight"),
+        "weight = 1.0 was MATERIALIZED by a write about another row: {memory_c}"
+    );
+    assert_eq!(
+        capability_block(&text_c, "knowledge_ingest_graph"),
+        other_before,
+        "the untouched row is still byte-identical"
+    );
+    assert!(
+        text_c.contains("[capabilities.recall_leg_wiki]"),
+        "the row the write WAS about landed: {text_c}"
+    );
+    assert_eq!(
+        row_of(&body_c, "recall_leg_wiki")["options_set"]["enabled"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        row_of(&body_c, "recall_leg_memory_semantic")["options_set"]["weight"],
+        serde_json::json!(false),
+        "and the write did not turn the default into a file key"
+    );
+
+    // (d) the write door: `enabled + weight 0.0` is refused with the recall path's
+    // own sentence, the file is byte-identical, and the next recall still succeeds.
+    let before_d = policy_text(&root);
+    let mut table_d = panel_body(&body_c);
+    set_option(
+        &mut table_d,
+        "recall_leg_memory_semantic",
+        "weight",
+        serde_json::json!(0.0),
+    );
+    let (status, refusal) = put_capabilities_raw(&http, &daemon_url, table_d).await;
+    println!("READING §11.5(d) PUT enabled + weight 0.0 -> {status}: {refusal}");
+    assert_eq!(
+        status, 400,
+        "the write door refuses a configuration the recall path is guaranteed to reject: {refusal}"
+    );
+    assert!(
+        refusal.contains("disable the leg instead of zeroing it"),
+        "with the recall path's own sentence: {refusal}"
+    );
+    assert!(
+        refusal.contains("memory semantic"),
+        "naming the leg it is about: {refusal}"
+    );
+    assert_eq!(
+        policy_text(&root),
+        before_d,
+        "a refused write writes nothing"
+    );
+    let still = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    assert_eq!(
+        row_of(
+            &capabilities_get(&http, &daemon_url).await,
+            "recall_leg_memory_semantic"
+        )["options"]["weight"],
+        serde_json::json!(1.0),
+        "and the live plane did not move either: {still}"
+    );
+
+    // (e) THE CONTROL, and the reason (c) has teeth. The OLD body shape — every row
+    // the file names re-emitting every RESOLVED non-null value, which is what the
+    // panel did before `options_set` existed — DOES write `weight = 1.0` into the
+    // user's file. This is the defect §11.5 (2) measured, reproduced here against
+    // this same daemon, so (c)'s "weight was not materialized" is known to be an
+    // assertion that can fail rather than a comment. It runs LAST so it cannot
+    // disturb (a)-(d).
+    let mut old_style = serde_json::Map::new();
+    for r in body_c["capabilities"].as_array().expect("rows is an array") {
+        if r["configured"] != "file" {
+            continue;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("enabled".to_string(), r["enabled"].clone());
+        for (key, value) in r["options"].as_object().expect("options is an object") {
+            if !value.is_null() {
+                entry.insert(key.clone(), value.clone());
+            }
+        }
+        old_style.insert(
+            r["id"].as_str().expect("a row has an id").to_string(),
+            serde_json::Value::Object(entry),
+        );
+    }
+    assert!(
+        !capability_block(&policy_text(&root), "recall_leg_memory_semantic").contains("weight"),
+        "the control starts from a row the file does NOT carry `weight` for"
+    );
+    put_capabilities(&http, &daemon_url, serde_json::Value::Object(old_style)).await;
+    let after_e = capability_block(&policy_text(&root), "recall_leg_memory_semantic");
+    println!("READING §11.5(e) the OLD body shape materialized:\n{after_e}");
+    assert!(
+        after_e.contains("weight = 1.0"),
+        "the control must reproduce the re-materialization: {after_e}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
