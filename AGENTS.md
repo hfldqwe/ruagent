@@ -203,6 +203,29 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   own entries above cite bare ids from earlier generations (t66, t93/t81, t76, t45/t54, t188), so this
   is an improvement on current practice rather than a description of it; apply it to new comments and
   do not rewrite the old ones as a drive-by.
+- **A green gate certifies the BYTES it ran on, so a post-handover edit must be disclosed and the gates
+  re-run** (ruagent-tunable-capabilities t20, from the increment-5 handover). The increment-5
+  implementer added two COMMENT-ONLY clarifications to `crates/daemon/src/capability.rs` AFTER handing
+  the task over — prompted by a captain question about a sixth leg — while that increment's verification
+  had already started: `git diff --numstat` for the file moved from `223/69` to `242/69` mid-run, and
+  nothing on disk said why. The failure mode is silent, which is why this is written down: a green
+  reading belonging to a previous revision looks EXACTLY like a green reading of the bytes in the tree,
+  so the next reader cannot tell them apart, and a verification built on the earlier run certifies bytes
+  it never saw. Two obligations follow.
+  * **The author of the edit** re-runs the gates on the FINAL bytes and says which reading belongs to
+    which revision. Avoiding the edit is not the rule ("never touch it after handover" is not always
+    available — a review's question can require a clarification); DISCLOSING it and re-covering it is.
+  * **A verifier or reviewer that sees a hash move** re-hashes, establishes the NATURE of the change BY
+    READING THE DIFF — never by accepting the author's or the captain's summary of it — and states which
+    revision each of its readings came from.
+  What the honest path cost, and what the silent one hides: in that round the verifier's own copy of the
+  file POSTDATED the write, so the 19 added lines could not be isolated at all; it refused to take
+  "comment-only" on trust, re-ran all four gates against the final bytes, and reported the earlier run as
+  unpinnable and superseded. One re-run and one sentence bought that. Without the disclosure the same
+  moved hash is indistinguishable from a task whose green reading belongs to a different revision. Note
+  who else this binds: a captain's follow-up question is one of the things that CAUSES a post-handover
+  edit, so the duty to disclose and re-run sits with the author and with the captain who asked — not only
+  with the next verifier.
 
 ## E2E specs that write the daemon's real config
 

@@ -51,11 +51,9 @@ use std::path::{Path, PathBuf};
 
 use axum::Json;
 use axum::extract::State;
-use ruagent_knowledge::rrf::WeightError;
 
 use crate::api::{ApiError, AppState};
 use crate::config::CapabilitiesEditor;
-use crate::memembed::RecallLeg;
 
 // ---------------------------------------------------------------------------
 // The registry (§4.2)
@@ -938,65 +936,113 @@ fn unconfirmed_llm_enable(
         .map(|s| s.id)
 }
 
-/// THE WRITE DOOR for the leg-weight invariant (design §11.5; increment 4).
-/// `Some(message)` = this request would leave a MEMORY leg enabled at weight 0.
+/// Does the RECALL RUNTIME refuse this plane because of THIS capability — and with
+/// what sentence? Asked through the runtime's own composition,
+/// [`crate::api::recall_legs`] (= `RecallLegConfig::resolve`, the call the recall
+/// handler makes), on a plane whose ONLY configured row is this capability, so the
+/// answer can only be about it.
 ///
-/// THE INVARIANT. `check_weights` (`crates/knowledge/src/rrf.rs`) refuses an
-/// ENABLED leg at weight `<= 0.0`, and the recall handler turns that into a 400
-/// naming the leg. The negative half never reaches this door — `validate` already
-/// refuses a weight below `0.0` — so the state this checks is exactly
-/// `weight == 0.0` with the leg enabled. `CapabilityPlane::from_policy`
-/// deliberately does NOT enforce it: doing so would stop a `policy.toml` that
-/// boots today from booting at all, and a daemon that refuses to start cannot show
-/// the user which line to fix.
+/// `None` = the runtime accepts it. That covers three shapes, and none of them is
+/// decided here: the capability declares no `weight` at all (the daemon's other nine
+/// rows, `recall_leg_wiki` and `recall_leg_graph` among them); the runtime does not
+/// weigh it (`RecallLegConfig` carries wiki and graph as plain bools, so
+/// `check_weights` never sees them); or the leg is DISABLED, and the runtime ignores a
+/// disabled leg's weight (clause 3 of `check_weights` — that is what `enabled = false`
+/// is for).
+///
+/// The probe carries the plane's OWN readings, so the runtime does its own
+/// `Option<f64> -> f32` conversion and applies its own default: the door re-implements
+/// neither. Every other row of the probe is ABSENT, i.e. at its registry default,
+/// which is a value the runtime accepts for every weighted row — so no other row can
+/// produce this answer.
+fn runtime_refusal(plane: &CapabilityPlane, id: CapabilityId) -> Option<String> {
+    let file = ruagent_policy::CapabilityFile {
+        enabled: Some(plane.gate(id, true)),
+        weight: plane.options(id).weight,
+        ..Default::default()
+    };
+    // Built structurally rather than through `from_policy`: both values are readings of
+    // a plane that already validated (the registry default in between is valid by
+    // construction), and this probe is an ARGUMENT SOURCE for the runtime — it is never
+    // written to a file and never installed anywhere.
+    let probe = CapabilityPlane {
+        table: Some(BTreeMap::from([(id.as_str().to_string(), file)])),
+    };
+    crate::api::recall_legs(&probe)
+        .err()
+        .map(crate::api::leg_config_error)
+}
+
+/// THE WRITE DOOR for the leg-weight invariant (design §11.5; increment 4 bounded it
+/// to the MEMORY legs, increment 5 REMOVED that bound). `Some(message)` = this request
+/// would newly leave a leg in a state the runtime refuses.
+///
+/// THE INVARIANT. `check_weights` (`crates/knowledge/src/rrf.rs`) refuses an ENABLED
+/// leg at weight `<= 0.0`, and the recall handler turns that into a 400 naming the leg.
+/// The negative half never reaches this door — `validate` already refuses a weight
+/// below `0.0` — so the state this checks is exactly `weight == 0.0` with the leg
+/// enabled. `CapabilityPlane::from_policy` deliberately does NOT enforce it: doing so
+/// would stop a `policy.toml` that boots today from booting at all, and a daemon that
+/// refuses to start cannot show the user which line to fix.
+///
+/// THE COVERAGE IS THE RUNTIME'S, AND IT IS DISCOVERED RATHER THAN LISTED. For every id
+/// the registry knows, the door asks the runtime ([`runtime_refusal`]) whether this
+/// plane would put THAT capability in a state the runtime refuses, and whether the
+/// previous plane already did. There is no leg list here, no leg LABEL and no copy of
+/// the rule: `MemoryLegs::validate` and `LegConfig::validate` are what decide which legs
+/// carry a weight — measured over HTTP and in this module: `memory semantic`,
+/// `memory fts`, `knowledge semantic`, `knowledge keyword`, exactly the four rows that
+/// declare a `weight` — and a leg added to the runtime later is covered the moment it
+/// exists, without this file changing, PROVIDED its reading reaches `recall_legs`
+/// (crate::api), which is the one piece of leg WIRING the daemon owns: that is the
+/// argument list of the runtime's own resolver, it is arity-checked by the compiler,
+/// and a weighted leg that is declared but left unwired turns
+/// `the_write_door_covers_exactly_the_legs_the_runtime_refuses` RED rather than
+/// leaving a silent gap. The equality is asserted per capability id
+/// against `recall_legs` by `the_write_door_covers_exactly_the_legs_the_runtime_refuses`,
+/// rather than against a second list.
 ///
 /// BEFORE/AFTER, the [`unconfirmed_llm_enable`] shape: the door fires on the
-/// TRANSITION (the state is new to this request), not on the resulting state. A
-/// file that ALREADY carries `enabled = true, weight = 0.0` still boots, its read
-/// path is untouched (recall still 400s, loudly, naming the leg), and — this is
-/// why the check is a transition — its panel can still save: refusing every write
-/// that merely carries the state forward would brick the UI of exactly the file
-/// the boot refusal was rejected for.
+/// TRANSITION (the state is new to this request), not on the resulting state. A file
+/// that ALREADY carries a refused leg still boots, its read path is untouched (recall
+/// still 400s, loudly, naming the leg), AND it stays editable: refusing every write
+/// that merely carries the state forward would brick the panel of exactly the file the
+/// boot refusal was rejected for.
 ///
-/// BEHAVIOUR CHANGE, recorded as one (a change, not a bug fix).
-/// * BEFORE (`a0f1eae`): `PUT {"recall_leg_memory_semantic": {"enabled": true,
-///   "weight": 0.0}}` answered **200** and wrote it; the NEXT `GET /api/v1/recall`
-///   answered **400**. The configuration was accepted by the door that owns the
-///   file and rejected by the path that reads it.
-/// * AFTER: the same `PUT` answers **400** with the recall path's own sentence, and
-///   the file is byte-identical. Load and read are unchanged.
+/// BEHAVIOUR CHANGE, recorded as one (a change, not a bug fix). Increment 4 shipped
+/// this door for the MEMORY pair only, which left the two surfaces disagreeing: the
+/// panel's own guard refuses an enabled `weight = 0` leg on EVERY row that declares a
+/// weight (`panel/src/capability-options.ts`, `zeroWeightEnabled`) — the knowledge legs
+/// included — while the door accepted them. So the panel could refuse a state the
+/// daemon's own door would have taken, and a client that did not carry that guard could
+/// persist one.
+/// * BEFORE (`4677912`, increment 4): `PUT {"recall_leg_knowledge_semantic":
+///   {"enabled": true, "weight": 0.0}}` answered **200** and wrote it; the NEXT
+///   `GET /api/v1/recall` answered **400**. The configuration was accepted by the door
+///   that owns the file and rejected by the path that reads it.
+/// * AFTER: the same `PUT` answers **400** with the recall path's own sentence
+///   (`leg \`knowledge semantic\` is enabled with weight 0: … disable the leg instead
+///   of zeroing it`), and the file is byte-identical. Load and read are unchanged.
 ///
-/// SCOPE, bounded deliberately: enforced and measured for the MEMORY legs
-/// (`recall_leg_memory_semantic`, `recall_leg_memory_fts`). Whether
-/// `recall_leg_knowledge_*` gets the same guard is NOT asserted here — those legs
-/// are still refused at recall time by the same shared `check_weights`.
+/// BOUNDED TO WHAT WAS MEASURED: the four legs named above are refused at the door and
+/// wiki/graph are not (they have no weight to refuse); a DISABLED leg at any weight is
+/// never refused; and a plane that merely carries a refused row forward is accepted, so
+/// such a file stays editable. The panel and this door now enumerate the same set — the
+/// rows that declare a `weight`, which the equality test pins to the runtime's own
+/// weighed legs.
 ///
 /// The SENTENCE is not spelled in this file: it is [`WeightError`]'s own `Display`
-/// under the prefix [`crate::api::leg_config_error`] builds, which the recall
-/// handler uses too, so the door and the read path answer with one sentence and
-/// neither can drift from the other.
-fn zero_weight_memory_leg(before: &CapabilityPlane, after: &CapabilityPlane) -> Option<String> {
-    for (id, leg) in [
-        (
-            CapabilityId::RecallLegMemorySemantic,
-            RecallLeg::MemorySemantic,
-        ),
-        (CapabilityId::RecallLegMemoryFts, RecallLeg::MemoryFts),
-    ] {
-        // The runtime's OWN conversion and comparison, so the door cannot be
-        // stricter or looser than read time at any edge: `MemoryLegs::resolve` maps
-        // an absent weight to 1.0 and casts to `f32`, and `check_weights` refuses
-        // `enabled && weight <= 0.0`.
-        let weight = |p: &CapabilityPlane| p.options(id).weight.map_or(1.0, |w| w as f32);
-        let zeroed = |p: &CapabilityPlane| p.enabled(id) && weight(p) <= 0.0;
-        if zeroed(after) && !zeroed(before) {
-            return Some(crate::api::leg_config_error(WeightError::NonPositive {
-                leg: leg.label(),
-                weight: weight(after),
-            }));
-        }
-    }
-    None
+/// under the prefix [`crate::api::leg_config_error`] builds, which the recall handler
+/// uses too, so the door and the read path answer with one sentence and neither can
+/// drift from the other.
+fn zero_weight_leg(before: &CapabilityPlane, after: &CapabilityPlane) -> Option<String> {
+    // Registry order, so which leg a request hears about first is deterministic (and
+    // matches the runtime's own memory-then-knowledge order for a plane that breaks
+    // one leg in each pair).
+    CapabilityId::ALL.iter().find_map(|id| {
+        let refusal = runtime_refusal(after, *id)?;
+        runtime_refusal(before, *id).is_none().then_some(refusal)
+    })
 }
 
 /// `PUT /api/v1/capabilities` — replace the whole `[capabilities]` table
@@ -1028,10 +1074,10 @@ pub async fn update_capabilities(
     // The cross-field invariant the recall path enforces (§11.5): a state the read
     // path is GUARANTEED to reject is not accepted here either. This is a
     // deliberate behaviour change — before it, this PUT answered 200 and wrote a
-    // configuration whose next read answered 400; see
-    // `zero_weight_memory_leg` for the before/after and for why it fires on the
-    // transition rather than on the resulting state.
-    if let Some(message) = zero_weight_memory_leg(&before, &after) {
+    // configuration whose next read answered 400; see `zero_weight_leg` for the
+    // before/after and for why it fires on the transition rather than on the
+    // resulting state.
+    if let Some(message) = zero_weight_leg(&before, &after) {
         return Err(ApiError::bad_request(message));
     }
     if let Some(id) = unconfirmed_llm_enable(&before, &after, req.confirm_cost) {
@@ -1670,19 +1716,19 @@ mod tests {
         );
     }
 
-    /// THE WRITE DOOR (increment 4, §11.5). Before/after, the
-    /// `unconfirmed_llm_enable` shape: a `PUT` that CREATES an enabled memory leg at
-    /// weight 0.0 is refused; one that merely carries an existing one forward is not
-    /// (a file that already carries the state still boots, and its panel must still
-    /// be able to save).
+    /// THE WRITE DOOR (§11.5). Before/after, the `unconfirmed_llm_enable` shape: a
+    /// `PUT` that CREATES an enabled leg at weight 0.0 is refused; one that merely
+    /// carries an existing one forward is not (a file that already carries the state
+    /// still boots, and its panel must still be able to save). Increment 5 covered the
+    /// KNOWLEDGE legs too, so both families are asserted here.
     #[test]
-    fn the_write_door_refuses_a_new_enabled_memory_leg_at_zero_weight() {
+    fn the_write_door_refuses_a_new_enabled_leg_at_zero_weight_and_is_a_transition() {
         let healthy =
             plane("[capabilities.recall_leg_memory_semantic]\nenabled = true\nweight = 1.0\n");
         let zeroed =
             plane("[capabilities.recall_leg_memory_semantic]\nenabled = true\nweight = 0.0\n");
 
-        let message = zero_weight_memory_leg(&healthy, &zeroed).expect("the transition is refused");
+        let message = zero_weight_leg(&healthy, &zeroed).expect("the transition is refused");
         // The sentence IS the recall path's: claimed here against the runtime's own
         // constructor (`RecallLegConfig::resolve` -> `check_weights`), so the door
         // cannot grow a second wording.
@@ -1703,9 +1749,9 @@ mod tests {
         assert!(message.contains("memory semantic"), "{message}");
 
         // No transition, no refusal: an existing zero is not a NEW misconfiguration.
-        assert_eq!(zero_weight_memory_leg(&zeroed, &zeroed), None);
+        assert_eq!(zero_weight_leg(&zeroed, &zeroed), None);
         assert_eq!(
-            zero_weight_memory_leg(&zeroed, &healthy),
+            zero_weight_leg(&zeroed, &healthy),
             None,
             "fixing it is a legal write"
         );
@@ -1713,10 +1759,137 @@ mod tests {
         // disabled leg's weight, and disabling is the supported way to drop one.
         let off =
             plane("[capabilities.recall_leg_memory_semantic]\nenabled = false\nweight = 0.0\n");
-        assert_eq!(zero_weight_memory_leg(&healthy, &off), None);
+        assert_eq!(zero_weight_leg(&healthy, &off), None);
         // The other memory leg, whose message names ITS leg.
         let fts = plane("[capabilities.recall_leg_memory_fts]\nenabled = true\nweight = 0.0\n");
-        let fts_message = zero_weight_memory_leg(&healthy, &fts).expect("fts is refused too");
+        let fts_message = zero_weight_leg(&healthy, &fts).expect("fts is refused too");
         assert!(fts_message.contains("memory fts"), "{fts_message}");
+
+        // INCREMENT 5: the KNOWLEDGE legs are covered by the same door, and their
+        // sentence names the runtime's own label for them.
+        let knowledge_semantic =
+            plane("[capabilities.recall_leg_knowledge_semantic]\nenabled = true\nweight = 0.0\n");
+        let ks_message =
+            zero_weight_leg(&healthy, &knowledge_semantic).expect("a knowledge leg is refused");
+        assert!(ks_message.contains("knowledge semantic"), "{ks_message}");
+        assert!(
+            ks_message.contains("disable the leg instead of zeroing it"),
+            "{ks_message}"
+        );
+        let knowledge_fts =
+            plane("[capabilities.recall_leg_knowledge_fts]\nenabled = true\nweight = 0.0\n");
+        let kf_message =
+            zero_weight_leg(&healthy, &knowledge_fts).expect("the other knowledge leg too");
+        assert!(kf_message.contains("knowledge keyword"), "{kf_message}");
+        // ...and the transition rule holds for them as well, so a file that already
+        // carries one stays editable.
+        assert_eq!(
+            zero_weight_leg(&knowledge_semantic, &knowledge_semantic),
+            None
+        );
+        assert_eq!(
+            zero_weight_leg(&knowledge_semantic, &healthy),
+            None,
+            "fixing a knowledge leg is a legal write"
+        );
+        // A leg the runtime does NOT weigh is never refused by this door: wiki and
+        // graph are switches in `RecallLegConfig`, and `check_weights` never sees them.
+        let wiki = plane("[capabilities.recall_leg_wiki]\nenabled = true\n");
+        assert_eq!(zero_weight_leg(&healthy, &wiki), None);
+        assert_eq!(
+            zero_weight_leg(&healthy, &CapabilityPlane::legacy()),
+            None,
+            "legacy mode (table absent) can carry no refused leg"
+        );
+    }
+
+    /// THE DOOR'S COVERAGE IS THE RUNTIME'S COVERAGE (increment 5). NEITHER SIDE OF
+    /// THIS COMPARISON IS A LIST OF LEGS: for every capability the registry knows, the
+    /// door is asked about a plane that puts that capability at `enabled + weight 0.0`
+    /// (or plain `enabled` where it cannot carry a weight), and the runtime's own answer
+    /// is `recall_legs(&after)` — `RecallLegConfig::resolve`, the call the recall handler
+    /// makes. Equality is asserted per id, so a leg the runtime learns to weigh (or one
+    /// the registry stops configuring) cannot be covered by one side and not the other,
+    /// and the door's sentence is asserted to be the runtime's sentence.
+    #[test]
+    fn the_write_door_covers_exactly_the_legs_the_runtime_refuses() {
+        let healthy = CapabilityPlane::legacy();
+        let mut covered: Vec<&'static str> = Vec::new();
+        for id in CapabilityId::ALL {
+            // The one row this probe configures. A row that declares no `weight` cannot
+            // be given one — `from_policy` refuses the undeclared key — so the probe
+            // spells only what the registry declares.
+            let file = ruagent_policy::CapabilityFile {
+                enabled: Some(true),
+                weight: spec(*id)
+                    .options
+                    .contains(&OptionKey::Weight)
+                    .then_some(0.0),
+                ..Default::default()
+            };
+            let after = CapabilityPlane::from_policy(&ruagent_policy::PolicyConfig {
+                capabilities: Some(BTreeMap::from([(id.as_str().to_string(), file)])),
+                ..Default::default()
+            })
+            .expect("a probe row the registry declares validates");
+
+            let door = zero_weight_leg(&healthy, &after);
+            let runtime = crate::api::recall_legs(&after);
+            assert_eq!(
+                door.is_some(),
+                runtime.is_err(),
+                "`{}`: the door and the runtime must agree",
+                id.as_str()
+            );
+            match (door, runtime) {
+                (Some(message), Err(e)) => {
+                    assert_eq!(
+                        message,
+                        crate::api::leg_config_error(e),
+                        "`{}`: one sentence, the runtime's",
+                        id.as_str()
+                    );
+                    covered.push(id.as_str());
+                }
+                (None, Ok(_)) => {}
+                (door, runtime) => panic!("`{}`: door={door:?} runtime={runtime:?}", id.as_str()),
+            }
+        }
+        // The reading, and why it is the same set on both daemon surfaces: the legs the
+        // runtime weighs are exactly the rows that DECLARE a `weight`, which is the set
+        // the panel's own guard (`zeroWeightEnabled`) applies to. Computed, not listed.
+        //
+        // THIS ASSERTION IS ALSO THE "SIXTH LEG" ALARM, and it is the reason the door
+        // itself may not carry a list. If a leg is added to the runtime later: with a
+        // registry row that declares `weight` and the reading wired into
+        // `crate::api::recall_legs`, the door covers it automatically (the per-id
+        // equality above stays green because the door ASKS the runtime) and this
+        // comparison stays green; a leg added to the runtime but NOT wired into
+        // `recall_legs` makes `covered` miss an id that `declares_weight` has, so this
+        // goes RED and forces the decision instead of drifting; a registry row that
+        // declares no `weight` (wiki, graph, and the nine non-recall capabilities)
+        // appears in neither list. A hardcoded list in the door would make all three
+        // cases silent.
+        let declares_weight: Vec<&'static str> = specs()
+            .iter()
+            .filter(|s| s.options.contains(&OptionKey::Weight))
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            covered, declares_weight,
+            "the door's coverage is exactly the registry's weight-declaring rows"
+        );
+        // The four ids below are the READING this increment is about, not an input to
+        // the door: the set above was computed from the runtime and the registry.
+        assert_eq!(
+            covered,
+            [
+                "recall_leg_memory_semantic",
+                "recall_leg_memory_fts",
+                "recall_leg_knowledge_semantic",
+                "recall_leg_knowledge_fts",
+            ],
+            "the reading this increment is about: four legs, wiki and graph NOT among them"
+        );
     }
 }

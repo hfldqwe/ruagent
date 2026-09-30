@@ -295,12 +295,31 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
 /// The message of a REFUSED tool call. A refusal that reads as a success is the
 /// failure this helper exists to make impossible: `ErrorData` reaches the
 /// client as a JSON-RPC error, so `Ok(..)` here is a broken contract, not a
-/// softer assertion.
+/// softer assertion. A failure raised BEFORE the handler runs (rmcp's parameter
+/// extraction, t17) arrives as `Ok(..)` with `is_error: true` instead — that is
+/// [`failure`]'s shape, and the difference is the layer, not the severity.
 fn refusal(out: Result<rmcp::model::CallToolResult, rmcp::ServiceError>) -> String {
     match out {
         Err(e) => e.to_string(),
         Ok(r) => panic!(
             "expected a refusal, got a successful result: {} / {r:?}",
+            text_of(&r)
+        ),
+    }
+}
+
+/// A tool call that FAILED as the client sees it. Two shapes are legitimate and
+/// both are failures a caller acts on: a JSON-RPC error (`Err`, what a
+/// handler-level `Err(ErrorData)` produces) and a tool result with
+/// `is_error: true` (what rmcp's own parameter extraction produces for a field the
+/// tool cannot send — t17). A plain `Ok` that is not an error is the false success
+/// this helper exists to make impossible.
+fn failure(out: Result<rmcp::model::CallToolResult, rmcp::ServiceError>) -> String {
+    match out {
+        Err(e) => e.to_string(),
+        Ok(r) if r.is_error == Some(true) => text_of(&r),
+        Ok(r) => panic!(
+            "expected a failure, got a successful result: {} / {r:?}",
             text_of(&r)
         ),
     }
@@ -802,6 +821,77 @@ async fn capability_set_preserves_the_files_own_key_set() {
         std::fs::read_to_string(&policy).unwrap(),
         after_two,
         "a refused write must not touch the file"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t17: a field this tool cannot SEND is refused, and nothing is written.
+///
+/// The measured defect this closes: `capability_set(id=recall_leg_memory_semantic,
+/// enabled=true, decay_half_life=5.0)` answered SUCCESS while serde dropped the key
+/// before the bridge saw it — the caller was told the update happened, and the key
+/// appeared neither in the reply nor in `policy.toml`. The FILE is the witness here:
+/// a refusal must leave it byte-identical, and the control call through the SAME
+/// daemon shows the tool still writes when every field is one it can send.
+#[tokio::test]
+async fn capability_set_refuses_a_field_it_cannot_send() {
+    let (daemon_url, root) = start_test_daemon_with_policy(
+        "[permissions]\ndefault = \"ask\"\n\n[capabilities.recall_leg_memory_semantic]\nweight = 3.5\n",
+    )
+    .await;
+    let policy = root.join("config").join("policy.toml");
+    let before = std::fs::read_to_string(&policy).unwrap();
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    // The refused call: no success result exists, so nothing can have claimed the
+    // update happened.
+    let err = failure(
+        client
+            .call_tool(call(
+                "capability_set",
+                serde_json::json!({
+                    "id": "recall_leg_memory_semantic",
+                    "enabled": true,
+                    "decay_half_life": 5.0
+                }),
+            ))
+            .await,
+    );
+    assert!(err.contains("unknown field `decay_half_life`"), "{err}");
+    assert!(
+        !err.contains("is now enabled"),
+        "the caller must not be told the change happened: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&policy).unwrap(),
+        before,
+        "the refused call must leave policy.toml untouched"
+    );
+
+    // CONTROL through the same daemon: with only fields the tool can send, the write
+    // lands — the refusal above is about the field, not about the tool being broken.
+    let out = client
+        .call_tool(call(
+            "capability_set",
+            serde_json::json!({
+                "id": "recall_leg_memory_semantic",
+                "enabled": true,
+                "min_score": 0.4
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&out).contains("`recall_leg_memory_semantic` is now enabled=true"),
+        "{out:?}"
+    );
+    let after = std::fs::read_to_string(&policy).unwrap();
+    assert_ne!(after, before, "the control write must land in the file");
+    assert_eq!(
+        capability_section_keys(&after, "recall_leg_memory_semantic"),
+        vec!["enabled", "min_score", "weight"],
+        "the control write adds exactly what the caller set: {after}"
     );
 
     shutdown_pair(client, server_task).await;

@@ -1350,10 +1350,13 @@ file. Both are fixed by making the API report the two facts the panel is current
    `rows()`, `:510`), and the panel renders an input per key whose value is non-null
    (`reportedOptions`, `panel/src/capability-options.ts:118-120`), so that row renders
    `["weight"]` and never `min_score` — measured. The panel's own comment discloses the hole
-   at `capability-options.ts:113-117`. **The MCP surface has the same hole for the same
-   reason**: `capability_set` has the parameter, but `capabilities_list` renders
+   at `capability-options.ts:113-117`. **The MCP surface had the same hole for the same
+   reason**: `capability_set` has the parameter, but `capabilities_list` rendered
    `options_to_text` from RESOLVED values (`crates/mcp/src/lib.rs:621-631`), so an agent
-   reading the list cannot discover the key either. What is unreachable is not cosmetic: the
+   reading the list could not discover the key either. **CLOSED (increment 4): `capabilities_list`
+   now renders the DECLARED schema — `options_to_text` (`crates/mcp/src/lib.rs:714`) calls
+   `declared_options` (`:680`, call site `:716`) — so every declared key is rendered with its
+   provenance and the key IS visible there.** What is unreachable is not cosmetic: the
    handler reads that key and it changes recall (`api.rs:2957-2961`, `.map(|v| v as f32)
    .unwrap_or(if conservative { 0.30 } else { 0.25 })`, used as `min_score` at
    `api.rs:2967-2975` -> `memembed.rs:949`). Without it the override is dead code learned of
@@ -1437,11 +1440,16 @@ correct — with the non-edited branch re-emitting each row's `options_set` keys
 when `options_set.enabled`) instead of every resolved value, which is what removes defect (2).
 `panel/src/api.ts` gains the two fields on `CapabilityRow` (`:296-307`) and the schema type
 next to `CapabilityOptions` (`:281-287`); the shape guard (`:747-768`) does not need them
-(absent fields must not fail the guard, or an older daemon becomes a client-side error). The
+(absent fields must not fail the guard, or an older daemon becomes a client-side error).
+**SUPERSEDED (increment 4, which landed the other way): the guard DOES need them —
+`capabilitiesShape` requires `options_schema` and `options_set`
+(`panel/src/api.ts:820-821`), so a payload missing them fails the guard instead of passing
+it.** The
 MCP's own copy of the key list (`crates/mcp/src/lib.rs:613-619`) is a THIRD spelling of the
 same fact and should be removed in the same change by iterating the row's `options_schema`;
 that is `crates/mcp`, outside this document's file set, so it is named here as the follow-up
-rather than folded in.
+rather than folded in. **DONE (increment 4): that copy is gone — `capabilities_list` iterates
+the row's `options_schema` through `declared_options` (`crates/mcp/src/lib.rs:716`).**
 
 **The cross-field invariant: resolve it at the WRITE door, not at boot (option 3 of three).**
 Measured today: `PUT` accepts `{"<recall leg>": {"enabled": true, "weight": 0.0}}` with 200,
@@ -2186,8 +2194,7 @@ Live probe for t9 (not a substitute for the tests): start the daemon with
    as accepted with the reason; what must not happen is leaving it unstated.
 
    *THE ONE EDGE OF THE WRITE-DOOR RULE (§11.5), recorded with its rule.* The transition check in
-   `zero_weight_memory_leg` (crates/daemon/src/capability.rs — the `PUT`-door check, cited by
-   name because that file is being edited concurrently) compares the RESOLVED
+   `zero_weight_leg` (crates/daemon/src/capability.rs — the `PUT`-door check) compares the RESOLVED
    weights of two planes — `before` is the LIVE PLANE, `after` is the body being written — and
    never reads the file. CONDITION: `policy.toml` is edited behind the daemon's back (there is
    no reload; the plane has never watched the file) so the file says `weight = 1.0` while the

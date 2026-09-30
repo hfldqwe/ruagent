@@ -330,7 +330,10 @@ impl PlatformTools {
     #[tool(
         description = "The generated wiki's pages: slug, status, freshness (fresh|stale|unknown), the recorded cite_coverage and has_anchors. cite_coverage: null means NO BUILD RECORDED a reading for that page -- it is not 0.0 and not 1.0: read it as unknown. WHEN: you need to know which generated pages exist and how stale they are before citing one. COST: free (zero model tokens)."
     )]
-    async fn wiki_pages(&self) -> Result<String, rmcp::ErrorData> {
+    async fn wiki_pages(
+        &self,
+        Parameters(_params): Parameters<NoParams>,
+    ) -> Result<String, rmcp::ErrorData> {
         let url = format!("{}/api/v1/knowledge/wiki/pages", self.config.daemon_url);
         let resp = json_of(self.http.get(&url), "wiki_pages", &self.config.daemon_url).await?;
         Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
@@ -339,7 +342,10 @@ impl PlatformTools {
     #[tool(
         description = "The wiki's link graph: links_out per page (counts broken links, excludes self-links) and links_in, plus the pages that wanted-but-missing pages demand. WHEN: you are checking the wiki's coherence (broken links, wanted pages) or deciding what to generate next. COST: free (zero model tokens)."
     )]
-    async fn wiki_links(&self) -> Result<String, rmcp::ErrorData> {
+    async fn wiki_links(
+        &self,
+        Parameters(_params): Parameters<NoParams>,
+    ) -> Result<String, rmcp::ErrorData> {
         let url = format!("{}/api/v1/knowledge/wiki/links", self.config.daemon_url);
         let resp = json_of(self.http.get(&url), "wiki_links", &self.config.daemon_url).await?;
         Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
@@ -376,7 +382,7 @@ impl PlatformTools {
     // untouched, so no caller breaks; nothing parses a description, and no tool was
     // added or removed. This removes a staleness source and changes no behaviour.
     #[tool(
-        description = "Enable, disable or re-weight ONE capability by id: id=distill_session, enabled=false stops unattended distillation; id=knowledge_ingest_graph, enabled=true lets knowledge documents feed the knowledge graph; id=recall_leg_wiki, enabled=false drops that recall leg. WHEN: the user asks to turn a pipeline on or off, or complains about the behaviour or the cost of one. COST: this call is free, but ENABLING an llm-tier capability (distill_session) makes the platform spend the user's model tokens from then on: say so out loud, and only then pass confirm_cost=true -- without it the daemon refuses the write (HTTP 409) and nothing changes. That check is on the CONFIGURATION, not on what is effectively running, so it is required even when [distill].auto is already true. The write goes to policy.toml and takes effect immediately; the reply is the full post-change state, so read it instead of calling capabilities_list again. OPTION KEYS ARE NOT LISTED HERE ON PURPOSE: which keys a capability accepts is declared per row by capabilities_list's options_schema (one entry per declared key, with its kind, its bounds and the daemon's own accepted-range phrase) -- read the row for the id you are about to change before setting an option; the parameter list below is what this tool can send. An option you omit keeps its current value, and an unknown id or undeclared key is refused with the known ids and the declared keys named. This tool changes exactly one capability and KEEPS every capability policy.toml already configures, because the daemon's PUT replaces the whole [capabilities] table: a bare one-id write would silently reset every other capability to its registry default (and an llm-tier default is OFF). The first write on a root with no [capabilities] table creates one, which puts every capability at its registry default -- read the reply's conflicts[] list: it names any capability whose legacy switch is still on while the capability is now off, and prints the exact [capabilities.<id>] line that restores it."
+        description = "Enable, disable or re-weight ONE capability by id: id=distill_session, enabled=false stops unattended distillation; id=knowledge_ingest_graph, enabled=true lets knowledge documents feed the knowledge graph; id=recall_leg_wiki, enabled=false drops that recall leg. WHEN: the user asks to turn a pipeline on or off, or complains about the behaviour or the cost of one. COST: this call is free, but ENABLING an llm-tier capability (distill_session) makes the platform spend the user's model tokens from then on: say so out loud, and only then pass confirm_cost=true -- without it the daemon refuses the write (HTTP 409) and nothing changes. That check is on the CONFIGURATION, not on what is effectively running, so it is required even when [distill].auto is already true. The write goes to policy.toml and takes effect immediately; the reply is the full post-change state, so read it instead of calling capabilities_list again. OPTION KEYS ARE NOT LISTED HERE ON PURPOSE: which keys a capability accepts is declared per row by capabilities_list's options_schema (one entry per declared key, with its kind, its bounds and the daemon's own accepted-range phrase) -- read the row for the id you are about to change before setting an option; the parameter list below is what this tool can send, and a field this tool does not declare is REFUSED rather than ignored (so a typo cannot look like a successful write). An option you omit keeps its current value, and an unknown id or undeclared key is refused with the known ids and the declared keys named. This tool changes exactly one capability and KEEPS every capability policy.toml already configures, because the daemon's PUT replaces the whole [capabilities] table: a bare one-id write would silently reset every other capability to its registry default (and an llm-tier default is OFF). The first write on a root with no [capabilities] table creates one, which puts every capability at its registry default -- read the reply's conflicts[] list: it names any capability whose legacy switch is still on while the capability is now off, and prints the exact [capabilities.<id>] line that restores it."
     )]
     async fn capability_set(
         &self,
@@ -1200,7 +1206,40 @@ impl ServerHandler for PlatformTools {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool parameters. EVERY struct here carries `deny_unknown_fields`.
+// ---------------------------------------------------------------------------
+//
+// WHY EVERY ONE (ruagent-tunable-capabilities t21, finding F1 — MEASURED: 15 params
+// structs, only `CapabilitySetParams` carried the attribute, and 17 of the 18 PUBLISHED
+// schemas left `additionalProperties` unset). Without the attribute serde silently
+// DISCARDS a field the struct does not declare, so `capabilities_list(tier=…,
+// skip_semantic=true)` answers SUCCESS with the extra field dropped and the caller's
+// intent ignored — the same caller-visible false success t17 fixed for
+// `capability_set`, repeated one tool over. For a READ tool that is a lying success;
+// for a WRITE tool it is worse, because a mistyped flag quietly means "the default", so
+// the write runs for real when the caller meant to price it first.
+//
+// COMPATIBILITY CONSEQUENCE, stated once and plainly: a client that sends a field the
+// tool does not declare now gets a HARD FAILURE — a tool result with `is_error: true`
+// carrying serde's `unknown field …` sentence — instead of silence. Nothing else
+// changes: no declared field was added, removed, renamed, retyped or re-defaulted, and
+// the 18 tool names are untouched. A tool that ships WITHOUT the attribute fails
+// `crates/mcp/tests/tool_surface.rs::every_tool_refuses_fields_it_does_not_declare`,
+// which walks every published schema rather than naming the tools one by one.
+//
+// `wiki_pages` and `wiki_links` take no argument, and they now carry [`NoParams`]
+// rather than no parameter type at all: without a params type rmcp publishes
+// `{"type":"object","properties":{}}`, whose `additionalProperties` is unset, so those
+// two silently accepted and discarded ANY field. `NoParams` declares no field either —
+// the declared surface is unchanged — and it makes the refusal uniform across all 18.
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NoParams {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchParams {
     #[schemars(description = "What to look for")]
     pub query: String,
@@ -1209,6 +1248,7 @@ pub struct SearchParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecallParams {
     #[schemars(description = "What to look for")]
     pub query: String,
@@ -1225,12 +1265,14 @@ pub struct RecallParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HashParams {
     #[schemars(description = "The memory's content_hash (64 hex chars)")]
     pub content_hash: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GraphSearchParams {
     #[schemars(description = "Name/summary text to look for")]
     pub query: String,
@@ -1239,6 +1281,7 @@ pub struct GraphSearchParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GraphRetrieveParams {
     #[schemars(description = "The question, in words")]
     pub query: String,
@@ -1251,12 +1294,14 @@ pub struct GraphRetrieveParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetParams {
     #[schemars(description = "Memory id from recall/search results")]
     pub id: i64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteParams {
     #[schemars(description = "profile | observation | procedure | lesson")]
     pub store: String,
@@ -1269,6 +1314,7 @@ pub struct WriteParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestParams {
     #[schemars(description = "Document name")]
     pub name: String,
@@ -1277,24 +1323,28 @@ pub struct IngestParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkParams {
     #[schemars(description = "Chunk id from recall/search results")]
     pub chunk_id: i64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EntityParams {
     #[schemars(description = "Entity id from recall results")]
     pub id: i64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TaskFilterParams {
     #[schemars(description = "Optional status filter")]
     pub status: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilitiesParams {
     #[schemars(
         description = "Optional token-tier filter: free (zero model tokens, deterministic) or llm (spends the user's model tokens). Anything else is refused."
@@ -1302,7 +1352,52 @@ pub struct CapabilitiesParams {
     pub tier: Option<String>,
 }
 
+/// The parameters of `capability_set`, as a CLIENT sends them.
+///
+/// `deny_unknown_fields` IS THE FIX FOR A MEASURED FALSE SUCCESS
+/// (ruagent-tunable-capabilities t17): `capability_set(id=…, enabled=true,
+/// decay_half_life=5.0)` used to answer SUCCESS while serde silently dropped that
+/// key before this bridge ever saw it — the caller was told the update happened and
+/// the field was never sent. With this attribute rmcp's own parameter extraction
+/// (`FromContextPart for Parameters<P>`) fails FIRST, and MEASURED the client sees a
+/// tool result with `is_error: true` whose text is `failed to deserialize
+/// parameters: unknown field `decay_half_life`, expected one of `id`, `enabled`, …`
+/// — the key that was not sent, and every field this tool can send instead (the
+/// `ErrorData` behind it is `invalid_params`, -32602). See
+/// `crates/mcp/tests/tool_surface.rs`.
+///
+/// CHOICE, AND THE ALTERNATIVE REJECTED. The recorded alternative was a catch-all
+/// field (`#[serde(flatten)] extra: serde_json::Map<…>`) refused by hand in the
+/// handler. Rejected: it needs a phantom field, it adds a hand-written validation
+/// path that nothing keeps in step with the field list, and its generated schema
+/// advertises the OPPOSITE of the truth — a flattened map tells every client that
+/// arbitrary extra properties are allowed, which is the false promise being removed
+/// here. The attribute states wire-ability declaratively, at the earliest possible
+/// point, with no code.
+///
+/// COMPATIBILITY CONSEQUENCE, stated rather than slipped in: a client that sends a
+/// field this struct does not declare now gets a hard failure — `is_error: true`
+/// carrying serde's `unknown field …` sentence — instead of a silent success. That
+/// is the intended change and the ONLY one: no field was added or removed, no name
+/// changed, and every field a client legitimately sends still deserializes exactly
+/// as before. The one schema-level difference is measured, not guessed:
+/// `additionalProperties: false` appears in this tool's `inputSchema`, derived by
+/// schemars from this attribute, so the schema now says what the extractor enforces.
+///
+/// The DAEMON remains the authority on whether a SENDABLE key is legal for the
+/// target capability (an undeclared key is a 400 naming the declared set); this
+/// struct decides only what can be put on the wire.
+///
+/// DELIBERATELY LEFT ALONE (finding F3, ruagent-tunable-capabilities t17):
+/// schemars still publishes `minimum: 0` on the two u32 fields (`max_per_input`,
+/// `max_docs_per_pass`) and nothing numeric on the three f64 ones (`weight`,
+/// `min_score`, `min_confidence`). Those come from the FIELD TYPES, not from the
+/// registry, so they cannot go stale when `OptionKey::bounds()` moves. The ranges
+/// that COULD drift are no longer written in ANY string this tool publishes — they
+/// were the five descriptions' range clauses — and each description now sends the
+/// reader to `options_schema` instead.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilitySetParams {
     #[schemars(
         description = "Capability id, spelled exactly as capabilities_list, the HTTP API and policy.toml spell it (e.g. recall_leg_wiki, knowledge_ingest_graph, distill_session)"
@@ -1311,23 +1406,23 @@ pub struct CapabilitySetParams {
     #[schemars(description = "true = turn it on, false = turn it off")]
     pub enabled: bool,
     #[schemars(
-        description = "Fusion weight (0.0..=100.0) for the capabilities that declare it; omitted = keep the current value"
+        description = "Optional fusion weight, for a capability whose row declares it; omitted = keep the current value. WHICH capabilities declare it, and its accepted range, are DATA: capabilities_list's options_schema for the target row (each entry carries the kind, the bounds and the daemon's own accepted-range phrase)."
     )]
     pub weight: Option<f64>,
     #[schemars(
-        description = "Minimum score 0.0..=1.0 (recall_leg_memory_semantic: overrides both strategies' floors); omitted = keep the current value"
+        description = "Optional relevance-floor override, for a row whose options_schema declares it; omitted = keep the current value. Read that row's options_schema for the accepted range — never a range copied into this string."
     )]
     pub min_score: Option<f64>,
     #[schemars(
-        description = "Max candidates per input, 1..=10000 (session_extract_rules, knowledge_ingest_graph); omitted = keep the current value"
+        description = "Optional cap on candidates per input, for a row whose options_schema declares it; omitted = keep the current value. Read that row's options_schema for the accepted range."
     )]
     pub max_per_input: Option<u32>,
     #[schemars(
-        description = "Minimum confidence 0.0..=1.0 (session_extract_rules); omitted = keep the current value"
+        description = "Optional confidence floor, for a row whose options_schema declares it; omitted = keep the current value. Read that row's options_schema for the accepted range."
     )]
     pub min_confidence: Option<f64>,
     #[schemars(
-        description = "Max documents per sweep, 1..=1000 (knowledge_ingest_graph); omitted = keep the current value"
+        description = "Optional cap on documents per sweep, for a row whose options_schema declares it; omitted = keep the current value. Read that row's options_schema for the accepted range."
     )]
     pub max_docs_per_pass: Option<u32>,
     #[schemars(
@@ -1337,6 +1432,7 @@ pub struct CapabilitySetParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DistillSessionParams {
     #[schemars(description = "Session key as the sessions listing spells it (e.g. ruagent:<hex>)")]
     pub session_key: String,
@@ -1351,6 +1447,7 @@ pub struct DistillSessionParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeGraphIngestParams {
     #[schemars(
         description = "Document name to ingest; omitted or empty = sweep the documents the ledger has not seen, up to the configured max_docs_per_pass"
@@ -1951,6 +2048,47 @@ mod tests {
         let err = merged_table(&rows, &set_params("recall_leg_wiki", false))
             .expect_err("drift must be loud");
         assert!(err.to_string().contains("options_set"), "{err}");
+    }
+
+    /// t17 item 1, at the level where it is enforced: the struct itself refuses a
+    /// field it cannot send, so no handler code can be tempted to "handle" an
+    /// unsendable key. rmcp's parameter extraction
+    /// (`FromContextPart for Parameters<P>`) runs this — measured: the client sees a
+    /// tool result with `is_error: true` whose text is
+    /// `failed to deserialize parameters: unknown field \`decay_half_life\`,
+    /// expected one of \`id\`, \`enabled\`, …`.
+    #[test]
+    fn an_option_field_this_tool_cannot_send_is_refused_at_the_wire() {
+        let ok = serde_json::from_value::<CapabilitySetParams>(serde_json::json!({
+            "id": "recall_leg_memory_semantic",
+            "enabled": true,
+            "min_score": 0.4
+        }))
+        .expect("every declared field still deserializes");
+        assert_eq!(ok.min_score, Some(0.4));
+
+        let err = serde_json::from_value::<CapabilitySetParams>(serde_json::json!({
+            "id": "recall_leg_memory_semantic",
+            "enabled": true,
+            "decay_half_life": 5.0
+        }))
+        .expect_err("a field this tool cannot send must not deserialize silently");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field `decay_half_life`"), "{msg}");
+        // ... and the message names the fields that ARE sendable, so a caller can fix
+        // the call without reading this source.
+        for key in [
+            "weight",
+            "min_score",
+            "max_per_input",
+            "min_confidence",
+            "max_docs_per_pass",
+        ] {
+            assert!(
+                msg.contains(key),
+                "the refusal does not name `{key}`: {msg}"
+            );
+        }
     }
 
     #[test]

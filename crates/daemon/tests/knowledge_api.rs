@@ -2085,3 +2085,138 @@ async fn the_panel_sees_every_declared_key_and_a_write_does_not_materialize_defa
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// INCREMENT 5: THE WRITE DOOR COVERS EVERY LEG THE RUNTIME REFUSES, so the panel's
+/// guard and the daemon's door accept the SAME set. Increment 4's door covered the
+/// MEMORY pair only, while the panel's own guard refuses an enabled 0-weight leg on
+/// EVERY row declaring a `weight` (`panel/src/capability-options.ts`,
+/// `zeroWeightEnabled`) — so the panel could refuse a state the daemon's door took,
+/// and a client without that guard could persist one.
+///
+/// Asserted over HTTP in both directions, on a KNOWLEDGE leg (the family increment 4
+/// left out):
+///  * the NEW refusal — this `PUT` answered 200 before, and the file is untouched by
+///    it now; the sentence is the recall path's own and names the runtime's leg label;
+///  * the reading is not about one id: the other knowledge leg is refused too, and a
+///    DISABLED leg at 0.0 is still legal (the runtime ignores a disabled leg's weight);
+///  * READ/LOAD untouched AND THE FILE STAYS EDITABLE: a daemon that BOOTS with such a
+///    row still boots, still 400s at recall naming the leg, and still accepts a PUT
+///    that carries the row forward with an unrelated change.
+#[tokio::test]
+async fn the_write_door_refuses_a_newly_zeroed_leg_on_every_leg_the_runtime_weighs() {
+    let (daemon_url, root) = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    put_capabilities(&http, &daemon_url, all_recall_legs_on()).await;
+
+    // (a) THE NEW REFUSAL. `recall_leg_knowledge_semantic` at `enabled + weight 0.0`
+    // used to be accepted here; the door now answers with the recall path's sentence.
+    let mut zeroed = all_recall_legs_on();
+    zeroed["recall_leg_knowledge_semantic"] = serde_json::json!({ "enabled": true, "weight": 0.0 });
+    let before_a = policy_text(&root);
+    let (status, refusal) = put_capabilities_raw(&http, &daemon_url, zeroed).await;
+    println!("READING t16 PUT knowledge semantic enabled + weight 0.0 -> {status}: {refusal}");
+    assert_eq!(
+        status, 400,
+        "the door refuses the state the runtime is guaranteed to reject: {refusal}"
+    );
+    assert!(
+        refusal.contains("disable the leg instead of zeroing it"),
+        "with the recall path's own sentence: {refusal}"
+    );
+    assert!(
+        refusal.contains("knowledge semantic"),
+        "naming the leg it is about: {refusal}"
+    );
+    assert_eq!(
+        policy_text(&root),
+        before_a,
+        "a refused write writes nothing"
+    );
+
+    // (b) The other knowledge leg, so the reading is about the SET and not one id.
+    let mut zeroed_fts = all_recall_legs_on();
+    zeroed_fts["recall_leg_knowledge_fts"] = serde_json::json!({ "enabled": true, "weight": 0.0 });
+    let (status, refusal) = put_capabilities_raw(&http, &daemon_url, zeroed_fts).await;
+    println!("READING t16 PUT knowledge fts enabled + weight 0.0 -> {status}: {refusal}");
+    assert_eq!(status, 400, "{refusal}");
+    assert!(
+        refusal.contains("knowledge keyword"),
+        "the runtime's own label for that leg: {refusal}"
+    );
+
+    // (c) A DISABLED leg at 0.0 is still legal on both surfaces: the runtime ignores a
+    // disabled leg's weight, and `enabled = false` is the supported way to drop a leg.
+    let mut off = all_recall_legs_on();
+    off["recall_leg_knowledge_fts"] = serde_json::json!({ "enabled": false, "weight": 0.0 });
+    put_capabilities(&http, &daemon_url, off).await;
+    let ok = recall_get(&http, &daemon_url, "kettle descaling", None).await;
+    println!(
+        "READING t16 disabled knowledge fts at weight 0.0: recall ok, legs_disabled={}",
+        ok["legs_disabled"]
+    );
+    assert_eq!(
+        ok["legs_disabled"],
+        serde_json::json!(["recall_leg_knowledge_fts"])
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    // (d) READ/LOAD UNTOUCHED, AND THE FILE STAYS EDITABLE. A daemon that STARTS with
+    // the refused row in its policy.toml boots, its recall 400s naming the leg, and a
+    // PUT that merely carries the row forward — the panel's read-modify-write body with
+    // an unrelated toggle — is ACCEPTED. That last half is the transition rule: without
+    // it, this file could not be edited at all.
+    let (url2, root2) = start_test_daemon_with_policy(
+        "[permissions]\ndefault = \"ask\"\n\n[capabilities.recall_leg_knowledge_semantic]\n\
+         enabled = true\nweight = 0.0\n",
+    )
+    .await;
+    let http2 = reqwest::Client::new();
+    let caps = capabilities_get(&http2, &url2).await;
+    let row = row_of(&caps, "recall_leg_knowledge_semantic");
+    assert_eq!(
+        row["enabled"],
+        serde_json::json!(true),
+        "the row is in the file and the daemon booted with it: {row}"
+    );
+    assert_eq!(row["options_set"]["weight"], serde_json::json!(true));
+    let resp = http2
+        .get(format!("{url2}/api/v1/recall"))
+        .query(&[("q", "kettle descaling"), ("top_n", "5")])
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    println!("READING t16 recall over a pre-existing zeroed knowledge leg: {status} {body}");
+    assert_eq!(
+        status, 400,
+        "the read path still refuses it, naming the leg: {body}"
+    );
+    assert!(body.contains("knowledge semantic"), "{body}");
+
+    let mut body_d = panel_body(&caps);
+    body_d
+        .as_object_mut()
+        .expect("the body is an object")
+        .insert(
+            "recall_leg_wiki".to_string(),
+            serde_json::json!({ "enabled": false }),
+        );
+    let accepted = put_capabilities(&http2, &url2, body_d).await;
+    let text_d = policy_text(&root2);
+    println!("READING t16 the file after an UNRELATED write:\n{text_d}");
+    assert!(
+        text_d.contains("weight = 0.0"),
+        "the pre-existing row is carried forward, not bricked: {text_d}"
+    );
+    assert!(
+        text_d.contains("[capabilities.recall_leg_wiki]"),
+        "and the write the user asked for landed: {text_d}"
+    );
+    assert_eq!(
+        row_of(&accepted, "recall_leg_knowledge_semantic")["options"]["weight"],
+        serde_json::json!(0.0),
+        "the live plane kept the row exactly as the file had it: {accepted}"
+    );
+    let _ = std::fs::remove_dir_all(&root2);
+}

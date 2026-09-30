@@ -422,7 +422,7 @@ impl axum::response::IntoResponse for ApiError {
 ///
 /// `pub(crate)` because TWO doors can meet this invariant and they must answer with
 /// the same words: the recall handler (read time) and the capability `PUT`
-/// (`crate::capability::zero_weight_memory_leg`, write time). The message is
+/// (`crate::capability::zero_weight_leg`, write time). The message is
 /// [`WeightError`]'s own `Display`, so the leg name and the rule — including
 /// "(disable the leg instead of zeroing it)" — are spelled in one place, the
 /// knowledge-side weight rule, and neither door can paraphrase them.
@@ -2889,6 +2889,40 @@ fn recall_leg_id(leg: crate::memembed::RecallLeg) -> &'static str {
     .as_str()
 }
 
+/// THE ONE PLACE the six recall legs are read off the capability plane: the runtime's
+/// own `(enabled, configured weight)` per leg, handed to the runtime's own resolver.
+///
+/// Two callers need exactly this question asked of exactly this table:
+///
+/// * the recall handler below, which must not let two call sites resolve a leg
+///   differently (`legacy = true` for all six: every one of them is today's behaviour,
+///   design L1/L2, so the plane can only NARROW what the handler does);
+/// * the capability write door's per-leg probe (`crate::capability::runtime_refusal`),
+///   which asks whether a given plane would put ONE leg in a state the runtime refuses.
+///   Without this function that probe would have to re-read the plane and re-apply
+///   `Option<f64> -> f32` itself, i.e. carry a second copy of the reading — and the
+///   copy is what drifts.
+///
+/// `RecallLegConfig::resolve` (crates/daemon/src/memembed.rs) is the runtime's own
+/// composition over `MemoryLegs::resolve` and `LegConfig::resolve`; this function only
+/// supplies its arguments, so which legs carry a weight (and what a leg's default is
+/// when the file names none) is decided there and nowhere else.
+pub(crate) fn recall_legs(
+    plane: &crate::capability::CapabilityPlane,
+) -> Result<crate::memembed::RecallLegConfig, WeightError> {
+    use crate::capability::CapabilityId;
+    use crate::memembed::RecallLegConfig;
+    let leg = |id: CapabilityId| (plane.gate(id, true), plane.options(id).weight);
+    RecallLegConfig::resolve(
+        leg(CapabilityId::RecallLegMemorySemantic),
+        leg(CapabilityId::RecallLegMemoryFts),
+        leg(CapabilityId::RecallLegKnowledgeSemantic),
+        leg(CapabilityId::RecallLegKnowledgeFts),
+        plane.gate(CapabilityId::RecallLegWiki, true),
+        plane.gate(CapabilityId::RecallLegGraph, true),
+    )
+}
+
 /// `GET /api/v1/recall?q=...&top_n=N[&strategy=...][&min_score=...][&source=...]`
 ///
 /// The knowledge hits in this response are the CROSS-KIND fused top-N: memories,
@@ -2926,19 +2960,11 @@ async fn recall(
     // is never queried (`recall_memories_with` / `search_page_with` gate the CALL,
     // not the results — the embedding and the SQL are the costs).
     //
-    // `legacy = true` for all six: every one of them is today's behaviour (design
-    // L1/L2), so the plane can only NARROW what this handler does.
+    // The reading lives in [`recall_legs`], because the capability write door asks the
+    // SAME question of the SAME table (§11.5, increment 5) and must not be able to
+    // disagree with this handler about what the plane says.
     let plane = state.chats.capabilities();
-    let leg =
-        |id: crate::capability::CapabilityId| (plane.gate(id, true), plane.options(id).weight);
-    let legs = match crate::memembed::RecallLegConfig::resolve(
-        leg(crate::capability::CapabilityId::RecallLegMemorySemantic),
-        leg(crate::capability::CapabilityId::RecallLegMemoryFts),
-        leg(crate::capability::CapabilityId::RecallLegKnowledgeSemantic),
-        leg(crate::capability::CapabilityId::RecallLegKnowledgeFts),
-        plane.gate(crate::capability::CapabilityId::RecallLegWiki, true),
-        plane.gate(crate::capability::CapabilityId::RecallLegGraph, true),
-    ) {
+    let legs = match recall_legs(&plane) {
         Ok(legs) => legs,
         Err(e) => {
             return Err(ApiError::bad_request(leg_config_error(e)));

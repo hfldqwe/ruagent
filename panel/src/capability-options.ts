@@ -156,9 +156,23 @@ export interface RowEdit {
   options: CapabilityFileEntry;
 }
 
-/** The daemon's resolution of a weight nothing sets: `MemoryLegs::resolve` maps an
- *  absent weight to 1.0, and the write door's own `zero_weight_memory_leg` uses
- *  the same `map_or(1.0, ..)` (crates/daemon/src/capability.rs). */
+/** The panel's fallback for a weight nothing sets.
+ *
+ *  The daemon's write door (`zero_weight_leg`, crates/daemon/src/capability.rs) does
+ *  NOT forward a bare `Option`: it reads the plane's RESOLVED weight —
+ *  `CapabilityPlane::options`, documented as "the resolved options (defaults merged
+ *  with the file)" and spelled `weight: f.weight.or(defaults.weight)` — so a NUMBER
+ *  always reaches the runtime, and the numbers in play are the REGISTRY's declared
+ *  defaults (`CapabilitySpec::defaults`: 1.0 on both memory legs and on
+ *  `recall_leg_knowledge_fts`, 2.0 on `recall_leg_knowledge_semantic`). The runtime's
+ *  OWN per-leg default (`MemoryLegs::resolve`'s `map_or(1.0, ..)`, `LegConfig::resolve`'s
+ *  `FUSION` weight) therefore never fires on this path: it takes a `None` the plane
+ *  cannot produce for a row that declares `weight`.
+ *
+ *  This constant is a last resort for the same reason — such a row ALWAYS resolves to
+ *  a number, and its schema `default` is never null (the registry's ONE null-default
+ *  key is `min_score` on `recall_leg_memory_semantic`), which is what the two `??`
+ *  chains below fall back through. */
 const DEFAULT_WEIGHT = 1.0;
 
 function zeroed(enabled: boolean, weight: number): boolean {
@@ -171,10 +185,13 @@ function zeroed(enabled: boolean, weight: number): boolean {
  *  THE ONE CLIENT-SIDE RULE. The daemon's schema is per key (`kind`/`min`/`max`),
  *  so a rule spanning `enabled` and `weight` cannot be mirrored from data, and the
  *  API publishes no cross-field constraint to read. The daemon enforces it at its
- *  write door for the two MEMORY recall legs: `check_weights`
- *  (crates/knowledge/src/rrf.rs) refuses an enabled leg at weight <= 0, and the
- *  door answers with that path's own sentence, so a client that skipped this guard
- *  still cannot persist the state.
+ *  write door (`zero_weight_leg`, crates/daemon/src/capability.rs) for EVERY leg the
+ *  recall runtime weighs — four today: memory semantic, memory fts, knowledge
+ *  semantic, knowledge keyword — and it enumerates none of them: the door asks the
+ *  runtime (`RecallLegConfig::resolve` -> `check_weights`,
+ *  crates/knowledge/src/rrf.rs, which refuses an enabled leg at weight <= 0) which
+ *  legs carry a weight at all. The door answers with that path's own sentence, so a
+ *  client that skipped this guard still cannot persist the state.
  *
  *  Two details are mirrored deliberately, because they are what make the two doors
  *  agree rather than merely resemble each other:
@@ -187,13 +204,20 @@ function zeroed(enabled: boolean, weight: number): boolean {
  *     the edit REMOVES the key (a removal falls back to the default, exactly as
  *     the plane resolves it).
  *
- *  The panel applies the rule to every row that declares `weight`. That is
- *  strictly stricter than the daemon on the KNOWLEDGE legs only: an enabled
- *  0-weight leg there is equally meaningless, has the same remedy, and refusing it
- *  keeps ONE rule in the UI instead of a list of leg ids copied into the panel.
+ *  The panel applies the rule to every row that declares `weight`, and the daemon's
+ *  door refuses the same set — not because two lists agree, but because the door asks
+ *  the runtime which legs it weighs. Measured: the two surfaces' ACCEPTED SETS over
+ *  all 11 capability ids are identical, so what differs is not WHETHER a state is
+ *  refused but WHERE and in WHAT WORDS. The panel pre-checks from the payload of its
+ *  last `GET` (an input turns red and no request is sent for that row), while the door
+ *  evaluates the LIVE plane at `PUT` time — `before` is what the daemon holds, not
+ *  what the panel last saw. A concurrent write, or an operator editing policy.toml,
+ *  can therefore make the two disagree for the duration of that race, and the DOOR IS
+ *  AUTHORITATIVE: a state it refuses is refused whatever the panel believed.
  *  The daemon's sentence is not reproduced either — it is built in Rust from the
  *  leg's display label, which the API does not expose as data, and a copy of that
- *  sentence is the kind of duplicated fact this module deletes. */
+ *  sentence is the kind of duplicated fact this module deletes; a client that skips
+ *  this pre-check simply meets the daemon's own sentence in the `PUT`'s 400. */
 export function zeroWeightEnabled(row: CapabilityRow, edit: RowEdit): boolean {
   const weightEntry = (row.options_schema ?? []).find((e) => e.key === "weight");
   if (!weightEntry) return false;
