@@ -274,6 +274,38 @@ switch ($Action) {
       throw [System.Management.Automation.RuntimeException]::new($Summary)
     }
 
+    # ── PRE-FLIGHT: the action this run is about to register must be able to RUN (t35) ─
+    # MEASURED BEFORE THIS EXISTED, on the DOCUMENTED command with one mistyped `-Exe`
+    # (no copy involved): exit 0, `scheduled task ... registered`, and
+    # `verified by read-back: ... -Exe "...\no-such-ruagent.exe" ...` -- leaving an ENABLED
+    # task whose action can never start the daemon. The read-back CANNOT catch this: every
+    # field it compares is built from this run's own `$Exe`, so it agrees with itself while
+    # the machine is left with a watchdog that fails every five minutes and says nothing.
+    #
+    # WHAT IS CHECKED: that the path the action will name EXISTS and is a FILE, i.e. that
+    # `watch` has something to start at all. WHAT IS DELIBERATELY NOT CHECKED: that the file
+    # is the RIGHT binary -- the right build, the right architecture, or even a ruagent
+    # binary. A pre-flight that answered "the Exe is usable" from a path test would be the
+    # third edition of this script's historical defect (a check claiming more than it
+    # verified: the all-users registration that could never succeed, and the success line
+    # that depended on nothing). A stronger check would have to RUN the path (`--version`)
+    # or hash it, making install-task's outcome depend on code execution and on a file a
+    # rebuild can replace under the same path. The boundary is deliberate: install-task
+    # refuses a path that cannot run AT ALL; a wrong-but-existing binary is a runtime
+    # failure the start/watch path reports.
+    #
+    # PLACED HERE, AFTER `Fail-InstallTask` IS DEFINED, because PowerShell resolves a
+    # function when the line RUNS: an earlier draft sat next to the task shape, called
+    # `Fail-InstallTask` before it existed, and failed with `The term 'Fail-InstallTask' is
+    # not recognized` -- which is non-zero under -File/-Command but measured **0 through a
+    # wrapper**, exactly the invocation-shape hole the V3 comment above closed. It is still
+    # before the registration, which is what the pre-flight is for.
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+      Write-Output "FAILED: -Exe '$Exe' does not exist (or is not a file), so the watchdog this would register could never start the daemon -- it would be a task that fails silently every five minutes."
+      Write-Output "what to do: pass the path to a built ruagent binary, e.g. -Exe `"D:\rust_cache\debug\ruagent.exe`" -- build it with 'cargo build -p ruagent --bin ruagent' if it is missing. NOTHING was registered: the machine's scheduled task (if any) is exactly as it was, so this run cannot have broken a working watchdog."
+      Fail-InstallTask "install-task FAILED: -Exe '$Exe' does not exist, so the watchdog's action could never run (nothing was registered)"
+    }
+
     # WHAT THE MACHINE RUNS RIGHT NOW, read BEFORE the attempt (t12): this run may be
     # about to change it, and an action that changes target silently is the incident
     # this read-back exists to catch.
@@ -445,5 +477,9 @@ switch ($Action) {
     }
     Write-Output "scheduled task $taskName registered for $userId (at logon + every 5 min)"
     Write-Output "verified by read-back: $observed"
+    # The pre-flight's own boundary, stated where the claim is made: it established that the
+    # action's -Exe EXISTS, not that it is the right binary. Saying nothing would let the
+    # success line read as more than it is (t35).
+    Write-Output "pre-flight: the action's -Exe exists ($Exe) -- a path check only, NOT a check that it is the right binary"
   }
 }
