@@ -630,6 +630,17 @@ export interface GraphEntity {
   name: string;
   kind: string | null;
   summary: string | null;
+  /** The OTHER names this entity is known by (`entity_aliases`) — the folded-in
+   *  spellings, e.g. `模糊` for `AMBIGUOUS（模糊）`.
+   *
+   *  ADDITIVE on the wire (ruagent-close-the-gaps t22) and OPTIONAL here for two
+   *  reasons that both matter: only the per-entity route
+   *  (`GET /api/v1/graph/entity/{id}`) carries it — the `[entity, count]` rows of
+   *  `GET /api/v1/graph/entities` do not, unless a caller opts into the separate
+   *  `aliases` map — and a daemon that predates the field answers without the key.
+   *  A reader must therefore render rather than require, and treat `undefined`
+   *  exactly like `[]`. */
+  aliases?: string[];
 }
 
 export interface GraphEdge {
@@ -1159,8 +1170,24 @@ export const api = {
     get<{ entities: GraphEntity[]; match?: string }>(
       `/api/v1/graph/search?q=${encodeURIComponent(q)}`,
     ),
+  /** The entity, its aliases and its facts: the route's WHOLE payload.
+   *
+   *  This accessor used to be `.then((r) => r.facts)` and had no caller anywhere in
+   *  panel/src — so the alias text that `GET /api/v1/graph/entity/{id}` has carried
+   *  since ruagent-close-the-gaps t22 had no hop into the panel at all. That is the
+   *  hop this returns (t27).
+   *
+   *  Every field is optional, `facts` included: `name`/`kind`/`aliases` are additive
+   *  on the wire, the route answers 200 with EMPTY collections for an id it does not
+   *  know (it does not 404), and a daemon that predates the fields omits them. A
+   *  reader must render, never require. */
   graphEntity: (id: number) =>
-    get<{ facts: GraphEdge[] }>(`/api/v1/graph/entity/${id}`).then((r) => r.facts),
+    get<{
+      name?: string | null;
+      kind?: string | null;
+      aliases?: string[];
+      facts?: GraphEdge[];
+    }>(`/api/v1/graph/entity/${id}`),
   graphNeighbors: (id: number, hops = 2) =>
     get<{ neighbors: [GraphEntity, number][] }>(
       `/api/v1/graph/entity/${id}/neighbors?hops=${hops}`,

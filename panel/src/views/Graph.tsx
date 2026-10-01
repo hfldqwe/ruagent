@@ -1370,6 +1370,15 @@ function EntityDetail({
   const [facts, setFacts] = useState<GraphEdge[] | null>(null);
   const [factsErr, setFactsErr] = useState<unknown>(null);
   const [neighbors, setNeighbors] = useState<[GraphEntity, number][] | null>(null);
+  /** This entity's OTHER names, read off the per-entity route.
+   *
+   *  `null` = not read yet, or unreadable — the row is simply absent then, which is
+   *  the SAME rendering as an entity that has no aliases (the common case). That is
+   *  deliberate for an additive identity field: the row claims nothing when it is
+   *  not there, so an unreadable alias list cannot be displayed AS a reading of
+   *  "no aliases" — and the facts zone directly below is where this panel reports a
+   *  read failure for the same entity. */
+  const [aliases, setAliases] = useState<string[] | null>(null);
   const [at, setAt] = useState("");
   const [addingFact, setAddingFact] = useState(false);
   // t301: the entity's hard-delete entry (t276's DELETE route had no consumer).
@@ -1403,6 +1412,16 @@ function EntityDetail({
       .graphNeighbors(entity.id, 2)
       .then(setNeighbors)
       .catch(() => setNeighbors([]));
+    // The aliases come from the per-entity route — the only response that carries
+    // the alias text. The entity passed in comes from the LIST route, whose rows do
+    // not carry it, so this is the hop that makes the folded names visible.
+    // `?? []` is not defensive padding: the field is additive, so an old daemon (or
+    // an id the graph does not know) answers without it, and "absent" means exactly
+    // what "empty" means here — no row.
+    api
+      .graphEntity(entity.id)
+      .then((d) => setAliases(d.aliases ?? []))
+      .catch(() => setAliases(null));
   }, [entity.id]);
 
   return (
@@ -1466,6 +1485,24 @@ function EntityDetail({
           <Icon name="x" size={14} />
         </Button>
       </div>
+      {/* The entity's OTHER names — the folded-in spellings, e.g. `模糊` for
+          `AMBIGUOUS（模糊）`: the graph recorded that these are one concept, and this
+          is where a reader can see it.
+          NOT rendered when there are none, which is MOST entities: an empty section
+          would state that a section exists where the data says nothing (the same
+          rule the three-state readouts follow). Absent and `[]` are one case here.
+          The alias text is the daemon's own and is shown verbatim — `data-alias` is
+          the DOM hook the e2e spec reads, not decoration. */}
+      {aliases && aliases.length > 0 ? (
+        <p className="entity-aliases" data-alias-count={aliases.length}>
+          <span className="muted micro">{t("graph.aliases")}</span>
+          {aliases.map((a) => (
+            <span key={a} className="tag" data-alias={a}>
+              {a}
+            </span>
+          ))}
+        </p>
+      ) : null}
       {entity.summary ? <p className="muted intent">{entity.summary}</p> : null}
 
       <div className="card">

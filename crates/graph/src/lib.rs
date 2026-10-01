@@ -153,6 +153,13 @@ pub async fn add_fact(
 /// `facts_removed` counts the currently-valid ones (`invalid_at IS NULL`) —
 /// the facts the graph page renders. Both are reported because a row-only
 /// delete leaves the page drawing dangling edges (t276).
+///
+/// The alias, pending-pair and community rows the delete also removes are NOT
+/// counted here (ruagent-close-the-gaps t31). The route's `match` on this enum
+/// is exhaustive without `..`, so a new field is a compile error in
+/// `daemon/src/api.rs`, a file that change does not own; and borrowing one of
+/// the two existing numbers to carry them would be a small lie. What the delete
+/// destroys is documented on `delete_entity` instead.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntityDeleteOutcome {
     Deleted {
@@ -163,29 +170,78 @@ pub enum EntityDeleteOutcome {
     NotFound,
 }
 
-/// Hard-delete an entity together with every edge and fact that touches it,
-/// in either direction. An absent id reports NotFound instead of a silent
-/// success (t276): "nothing was there" and "it is gone now" are different
-/// facts. The FTS index follows via the `entities_ad` trigger.
+/// Hard-delete an entity together with every row that references it, in ONE
+/// transaction. An absent id reports NotFound instead of a silent success
+/// (t276): "nothing was there" and "it is gone now" are different facts. The FTS
+/// index follows via the `entities_ad` trigger.
+///
+/// FOUR CHILD TABLES, ALL FOUR REMOVED HERE (ruagent-close-the-gaps t31).
+/// `entity_edges`, `entity_aliases`, `resolution_pending` and
+/// `community_entities` each declare `… REFERENCES entities(id)`
+/// (`0005_graph.sql:26-27`, `0021_graph_evidence.sql:48`, `:60-61`, `:82`) and
+/// NONE of them carries `ON DELETE CASCADE`, while `foreign_keys=ON` is set at
+/// open (store's `configure_and_spawn`). SQLite therefore refuses
+/// `DELETE FROM entities` while any child row survives — and until t31 this
+/// function removed only the edges, so `DELETE /api/v1/graph/entity/{id}`
+/// answered `sqlite error: FOREIGN KEY constraint failed` for every entity that
+/// had an alias (measured: any merged entity) or sat in a community.
+///
+/// THE 500 WAS NOT A NO-OP, which is why the transaction is part of the fix:
+/// each statement used to run in autocommit, so the edges were ALREADY deleted
+/// when the entity delete failed — measured, a failed delete of a merged entity
+/// took its `entity_edges` from 1 to 0 while the entity and its alias stayed.
+/// Ordering children before the parent only prevents the FK ERROR (the mistake
+/// `merge_entities`' old comment made, t81); the transaction is what prevents a
+/// half-delete.
+///
+/// WHY CASCADE, AND NOT A REFUSAL WHILE ALIASES EXIST. The delete button is the
+/// only way the graph page corrects a wrong entity (t276), and the entities it
+/// most needs to correct are the wrong merges — the ones that carry aliases.
+/// A refusal would leave that button dead for exactly those rows and would name
+/// a condition no other route can clear: nothing in the API removes an alias row
+/// (`add_alias` only inserts, `merge_entities` only MOVES them), so the user
+/// would be told "blocked" with no action to take.
+///
+/// WHAT CASCADING COSTS, said plainly: the alias rows NAME this entity, so they
+/// cannot outlive it. When `merge_entities` folded a name onto this entity, that
+/// alias row became the only record that the two names were ever the same thing,
+/// and deleting the keeper destroys that record with the keeper. That is what
+/// deleting the keeper means; keeping the rows instead is not a state the schema
+/// allows (the column is `NOT NULL REFERENCES entities(id)`). The absorbed
+/// entity's OWN rows are not at risk here: `merge_entities` already moved its
+/// aliases onto the keeper and deleted its edges/community/pending rows at merge
+/// time.
 pub async fn delete_entity(db: &Db, id: i64) -> Result<EntityDeleteOutcome, DbError> {
-    db.call(
+    db.call_flat(
         move |conn| -> Result<EntityDeleteOutcome, rusqlite::Error> {
+            let tx = conn.transaction()?;
             let exists: i64 =
-                conn.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |r| {
+                tx.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |r| {
                     r.get(0)
                 })?;
             if exists == 0 {
+                // The transaction drops => rollback: nothing was touched.
                 return Ok(EntityDeleteOutcome::NotFound);
             }
-            let facts_removed: i64 = conn.query_row(
+            let facts_removed: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM entity_edges
               WHERE (src = ?1 OR dst = ?1) AND invalid_at IS NULL",
                 [id],
                 |r| r.get(0),
             )?;
             let edges_removed =
-                conn.execute("DELETE FROM entity_edges WHERE src = ?1 OR dst = ?1", [id])? as i64;
-            conn.execute("DELETE FROM entities WHERE id = ?1", [id])?;
+                tx.execute("DELETE FROM entity_edges WHERE src = ?1 OR dst = ?1", [id])? as i64;
+            // The three FK children the schema declares without a cascade. The
+            // aliases also leave the `entity_aliases_fts` index via migration
+            // 0027's delete trigger, so a freed `norm_alias` cannot keep matching.
+            tx.execute("DELETE FROM entity_aliases WHERE entity_id = ?1", [id])?;
+            tx.execute(
+                "DELETE FROM resolution_pending WHERE entity_a = ?1 OR entity_b = ?1",
+                [id],
+            )?;
+            tx.execute("DELETE FROM community_entities WHERE entity_id = ?1", [id])?;
+            tx.execute("DELETE FROM entities WHERE id = ?1", [id])?;
+            tx.commit()?;
             Ok(EntityDeleteOutcome::Deleted {
                 id,
                 edges_removed,
@@ -193,8 +249,7 @@ pub async fn delete_entity(db: &Db, id: i64) -> Result<EntityDeleteOutcome, DbEr
             })
         },
     )
-    .await?
-    .map_err(DbError::from)
+    .await
 }
 
 /// Currently-valid facts about an entity (either direction).
@@ -436,8 +491,10 @@ pub async fn entity_by_id(db: &Db, id: i64) -> Result<Option<Entity>, DbError> {
 /// existed, the alias text appeared in no response at all, so a search for a term
 /// the graph knows answered with a candidate list nobody could verify.
 ///
-/// READ-ONLY. Indexing aliases in the FTS table is a SEPARATE change: it alters
-/// every existing query's results and needs its own before/after over a corpus.
+/// READ-ONLY, and it stayed read-only when the search learned to read this table
+/// (ruagent-close-the-gaps t25): the aliases got their own index
+/// (`entity_aliases_fts`, migration 0027) and `search_entities` reads that; no row
+/// here is rewritten and no entity's `name` changes.
 pub async fn aliases_of(db: &Db, entity: i64) -> Result<Vec<String>, DbError> {
     db.call(move |conn| -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt =
@@ -488,10 +545,47 @@ pub async fn aliases_for(
     .map_err(DbError::from)
 }
 
-/// FTS over entity names/summaries (the keyword candidate leg of
-/// resolution and retrieval). Punctuated tokens (scripts/release.sh,
-/// node.js) are FTS5 syntax errors as raw input — quote each token
-/// into a literal phrase.
+/// Entity search by name, by recorded alias, then by FTS over the
+/// name/summary text (the keyword candidate leg of resolution and
+/// retrieval). Punctuated tokens (scripts/release.sh, node.js) are FTS5
+/// syntax errors as raw input — quote each token into a literal phrase.
+///
+/// FOUR LEGS, IN THIS ORDER, and the order is the ranking decision
+/// (ruagent-close-the-gaps t25). It is the crate's own precedence
+/// (`retrieve.rs` `SeedLeg`: `ExactName` > `AliasTable` > `NameToken` >
+/// `SummaryFts`), applied to the search face:
+///
+/// 1. the entity's own NAME, by identity (`norm_name = norm(query)`);
+/// 2. an alias the graph recorded for it, by identity (`norm_alias = …`);
+/// 3. the same query against the ALIAS INDEX (`entity_aliases_fts`, migration
+///    0027), rank order — this is what reaches a query that is only PART of a
+///    folded name;
+/// 4. `entities_fts(name, summary)` as it always was, rank order — the recall
+///    tail.
+///
+/// WHY LEGS 1-3 COME BEFORE LEG 4: legs 1-3 mean "this string IS a name the
+/// graph holds for the entity"; leg 4 also fires when the entity's SUMMARY
+/// merely mentions the tokens. That difference is the measured defect this
+/// ordering fixes, not a preference:
+///
+///   * the 141 alias-only names of the t18 measurement (a folded name that is
+///     not an `entities.name`) reach their owning entity on 141/141, and it is
+///     the TOP hit on 141/141 — before, 32 of them did not contain the owner at
+///     all and 38 answered a false-positive `exact` for a different entity;
+///   * over all 8449 entity-name queries of the corpus, every one now answers
+///     with the entity that name belongs to. Before, 952 (11.3%) did not — the
+///     entity named by the query was not even in the top 10 for many of them,
+///     because FTS rank put a summary mention first.
+///
+/// WHAT IT COSTS (measured on the same corpus, 8728 queries): 952 name queries
+/// change their top result (all to the entity named by the query), 3 of the 114
+/// parenthetical entity names, 3 of the 24 recorded `recall_log` queries; 354
+/// lists of 8449 lose their TAIL rows to the promoted legs, and NO query becomes
+/// empty. On no query of any of the four sets is an entity whose name matched
+/// ranked below an alias-only hit.
+///
+/// `entity_aliases` is never rewritten and no entity's `name` is changed: the
+/// alias table stays the graph's record of how two names became one entity.
 pub async fn search_entities(db: &Db, query: &str, limit: u32) -> Result<Vec<Entity>, DbError> {
     let fts_query = query
         .split_whitespace()
@@ -501,23 +595,75 @@ pub async fn search_entities(db: &Db, query: &str, limit: u32) -> Result<Vec<Ent
     if fts_query.is_empty() {
         return Ok(Vec::new());
     }
+    let norm_query = norm(query);
     db.call(move |conn| -> Result<Vec<Entity>, rusqlite::Error> {
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.name, e.kind, e.summary
-             FROM entities_fts f JOIN entities e ON e.id = f.rowid
-             WHERE entities_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(rusqlite::params![fts_query, limit], |row| {
-                Ok(Entity {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    kind: row.get(2)?,
-                    summary: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        // The mapper captures nothing, so it is used by all four legs.
+        let read = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Entity> {
+            Ok(Entity {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                summary: row.get(3)?,
+            })
+        };
+        let mut out: Vec<Entity> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let keep = |rows: Vec<Entity>,
+                    out: &mut Vec<Entity>,
+                    seen: &mut std::collections::HashSet<i64>| {
+            for e in rows {
+                if seen.insert(e.id) {
+                    out.push(e);
+                }
+            }
+        };
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, summary FROM entities
+                 WHERE norm_name = ?1 ORDER BY id LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![norm_query, limit], read)?
+                .collect::<Result<Vec<_>, _>>()?;
+            keep(rows, &mut out, &mut seen);
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.name, e.kind, e.summary
+                 FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+                 WHERE a.norm_alias = ?1 ORDER BY e.id LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![norm_query, limit], read)?
+                .collect::<Result<Vec<_>, _>>()?;
+            keep(rows, &mut out, &mut seen);
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.name, e.kind, e.summary
+                 FROM entity_aliases_fts f
+                 JOIN entity_aliases a ON a.id = f.rowid
+                 JOIN entities e ON e.id = a.entity_id
+                 WHERE entity_aliases_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![fts_query, limit], read)?
+                .collect::<Result<Vec<_>, _>>()?;
+            keep(rows, &mut out, &mut seen);
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.name, e.kind, e.summary
+                 FROM entities_fts f JOIN entities e ON e.id = f.rowid
+                 WHERE entities_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![fts_query, limit], read)?
+                .collect::<Result<Vec<_>, _>>()?;
+            keep(rows, &mut out, &mut seen);
+        }
+        out.truncate(limit as usize);
+        Ok(out)
     })
     .await?
     .map_err(DbError::from)

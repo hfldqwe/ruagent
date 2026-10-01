@@ -32,6 +32,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0024_distill_attempts.sql"),
     include_str!("migrations/0025_query_eval_gold_unique.sql"),
     include_str!("migrations/0026_capability_ingest.sql"),
+    include_str!("migrations/0027_entity_aliases_fts.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.
@@ -490,6 +491,10 @@ mod tests {
             "wiki_citations",
             "wiki_graph_readings",
             "wiki_corrections",
+            // 0027: the alias index. A VIRTUAL TABLE is a `table` row in
+            // sqlite_master, so it is asserted beside the real ones -- and it is
+            // what makes a folded name searchable (graph's `search_entities`).
+            "entity_aliases_fts",
         ] {
             assert_eq!(
                 count_where(
@@ -930,6 +935,105 @@ mod tests {
         assert_eq!(matches("访问权限"), 1);
         assert_eq!(matches("权限访问"), 0, "a phrase of bigrams is ordered");
         assert_eq!(matches("潜艇"), 0);
+    }
+
+    /// 0027 (ruagent-close-the-gaps t25): the alias index follows the alias
+    /// TABLE, on every write shape, and its `rebuild` is idempotent.
+    ///
+    /// Every assertion goes through MATCH: `entity_aliases_fts` is an
+    /// external-content table, so a plain `SELECT COUNT(*)` reads
+    /// `entity_aliases` and would report the alias-table count whatever the
+    /// index holds.
+    ///
+    /// WHY THIS IS NOT COVERED BY THE GRAPH TEST: graph's `add_alias` only ever
+    /// INSERTs. A merge rewrites `entity_id` and the daemon's cleanup DELETEs, so
+    /// the UPDATE and DELETE triggers are exercised here or nowhere.
+    #[test]
+    fn alias_index_follows_the_alias_table_through_insert_update_and_delete() {
+        let conn = fresh();
+        let matches = |phrase: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM entity_aliases_fts WHERE entity_aliases_fts MATCH ?1",
+                [format!("\"{phrase}\"")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        conn.execute(
+            "INSERT INTO entities (id, name, norm_name, created_at, updated_at)
+             VALUES (1, 'k1（饱和参数）', 'k1（饱和参数）', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        // The write path: an alias that is NOT an entity name (the 141 of t18).
+        conn.execute(
+            "INSERT INTO entity_aliases (id, entity_id, alias, norm_alias, source, created_at)
+             VALUES (7, 1, 'k1（饱和参数）', 'k1（饱和参数）', 'knowledge', 'x')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            matches("k1（饱和参数）"),
+            1,
+            "the INSERT trigger must index it"
+        );
+
+        // The merge path rewrites `entity_id` and leaves the TEXT alone: the WHEN
+        // filter must keep the row indexed (unchanged), not drop it.
+        conn.execute(
+            "INSERT INTO entities (id, name, norm_name, created_at, updated_at)
+             VALUES (2, '饱和参数', '饱和参数', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE entity_aliases SET entity_id = 2 WHERE id = 7", [])
+            .unwrap();
+        assert_eq!(
+            matches("k1（饱和参数）"),
+            1,
+            "a rewrite of entity_id must leave the text indexed"
+        );
+
+        // A real text change: replaced, not duplicated (a duplicate posting would
+        // make MATCH return the same rowid twice).
+        conn.execute(
+            "UPDATE entity_aliases SET alias = 'k1（改名）', norm_alias = 'k1（改名）' WHERE id = 7",
+            [],
+        )
+        .unwrap();
+        assert_eq!(matches("k1（饱和参数）"), 0, "the old text must be gone");
+        assert_eq!(matches("k1（改名）"), 1, "the new text must be there once");
+
+        // Delete, then the whole-index rebuild the migration itself ends with:
+        // idempotent, and it re-reads the table rather than an index.
+        conn.execute("DELETE FROM entity_aliases WHERE id = 7", [])
+            .unwrap();
+        assert_eq!(matches("k1（改名）"), 0);
+        conn.execute(
+            "INSERT INTO entity_aliases (id, entity_id, alias, norm_alias, source, created_at)
+             VALUES (8, 2, 'AQS（AbstractQueuedSynchronizer）', 'aqs（abstractqueuedsynchronizer）', 'knowledge', 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_aliases_fts(entity_aliases_fts) VALUES('rebuild')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_aliases_fts(entity_aliases_fts) VALUES('rebuild')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(matches("AQS（AbstractQueuedSynchronizer）"), 1);
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_aliases_fts WHERE entity_aliases_fts MATCH ?1",
+                ["\"aqs*\" OR \"abstractqueuedsynchronizer\""],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "the rebuilt index holds the row exactly once");
     }
 
     /// t6: the wiki_builds invariant, replayed against the EXACT statements the
