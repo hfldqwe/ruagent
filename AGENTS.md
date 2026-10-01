@@ -192,6 +192,22 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   machine until the baseline says otherwise. Do not bypass a gate that is red for a reason that might
   be yours, and never report a gate as green when you ran it only with the bypass (or did not run it):
   say which command produced which reading.
+  **The same dead proxy blocks any network client on this machine, not only tests** (ruagent-close-the-gaps
+  t36). Pushing this effort's commits failed with `fatal: unable to access 'https://github.com/…':
+  Failed to connect to 127.0.0.1 port 7890` — and every obvious place to look was CLEAN, which is what
+  made it cost two attempts: `git config --get http.proxy` is EMPTY locally and globally, and
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (and their lowercase spellings) are EMPTY. The proxy comes
+  from the Windows system settings — `HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet
+  Settings`, `ProxyEnable=1`, `ProxyServer=127.0.0.1:7890`, and a `ProxyOverride` list of unrelated
+  domains that does NOT include github.com — so any client that reads the system proxy honours a proxy
+  nothing is listening on. The remedy is a measured PAIR, and both halves reproduce without pushing
+  (`git ls-remote origin HEAD`): `git -c http.proxy= -c https.proxy= …` STILL FAILS — an explicitly
+  empty proxy does not disable the system one, curl falls back to it — while `$env:NO_PROXY='*'`
+  succeeded on the first attempt (`e24263d..813d2f9 main -> main`, and `ls-remote` exit 0 under it).
+  Prefer that second one: it changes nothing on the machine, where the alternative is toggling the
+  user's system proxy off and back on — their setting, probably there for a reason, changed to work
+  around an environment fault. So read this entry as "any network client on this machine, not only
+  loopback tests"; the baseline-diff discipline above is unchanged.
 - **With `CARGO_NET_OFFLINE=true`, this workspace fails to LINK on ONNX — so it reads as a source
   regression in a crate you never touched** (ruagent-close-the-gaps t14, from the increment-7 migration
   work). `cargo test --workspace` dies at link time with `link.exe` **error 1120** and unresolved
