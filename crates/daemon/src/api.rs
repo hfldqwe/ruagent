@@ -2101,6 +2101,24 @@ struct StartRunRequest {
     options: std::collections::BTreeMap<String, String>,
 }
 
+/// The agent for the no-cascade fallback: the first ENABLED card of the REGISTRY the run resolves
+/// against (t38) -- never the config-file view's card, whose `AgentId` is minted fresh on every
+/// load (`config.rs:200/225/265/307`).
+///
+/// MEASURED, and why this exists: with `routing.toml` commented out (this machine's live shape)
+/// every run takes this fallback. The old body read `state.config.default_agent()` and recorded
+/// ITS id, so a run's `routed` event named an agent that exists in no registry and in no table --
+/// `01a0f580-b2ac-7048-a136-6bbe33d5f13b` in the live transcript, while the same run's
+/// `params.agent` was `01a0b915-8273-73c4-8fe9-0e35a34d4ded` (approver, resolved by name through
+/// the manager a few lines below). The two views are both legitimate; only the registry's id is
+/// resolvable, so that is the one to record.
+///
+/// The RULE is the config view's own (`config.rs:106`: the first enabled card), so this changes
+/// which ID is recorded for the default agent, not WHICH agent is the default.
+fn default_route_agent(cards: &[ruagent_core::AgentCard]) -> Option<ruagent_core::AgentCard> {
+    cards.iter().find(|c| c.enabled).cloned()
+}
+
 async fn start_run(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -2140,7 +2158,17 @@ async fn start_run(
                 .ok_or_else(|| ApiError::bad_request("routing decision named an unknown agent"))?;
             (card.name.clone(), decision)
         } else {
-            let card = state.config.default_agent().ok_or_else(|| {
+            // t38: build the fallback from the SAME registry the run resolves against, below.
+            // `state.config.default_agent()` is the CONFIG-FILE view (`config.rs:106`), and the
+            // cards that view builds carry a fresh `AgentId::generate()` on every load
+            // (`config.rs:200/225/265/307`; the last one's own comment says the stable database id
+            // replaces it). Recording that id put an agent into the `routed` event that no registry
+            // contains -- measured: the live transcript carried `01a0f580-b2ac-7048-a136-6bbe33d5f13b`
+            // while the same run's `params.agent` was `01a0b915-8273-73c4-8fe9-0e35a34d4ded`
+            // (approver) -- and the emission site had to reconcile it. Two views are not the bug:
+            // the file describes what is CONFIGURED, the registry what is RUNNABLE. Recording the
+            // unmaterialized one was.
+            let card = default_route_agent(&state.mgr.agents()).ok_or_else(|| {
                 ApiError::bad_request("no agent specified and no default configured")
             })?;
             (
@@ -5276,6 +5304,72 @@ fn sse_end(status: RunStatus) -> Result<Event, Infallible> {
 #[cfg(test)]
 mod tests {
     use crate::extract_plane::{ExtractPlan, Extractor};
+
+    /// t38: the no-cascade fallback must take its agent from the SAME registry the run resolves
+    /// against, so the id in the `routed` decision and the id in `params.agent` agree BY
+    /// CONSTRUCTION instead of being reconciled at the emission site afterwards.
+    ///
+    /// The two cards below are the measured shape of ONE agent seen through two views: the registry
+    /// holds the materialized card (the id the run uses), while the config file's view mints a fresh
+    /// `AgentId::generate()` per load, so `GET /api/v1/agents` contains the first and not the
+    /// second. Standing of this test against the PRE-CHANGE code, stated plainly: the old body was
+    /// inline in the `start_run` handler (`state.config.default_agent()`), so this test could not
+    /// run against it at all -- the pre-change evidence is the private-daemon reading (the emission
+    /// site's reconciliation fired on EVERY run, `routed rationale = "router named <config-view id>
+    /// (not the registry id of the agent that ran)"`). What this test pins is the resolution itself:
+    /// point `default_route_agent` back at a config-view card and `chosen.id == registry_card.id`
+    /// fails on the very first assertion.
+    #[test]
+    fn the_default_route_agent_comes_from_the_registry_view() {
+        fn card(id: &str, name: &str, enabled: bool) -> ruagent_core::AgentCard {
+            ruagent_core::AgentCard {
+                id: id.parse().expect("an agent id"),
+                name: name.to_string(),
+                harness: ruagent_core::HarnessKind::Dsh,
+                command: None,
+                description: String::new(),
+                model: None,
+                reasoning_effort: None,
+                context_window: None,
+                mcp_profile: None,
+                models: Vec::new(),
+                prompt: None,
+                runtime: None,
+                runtimes: Vec::new(),
+                options: std::collections::BTreeMap::new(),
+                tags: Vec::new(),
+                enabled,
+            }
+        }
+        // The registry's id and the config view's per-load id, as measured live.
+        let registry_card = card("01a0b915-8273-73c4-8fe9-0e35a34d4ded", "approver", true);
+        let config_view_card = card("01a0f580-b2ac-7048-a136-6bbe33d5f13b", "approver", true);
+        assert_ne!(
+            registry_card.id, config_view_card.id,
+            "one agent, two views, two ids -- that is the trap this test guards"
+        );
+
+        let chosen =
+            default_route_agent(std::slice::from_ref(&registry_card)).expect("a default agent");
+        assert_eq!(
+            chosen.id, registry_card.id,
+            "the fallback records the REGISTRY's id -- the one `params.agent` will carry"
+        );
+        assert_ne!(
+            chosen.id, config_view_card.id,
+            "and never the config view's id, which no registry on this machine resolves"
+        );
+
+        // The RULE is deliberately the config view's own (config.rs:106): the first card that is
+        // ENABLED, so the choice of default agent does not change -- only the id recorded for it.
+        let disabled_first = card("01a0f580-0000-0000-0000-000000000000", "aaa", false);
+        let both = vec![disabled_first, registry_card.clone()];
+        assert_eq!(
+            default_route_agent(&both).expect("a default agent").id,
+            registry_card.id,
+            "the disabled card is skipped, as the config view's own rule does"
+        );
+    }
 
     /// t4: the manual distill route's optional body (§14.3). An EMPTY body is
     /// today's behaviour — one ACP turn, no dry run — and a malformed or unknown
