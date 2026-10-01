@@ -185,6 +185,166 @@ pub fn contains_any(hay_lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| contains_marker(hay_lower, m))
 }
 
+// ---------------------------------------------------------------------------
+// The requirement-context guards (ruagent-close-the-gaps t32)
+// ---------------------------------------------------------------------------
+
+/// `contains_any` for the requirement markers, with the four context guards.
+///
+/// The verification of the requirement-marker pass showed `user_preference` firing on
+/// five families of text that REPORTS a requirement instead of stating one, all of
+/// which are silent through this entry point: quotation, a third party's statement,
+/// a hypothetical, boilerplate attribution, and the substring collision
+/// (`不能用` inside `能不能用`). The guards, and what each costs:
+///
+/// 1. the existing negation guard (unchanged);
+/// 2. A-not-A adjacency — a marker that starts with `不` is not a match when the
+///    character BEFORE that `不` equals the character AFTER it, which is exactly the
+///    V不V question pattern (`能不能用`, `要不要用`, `是不是`, `有没有`). No spaces are
+///    needed because the boundary is the reduplication itself. Cost: a statement that
+///    literally begins mid-reduplication is not a statement about the user anyway.
+/// 3. quotation parity — the match position must not sit inside an unbalanced
+///    quotation (`“” 「」 『』` and the ASCII `"`), and a sentence that starts with `>`
+///    is a markdown quotation from its first word. Cost, stated because the harness
+///    cannot see it: a genuine first-person statement that follows an UNCLOSED quote
+///    is silenced — the same trade the session-title split already makes, and the
+///    reason the guard is parity rather than "any quote anywhere in the sentence".
+/// 4. reporting/conditional/boilerplate context — `rules::REPORTING_FRAMES` in the 12
+///    characters immediately before the match, `rules::CONDITIONAL_FRAMES` in the 3
+///    before, `rules::BOILERPLATE_HEADS` right after. Cost: the frames are
+///    subject+verb PHRASES, never the bare verb `说`, so `你说的对，我需要改一下`
+///    still matches (pinned by a test).
+pub fn contains_requirement(hay_lower: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|m| {
+        !m.is_empty()
+            && hay_lower
+                .match_indices(m)
+                .any(|(i, _)| !requirement_marker_blocked(hay_lower, i, m))
+    })
+}
+
+fn requirement_marker_blocked(hay: &str, i: usize, marker: &str) -> bool {
+    negated_before(hay, i)
+        || anot_a_before(hay, i, marker)
+        || inside_quotation(hay, i)
+        || attributed_before(hay, i)
+        || hypothetical_before(hay, i)
+        || boilerplate_after(hay, i + marker.len())
+}
+
+/// Is this occurrence the `不` of a V不V question (`能不能用` contains `不能用`)?
+///
+/// Structural, so it works without word spaces: the reduplicated verb is the same
+/// character on both sides of the `不`.
+fn anot_a_before(hay: &str, i: usize, marker: &str) -> bool {
+    if !marker.starts_with('不') || i == 0 {
+        return false;
+    }
+    let before = hay[..i].chars().next_back();
+    let after = hay[i + '不'.len_utf8()..].chars().next();
+    matches!((before, after), (Some(b), Some(a)) if b == a)
+}
+
+/// Is the match inside a quotation (or after the `>` of a markdown one)?
+///
+/// Parity, not "a quote appears somewhere": an even number of delimiters before the
+/// match means the text is back outside the quotation, and a genuine statement that
+/// follows a CLOSED quotation must still match.
+fn inside_quotation(hay: &str, i: usize) -> bool {
+    let before = &hay[..i];
+    let opens = before.matches(['“', '「', '『']).count();
+    let closes = before.matches(['”', '」', '』']).count();
+    if opens > closes {
+        return true;
+    }
+    if before.matches('"').count() % 2 == 1 {
+        return true;
+    }
+    hay.trim_start().starts_with('>')
+}
+
+/// Does a reporting frame introduce this occurrence?
+///
+/// The window is the 12 characters immediately before the match, so the frame must
+/// be adjacent to the statement it introduces.
+fn attributed_before(hay: &str, i: usize) -> bool {
+    use crate::rules::REPORTING_FRAMES;
+    window_before(hay, i, 12).is_some_and(|w| REPORTING_FRAMES.iter().any(|f| w.contains(f)))
+}
+
+/// Is the occurrence inside a conditional frame (`如果…需要`, `是否…需要`)?
+///
+/// The window is 3 characters and the test is CONTAINMENT, not suffix equality: Chinese
+/// puts adverbs between the frame and the verb (`是否还`需要, `如果也`需要), and a
+/// suffix test missed exactly that shape on the corpus (one of the t26 delta's
+/// task-prompt questions survived it). The cost is bounded by the window: a frame
+/// further than 3 characters away does not silence anything.
+fn hypothetical_before(hay: &str, i: usize) -> bool {
+    use crate::rules::CONDITIONAL_FRAMES;
+    window_before(hay, i, 3).is_some_and(|w| CONDITIONAL_FRAMES.iter().any(|f| w.contains(f)))
+}
+
+/// Does the marker introduce boilerplate (`需要说明的是…`)?
+fn boilerplate_after(hay: &str, end: usize) -> bool {
+    use crate::rules::BOILERPLATE_HEADS;
+    let after = hay.get(end..).unwrap_or("");
+    BOILERPLATE_HEADS.iter().any(|h| after.starts_with(h))
+}
+
+/// `contains_any` for the `DECISION` markers, with the stative-prefix guard.
+///
+/// `DECISION` contains the single-character marker `选`, and a single Han character is
+/// the worst case for containment without word spaces: it fires inside `可选`
+/// ("optional"), `选择`, `筛选`, `评选`. The boundary rule chosen here is the one
+/// Chinese marks structurally — the POTENTIAL/STATIVE construction `可+V`, where `可`
+/// turns the verb into an adjective (`可选` = optional, `可用` = usable). A
+/// single-character marker immediately preceded by `可` is therefore not a decision
+/// predicate.
+///
+/// Cost, stated because the harness cannot see it: an imperative that really is
+/// `可选 A 或 B` loses its `user_decision` candidate. It keeps the sentence's other
+/// candidates, and the decision markers with their own frame (`就用`, `决定`,
+/// `定下来`) are untouched. Found by the t32 verification's boilerplate case
+/// (`需要说明的是，这个字段是可选的。`) — that match was PRE-EXISTING, not one the
+/// requirement markers introduced, and it is fixed here because it is the same defect
+/// family the finding names.
+pub fn contains_decision(hay_lower: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|m| {
+        !m.is_empty()
+            && hay_lower.match_indices(m).any(|(i, _)| {
+                !negated_before(hay_lower, i) && !stative_prefix_before(hay_lower, i, m)
+            })
+    })
+}
+
+/// Is a single-character marker the verb inside a `可+V` stative compound?
+fn stative_prefix_before(hay: &str, i: usize, marker: &str) -> bool {
+    if marker.chars().count() != 1 || i == 0 {
+        return false;
+    }
+    hay[..i].ends_with('可')
+}
+
+/// The last `n` characters before byte index `i`, as a `&str` (never panics on a
+/// char boundary).
+fn window_before(hay: &str, i: usize, n: usize) -> Option<&str> {
+    if i == 0 {
+        return None;
+    }
+    let before = &hay[..i];
+    let mut k = before.len();
+    for _ in 0..n {
+        if k == 0 {
+            break;
+        }
+        k -= 1;
+        while k > 0 && !before.is_char_boundary(k) {
+            k -= 1;
+        }
+    }
+    Some(&before[k..])
+}
+
 /// The last of `ascii` / `wide` in `s`, with the character that matched, so a
 /// caller can advance past the delimiter by ITS OWN byte length.
 fn last_delimiter(s: &str, ascii: char, wide: char) -> Option<(usize, char)> {

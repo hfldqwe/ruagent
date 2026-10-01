@@ -44,6 +44,33 @@ pub const NAMESPACE_USER: &str = "user";
 /// Design §8.2 spells one marker as `我的…是`; a marker table cannot express a
 /// wildcard, so it is realised as the prefix `我的` (the first-person store test
 /// below covers the rest of the shape).
+///
+/// REQUIREMENT-SHAPED STATEMENTS (ruagent-close-the-gaps t26). The hand read behind
+/// the hygiene measurement found this one gap: Chinese requirement statements
+/// (`我要…`, `我需要…`, `…应该用…`, `不要用…`) had NO marker at all, so the durable
+/// statements the user actually makes were caught, when they were caught, by accident
+/// in the wrong rule (`不是`/`应该是` → user_correction, `我觉得` → hedged_statement).
+/// The six entries below close it, and each one is the FORM that survived a
+/// precision measurement rather than the bare word:
+///
+/// * `我要` — first-person statement of a durable want (0 false positives in the
+///   bounded read of 55 real user turns).
+/// * `需要` — the recall leg of the same sentence family: it carries the constraint
+///   statements ("…所以需要的内容都需要提前下载好") that the other markers miss. Kept
+///   broad deliberately; the question filter (`text::is_question`, §8.7) already
+///   blocks the "…吗" forms.
+/// * `应该用`, NOT bare `应该`: bare 应该 fires on the HEDGE `应该就好了吧` — a measured
+///   false positive, and the exact precision failure this tier already had — and it
+///   is a substring of `应该是`, which is `CORRECT`'s marker, so it would double-count
+///   every correction as a preference.
+/// * `不能用` / `不要用`, NOT bare `不能` / `不要`: bare 不要 fires inside the QUESTION
+///   `要不要考虑换成postgresql` (measured), and on the residue of our OWN unattended
+///   prompts still on disk (`不要写文件`, `不要全列` — one prompt family, ~20+ candidates
+///   across sessions), which the hygiene work exists to exclude. Bare 不能 fired on a
+///   rhetorical complaint (`你不能直接调用命令就阻塞等待吗`).
+/// * `我不认可` — explicit first-person rejection, the strongest requirement shape in
+///   the measured set and the one the hand read named; it is the only marker here
+///   whose every measured hit was a durable decision.
 pub const PREF: &[&str] = &[
     "记住",
     "以后",
@@ -55,6 +82,12 @@ pub const PREF: &[&str] = &[
     "我偏好",
     "统一用",
     "我的",
+    "我要",
+    "需要",
+    "应该用",
+    "不能用",
+    "不要用",
+    "我不认可",
     "remember that",
     "from now on",
     "always use",
@@ -168,6 +201,54 @@ pub const HEDGE: &[&str] = &[
 /// First-person markers: they decide `profile` vs `observation` for
 /// `user_preference` (design §8.2).
 pub const FIRST_PERSON: &[&str] = &["我", "我的", "我们", "my ", "i ", "i'"];
+
+// ---------------------------------------------------------------------------
+// The requirement-context guards (t32)
+// ---------------------------------------------------------------------------
+//
+// `PREF` is matched through `text::contains_requirement` (`PREF` only;
+// `CORRECT`/`CONFIRM`/`HEDGE` keep the plain containment they were designed with),
+// which adds four context guards on top of the negation guard. Why: containment
+// fires on text that REPORTS a requirement instead of stating one. Measured against
+// the verification's five families (ruagent-close-the-gaps t32), every one of which
+// fired `user_preference` before these guards existed. The three tables below are
+// the word lists those guards use; the structural rules (the A-not-A adjacency rule
+// and the quotation parity rule) live in `text.rs`, because they are about POSITION
+// rather than about words.
+
+/// Attribution frames: a requirement introduced by one of these is someone else's
+/// statement being reported (`同事说他需要更多时间。`), not the user's own.
+///
+/// SUBJECT+VERB phrases, never the bare verb `说`: a bare `说` would silence
+/// `你说的对，我需要改一下`, which IS the user's requirement — the recall regression
+/// this table is shaped to avoid. The window is the 12 characters immediately before
+/// the match (`text::attributed_before`).
+pub const REPORTING_FRAMES: &[&str] = &[
+    "他说",
+    "她说",
+    "他们说",
+    "同事说",
+    "对方说",
+    "别人说",
+    "文档里说",
+    "文档说",
+    "书里说",
+    "文章说",
+    "作者说",
+    "原文",
+    "readme",
+    "据说",
+    "引用",
+];
+
+/// Conditional frames immediately before the marker: a hypothetical is not a
+/// requirement (`如果需要的话我可以补测试。`). `是否` belongs here because it is the
+/// same shape — a yes/no frame (`是否还需要真正的部署起来`).
+pub const CONDITIONAL_FRAMES: &[&str] = &["如果", "假如", "要是", "假设", "万一", "是否"];
+
+/// Discourse heads immediately AFTER the marker: boilerplate that introduces an
+/// explanation rather than stating a requirement (`需要说明的是…`).
+pub const BOILERPLATE_HEADS: &[&str] = &["说明", "指出", "强调", "注明"];
 
 // ---------------------------------------------------------------------------
 // Graph rules (§9.2, §9.4)

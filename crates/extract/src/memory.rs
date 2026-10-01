@@ -160,7 +160,13 @@ fn turn_candidates(
 
         match turn.role {
             Role::User => {
-                let preference = text::contains_any(&sentence_lower, rules::PREF);
+                // `contains_requirement` and not `contains_any` (ruagent-close-the-gaps
+                // t32): `PREF` carries the requirement markers, and a containment test
+                // fired on text that REPORTS a requirement — a quotation, a third
+                // party's statement, a hypothetical, boilerplate attribution, or the
+                // substring collision `不能用` inside `能不能用`. The other sets keep the
+                // plain containment they were designed with (see `text.rs`).
+                let preference = text::contains_requirement(&sentence_lower, rules::PREF);
                 let confirmation = text::contains_any(&sentence_lower, rules::CONFIRM);
                 if preference || confirmation {
                     // Store (§8.2): profile when the sentence is about the user
@@ -202,7 +208,11 @@ fn turn_candidates(
                         rules::RULE_USER_CORRECTION,
                     ));
                 }
-                if text::contains_any(&sentence_lower, rules::DECISION) {
+                // `contains_decision` (ruagent-close-the-gaps t32): the bare
+                // single-character marker `选` fired inside `可选` — the same
+                // word-boundary defect the requirement-marker finding names, so it is
+                // closed with the `可+V` stative rule rather than left behind.
+                if text::contains_decision(&sentence_lower, rules::DECISION) {
                     // Store (§8.2): procedure when the decision names something
                     // you operate (TOOLISH), else an observation.
                     let store = if text::contains_any(&sentence_lower, rules::TOOLISH) {
