@@ -1265,6 +1265,52 @@ impl RunManager {
 }
 
 /// The per-run supervisor: drives the ACP connection, writes the
+/// The `routed` event must name the agent that RAN, not merely the id the router handed over.
+///
+/// MEASURED, from a real run on this machine (the live `run-01a0f641-d8e5-7566-8247-23b7068f357d.jsonl`,
+/// its first event): `routed` carried `agents:["01a0f580-b2ac-7048-a136-6bbe33d5f13b"]`, an id
+/// that appears in no registry the API serves and in no table of the database, while the very
+/// same run's `params.agent` was `01a0b915-8273-73c4-8fe9-0e35a34d4ded` = `approver` -- the card
+/// the run resolved by name, and the agent whose prompt the `context_injected` event rendered in
+/// the next line. So the run was right and the audit trail named something no reader can resolve.
+///
+/// WHERE THE FOREIGN ID COMES FROM (out of this file's scope, recorded because a reader of this
+/// function needs it): the API's no-cascade fallback records `state.config.default_agent().id`
+/// (`api.rs:2143` -> `api.rs:2148`) and then re-resolves the run BY NAME in the manager's registry
+/// (`api.rs:2152`-`2155`), which is where `params.agent` comes from. The config-file view mints a
+/// fresh `AgentId::generate()` per card (`config.rs:200`, `225`, `265`, `307` -- the last one's own
+/// comment says "replaced by the stable DB id"), so the two ids are two VIEWS of one agent and only
+/// one of them resolves. The cascade path is not affected: its ids are resolved through the
+/// manager's registry before `orchestrator::route` ever sees them (`api.rs:5224`).
+///
+/// WHY RECONCILE HERE RATHER THAN TRUST THE DECISION: this event's job is to say what happened, and
+/// the run's own agent is the ground truth the event describes. An upstream id can be wrong for
+/// reasons this file cannot see -- here, a view mismatch in another module -- and a reader
+/// reconstructing a finished run should not have to cross-check `params.agent` to learn who ran.
+/// The router's own identity is NOT discarded: it moves into the rationale, so nothing is silently
+/// dropped and the divergence itself stays visible.
+fn routed_naming_what_ran(
+    decision: RoutingDecision,
+    ran: ruagent_core::AgentId,
+) -> RoutingDecision {
+    if decision.primary() == ran {
+        return decision;
+    }
+    let named = decision.primary();
+    let mut rationale = decision.rationale.unwrap_or_default();
+    if !rationale.is_empty() {
+        rationale.push_str("; ");
+    }
+    rationale.push_str(&format!(
+        "router named {named} (not the registry id of the agent that ran)"
+    ));
+    RoutingDecision {
+        agents: vec![ran],
+        source: decision.source,
+        rationale: Some(rationale),
+    }
+}
+
 /// transcript, applies the permission policy, and finalizes state.
 #[allow(clippy::too_many_arguments)]
 async fn supervise(
@@ -1301,11 +1347,17 @@ async fn supervise(
     };
 
     if let Some(decision) = routed {
+        // t37: the run's own agent is the ground truth this event describes; see
+        // `routed_naming_what_ran` for the measured divergence and why the reconciliation
+        // belongs at the emission site rather than in the decision's producer.
+        let ran = run.params.agent;
         emit(
             &mut transcript,
             &broadcast,
             &run,
-            RunEvent::Routed { decision },
+            RunEvent::Routed {
+                decision: routed_naming_what_ran(decision, ran),
+            },
         );
     }
     if !injection.is_empty() {
@@ -2016,6 +2068,58 @@ async fn render_run_injection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t37: the recorded `routed` event must name the agent whose prompt was actually injected.
+    ///
+    /// THE ASSERTION THAT FAILS AGAINST THE PRE-CHANGE CODE: `recorded.primary() == ran` -- before
+    /// the reconciliation the decision went into the event verbatim, so `primary()` was the
+    /// router's own id, which is a config-file card id that no registry on this machine contains.
+    /// The two ids below are the MEASURED pair from the live transcript
+    /// (`run-01a0f641-d8e5-7566-8247-23b7068f357d.jsonl` seq 0 vs the same run's `params.agent`).
+    #[test]
+    fn the_routed_event_names_the_agent_that_ran() {
+        let ran: ruagent_core::AgentId = "01a0b915-8273-73c4-8fe9-0e35a34d4ded".parse().unwrap();
+        let router: ruagent_core::AgentId = "01a0f580-b2ac-7048-a136-6bbe33d5f13b".parse().unwrap();
+        let recorded = routed_naming_what_ran(
+            RoutingDecision {
+                agents: vec![router],
+                source: RouteSource::Default,
+                rationale: None,
+            },
+            ran,
+        );
+        assert_eq!(
+            recorded.primary(),
+            ran,
+            "the routed event must name the agent whose prompt was injected"
+        );
+        assert!(
+            recorded.agents.iter().all(|a| *a == ran),
+            "no unresolvable id may remain in `agents`: {:?}",
+            recorded.agents
+        );
+        assert_eq!(
+            recorded.source,
+            RouteSource::Default,
+            "the cascade level that produced the decision is still recorded"
+        );
+        let why = recorded.rationale.clone().unwrap_or_default();
+        assert!(
+            why.contains(&router.to_string()),
+            "the router's own id is kept as provenance rather than dropped: {why}"
+        );
+
+        // A decision that already names the run is passed through untouched -- no gratuitous
+        // rewrite of the other producers' decisions (retry/fan-out/pipeline all use `card.id`).
+        let same = RoutingDecision {
+            agents: vec![ran],
+            source: RouteSource::Explicit,
+            rationale: Some("retry of run x".into()),
+        };
+        let kept = routed_naming_what_ran(same, ran);
+        assert_eq!(kept.rationale.as_deref(), Some("retry of run x"));
+        assert_eq!(kept.agents, vec![ran]);
+    }
 
     #[test]
     fn handoff_is_bounded() {
