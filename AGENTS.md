@@ -204,10 +204,28 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   (`git ls-remote origin HEAD`): `git -c http.proxy= -c https.proxy= …` STILL FAILS — an explicitly
   empty proxy does not disable the system one, curl falls back to it — while `$env:NO_PROXY='*'`
   succeeded on the first attempt (`e24263d..813d2f9 main -> main`, and `ls-remote` exit 0 under it).
-  Prefer that second one: it changes nothing on the machine, where the alternative is toggling the
-  user's system proxy off and back on — their setting, probably there for a reason, changed to work
-  around an environment fault. So read this entry as "any network client on this machine, not only
-  loopback tests"; the baseline-diff discipline above is unchanged.
+  For CURL-BACKED CLIENTS that is the remedy, and it changes nothing on the machine — where the
+  alternative is toggling the user's system proxy off and back on, their setting, probably there for
+  a reason, changed to work around an environment fault. **But `*` is NOT the remedy for "any network
+  client", which is how the first version of this paragraph read, and applying the wrong form
+  manufactures the very red this entry warns about** (ruagent-close-the-gaps t39). MEASURED,
+  `cargo test --workspace` with `NO_PROXY='*'`: **exit 101**, 9 failures in
+  `crates/daemon/tests/capabilities.rs` — including `put_persists_the_table_and_get_reflects_it`,
+  `a_file_table_activates_the_plane_and_narrowing_is_reported` and `an_empty_map_restores_legacy_mode`
+  — every one an `Err` whose source is
+  `ConnectError("tcp connect error", 127.0.0.1:7890, Os { code: 10061, ... })`, because `reqwest` does
+  not treat `*` as a wildcard. Cargo stops at that failing target, so the run reports `184 passed / 9
+  failed` on one FAILED target instead of the same tree's `73 targets, 660 passed, 0 failed` under the
+  host list — most of the suite never runs. **The two clients cannot share one value**, measured three
+  ways on `git ls-remote origin HEAD` (no push needed): `NO_PROXY=127.0.0.1,localhost,::1` → **exit
+  128** (`Failed to connect to 127.0.0.1 port 7890`; curl never matches github.com against a loopback
+  list), `NO_PROXY=127.0.0.1,localhost,::1,*` → **exit 128** as well (curl accepts `*` only as the
+  WHOLE value, never as a list item), `NO_PROXY='*'` alone → **exit 0**. So, per real command: the
+  three Rust gates (`fmt`/`clippy`/`test`) need the explicit host list, while `git push` and
+  `git ls-remote` need `*` alone — do not try to build a combined value. The panel e2e entry point
+  (`npm run test:e2e`) starts its own daemon and its proxy needs were NOT measured; assume neither
+  value for it. The baseline-diff discipline above is unchanged, and this is that discipline one level
+  down: the REMEDY has a scope too.
 - **With `CARGO_NET_OFFLINE=true`, this workspace fails to LINK on ONNX — so it reads as a source
   regression in a crate you never touched** (ruagent-close-the-gaps t14, from the increment-7 migration
   work). `cargo test --workspace` dies at link time with `link.exe` **error 1120** and unresolved
