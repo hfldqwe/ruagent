@@ -102,10 +102,12 @@ impl DaemonConfig {
         self.agents.iter().find(|a| a.name == name)
     }
 
-    /// The first enabled agent (routing default).
-    pub fn default_agent(&self) -> Option<&AgentCard> {
-        self.agents.iter().find(|a| a.enabled)
-    }
+    // `default_agent()` was deleted in t43. Two reasons, both recorded here so nobody re-adds it:
+    // the routing fallback's "first enabled card" rule now lives in `api.rs::default_route_agent`
+    // and reads the REGISTRY (the API stopped calling this config-file view in t38, leaving this
+    // accessor with no production caller), and the fallback's new guard against the permission
+    // approver must NEVER be moved here -- it keys on the approver `policy.toml` designates, not on
+    // any attribute of `agents.toml`.
 }
 
 // ---------------------------------------------------------------------------
@@ -973,7 +975,9 @@ servers = ["fs", "all"]
         assert!(dir.join("config/agents.toml").exists());
         assert_eq!(cfg.agents.len(), 4);
         assert!(cfg.agent("claude").is_some());
-        assert!(cfg.default_agent().is_some());
+        // t43 deleted `cfg.default_agent()`; the routing fallback's rule lives in api.rs now, so this
+        // asserts the property that accessor existed for: the shipped config has an enabled agent.
+        assert!(cfg.agents.iter().any(|a| a.enabled));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -1171,7 +1175,12 @@ const DEFAULT_ROUTING_TOML: &str = r#"# ruagent routing rules (design §5.4/§9.
 # The LLM router tier is a pluggable future addition (off by default).
 # NOTE: top-level keys (default) must come BEFORE any [[routes]] section.
 
-# default = "claude"
+# A default agent, BY NAME (enabled in t43). `claude` is the first enabled card of the shipped
+# agents.toml, so this states today's outcome explicitly instead of leaving it to alphabetical
+# accident -- and the permission-approver guard in the fallback can then never be what a fresh
+# install hits. An install that already has a routing.toml keeps its own file: the seed is written
+# only when the file is missing.
+default = "claude"
 
 # [[routes]]
 # project = "ruagent"

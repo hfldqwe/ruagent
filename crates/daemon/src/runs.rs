@@ -445,6 +445,17 @@ impl RunManager {
         self.broadcast.subscribe()
     }
 
+    /// The id of the agent the permission cascade designates as its APPROVER, resolved exactly the way
+    /// tier 2 resolves it above (`policy.approver.agent`, a NAME, looked up in this registry), or
+    /// `None` when none is configured or it is not registered (t43).
+    ///
+    /// The routing fallback reads this to refuse to select the adjudicator by accident. It is the same
+    /// identity the run path uses, deliberately: a `kind` test, a name literal or a prompt substring
+    /// would each be a second, divergent notion of "the approver".
+    pub fn approver_id(&self) -> Option<ruagent_core::AgentId> {
+        self.approver_id
+    }
+
     pub fn db(&self) -> &Db {
         &self.db
     }

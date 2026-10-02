@@ -2113,10 +2113,25 @@ struct StartRunRequest {
 /// the manager a few lines below). The two views are both legitimate; only the registry's id is
 /// resolvable, so that is the one to record.
 ///
-/// The RULE is the config view's own (`config.rs:106`: the first enabled card), so this changes
-/// which ID is recorded for the default agent, not WHICH agent is the default.
-fn default_route_agent(cards: &[ruagent_core::AgentCard]) -> Option<ruagent_core::AgentCard> {
-    cards.iter().find(|c| c.enabled).cloned()
+/// The RULE is still "the first enabled card", the rule the config-file view's `default_agent()` used
+/// -- which t43 deleted, this being its only replacement. It changes which ID is recorded for the
+/// default agent, not which agent is the default -- except for the t43 guard below.
+///
+/// t43: the last-resort fallback must NOT be the card the permission cascade designates as its
+/// APPROVER. `approver` is that card's ID, resolved from `policy.toml`'s
+/// `[permissions.approver].agent` by NAME against this same registry -- the resolution
+/// `RunManager::new` computes for tier 2 (`runs.rs:253-256`, exposed as `RunManager::approver_id`) --
+/// and NOT a `kind` test (a derived presentation attribute), a name convention, or a prompt substring.
+/// Only the last-resort fallback consults it: a rule naming the adjudicator, a pin naming it, or a
+/// `routing.toml` `default` naming it are the operator's deliberate choices and never reach here.
+fn default_route_agent(
+    cards: &[ruagent_core::AgentCard],
+    approver: Option<ruagent_core::AgentId>,
+) -> Option<ruagent_core::AgentCard> {
+    cards
+        .iter()
+        .find(|c| c.enabled && Some(c.id) != approver)
+        .cloned()
 }
 
 /// t41 (from the t40 measurement): a default-level decision must SAY which agent it chose and why.
@@ -2138,28 +2153,71 @@ fn default_route_agent(cards: &[ruagent_core::AgentCard]) -> Option<ruagent_core
 ///
 /// The agent's NAME, never its id: `params.agent` already carries the id, and an id is exactly what a
 /// reader cannot use without a second lookup.
-fn default_rationale(agent: &str, configured: bool) -> String {
+fn default_rationale(agent: &str, configured: bool, approver: Option<&str>) -> String {
     if configured {
-        format!("no agent pinned and no route matched; configured default `{agent}` (routing.toml)")
+        let mut text = format!(
+            "no agent pinned and no route matched; configured default `{agent}` (routing.toml)"
+        );
+        if approver == Some(agent) {
+            // t43: an operator may deliberately want the adjudicator as the fallback, and that is a
+            // legitimate state -- but the text has to say what they have asked for, or the one-word
+            // answer looks like a bug.
+            text.push_str(
+                " -- this is the permission approver policy.toml designates: it answers ALLOW/REJECT, \
+                 so a task sent here is adjudicated, not performed",
+            );
+        }
+        text
     } else {
-        format!(
-            "no agent pinned, no route matched and no default configured; using the first enabled card `{agent}` (set routing.toml's `default` to choose)"
-        )
+        match approver {
+            // t43: the fallback skipped the adjudicator to get here. Say so, and say how to choose it
+            // deliberately, because "the agent I wanted was silently not used" is the failure mode
+            // this whole guard exists to avoid replacing with another silence.
+            Some(skipped) => format!(
+                "no agent pinned, no route matched and no default configured; using the first enabled \
+                 card that is NOT the permission approver `{agent}` -- `{skipped}` is the approver \
+                 policy.toml designates, and it adjudicates instead of performing the task (set \
+                 routing.toml's `default` to pick either deliberately)"
+            ),
+            None => format!(
+                "no agent pinned, no route matched and no default configured; using the first enabled card `{agent}` (set routing.toml's `default` to choose)"
+            ),
+        }
     }
 }
 
-/// Fill in the rationale of a DEFAULT-level decision that has none (t41). Explicit and rule decisions
-/// are left alone: they already carry their own provenance (`RouteSource::Rule { rule_id }`, which the
-/// panel prefers over the rationale), and only the default level was silent.
+/// Fill in the rationale of a DEFAULT-level decision that has none (t41), and name the permission
+/// approver when it is what the decision is about (t43): either a configured `default` that names the
+/// adjudicator, or a fallback that had to skip it. Explicit and rule decisions are left alone: they
+/// already carry their own provenance (`RouteSource::Rule { rule_id }`, which the panel prefers over
+/// the rationale).
+///
+/// `approver` is the NAME of the card `policy.toml`'s `[permissions.approver].agent` designates
+/// (`designated_approver_name`), so both branches talk about the same identity the run path uses.
 fn with_default_rationale(
     mut decision: ruagent_core::RoutingDecision,
     agent: &str,
     configured: bool,
+    approver: Option<&str>,
 ) -> ruagent_core::RoutingDecision {
     if decision.source == ruagent_core::RouteSource::Default && decision.rationale.is_none() {
-        decision.rationale = Some(default_rationale(agent, configured));
+        decision.rationale = Some(default_rationale(agent, configured, approver));
     }
     decision
+}
+
+/// The NAME of the card `policy.toml` designates as the permission approver (t43), resolved through
+/// the SAME id the run path uses (`RunManager::approver_id`, which `RunManager::new` computes from
+/// `policy.approver.agent` by name against this registry). `None` when no approver is configured or
+/// it is not registered -- in which case the fallback has nothing to exclude.
+fn designated_approver_name(state: &AppState) -> Option<String> {
+    let id = state.mgr.approver_id()?;
+    state
+        .mgr
+        .agents()
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(|c| c.name)
 }
 
 async fn start_run(
@@ -2200,10 +2258,13 @@ async fn start_run(
                 .find(|c| c.id == id)
                 .ok_or_else(|| ApiError::bad_request("routing decision named an unknown agent"))?;
             // t41: the cascade yields `Default` only when `routing.toml` named a `default`, so this is
-            // the CONFIGURED case -- name the agent and say where the choice lives.
+            // the CONFIGURED case -- name the agent and say where the choice lives. t43: if that name is
+            // the permission approver, say what that means -- the operator asked for it on purpose, and
+            // the guard below deliberately does not stand in their way.
+            let designated = designated_approver_name(&state);
             (
                 card.name.clone(),
-                with_default_rationale(decision, &card.name, true),
+                with_default_rationale(decision, &card.name, true, designated.as_deref()),
             )
         } else {
             // t38: build the fallback from the SAME registry the run resolves against, below.
@@ -2216,17 +2277,48 @@ async fn start_run(
             // (approver) -- and the emission site had to reconcile it. Two views are not the bug:
             // the file describes what is CONFIGURED, the registry what is RUNNABLE. Recording the
             // unmaterialized one was.
-            let card = default_route_agent(&state.mgr.agents()).ok_or_else(|| {
-                ApiError::bad_request("no agent specified and no default configured")
+            // t43: the LAST-RESORT fallback must not be the permission approver, and where it cannot
+            // proceed it must say why instead of running the adjudicator. The key is the id `policy.toml`
+            // designates, resolved exactly as tier 2 resolves it (`RunManager::approver_id`).
+            let approver_id = state.mgr.approver_id();
+            let approver_name = designated_approver_name(&state);
+            let cards = state.mgr.agents();
+            let card = default_route_agent(&cards, approver_id).ok_or_else(|| {
+                match cards
+                    .iter()
+                    .find(|c| c.enabled && approver_id == Some(c.id))
+                    .map(|c| c.name.as_str())
+                {
+                    // The adjudicator is the ONLY enabled agent. Running it would report success while
+                    // adjudicating a task, so refuse -- and say what to do instead (t43). This text is
+                    // NOT the old "no agent specified and no default configured": that one means
+                    // "nothing is enabled", which is the `None` arm below and stays unchanged.
+                    Some(adjudicator) => ApiError::bad_request(format!(
+                        "no agent specified, no route matched and no default configured, and the only \
+                         enabled agent is `{adjudicator}` -- the permission approver policy.toml \
+                         designates, which answers ALLOW/REJECT instead of performing tasks; enable a \
+                         work-capable agent, name one in routing.toml's `default`, or pin one on this \
+                         run (`agent`)"
+                    )),
+                    None => ApiError::bad_request("no agent specified and no default configured"),
+                }
             })?;
-            // t41: nothing is configured, so this is the ACCIDENT case -- the text has to say that too,
-            // or it would read exactly like a decision somebody made.
+            // t41 + t43: nothing is configured, so this is the ACCIDENT case -- and when the approver had
+            // to be skipped to get here (it is the first ENABLED card), the text says so and says how to
+            // choose it deliberately. A skip that did not happen passes `None`.
+            let skipped = approver_name.as_deref().filter(|name| {
+                cards
+                    .iter()
+                    .find(|c| c.enabled)
+                    .is_some_and(|first| first.name == *name)
+            });
             (
                 card.name.clone(),
                 with_default_rationale(
                     ruagent_core::RoutingDecision::default_agent(card.id),
                     &card.name,
                     false,
+                    skipped,
                 ),
             )
         }
@@ -5359,6 +5451,29 @@ fn sse_end(status: RunStatus) -> Result<Event, Infallible> {
 mod tests {
     use crate::extract_plane::{ExtractPlan, Extractor};
 
+    /// A minimal `AgentCard` for the routing tests (t38/t41/t43). Nothing here reads a prompt, a
+    /// `kind` or a description, which is the point: the fallback must key on neither.
+    fn card(id: &str, name: &str, enabled: bool) -> ruagent_core::AgentCard {
+        ruagent_core::AgentCard {
+            id: id.parse().expect("an agent id"),
+            name: name.to_string(),
+            harness: ruagent_core::HarnessKind::Dsh,
+            command: None,
+            description: String::new(),
+            model: None,
+            reasoning_effort: None,
+            context_window: None,
+            mcp_profile: None,
+            models: Vec::new(),
+            prompt: None,
+            runtime: None,
+            runtimes: Vec::new(),
+            options: std::collections::BTreeMap::new(),
+            tags: Vec::new(),
+            enabled,
+        }
+    }
+
     /// t38: the no-cascade fallback must take its agent from the SAME registry the run resolves
     /// against, so the id in the `routed` decision and the id in `params.agent` agree BY
     /// CONSTRUCTION instead of being reconciled at the emission site afterwards.
@@ -5373,38 +5488,24 @@ mod tests {
     /// (not the registry id of the agent that ran)"`). What this test pins is the resolution itself:
     /// point `default_route_agent` back at a config-view card and `chosen.id == registry_card.id`
     /// fails on the very first assertion.
+    ///
+    /// The fixture is `impl`, deliberately NOT `approver` (t43): the fallback now keys on the card
+    /// `policy.toml` designates as the permission approver, so a fixture named `approver` would make a
+    /// reader unable to tell whether a pass came from this rule or from that guard. The adjudicator is
+    /// the subject of exactly one test, `the_fallback_skips_the_designated_permission_approver`.
     #[test]
     fn the_default_route_agent_comes_from_the_registry_view() {
-        fn card(id: &str, name: &str, enabled: bool) -> ruagent_core::AgentCard {
-            ruagent_core::AgentCard {
-                id: id.parse().expect("an agent id"),
-                name: name.to_string(),
-                harness: ruagent_core::HarnessKind::Dsh,
-                command: None,
-                description: String::new(),
-                model: None,
-                reasoning_effort: None,
-                context_window: None,
-                mcp_profile: None,
-                models: Vec::new(),
-                prompt: None,
-                runtime: None,
-                runtimes: Vec::new(),
-                options: std::collections::BTreeMap::new(),
-                tags: Vec::new(),
-                enabled,
-            }
-        }
-        // The registry's id and the config view's per-load id, as measured live.
-        let registry_card = card("01a0b915-8273-73c4-8fe9-0e35a34d4ded", "approver", true);
-        let config_view_card = card("01a0f580-b2ac-7048-a136-6bbe33d5f13b", "approver", true);
+        // The registry's id and the config view's per-load id, as measured live (the latter is the
+        // shape of the id the config view mints, kept only to show it is not the one recorded).
+        let registry_card = card("01a0b8bb-f251-739a-a5ed-1dd1c1635302", "impl", true);
+        let config_view_card = card("01a0f580-b2ac-7048-a136-6bbe33d5f13b", "impl", true);
         assert_ne!(
             registry_card.id, config_view_card.id,
             "one agent, two views, two ids -- that is the trap this test guards"
         );
 
-        let chosen =
-            default_route_agent(std::slice::from_ref(&registry_card)).expect("a default agent");
+        let chosen = default_route_agent(std::slice::from_ref(&registry_card), None)
+            .expect("a default agent");
         assert_eq!(
             chosen.id, registry_card.id,
             "the fallback records the REGISTRY's id -- the one `params.agent` will carry"
@@ -5414,15 +5515,85 @@ mod tests {
             "and never the config view's id, which no registry on this machine resolves"
         );
 
-        // The RULE is deliberately the config view's own (config.rs:106): the first card that is
-        // ENABLED, so the choice of default agent does not change -- only the id recorded for it.
+        // The RULE is still "the first ENABLED card", so a disabled card in front changes nothing.
         let disabled_first = card("01a0f580-0000-0000-0000-000000000000", "aaa", false);
         let both = vec![disabled_first, registry_card.clone()];
         assert_eq!(
-            default_route_agent(&both).expect("a default agent").id,
+            default_route_agent(&both, None)
+                .expect("a default agent")
+                .id,
             registry_card.id,
-            "the disabled card is skipped, as the config view's own rule does"
+            "the disabled card is skipped, as the rule has always done"
         );
+    }
+
+    /// t43: the last-resort fallback must skip the card `policy.toml` designates as the permission
+    /// approver -- keyed on that card's ID, which is what the handler passes in -- and must come back
+    /// `None` (so the handler can refuse loudly) when the adjudicator is the only enabled card.
+    ///
+    /// The adjudicator's real name is used here on purpose: this is the one test where it is the
+    /// subject, so a reader cannot mistake a pass for the fixture. Every other test in this module uses
+    /// non-adjudicator cards for exactly that reason.
+    ///
+    /// Standing against the PRE-CHANGE bytes: `default_route_agent` took no approver argument there, so
+    /// these assertions cannot run; the behavioural pre-change reading is the private-daemon
+    /// reproduction in the task output (`run.result = ALLOW` on a real intent).
+    #[test]
+    fn the_fallback_skips_the_designated_permission_approver() {
+        let adjudicator = card("01a0b915-8273-73c4-8fe9-0e35a34d4ded", "approver", true);
+        let worker = card("01a0b8bb-f251-739a-a5ed-1dd1c1635302", "impl", true);
+        let both = vec![adjudicator.clone(), worker.clone()];
+
+        // Without a designated approver the rule is unchanged: the first enabled card, approver
+        // included -- which is what makes the guard a guard and not a rename of the rule.
+        assert_eq!(
+            default_route_agent(&both, None).expect("a default").id,
+            adjudicator.id,
+            "no designated approver -> the rule is exactly what it was"
+        );
+        // With one, the card is skipped rather than chosen.
+        let chosen = default_route_agent(&both, Some(adjudicator.id)).expect("a default");
+        assert_eq!(
+            chosen.id, worker.id,
+            "the adjudicator is skipped, not selected"
+        );
+        assert_ne!(chosen.id, adjudicator.id);
+
+        // Only the adjudicator enabled: this is the handler's loud-refusal state. Measured on a private
+        // daemon (a config whose only enabled card is the approver): the run is refused before it spawns.
+        assert!(
+            default_route_agent(std::slice::from_ref(&adjudicator), Some(adjudicator.id)).is_none(),
+            "only the adjudicator enabled -> None -> start_run refuses instead of adjudicating a task"
+        );
+
+        // A disabled card in front is skipped by the pre-existing rule, and the guard does not
+        // resurrect it.
+        let disabled = card("01a0f580-0000-0000-0000-000000000000", "aaa", false);
+        let with_disabled = vec![disabled, adjudicator.clone(), worker.clone()];
+        assert_eq!(
+            default_route_agent(&with_disabled, Some(adjudicator.id))
+                .expect("a default")
+                .id,
+            worker.id
+        );
+
+        // The two rationales this path can produce, in the exact words the panel will render.
+        let skipped = default_rationale("impl", false, Some("approver"));
+        assert!(skipped.contains("NOT the permission approver"), "{skipped}");
+        assert!(
+            skipped.contains("`impl`") && skipped.contains("`approver`"),
+            "both names, so the reader sees what was chosen and what was skipped: {skipped}"
+        );
+        assert!(skipped.contains("adjudicates"), "{skipped}");
+        // An operator who deliberately configures the adjudicator as the default is NOT blocked -- the
+        // guard is on the fallback -- and the rationale says what they asked for.
+        let deliberate = default_rationale("approver", true, Some("approver"));
+        assert!(
+            deliberate.contains("configured default `approver`"),
+            "{deliberate}"
+        );
+        assert!(deliberate.contains("permission approver"), "{deliberate}");
+        assert!(deliberate.contains("ALLOW/REJECT"), "{deliberate}");
     }
 
     /// t41: the rationale must name the AGENT and the REASON, and must keep the two default cases
@@ -5437,10 +5608,10 @@ mod tests {
     /// `assert!(no_default.contains("approver"))` plus `assert_ne!(no_default, configured)`.
     #[test]
     fn the_default_rationale_names_the_agent_and_the_reason() {
-        let no_default = default_rationale("approver", false);
+        let no_default = default_rationale("architect", false, None);
         assert!(
-            no_default.contains("approver"),
-            "the NAME is what a run JSON lacks (its `approver` search is False): {no_default}"
+            no_default.contains("architect"),
+            "the NAME is what a run JSON lacks (its agent-name search is False): {no_default}"
         );
         assert!(
             no_default.contains("no default configured"),
@@ -5455,7 +5626,7 @@ mod tests {
             "an id is NOT the answer -- `params.agent` already carries it: {no_default}"
         );
 
-        let configured = default_rationale("impl", true);
+        let configured = default_rationale("impl", true, Some("approver"));
         assert!(configured.contains("impl"), "{configured}");
         assert!(
             configured.contains("configured default"),
@@ -5476,7 +5647,7 @@ mod tests {
             rationale: None,
         };
         assert!(
-            with_default_rationale(rule, "architect", true)
+            with_default_rationale(rule, "architect", true, None)
                 .rationale
                 .is_none()
         );
@@ -5486,7 +5657,7 @@ mod tests {
             rationale: Some("retry of run x".into()),
         };
         assert_eq!(
-            with_default_rationale(retry, "approver", false)
+            with_default_rationale(retry, "approver", false, None)
                 .rationale
                 .as_deref(),
             Some("retry of run x"),
@@ -5499,7 +5670,7 @@ mod tests {
             source: ruagent_core::RouteSource::Default,
             rationale: None,
         };
-        let named = with_default_rationale(silent, "approver", false);
+        let named = with_default_rationale(silent, "approver", false, None);
         let why = named.rationale.clone().unwrap_or_default();
         assert!(why.contains("approver"), "{why}");
         assert_eq!(
