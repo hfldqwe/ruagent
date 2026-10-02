@@ -2119,6 +2119,49 @@ fn default_route_agent(cards: &[ruagent_core::AgentCard]) -> Option<ruagent_core
     cards.iter().find(|c| c.enabled).cloned()
 }
 
+/// t41 (from the t40 measurement): a default-level decision must SAY which agent it chose and why.
+///
+/// WHY, measured: a run's JSON carries no agent name at all -- a substring search for `approver` over
+/// the whole object is False, its only trace is `params.agent`, a bare ULID -- and the routing
+/// decision said `source.level = "default"` with `rationale: null`. So a CONFIGURED default and the
+/// no-default accident were indistinguishable, and the user whose real intent came back `ALLOW`
+/// (`run.result = ALLOW`, 13 s, `status=completed`, `used=14422` tokens) had nothing that connected
+/// the one word to its cause. The panel already renders this field next to `路由：{level}`, so this is
+/// text, not UI.
+///
+/// TWO CASES, kept apart because their remedies differ:
+///   * `configured = true` -- `routing.toml` names a `default`: an operator chose this agent, so the
+///     text says "configured default" and names the file, which is where to choose another one;
+///   * `configured = false` -- nothing is configured, so the FIRST ENABLED CARD was used: the text
+///     says so and names the key to set, so the reader learns the agent was picked by ordering rather
+///     than by anyone's decision.
+///
+/// The agent's NAME, never its id: `params.agent` already carries the id, and an id is exactly what a
+/// reader cannot use without a second lookup.
+fn default_rationale(agent: &str, configured: bool) -> String {
+    if configured {
+        format!("no agent pinned and no route matched; configured default `{agent}` (routing.toml)")
+    } else {
+        format!(
+            "no agent pinned, no route matched and no default configured; using the first enabled card `{agent}` (set routing.toml's `default` to choose)"
+        )
+    }
+}
+
+/// Fill in the rationale of a DEFAULT-level decision that has none (t41). Explicit and rule decisions
+/// are left alone: they already carry their own provenance (`RouteSource::Rule { rule_id }`, which the
+/// panel prefers over the rationale), and only the default level was silent.
+fn with_default_rationale(
+    mut decision: ruagent_core::RoutingDecision,
+    agent: &str,
+    configured: bool,
+) -> ruagent_core::RoutingDecision {
+    if decision.source == ruagent_core::RouteSource::Default && decision.rationale.is_none() {
+        decision.rationale = Some(default_rationale(agent, configured));
+    }
+    decision
+}
+
 async fn start_run(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -2156,7 +2199,12 @@ async fn start_run(
                 .into_iter()
                 .find(|c| c.id == id)
                 .ok_or_else(|| ApiError::bad_request("routing decision named an unknown agent"))?;
-            (card.name.clone(), decision)
+            // t41: the cascade yields `Default` only when `routing.toml` named a `default`, so this is
+            // the CONFIGURED case -- name the agent and say where the choice lives.
+            (
+                card.name.clone(),
+                with_default_rationale(decision, &card.name, true),
+            )
         } else {
             // t38: build the fallback from the SAME registry the run resolves against, below.
             // `state.config.default_agent()` is the CONFIG-FILE view (`config.rs:106`), and the
@@ -2171,9 +2219,15 @@ async fn start_run(
             let card = default_route_agent(&state.mgr.agents()).ok_or_else(|| {
                 ApiError::bad_request("no agent specified and no default configured")
             })?;
+            // t41: nothing is configured, so this is the ACCIDENT case -- the text has to say that too,
+            // or it would read exactly like a decision somebody made.
             (
                 card.name.clone(),
-                ruagent_core::RoutingDecision::default_agent(card.id),
+                with_default_rationale(
+                    ruagent_core::RoutingDecision::default_agent(card.id),
+                    &card.name,
+                    false,
+                ),
             )
         }
     };
@@ -5368,6 +5422,95 @@ mod tests {
             default_route_agent(&both).expect("a default agent").id,
             registry_card.id,
             "the disabled card is skipped, as the config view's own rule does"
+        );
+    }
+
+    /// t41: the rationale must name the AGENT and the REASON, and must keep the two default cases
+    /// apart -- one is a configuration (`routing.toml`), the other is an accident of ordering.
+    ///
+    /// STANDING AGAINST THE PRE-CHANGE BYTES, plainly: these assertions cannot run there because
+    /// neither helper existed. What the pre-change bytes DO show is the behaviour they pin, MEASURED
+    /// on a private daemon minutes before this change: an unpinned run's decision was
+    /// `{"source":{"level":"default"},"rationale":null}` on BOTH paths -- agent `approver` with
+    /// `routing.toml` commented out, and agent `impl` with `default = "impl"` -- i.e. byte-identical
+    /// text for a configuration and an accident. A reviewer should read the property as the pair
+    /// `assert!(no_default.contains("approver"))` plus `assert_ne!(no_default, configured)`.
+    #[test]
+    fn the_default_rationale_names_the_agent_and_the_reason() {
+        let no_default = default_rationale("approver", false);
+        assert!(
+            no_default.contains("approver"),
+            "the NAME is what a run JSON lacks (its `approver` search is False): {no_default}"
+        );
+        assert!(
+            no_default.contains("no default configured"),
+            "the accidental case must say so, or it reads like a decision: {no_default}"
+        );
+        assert!(
+            no_default.contains("routing.toml"),
+            "and it must name where to choose, so the text is actionable: {no_default}"
+        );
+        assert!(
+            !no_default.contains("01a0") && !no_default.contains("d4ded"),
+            "an id is NOT the answer -- `params.agent` already carries it: {no_default}"
+        );
+
+        let configured = default_rationale("impl", true);
+        assert!(configured.contains("impl"), "{configured}");
+        assert!(
+            configured.contains("configured default"),
+            "the configured case must be labelled as a configuration: {configured}"
+        );
+        assert!(
+            !configured.contains("no default configured"),
+            "the two cases must not read alike: {configured}"
+        );
+
+        // Only a default-level decision with an EMPTY rationale is touched. A rule decision keeps its
+        // own provenance (the panel prefers `rule_id` over the rationale), and nothing is overwritten.
+        let rule = ruagent_core::RoutingDecision {
+            agents: vec!["01a09d69-498f-77a1-9bcd-b84a93ff4122".parse().unwrap()],
+            source: ruagent_core::RouteSource::Rule {
+                rule_id: "project~None+title~Some(\"x\")".into(),
+            },
+            rationale: None,
+        };
+        assert!(
+            with_default_rationale(rule, "architect", true)
+                .rationale
+                .is_none()
+        );
+        let retry = ruagent_core::RoutingDecision {
+            agents: vec!["01a0b915-8273-73c4-8fe9-0e35a34d4ded".parse().unwrap()],
+            source: ruagent_core::RouteSource::Default,
+            rationale: Some("retry of run x".into()),
+        };
+        assert_eq!(
+            with_default_rationale(retry, "approver", false)
+                .rationale
+                .as_deref(),
+            Some("retry of run x"),
+            "an existing rationale is never overwritten"
+        );
+
+        // A silent default-level decision IS filled, and neither the level nor the chosen agent moves.
+        let silent = ruagent_core::RoutingDecision {
+            agents: vec!["01a0b915-8273-73c4-8fe9-0e35a34d4ded".parse().unwrap()],
+            source: ruagent_core::RouteSource::Default,
+            rationale: None,
+        };
+        let named = with_default_rationale(silent, "approver", false);
+        let why = named.rationale.clone().unwrap_or_default();
+        assert!(why.contains("approver"), "{why}");
+        assert_eq!(
+            named.source,
+            ruagent_core::RouteSource::Default,
+            "the level is unchanged"
+        );
+        assert_eq!(
+            named.primary(),
+            "01a0b915-8273-73c4-8fe9-0e35a34d4ded".parse().unwrap(),
+            "which agent is chosen is NOT this task's business"
         );
     }
 
