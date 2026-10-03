@@ -461,6 +461,28 @@ a SIBLING directory: component-wise containment must not confuse it
 
 **通则（给下一位）**：撞到 `inScope overlaps <已冻单>` 时，**不要**去改自己任务的路径（那是把工作挪开而不是把问题解决），也不要去削弱被冻单的 inScope（`update_task` 本来就改不了）。三条合法出路，按优先级：① **用读数证明被冻单的前提已被取代 ⇒ captain 直接取消它**；② 把工作**真的**挪到不重叠的路径（只有当工作本来就可以那样切分时才成立）；③ 记下冲突**等**（例如 `t64`/`t89` 这一对）。**本代已经在这条规则上付出了两次代价**（`t96` 堵住 api.rs 一轮；`t111/t112` 曾被 `t110` 串行化）。
 
+## B28. `crates/extract` 的第一次独立审计（t125，verify2 攻击式）：4 条声称成立、5 条不成立、2 处机械证明被打红
+
+**报告**：`docs/design/reviews/gen4-audit-extract.md`（44,763 B，§0–§8；提交 `1bf51f2`）。**被审对象**：capability 那代新增的整块 crate（~2755 源码行 / ~1247 测试行），**此前从未被独立审过**。
+
+**先记成立的（正读数，别只记 findings）**：① **zero-token 是结构性的** —— `Cargo.toml` **无 `[dependencies]`**、`Cargo.lock` 只有 dev-dep `serde_json`、19 项 FORBIDDEN 扫描五文件 clean、`Rules` 臂体内无 `ask_agent`（模型只在 `AcpExtractor::ask`）；② **`max_per_input` 是精确的齿** —— 记忆 3/4/5/6/7 轮（cap=5）→ 3/4/5/5/5 且 `truncated=false/false/false/true/true` ⇒ **「正好 n」与「被砍在 n」可区分**（t9 那套口径）；③ **确定性跨进程**同指纹；④ **图谱路径真有界**（1/4/16 MB → 34/23/39 ms、输出恒 3）。
+
+| id | sev | 一句话 | 状态 |
+| --- | --- | --- | --- |
+| **F1** | medium | **`tests/bounded.rs` 的名字在承诺有界，而转录路径没有按字节的界** —— `max_turns` 只界条数；单轮文本整段进 `split_sentences`（先建 `char_indices()` = 16 B/字符）⇒ 实测 `137 → 513 → 1943 ms`、**峰值分配 = 输入 ×16**（16/64/256 MiB）；而那个 1.1 MB 单轮用例**只断言输出条数** | **`t132` 在办**（verify2） |
+| **F2** | medium | **`max_content_bytes` 的丢弃是静默的**：46 B 句 + cap=45 ⇒ **0 候选而所有计数器全零**（`truncated`/`suppressed`/`turns_skipped` 都不动）⇒ 调用方分不清「句子太长被丢」「没有规则命中」「去重了」。**与这个 crate 自己在 `extract_plane.rs:457-489` 立的规矩同类**（「调用方必须能区分 exactly 32 与 capped at 32」），只是**在另一个位置复发** | 未立单 |
+| **F3** | medium | **gold fixture 不钉证据字段**：记忆侧渲染只比 `rule\|store\|confidence\|content`；图谱侧 6/7 段无 `origin`/`source` ⇒ 实测**篡改 `origin.index-1` + 翻转 `role` 仍被接受**、`source="WRONG-SESSION"` 渲染相同；图谱 `section=Some(99)`+`source=""` **两个渲染串相同且全部 in-pass 断言通过 ⇒ 接受=true**。**（它如实列出：`index+1` 被范围检查兜住了 —— 这条反例让 F3 的边界准确）** | 未立单 |
+| **F4** | medium | **证据链缺位置一维，且现有坐标无人消费**：`split_sentences` 的 offset **算得出来却被丢弃**（`memory.rs:147`）、三个候选结构体都无区间字段，且**全仓 `origin` 消费者为零** ⇒ 一行记忆/图谱边**回溯不到具体轮次/章节** | 未立单 |
+| **F5** | low | `window_text` 注释承诺「回退到前一段落边界、段落绝不会被抽一半」，而 `None => cut` 是**生切**（200,000 B 单段落实测 `bytes_skipped=134,464`、窗口末尾落在段落内部） | 未立单（**可能升级**：见下 G1） |
+| **F6** | low | **`min_score` 齿在出厂值上不咬**：默认 `0.0`，而图谱实体最低分 0.25 ⇒ 永不裁剪；两个抽取 capability 只声明 `max_per_input`/`max_docs_per_pass` ⇒ 生产路径上这个齿**从未被设过** | 未立单 |
+| **F7** | low | **「四个齿」不在同一个 crate 里**：`max_per_input`/`min_score` 在 extract（后者惰性）、`max_docs_per_pass` 在 **daemon 的摄取扫描**、`weight` 是**召回腿融合权重**（与抽取无关）；且**默认抽取路由是 `acp`（花 token）、零 token 层默认 off** | 未立单（文档归属问题） |
+| **F8** | low | **内容预算按字节、名字预算按字符 ⇒ 脚本间不对称**：同一 `max_content_bytes=400` 下 140 ASCII 字符（156 B）留着、140 汉字（416 B）被丢 ⇒ 汉语有效句长预算约为 ASCII 的 1/3 | 未立单 |
+| **F9** | low | **纯度扫描的文件清单是手写 5 项常量** ⇒ 隔离副本里加 `src/io_probe.rs`（真 `std::fs`）+ `pub mod io_probe;` 后 **扫描仍判 clean**（而副本能编译）⇒ 真实的 I/O 可达路径能绕过「纯度的机械证明」 | 未立单 |
+
+**两条猜想（§5，作者明确不混进 findings）**：**G1「半句变逐字证据」** —— F5 的生切原则上让窗口末尾出现半句，而关系/实体把所在句**逐字**写进 `fact`/`summary`；作者**没造出来**（碎片被 df≥2 闸门与反引号配对挡住），但给了**精确的下一步配方**（把 64 KiB 切点对准**成对定界符的闭括号之后**、或 inline-code 的**闭反引号之后**，同时让该 token 在前文出现 ≥2 次）⇒ **若能造出带半句 `summary`/`fact` 的候选，F5 应从 low 升为 medium/high**（因为它把「半句」写成了「逐字证据」）。**G2** `min_score = NaN` ⇒ 恒假⇒静默清空（今天 daemon 校验 finite 且 0..=1，产不出 NaN）。
+
+**审计者自己的纪律（值得记）**：① **拒绝抬高分级**并写出理由（无 blocker/high：没有一条会把**错误的结论**写进记忆/图谱；唯一可能伪造事实的路径**没造出来** ⇒ 进猜想）；② 列出**与结论相反**的读数（`index+1` 被兜住）；③ 把读数**钉在字节上**（五个文件 SHA-256，因为 HEAD 在它侦察期连移三次 `873bb90→db46f6c→e8aaead`）；④ 环境纠正：活 daemon **pid 79984 开工时已不存在**（8787 由 14944 持有），`%TEMP%` 里另有 11 个不是它的 `t125*` 条目，**只删自己那一个具体路径**。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
