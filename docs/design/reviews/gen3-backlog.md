@@ -426,6 +426,28 @@ a SIBLING directory: component-wise containment must not confuse it
 1. **「核对当前字节」直接省掉了一整张单**：capability 设计文档 §20 第 4 条列着三条 follow-up（让不可传输的键**响亮**、删掉 prose 里的数字边界、加字段集守卫）。派活前我核了当前字节 —— **三条都已落地**（`crates/mcp/src/lib.rs:1210` 的「EVERY struct here carries `deny_unknown_fields`」、`:1357` 的「`deny_unknown_fields` IS THE FIX FOR A MEASURED FALSE SUCCESS」、`:1400` 的属性、`:1409-1425` 已改成「read that row's `options_schema`」、`:1865`/`:2417` 的字段集守卫）。**照文档立单就是让成员去做一件已经做完的事**，而成员会（正确地）拿现有代码回报「已完成」，白烧一轮。⇒ 通则：**登记的 follow-up 也是会过期的读数，立单前必须回到字节。**
 2. **平台规则改变了正确的动作，而不是只阻挡它**：t118 与 t96 在 `crates/daemon/src/api.rs` 上重叠，而 running 团队只允许对 pending 单做 `update_task`（改不了 inScope、也删不掉）。我没有去削弱 t96 的 inScope，而是**回头重审修法本身** —— 发现存在信号已在 wire 上，于是本轮变成**纯消费面修复**，根本不需要那块路径。⇒ **通则：inScope 冲突先当设计问题重审，别当权限问题绕过。**
 
+## B26. F1 根因族的同族盘点（t123，mem-core 只读）：桥里另有 11 处，排序第一会让 agent 说出直接的假话
+
+**报告**：`docs/design/reviews/gen4-protocol-drift-sweep.md`（107 行）。**形状**（= F1 的根因）：读生产方响应键 + **吸收缺失**（`unwrap_or`/`unwrap_or_default`/`map(false)`/`or_else`）⇒ 键名漂移**静默**变成一句读起来正常的**成功**。
+
+**11 处 (a) 类，按「后果严重度 × 可达」排序（前 5 名）**
+
+| 排名 | 读点 | 漂移后 agent/用户看到的原话 |
+| --- | --- | --- |
+| **1** | `hits_to_text` 的 `hits`（`lib.rs:72`/`:157`，`memory_search`/`knowledge_search` 共用） | **`no results`** —— 而生产方确实发 `hits`（`api.rs:4974`/`5377`）。**有命中却告诉 agent「记忆/知识库里没有」**（并可能诱发重复写入） |
+| 2 | `memory_get` 的 `memory.store`/`.namespace`/`.content`（`:132-137`） | 一条真实记忆显示成 **`[?/?] ?`** ⇒ agent 以为记忆是空的/别人的 |
+| 3 | `recall_to_text` 的 `kind` + `_ => continue`（`:1521-1596`）；`legs_disabled` | 章节标题下**一行都没有**；「薄结果」的**解释行消失** |
+| 4 | `hits_to_text` 的兜底键 `result`（`:1614-1624`） | `result` 在 daemon **0 次** ⇒ **死兜底**（与 t118 删掉的 `entity`/`exists` 同形）；`content` 改名 ⇒ 单条回 `?` |
+| 5 | `chunks`（`:179`）· `tier` 过滤（`:760-768`）· facts 四字段（`:251-254`）· `tasks`（`:477-484`）· `truncated`/`dry_run`（`:1047-1077`）· expand 三键（`:202-204`） | `ingested 0 chunks` · `0 of N capabilities` · `#0 --?--> #0 ?` · `no tasks` · 「未截断」/回显自己的请求 · 展开内容成了 `?` |
+
+**同一个文件里已经有一批 (c) 响亮样板**：`field_str`/`field_bool`/`drift`（点名「文件、键、取回的键集」）+ `capabilities`/`distill`/`ingest` 的承载键都走 `ok_or_else(drift(...))`，并有 5 条测试钉住 ⇒ **修法是把旧点改成新点的写法，不是发明新机制**（t118 的 `entity_exists` 已是第三个样板）。
+
+**面板侧**：`panel/src/api.ts` 的 `getChecked`/`expectShape` **已是**运行期形状断言 (c)；残留 (a) 集中在**视图**对可选字段的 `?? 0`/`?? []` —— `Agents.tsx:353` `s.health.tools ?? 0`（MCP 服务器显示 **`0 tools`**）、`:233`、`:458`。
+
+**下一轮的头（已定，未立单）**：修 **M1**（并顺手删 `result` 死兜底）。**但它与在飞的 t118 是同一个文件** `crates/mcp/src/lib.rs` ⇒ 单子必须**等 t118 落地后**才能立（平台会拒 inScope 重叠），且坐标要**按 t118 落地后的字节重读**。
+
+**t123 自陈的两条读数陷阱（值得进纪律）**：① **清点生产方只 grep 带引号的键名会漏掉 serde 结构体字段** —— `grep -rn '"chunk"' crates/daemon/src/` = 0 命中，差点把 `knowledge_expand` 的 `chunk` 判成「生产方从不发出」，实际生产方是 `#[derive(Serialize)] struct Expansion { pub chunk: String }`（`knowledge/src/files.rs:52-61`），serde 按**字段名**发出、**没有引号** ⇒ 必须三种都查（`json!` 字面量 + `Serialize` 字段 + SELECT 列名）；② **文件在读取期间会动** —— `lib.rs` 同一轮里 2474 → 2560 → 2561 行（t118 在途），同一读点两次 `grep -n` 给出不同行号 ⇒ **引坐标必须带读取时刻的 sha256**。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
