@@ -523,6 +523,16 @@ a SIBLING directory: component-wise containment must not confuse it
 
 **未立单的理由**：`crates/store/**` 此刻无主（t94 的存储层审计已终结）；且这条需要「改 schema 的隔离副本负控」才有判别力 —— 成本明确后立单更稳。**关联**：t119 的残余风险结论是「`name` 不构成阻断性 finding」（因为 `NULL` 在今天的 schema 下造不出来），所以本条**不是** t118 的缺陷，而是**它依赖的不变量没有守卫**。
 
+## B32. 可照抄的范式：**源码扫描型守卫的三件套**（`crates/daemon/src/extract_plane.rs` 已落地，captain 本轮读到）
+
+**现场**（`extract_plane.rs:995-1057`，t137 改动旁边）：这是本代一直在要的那个形状，而且**已经在树里**，不必新造 ——
+
+1. **扫描下限**：`assert!(scanned > 10, "the scan must actually walk the daemon's sources; it walked {scanned}")` ⇒ **扫到 0 个文件不是「干净」，是「守卫失明」**（对照本代的反例：F9 的纯度扫描手写清单、C32 的 pid 守卫 —— 它们都**没有**这一半）。
+2. **植入控制**：`let planted = "...session.send(ChatCommand::Prompt {..."` + `assert_eq!(unmarked_prompt_sends(planted), vec![2], "the scanner must fail on a sender that skips the marker, otherwise the check is vacuous")` ⇒ **证明扫描器不是空转的**，而且**控制永不进树**（写在测试里）。
+3. **写明排除 + 理由**：跳过 `chat.rs`（「the user's own path, by name and for a stated reason」）、在 `#[cfg(test)]` 处截断（理由：测试模块里的字面量会提到该符号，而它们不是发送者）⇒ **每处排除都给出对象集理由**，而不是「这样测试就过了」。
+
+**为什么值得单独记**：本代记了太多「守卫静默失明」的缺陷（C32 pid 守卫 / F9 纯度清单 / §B29 第二份危险默认 / B31 未守卫的不变量），**却很少记「长对了的样子」**。这一处可以直接照抄到其它扫描型守卫（例如 `.github/workflows/scripts/*.sh` 的路径检查、`check-workflow-refs.sh` 的引用检查）：**下限 + 植入控制 + 具名排除**，三件缺一，扫描就会在某天变成空转。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
