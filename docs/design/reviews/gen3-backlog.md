@@ -511,6 +511,16 @@ a SIBLING directory: component-wise containment must not confuse it
 **更强的假设（未证实，但有可构造输入 —— 交给立案者）**：那一次异常落在 **8899 正被 `t128` 的临时 daemon（PID 31020，启动 `00:24:44`）绑定的窗口内**。「**连接被拒绝**」与「**TCP 连上了但对方不服务**」是两件事：前者让点名检查**快速**返回 `daemon not reachable`；后者会让 run 进入 **`auditRoute`（`design-audit.mjs:3857`）**，在 **13 条路由**上各自等到超时（合计 **~130s**）后抛错，再由 **`:8436-8439` 的 catch** 换成 **exit 2 + 栈回溯** —— 与该次观测的**全部特征吻合**（既慢、又没那句话、且有栈回溯）。**构造输入**：让目标端口上有一个**会 `accept` 但不服务**的监听者（或一个正在绑定的进程）再跑控制 —— 若能复现，就同时钉住这条路径**与它的可判定输入**（这条线索就能从「抖动」升级为「一个有确切触发条件的缺陷」）。
 
 
+## B31. `entities.name NOT NULL` **全仓没有测试钉住**（`t119` 的独立验证带出的 low finding，未立单）
+
+**读数（t119 报告 §残余风险 + L1）**：存在信号是 `name`（`null` ⇔ 不在图里），而该信号**依赖一个 schema 约束**：`crates/store/src/migrations.rs` 的 `0005_graph.sql:9` = `name TEXT NOT NULL`（sha256 `505F0F81A4E599CD…`）。但**全仓没有任何测试钉住这个 `NOT NULL`**：约束类命中**全是 FOREIGN KEY**；仓库里唯一碰 `PRAGMA table_info` 的家什（`migrations.rs:637-661`）断言的是 **`notnull == 0` 的反极性**（它检查的是「某列**不是** NOT NULL」，恰与本条要钉的方向相反）。
+
+**后果（为什么这不只是「缺个测试」）**：将来一次表重建（SQLite 的列变更要走重建）若把 `NOT NULL` 丢掉，**「实体存在但 `name` 为 NULL」会被读成「不在图里」** —— 而**门禁全绿**。这正好是本代反复打的族：**守卫/判据还在，它保护的不变量已经不在**（C32 的 pid 守卫、F9 的纯度扫描清单、§B29 的第二份危险默认、t119 自己证伪的「空转断言」都是同一族）。
+
+**可证伪的判据（立单时照用）**：把 `("entities","name")` 加进一条断言 `notnull == 1` 的测试 ⇒ 今天它**必须先红**（因为该断言尚不存在），补上后绿；再把 `0005_graph.sql` 的 `NOT NULL` 去掉（**隔离副本**）⇒ 该测试**必须红**。
+
+**未立单的理由**：`crates/store/**` 此刻无主（t94 的存储层审计已终结）；且这条需要「改 schema 的隔离副本负控」才有判别力 —— 成本明确后立单更稳。**关联**：t119 的残余风险结论是「`name` 不构成阻断性 finding」（因为 `NULL` 在今天的 schema 下造不出来），所以本条**不是** t118 的缺陷，而是**它依赖的不变量没有守卫**。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
@@ -577,6 +587,8 @@ a SIBLING directory: component-wise containment must not confuse it
 | **C35** | **复用「现成二进制」之前，先用一个你确知是最近才加的字段证明它的年份** —— 一份陈旧二进制会把新字段**安静地读成「不存在」**，而那看起来正是一个结论（captain 本轮自犯：我建议了它） | 现场：我为省下构建锁的名额，建议 `mem-core` 用 `%TEMP%\ruagent-team-target\debug\ruagent.exe`（mtime **2026-09-29 09:28:43**）起临时 daemon 取数。`recall` 在 t118 里量到：用那份二进制，**不存在的实体 id 回的是 `{"facts":[]}`（旧 wire 形状，缺 `name`/`kind`/`aliases`）**，而重建后（`Finished in 1m11s`）才回 `{"name":null,"kind":null,"aliases":[],"facts":[]}` ⇒ **用陈旧字节取数会「推翻」新字段的存在**。**判据**：① 复用任何预编译产物前，用一个**你确知是最近才加的字段/行为**当探针（本轮的形状：`GET /api/v1/graph/entity/<不存在的 id>` 看有没有 `name` 键），**10 秒的成本**；② 报告里的「字节归属」必须**逐条**给路径 + mtime，不允许一句带过；③ 三条候选二进制在本机**年份各不相同**（`D:\rust_cache\debug\ruagent.exe` = **10-02 23:05:41**（活守护进程的、也是 t122 用的）· 共享 target = **09-29 09:28:43**（陈旧，缺 `name`）· 各人新编的 = 各自时间）⇒ **「哪份字节」是一个必须每次都答的问题**。**同族**：C32（活守护进程的字节与树上的不是同一份）、C33（你自己的编辑会推走行号）、t123 §8②（文件在你读的时候被改）—— 本条是它们的镜像：**字节在你读之前就已经旧了**。 | captain（沿用） |
 
 | **C37** | **`github.com` 可以单独不可达，而 `api.github.com` / `codeload.github.com` 正常** —— 此时 HTTPS 推送必失败，但 **SSH 旁路可通且零配置改动**（本轮实测） | 现场（2026-10-04 `00:3x`）：`curl https://github.com` **超时**（12/15/20s 三次都超）· `https://api.github.com` **200 / 2.8s** · `https://codeload.github.com` **301 / 1.6s**；`Resolve-DnsName` 三个主机 = `140.82.121.4 / .5 / .10` ⇒ **同一 /24 上只有 `.4` 不可达** ⇒ **单 IP 的路由/ISP 故障，不是代理**（`ProxyEnable=0`、7890 无监听；`git config http.proxy`/`https.proxy` 皆空）。**`gh` 照常工作，是因为它打 `api.github.com`** —— 这正是「`gh` 绿 ≠ `git push` 能通」的原因。**有效旁路（零配置改动、不碰用户系统设置）**：`ssh -p 443 -o StrictHostKeyChecking=accept-new -T git@ssh.github.com` ⇒ `Hi hfldqwe! You've successfully authenticated`（exit 1 是预期的）；`git push ssh://git@ssh.github.com:443/hfldqwe/ruagent.git main:main` ⇒ **`9059225..ec24b61  main -> main`，exit 0** —— `ssh.github.com` 是**另一个主机名**，**可达**，且用现成的 `id_rsa`。**记账副作用与补法**：显式 URL 推送**不会**更新本地 `origin/main` ⇒ `git update-ref refs/remotes/origin/main <sha>`，并用 **`gh api repos/<o>/<r>/commits/main --jq .sha` 独立核实远端**（走 `api.github.com`，不受本故障影响）。**判据**：`git push` 报 `Failed to connect to github.com port 443` 而 `gh` 正常 ⇒ **先分辨是哪台主机**；**不要去改代理设置**（那是用户的系统设置，而且对「单主机不可达」无效 —— 实测 `ProxyEnable=0` 本来就是直连）。 | captain（沿用） |
+
+| **C38** | **一次提交装多个单元 ⇒「写入集合」这条判据当场失效**（`t120` 的评审给我开的单；owner 写明是 captain） | 现场：我把**五个单元**（t118/t127/t128/t131/t132）装进同一个提交 `ec24b61`（19 个文件 / +1989−42），因为当时四张单几乎同时交付、我想尽快把成果推上 main。**后果是真实的、不是形式**：`t118` 的 acceptance 第 6 条与评审自己的「写入集合」判据都要求用**工作树 diff** 证明「只落在 `crates/mcp/**`」—— **改动一旦提交，这条检查就不可用**；评审只能退而「按各单元自己申报的路径」推断那 39 行 `daemon/src/api.rs` 不是 t118 的（它**明说了这是限制**）。⇒ **规则**：**一个单元一次提交**；若确实要批量推，**在任务单里把判据写成**「该单元申报的路径 == 其提交里的路径子集」（可审计），而**不要**依赖事后无法执行的工作树 diff。**同族**：C33（引用会漂）、t20（绿读数只认证它跑过的字节）—— 都是「**判据必须能在事后被执行**」。**我的处置**：这条我立刻执行（未推送的两提交按单元拆开），而不是辩解「反正 CI 在跑」。 | captain（本轮） |
 
 ## D. 纪律账
 
