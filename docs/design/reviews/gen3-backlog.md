@@ -479,6 +479,8 @@ a SIBLING directory: component-wise containment must not confuse it
 
 | **C29** | **登记的 follow-up 也会过期：立单前必须回到字节**（captain 本轮，差点白烧一整轮） | capability 设计文档 §20 第 4 条列着三条 follow-up（让不可传输的 MCP 键**响亮**、删掉 prose 里的数字边界、加字段集守卫）。派活前核当前字节 ⇒ **三条都已落地**（坐标见 §B25）。若照文档立单，成员会（正确地）拿现有代码回报「已完成」⇒ 白烧一轮，且会让人误以为「登记还开着」。**判据**：任何由文档/账本行号驱动的立单，派活前先在**当前字节**上核一次；**文档说「未决」不等于今天未决**。同族：C22、§B25 的两处坐标漂移（`api.rs:1207-1216` 已指向 wiki corrections）。 | captain（沿用） |
 
+| **C30** | **「看起来是缺口」不等于缺口：候选缺口必须由读数了结，而最便宜的那次读数往往就是流水线自己的输出**（captain 本轮，三次假设三次被推翻） | 本轮我按「找缺口」的姿态提了三条候选，**全部被当前字节或 CI 自己的读数否掉**：① capability 设计文档 §20 第 4 条列的三条 follow-up（`deny_unknown_fields` / 删 prose 边界 / 字段集守卫）—— 核字节发现**都已落地**（见 §B25）；② §22.3「面板 e2e 有一条从未打开 `#settings` 的绿色套件」—— 该文自己写着 **After: 51 passed / 2 skipped** 且 `panel/e2e/settings-capabilities.spec.ts` 存在 ⇒ **已闭合**；③ 我怀疑「Wiki 标签页无覆盖」（`views.spec.ts` 走 12 个视图、`App.tsx:39-56` 的路由表里没有 `wiki` 这个 kind）—— 但 `panel/src/views/Knowledge.tsx:25` 直接 `import { WikiTab } from "./Wiki"`（它是知识页的**标签页**，不是独立路由），`panel/e2e/wiki.spec.ts:12/79` 真的点开它，而 **CI run `37024461223` 的证据步原文**是 `playwright: exit 0, JSON says **0 skipped / 0 named**` + `CONFIRMED: no spec was skipped in this run` ⇒ 那两条 `test.skip(pages.length === 0, …)`（`:53`/`:76`）**在 CI 上没有跳**，覆盖是真的。**判据**：① 提缺口前先问「谁能否掉它」，并用**最便宜的可信读数**去试（CI 日志、证据步输出、字节）；② **条件性 `test.skip` 的存在不等于它今天在跳** —— 仲裁者是**具名跳过计数**，不是守卫的写法；③ 被推翻的假设要**写下来**（本节即是），否则下一位会重开同一张空单。同族：C29（登记的 follow-up 会过期）、C24（`Select-String` 默认大小写把 `0 failed` 数成假红 —— 都是「测量口径本身就是缺陷来源」）。 | captain（沿用） |
+
 ## D. 纪律账
 
 本代把 22 条纪律写进了 `docs/design/reviews/gen2-integration-contract.md` §6.0（六族：**判据 / 绿红 / 解释 / 量词 / 声称面 / 异步面**）。此处**不复制**，只指向那份契约——**一个事实一个来源**。
