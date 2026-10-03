@@ -170,11 +170,14 @@ impl Chat {
         embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
         text: String,
     ) -> Result<()> {
-        let context = if self
+        // t137: the budget rides out of this block NEXT TO the bytes it measured,
+        // so the pair cannot drift: both come from the same
+        // `render_context_report` call in the producer.
+        let (context, ctx_budget) = if self
             .memory_injected
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            None
+            (None, None)
         } else {
             // `memory_inject_chat` gates the RETRIEVAL block only (design §12):
             // the role and handoff blocks below still ride, because they are the
@@ -186,10 +189,19 @@ impl Chat {
                 .read()
                 .expect("capability plane")
                 .gate(crate::capability::CapabilityId::MemoryInjectChat, true);
-            let mut ctx = if inject {
-                ChatManager::injection_context(db, self.knowledge.as_deref(), embedder, &text).await
+            let (mut ctx, ctx_budget) = if inject {
+                // t137: the producer's own report rides WITH the bytes it
+                // measured. `Ok(None)` = no render happened, so the event says
+                // "not collected" (`None`) rather than an all-zero object that
+                // would read as a measured empty injection.
+                match ChatManager::injection_context(db, self.knowledge.as_deref(), embedder, &text)
+                    .await?
+                {
+                    Some((render, report)) => (Some(render), Some(report)),
+                    None => (None, None),
+                }
             } else {
-                None
+                (None, None)
             };
             // A handoff tail rides first: the conversation the new
             // agent is taking over.
@@ -215,7 +227,7 @@ impl Chat {
                     None => role_block,
                 });
             }
-            ctx
+            (ctx, ctx_budget)
         };
 
         // History: the first prompt becomes the title, every prompt
@@ -243,7 +255,14 @@ impl Chat {
         // exactly where the injection stops. With no context nothing was
         // injected and nothing is marked -- a plain prompt is unchanged.
         let context = context.map(|c| format!("{c}{USER_TEXT_SENTINEL}"));
-        let sent = self.send(ChatCommand::Prompt { text, context });
+        // The budget rides the SAME command as the bytes it measured: the
+        // sentinel above changes the string the agent sees, not what was
+        // RENDERED, so the report still describes the render (t137).
+        let sent = self.send(ChatCommand::Prompt {
+            text,
+            context,
+            context_budget: ctx_budget,
+        });
         if sent.is_err() {
             // Nothing went out, so nothing will ever clear it.
             self.generating
@@ -574,14 +593,22 @@ impl ChatManager {
     ///
     /// Returns None when nothing was found: no context is better than a
     /// placeholder that costs tokens and says nothing.
+    ///
+    /// t137: the render now hands back its OWN budget report next to the bytes,
+    /// and this is a `Result` because serialising that report can fail — a
+    /// failure is an ERROR, never a silent `None` (that absorber shape is what
+    /// this generation audits). `Ok(None)` = nothing was found, i.e. no render
+    /// happened and the event must say "not collected"; `Ok(Some((text,
+    /// report)))` = the render ran, so the report is a MEASUREMENT even when it
+    /// is all zero. Same shape as the run path (`runs.rs::render_run_injection`).
     pub async fn injection_context(
         db: &ruagent_store::Db,
         knowledge: Option<&ruagent_knowledge::Knowledge>,
         embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
         query: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<(String, serde_json::Value)>> {
         use ruagent_memory::inject::{
-            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, WIKI_PAGES, render_context,
+            ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, WIKI_PAGES, render_context_report,
         };
 
         let mut items: Vec<ContextItem> = Vec::new();
@@ -678,10 +705,18 @@ impl ChatManager {
         items.sort_by_key(|i| ruagent_memory::inject::tag_rank(i.tag));
 
         if items.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let out = render_context(&items, &InjectionBudget::default());
-        (!out.trim().is_empty()).then_some(out)
+        let (out, report) = render_context_report(&items, &InjectionBudget::default());
+        if out.trim().is_empty() {
+            return Ok(None);
+        }
+        // The report is serialised WHERE IT IS PRODUCED, and a failure is a real
+        // error (`with_context`), never a `None` that would read as "not
+        // collected" while a render did happen (t137).
+        let budget = serde_json::to_value(&report)
+            .with_context(|| "serialising the chat injection budget report")?;
+        Ok(Some((out, budget)))
     }
 
     /// Start a new chat on the given agent (optionally with a model).

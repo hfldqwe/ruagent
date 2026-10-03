@@ -732,6 +732,11 @@ impl Distiller {
         session.send(ChatCommand::Prompt {
             text: platform_prompt(prompt),
             context: None,
+            // `None` because this sender RENDERS nothing: with no context there
+            // is no injection to measure, so the event says "not collected"
+            // (`null`) -- it is NOT an all-zero report, which would read as a
+            // measured empty injection (t137, contract §3.2).
+            context_budget: None,
         })?;
         let reply = match tokio::time::timeout(std::time::Duration::from_secs(300), done_rx).await {
             Ok(Ok(text)) => text,

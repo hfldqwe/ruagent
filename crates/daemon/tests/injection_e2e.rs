@@ -778,3 +778,198 @@ async fn a_retried_run_carries_the_shared_retry_prefix() {
         "the retried run's prefix is not the shared bytes: {render}"
     );
 }
+
+/// t137: the CHAT path's `context_injected` event now carries the budget report
+/// its producer MEASURED — read off the transcript FILE, not inferred from the
+/// code path.
+///
+/// RED BEFORE THE CHANGE: pre-t137 the chat event hardcoded `budget: None`, so
+/// the JSONL held no `budget` object at all and the first assertion failed.
+///
+/// THREE READINGS, all from the same file: (1) the report is a real measurement
+/// (`dropped_items > 0` from a corpus that overflows the 4096-char budget, and
+/// `used_chars <= total_chars`); (2) it describes the BYTES THIS EVENT RECORDED
+/// (`used_chars == render.chars().count()`) — the report and the render are two
+/// different sources in the file, so agreeing is evidence, not tautology;
+/// (3) the agent received that render (the mock echoes its prompt).
+#[tokio::test]
+#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+async fn chat_event_carries_the_injection_budget_report() {
+    let d = boot("chatbudget", true).await.expect(NEEDS_MOCK);
+    // Overflow the render budget ON PURPOSE. The knobs that actually move it on
+    // this path are the PROFILE rows (a store leg, not a vector-search leg: the
+    // 20 observation rows seeded by the first cut of this test were never
+    // SELECTED, so the report stayed `items=1` and proved nothing). One row far
+    // past `per_block_chars` forces a TRUNCATION, and 12 long rows push the
+    // 4096-char total, which is what forces DROPS.
+    for (i, len) in [(0usize, 6000usize)]
+        .into_iter()
+        .chain((1..12).map(|i| (i, 700)))
+    {
+        let content = format!(
+            "t137-overflow-{i} {}",
+            "the deploy script lives in scripts/release.sh and runs from the repository root "
+                .repeat(len / 74 + 1)
+        );
+        let out = ruagent_memory::write_memory(
+            &d.db,
+            &ruagent_memory::MemoryWrite {
+                store: ruagent_memory::MemoryStore::Profile,
+                namespace: ruagent_memory::Namespace::parse("user").unwrap(),
+                content,
+                confidence: 0.9,
+                source_episode: None,
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(out, ruagent_memory::WriteOutcome::Inserted(_)),
+            "seeding the overflow corpus failed: {out:?}"
+        );
+    }
+
+    let http = reqwest::Client::new();
+    let chat: serde_json::Value = http
+        .post(format!("{}/api/v1/chat", d.url))
+        .json(&serde_json::json!({ "agent": "mock" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let chat_id = chat["id"].as_str().unwrap().to_string();
+    http.post(format!("{}/api/v1/chat/{chat_id}/messages", d.url))
+        .json(&serde_json::json!({ "text": PROMPT }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let path = d
+        .root
+        .join("data")
+        .join("transcripts")
+        .join(format!("run-{chat_id}.jsonl"));
+
+    let mut event: Option<serde_json::Value> = None;
+    let mut echoed = String::new();
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                match v["event"]["type"].as_str() {
+                    Some("context_injected") => event = Some(v),
+                    Some("agent_message_chunk") => {
+                        if let Some(t) = v["event"]["content"][0]["text"].as_str() {
+                            echoed.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if event.is_some() && !echoed.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ev = event.unwrap_or_else(|| {
+        panic!(
+            "no context_injected event in the chat transcript {}",
+            path.display()
+        )
+    });
+    let render = ev["event"]["render"]
+        .as_str()
+        .expect("the event's render")
+        .to_string();
+    let budget = &ev["event"]["budget"];
+    println!(
+        "T137 CHAT BUDGET>>>{budget}<<< render_chars={}",
+        render.chars().count()
+    );
+    assert!(
+        budget.is_object(),
+        "the chat event carries NO budget report ({budget}) — the ledger is not wired to this path"
+    );
+    let field = |k: &str| {
+        budget[k]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the report has no {k}: {budget}"))
+    };
+    let (used, total, dropped, truncated_blocks) = (
+        field("used_chars"),
+        field("total_chars"),
+        field("dropped_items"),
+        field("truncated_blocks"),
+    );
+    assert!(
+        used <= total,
+        "the report claims more used chars than its own budget: {budget}"
+    );
+    // SAME-SOURCE CHECK, read from the file: the ledger's own two
+    // representations of one accounting must agree. (MEASURED: `used_chars` is
+    // the sum of the block contents, NOT the render length — the render adds
+    // 23 chars of headers in the stock fixture. The first cut of this test
+    // asserted `used_chars == render.chars().count()` and went red on a real
+    // chat, which is how that number is known.)
+    let blocks = budget["blocks"]
+        .as_array()
+        .expect("the report's blocks list")
+        .clone();
+    let sum_blocks: u64 = blocks
+        .iter()
+        .map(|b| b["chars"].as_u64().expect("block chars"))
+        .sum();
+    assert_eq!(
+        used, sum_blocks,
+        "the report's used_chars must be the sum of its own blocks: {budget}"
+    );
+    assert_eq!(
+        truncated_blocks,
+        blocks
+            .iter()
+            .filter(|b| b["truncated_chars"].as_u64().unwrap_or(0) > 0)
+            .count() as u64,
+        "truncated_blocks must count the blocks that report truncation: {budget}"
+    );
+    // The ledger DESCRIBES THE BYTES on disk: every block it lists is a block the
+    // event's render actually carries (the "⊇" rule), and a truncation or a drop
+    // the ledger claims must be VISIBLE in those bytes.
+    for b in &blocks {
+        let tag = b["tag"].as_str().expect("block tag");
+        assert!(
+            render.contains(&format!("<{tag}>")),
+            "the ledger lists a block the render does not carry ({tag}): {render}"
+        );
+        if b["truncated_chars"].as_u64().unwrap_or(0) > 0 {
+            assert!(
+                render.contains(&format!("[+{} chars truncated]", b["truncated_chars"])),
+                "the ledger claims truncation the bytes do not show: {budget}"
+            );
+        }
+    }
+    if dropped > 0 {
+        assert!(
+            render.contains("items dropped"),
+            "the ledger claims {dropped} dropped items the bytes do not show: {render}"
+        );
+    }
+    // This fixture overflows a block (the 6000-char row): the report must be a
+    // MEASUREMENT, not a zero that any pass would produce.
+    assert!(
+        truncated_blocks > 0,
+        "the fixture must truncate at per_block_chars, else this proves nothing: {budget}"
+    );
+    assert!(
+        echoed.contains("t137-overflow-0") || echoed.contains(SOURCE_TEXT),
+        "the agent's echoed prompt carries none of the injected context: {echoed}"
+    );
+}

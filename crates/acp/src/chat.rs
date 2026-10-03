@@ -147,6 +147,18 @@ pub enum ChatCommand {
     Prompt {
         text: String,
         context: Option<String>,
+        /// The injection BUDGET REPORT of `context`, serialised by the producer
+        /// (`daemon::chat::injection_context`) — `Some` when that producer
+        /// RENDERED a block, `None` when there is nothing to measure (no
+        /// context at all, or no render happened).
+        ///
+        /// It travels as the event's own `serde_json::Value` type so this
+        /// adapter stays free of the memory crate: the ACP client FORWARDS what
+        /// the producer measured and does not interpret it. `None` keeps the
+        /// injection contract's meaning — "not collected" — and never stands in
+        /// for an empty injection: an all-zero report is a MEASUREMENT and rides
+        /// as `Some` (t129/t137, contract §3.2).
+        context_budget: Option<serde_json::Value>,
     },
     /// Cancel the in-flight prompt: sends `$/cancel_request` for the
     /// outstanding request; the session reports `Stopped{cancelled}`
@@ -488,21 +500,26 @@ async fn supervise_chat(
                     },
                 };
                 match cmd {
-                    ChatCommand::Prompt { text, context } => {
+                    ChatCommand::Prompt {
+                        text,
+                        context,
+                        context_budget,
+                    } => {
                         // First-prompt platform memory: recorded as a
                         // separate event, prepended to what the agent sees.
                         let outgoing = match context {
                             Some(d) if !d.trim().is_empty() => {
                                 let _ = events.send(RunEvent::ContextInjected {
                                     render: d.clone(),
-                                    // DEP-INT-1 (t19): the CHAT producer. This
-                                    // adapter does not build the block and holds
-                                    // no budget report, so `budget` is `None` --
-                                    // "not collected" -- never an all-zero object
-                                    // that would read as a measured empty
-                                    // injection.
+                                    // DEP-INT-1 (t19): the CHAT producer's own
+                                    // label. t129/t137: `budget` is now the
+                                    // producer's OWN report, forwarded verbatim
+                                    // -- `None` means the producer did not render
+                                    // a block ("not collected"), and an all-zero
+                                    // report rides as `Some`, because it is a
+                                    // measurement (contract §3.2).
                                     path: Some("chat".to_string()),
-                                    budget: None,
+                                    budget: context_budget,
                                 });
                                 format!(
                                     "{d}
