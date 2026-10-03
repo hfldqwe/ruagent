@@ -46,6 +46,25 @@
 #     answers "did the set of checks the tool runs change?", and says nothing about
 #     contract rows that were never implemented.
 # Only then does removing `continue-on-error` from the audit step mean anything.
+#
+# WHERE THE COUNTS COME FROM, AND WHY (t143, after the FIRST CI RUN, 2026-10-04, run
+# 37137554330 on this file). That run went red, and it was the WIRING that failed, not the
+# measurement: the audit step exited 1 and the guardrail step exited 1 with `no '[audit] N
+# captures ... checks P pass / F fail / U not measured' line in the log` -- yet the tool had
+# finished its work and written a COMPLETE `metrics.json` (65 checks / 24 captures /
+# 45 pass / 10 fail / 10 not measured, its not_measured set equal to the pin item for item).
+# What was lost was the stdout carrier: `audit.log` stopped mid-sentence at 67,938 bytes.
+# The tool writes `metrics.json` BEFORE it prints the long report (design-audit.mjs:8385 vs
+# :8390-8391), so the artefact survives exactly the failure that ate the log.
+# DECISION (the contract's option ①): the guardrails take their counts from `metrics.json`,
+# not from stdout. Option ② ("print the summary before the long report") needs a change in
+# `panel/tools/**`, which is out of scope for this task and would only make ONE line more
+# robust, while ① moves ALL of it -- counts, both row lists, captures -- onto something that
+# is already complete and already uploaded as an artefact. The stdout summary line was NOT
+# dropped: when present it must AGREE with metrics.json, and a disagreement is a red (a
+# guardrail this step did not have before). See
+# docs/design/reviews/gen4-audit-ci-first-run.md for the run's readings and the carrier
+# difference (CI 45/10/10 vs local 44/11/10; the unmeasured set identical).
 
 name: Design audit (§12, live DOM)
 
@@ -194,41 +213,116 @@ jobs:
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/audit.log"
+          METRICS="$RUNNER_TEMP/audit/metrics.json"
+          COUNTS="$RUNNER_TEMP/counts.env"
           if [ ! -f "$LOG" ]; then
             echo "::error::no audit log at $LOG -- the audit step did not run"
             exit 1
           fi
 
-          # ① THE SUMMARY LINE MUST EXIST. A run that judged nothing must never read as a
-          # reading of something (the failure shape t101/t104/t110 kept hitting).
-          line=$(grep -E '^\[audit\] [0-9]+ captures in [0-9.]+s · checks [0-9]+ pass / [0-9]+ fail / [0-9]+ not measured' "$LOG" | tail -1 || true)
-          if [ -z "$line" ]; then
-            echo "::error::no '[audit] N captures ... checks P pass / F fail / U not measured' line in the log"
+          # ⓪ t143 -- THE COUNTS COME FROM THE STRUCTURED ARTEFACT, NOT FROM stdout.
+          # WHY (first CI run, 2026-10-04, run 37137554330): the tool writes metrics.json
+          # (design-audit.mjs:8385) BEFORE it prints the long report to stdout (:8390-8391),
+          # and on CI the stdout carrier was TRUNCATED mid-sentence (67,938 bytes, the last
+          # line cut in half) -- so the summary line never arrived, while metrics.json was
+          # COMPLETE (65 checks / 24 captures / 45 pass / 10 fail / 10 not measured, its
+          # not_measured set equal to the pin item for item). That run went red on the
+          # WIRING, not on the measurement. Reading the artefact is what makes guardrails
+          # ① ② ④ rest on something a truncated log cannot take away. The stdout summary
+          # line is NOT dropped: it becomes a CROSS-CHECK below, and a disagreement between
+          # the two carriers is a red (that is a guardrail this step did not have before).
+          cat > "$RUNNER_TEMP/counts.cjs" <<'COUNTS_CJS'
+          const fs = require("node:fs");
+          const file = process.argv[2];
+          let doc;
+          try {
+          doc = JSON.parse(fs.readFileSync(file, "utf8"));
+          } catch (e) {
+          console.error("metrics.json is not parseable: " + e.message);
+          process.exit(3);
+          }
+          const checks = Array.isArray(doc.checks) ? doc.checks : null;
+          const captures = Array.isArray(doc.captures) ? doc.captures : null;
+          if (!checks || !captures) {
+          console.error("metrics.json lacks checks[] or captures[]");
+          process.exit(4);
+          }
+          const known = ["pass", "fail", "not_measured", "pending"];
+          const bad = checks.filter((c) => !c || typeof c.n !== "number" || !known.includes(c.verdict));
+          if (bad.length) {
+          console.error("metrics.json has " + bad.length + " check(s) without a numeric n / known verdict");
+          process.exit(5);
+          }
+          const by = (v) => checks.filter((c) => c.verdict === v);
+          const nums = (v) => by(v).map((c) => c.n).sort((a, b) => a - b);
+          const failRows = nums("fail");
+          const nmRows = nums("not_measured");
+          const q = (s) => "'" + String(s).split("'").join("'\\''") + "'";
+          process.stdout.write(
+          [
+          "captures=" + q(captures.length),
+          "checks=" + q(checks.length),
+          "pass=" + q(by("pass").length),
+          "fail=" + q(failRows.length),
+          "unmeas=" + q(nmRows.length),
+          "pending=" + q(by("pending").length),
+          "judged=" + q(checks.length - by("pending").length),
+          "failing=" + q(failRows.join(", ")),
+          "observed_raw=" + q(nmRows.join(" ")),
+          ].join("\n") + "\n",
+          );
+          COUNTS_CJS
+          rm -f "$COUNTS"
+          if [ -f "$METRICS" ]; then
+            node "$RUNNER_TEMP/counts.cjs" "$METRICS" > "$COUNTS" 2>"$RUNNER_TEMP/counts.err" || true
+          else
+            echo "metrics.json not found at $METRICS" > "$RUNNER_TEMP/counts.err"
+          fi
+          log_bytes=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+          # ① THE COUNTS MUST EXIST -- now asked of the artefact, not of the log.
+          # The condition changed shape in t143 (stdout summary line missing -> metrics.json
+          # missing/unparseable) because the first CI run proved the two are NOT
+          # interchangeable: one was truncated, the other was complete. It still reddens.
+          if [ ! -s "$COUNTS" ]; then
+            echo "::error::no usable counts: $METRICS is missing or unparseable, so this run has no reading. stdout cannot substitute for it -- the first CI run lost the summary line to a truncated log while this file was complete."
             {
-              echo "### Guardrail ① FAILED: the run produced no summary line"
+              echo "### Guardrail ① FAILED: no structured counts"
               echo ""
-              echo "Nothing was measured, so nothing may read as a reading. Last 40 log lines:"
+              echo "- metrics.json: \`$METRICS\` ($([ -f "$METRICS" ] && echo present || echo ABSENT))"
+              echo "- how the reader failed:"
               echo '```'
-              tail -40 "$LOG"
+              tail -5 "$RUNNER_TEMP/counts.err" 2>/dev/null || true
+              echo '```'
+              echo "- the audit log was \`$log_bytes\` bytes; its last 20 lines:"
+              echo '```'
+              tail -20 "$LOG" || true
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          captures=$(printf '%s\n' "$line" | sed -E 's/^\[audit\] ([0-9]+) captures.*/\1/')
-          pass=$(printf '%s\n' "$line" | sed -E 's/.*checks ([0-9]+) pass.*/\1/')
-          fail=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) fail.*/\1/')
-          unmeas=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) not measured.*/\1/')
-          # t141 F1: the summary line carries an OPTIONAL tail -- " / K pending criterion
-          # revision" (design-audit.mjs:8398) -- and the tool's own arithmetic is
-          # judged = checks - pending (:8397). Until this revision the tail was never read,
-          # so a run whose ONLY change was a row moving into `pending` reddened the check
-          # below while its message blamed the tool/threshold: the misdirection t134 F1
-          # named. These two extra variables are diagnostic ONLY -- the assertion that
-          # follows is byte-identical to what it was.
-          pending=$(printf '%s\n' "$line" | sed -nE 's/.* ([0-9]+) pending criterion revision.*/\1/p')
-          pending=${pending:-0}
-          judged=$((pass + fail + unmeas))
-          checks=$((judged + pending))
+          . "$COUNTS"
+
+          # ①b CROSS-CHECK OF THE TWO CARRIERS (new in t143, and it can red). metrics.json is
+          # the source of record; when stdout ALSO carried the summary line, the two must
+          # agree on every count. Two carriers disagreeing is an instrument defect, not a
+          # reading -- and it is the only thing the old stdout-parsing guardrail was good
+          # for that this one must keep.
+          line=$(grep -E '^\[audit\] [0-9]+ captures in [0-9.]+s · checks [0-9]+ pass / [0-9]+ fail / [0-9]+ not measured' "$LOG" | tail -1 || true)
+          if [ -n "$line" ]; then
+            s_captures=$(printf '%s\n' "$line" | sed -E 's/^\[audit\] ([0-9]+) captures.*/\1/')
+            s_pass=$(printf '%s\n' "$line" | sed -E 's/.*checks ([0-9]+) pass.*/\1/')
+            s_fail=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) fail.*/\1/')
+            s_unmeas=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) not measured.*/\1/')
+            s_pending=$(printf '%s\n' "$line" | sed -nE 's/.* ([0-9]+) pending criterion revision.*/\1/p')
+            s_pending=${s_pending:-0}
+            if [ "$s_captures" != "$captures" ] || [ "$s_pass" != "$pass" ] || [ "$s_fail" != "$fail" ] || [ "$s_unmeas" != "$unmeas" ] || [ "$s_pending" != "$pending" ]; then
+              echo "::error::the two carriers disagree -- metrics.json says captures=$captures checks=$checks pass=$pass fail=$fail not_measured=$unmeas pending=$pending, while the stdout summary line says captures=$s_captures pass=$s_pass fail=$s_fail not_measured=$s_unmeas pending=$s_pending. One of them is wrong, so neither may be read as the run's counts."
+              exit 1
+            fi
+            echo "counts source=metrics.json (structured) · stdout summary line present and in agreement"
+          else
+            echo "counts source=metrics.json (structured) · stdout summary line ABSENT (log $log_bytes bytes, truncated mid-report -- the first CI run shape; the counts above do not depend on it)"
+          fi
           exit_code=$(cat "$RUNNER_TEMP/audit.exit" 2>/dev/null | tr -d '\r\n' || true)
           [ -n "$exit_code" ] || exit_code="?"
 
@@ -266,20 +360,24 @@ jobs:
             exit 1
           fi
 
-          failing=$(grep -E '^\[audit\] failing rows:' "$LOG" | tail -1 | sed -E 's/^\[audit\] failing rows: //' || true)
           # ② THE UNMEASURED SET IS PINNED. Note what is NOT done here: we never pass
           # `--allow-not-measured`, because it waives EVERY unmeasured row at once while
           # leaving the exit code unchanged (design-audit.mjs:417/466/8416-8418) -- the
           # "green by waiver" shape this repo keeps rejecting. Instead the set itself is
           # an expectation: a row that stops being measurable, or a new unmeasurable row,
           # moves the set and fails THIS step.
-          # The pin is the 2026-10-02 reading (Windows / chromium-1243). The FIRST CI run
-          # may legitimately differ (ubuntu + its chromium rasteriser and fonts -- t122
-          # lists that as an explicitly unmeasured item): when it does, record that run's
-          # reading in docs/design/reviews/gen4-audit-gate-impl.md and update this line in
-          # a follow-up commit. The diff is the evidence; do not widen it silently.
+          # The pin is the 2026-10-02 reading (Windows / chromium-1243). t122 predicted the
+          # first CI run might legitimately differ (ubuntu + its chromium rasteriser and
+          # fonts); t143 has the answer, and it did NOT differ: the first CI run's
+          # not_measured set is 25 28 31 33 46 47 49 50 54 77 -- equal to this pin ITEM FOR
+          # ITEM (docs/design/reviews/gen4-audit-ci-first-run.md). The pin therefore stands
+          # unchanged. What DID differ between the carriers is the pass/fail split (CI
+          # 45 pass / 10 fail, fail = 4 6 7 12 13 14 18 20 38 75; local 44/11 with row 2
+          # also failing) -- and that is a DIFFERENT question from this pin: the unmeasured
+          # set is stable across carriers, individual judgements are not.
           EXPECTED_NOT_MEASURED="25 28 31 33 46 47 49 50 54 77"
-          observed_raw=$(grep -E '^\[audit\] not measured:' "$LOG" | tail -1 | grep -oE '#[0-9]+' | tr -d '#' | tr '\n' ' ' || true)
+          # `observed_raw` (the same list, taken from metrics.json) replaces the old stdout
+          # grep in t143: the artefact is complete even when the log is truncated.
           norm() { printf '%s' "$1" | tr ' ' '\n' | sed '/^$/d' | sort -n | tr '\n' ' ' | sed -E 's/ +$//'; }
           got=$(norm "$observed_raw")
           want=$(norm "$EXPECTED_NOT_MEASURED")
@@ -302,10 +400,11 @@ jobs:
             echo "### design-audit --check (advisory)"
             echo ""
             echo '```'
-            echo "$line"
+            if [ -n "$line" ]; then echo "$line"; else echo "[stdout carried no summary line: the log was truncated mid-report ($log_bytes bytes). The counts below come from metrics.json, which the tool writes BEFORE it prints the report (design-audit.mjs:8385 vs :8390).]"; fi
             echo '```'
             echo ""
             echo "- audit exit code: **$exit_code** (advisory: recorded, not enforced)"
+            echo "- counts source: **metrics.json** (structured artefact, complete even when the log is truncated); stdout summary line: $([ -n "$line" ] && echo present-and-agreeing || echo ABSENT) · log size: \`$log_bytes\` bytes"
             echo "- captures: **$captures** -- NOT a constant: a fresh root skips the \`#task\` route (24 vs 26)"
             echo "- judged rows: **$judged** (pass $pass / fail $fail / not measured $unmeas); the pinned constant is **65** -- that is the TOOL's judged row count (\`checks=$checks\`, of which \`pending=$pending\`), NOT §12's row count (77 today; the tool's check list is hardcoded, design-audit.mjs:4185)"
             echo "- failing rows: \`${failing:-none}\`"
@@ -325,6 +424,10 @@ jobs:
           path: |
             ${{ runner.temp }}/audit
             ${{ runner.temp }}/audit.log
+            ${{ runner.temp }}/audit.exit
+            ${{ runner.temp }}/counts.env
+            ${{ runner.temp }}/counts.err
+            ${{ runner.temp }}/counts.cjs
             ${{ runner.temp }}/negctl
             ${{ runner.temp }}/daemon.log
           if-no-files-found: warn
