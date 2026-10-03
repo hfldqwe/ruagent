@@ -130,3 +130,27 @@
 | `result` | `h["content"].as_str().or_else(\|\| h["result"].as_str()).unwrap_or("?")`（`lib.rs:1621-1622`） | **`"result"` 在 `crates/daemon/src` 出现 0 次** ⇒ 兜底键从不发出 | 只在 `content` 也缺失时才被用到 ⇒ 回 **`?`** | 本清单 M16 的一部分（低危：兜底，不影响正常路径） |
 
 **验证方法（可复现）**：`grep -rn "\"<key>\"" crates/daemon/src/`（引号键名）**加上** `grep -rn "pub <key>:" crates/{graph,knowledge,memory}/src/*.rs`（`Serialize` 结构体字段）与 SELECT 列名——两条都要查（§8-1 是我自己的假阳性）。**`chunk`/`fact_text` 经第二种查法证明是活的**（`knowledge/src/files.rs:52-61`、`graph/src/lib.rs:259`）。
+
+## 10 追加更正（append-only，2026-10-04 00:14:06 读数；本报告交付后追加，不改上文）
+
+**被更正的原句（§7，逐字）**：
+
+> - 只读：唯一写入 = 本报告。`crates/**`、`panel/**`、`.github/**`、`scripts/**` 未改；未 push / dispatch / rerun / cancel / 建 tag；未碰 pid 79984 与 `~/.ruagent`。
+
+**它哪里坏了**：这句自证**保护的是一个已经不存在的进程** —— 79984 是 09-27 05:35:37 起的那次守护进程，早已不在；守护进程在 **2026-10-02 23:05:45** 被重启（captain 立 C32；本报告作者独立复核如下）。**这正是本报告自己审的那族形状**：一句读起来完好、实际是空守卫的自证。
+
+**权威来源三方一致（我自己在 2026-10-04 00:14:06 读的，不转述 captain 的读数）**：
+
+| 来源 | 读数 |
+| --- | --- |
+| 端口归属 `Get-NetTCPConnection -LocalPort 8787 -State Listen` | `127.0.0.1:8787` ⇒ **`OwningProcess = 14944`** |
+| 该 pid 的进程 | `ruagent`，StartTime **2026/10/2 23:05:45**，Path `D:\rust_cache\debug\ruagent.exe` |
+| `~/.ruagent/data/daemon.pid` | **`14944`**（文件 mtime 2026-10-02 23:05:45） |
+| health（`scripts/ruagent-daemon.ps1 status`，**未用会写 `recall_log` 的 `/api/v1/recall`**） | `health: ok` / `pid: 14944 (ours)` |
+| 79984 是否还在 | **不存在**（`Get-Process -Id 79984` 无此进程） |
+
+⇒ **往后的自证写「8787 的端口归属 + health」（或 `daemon.pid`），不写被记住的 pid。**
+
+**一句附带读数（与本单主题相邻，供 M1 那一单当环境对照）**：活守护进程自己的 mcphealth 探针写的是 **`tools=18`**（日志 `2026-10-03T16:11:06.981220Z … mcp health ok server=ruagent tools=18`），而**当时树上** `crates/mcp/src/lib.rs` 的 `#[tool(` 声明数是 **18** ⇒ 这份正在跑的镜像与它自己的声明**一致**（AGENTS.md 记过「compiled 14 vs source 18」的假象，今天没有复现）。**限度**：活镜像来自 2026-10-02 23:05:41 的构建，**不构成**对当前工作树字节（`7842d375…`）可编译的证明。
+
+**字节归属声明（t20 那条纪律的两个方向）**：§1 的全部坐标属于 **`crates/mcp/src/lib.rs` sha256 `52e9f00a…`（2561 行）**，即我读的那一刻。追加本节的同一分钟内该文件已再次被 t118 改成 **`7842d375b530ebf7…`** ⇒ 报告里的行号**必须等 t118 落地后重读**，不能直接引用（这也是 §7/§8-2 已经声明的限制，此处补上动后的哈希）。本报告自身：追加前 132 行 / sha256 `d6b6fc69c43a5dcf…`；追加后 = 本节所在版本。
