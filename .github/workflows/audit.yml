@@ -1,0 +1,297 @@
+# THE PANEL'S REAL MEASUREMENT, in the pipeline (F2 / t95 T-2, landed by t131).
+#
+# `design-audit.mjs --check` judges MASTER.md §12 against the LIVE DOM of a built panel
+# served by a real daemon and exits 1 on failure (panel/tools/design-audit.mjs:454).
+# Until now CI ran only `--self-test` (ci.yml:457-459), which never reaches
+# chromium.launch and therefore never looks at a page. This workflow runs the real one.
+#
+# WHY THIS JOB IS ADVISORY (not blocking) -- a measured decision, not caution:
+# on 2026-10-02 the real check returned, on the current tree,
+#     [audit] 24 captures in 620.7s · checks 44 pass / 11 fail / 10 not measured
+# with exit 1 (docs/design/reviews/gen4-audit-gate-recon.md). The tool has NO
+# baseline/known-failure mechanism: `exitDecision` (design-audit.mjs:8431-8442) has
+# exactly three fatal sources -- fails > 0, contractWarnings.length > 0, or
+# unmeasured > 0 without `--allow-not-measured`. Wiring this in as a REQUIRED gate today
+# would pin main red and teach everyone to ignore it. What this job guarantees instead:
+# the numbers are produced on every run, the artefacts are kept, and the gate is PROVEN
+# able to fail (the negative control below runs every time).
+#
+# WHO BLOCKS WHOM, TODAY: nobody. This workflow is deliberately NOT in branch
+# protection and must not be added while it is advisory -- a red run here blocks no
+# push. Its redness is a READING to be recorded (the step summary + the artefacts),
+# not a verdict on the commit.
+#
+# WHEN IT MAY BECOME BLOCKING (see docs/design/reviews/gen4-audit-gate-impl.md):
+#   * the 11 failing rows have converged to a NAMED list that is stable over
+#     EXPECTED_STABLE_RUNS consecutive runs, AND
+#   * the not_measured set is that same pinned list for those runs (it already is
+#     pinned below -- see EXPECTED_NOT_MEASURED), AND
+#   * the failing-rows list gets pinned the same way (a second constant next to
+#     EXPECTED_NOT_MEASURED), AND
+#   * the daemon/panel fixture is identical between those runs (same root shape,
+#     same port, same dist)、so the comparison is between comparable readings.
+# Only then does removing `continue-on-error` from the audit step mean anything.
+
+name: Design audit (§12, live DOM)
+
+on:
+  # A human can always ask for the reading. This is how the FIRST CI number arrives.
+  workflow_dispatch:
+  # Weekly: the point is PRODUCT drift, not this push's diff. A --check run is
+  # 10.4 minutes of real browser work, which does not belong on the push path
+  # (ci.yml already spends ~25 minutes there).
+  schedule:
+    - cron: "0 3 * * 1" # Mondays, 03:00 UTC
+
+# Minimal, per job: this job reads the repository and uploads an artefact.
+permissions:
+  contents: read
+
+concurrency:
+  # NOT cancel-in-progress: a cancelled run hides the reading it was started for
+  # (the same lesson as the cancelled CI runs in docs/design/reviews/gen3-ci-red-history.md).
+  group: design-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: design-audit --check (advisory)
+    runs-on: ubuntu-latest
+    # 45 min, derived from the measured baseline (t122): the complete run took
+    # 624.6s wall (24 captures; 620.7s of it capturing) plus the CI-only
+    # prerequisites -- cargo build ~246s and panel build ~22s (both measured in the
+    # e2e job), `npx playwright install` and the daemon boot.
+    # 624.6 x 3 ~= 31 min, + ~6 min of prerequisites ~= 37 -> 45.
+    # The multiplier is taken from the COMPLETE run on purpose: the cheap legs are
+    # 53.9s (one route) and 0.4s (dead port) -- truncated readings that would kill a
+    # real audit mid-flight. GitHub's default is 360 minutes, which makes "hung" and
+    # "slow" indistinguishable (docs/design/reviews/gen3-ci-timeouts.md).
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # upload-artifact writes to artefact storage. This is the same pair release.yml
+      # grants its build job (:101-106) and NOT `contents: write`: this job never
+      # touches repository contents.
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 (2025-04-02)
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+
+      - name: Build the daemon
+        run: cargo build -p ruagent
+
+      - name: Build the panel (dist must be newer than src -- the audit reports both)
+        working-directory: panel
+        run: npm ci && npm run build
+
+      - name: Install the browser the audit drives
+        # Playwright's bundled Chromium (design-audit.mjs:43/8253), the same install the
+        # e2e job does at e2e.yml:169. Without it the audit dies at chromium.launch.
+        working-directory: panel
+        run: npx playwright install chromium --with-deps
+
+      - name: Boot a throwaway daemon serving that panel
+        # A NON-default port, an EXPLICIT temp root, and an explicit panel path: the
+        # audit's own default target is `E2E_BASE_URL ?? http://127.0.0.1:8787`
+        # (design-audit.mjs:401), i.e. whatever daemon the machine already runs. Every
+        # audit invocation below passes --base-url for exactly that reason.
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/audit-root"
+          mkdir -p "$ROOT"
+          # `cargo run` rather than ./target/debug/ruagent: the guard
+          # (.github/workflows/scripts/check-workflow-refs.sh) requires every path a
+          # workflow executes to be TRACKED in the repo, and a build artefact is not.
+          # Same shape as the e2e job's "Boot daemon" step (e2e.yml:143).
+          RUAGENT_PANEL_DIST="$PWD/panel/dist" \
+            cargo run -p ruagent -- serve --root "$ROOT" --addr 127.0.0.1:8898 \
+            >"$RUNNER_TEMP/daemon.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/daemon.pid"
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8898/api/v1/health >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::the throwaway daemon never became healthy"
+            cat "$RUNNER_TEMP/daemon.log"
+            exit 1
+          fi
+          curl -sf http://127.0.0.1:8898/ | grep -q 'id="root"'
+          echo "daemon healthy on 127.0.0.1:8898 with root $ROOT"
+
+      - name: Negative control -- the gate must be ABLE to fail (cheap, every run)
+        # A gate that cannot fail is not a gate (t110's lesson, applied here). This
+        # points the audit at a port nobody listens on; measured 2026-10-02: exit 2 in
+        # 0.4s with "daemon not reachable at ... (no panel to audit)".
+        working-directory: panel
+        run: |
+          set -euo pipefail
+          set +e
+          out=$(node tools/design-audit.mjs --check --routes=home --modes=dark --no-shots \
+                 --base-url=http://127.0.0.1:1 --out="$RUNNER_TEMP/negctl" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          echo "negative control exit=$rc (want 2)"
+          if [ "$rc" != "2" ]; then
+            echo "::error::the audit did NOT fail on a dead port (exit $rc): this gate cannot redden"
+            exit 1
+          fi
+          echo "$out" | grep -q "daemon not reachable" || {
+            echo "::error::the dead-port failure did not NAME the missing precondition"
+            exit 1
+          }
+          {
+            echo "### Negative control (dead port)"
+            echo ""
+            echo "- exit: $rc (want 2) · named reason (\`daemon not reachable\`) present: yes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Design audit --check (ADVISORY -- the exit code is recorded, not enforced)
+        id: audit
+        working-directory: panel
+        # ADVISORY, on purpose: see the header. Removing this line is the change that
+        # turns the reading into a verdict, and the header says when that may happen.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          set +e
+          node tools/design-audit.mjs --check \
+            --base-url=http://127.0.0.1:8898 \
+            --out="$RUNNER_TEMP/audit" 2>&1 | tee "$RUNNER_TEMP/audit.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > "$RUNNER_TEMP/audit.exit"
+          echo "audit exit=$rc (advisory: this step's failure does not fail the job)"
+          exit "$rc"
+
+      - name: Guardrails -- the counts exist, the unmeasured set is pinned, captures is not a constant
+        if: always()
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/audit.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::no audit log at $LOG -- the audit step did not run"
+            exit 1
+          fi
+
+          # ① THE SUMMARY LINE MUST EXIST. A run that judged nothing must never read as a
+          # reading of something (the failure shape t101/t104/t110 kept hitting).
+          line=$(grep -E '^\[audit\] [0-9]+ captures in [0-9.]+s · checks [0-9]+ pass / [0-9]+ fail / [0-9]+ not measured' "$LOG" | tail -1 || true)
+          if [ -z "$line" ]; then
+            echo "::error::no '[audit] N captures ... checks P pass / F fail / U not measured' line in the log"
+            {
+              echo "### Guardrail ① FAILED: the run produced no summary line"
+              echo ""
+              echo "Nothing was measured, so nothing may read as a reading. Last 40 log lines:"
+              echo '```'
+              tail -40 "$LOG"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          captures=$(printf '%s\n' "$line" | sed -E 's/^\[audit\] ([0-9]+) captures.*/\1/')
+          pass=$(printf '%s\n' "$line" | sed -E 's/.*checks ([0-9]+) pass.*/\1/')
+          fail=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) fail.*/\1/')
+          unmeas=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) not measured.*/\1/')
+          judged=$((pass + fail + unmeas))
+          exit_code=$(cat "$RUNNER_TEMP/audit.exit" 2>/dev/null | tr -d '\r\n' || true)
+          [ -n "$exit_code" ] || exit_code="?"
+
+          # ④ captures IS NOT A CONSTANT, and is never pinned: with an empty root the tool
+          # SKIPS the whole #task route (/api/v1/tasks has no rows), which is why the very
+          # same tool reported 24 captures here and 26 elsewhere (t122 §2). A gate that
+          # required 26 would redden on a fresh fixture -- and a gate that required "24"
+          # would hide the day the route silently stopped being captured. So: print it,
+          # require only that it is non-zero, and pin the CHECK LIST SIZE instead.
+          echo "captures=$captures pass=$pass fail=$fail not_measured=$unmeas judged=$judged audit_exit=$exit_code"
+          if [ "$captures" -lt 1 ]; then
+            echo "::error::the audit captured 0 pages -- nothing was measured, so nothing may pass"
+            exit 1
+          fi
+          if [ "$judged" != "65" ]; then
+            echo "::error::the audit judged $judged rows, not 65: the CHECK LIST changed size (tool or threshold drift), so this reading is not comparable with the pinned one"
+            exit 1
+          fi
+
+          failing=$(grep -E '^\[audit\] failing rows:' "$LOG" | tail -1 | sed -E 's/^\[audit\] failing rows: //' || true)
+          # ② THE UNMEASURED SET IS PINNED. Note what is NOT done here: we never pass
+          # `--allow-not-measured`, because it waives EVERY unmeasured row at once while
+          # leaving the exit code unchanged (design-audit.mjs:417/466/8416-8418) -- the
+          # "green by waiver" shape this repo keeps rejecting. Instead the set itself is
+          # an expectation: a row that stops being measurable, or a new unmeasurable row,
+          # moves the set and fails THIS step.
+          # The pin is the 2026-10-02 reading (Windows / chromium-1243). The FIRST CI run
+          # may legitimately differ (ubuntu + its chromium rasteriser and fonts -- t122
+          # lists that as an explicitly unmeasured item): when it does, record that run's
+          # reading in docs/design/reviews/gen4-audit-gate-impl.md and update this line in
+          # a follow-up commit. The diff is the evidence; do not widen it silently.
+          EXPECTED_NOT_MEASURED="25 28 31 33 46 47 49 50 54 77"
+          observed_raw=$(grep -E '^\[audit\] not measured:' "$LOG" | tail -1 | grep -oE '#[0-9]+' | tr -d '#' | tr '\n' ' ' || true)
+          norm() { printf '%s' "$1" | tr ' ' '\n' | sed '/^$/d' | sort -n | tr '\n' ' ' | sed -E 's/ +$//'; }
+          got=$(norm "$observed_raw")
+          want=$(norm "$EXPECTED_NOT_MEASURED")
+          if [ "$got" != "$want" ]; then
+            {
+              echo "### Guardrail ② FAILED: the not_measured set moved"
+              echo ""
+              echo "- pinned expectation: \`#$want\`"
+              echo "- this run observed: \`#$got\`"
+              echo ""
+              echo "A moving unmeasured set is a red, not a remark: either a row became"
+              echo "measurable (good -- update the pin with this run as evidence) or a row"
+              echo "stopped being measurable (a defect in the instrument)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::not_measured set moved: expected '#$want', got '#$got'"
+            exit 1
+          fi
+
+          {
+            echo "### design-audit --check (advisory)"
+            echo ""
+            echo '```'
+            echo "$line"
+            echo '```'
+            echo ""
+            echo "- audit exit code: **$exit_code** (advisory: recorded, not enforced)"
+            echo "- captures: **$captures** -- NOT a constant: a fresh root skips the \`#task\` route (24 vs 26)"
+            echo "- judged rows: **$judged** (pass $pass / fail $fail / not measured $unmeas); the pinned constant is 65"
+            echo "- failing rows: \`${failing:-none}\`"
+            echo "- not measured (matches the pinned set \`#$want\`): \`#$got\`"
+            echo "- artefacts: \`design-audit\` (metrics.json, report.md, the capture PNGs, the raw log)"
+            echo ""
+            echo "This workflow is **not in branch protection**: a red run here blocks no push."
+            echo "The commitment it does make: the counts are published, the unmeasured set is"
+            echo "pinned, and the gate proves it can fail on every run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the audit artefacts (always -- a failing run is the one worth keeping)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (2025-03-19)
+        with:
+          name: design-audit
+          path: |
+            ${{ runner.temp }}/audit
+            ${{ runner.temp }}/audit.log
+            ${{ runner.temp }}/negctl
+            ${{ runner.temp }}/daemon.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Record the verdict
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "audit step outcome: \`${{ steps.audit.outcome }}\`"
+            echo "job-${{ github.job }} on ${{ github.ref_name }} (${{ github.event_name }})"
+          } >> "$GITHUB_STEP_SUMMARY"

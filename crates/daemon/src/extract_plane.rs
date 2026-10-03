@@ -485,6 +485,16 @@ pub fn extract_rules(cx: &ExtractCtx<'_>) -> ExtractBundle {
     //   did — and it is kept, because dropping it would make this flag newly false
     //   for a genuinely cut transcript, the same class of lie in the other
     //   direction.
+    // * `pass.bytes_skipped` is the transcript's BYTE budget (t132, closing the
+    //   t125 F1 finding): the turns `max_input_bytes` pushed out of the window,
+    //   plus the cut tail of the boundary turn when only its head fitted. The pass
+    //   raises `pass.truncated` for it as well, so this predicate covers it
+    //   WITHOUT a second expression here — and the daemon does not cut bytes
+    //   itself. `turn_for_extraction` below filters platform prompts; it does not
+    //   size what it hands in. One bound, one door, one report: a caller that
+    //   sized the text here would be a second source of truth for a limit the
+    //   limit set already owns, and its cut would be invisible to `truncated`,
+    //   which is the defect class t9 was about.
     //
     // NOT changed here: the cap and the rules. This is a reporting fix.
     ExtractBundle {

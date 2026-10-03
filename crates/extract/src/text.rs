@@ -80,13 +80,8 @@ pub fn split_sentences(text: &str) -> Vec<(usize, String)> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut start = 0usize;
     for (n, &(i, c)) in chars.iter().enumerate() {
-        let hard = matches!(c, '。' | '！' | '？' | '!' | '?' | '\n');
-        let soft = matches!(c, '.' | ';')
-            && chars
-                .get(n + 1)
-                .map(|&(_, next)| next.is_whitespace())
-                .unwrap_or(false);
-        if hard || soft {
+        let next = chars.get(n + 1).map(|&(_, next)| next);
+        if splits_here(c, next) {
             push_sentence(&mut out, &text[start..i + c.len_utf8()], start);
             start = i + c.len_utf8();
         }
@@ -95,6 +90,32 @@ pub fn split_sentences(text: &str) -> Vec<(usize, String)> {
         push_sentence(&mut out, &text[start..], start);
     }
     out
+}
+
+/// Whether a sentence ENDS at `c`, given the character that follows it. ONE
+/// predicate for both the splitter and [`last_sentence_end`]: the two have to
+/// agree about where a sentence ends, so the rule is written once.
+fn splits_here(c: char, next: Option<char>) -> bool {
+    if matches!(c, '。' | '！' | '？' | '!' | '?' | '\n') {
+        return true;
+    }
+    matches!(c, '.' | ';') && next.map(char::is_whitespace).unwrap_or(false)
+}
+
+/// The byte offset just past the LAST sentence end in `s`, if `s` has one. Used
+/// to cut an over-long input at a sentence boundary rather than inside a
+/// sentence: a half sentence handed to `split_sentences` would be emitted as
+/// verbatim evidence (the shape t125 F5 flagged). `None` means no terminator.
+pub fn last_sentence_end(s: &str) -> Option<usize> {
+    let mut end = None;
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let next = it.peek().map(|&(_, next)| next);
+        if splits_here(c, next) {
+            end = Some(i + c.len_utf8());
+        }
+    }
+    end
 }
 
 fn push_sentence(out: &mut Vec<(usize, String)>, raw: &str, offset: usize) {

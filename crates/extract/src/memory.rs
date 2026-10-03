@@ -29,10 +29,26 @@ pub struct MemoryCandidates {
     /// than left in generation order so the counter reads the same way whatever
     /// order the rules happened to run in.
     pub suppressed_rules: Vec<&'static str>,
-    /// True when the deduped list was cut to `max_per_input` (§8.5).
+    /// True when the pass DROPPED something the caller would otherwise have
+    /// seen. TWO different losses raise it, and it is not a description of
+    /// either one alone (the same shape as `GraphCandidates::truncated`):
+    ///
+    /// * a deduped candidate was dropped because the list was cut to
+    ///   `max_per_input` (§8.5), and
+    /// * the input TEXT was cut to `max_input_bytes` — see `bytes_skipped`.
+    ///
+    /// It stays `false` when the list merely FILLS the cap with nothing left to
+    /// drop: `exactly 32` is not the same reading as `capped at 32`.
     pub truncated: bool,
     /// Leading turns dropped because only the last `max_turns` are read (§7.4.1).
+    /// This counts the `max_turns` window ONLY: the turns the byte budget pushed
+    /// out are counted in `bytes_skipped`, so neither bound loses its meaning.
     pub turns_skipped: usize,
+    /// Bytes of turn text the pass did NOT read: the turns the `max_input_bytes`
+    /// budget pushed out of the window, plus the cut tail of the boundary turn
+    /// when only its head fits. Non-zero implies `truncated` — the transcript
+    /// path has no silent cut (t132, closing the t125 F1 finding).
+    pub bytes_skipped: usize,
 }
 
 /// Session transcript -> memory candidates. Deterministic, bounded, pure.
@@ -53,20 +69,39 @@ pub fn memory_candidates_for(
     turns: &[Turn],
     limits: &ExtractLimits,
 ) -> MemoryCandidates {
-    // §7.4.1 windowing: keep the LAST max_turns turns.
-    let start = turns.len().saturating_sub(limits.max_turns);
-    let window = &turns[start..];
+    // §7.4.1 windowing: keep the LAST max_turns turns. `turns_skipped` reports
+    // THIS window and nothing else — the byte budget below reports through
+    // `bytes_skipped`, so the two bounds cannot be confused for one another.
+    let turns_skipped = turns.len().saturating_sub(limits.max_turns);
+    let window = &turns[turns_skipped..];
+
+    // …and then the BYTE budget over that window (t132, closing t125 F1):
+    // `max_turns` bounds the COUNT of turns, this bounds the TEXT the pass has to
+    // read — and with it the `char_indices` table `split_sentences` builds.
+    let (first_kept, head_keep, bytes_skipped) = match byte_window(window, limits.max_input_bytes) {
+        Some((first, keep, skipped)) => (first, Some(keep), skipped),
+        None => (0, None, 0),
+    };
+    let window = &window[first_kept..];
+    let base = turns_skipped + first_kept;
 
     let mut found: Vec<(usize, MemoryCandidate)> = Vec::new();
     let mut suppressed_rules: Vec<&'static str> = Vec::new();
 
     for (offset, turn) in window.iter().enumerate() {
-        let index = start + offset;
-        let turn_lower = text::lower(&turn.text);
+        let index = base + offset;
+        // Only the boundary turn is read as a head; every newer turn in the
+        // window fits the budget whole, so `head_keep` belongs to `window[0]`.
+        let text: &str = match head_keep {
+            Some(keep) if offset == 0 => &turn.text[..keep],
+            _ => &turn.text,
+        };
+        let turn_lower = text::lower(text);
         let has_confirm = text::contains_any(&turn_lower, rules::CONFIRM);
         let has_hedge = text::contains_any(&turn_lower, rules::HEDGE);
         let candidates = turn_candidates(
             turn,
+            text,
             index,
             source,
             has_confirm,
@@ -124,14 +159,69 @@ pub fn memory_candidates_for(
         candidates: out,
         suppressed: suppressed_rules.len(),
         suppressed_rules,
-        truncated,
-        turns_skipped: start,
+        truncated: truncated || bytes_skipped > 0,
+        turns_skipped,
+        bytes_skipped,
     }
 }
 
-/// Every candidate one turn produces, before dedup and truncation.
+/// The transcript's byte budget (t132, closing t125 F1): the largest SUFFIX of
+/// `turns` whose text totals at most `max` bytes, read newest-first. Returns
+/// `(first_kept, kept_bytes_of_that_turn, bytes_skipped)`, or `None` when the
+/// whole slice fits — the common case, where nothing changes at all.
+///
+/// The one turn that does not fit is read as its HEAD — the document window's own
+/// rule (`graph::window_text`), for the same reason: a text's head states its
+/// terms. The count `max_turns` reports is not disturbed: the turns this budget
+/// drops are counted in `bytes_skipped` instead.
+fn byte_window(turns: &[Turn], max: usize) -> Option<(usize, usize, usize)> {
+    let mut acc = 0usize;
+    for (i, turn) in turns.iter().enumerate().rev() {
+        let len = turn.text.len();
+        if acc.saturating_add(len) <= max {
+            acc += len;
+            continue;
+        }
+        let keep = head_within(&turn.text, max.saturating_sub(acc));
+        let older: usize = turns[..i].iter().map(|t| t.text.len()).sum();
+        let skipped = (len - keep.len()) + older;
+        if keep.is_empty() {
+            // Nothing of this turn fits, so it goes too — and every older turn
+            // with it.
+            return Some((i + 1, 0, skipped));
+        }
+        return Some((i, keep.len(), skipped));
+    }
+    None
+}
+
+/// The head of `text` that fits in `max` bytes, snapped back to the last
+/// sentence terminator inside it when there is one: a cut in the middle of a
+/// sentence would hand `split_sentences` a shortened sentence to emit as verbatim
+/// evidence. With no terminator inside the budget the cut is on the nearest
+/// character boundary. The loss is reported either way (`bytes_skipped` and
+/// `truncated`), so this is never a silent truncation.
+fn head_within(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut cut = max;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &text[..cut];
+    match text::last_sentence_end(head) {
+        Some(end) => &head[..end],
+        None => head,
+    }
+}
+
+/// Every candidate one turn produces, before dedup and truncation. `text` is the
+/// part of `turn` this pass is allowed to read — the whole turn, or its head when
+/// the byte budget cut it (`memory_candidates_for`).
 fn turn_candidates(
     turn: &Turn,
+    text: &str,
     index: usize,
     source: &str,
     has_confirm: bool,
@@ -144,7 +234,7 @@ fn turn_candidates(
         source,
     };
     let mut out: Vec<MemoryCandidate> = Vec::new();
-    for (_, sentence) in text::split_sentences(&turn.text) {
+    for (_, sentence) in text::split_sentences(text) {
         // §8.7 guards: the body cap, the question filter and the content token.
         // Marker matching alone is never sufficient.
         if sentence.len() > max_content_bytes {

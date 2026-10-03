@@ -102,3 +102,35 @@ CallToolResult { … content: [Text(TextContent { text: "entity #987654321 has n
 - 三次负控窗口全部**先宣告**、限时（3m56s / 1m13s / 46s）、按字节恢复（三个窗口的恢复哈希都已记录并在 §5 给出；窗口 #2 是我自己的插入点失误，已如实记账）。
 - 临时守护进程：本单共起 3 个，**自记 pid 30780**（负控窗口 #1）· **15748**（第一次原始 JSON 取数，那次 curl 抢在健康检查之前、读数被我作废）· **7860**（重建二进制后的原始 JSON 取数）—— 三个全部停止；临时 root `ra-t118-root` / `ra-t118-root2` / `ra-t118-root3` 全部删除；**活守护进程 pid 79984 与活库 `~/.ruagent` 全程未被触碰**（只读健康检查）。
 - 未 push / dispatch / rerun / cancel / tag。
+
+## 9 交付后改动：披露 + 在最终字节上复跑（AGENTS.md「green 门只认证它跑过的字节」t20）
+
+### 9.1 披露（改动发生在 `00:25:56` 前后）
+| 文件 | 报告落笔时 | 现在（`00:28:17`） |
+| --- | --- | --- |
+| `crates/mcp/src/lib.rs` | `sha256 52E9F00A…B4B9EB`，numstat **100/13** | `sha256 2BF35EEC…141421`，numstat **222/13** |
+| `crates/mcp/tests/roundtrip.rs` | `sha256 6C24593E…083287`，numstat **115/0** | **与 HEAD 无差异**（已整文件还原） |
+
+**移动了什么**：两条端到端用例 + 其夹具（`stub_daemon` / `ToolClient` / `graph_entity_as_a_caller_sees_it`）从 `crates/mcp/tests/roundtrip.rs` 移入 `crates/mcp/src/lib.rs` 的 `mod tests`。最终坐标：`stub_daemon` **L1679** · `a_fabricated_entity_id_is_refused_not_answered_with_no_facts` **L1763** · `an_entity_with_no_current_facts_is_still_a_success` **L1781** · 纯函数用例 `entity_existence_is_read_from_name_and_drift_is_not_absorbed` **L1795**。
+
+**为什么**：**平台把 `crates/mcp/tests/roundtrip.rs` 判为 `undeclared` 并拒绝 t118 完成** —— 契约 inScope 写的是目录 `crates/mcp/tests`，而完成校验要求**精确文件路径**。为了不改契约、不扩面，把用例搬进已声明的 `src/lib.rs`。（这是本单遇到的一个真问题：目录式 inScope 与精确路径校验器不兼容，值得记一笔。）
+
+### 9.2 哪些读数属于哪一份字节
+- **属于改动前字节（`52E9F00A…`）**：§6 的四门读数（mcp exit 0 / 50.6s；daemon-lib 156；clippy 13.2s；fmt 0）· **三个负控窗口的全部读数**（#1 `6 passed; 1 failed`、#2、#3 的客户端可见原文）· §1 的 wire 原文（那是**二进制**读数）。
+- **属于改动后最终字节（`2BF35EEC…`，`00:28:17` 取）**——这才是我现在提交的字节：
+  - `cargo-team.ps1 test -p ruagent-mcp` → **exit 0**（26.5s）：lib `test result: ok. 46 passed; 0 failed`（含新用例 `tests::a_fabricated_entity_id_is_refused_not_answered_with_no_facts ... ok`、`tests::an_entity_with_no_current_facts_is_still_a_success ... ok`、`tests::entity_existence_is_read_from_name_and_drift_is_not_absorbed ... ok`）· roundtrip `ok. 5 passed` · tool_surface `ok. 3 passed` · doc-tests `ok. 0`
+  - `cargo-team.ps1 clippy -p ruagent-mcp --all-targets -DenyWarnings` → **exit 0**（4.4s，`^warning`/`^error` 0 行）
+  - `cargo fmt --all --check` → **exit 0**；`rustfmt --edition 2024 --check crates\mcp\src\lib.rs` → exit 0
+  - `cargo-team.ps1 test -p ruagent-daemon --lib` → **exit 0**（20.6s）：`ok. 156 passed`，含 `api::tests::the_entity_route_exposes_the_alias_text_and_the_list_opt_in_is_additive ... ok`
+
+### 9.3 协议层证据的状态（实质问题，不是形式）
+移动后这两条用例**不再驱动真守护进程**：它们对**一个 axum stub** 发真实 HTTP、经由**真实 MCP 协议**（rmcp duplex）调用工具，而 stub 回的正是**本单从真守护进程实测到的两份 JSON 原文**（§1）。
+⇒ 交付物覆盖的是**工具出口**这一层（两方向各一条，断言的正是客户端可见形状）；**「真实 daemon 路由」这一层不再由本单的测试驱动**。按 captain 的口径：**协议层（真路由）证据改由 t119 独立验证取**，可直接复用的材料已备好：
+1. **真路由夹具**：`crates/mcp/tests/roundtrip.rs` 的 `start_test_daemon_with_policy(..)`（真守护进程 + 临时 root）与 `mcp_pair(..)`（rmcp duplex）—— 该文件当前**与 HEAD 无差异**，夹具现成；
+2. **断言配方**：先读 wire（`raw["name"].is_null()` ⇒ 该 id 不在图里；`raw["name"].is_string()` ⇒ 在）**再**断言工具出口；「存在但零事实」用 `POST /api/v1/graph/entity`（body `{"name":…,"kind":…}`）造，**不加任何 fact**；
+3. **本单实测的两份原始 JSON** 与三窗口读数（§1/§5）；
+4. 负控配方：把 `entity_exists` 换回旧读法 ⇒ 只有「不存在」方向红，约 **46 秒**（窗口 #3 的形状）；**本单不再开窗口**（captain 已裁定成本到此为止），若 t119 要跑，建议照窗口 #3 的宣告形状做。
+
+### 9.4 与负控的关系（一处必须说清）
+三个窗口的变异对象始终是 **`entity_exists`**（两版字节里都是它），窗口读数是在**移动前**的用例上取的；移动换掉的是**夹具**（真守护进程 ⇒ stub），**没有改** `entity_exists`、也没有改被断言的出口语义。所以 §5 的负控结论对最终字节仍然成立（同一个函数、同一条拒绝分支），但**严格按「门只认证它跑过的字节」**：§5 的窗口读数属于 `52E9F00A…`，最终字节上的窗口未跑（由 9.3 的配方交给 t119）。
+

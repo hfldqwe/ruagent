@@ -45,6 +45,12 @@ export const zh: Record<string, string> = {
   "agents.err.hint": "读不到统计：daemon 不可达，或者它返回的响应不符合契约。统计缺失（—）与「跑了 0 次」是两件事，这里不做混淆。",
   "agents.stale.hint": "显示的是上一次成功读取的结果，轮询正在重试。",
   "agents.enable": "启用",
+  // t128: the MCP health row's THIRD state. The daemon answered `health` but did
+  // not report a tool count, so the row must not print a 0 that looks measured.
+  // Same word table as `runtimes.probeFailed` ("探测失败 · 重试"): a short state
+  // phrase ending in the retry it actually offers.
+  "agents.mcp.toolsUnknown": "未告知工具数 · 重试",
+  "agents.mcp.toolsUnknown.hint": "守护进程回了 health，但没有给出工具数——缺失不等于「没有工具」。点这里重新拉取。",
 };
 
 export const en: Record<string, string> = {
@@ -87,4 +93,7 @@ export const en: Record<string, string> = {
   "agents.err.hint": "Cannot read the stats: the daemon is unreachable, or the response it returned does not match the contract. A missing statistic (—) and “ran 0 times” are two different things and are not conflated here.",
   "agents.stale.hint": "Showing the last successful read; the poll is retrying.",
   "agents.enable": "Enable",
+  // t128: same third state as the zh side (missing tool count is not a 0).
+  "agents.mcp.toolsUnknown": "tools not reported · retry",
+  "agents.mcp.toolsUnknown.hint": "The daemon answered health but did not report a tool count — missing is not the same as none. Click to re-read.",
 };

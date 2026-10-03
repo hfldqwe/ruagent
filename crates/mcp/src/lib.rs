@@ -222,19 +222,15 @@ impl PlatformTools {
         // and EVERY entity reports "has no current facts", with no test to catch
         // it. A missing or mistyped field is an error, not an empty result.
         //
-        // M1 (first half): "this entity does not exist" must not read the same as
-        // "this entity exists with no current facts". The daemon's
-        // `GET /graph/entity/{id}` (api.rs:1207-1216) returns `{"facts": []}` for
-        // BOTH today -- it carries no existence field and no 404 -- so this tool
-        // cannot invent the distinction on its own. The branch below already
-        // honours an existence field (`entity: null` or `exists: false`), so the
-        // daemon side is a one-line change; see the finding in the report.
-        let entity_missing = resp
-            .get("entity")
-            .map(|e| e.is_null())
-            .or_else(|| resp.get("exists").and_then(|e| e.as_bool()).map(|b| !b))
-            .unwrap_or(false);
-        if entity_missing {
+        // M1 (first half, repaired in t118): "this id is not in the graph" must not
+        // read the same as "this entity exists with no current facts". The daemon
+        // DOES carry that distinction -- `name: null` means the id is absent -- and
+        // always did; the signal, its coordinates and the daemon test that pins it
+        // are documented on [`entity_exists`]. What used to be here read
+        // `resp["entity"]` / `resp["exists"]`, two keys the daemon has never emitted,
+        // so the missing branch could not fire and a fabricated id came back as a
+        // successful "has no current facts" -- a false success the caller acts on.
+        if !entity_exists(&resp).map_err(|e| rmcp::ErrorData::internal_error(e, None))? {
             return Err(rmcp::ErrorData::internal_error(
                 format!(
                     "entity #{} not found: the graph has no entity with that id",
@@ -1183,6 +1179,67 @@ pub fn facts_of(resp: &serde_json::Value) -> Result<Vec<serde_json::Value>, Stri
         .ok_or_else(|| format!("daemon response carries no `facts` array: {resp}"))
 }
 
+/// The JSON type of a value, for drift messages that name what actually arrived.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Whether the daemon's `/api/v1/graph/entity/{id}` response says the entity
+/// EXISTS. `Ok(false)` means "that id is not in the graph" -- `Ok(true)` means the
+/// row is there, whether or not it has any facts.
+///
+/// THE WHOLE SIGNAL IS ONE KEY: **`name`, and the value that means absent is
+/// `null`.** The daemon builds it in `async fn graph_entity` as
+/// `entity.as_ref().map(|e| e.name.clone())` (read 2026-10-04: `api.rs:1361`), where
+/// `entity` is `ruagent_graph::entity_by_id(db, id).await?` (same read: `api.rs:1355`)
+/// -- so `null` is exactly "no row for this id", while any string (an empty one
+/// included) is a row that is there. The daemon does that on purpose and says so at
+/// `api.rs:1358-1359`: an id that is not in the graph keeps a **200 with empty
+/// collections, never a 404**, so the status code carries no existence information
+/// and this key is the only carrier. It is pinned on the daemon side by the test
+/// `the_entity_route_exposes_the_alias_text_and_the_list_opt_in_is_additive` (same
+/// read: `api.rs:6711`) -- HTTP 200 for an id that is not in the graph (`api.rs:6783`),
+/// `name.is_null()` for it (`api.rs:6784`), `facts == []` for it (`api.rs:6785-6788`).
+/// THESE NUMBERS DRIFT -- a concurrent unit edits that file, and during this very
+/// unit they moved by 19 lines. Resolve by SYMBOL (`graph_entity`, `entity_by_id`,
+/// the four-key response literal, that test name); each number above is a hint with
+/// the date it was read.
+///
+/// STRICT ON PURPOSE, in the same spirit as [`facts_of`]: a response with no `name`
+/// key, or a `name` that is neither a string nor `null`, is an ERROR. A renamed or
+/// retyped field must not silently read as "the entity does not exist" *or* as "it
+/// exists" -- that silent absorption is the very thing this replaces.
+///
+/// WHAT IT REPLACES (ruagent-tunable-capabilities t118, the first half of t93's M1):
+/// the branch here used to read `resp["entity"]` and fall back to `resp["exists"]`.
+/// The daemon has never emitted either key (the response literal is four keys:
+/// `name`, `kind`, `aliases`, `facts` -- `api.rs:1341-1346`), so the predicate was
+/// `false` for EVERY response, including one served for a fabricated id. Both
+/// branches are deleted rather than kept unreachable: a branch that can never fire
+/// is not a safety net, it is a false green waiting to be cited.
+pub fn entity_exists(resp: &serde_json::Value) -> Result<bool, String> {
+    match resp.get("name") {
+        Some(v) if v.is_null() => Ok(false),
+        Some(v) if v.is_string() => Ok(true),
+        Some(other) => Err(format!(
+            "daemon response has `name` of type {} (expected a string, or null for an \
+             id that is not in the graph), so the entity-existence signal is gone: {resp}",
+            json_kind(other)
+        )),
+        None => Err(format!(
+            "daemon response carries no `name` key, and `name` is the entity-existence \
+             signal (`name: null` = that id is not in the graph): {resp}"
+        )),
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for PlatformTools {
     fn get_info(&self) -> ServerInfo {
@@ -1611,6 +1668,158 @@ fn t93_facts_of_rejects_a_renamed_or_mistyped_field() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-route stand-in for the daemon's `GET /api/v1/graph/entity/{id}`, serving
+    /// the TWO bodies the REAL route serves -- captured from it in this unit (report
+    /// §1, after rebuilding the stale shared binary):
+    ///   id not in the graph -> {"name":null,"kind":null,"aliases":[],"facts":[]}
+    ///   id 1 (exists, no facts) -> {"name":"t118-probe-without-facts",...
+    /// The happy path is the daemon's own test (`crates/daemon/src/api.rs:6673`); this
+    /// stub exists so the TOOL's two directions can be pressed without a database.
+    async fn stub_daemon() -> String {
+        use axum::{Router, routing::get};
+        let app = Router::new().route(
+            "/api/v1/graph/entity/{id}",
+            get(
+                |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    if id == "987654321" {
+                        axum::Json(serde_json::json!({
+                            "name": serde_json::Value::Null, "kind": serde_json::Value::Null,
+                            "aliases": [], "facts": []
+                        }))
+                    } else {
+                        axum::Json(serde_json::json!({
+                            "name": "t118-probe-without-facts", "kind": "concept",
+                            "aliases": [], "facts": []
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    struct ToolClient;
+    impl rmcp::ClientHandler for ToolClient {
+        fn get_info(&self) -> rmcp::model::ClientInfo {
+            Default::default()
+        }
+    }
+
+    /// Call `graph_entity` over the real MCP seam (duplex pipe) and return what the
+    /// CALLER sees: `Err(text)` for a refusal (JSON-RPC error or `is_error: true`),
+    /// `Ok(text)` for a successful answer.
+    async fn graph_entity_as_a_caller_sees_it(daemon_url: &str, id: i64) -> Result<String, String> {
+        use rmcp::ServiceExt;
+        let (server_t, client_t) = tokio::io::duplex(4096);
+        let url = daemon_url.to_string();
+        let server_task = tokio::spawn(async move {
+            PlatformTools::new(BridgeConfig { daemon_url: url })
+                .serve(server_t)
+                .await
+                .expect("mcp server starts")
+        });
+        let client = ToolClient.serve(client_t).await.unwrap();
+        let out = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("graph_entity".to_string()).with_arguments(
+                    serde_json::json!({ "id": id })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await;
+        let seen = match out {
+            Err(e) => Err(e.to_string()),
+            Ok(r) => {
+                let text: String = r
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        rmcp::model::ContentBlock::Text(t) => Some(t.text.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                if r.is_error == Some(true) {
+                    Err(text)
+                } else {
+                    Ok(text)
+                }
+            }
+        };
+        let _ = client.cancel().await;
+        let _ = server_task.await;
+        seen
+    }
+
+    /// t118, direction 1 of 2: an id that is NOT in the graph is a REFUSAL that names
+    /// it. Before t118 this came back `Ok("entity #987654321 has no current facts")`
+    /// with `is_error: Some(false)` -- the caller-visible false success this pins.
+    #[tokio::test]
+    async fn a_fabricated_entity_id_is_refused_not_answered_with_no_facts() {
+        let url = stub_daemon().await;
+        let seen = graph_entity_as_a_caller_sees_it(&url, 987_654_321).await;
+        let message = seen.expect_err("an id that is not in the graph must be refused");
+        assert!(
+            message.contains("987654321"),
+            "the refusal must NAME the id the caller sent: {message}"
+        );
+        assert!(message.contains("not found"), "{message}");
+        assert!(
+            !message.contains("has no current facts"),
+            "an absent id must not be reported as an entity without facts: {message}"
+        );
+    }
+
+    /// t118, direction 2 of 2: an entity that EXISTS with no current facts stays a
+    /// success with today's text -- the two cases must be distinguishable.
+    #[tokio::test]
+    async fn an_entity_with_no_current_facts_is_still_a_success() {
+        let url = stub_daemon().await;
+        let text = graph_entity_as_a_caller_sees_it(&url, 1)
+            .await
+            .expect("an entity that exists must not be refused");
+        assert!(text.contains("has no current facts"), "{text}");
+    }
+
+    /// t118 / t93-M1 (first half): the existence reading, pressed on all four
+    /// shapes. The two `Ok` cases are the two facts the tool must tell apart; the
+    /// two `Err` cases are the drift the reading must NOT absorb (a missing key used
+    /// to read as "not missing"). The protocol half lives above, over a stub serving
+    /// the same two bodies the REAL route serves; driving the real route
+    /// (`crates/mcp/tests/roundtrip.rs`: `start_test_daemon_with_policy` + `mcp_pair`)
+    /// is delegated to the independent verification -- see the report, section 9.
+    #[test]
+    fn entity_existence_is_read_from_name_and_drift_is_not_absorbed() {
+        // An entity that exists: `name` is its name -- a string, even when empty.
+        let present = serde_json::json!({ "name": "Kubernetes", "kind": "concept", "aliases": [], "facts": [] });
+        assert_eq!(entity_exists(&present), Ok(true), "{present}");
+
+        // An empty string is still a row that is there: `null` is the absent value,
+        // not "empty" (the daemon maps a row through `entity.as_ref().map(...)`).
+        let present_empty_name =
+            serde_json::json!({ "name": "", "kind": null, "aliases": [], "facts": [] });
+        assert_eq!(entity_exists(&present_empty_name), Ok(true));
+
+        // The id is not in the graph: `name: null` (daemon api.rs:1342) -- this is
+        // the case that used to come back as a SUCCESS with "has no current facts".
+        let absent = serde_json::json!({ "name": null, "kind": null, "aliases": [], "facts": [] });
+        assert_eq!(entity_exists(&absent), Ok(false));
+
+        // Drift, direction 1: the signal key is gone -- an error, not "missing".
+        let renamed = serde_json::json!({ "entity_name": "Kubernetes", "facts": [] });
+        let e = entity_exists(&renamed).expect_err("a missing `name` must be an error");
+        assert!(e.contains("no `name` key"), "{e}");
+
+        // Drift, direction 2: the signal key was retyped.
+        let retyped = serde_json::json!({ "name": 7, "facts": [] });
+        let e = entity_exists(&retyped).expect_err("a non-string `name` must be an error");
+        assert!(e.contains("type number"), "{e}");
+    }
 
     #[test]
     fn recall_to_text_renders_sections_and_entity_wiki() {

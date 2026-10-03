@@ -349,13 +349,37 @@ export function Agents() {
                   <strong>{s.name}</strong>
                   {s.health ? (
                     s.health.state === "ok" ? (
-                      <Tooltip
-                        title={`${s.health.tools ?? 0} ${t("mcp.tools")} · ${s.health.latency_ms}ms`}
-                      >
-                        <span className="tag ok">
-                          {t("mcp.up")} · {s.health.tools ?? 0}
-                        </span>
-                      </Tooltip>
+                      // t128 (t123 §3 F1 family): `tools == null` is the THIRD
+                      // state, and it is not a zero.
+                      //
+                      // `tools` is `number | null` (api.ts:261) and the key can
+                      // also be ABSENT, which reads as `undefined` here: `?? 0`
+                      // collapsed both into a confident "0 tools", i.e. "this
+                      // server exposes nothing" when the truth was "the daemon
+                      // did not tell us". Same rule as `runtimes.probeFailed`
+                      // (Runtimes.tsx:213-218: a failed probe must not print a
+                      // measured 0) and as `knowledgeSearchLegs`'s "a missing leg
+                      // is null, never 0" (api.ts:1341-1346). Loose `==` is
+                      // deliberate: it catches `null` AND a deleted key.
+                      s.health.tools == null ? (
+                        // The label promises a retry, so it has to BE one -- the
+                        // shape Runtimes.tsx:305-310 already established for its
+                        // third state (neutral `.tag`, not `.ok`, not `.warn`:
+                        // `warn` is "down", which IS a measurement).
+                        <Tooltip title={t("agents.mcp.toolsUnknown.hint")}>
+                          <button type="button" className="tag" onClick={load}>
+                            {t("mcp.up")} · {t("agents.mcp.toolsUnknown")}
+                          </button>
+                        </Tooltip>
+                      ) : (
+                        <Tooltip
+                          title={`${s.health.tools} ${t("mcp.tools")} · ${s.health.latency_ms}ms`}
+                        >
+                          <span className="tag ok">
+                            {t("mcp.up")} · {s.health.tools}
+                          </span>
+                        </Tooltip>
+                      )
                     ) : (
                       // "down" is a state, not an error: .tag.warn, never .tag.err
                       <Tooltip title={s.health.error ?? t("mcp.down")}>

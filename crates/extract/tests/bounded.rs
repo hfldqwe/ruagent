@@ -342,6 +342,7 @@ fn pathological_inputs_stay_bounded() {
         max_per_input: 0,
         max_turns: 0,
         max_text_bytes: 0,
+        max_input_bytes: 0,
         max_content_bytes: 0,
         max_entity_name_chars: 0,
         min_score: 1.0,
@@ -351,6 +352,103 @@ fn pathological_inputs_stay_bounded() {
     let got = memory_candidates_with(&sample_turns(), &zero);
     assert!(got.candidates.is_empty());
     assert_eq!(got.turns_skipped, sample_turns().len());
+}
+
+/// t132, closing the t125 F1 finding: the transcript window is bounded in BYTES,
+/// not only in turns — and what it cuts is REPORTED.
+///
+/// Why this test exists, in one sentence: `pathological_inputs_stay_bounded`
+/// above only asserted that a 1.1 MB single turn yields ONE candidate, so nothing
+/// in this file would have gone red while a 16 MB turn made the pass do 16 MB of
+/// work and allocate a 16 MB `char_indices` table (measured: 137 → 513 → 1943 ms
+/// for 1/4/16 MB, peak allocation = 16x the input).
+///
+/// THREE things make the assertion able to go red, and the third is the one that
+/// cannot be satisfied by accident:
+///
+/// 1. the cut is reported (`truncated` true, `bytes_skipped` exact arithmetic),
+/// 2. a sentence placed BEYOND the budget is never extracted,
+/// 3. the same prefix in a 16x larger turn yields the SAME candidate list — the
+///    pass's output may not depend on the input past its own budget.
+///
+/// The negative control (run outside the shared tree, `byte_window` neutralised)
+/// turns 1, 2 and 3 red: see docs/design/reviews/gen4-extract-bounds-repair.md.
+#[test]
+fn an_over_long_transcript_is_bounded_by_bytes_and_the_loss_is_reported() {
+    // Sentences of a FIXED byte length, so the budget lands exactly on a sentence
+    // boundary and the skipped-byte count is exact arithmetic rather than a
+    // range.
+    let sentence = |i: usize| format!("以后统一用 填充{i:04} 处理这件事。");
+    let unit = sentence(0).len();
+    let kept_sentences = 100usize;
+    let limit = unit * kept_sentences;
+    let marker = "以后统一用 独特标记ZZZ 处理这件事。";
+    let make = |total: usize| -> String {
+        let mut s = String::with_capacity(total);
+        let mut i = 0usize;
+        while s.len() + unit <= total - marker.len() {
+            s.push_str(&sentence(i));
+            i += 1;
+        }
+        while s.len() + marker.len() < total {
+            s.push(' ');
+        }
+        s.push_str(marker);
+        assert_eq!(s.len(), total, "the fixture's length is exact");
+        s
+    };
+
+    let limits = ExtractLimits {
+        max_input_bytes: limit,
+        // The byte budget must be the ONLY bound in play here, or the cap could
+        // take the credit for the loss.
+        max_per_input: 4096,
+        ..ExtractLimits::default()
+    };
+
+    let one = vec![Turn {
+        role: Role::User,
+        text: make(limit * 16),
+        ts_ms: 0,
+    }];
+    let got = memory_candidates_with(&one, &limits);
+    let contents: Vec<&str> = got.candidates.iter().map(|c| c.content.as_str()).collect();
+
+    // 1. the cut is reported, exactly.
+    assert!(
+        got.truncated,
+        "an input cut to max_input_bytes must be reported as a loss: {got:?}"
+    );
+    assert_eq!(
+        got.bytes_skipped,
+        one[0].text.len() - limit,
+        "the skipped byte count must be the exact number of bytes not read"
+    );
+    assert_eq!(got.turns_skipped, 0, "max_turns cut nothing here");
+
+    // 2. nothing beyond the budget was read, and the head still was.
+    assert!(
+        !contents.iter().any(|c| c.contains("独特标记ZZZ")),
+        "a sentence past the byte budget must not be extracted: {contents:?}"
+    );
+    assert!(
+        contents.iter().any(|c| c.contains("填充0000")),
+        "the head of the turn is inside the budget and must still be read: {contents:?}"
+    );
+
+    // 3. scale invariance: 16x the input, byte-identical output.
+    let big = vec![Turn {
+        role: Role::User,
+        text: make(limit * 256),
+        ts_ms: 0,
+    }];
+    let got_big = memory_candidates_with(&big, &limits);
+    assert_eq!(
+        format!("{:?}", got_big.candidates),
+        format!("{:?}", got.candidates),
+        "the candidate list must not depend on the input size beyond the budget"
+    );
+    assert!(got_big.truncated, "the larger turn is cut too");
 }
 
 /// The guards that keep a deterministic rule honest are visible from outside:

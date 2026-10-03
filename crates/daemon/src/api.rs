@@ -479,7 +479,26 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<serde_json::
 
 async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let stats = state.mgr.db().agent_stats().await?;
-    Ok(Json(serde_json::json!({ "agents": stats })))
+    // INT-F4 (t127, additive): the two calibration versions the rest of the
+    // wire already reports, so a reader of this payload can tell "worse" from
+    // "embedded or scored by a different version". BOTH come from their single
+    // source of truth — a literal here would be a second, silently drifting
+    // copy of the value it is supposed to report. Cite the SYMBOL, not the line:
+    //   * `state.knowledge.embedder_name()` — the live embedder's own name,
+    //     defined by `Knowledge::embedder_name` (`crates/knowledge/src/
+    //     store.rs`, `pub fn embedder_name(&self) -> &'static str`);
+    //     `/api/v1/knowledge/documents` already reads the same accessor.
+    //   * `ruagent_knowledge::SCORING_VERSION` — the fusion/calibration
+    //     constant (`crates/knowledge/src/store.rs`, re-exported by
+    //     `crates/knowledge/src/lib.rs`).
+    // (The line numbers these sat on moved when this comment was inserted --
+    // that is why the symbols are the citation.)
+    // The pre-existing `agents` key is first and untouched.
+    Ok(Json(serde_json::json!({
+        "agents": stats,
+        "embedder": state.knowledge.embedder_name(),
+        "scoring_version": ruagent_knowledge::SCORING_VERSION,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -2946,6 +2965,24 @@ async fn pick_directory() -> Json<serde_json::Value> {
 /// built-in extraction prompt for reference.
 async fn distill_policy_get(State(state): State<AppState>) -> Json<serde_json::Value> {
     let p = state.chats.distill_policy_now();
+    // INT-F3 (t127, additive): `prompt_hash` is the SAME origin as the hash
+    // the real distillation records — `Distiller::distill_plan` computes
+    // `ruagent_memory::write::content_hash(&self.compose_prompt())`
+    // (`crates/daemon/src/distill.rs`). `compose_prompt` is `pub(crate)`, so
+    // this handler builds the SAME struct out of the SAME policy the six keys
+    // above already report — `Distiller` has no private fields, so no accessor
+    // was needed. The field mapping is the one the auto-distill path installs at
+    // boot (`crates/daemon/src/lib.rs`): `[distill] prompt -> prompt_override`,
+    // `language -> language`, `graph -> graph` (policy -> field).
+    let distiller = crate::distill::Distiller {
+        db: state.mgr.db().clone(),
+        root: state.config.root.clone(),
+        embedder: Some(state.knowledge.embedder()),
+        registry: state.mgr.registry_view(),
+        language: p.language.clone(),
+        prompt_override: p.prompt.clone(),
+        graph: p.graph,
+    };
     Json(serde_json::json!({
         "auto": p.auto,
         "agent": p.agent,
@@ -2953,6 +2990,7 @@ async fn distill_policy_get(State(state): State<AppState>) -> Json<serde_json::V
         "prompt": p.prompt,
         "graph": p.graph,
         "builtin_prompt": crate::distill::builtin_extraction_prompt(),
+        "prompt_hash": ruagent_memory::write::content_hash(&distiller.compose_prompt()),
     }))
 }
 

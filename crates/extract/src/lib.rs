@@ -42,9 +42,15 @@
 //! truncated (half a sentence is invented text — the repo has already paid for
 //! body rewriting, t347/distill.rs:671-677); entity names are at most
 //! [`ExtractLimits::max_entity_name_chars`]; the transcript window is the last
-//! [`ExtractLimits::max_turns`] turns; the document window is the first
+//! [`ExtractLimits::max_turns`] turns **and** the last
+//! [`ExtractLimits::max_input_bytes`] bytes of them (a cut there is reported as
+//! [`MemoryCandidates::bytes_skipped`]); the document window is the first
 //! [`ExtractLimits::max_text_bytes`] bytes; the term table is capped at
-//! [`rules::MAX_DISTINCT_TERMS`]. Work is linear in the windowed input.
+//! [`rules::MAX_DISTINCT_TERMS`]. Work is linear in the windowed input — and both
+//! windows are bounded in BYTES as well as in units, so "the windowed input" is
+//! itself bounded (t132; before it, one 16 MB turn was 16 MB of work and a 16 MB
+//! `char_indices` table, which `tests/bounded.rs` was named for and never
+//! asserted).
 //!
 //! # Named deviations from the design text, and why
 //!
@@ -362,8 +368,26 @@ pub struct ExtractLimits {
     /// Graph candidates below this ranking are dropped (§9.3). Memory candidates
     /// are never filtered by confidence (§7.4.7) — only truncated.
     pub min_score: f32,
-    /// The document window (§9.5). The transcript window is `max_turns`.
+    /// The document window (§9.5). The transcript window is `max_turns` **and**
+    /// `max_input_bytes` — a document is read from its head, a transcript from
+    /// its newest turns, and both are bounded in BYTES as well as in units.
     pub max_text_bytes: usize,
+    /// The transcript's BYTE window (t132, closing the t125 F1 finding): the
+    /// pass reads the largest SUFFIX of the `max_turns` window whose text totals
+    /// at most this many bytes, newest turn first.
+    ///
+    /// `max_turns` bounds how MANY turns are read; this bounds how MUCH TEXT,
+    /// because the pass's work — including `text::split_sentences`'s
+    /// `char_indices` table (16 bytes per char) — is proportional to the text it
+    /// reads. Without it, one 16 MB turn made the pass do 16 MB of work and
+    /// allocate a 16 MB table, which is the shape `tests/bounded.rs` was named
+    /// for and never asserted.
+    ///
+    /// When the newest turn alone exceeds the budget its HEAD is kept (the
+    /// document window's own rule, §9.5: a text's head states its terms). What is
+    /// cut is REPORTED, never silent: [`MemoryCandidates::bytes_skipped`] counts
+    /// it and [`MemoryCandidates::truncated`] turns true.
+    pub max_input_bytes: usize,
     /// A longer content/fact unit is DROPPED, not truncated (§7.4.3).
     pub max_content_bytes: usize,
     pub max_entity_name_chars: usize,
@@ -378,6 +402,12 @@ impl Default for ExtractLimits {
             max_per_input: 32,
             min_score: 0.0,
             max_text_bytes: 256 * 1024,
+            // 4x the document window: a session carries both sides of the
+            // conversation, and 1 MiB is several times a realistic 2000-turn
+            // session (~500 bytes/turn). So this bounds the pathological turn
+            // without retuning normal ones — every fixture in tests/ fits inside
+            // it and takes the no-cut path, where nothing changes.
+            max_input_bytes: 1024 * 1024,
             max_content_bytes: 400,
             max_entity_name_chars: 60,
             max_turns: 2000,
