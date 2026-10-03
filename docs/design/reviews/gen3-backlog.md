@@ -389,6 +389,43 @@ a SIBLING directory: component-wise containment must not confuse it
 - **R-12（`daemon/sessions.rs` + `acp/adapter.rs` 共 7 处往返断言）**：**现在中性**（原样回显），但若将来改用 `file_name()`/`parent()` 推导，同一夹具在 Linux 上会给出**另一个**答案 ⇒ 建议加备注或换平台中立夹具。**登记，不立单**（当前不构成缺陷）。
 - **方法学结论（比清单本身更有用）**：全仓 19 处同类命中里，**真问题不是「有没有 `C:\`」，而是「断言的真值是否依赖宿主的分隔符语义」**。19 处中只有这一处踩上。
 
+## B25. 2026-10-03 恢复运转：两条新 finding（F1 已立单 / F2 待立单）
+
+**开工前的树与 `main` 读数（captain 亲自取）**：`HEAD = 9059225`（2026-10-02 23:05 +08:00），**与 `origin/main` 同字节**；`gh run list` 显示 `9059225` 的 **CI ✅（25m29s）+ E2E ✅（3m58s）**；`git status --porcelain` 在本轮开始时**只有一份未提交的账本改动**（本账 §10 的续写行）。工作树最近一次被写是 **10-02**，此后约 25 小时无人写 ⇒ 本轮在**安静窗口**里开工。
+
+**本代之后的代码是别的会话写的，不是本队的**：`e24263d..9059225` 共 15 个提交（capability 面、新增 `crates/extract`、`extract_plane.rs`、`knowledge_graph.rs`、graph 别名 FTS、routing 修正），设计文档在 `docs/plans/capability-plugins-design.md`（现 181 KB / 2667 行）。⇒ **本账 §10 的「待推/仍在办」是 2026-09-29 的快照**，不是现状；t110/t111/t112/t114 都已落地且 main 上绿。本账不追认他人提交的细节，只记「该快照已被后续现实取代」。
+
+### F1（已立单 t118）`graph_entity` 把「不存在」读成「存在但无事实」—— 调用方可见的假成功
+
+| 面 | 读数（captain 在当前字节上读出） |
+| --- | --- |
+| daemon（wire） | `GET /api/v1/graph/entity/{id}` 返回 `name`/`kind`/`aliases`/`facts`；`name` 由 `entity.as_ref().map(\|e\| e.name.clone())` 产生 ⇒ 不存在的 id 让 `name` 为 **`null`**，HTTP 仍 **200**（`crates/daemon/src/api.rs` 的 `async fn graph_entity`；同文件 `mod tests` 正是不存在 id ⇒ `200` + `name.is_null()` + `facts == []`）。**存在性本来就在 wire 上。** |
+| MCP（消费面） | `crates/mcp/src/lib.rs:232-236` 判存在读 `resp.get("entity")`，`or_else(\|\| resp.get("exists")...)` —— **这两个键在 wire 上都不存在** ⇒ `entity_missing` **恒 false** ⇒ `:248-250` 把不存在的实体答成 `entity #N has no current facts`，`isError=false`。**agent 把自己瞎编的 id 读成「真实存在、只是没有事实」。** |
+
+**与谁同族**：与 capability 设计文档 §20 第 4 条那条「不可传输的键被静默丢弃、调用方拿到成功」同族（t93 的 M1 前半；当时以「需 daemon 侧」交回 finding，此后 daemon 长出 `name` 而**消费面没跟上**）。**修法是纯消费面**（存在信号已在 wire 上、且由 daemon 自己的测试钉住）⇒ t118 的 inScope 只落 `crates/mcp/**`。
+
+**附带证据（坐标漂移的又一处）**：`:225-231` 的注释声称 daemon「carries no existence field and no 404」——**这句现在是假的**；它引的 `api.rs:1207-1216` 在当前字节上是 `wiki_page_corrections`，**早已不是 graph entity**。⇒ t118 的验收要求注释里每个行号引用都对当前字节回读。
+
+### F2（待立单）面板的真测量从未进过 CI：`--check` 判活 DOM 并 exit 1，CI 只跑 `--self-test`
+
+| 面 | 读数 |
+| --- | --- |
+| 工具自己的契约 | `panel/tools/design-audit.mjs:14` = `--check` judge §12，**exit 1 on failure**；`:493` = `--check` **DOES judge the live DOM**；`:490` = `--self-test` 只证 rows 16/23 的准则 **LOGIC** 与可读性（不需要浏览器）。 |
+| CI 实际跑的 | `.github/workflows/ci.yml:459` = `node tools/design-audit.mjs --self-test` —— **只有自检**。全仓 `grep design-audit .github/` 只有这一处。 |
+
+⇒ **后果**：§12 的可实施行（含活 DOM 判据）在 main 上**没有任何门禁**；面板真实行为回归可以一路绿到 main。这正是 t95 的 T-2 与 t99 的立单理由，而 t99 依赖 `t66`（终态失败）⇒ **永不可认领**。⇒ 下一轮首要候选：把 `--check` 接进流水线（四条护栏：计数 + 跳过点名 + 能红的负控 + 不可测记 `not_measured` 且 exit 1），**且在接进去之前先用一次真跑证明它今天就能红/能绿**。
+
+### 卫生与账目更正（本轮 captain 动作）
+
+- **t96 的前提已被取代**：`log`→`rows` 的改名在本代早已被裁决**回退到 `log`**（§C12 与 §192「已一致回退到 `log`」）；当前字节两侧一致且写明理由（`panel/src/api.ts:480-483/485/489`：`log` = **一页**、`rows` = **总数**）。⇒ t96 的改名动作作废（不是未完成）；它另带的 F3/F4 已由 t62 承载。t96 的依赖是两张终态失败单 ⇒ **它本已不可认领**（这正是 R-11 被登记而非立单的同一条理由）。
+- **t62 已从 t96 摘开依赖**（`update_task` 原子生效），并追加重测要求：`api.rs` 已被 capability 那代重写，t62 当初登记的行号极可能已漂 ⇒ **先在当前字节上量**（已有 ⇒ 以「读数 + 已满足」收口；缺 ⇒ 才是实现）。
+- **未提交的账本改动随之入库**：本账 §10 的续写行在本轮开工时**已在工作树上挂了 3 天未提交**。这本身就是隐患 —— **共享树上任何未提交的文件，都会被下一位读者的 `git diff` 读成「有人正在改」**。
+
+### 两条方法学观察（本轮的，不是重复）
+
+1. **「核对当前字节」直接省掉了一整张单**：capability 设计文档 §20 第 4 条列着三条 follow-up（让不可传输的键**响亮**、删掉 prose 里的数字边界、加字段集守卫）。派活前我核了当前字节 —— **三条都已落地**（`crates/mcp/src/lib.rs:1210` 的「EVERY struct here carries `deny_unknown_fields`」、`:1357` 的「`deny_unknown_fields` IS THE FIX FOR A MEASURED FALSE SUCCESS」、`:1400` 的属性、`:1409-1425` 已改成「read that row's `options_schema`」、`:1865`/`:2417` 的字段集守卫）。**照文档立单就是让成员去做一件已经做完的事**，而成员会（正确地）拿现有代码回报「已完成」，白烧一轮。⇒ 通则：**登记的 follow-up 也是会过期的读数，立单前必须回到字节。**
+2. **平台规则改变了正确的动作，而不是只阻挡它**：t118 与 t96 在 `crates/daemon/src/api.rs` 上重叠，而 running 团队只允许对 pending 单做 `update_task`（改不了 inScope、也删不掉）。我没有去削弱 t96 的 inScope，而是**回头重审修法本身** —— 发现存在信号已在 wire 上，于是本轮变成**纯消费面修复**，根本不需要那块路径。⇒ **通则：inScope 冲突先当设计问题重审，别当权限问题绕过。**
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
@@ -439,6 +476,8 @@ a SIBLING directory: component-wise containment must not confuse it
 | C27 | **`immutable=1` 是正确性，不是优化**（t75，mem-core 实测） | 朴素 `SQLITE_OPEN_READ_ONLY` 打开一份 WAL 副本，会**在用户数据目录里生成** `-shm`/`-wal`（实测生成 32,768 B 的 `-shm` 与 0 B 的 `-wal`，**而一个「遗忘报告」不许写它正在报告的那个目录**）。⇒ 判据：读副本必须 `immutable=1`；候选集排除 `-shm`/`-wal`；**带非空 `-wal` 的副本判为未测**。同族的两条：**读不出来的候选 ⇒ 该面 `total: None`（未测）而不是 0**；**文件种类必须按字节嗅探而不是按扩展名**（`-150802` 结尾的副本被 `.db` 过滤器漏掉 ⇒ 候选 1 vs 2） | 全员 |
 
 | C28 | **合法 YAML ≠ GitHub 可加载的工作流：非法 `${{ }}` 会拒掉整个文件，而 YAML 解析器看不见**（captain 本轮真实事故，一行修复 `5d3adfd`） | t104 在 `e2e.yml` 的 `run: |` **块标量内部**（即 shell 脚本正文、**不是 YAML 注释**）写了字面量 `` `${{ ... }}` ``。**GitHub 对整段 `run:` 字符串做表达式替换（shell 注释也照做）** ⇒ 去解析 `...` 这个非法表达式 ⇒ **整个 workflow 文件被拒**：run `36484582363` **0s、无 job**、`name` 退化成**文件路径**、纯文本视图直说「This run likely failed because of a workflow file issue」。**PyYAML 说该文件合法**（我复核过：229 行、0 tab、唯一 `${{` 就在那处）⇒ **守卫与我都漏了它**。**判据**：① workflow 里的 `${{ }}` 必须**逐个是合法表达式**，且在 `run:` 块内也要检查；② `concurrency.group` 里的合法表达式**不许**被误报；③ 推一个改动过 workflow 的提交前，**必须用能看见这一层的检查**（已并入 t106 的验收，带「写 `${{ ... }}` ⇒ 必须红」的负控）。**旁证**：`ci.yml:30` 的 `${{ github.workflow }}-${{ github.ref }}` 是合法的、不在 run 块内 ⇒ 那次 CI run 只是 `pending`（没被拒），两件事正好互证 | captain + t106 |
+
+| **C29** | **登记的 follow-up 也会过期：立单前必须回到字节**（captain 本轮，差点白烧一整轮） | capability 设计文档 §20 第 4 条列着三条 follow-up（让不可传输的 MCP 键**响亮**、删掉 prose 里的数字边界、加字段集守卫）。派活前核当前字节 ⇒ **三条都已落地**（坐标见 §B25）。若照文档立单，成员会（正确地）拿现有代码回报「已完成」⇒ 白烧一轮，且会让人误以为「登记还开着」。**判据**：任何由文档/账本行号驱动的立单，派活前先在**当前字节**上核一次；**文档说「未决」不等于今天未决**。同族：C22、§B25 的两处坐标漂移（`api.rs:1207-1216` 已指向 wiki corrections）。 | captain（沿用） |
 
 ## D. 纪律账
 

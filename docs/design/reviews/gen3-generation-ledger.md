@@ -130,12 +130,39 @@ E2E 36507120602 @b1e0e9f: completed/success（Doctor 7 ✅ · Panel E2E (Playwri
 
 **推后逐条记录（每次推送都会取消前一条 run，故必须逐条写）**：
 - `05755d0`（t109）E2E ✅ · `b1e0e9f`（t108）CI+E2E ✅ · `1516814`（t113）E2E ✅ **且算术闭合**：`51 passed`、零跳过（上一代是「46 passed + 1 skipped + 4 failed = 51」⇒ **同一批 51 个测试现在全过、一个不跳**）。
-- ⚠️ **`5c0bc8f`（t110 增量）E2E ❌** —— 而这次红是**护栏按设计工作**：`no Playwright JSON report at …/t65/playwright.json -- this leg cannot name a skipped spec … a skip that cannot be named must never be reported as green`（步骤链其余全绿，**含 `Panel E2E (Playwright)` success**）。根因（待证实）：`PLAYWRIGHT_JSON_OUTPUT_NAME` 是**相对 `outputDir` 的文件名**、`PLAYWRIGHT_JSON_OUTPUT_FILE` 才是绝对路径，而 t107 之后 `outputDir` **每次运行独占** ⇒ **写的人与读的人用了两个路径假设**。⇒ 处置：修复单（同一处 `env:` 定义路径 + 三条护栏一条不削弱 + 报告把「未真跑」更新成「CI 已证明不工作 → 已修 → 待验证」）。**不把这次红藏起来**：它换来的是「再也无法在拿不到名字时报绿」。
-- **待推**：`t111`（四个 job 超时上界；**判据「上界按『绿』的运行取，不能按红的」**）+ `t112`（12 处 `uses:` 固定 SHA，含 `dtolnay/rust-toolchain@stable` **移动分支**；**固定动作 ≠ 固定工具链**已行内写明）。
+- `5c0bc8f`（t110 增量）E2E ❌ —— **护栏按设计工作**（JSON 报告在 CI 上没生成 ⇒ 拒绝在拿不到名字时报绿；步骤链其余全绿，含 `Playwright`）。根因由作者用**同一形状**（`CI=true`）复现，并**纠正了我最初的推断**（`_NAME`/`_FILE` 语义差不是成因）：`CI=true` 换掉 config 的 reporter 清单，CLI 合并结果两环境不同；**确定性那条腿**是 `PW_TEST_REPORTER`（`createReporters()` 无条件按名字挂一个）。⇒ 修法：路径**一处定义**（job 级 `env`）+ **单一 json 写者**。
+- `02dea44`（该修复 + t111/t112/t114）**E2E 在加载期被 GitHub 拒**（0s、无 job、`name` 退化成文件路径）—— 因为 job 级 `env:` 用了 **`runner.temp`**（该键不允许 `runner`）。**`ci.yml` 用同一批 SHA 与同样的 `timeout-minutes` 却加载正常**，这才把范围缩小到该文件。⇒ `22255c4` 改用 `${{ github.workspace }}` 并**由平台确认加载恢复**（工作流名回到 `E2E`）。这是**第三种「YAML 合法但 GitHub 拒」**（前两种：非法 `${{ }}`、未加引号 `: `）⇒ 已立 `t115` 把这一层补进守卫。
+- ★ **`22255c4` 全绿（两条 workflow、所有 job）**：`CI ✅`（windows / ubuntu / Panel）+ `E2E ✅`（Doctor / Playwright / **E2E evidence（skips named）** / Upload）⇒ **12 处固定 SHA 真被解析并执行 · 6 个上界未误杀正常路径 · JSON 点名机制在 CI 上工作**。作者承诺的四行**逐字**出现：`| JSON report stats.skipped | 0 |` · `| **named skipped specs** | **0** |` · `**CONFIRMED: no spec was skipped in this run** -- … a different fact from "a skip existed and could not be named"` · `playwright: exit 0, JSON says 0 skipped / 0 named, none of them registry.spec.ts`。
+- `d632937`（t115：守卫补上**上下文可用性**，只实现两组确证规则、不许误报）已入库 ⇒ 它在 CI 上的第一批读数见下一条 run。
 
 **判据提醒**：上表的「结果」都要求**成对读数**（改前→改后）与**能红的负控**；「CI 绿」只有在**这六项**都有读数之后才允许宣称 —— 现在它们是：五项有读数、一项（t110）明确写着**未完成**。
 
 ---
+
+## 11. 2026-10-03 恢复运转（本账第一次带日期的追认）
+
+**为什么需要这一节**：§10 的「待推 / 仍在办」写于 **2026-09-29**。此后**别的会话的队伍**在同一棵树上又推了 15 个提交（capability 面、新增 `crates/extract`、`extract_plane.rs`、`knowledge_graph.rs`、graph 别名 FTS、routing 修正；设计文档 `docs/plans/capability-plugins-design.md` 现 181 KB）。⇒ 本账**不追认他人提交的细节**（那不是本队的读数），但必须标明：**§10 那几行是历史快照，不是现状**。
+
+**恢复时的现场读数（captain 亲自取，2026-10-03 23:5x +08:00）**：
+
+| 项 | 读数 |
+| --- | --- |
+| `main` 尖端 | `9059225`（2026-10-02 23:05 +08:00），**与 `origin/main` 同字节** |
+| 该提交的流水线 | **CI ✅ 25m29s + E2E ✅ 3m58s**（`gh run list` 原文；`684b5d8`/`e4bd0a4` 的 CI 被后续推送取消——正常，E2E 绿） |
+| 安静窗口 | 工作树最近一次被写 = **10-02**，到开工约 **25 小时**无人写 ⇒ 本轮在安静窗口里开工 |
+| 工作树 | `git status --porcelain` 在本轮开工时**只有一份未提交的账本改动**（§10 的续写行，挂了 3 天）⇒ 已随本轮入库 |
+| 目标① | ✅（16 次推送 + 后续会话的 15 个提交都在 `main` 上） |
+| 目标② | ✅ **且被追认**：`9059225` 的 CI+E2E 双绿；§10 里「待推」的 t111（超时上界）/t112（12 处 SHA）/t114（release 上界）都已落地 |
+| 目标③ | ▶ **在运转**：本轮发现两条新 finding 并立了第一条的完整质量环 |
+
+**本轮的两条新 finding（证据在 `gen3-backlog.md` §B25）**：
+
+- **F1（已立单 `t118`，质量环 t118→t119→t120→t121）**：`graph_entity` 把「实体不存在」答成「存在但无事实」——调用方可见的**假成功**。存在信号本来就在 daemon 的 wire 上（`name` 为 `null`，HTTP 200，且被 daemon 自己的测试钉住），而消费面读的是两个**在 wire 上不存在**的键（`entity`/`exists`）⇒ 判定恒为 false。**修法因此是纯消费面**（不碰 daemon）。
+- **F2（待立单）**：面板的**真测量从未进过 CI** —— `panel/tools/design-audit.mjs --check` 判活 DOM 且 `exit 1`，而 `.github/workflows/ci.yml:459` 只跑 `--self-test`（只证准则逻辑，不需浏览器）。⇒ §12 的可实施行在 `main` 上**没有门禁**。这正是 t95 的 T-2 / t99 的立单理由，而 t99 因依赖终态失败的 `t66` **永不可认领** ⇒ 下一轮首要候选。
+
+**本轮同时更正的两处账目**：t96 的 `log`→`rows` 前提**已被裁决取代**（当前字节两侧一致且写明「`log` 是一页、`rows` 是总数」；F3/F4 由 t62 承载）；t62 已从 t96 摘开依赖并追加重测要求（`api.rs` 已被重写，旧行号极可能已漂）。
+
+**本账的诚实边界（本轮新增）**：从本轮起，本账的每一节都必须能回答「**这份读数是什么时候、在哪份字节上取的**」。§10 之所以需要 §11 追认，不是因为它当时写错了，而是它**没有带日期地声明自己的适用面**。
 
 ## 附：本账的维护
 
