@@ -93,3 +93,31 @@ git log -1 -- crates/mcp/src/lib.rs  -> ec24b61 (2026-10-04 00:31) 「feat(memor
 * **我没有**做隔离 worktree 基线，也没有重跑 t118 的三次控制窗口（控制窗口的读数我采信为**旁证**并标明；判别力由我自己的探针判定）。
 * **我没有**审计 t118 之外四个单元（extract/panel/ci/version-points）的代码；只读了它们的**提交归属**。
 * 未跑 `--check`/面板 e2e/活库查询；`entities.name NOT NULL` 的钉住缺口（t119 的 L1）我**复核了其存在**（本报告不重复记账，归 t119 的 finding）。
+
+---
+
+## 5 t139 · round 2（2026-10-04，评审 t138 对 GEN4-EX-R1 的收口）——**追加，不改写上文**
+
+**本轮读的字节**：`crates/mcp/src/lib.rs` = **125,843 B / sha256 `EB4129AB9715414D…` / mtime 2026-10-04 00:49:24**（与 round 1 的 `2BF35EEC…` 不同，差异即 t138 的注释修订）；`crates/daemon/src/api.rs` 当前字节。
+
+**① 改动的性质（我读了完整 diff，不只信摘要）**：`git diff --numstat -- crates/mcp/src/lib.rs` = **10/5**，`git diff -U0` 的每一行 `+`/`-` 都带注释前缀（`///` 或 `//`）⇒ **注释级改动，零代码行** ⇒ round 1 对 `entity_exists` 与两个方向用例的**行为读数在这份字节上仍然有效**（t138 不动行为）。
+
+**② 七个坐标逐条回读（t138 的声称，我独立核对）**：
+| 引用 | 当前字节 | 判 |
+| --- | --- | --- |
+| `api.rs:1355` | `let entity = ruagent_graph::entity_by_id(db, id).await?;` | 通过 |
+| `api.rs:1361` | `"name": entity.as_ref().map(|e| e.name.clone()),` | 通过（存在信号的真实发出行） |
+| `api.rs:1358-1365` | `:1358-1359` 的 200/404 散文 + `:1360-1365` 的 `json!({name,kind,aliases,facts})` 字面量 | 通过（扩段后直达实现） |
+| `api.rs:6711` | `async fn the_entity_route_exposes_the_alias_text_and_the_list_opt_in_is_additive()` | 通过 |
+| `api.rs:6783` / `:6784` / `:6785-6788` | `assert_eq!(st, StatusCode::OK, "{raw}")` / `assert!(missing["name"].is_null(), "{raw}")` / facts 空断言 | 全部通过 |
+| 旧提示 `6673` | 今天是 `);`（不落在那个测试函数上）⇒ **t138 的更正方向正确** | 已由新注释标注 |
+
+**③ 「已为假的声称」扫描**：`crates/mcp/src/lib.rs` 里 `never emitted` / `carries no existence` 命中只剩 `L230`、`L1205`、`L1224`，三处都**为真**（`resp["entity"]`/`resp["exists"]` 两键确实从未被发出；状态码确实不携带存在性；四键字面量确实只有 name/kind/aliases/facts）⇒ **round 1 的 GEN4-EX-R1 已收口，且没有新的假声称**。
+
+**④ 门禁（我本人重跑，字节同上）**：`scripts/cargo-team.ps1 test -p ruagent-mcp` ⇒ **exit 0**（lib **46** / roundtrip **5** / tool_surface **3** / doc **0**，与 t138 的签名数字一致）；`fmt --all --check` ⇒ **exit 0**。
+
+**⑤ 写入集合**：`git diff --name-only HEAD -- crates/mcp` = **只有 `crates/mcp/src/lib.rs`**；`git status --porcelain -- crates/mcp` = ` M crates/mcp/src/lib.rs`。全量 `git diff --name-only HEAD` 另含 `crates/acp/src/chat.rs`、`crates/daemon/src/chat.rs`、`crates/daemon/src/distill.rs`、`crates/daemon/tests/injection_e2e.rs` —— **都不是本单元申报的路径**（共享树里其他在途单元的编辑；round 1 时那三个 dirty 文件已换过一轮，说明工作树在移动）⇒ 按验收的失败条件「**动了别处而未被授权**」判定：**无证据**表明 t138 动了它们（它申报且实际只落 `crates/mcp/src/lib.rs`，且该文件 diff 为注释级）⇒ **不构成 blocker**。**GEN4-EX-R2（流程）在本轮再次出现**：`git diff` 无法在共享树里归属写入者，建议按「申报路径 == 提交/工作树里该单元路径子集」判，并单独列出他人 dirty 文件。
+
+**⑥ t118 的 6 条 acceptance（round 2 判决）**：1 达成（`Err` 点名 id 的代码与用例未变）· 2 达成（零事实方向的代码与用例未变）· 3 达成（信号 = `name`；**测试坐标七条全部回读通过**）· 4 达成（纯函数 + 两方向用例未变；判别力由 round 1 的探针判定并采信 t118 的实跑为旁证）· **5 达成（round 1 的唯一失败项已修：`1341-1346`→`1360-1365`、`1342`→`1361`，并附日期化的更正说明；旧提示 `6673` 也一并改为 `6711` 且注明旧值指进了另一个测试）** · 6 达成（本单元只改 `crates/mcp/src/lib.rs`，daemon 侧零改动；daemon wire 形状今天仍是 `name:null ⇔ 不在图里`，见 round 1 §0① 的活守护进程读数）。
+
+**verdict = pass**（round 2）。主问题的答案不变且更硬：拿瞎编 id 调 `graph_entity` 拿不到假成功；注释里的坐标现在**逐条可在当前字节上命中**，且改动是注释级的、门禁在我跑的这两个命令上 exit 0。**未覆盖**与 round 1 §4 相同（未自起 MCP 客户端；真 daemon 路由层证据在 t119；未审计其他单元）。**披露**：我是 round 1 的评审员（GEN4-EX-R1 的提出者），t138 是**别人**的实现 —— 本判决不是自评。
