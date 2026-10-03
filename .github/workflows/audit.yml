@@ -9,9 +9,15 @@
 # on 2026-10-02 the real check returned, on the current tree,
 #     [audit] 24 captures in 620.7s · checks 44 pass / 11 fail / 10 not measured
 # with exit 1 (docs/design/reviews/gen4-audit-gate-recon.md). The tool has NO
-# baseline/known-failure mechanism: `exitDecision` (design-audit.mjs:8431-8442) has
-# exactly three fatal sources -- fails > 0, contractWarnings.length > 0, or
-# unmeasured > 0 without `--allow-not-measured`. Wiring this in as a REQUIRED gate today
+# baseline/known-failure mechanism: `exitDecision` has exactly three fatal sources --
+# fails > 0, contractWarnings.length > 0, or unmeasured > 0 without
+# `--allow-not-measured` (design-audit.mjs:8107-8109). COORDINATE, corrected
+# 2026-10-04 (t141): the function is DEFINED at :8105-8111 and CALLED at :8422.
+# Earlier revisions of this header cited ":8431-8442", which is not the function at
+# all -- it is the `if (process.argv[1] ...)` entry block at the END of the file, and
+# the range even overshot it (:8433-8440, with its two comment lines at :8431-8432;
+# the file is 8440 lines). The declaration itself was and is true; only the
+# coordinate was wrong. Wiring this in as a REQUIRED gate today
 # would pin main red and teach everyone to ignore it. What this job guarantees instead:
 # the numbers are produced on every run, the artefacts are kept, and the gate is PROVEN
 # able to fail (the negative control below runs every time).
@@ -29,7 +35,16 @@
 #   * the failing-rows list gets pinned the same way (a second constant next to
 #     EXPECTED_NOT_MEASURED), AND
 #   * the daemon/panel fixture is identical between those runs (same root shape,
-#     same port, same dist)、so the comparison is between comparable readings.
+#     same port, same dist)、so the comparison is between comparable readings, AND
+#   * the PIN'S COVERAGE BOUNDARY is understood (t141 F2): the pinned `65` is the TOOL'S
+#     JUDGED ROW COUNT (`judged = checks - pending`, design-audit.mjs:8397), NOT §12's
+#     row count -- measured 2026-10-04: MASTER.md §12 has **77** numbered rows (1..77,
+#     contiguous) and the tool's hardcoded list (`const CHECKS = [`, :4185) has **65**
+#     entries, one per judged §12 row: 77 - 12 = 65, and the 12 §12 rows with NO check are
+#     rows **60-71**. The tool never reads MASTER.md at run time, so a §12 row added
+#     WITHOUT an implementation leaves this pin green -- as those 12 already do. The pin
+#     answers "did the set of checks the tool runs change?", and says nothing about
+#     contract rows that were never implemented.
 # Only then does removing `continue-on-error` from the audit step mean anything.
 
 name: Design audit (§12, live DOM)
@@ -203,7 +218,17 @@ jobs:
           pass=$(printf '%s\n' "$line" | sed -E 's/.*checks ([0-9]+) pass.*/\1/')
           fail=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) fail.*/\1/')
           unmeas=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) not measured.*/\1/')
+          # t141 F1: the summary line carries an OPTIONAL tail -- " / K pending criterion
+          # revision" (design-audit.mjs:8398) -- and the tool's own arithmetic is
+          # judged = checks - pending (:8397). Until this revision the tail was never read,
+          # so a run whose ONLY change was a row moving into `pending` reddened the check
+          # below while its message blamed the tool/threshold: the misdirection t134 F1
+          # named. These two extra variables are diagnostic ONLY -- the assertion that
+          # follows is byte-identical to what it was.
+          pending=$(printf '%s\n' "$line" | sed -nE 's/.* ([0-9]+) pending criterion revision.*/\1/p')
+          pending=${pending:-0}
           judged=$((pass + fail + unmeas))
+          checks=$((judged + pending))
           exit_code=$(cat "$RUNNER_TEMP/audit.exit" 2>/dev/null | tr -d '\r\n' || true)
           [ -n "$exit_code" ] || exit_code="?"
 
@@ -213,13 +238,31 @@ jobs:
           # required 26 would redden on a fresh fixture -- and a gate that required "24"
           # would hide the day the route silently stopped being captured. So: print it,
           # require only that it is non-zero, and pin the CHECK LIST SIZE instead.
-          echo "captures=$captures pass=$pass fail=$fail not_measured=$unmeas judged=$judged audit_exit=$exit_code"
+          #
+          # t141 F2 -- WHAT THIS PIN COVERS, AND WHAT IT DOES NOT. The constant compared
+          # below (65) is the TOOL'S JUDGED ROW COUNT, not MASTER.md §12's row count. Both
+          # measured 2026-10-04: §12 has 77 numbered rows (1..77, contiguous) while the
+          # tool's hardcoded list (`const CHECKS = [`, design-audit.mjs:4185) has 65
+          # entries -- one per judged §12 row; the 12 §12 rows with NO check are 60-71, so
+          # 77 - 12 = 65. The tool does not read MASTER.md at run time, so a §12 row added
+          # WITHOUT a corresponding check keeps judged == 65 and this gate stays green --
+          # exactly what those 12 rows already do. This pin answers "did the set of checks
+          # the tool runs change?" and says NOTHING about contract rows that were never
+          # implemented. (t141 chose a stated boundary over a second hand-kept constant: a
+          # hardcoded 77 would be a number nobody's tool reads, the "depends on someone
+          # remembering" shape this repo keeps rejecting.)
+          echo "captures=$captures pass=$pass fail=$fail not_measured=$unmeas judged=$judged checks=$checks pending=$pending audit_exit=$exit_code"
           if [ "$captures" -lt 1 ]; then
             echo "::error::the audit captured 0 pages -- nothing was measured, so nothing may pass"
             exit 1
           fi
           if [ "$judged" != "65" ]; then
-            echo "::error::the audit judged $judged rows, not 65: the CHECK LIST changed size (tool or threshold drift), so this reading is not comparable with the pinned one"
+            # t141 F1: name BOTH quantities instead of asserting a cause. The test above is
+            # byte-identical to what it was (a pending row makes the reading
+            # non-comparable, so it MUST redden); only this message changed. The old text
+            # said "the CHECK LIST changed size (tool or threshold drift)" in BOTH cases,
+            # which pointed the reader at the tool even when the check list had not moved.
+            echo "::error::this reading is not comparable with the pinned one: judged=$judged (pinned 65), checks=$checks, pending=$pending. judged = checks - pending (design-audit.mjs:8397), so the cause is EITHER a check-list size change (checks != 65) OR a row that moved into 'pending criterion revision' (pending != 0) -- read the two numbers, do not assume the tool drifted."
             exit 1
           fi
 
@@ -264,7 +307,7 @@ jobs:
             echo ""
             echo "- audit exit code: **$exit_code** (advisory: recorded, not enforced)"
             echo "- captures: **$captures** -- NOT a constant: a fresh root skips the \`#task\` route (24 vs 26)"
-            echo "- judged rows: **$judged** (pass $pass / fail $fail / not measured $unmeas); the pinned constant is 65"
+            echo "- judged rows: **$judged** (pass $pass / fail $fail / not measured $unmeas); the pinned constant is **65** -- that is the TOOL's judged row count (\`checks=$checks\`, of which \`pending=$pending\`), NOT §12's row count (77 today; the tool's check list is hardcoded, design-audit.mjs:4185)"
             echo "- failing rows: \`${failing:-none}\`"
             echo "- not measured (matches the pinned set \`#$want\`): \`#$got\`"
             echo "- artefacts: \`design-audit\` (metrics.json, report.md, the capture PNGs, the raw log)"
