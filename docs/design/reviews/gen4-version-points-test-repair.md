@@ -14,7 +14,9 @@
 | HEAD（开工） | `307f071` → （期间同伴连续提交）→ **`498170a`**（收尾） |
 | 我改的文件 改前 | `git HEAD:crates/daemon/tests/version_points.rs` = **303 行 / 4 条测试 / 12406 字符**（= t127 的版本） |
 | 我改的文件 改后 | **477 行 / 5 条测试 / 19337 字节**；`git diff --numstat` = **187 增 / 13 删** |
-| 本单的读数来自 | **测试框架**（`cargo test`）——共享 target 里的测试二进制；**本单没有为读数重建过 `ruagent.exe`**（不需要：改的是测试，不是二进制行为）。⇒ C35 的"旧 exe"陷阱在本单不存在，但**隔离实验**用了一份私有 target 目录，见 §3 |
+| 本单的读数来自 | **测试框架**（`cargo test`）——共享 target 里的测试二进制 `%TEMP%\ruagent-team-target\debug\deps\version_points-b25472ed7185eaa0.exe`（mtime **2026-10-04 01:01:07**，sha256 `59C7BD76CBAFBF749186A995…`），它 **postdates** 我改后文件的 mtime（**01:00:54**）⇒ 那次绿读数属于**最终字节**。**本单没有为读数重建过 `ruagent.exe`**（不需要：改的是测试，不是二进制行为）。⇒ C35 的"旧 exe"陷阱在本单不存在，但**隔离实验**用了一份私有 target 目录，见 §3 |
+| 我的文件 改后 | sha256（前 24 hex）= **`48E81C4E29A476A554DFC8D2`**（隔离副本里的同名文件与它**逐字节相同** ⇒ §3 引用的行号对最终字节有效） |
+| C33 坐标回读 | 两处 panic 坐标 `version_points.rs:303` / `:385` 都是 `assert_eq!(` 的**起始行**（消息字符串在 `:309` / `:388`），已在最终字节上回读确认 |
 | 唯一一次隔离构建 | `%TEMP%\t142-iso-target`（私有，**不碰共享 target**）；冷建 **7m55s**（`Finished test profile … in 7m 55s`），第二次变异是增量 **20.36s** |
 | 共享树零变异 | 隔离副本 `api.rs` 被变异过（`C43BACC0A535A107` → `30126C7A9D583AB3`）又被**还原**回 `C43BACC0A535A107`；共享树 `api.rs` 全程 `C43BACC0A535A107`；隔离副本 `distill.rs` `0291DF0E6E580A7F` → `B0AF5F9F1F3CBD7F`，共享树 `distill.rs` 全程 `0291DF0E6E580A7F` |
 
@@ -201,9 +203,25 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | 命令 | 读数 |
 | --- | --- |
-| `scripts/cargo-team.ps1 test -p ruagent-daemon` | **exit 101** —— **我的目标全绿**：`version_points` **5 passed / 0 failed**（改前 4）；失败的**唯一**目标是 `--lib`，且失败在**同伴的文件**里：`chat::generating_tests::delete_removes_the_row_and_stops_a_live_run_first`，`panicked at crates\daemon\src\chat.rs:2046: assertion left == right failed: a deleted chat must not produce another message`（156 passed / 1 failed）。**这是 flaky**：同一份字节上**只跑 `--lib` 的重跑是 `ok. 157 passed; 0 failed`**（exit 0）⇒ 它在整套并发时序下偶发，**且与我的改动无关**（我的改动在 `tests/version_points.rs`，`--lib` 目标根本不编译它）。带 `--no-fail-fast` 的整套读数：**214 passed / 1 failed / 8 ignored**（lib 156+1F · capabilities 11 · capability_defaults 5 · event_compat 2 · graph_ingest 16 · injection_e2e 0+8ignored · knowledge_api 16 · recall_evidence_announced 3 · smoke 0 · **version_points 5** · doctests 0） |
+| `scripts/cargo-team.ps1 test -p ruagent-daemon` | **exit 101** —— **我的目标全绿**：`version_points` **5 passed / 0 failed**（改前 4）；失败的**唯一**目标是 `--lib`，且失败在**同伴的文件**里：`chat::generating_tests::delete_removes_the_row_and_stops_a_live_run_first`，`panicked at crates\daemon\src\chat.rs:2046: assertion left == right failed: a deleted chat must not produce another message`（156 passed / 1 failed）。**两点把它定性为 load-sensitive flake，而不是回归**：① **同一份字节上只跑 `--lib` 的重跑是 `ok. 157 passed; 0 failed`（exit 0）**；② 那次红发生时，**我自己的隔离冷建（4 jobs）正在同一台机器上跑**（§3 窗口 01:01:31–01:09:27 与该次门禁重叠），而重跑时它已经结束 ⇒ 这条断言是"删掉的 chat 不得再产出消息"的**时序竞争**，与 prompt hash 无任何关系。③ **我的改动不可能够到它**：它在 `--lib` 目标，而我的字节只在 `tests/version_points.rs`（另一个测试二进制）。带 `--no-fail-fast` 的整套读数：**214 passed / 1 failed / 8 ignored**（lib 156+1F · capabilities 11 · capability_defaults 5 · event_compat 2 · graph_ingest 16 · injection_e2e 0+8ignored · knowledge_api 16 · recall_evidence_announced 3 · smoke 0 · **version_points 5** · doctests 0）。⇒ 本行按 gate 的**字面读数**记 **failed（101）**，成因与归属写在这里，**不替同伴修**（已立 finding V-B7）；**attempt 2 在最终字节上重跑为 exit 0，见 §6.1**。 |
 | `scripts/cargo-team.ps1 clippy -p ruagent-daemon --all-targets -DenyWarnings` | **exit 0**（`Checking ruagent-daemon` + `Finished dev profile in …`） |
 | `cargo fmt --all --check` | **exit 0**（我曾在本单早期读到过一次红，那是**同伴**当时在途的 `crates/daemon/tests/injection_e2e.rs`；他修好/提交后现在是 0 —— 与我这条 187/13 的改动无关） |
+
+### 6.1 attempt 2：最终字节上的重跑 —— **三条门禁全绿**（收口 attempt 1 的 gate 红）
+
+**先说那份红的归宿（captain 的决定）**：整包那次 `exit 101` 由 **captain 在空闲机器上复核为绿**（`cargo-team.ps1 test -p ruagent-daemon` ⇒ `tests\version_points.rs → ok. 5 passed; 0 failed`、`Doc-tests ruagent_daemon → ok. 0`、`[cargo-team] exit=0 elapsed=11.1s`）⇒ **§6 表里那条红是负载/时序敏感，不是本单的失败**；该 flake 已**单独立案 `t145`**（要求：**有界等待 + 显式同步**，**不许**把 sleep 调长或"重试到过为止"，并明确"若根因在产品侧（生成循环本身与删除不同步）⇒ 如实写成产品缺陷、不许只改测试掩盖"）。
+
+**attempt 2 我自己的读数**（窗口 **01:22:04 → 01:36:24**；退出码在任何管道之前捕获，C40）：
+
+| 命令 | 退出码 | 计数原文 |
+| --- | --- | --- |
+| `scripts/cargo-team.ps1 test -p ruagent-daemon` | **0**（`[cargo-team] exit=0 elapsed=11.7s`） | lib `157 passed; 0 failed` · capabilities `11/0` · capability_defaults `5/0` · event_compat `2/0` · graph_ingest `16/0` · injection_e2e `0 passed; 0 failed; 8 ignored` · knowledge_api `16/0` · recall_evidence_announced `3/0` · smoke `0` · **version_points `5 passed; 0 failed`** · doctests `0` ⇒ **215 passed / 0 failed / 8 ignored** |
+| `scripts/cargo-team.ps1 clippy -p ruagent-daemon --all-targets -DenyWarnings` | **0**（`Finished dev profile in 2.90s`，无 error/warning 行） | — |
+| `cargo fmt --all --check` | **0**（零 `Diff in`） | — |
+
+**这次认证的字节**：`crates/daemon/tests/version_points.rs` = sha256（前 24 hex）**`48E81C4E29A476A554DFC8D2`** —— 与 attempt 1 认证的**同一个哈希**（未再改动），且 `git diff --exit-code HEAD -- crates/daemon/tests/version_points.rs` = **0**（已随 `e6673d8` 提交）⇒ 上面三绿**属于 §2/§3 那份字节**。
+
+**对 flake 假设的一处诚实修正**：这次重跑时**同机有 3 个同伴的 cargo/rustc 在跑**（我得排队 **82 次 `waiting 10s`**，从 01:22:04 等到 01:35:21 才拿到构建锁），**整包仍然绿** ⇒ 触发条件**不是"存在别的构建"这么粗**。准确的说法是：**四次读数里只红过一次**（① attempt 1 的整包：红；② 同字节 `--lib` 单跑：绿；③ captain 空闲机整包：绿；④ attempt 2 整包、同机 3 个同伴构建：绿）⇒ 这是一个**稀有**的时序竞争，与 prompt hash / 本单改动无关；把它当成"负载一高必红"会是过度概括。
 
 ---
 
@@ -253,7 +271,9 @@ Remove-Item -Recurse -Force "$env:TEMP\t142-iso","$env:TEMP\t142-iso-target","$e
 * **写入集合** = 我改的 `crates/daemon/tests/version_points.rs` + 本报告；`crates/daemon/src/**`（只读，且隔离副本里的变异从不落到共享树）、`crates/knowledge/**`、`crates/mcp/**`、`panel/**`、`.github/**`、`scripts/**` **零字节改动**。
 * **负控/变异**：全部在 `%TEMP%\t142-iso`（`git archive HEAD` 的导出）+ 私有 `CARGO_TARGET_DIR`；窗口 **01:01:31–01:09:27**（冷建）与 **01:09:43–01:10:07**（增量）；**共享树零变异**（`api.rs`/`distill.rs` 哈希在两次窗口前后不变，§0）。
 * **构建路径**：共享树的门禁**全部**走 `scripts/cargo-team.ps1`，同树**没有**设 `CARGO_TARGET_DIR`/没有 `-TargetDir`；隔离副本用**私有** `CARGO_TARGET_DIR` 直跑 `cargo`（AGENTS.md 的 worktree 规矩），因此**不占团队锁**（对同伴更友好），这一点在此明说。
-* **进程与临时目录**：**本单没有起过守护进程**（读数都来自测试框架），因此活环境（8787 = pid 14944）**连读都没读**（不需要 POB 探针）；`%TEMP%\t142-iso`、`%TEMP%\t142-iso-target`、`%TEMP%\t142-fmt.txt` **已删**（只删这三个我自己创建的**具体路径**，**不用通配**——t135 我在这条上违规过一次，本单按具体路径）。
+* **进程与临时目录**：**本单没有起过守护进程**（读数都来自测试框架），因此活环境（8787 = pid 14944，收尾回读 health `ok`）**连读都没读**（不需要 POB 探针）；`%TEMP%\t142-iso`、`%TEMP%\t142-iso-target`、`%TEMP%\t142-fmt.txt` **已删**。
+  * **本单按 t135 的教训执行"先看归属、再删具体路径"**：收尾时 `%TEMP%` 里还有两个匹配 `t142*` 的条目 —— **`t142b` 与 `t142run`，mtime 都是 2026-10-02 20:14:39（比我开工早两天）** ⇒ **不是我的，我一个都没碰**（`my_temp_leftovers` 我的条目 = **0**；我删的三个路径全部是我本单创建的）。t135 那次的 glob 误删没有重演。
+  * **attempt 2 的收尾**：本 attempt 只创建了 5 个门禁日志 `%TEMP%\t142b.1`…`%TEMP%\t142b.5`，**按五个具体文件名逐个删除**（删后复核：五个文件都不在了）；那两个**不是我**的目录 `t142b`/`t142run`（2026-10-02）**仍在、未触碰**。**顺带记一条工具陷阱**：`Get-ChildItem -Filter 't142b.*'` 会**误匹配**那个没有点的目录名 `t142b`（Windows 旧通配语义），所以这里认的是"删了哪五个具体路径"，不是"按模式还剩几个"。我名下 `cargo.exe`/`rustc.exe` = **0**；`ruagent.exe` 只有活的 **pid 14944**（8787 的持有者）。
 * **读数三件套**：对象集（`version_points` 的 5 条测试 + 隔离副本里的老/新两份）；采样面（共享 target 的测试二进制，或私有 target 的隔离构建；单进程）；可证伪判据（**两个独立的 64-hex 值必须相等**，或**必须不等**；任一不符即红，且隔离副本里已实测会红）。
 * **期望值只写一处**：组字规格**只从 `distill.rs` 源码读**（子句与尾部各一处），语言取值只从线上 `language` 读 ⇒ 文件里**不再有第二份规格**。
 * **自我评审声明**：这条 finding 是我提的、修也是我做的 ⇒ **它需要独立评审**（我不给自己 pass）。
