@@ -182,7 +182,7 @@ jobs:
             "Rust (ubuntu) -- default run" "$log" "$(cat "$rcfile")"
 
       # ------------------------------------------- the ignored instruments
-      # THE SATISFIABLE ONE. The seven daemon instruments in
+      # THE SATISFIABLE ONE. The eight daemon instruments in
       # `crates/daemon/tests/injection_e2e.rs` need `ruagent-mock-agent` next to
       # the test binary -- and `cargo test --workspace` just built it there. Their
       # body-head `expect(NEEDS_MOCK)` means a missing binary is a FAILURE, not a
@@ -212,7 +212,8 @@ jobs:
             chat_without_knowledge_documents_has_no_knowledge_block \
             chat_and_run_use_the_same_block_wording \
             both_paths_emit_the_contract_truncation_marker \
-            a_retried_run_carries_the_shared_retry_prefix
+            a_retried_run_carries_the_shared_retry_prefix \
+            chat_event_carries_the_injection_budget_report
           exit "$rc"
 
       # ------------------------------------------- the manifest of the rest
@@ -245,8 +246,8 @@ jobs:
           fi
           found=$(grep -cE ': test$' "$RUNNER_TEMP/t65/ignored-list.txt" || true)
 
-          # RUN by the step above (7). Their names are demanded there.
-          covered=7
+          # RUN by the step above (8). Their names are demanded there.
+          covered=8
           # DECLARED NOT COVERED here (8). CI has no ~/.ruagent database and no e5
           # model; these instruments' subject IS the real history, so a synthetic
           # fixture would not measure them (an empty copy is rejected by their own
@@ -264,7 +265,7 @@ jobs:
             echo ""
             echo "| ignored test | disposition here |"
             echo "| --- | --- |"
-            echo "| \`injection_e2e\`: 7 names | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`) |"
+            echo "| \`injection_e2e\`: 8 names | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`) |"
             echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_…, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` = a migrated COPY of a real database (and for t25 a PRE-0024 copy). A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. |"
             echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
             echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"
@@ -308,7 +309,7 @@ jobs:
             echo ""
             echo "* **the panel** (its own job) and **the Playwright suite** (its own workflow)."
             echo "* **the 8 live-COPY instruments** (store 3, graph 3, knowledge 2): same reason as the ubuntu job's manifest -- no real \`~/.ruagent\` and no e5 model on a runner."
-            echo "* **the ubuntu job's \`--include-ignored\` instrumentation of the daemon 7**: this job builds them too, but does not demand those 7 names; the ubuntu job is the one that does."
+            echo "* **the ubuntu job's \`--include-ignored\` instrumentation of the daemon 8**: this job builds them too, but does not demand those 8 names; the ubuntu job is the one that does."
             echo "* **anything only a non-main push would catch**: this job does not run on pull requests."
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
