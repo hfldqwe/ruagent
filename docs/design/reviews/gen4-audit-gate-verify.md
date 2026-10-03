@@ -8,7 +8,8 @@
 
 ## 0 结论（一句话 + 计数）
 
-**能加载 ✓ · 四道护栏都能红 ✓（我另加 3 格）· pin 的来源可追且自洽 ✓（CI 上逐项再现）· 首次 CI 读数取到 ✓ —— 红在护栏 ①，不是作者预期的 ②。** 5 格矩阵我在**自己的日志/自己的数字**上重跑为 **8 格全中**；CI run 是 **`failure`**，红的**只有**护栏步，而它的 `judged==65` 与未测名单**与 pin 完全一致**（⇒ **pin 不需要改**）；另发现 **5 条 finding**（F5 是「门」级、其余为注释/口径级），**没有**一条是「不该绿而绿」。
+**能加载 ✓ · 四道护栏都能红 ✓（我另加 3 格）· pin 的来源可追且自洽 ✓（CI 上逐项再现）· 首次 CI 读数取到 ✓ —— 红在护栏 ①，不是作者预期的 ②。** 5 格矩阵我在**自己的日志/自己的数字**上重跑为 **8 格全中**；CI run 是 **`failure`**，红的**只有**护栏步，而它的 `judged==65` 与未测名单**与 pin 完全一致**（⇒ **pin 不需要改**）；另发现 **6 条 finding**（F5 是「门」级、F7 是「交稿即加载失败」级但已修、其余为注释/口径级），**没有**一条是「不该绿而绿」。
+**⚠️ 被验对象在验证期间换过两次版本**（作者 t143 在推 CI 修复）：§0–§8 的读数属于**已推的 `ec24b61`**；**当前工作区 V3**（`sha256 B88A33A2…`）我已另行复核（§9：refs 守卫 exit 0 + **11 格矩阵 11/11**，其中「CI 那一格的形状」现在**是绿的**）；中间还抓到一个**非法 YAML 的中间态**（F7）。
 
 | 验的东西 | 结论 | 证据在哪 |
 | --- | --- | --- |
@@ -142,9 +143,62 @@
 | **F3** | low | **引用的坐标是错的**：`audit.yml:10-14` 文件头与 t122 报告都写「`exitDecision`（`design-audit.mjs:8431-8442`）」。实测：**函数定义在 `:8105-8111`**，`:8422` 是调用点，`:8431-8442` 是 `if (process.argv[1] …)` 的入口块。**声明本身是真的**（`:8107-8109` 三个致命源：`fails > 0` ∨ `contractWarnings.length > 0` ∨ `unmeasured > 0 && !allowNotMeasured`），只有坐标错。 | 注释级：把两处坐标改成 `:8105-8111`（或改用符号引用，避免再漂）。 |
 | **F4** | —（已答） | **CI 上护栏 ② 是否红**：**否**。CI 的未测名单与 pin **逐项相同**（§5.2）⇒ 作者预期的「② 很可能红」**被证据推翻**，pin **不需要**按 CI 更新（也没有被放宽）。 | 无需改。这条记下来是为了**纠正预期**：以后把「CI 与 pin 一定不同」当默认假设是不成立的（至少这次 oxide 差异没影响这 10 行）。 |
 | **F6** | low | **`fail` 名单仍未被钉住，而它在 CI 上已经与本机不同**（本机 2026-10-02：11 条 fail；CI：10 条，ids `4,6,7,12,13,14,18,20,38,75`）。文件头 `:24-33` 自己把「钉 fail 名单」列为转阻塞的前置条件 ✓ ⇒ 这不是隐藏缺陷，但**今天它意味着：一行 fail↔pass 的翻转对任何护栏都不可见**（只有总和 65 受影响，而它不变）。 | 转阻塞前照 ② 的形状加第二个常量（fail 名单），并把 CI 这次读数作为初始值。 |
+| **F7** | medium（**已修，但值得记**） | **验证期间我抓到一个真实的中间态：`audit.yml` 是非法 YAML**（sha256 `6EA7FF8C…`）。原因：新加的 `counts.cjs` **heredoc 体从第 1 列开始**，而它嵌在 `run: \|` 块标量里 ⇒ 块标量在该行结束，YAML 接着解析 JS ⇒ PyYAML：`while scanning a simple key … in line 235 const fs = require("node:fs")` ⇒ GitHub 会判 **Invalid workflow file**（整份 workflow 不加载，连 YAML 合法都不到）。**最小复现**：同结构的缩进 heredoc 体 → OK；第 1 列 heredoc 体 → **YAML ERROR**。作者在数分钟内修好（当前 V3 = `B88A33A2…` 可解析 ✓）。 | 保持 heredoc 体与结束符**不浅于块标量缩进**（或把 `counts.cjs` 移成仓库内被跟踪的文件、由 workflow 引用 —— 那同时也满足 refs 守卫）。**交稿前必跑** `bash .github/workflows/scripts/check-workflow-refs.sh`：它用 PyYAML 解析四份 workflow，**这一类险只有它**能挡（它确实会红）。 |
 
+
+## 9 验证期间被验对象换过两次版本：披露 + 对**当前字节**的复核
+
+> AGENTS.md 那条纪律（「green 门只认证它跑过的字节」）在这里不是形式：**我开工时的 `audit.yml` 与收工时的不是同一份**。本节说清哪份读数属于哪版，并对**当前字节**补了复核。
+
+### 9.1 三个版本，逐份挂哈希
+| # | 版本 | 我怎么认出来的 | 我的读数属于它吗 |
+| --- | --- | --- | --- |
+| **V1 = `ec24b61`（已推 main）** | blob `5251b6ead2386aec695bb270e594867bb82f662e` · 297 行 | 我在开工时读它、并用 YAML 解析器抽出护栏体：**4913 bytes**，内容是**旧**的 ① ② ④（① 用 grep 找 stdout 汇总行；④ 的报文说「CHECK LIST changed size」） | **是**：§1 的 8 格矩阵 · §2 的可加载性/表达式 · §3 的护栏 ③ · §4 的 pin 溯源 · **§5 的 CI 读数** 全部属于它 |
+| **V2 = t143 工作区（含「先坏后修」）** | 中间态 sha256 **`6EA7FF8CC58FEF…`** | **PyYAML 在 L235 报错**：`const fs = require("node:fs");` —— heredoc 体**从第 1 列**开始，块标量在那一行就结束了，于是 YAML 把 JS 当 YAML 解析 ⇒ **整份文件在 GitHub 上是「Invalid workflow file」**。最小复现（我写的）：同样的 `run: \|` 里，缩进的 heredoc 体 **parses OK**，第 1 列的 **YAML ERROR: while scanning a simple key** | 这是**我抓到的真实中间态**（不是猜测）：linter 级证据 + 最小复现 + 哈希都在。**作者随后已修**（见 V3） |
+| **V3 = 当前工作区（复核对象）** | sha256 **`B88A33A29D449FFC…`**（26,501 bytes）· 护栏体 **11,809 bytes** | `check-workflow-refs.sh` = **exit 0**（22 refs / 0 missing；**四份 workflow 全部 `parses as YAML (PyYAML)`**，含 `audit.yml`）+ 我的 11 格矩阵 | **是**：§9.2 的全部读数 |
+
+**⇒ 结论一**：我对 **V1**（用户真正在跑的那一版）的验证结论**不变**（§0 的判定表）；
+**⇒ 结论二**：**V3 把 §5 的 CI 失败模式修好了**（下面 11 格的 A 格就是那个形状，现在绿）；
+**⇒ 结论三**：V2 的中间态说明**这条流水线最危险的失败是「YAML 非法」**——而它恰好被**仓库自己的守卫**（`check-workflow-refs.sh` 用 PyYAML 解析四份 workflow）覆盖 ⇒ 交稿前跑它，是这道险的唯一护栏。
+
+**⚠️ 连 HEAD 本身都在我验证期间移动了**：我读 V1 时 `git rev-parse HEAD:.github/workflows/audit.yml` = **`5251b6e`**，收工再看已是 **`cc5c28ac`**（新的提交落下来了）。所以上表的 blob sha 是**带时间点的读数**，不是「已推版本」的永久名字；**唯一可靠的锚是内容本身的 sha256/字节数**（V1 的护栏体 4913 B · V3 的护栏体 11,809 B 与 sha256 `B88A33A2…`）。我 §1–§5 的读数属于**我抽出的那份 4913 B 护栏体**所在的文件内容 —— 这一点由抽取物的内容（旧 ① 用 grep 找 stdout、④ 的报文说「CHECK LIST changed size」）与字节数共同钉住，不依赖任何会漂的 git 名字。
+
+### 9.2 V3 的四道护栏：我用**自己的**合成 `metrics.json` 重跑（11 格，11/11）
+方法：从 V3 原样抽出护栏体（11,809 bytes），`metrics.json` 由我构造 —— 关键是要**忠实模拟 id 空间**：65 条判定行的 `n` 取自 §12 的 **1..77**（去掉 t143 点名的 12 条无检查行 `60-71`），默认分布 **pass 45 / fail 10 / not_measured 10**（= CI 的真实分布），未测集合 = 现行 pin。
+（**披露我自己的一个错**：第一版生成器给出 65 条判定行但 id 取 `1..65`，与 pin 里 `#77` 不在同一 id 空间 ⇒ 那一轮的 11 格**全部作废**（`checks=67` 等自相矛盾的数字）；下面这一轮已修，且生成器有自检 `COVERED ids = 65 / verdicts = {pass:45, fail:10, not_measured:10}`。另：我的 harness 的 OK/MISMATCH 标一度误报，原因是 **manifest 被 Python 写成 CRLF**、`want_err` 变成 `"\r"` ⇒ 修掉后 11/11 干净；**退出码与 `::error::` 原文在误报的那两轮里就已经是对的**，我是照原文逐格核的。）
+
+| # | 我构造的场景 | 期望 | exit | `::error::` 原文（截断） |
+| --- | --- | --- | --- | --- |
+| **A** | **CI 的形状**：`metrics.json` 完整（65 行 / 45-10-10）+ 日志**没有**汇总行、断在半句 | 绿 | **0** | （无）⇒ **`counts source=metrics.json (structured) · stdout summary line ABSENT (log 483 bytes, truncated mid-report -- the first CI run shape; the counts above do not depend on it)`** |
+| J | `metrics.json` 完整 + 日志**有**一致汇总行 | 绿 | **0** | （无）⇒ `counts source=metrics.json … stdout summary line present and in agreement` |
+| B | 两个载体**不一致**（日志说 captures=26，文件说 24） | 红 | **1** | `the two carriers disagree -- metrics.json says captures=24 checks=65 pass=45 … while the stdout summary line says captures=26 …` |
+| C / D / H | 文件**缺失** / **不可解析** / 有**无 verdict 的行** | 红 | **1** ×3 | `no usable counts: … is missing or unparseable, so this run has no reading. stdout cannot substitute for it …` |
+| E | 未测集合**换了成员但个数不变**（`#77`→`#59`） | 红 | **1** | `not_measured set moved: expected '#25 28 31 33 46 47 49 50 54 77', got '#25 28 31 33 46 47 49 50 54 59'` |
+| F | 检查表**长大**（多一条判定行：66） | 红 | **1** | `this reading is not comparable with the pinned one: judged=66 (pinned 65), checks=66, pending=0. judged = checks - pending …` |
+| **I** | 一条行变成 **pending**（`checks=65` 但 `judged=64`） | 红 | **1** | 同上结构，**点名 `judged=64 … checks=65, pending=1`** ⇒ **F1 已修**：报文不再把 pending 说成「检查表变了」 |
+| G | `captures=0` | 红 | **1** | `the audit captured 0 pages -- nothing was measured, so nothing may pass` |
+| L | **没有**未测行（全可测） | 红 | **1** | `not_measured set moved: expected '#…', got '#'` |
+
+**⇒ 11/11 与期望一致；没有「不该绿而绿」。** 特别是：
+- **A 格**证明 §5 那次 CI 红**在 V3 上会变绿**（同一个形状：完整的 artefacts + 被截断的日志）—— 这是对 t143 这次改动的**独立确认**；
+- **I 格**证明 F1 的修法有效（pending 与 checks 被分开点名）；
+- **F 格**同时说明 **F2 的「覆盖」方向是可被发现的**：**新增一条有判定的 §12 行**会让 `checks` 从 65 变 66 ⇒ 红；**只有「新增一条没有判定的 §12 行」才不可见**（t143 已经把这条边界写进注释 `:317-328`，并点名那 12 条是 `60-71`）. ⇒ **F2 在 V3 上已被「写明边界」的方式关闭**（比钉第二个常量更符合本仓的取向）。
+
+### 9.3 可加载性（V3）：`check-workflow-refs.sh` = exit 0
+```
+workflow path references checked: 22, not tracked/missing: 0
+  .github/workflows/audit.yml: parses as YAML (PyYAML)   ← V3 的 audit.yml
+  .github/workflows/ci.yml / e2e.yml / release.yml: parses as YAML (PyYAML)
+every executed path a workflow references is tracked
+```
+（本机 git-bash 5.2.37；耗时同口径 ~4–5 分钟。）⇒ **V3 能加载**，V2 那个「Invalid workflow file」的险已排除。
+
+### 9.4 我**没有**对 V3 做的事
+- V3 的 CI 读数**不存在**（还没推、没派发）⇒ §5 的 CI 读数永远属于 V1；**V3 的首次 CI 读数必须由推送后的那一次给出**（这是 V3 的「未测」项，见 F5 的收尾条件）。
+- V3 里新增的 `counts.cjs` 内联脚本我只做了**行为验证**（11 格）与 **YAML 可解析性**验证；没有在 ubuntu 上跑过它（node 版本差异在 `JSON.parse` 与 `Array.isArray` 上风险极低，但**不等于**测过）。
 
 ## 7 未覆盖什么（第 19 条）
+
 
 1. **本机没有跑真正的 `--check`**（只跑了死端口形式）：一次全量审计要 10.4 分钟 + 浏览器 + 真 daemon。⇒ 「`judged==65` 在本机再现」这一读数**没有**由我取得；我取到的是它的**定义**（`:8397`）与**两次历史读数**，以及 **CI 那次独立再现**（§5）。作者报告 §6 的本机读数我**没有**复跑，只做了溯源。
 2. **§12「12 行没有判定行」是算术推断**，不是逐行实测（见 §4.3）。
@@ -162,7 +216,8 @@
 ## 8 纪律回执
 
 - **写入集合 = 本报告一个文件**；`.github/**`、`panel/tools/**`、`crates/**`、`scripts/**` **零改动**（`git status --porcelain -- .github panel crates scripts` 无我的条目）。
-- **未** push / dispatch / rerun / cancel / 建 tag；只用了 `gh run view` / `gh api`（只读）。
+- **未** push / dispatch / rerun / cancel / 建 tag；只用了 `gh run view` / `gh run download` / `gh api`（**全部只读**）。CI 的原始证据我是**下载工件**（`gh run download 37137554330 -n design-audit`）后读的 —— 因为 GitHub 的日志服务本身可能截断，而工件的 `audit.log` / `metrics.json` 是那次跑的**实物**；下载物落在 `%TEMP%\t134-art`（仓库外）。
+- **版本披露义务**：被验对象在验证期间被改过两次（§9.1 三个版本逐份挂哈希），**哪些读数属于哪版**写在 §0 与 §9；我**没有**用 V1 的绿读数去认证 V3 的字节 —— V3 的读数是我在 V3 上另跑的一轮（§9.2/§9.3）。
 - **未触碰活守护进程 8787（pid 14944）与活库**：本机只跑了死端口形式（`127.0.0.1:1`）与**替身 node**，没有起任何真 daemon；`--out` 全部落在 `%TEMP%\t134\…`（仓库外）。
 - 我的临时资源：`%TEMP%\t134\`（抽出的 `guard.sh`/`negctl.sh`/`boot.sh`/`audit.sh`/`verdict.sh`、合成日志、summary、替身 `node`、matrix/guard3 脚本、`rt/negctl` 输出）· `%TEMP%\t134*.py` · `%TEMP%\t134-ci.log` · `%TEMP%\t134-refs.log`。**保留为证据，未删**（其中没有仓库内文件、没有常驻进程）。
 - 我**未**按名字/端口批量杀任何进程；本次没有起过需要收尾的常驻进程（替身 `node` 是脚本，死端口无人监听）。
