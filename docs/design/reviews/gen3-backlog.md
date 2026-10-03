@@ -448,6 +448,19 @@ a SIBLING directory: component-wise containment must not confuse it
 
 **t123 自陈的两条读数陷阱（值得进纪律）**：① **清点生产方只 grep 带引号的键名会漏掉 serde 结构体字段** —— `grep -rn '"chunk"' crates/daemon/src/` = 0 命中，差点把 `knowledge_expand` 的 `chunk` 判成「生产方从不发出」，实际生产方是 `#[derive(Serialize)] struct Expansion { pub chunk: String }`（`knowledge/src/files.rs:52-61`），serde 按**字段名**发出、**没有引号** ⇒ 必须三种都查（`json!` 字面量 + `Serialize` 字段 + SELECT 列名）；② **文件在读取期间会动** —— `lib.rs` 同一轮里 2474 → 2560 → 2561 行（t118 在途），同一读点两次 `grep -n` 给出不同行号 ⇒ **引坐标必须带读取时刻的 sha256**。
 
+## B27. 平台规则 vs 登记法：**冻住的单仍然占着它的 inScope**（captain 本轮撞到两处）
+
+**事实**：running 团队里 `edit_plan` 只允许对 pending/never-started 任务做 `update_task`，而 `update_task` **改不了 inScope、也不能删单**。于是「一张被终态失败前置冻住、因而永不可认领的单」会**一直**占着它声明的路径，**阻止新单被创建**（平台的 inScope 重叠检查在创建时就拒）。
+
+**本轮的两处**：
+
+| 冲突 | 形状 | 处置 |
+| --- | --- | --- |
+| `t96` ↔ F3/F4 实现单 | `t96`（never-started，依赖两张终态失败单）占着 `crates/daemon/src/api.rs`，使 F3/F4 的实现单**立不了** | ✅ **captain 直接取消 `t96`**（协议明许：captain 可直接取消 never-started 的 pending 单）。理由不是「烦」，而是它的 `log`→`rows` 前提**已被裁决推翻**、且经 `t62` 逐行独立复核（三处一致全部读 `log`）。取消后 `t126`（F3/F4 实现）立刻立单成功 ⇒ **这是本代第一条「用读数正当取消」的记录** |
+| `t64` ↔ `t89` | 两张**都冻着**，且**都占 `crates/daemon/src/runs.rs`**；我试图解冻 `t64`（deps → `[]`）时被拒：`inScope overlaps t89 at crates/daemon/src/runs.rs` | ⏳ **未处置**。注意 `t89` 的依赖里**本来就有 `t64`** ⇒ **次序其实已声明**，平台的重叠检查不看成对依赖。⇒ 下一步：**先核 `t89` 的前提今天是否仍成立**（`t78` C-3 是「权限审计把『默认值决定』记成『规则决定』」，而 daemon 的 api/config 已被 capability 那代重写过 —— C29：登记的 finding 也会过期）。**若已成立则保留、若已被取代则同样用读数正当取消**，两种情形都要把依据写进本账再动 |
+
+**通则（给下一位）**：撞到 `inScope overlaps <已冻单>` 时，**不要**去改自己任务的路径（那是把工作挪开而不是把问题解决），也不要去削弱被冻单的 inScope（`update_task` 本来就改不了）。三条合法出路，按优先级：① **用读数证明被冻单的前提已被取代 ⇒ captain 直接取消它**；② 把工作**真的**挪到不重叠的路径（只有当工作本来就可以那样切分时才成立）；③ 记下冲突**等**（例如 `t64`/`t89` 这一对）。**本代已经在这条规则上付出了两次代价**（`t96` 堵住 api.rs 一轮；`t111/t112` 曾被 `t110` 串行化）。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
