@@ -1201,7 +1201,7 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// `entity` is `ruagent_graph::entity_by_id(db, id).await?` (same read: `api.rs:1355`)
 /// -- so `null` is exactly "no row for this id", while any string (an empty one
 /// included) is a row that is there. The daemon does that on purpose and says so at
-/// `api.rs:1358-1359`: an id that is not in the graph keeps a **200 with empty
+/// `api.rs:1358-1365`: an id that is not in the graph keeps a **200 with empty
 /// collections, never a 404**, so the status code carries no existence information
 /// and this key is the only carrier. It is pinned on the daemon side by the test
 /// `the_entity_route_exposes_the_alias_text_and_the_list_opt_in_is_additive` (same
@@ -1210,7 +1210,9 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// THESE NUMBERS DRIFT -- a concurrent unit edits that file, and during this very
 /// unit they moved by 19 lines. Resolve by SYMBOL (`graph_entity`, `entity_by_id`,
 /// the four-key response literal, that test name); each number above is a hint with
-/// the date it was read.
+/// the date it was read -- all seven were re-read on 2026-10-04, which is where the
+/// two that had drifted by 19 (`1341-1346`, `1342`) were corrected to
+/// `1360-1365` / `1361`.
 ///
 /// STRICT ON PURPOSE, in the same spirit as [`facts_of`]: a response with no `name`
 /// key, or a `name` that is neither a string nor `null`, is an ERROR. A renamed or
@@ -1220,7 +1222,7 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// WHAT IT REPLACES (ruagent-tunable-capabilities t118, the first half of t93's M1):
 /// the branch here used to read `resp["entity"]` and fall back to `resp["exists"]`.
 /// The daemon has never emitted either key (the response literal is four keys:
-/// `name`, `kind`, `aliases`, `facts` -- `api.rs:1341-1346`), so the predicate was
+/// `name`, `kind`, `aliases`, `facts` -- `api.rs:1360-1365`), so the predicate was
 /// `false` for EVERY response, including one served for a fabricated id. Both
 /// branches are deleted rather than kept unreachable: a branch that can never fire
 /// is not a safety net, it is a false green waiting to be cited.
@@ -1674,7 +1676,10 @@ mod tests {
     /// §1, after rebuilding the stale shared binary):
     ///   id not in the graph -> {"name":null,"kind":null,"aliases":[],"facts":[]}
     ///   id 1 (exists, no facts) -> {"name":"t118-probe-without-facts",...
-    /// The happy path is the daemon's own test (`crates/daemon/src/api.rs:6673`); this
+    /// The happy path is the daemon's own test
+    /// `the_entity_route_exposes_the_alias_text_and_the_list_opt_in_is_additive`
+    /// (re-read 2026-10-04: `api.rs:6711`; the earlier hint `6673` pointed into
+    /// `the_manual_rules_route_runs_with_every_agent_disabled`); this
     /// stub exists so the TOOL's two directions can be pressed without a database.
     async fn stub_daemon() -> String {
         use axum::{Router, routing::get};
@@ -1805,7 +1810,7 @@ mod tests {
             serde_json::json!({ "name": "", "kind": null, "aliases": [], "facts": [] });
         assert_eq!(entity_exists(&present_empty_name), Ok(true));
 
-        // The id is not in the graph: `name: null` (daemon api.rs:1342) -- this is
+        // The id is not in the graph: `name: null` (daemon api.rs:1361) -- this is
         // the case that used to come back as a SUCCESS with "has no current facts".
         let absent = serde_json::json!({ "name": null, "kind": null, "aliases": [], "facts": [] });
         assert_eq!(entity_exists(&absent), Ok(false));
