@@ -31,6 +31,30 @@ import { dateOf, useI18n } from "../i18n";
 const STORES = ["profile", "observation", "procedure", "lesson"] as const;
 type Store = (typeof STORES)[number];
 
+// t146 (audit row 75 "Tab 顺序无陷阱", `#memory`/dark): the keyboard stops on the
+// Segmented's own radio input, and antd keeps that input at 0x0
+// (`node_modules/antd/es/segmented/style/index.js`, `&-input`: position:absolute;
+// width:0; height:0; opacity:0; pointer-events:none) so the control's geometry
+// cannot move -- while the ring is drawn on the LABEL instead
+// (`index.css`, `.ant-segmented-item:has(.ant-segmented-item-input:focus-visible)`).
+// Measured on the committed bytes: that input's rect is [0, 0] and the audit's
+// sample reads `2:main:invisible(input)` -- a sighted keyboard user sees focus go
+// nowhere. The input cannot be deleted or `tabIndex={-1}`ed: it IS the radio the
+// keyboard operates (arrow keys change the selection; measured), and antd's
+// Segmented exposes only root/icon/label/item semantic slots, no `input`. So it is
+// stretched over its own item -- the same focus target with the same key/pointer
+// behaviour (pointer-events stays none, clicks still reach the label) and the same
+// label ring, but the focused box is now the item's (measured 52x28 instead of 0x0).
+// The item is already `position: relative` (measured), so `inset: 0` fills it.
+// Scoped to this view: no other route's geometry moves.
+const SEGMENTED_INPUT_BOX = `
+.memory-view .ant-segmented-item-input {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+`;
+
 // Store → the namespace FAMILIES the backend accepts for it. This table must be
 // cell-by-cell the same set as the backend's own matrix
 // `MemoryStore::allowed_kinds()` (crates/memory/src/lib.rs:99-109):
@@ -225,7 +249,11 @@ export function Memory() {
   const shown = memories?.slice(0, CARD_CAP) ?? [];
 
   return (
-    <div>
+    <div className="memory-view">
+      {/* t146: the one rule this view needs and index.css cannot carry — see
+          SEGMENTED_INPUT_BOX above for the measurement and the reason the input
+          must stay. */}
+      <style>{SEGMENTED_INPUT_BOX}</style>
       <h1 className="sr-only micro">{t("memory.title")}</h1>
       <div className="view-bar">
         <h2>{t("memory.title")}</h2>
