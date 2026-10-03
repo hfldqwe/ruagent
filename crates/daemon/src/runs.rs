@@ -817,14 +817,21 @@ impl RunManager {
             // stores are not queried at all — the role identity and the retry
             // prefix below still ride, because they are the run's own context,
             // not evidence pulled from memory/knowledge/graph.
-            let mut injection = if gate_of(
+            // t129 (RV-INT INT-F6): the render now hands back its own budget
+            // report, so the `context_injected` event can say what the budget DID
+            // instead of `null`. `None` here means the render did not run at all
+            // (gate off) — "not collected"; `Some(report)` means it ran, and an
+            // all-zero report from it is a MEASUREMENT (contract §3.2: `null` and
+            // all-zero are different claims).
+            let (mut injection, injection_budget) = if gate_of(
                 &capabilities,
                 crate::capability::CapabilityId::MemoryInjectRuns,
                 true,
             ) {
-                render_run_injection(&db, &task, knowledge.as_deref()).await
+                let (text, report) = render_run_injection(&db, &task, knowledge.as_deref()).await;
+                (text, Some(report))
             } else {
-                String::new()
+                (String::new(), None)
             };
             // Attempt-history context (a retry's crash snapshot) rides
             // as context — visible in the ContextInjected render, never
@@ -878,6 +885,7 @@ impl RunManager {
                 cwd,
                 launch.routed,
                 injection,
+                injection_budget,
                 cancel_token,
             )
             .await;
@@ -1340,6 +1348,11 @@ async fn supervise(
     cwd: PathBuf,
     routed: Option<RoutingDecision>,
     injection: String,
+    // t129 (RV-INT INT-F6): the budget report of the render that produced
+    // `injection`, when that render RAN. The retry-prefix / role branches can
+    // make `injection` non-empty without any render having happened, and that
+    // case stays `None` (= "not collected"), never an all-zero report.
+    injection_budget: Option<ruagent_memory::inject::BudgetReport>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let transcripts_dir = root.join("data").join("transcripts");
@@ -1372,19 +1385,25 @@ async fn supervise(
         );
     }
     if !injection.is_empty() {
+        // t129 (RV-INT INT-F6): the budget the render MEASURED. A serialisation
+        // failure is a real error (`?`), never a silent `None` — the absorber
+        // shape this repo's own audits name.
+        let budget = match &injection_budget {
+            Some(report) => Some(
+                serde_json::to_value(report)
+                    .with_context(|| "serialising the injection budget report")?,
+            ),
+            None => None,
+        };
         emit(
             &mut transcript,
             &broadcast,
             &run,
             RunEvent::ContextInjected {
                 render: injection.clone(),
-                // DEP-INT-1 (t19): the producer's own label. `budget` stays `None`
-                // -- "not collected" -- because the injection contract exposes no
-                // report-returning render (`render_context` returns text only), and
-                // an all-zero budget object would read as a MEASURED empty
-                // injection (contract §3.2: `null` = 本次未采集, never all-zero).
+                // DEP-INT-1 (t19): the producer's own label.
                 path: Some("run".to_string()),
-                budget: None,
+                budget,
             },
         );
     }
@@ -1984,9 +2003,9 @@ async fn render_run_injection(
     db: &Db,
     task: &Task,
     knowledge: Option<&ruagent_knowledge::Knowledge>,
-) -> String {
+) -> (String, ruagent_memory::inject::BudgetReport) {
     use ruagent_memory::inject::{
-        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, WIKI_PAGES, render_context,
+        ContextItem, InjectionBudget, KNOWLEDGE_SOURCES, WIKI_PAGES, render_context_report,
     };
 
     let mut items: Vec<ContextItem> = Vec::new();
@@ -2067,18 +2086,83 @@ async fn render_run_injection(
     // reads project:<task.project> at all. The knowledge block stays
     // between the two so the BLOCK order is unchanged (tag_rank sorts it
     // anyway, and that rank -- not this file -- owns the drop order).
-    if items.is_empty() {
-        return String::new();
-    }
+    // The empty case is NOT special-cased any more (t129): it goes through the
+    // same renderer as the non-empty one, so the report is produced by the code
+    // that produced the bytes — an all-zero report from an empty item list is a
+    // measurement, and hand-building a second "empty" report here would be the
+    // second source this whole task exists to remove. (Measured by t60: the
+    // empty fixture renders 0 chars, so the bytes are unchanged.)
+    //
     // The BLOCK order is the contract drop order (see inject.rs::tag_rank),
     // not the order these items were discovered in.
     items.sort_by_key(|i| ruagent_memory::inject::tag_rank(i.tag));
-    render_context(&items, &InjectionBudget::default())
+    render_context_report(&items, &InjectionBudget::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t129 (RV-INT INT-F6): the budget the `context_injected` event carries must
+    /// come from the SAME call that produced the render bytes, and its numbers
+    /// must be measurements. THE ASSERTION THAT FAILS AGAINST THE PRE-CHANGE
+    /// CODE is the first one: before t129 the event site hard-coded
+    /// `budget: None`, so a run whose render dropped a block could not report
+    /// `dropped_items > 0` at all (V-INT t20/t21 measured `budget` 0/5).
+    ///
+    /// This pins the code path (`render_context_report` -> `serde_json::to_value`
+    /// -> the event's field names), not a whole daemon run: a full run needs a
+    /// mock-agent harness and a task whose corpus overflows the budget, which is
+    /// the one reading this task could not take inside its inScope (see the
+    /// report's "未覆盖什么").
+    #[test]
+    fn the_injection_budget_the_event_carries_is_measured_not_all_zero() {
+        use ruagent_memory::inject::{ContextItem, InjectionBudget, render_context_report};
+        let items = vec![
+            ContextItem::dated("relevant_memories", "a".repeat(80), "2026-01-01T00:00:00Z"),
+            ContextItem::dated("knowledge", "b".repeat(80), "2026-01-01T00:00:00Z"),
+        ];
+        // A total budget that cannot hold both blocks: the last one is dropped.
+        let budget = InjectionBudget {
+            per_block: 120,
+            total: 120,
+        };
+        let (render, report) = render_context_report(&items, &budget);
+        assert!(
+            report.dropped_items > 0,
+            "the fixture must drop a block, else this test proves nothing: {report:?}"
+        );
+        assert!(
+            report.used_chars <= report.total_chars,
+            "a report may not claim more used chars than the budget it measured: {report:?}"
+        );
+        // The exact bytes the event would carry (runs.rs's emit site).
+        let json = serde_json::to_value(&report).expect("a budget report serialises");
+        assert_eq!(
+            json["dropped_items"],
+            serde_json::json!(report.dropped_items),
+            "the event's dropped_items must be the report's, not a default: {json}"
+        );
+        assert_eq!(json["used_chars"], serde_json::json!(report.used_chars));
+        assert_eq!(json["total_chars"], serde_json::json!(report.total_chars));
+        // THE POINT OF THE REPORT, MEASURED (t60's headline, re-taken here): with
+        // the budget this tight the render holds ONE block and no
+        // `<context_budget>` notice — the bytes alone do not say a block was
+        // dropped, while the account does. So this test does NOT assert on the
+        // text; asserting "the drop must be visible in the bytes" is what made
+        // the first cut of this test FAIL (recorded in the t129 report): the
+        // notice is emitted only when what remains can hold it, so that claim is
+        // fixture-dependent, not contract.
+        assert!(
+            !render.contains("context_budget"),
+            "this fixture has no room for the drop notice, so the TEXT cannot carry \
+             the fact -- if this starts failing, the fixture changed, not the claim: {render:?}"
+        );
+        assert!(
+            render.chars().count() <= budget.total,
+            "the hard character bound holds: {render:?}"
+        );
+    }
 
     /// t37: the recorded `routed` event must name the agent whose prompt was actually injected.
     ///

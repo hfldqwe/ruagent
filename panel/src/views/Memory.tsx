@@ -31,12 +31,33 @@ import { dateOf, useI18n } from "../i18n";
 const STORES = ["profile", "observation", "procedure", "lesson"] as const;
 type Store = (typeof STORES)[number];
 
-// Store → allowed namespaces (design §6.1).
+// Store → the namespace FAMILIES the backend accepts for it. This table must be
+// cell-by-cell the same set as the backend's own matrix
+// `MemoryStore::allowed_kinds()` (crates/memory/src/lib.rs:99-109):
+//   profile = [user] · observation = [user, project, agent] ·
+//   procedure|lesson = [project, global]
+// t129 (t52's routed R-3): this table used to claim `observation` could write
+// `global` — it cannot (`global` is the cross-project scope of distilled
+// procedure/lesson), while it omitted `project`/`agent` for observation and
+// `project` for procedure/lesson. The dropdown is built from it, so the UI
+// offered a cell the daemon answers with `RejectedNamespace`.
+// `project` / `agent` are FAMILIES (`project:<name>`), never a literal value.
 const NAMESPACES: Record<Store, string[]> = {
   profile: ["user"],
-  observation: ["user", "global"],
-  procedure: ["global"],
-  lesson: ["global"],
+  observation: ["user", "project", "agent"],
+  procedure: ["project", "global"],
+  lesson: ["project", "global"],
+};
+
+/** The namespace a store switch lands on: the first CONCRETE value the backend
+ *  accepts (a family is not selectable on its own). Order in NAMESPACES is the
+ *  family order, so this cannot be `NAMESPACES[s][0]` for stores whose first
+ *  family is `project`. */
+const DEFAULT_NAMESPACE: Record<Store, string> = {
+  profile: "user",
+  observation: "user",
+  procedure: "global",
+  lesson: "global",
 };
 
 /** Memory cards per page — memoryList has no server-side paging, so the view
@@ -190,8 +211,15 @@ export function Memory() {
     acc[s] = (acc[s] ?? 0) + n;
     return acc;
   }, {});
+  // Only the families this STORE accepts contribute their data-derived values:
+  // `project:*` must not be offered for `profile`, and `agent:*` only for
+  // `observation`. (Before t129 both were merged in for every store.)
   const nsOptions = [
-    ...new Set([...NAMESPACES[store], ...projectNamespaces, ...agentNamespaces]),
+    ...new Set([
+      ...NAMESPACES[store].filter((v) => v === "user" || v === "global"),
+      ...(NAMESPACES[store].includes("project") ? projectNamespaces : []),
+      ...(NAMESPACES[store].includes("agent") ? agentNamespaces : []),
+    ]),
   ];
 
   const shown = memories?.slice(0, CARD_CAP) ?? [];
@@ -231,7 +259,7 @@ export function Memory() {
           onOpen: () => {
             setTab("browse");
             setStore(s);
-            setNamespace(NAMESPACES[s][0]);
+            setNamespace(DEFAULT_NAMESPACE[s]);
           },
         }))}
       />
@@ -255,7 +283,7 @@ export function Memory() {
                 value={store}
                 onChange={(v) => {
                   setStore(v as Store);
-                  setNamespace(NAMESPACES[v as Store][0]);
+                  setNamespace(DEFAULT_NAMESPACE[v as Store]);
                 }}
                 options={STORES.map((s) => ({ value: s, label: t(`memory.store.${s}`) }))}
               />
