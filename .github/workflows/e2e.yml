@@ -56,6 +56,14 @@ jobs:
     env:
       PW_TEST_REPORTER: json
       PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.workspace }}/playwright-evidence.json
+      # t179 / C60: the suite's target is ALWAYS explicit (its entry point refuses to
+      # guess, and refuses the daemon's default port 8787 by name), so this job names the
+      # daemon it boots below -- on a PRIVATE port, never on 8787. WHY: the old entry
+      # point defaulted the target to 127.0.0.1:8787 whenever CI was set, so a local
+      # "reproduce CI" run drove the operator's RESIDENT daemon. `runner.temp` must NOT
+      # be used in this block (see the note above: it invalidates the whole file); the
+      # steps derive their throwaway root from $RUNNER_TEMP instead.
+      E2E_BASE_URL: http://127.0.0.1:8891
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
@@ -78,6 +86,13 @@ jobs:
             echo "* **the 8 live-COPY instruments** (store 3, graph 3, knowledge 2): no"
             echo "  real \`~/.ruagent\` on a runner; they are named in the \`CI\` workflow's"
             echo "  ignored-instrument manifest."
+            echo "* **what the two counting guards below do NOT claim** (t179): the"
+            echo "  measured-test floor is a COUNT -- it says that many tests were measured,"
+            echo "  not that any of them is meaningful, and not which ones they are. The"
+            echo "  must-run set names 6 specs (\`registry.spec.ts\` verbatim, plus recall,"
+            echo "  consumption, failure-visibility, chat, settings-capabilities), so a legal"
+            echo "  skip of any OTHER one of the suite's 24 \`test.skip(\` sites still leaves"
+            echo "  this job green."
             echo ""
             echo "Counting unit here: no Rust test targets run (this job only builds"
             echo "them), so the evidence is the exit code plus the Playwright summary"
@@ -115,9 +130,22 @@ jobs:
         # Two scripted fan-out members + the judge behavior: lets the
         # Playwright suite exercise the full fan-out judge loop (design
         # §5.2/§5.3) against real runs, without spending real agents.
+        #
+        # t179 / C60: this step used to write `~/.ruagent/config/agents.toml`. On a
+        # runner that is throwaway; copied to a laptop it is the operator's REAL agent
+        # registry, so "reproduce CI locally" quietly overwrote it. The root now comes
+        # from $RUNNER_TEMP (required, not defaulted): a local copy that forgets it
+        # fails loudly instead of falling back to $HOME.
         run: |
-          mkdir -p ~/.ruagent/config
-          root="$HOME/.ruagent"
+          root="${RUNNER_TEMP:?RUNNER_TEMP must name a throwaway dir (the runner sets it; a local copy must set it too) -- refusing to fall back to \$HOME}/ruagent-e2e"
+          case "$root" in
+            "$HOME/.ruagent" | "$HOME/.ruagent/" | "$HOME/.ruagent"/*)
+              echo "::error::refusing to seed mock agents into (or under) the real \$HOME/.ruagent ($root): point RUNNER_TEMP at a throwaway dir."
+              exit 1
+              ;;
+          esac
+          echo "seeding mock agents into a throwaway root: $root"
+          mkdir -p "$root/config"
           bin="$PWD/target/debug/ruagent-mock-agent"
           printf '[{"marker":"FANOUT MARKER","reply":"answer from alpha"},{"marker":"CHAT MARKER","reply":"answer from alpha chat"}]' > "$root/config/e2e-alpha.json"
           printf '[{"marker":"FANOUT MARKER","reply":"answer from beta"}]' > "$root/config/e2e-beta.json"
@@ -139,20 +167,27 @@ jobs:
           EOF
           cat "$root/config/agents.toml"
       - name: Boot daemon
+        # t179 / C60: a PRIVATE port (not the daemon's default 8787) and an explicit
+        # throwaway root, so this step cannot touch an operator's resident daemon or
+        # their real ~/.ruagent -- even when these lines are copy-pasted locally.
         run: |
-          cargo run -p ruagent -- serve --addr 127.0.0.1:8787 &
+          export RUAGENT_HOME="${RUNNER_TEMP:?RUNNER_TEMP must name a throwaway dir -- refusing to fall back to \$HOME}/ruagent-e2e"
+          echo "booting the e2e daemon on a private port with RUAGENT_HOME=$RUAGENT_HOME"
+          cargo run -p ruagent -- serve --addr 127.0.0.1:8891 &
           for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8787/api/v1/health && break
+            curl -sf http://127.0.0.1:8891/api/v1/health && break
             sleep 1
           done
-          curl -sf http://127.0.0.1:8787/api/v1/health
+          curl -sf http://127.0.0.1:8891/api/v1/health
       - name: Doctor (7 end-to-end checks)
-        run: cargo run -p ruagent -- doctor
+        # `doctor` probes --url (default 8787), so the private port has to be named here
+        # too: without this the step would report on whatever is listening on 8787.
+        run: cargo run -p ruagent -- doctor --url http://127.0.0.1:8891
       - name: Panel serves
         run: |
-          html=$(curl -sf http://127.0.0.1:8787/)
+          html=$(curl -sf http://127.0.0.1:8891/)
           echo "$html" | grep -q 'id="root"'
-          curl -sf http://127.0.0.1:8787/ | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1 | grep -q .
+          curl -sf http://127.0.0.1:8891/ | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1 | grep -q .
       - name: Panel E2E (Playwright)
         # through the repo entry point on purpose: this is the line that arms the
         # write guard. Change it to `npx playwright test` and registry.spec.ts
