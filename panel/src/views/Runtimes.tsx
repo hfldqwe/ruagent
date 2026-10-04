@@ -18,6 +18,50 @@ const HARNESSES = ["claude-code", "opencode", "dsh", "mock"];
 const modelOption = (options: SessionOptionInfo[]) =>
   options.find((o) => o.category === "model" || o.id === "model");
 
+/** What a runtime's model-count chip may say.
+ *
+ *  A discriminated union on purpose: the NUMBER is only reachable by narrowing
+ *  `kind` to `"count"`, so no future edit can format an unknown as a number --
+ *  which is the whole point of t182/C4 (`known === false` means the daemon was
+ *  NEVER TOLD, and that must not be rendered as "0 models", the reading `t84`
+ *  already forbids for a failed probe). */
+export type ModelChipState =
+  | { kind: "failed" }
+  | { kind: "unknown" }
+  | { kind: "notProbed" }
+  | { kind: "count"; n: number };
+
+/** The chip's state. Order matters: `failed` and `unknown` both win over any
+ *  count, so the two "no reading" situations can never carry a number. */
+export function modelChipState(
+  failed: boolean,
+  notKnown: boolean,
+  count: number | undefined,
+): ModelChipState {
+  if (failed) return { kind: "failed" };
+  if (notKnown) return { kind: "unknown" };
+  if (!count) return { kind: "notProbed" };
+  return { kind: "count", n: count };
+}
+
+/** The strip's "models" readout.
+ *
+ *  A NUMBER only ever comes from runtimes the daemon ANSWERED for. A failed probe
+ *  keeps t84's own label (so that judgement and its wording are unchanged), and a
+ *  "never told" answer (`known === false`, t182/C4) falls to the third state too
+ *  instead of contributing a 0 that looks measured -- which is what an
+ *  all-unknown grid used to print. */
+export function modelsReadout(
+  counts: Record<string, number>,
+  probeFailed: Record<string, boolean>,
+  notKnown: Record<string, boolean>,
+  label: { failed: string; notProbed: string },
+): number | string {
+  const answered = Object.entries(counts).filter(([n]) => !probeFailed[n] && !notKnown[n]);
+  if (answered.length > 0) return answered.reduce((s, [, n]) => s + n, 0);
+  return Object.keys(probeFailed).some((n) => probeFailed[n]) ? label.failed : label.notProbed;
+}
+
 /** Model-count chip state for the card grid. */
 function useModelCounts(names: string[]) {
   const [counts, setCounts] = useState<Record<string, number>>({});
@@ -27,6 +71,13 @@ function useModelCounts(names: string[]) {
    *  This file already argued the rule for the SYNC path (`sync` returns whether
    *  the probe succeeded, R11); the mount probe was the sibling left behind. */
   const [probeFailed, setProbeFailed] = useState<Record<string, boolean>>({});
+  /** t182/C4: `known === false` is the THIRD situation -- the daemon answered
+   *  "I was never told which options this runtime has". It is not a failure (the
+   *  request succeeded) and it is not a count, so it gets its own reading; the
+   *  strip and the chip both exclude it rather than adding a 0 that looks
+   *  measured. Kept separate from `probeFailed` so t84's judgement ("a failed
+   *  probe") and its wording stay exactly what they were. */
+  const [notKnown, setNotKnown] = useState<Record<string, boolean>>({});
   const [syncing, setSyncing] = useState<string | null>(null);
   const key = names.join(",");
   useEffect(() => {
@@ -37,7 +88,24 @@ function useModelCounts(names: string[]) {
         .agentOptions(n)
         .then((o) => {
           if (!alive) return;
-          setCounts((c) => ({ ...c, [n]: modelOption(o.options)?.choices.length ?? 0 }));
+          // The route has carried `known` since t182; the generated type in
+          // `api.ts` does not declare it yet (`api.ts` is outside this task's
+          // scope), so it is read through one narrow, commented cast instead of
+          // widening a shared interface here.
+          const known = (o as { known?: boolean }).known !== false;
+          setNotKnown((u) => (u[n] === !known ? u : { ...u, [n]: !known }));
+          if (!known) {
+            // No number at all for "never told": drop any stale count so it
+            // cannot be summed by the strip.
+            setCounts((c) => {
+              if (!(n in c)) return c;
+              const next = { ...c };
+              delete next[n];
+              return next;
+            });
+          } else {
+            setCounts((c) => ({ ...c, [n]: modelOption(o.options)?.choices.length ?? 0 }));
+          }
           setProbeFailed((f) => (f[n] ? { ...f, [n]: false } : f));
         })
         .catch(() => {
@@ -57,6 +125,19 @@ function useModelCounts(names: string[]) {
     setSyncing(name);
     try {
       const o = await api.agentOptions(name, true);
+      // t182/C4: a sync that came back "never told" is NOT a successful probe --
+      // reporting it as one would put the 0 back through the successful branch.
+      const known = (o as { known?: boolean }).known !== false;
+      setNotKnown((u) => (u[name] === !known ? u : { ...u, [name]: !known }));
+      if (!known) {
+        setCounts((c) => {
+          if (!(name in c)) return c;
+          const next = { ...c };
+          delete next[name];
+          return next;
+        });
+        return false;
+      }
       setCounts((c) => ({ ...c, [name]: modelOption(o.options)?.choices.length ?? 0 }));
       // t103 (F2): the flag must not latch. A successful sync IS the recovery
       // path a user takes after a failed mount probe, and it used to leave the
@@ -72,7 +153,7 @@ function useModelCounts(names: string[]) {
       setSyncing(null);
     }
   };
-  return { counts, syncing, sync, probeFailed };
+  return { counts, syncing, sync, probeFailed, notKnown };
 }
 
 /** The create/edit form state; `editing` names the runtime being edited. */
@@ -127,7 +208,7 @@ export function Runtimes() {
 
   // Model-count chips per runtime, from the daemon's cached catalog.
   // Runs before the early return (hook order), names derived from state.
-  const { counts, syncing, sync, probeFailed } = useModelCounts(
+  const { counts, syncing, sync, probeFailed, notKnown } = useModelCounts(
     (agents ?? []).filter((a) => !isRoleAgent(a) && a.enabled).map((a) => a.name),
   );
 
@@ -158,6 +239,12 @@ export function Runtimes() {
       (a, b) =>
         (a.harness ?? "").localeCompare(b.harness ?? "") || a.name.localeCompare(b.name),
     );
+
+  // t182/C4: the runtimes the daemon actually ANSWERED for. A failed probe and a
+  // "never told" answer (`known === false`) are both no-readings, so neither may
+  // contribute a number to the strip -- that is how an unknown runtime used to be
+  // added as a 0 and an all-unknown grid printed a plain `0`. The rule lives in
+  // `modelsReadout` (above), so a check can drive it directly.
 
   const remove = async (name: string) => {
     try {
@@ -212,13 +299,18 @@ export function Runtimes() {
               // carries the third state instead of a 0 that looks measured.
               // (All-success is byte-identical to the old expression: no
               // failures means the filter removed nothing.)
-              value:
-                Object.keys(probeFailed).filter((n) => probeFailed[n]).length > 0 &&
-                Object.entries(counts).filter(([n]) => !probeFailed[n]).length === 0
-                  ? t("runtimes.probeFailed")
-                  : Object.entries(counts)
-                      .filter(([n]) => !probeFailed[n])
-                      .reduce((s, [, n]) => s + n, 0),
+              //
+              // t182/C4: `known === false` ("the daemon was never told") is a
+              // third no-reading situation, so it is excluded from the sum by the
+              // same rule. This is what stops an unknown runtime from being
+              // added as a 0 -- and an all-unknown grid used to print a plain
+              // `0`. t84's own branch is untouched: when something FAILED and
+              // nothing answered, its label still wins. The rule lives in
+              // `modelsReadout` so a check can drive it.
+              value: modelsReadout(counts, probeFailed, notKnown, {
+                failed: t("runtimes.probeFailed"),
+                notProbed: t("runtimes.notProbed"),
+              }),
             },
           ]}
         />
@@ -241,6 +333,13 @@ export function Runtimes() {
             // through `runtime` or through the `runtimes` list.
             const usedBy = roles.filter(
               (a) => a.runtime === r.name || a.runtimes?.includes(r.name),
+            );
+            // t182/C4: one state per card, computed through `modelChipState` --
+            // a count is only reachable when it is really a count.
+            const chipState = modelChipState(
+              !!probeFailed[r.name],
+              !!notKnown[r.name],
+              counts[r.name],
             );
             return (
               <Card key={r.name} className="agent-card" size="small">
@@ -297,7 +396,7 @@ export function Runtimes() {
                   </div>
                 ) : null}
                 <div className="row">
-                  {probeFailed[r.name] ? (
+                  {chipState.kind === "failed" ? (
                     // t103 (F2b): the label promises a retry, so it has to BE one.
                     // This was a bare <span> -- an action it did not offer (the
                     // same argument this file already makes below for the R11
@@ -311,10 +410,13 @@ export function Runtimes() {
                     >
                       {t("runtimes.probeFailed")}
                     </button>
-                  ) : counts[r.name] ? (
-                    <span className="tag">{t("runtimes.models", { n: counts[r.name] })}</span>
+                  ) : chipState.kind === "count" ? (
+                    <span className="tag">{t("runtimes.models", { n: chipState.n })}</span>
                   ) : (
-                    // "not probed" is not "0 models" (§5 empty ②).
+                    // "not probed" is not "0 models" (§5 empty ②). t182/C4: a
+                    // "never told" answer (`known === false`) lands here too --
+                    // the daemon did not get a catalogue, so there is no count to
+                    // print, and the sync button next to it is the retry.
                     <span className="muted">{t("runtimes.notProbed")}</span>
                   )}
                   <Button
