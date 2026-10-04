@@ -49,8 +49,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head (2026-09-03), kept SHA-pinned like every other action here
         with:
+          # PINNED TOOLCHAIN (user's decision, 2026-10-04; see rust-toolchain.toml).
+          # The action selects the toolchain from its @rev -- its README says so --
+          # so this input is what pins the runner's INSTALL; `rust-toolchain.toml`
+          # (also 1.95.0) is what pins what the commands RUN: rustup prints
+          # `stable-… (overridden by '…/rust-toolchain.toml')` in this repo, so the
+          # file governs cargo/rustc here regardless of what the runner installed.
+          # Raise both carriers together (rust-toolchain.toml + this input, here and
+          # in rust-windows).
+          toolchain: "1.95.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       # lancedb's lance-encoding needs protoc at build time
@@ -294,8 +303,12 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head (2026-09-03), kept SHA-pinned like every other action here
         with:
+          # SAME PIN as rust-linux and as rust-toolchain.toml: 1.95.0. Both runners
+          # must install the same compiler, or a green here and a green there are
+          # greens of DIFFERENT tools (which is what pinning exists to stop).
+          toolchain: "1.95.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc

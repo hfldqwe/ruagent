@@ -1,2 +1,31 @@
 [toolchain]
-channel = "stable"
+# PINNED, not floating (user's decision, 2026-10-04). MEASURED locally:
+#   rustc 1.95.0 (59807616e 2026-04-14) / cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+# and `rustup show active-toolchain` in this repo printed
+#   stable-… (overridden by '…\rust-toolchain.toml')
+# i.e. THIS FILE is what decides which compiler every cargo/rustc invocation in
+# the repository uses -- on any machine, including a CI runner.
+#
+# WHY: a floating `stable` makes a green depend on the DAY it ran. Measured
+# 2026-10-04: stable was 1.95.0 while 1.99.0 was already published
+# (`rustup check`: "update available: 1.95.0 (59807616e …) -> 1.99.0 (b940084d7 …)"),
+# so a new clippy lint could turn a zero-diff commit red under `-D warnings`.
+#
+# TO RAISE THE PIN (two carriers, keep them EQUAL):
+#   1. this file: channel = "x.y.z"
+#   2. .github/workflows/ci.yml: the `with: toolchain:` input of BOTH
+#      `dtolnay/rust-toolchain` steps (rust-linux and rust-windows)
+# ...AND INSTALL IT FIRST ON EVERY MACHINE THAT BUILDS THIS TREE:
+#   rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+# Pinning a version that is not installed here does NOT fall back: rustup selects
+# `1.95.0-x86_64-pc-windows-msvc`, tries to download it, and **every cargo/rustc
+# invocation in this repository fails until that download finishes**
+# (MEASURED 2026-10-04: `error: Missing manifest in toolchain
+# '1.95.0-x86_64-pc-windows-msvc'` after an interrupted auto-install -- the
+# directory existed, the manifest did not). On a machine where the download is
+# blocked, the escape hatch is per-process, never a repository edit:
+#   RUSTUP_TOOLCHAIN=stable cargo …   (only while stable IS the pinned version)
+# The CI action does NOT read this file -- its README says the toolchain comes
+# from the action's @rev -- so the input is what pins the runner's INSTALL; this
+# file is what pins what the commands RUN.
+channel = "1.95.0"
