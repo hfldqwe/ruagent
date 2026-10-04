@@ -186,10 +186,10 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
         <div className="zone-title">{t("distill.title")}</div>
       </div>
 
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <div style={{ minWidth: 0 }}>
+      <div className="row between">
+        <div className="minw0">
           <strong>{t("distill.auto")}</strong>
-          <p className="muted" style={{ margin: 0 }}>
+          <p className="muted flush">
             {t("distill.autoHint")}
           </p>
         </div>
@@ -200,10 +200,10 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
         />
       </div>
 
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <div style={{ minWidth: 0 }}>
+      <div className="row between">
+        <div className="minw0">
           <strong>{t("distill.graph")}</strong>
-          <p className="muted" style={{ margin: 0 }}>
+          <p className="muted flush">
             {t("distill.graphHint")}
           </p>
         </div>
@@ -226,13 +226,13 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
       </div>
 
       <div className="row wrap">
-        <label className="chat-field" style={{ flex: "1 1 220px" }}>
+        <label className="chat-field half">
           <span>{t("distill.agent")}</span>
           <Select
             aria-label={t("distill.agent")}
             value={policy.agent ?? ""}
             onChange={(v) => set({ agent: v || null })}
-            style={{ width: "100%" }}
+            className="w-full"
             options={[
               { value: "", label: t("distill.agentDefault") },
               ...(agents ?? []).map((a) => ({ value: a.name, label: a.name })),
@@ -243,7 +243,7 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
             notFoundContent={t("settings.noRoles")}
           />
         </label>
-        <label className="chat-field" style={{ flex: "1 1 220px" }}>
+        <label className="chat-field half">
           <span>{t("distill.language")}</span>
           <Input
             aria-label={t("distill.language")}
@@ -258,7 +258,7 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
         <span>
           {t("distill.prompt")}
           {/* §4: which of the two fields is in force must be readable. */}
-          <span className="tag" style={{ marginLeft: 8 }}>
+          <span className="tag ml8">
             {isCustom ? t("distill.customized") : t("distill.builtinTag")}
           </span>
         </span>
@@ -570,7 +570,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
         </span>
       </div>
 
-      <p className="muted micro" style={{ margin: 0 }}>
+      <p className="muted micro flush">
         {t("settings.capabilities.hint")}
       </p>
 
@@ -582,7 +582,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
           showIcon
           message={t("settings.capabilities.conflictTitle")}
           description={
-            <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+            <ul className="conflict-list">
               {data.conflicts.map((c) => (
                 <li key={`${c.id}:${c.legacy_key}`}>
                   <span className="mono">{c.id}</span>{" "}
@@ -608,9 +608,9 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
         const locked = pending !== null;
         return (
           <div key={row.id} data-capability={row.id}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <div style={{ minWidth: 0 }}>
-                <div className="row tight" style={{ padding: 0 }}>
+            <div className="row between">
+              <div className="minw0">
+                <div className="row tight pad0">
                   <strong>{name}</strong>
                   <Tooltip
                     title={
@@ -630,7 +630,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
                   ) : null}
                   {row.new ? <span className="tag">{t("settings.capabilities.newBadge")}</span> : null}
                 </div>
-                <p className="muted" style={{ margin: 0 }}>
+                <p className="muted flush">
                   {row.description}
                 </p>
                 <span className="muted micro">{row.gates}</span>
@@ -646,7 +646,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
             {/* The cost warning is visible BEFORE the switch is touched — the
                 confirmation dialog is the second gate, not the only one. */}
             {row.tier === "llm" ? (
-              <p style={{ margin: "0 4px 6px" }}>
+              <p className="cost-note">
                 <span className="tag warn">{t("settings.capabilities.costWarning")}</span>
               </p>
             ) : null}
@@ -714,7 +714,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
                     </label>
                   );
                 })}
-                <div className="row tight" style={{ padding: 0 }}>
+                <div className="row tight pad0">
                   <span data-apply-options={row.id}>
                     <Button
                       size="small"
@@ -754,7 +754,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
       {/* A refusal is local, so the daemon never saw it: say so, next to the
           field that carries the reason. */}
       {Object.keys(refusals).length > 0 && !saveErr ? (
-        <p className="muted micro" style={{ margin: 0 }}>
+        <p className="muted micro flush">
           {t("settings.capabilities.options.refused")}
         </p>
       ) : null}
@@ -787,7 +787,7 @@ function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: ()
           }
         >
           <p>{t("settings.capabilities.costBody", { name: capabilityName(t, armed.id) })}</p>
-          <p className="muted micro" style={{ marginBottom: 0 }}>
+          <p className="muted micro mb0">
             {armed.description}
           </p>
         </Modal>

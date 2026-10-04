@@ -222,6 +222,35 @@ html[data-mode="light"] .ruagent {
 .grow { flex: 1; min-width: 0; }
 .pad { padding: 16px 20px; }
 .truncated { max-width: 340px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* ruagent-mem-gen2 t186 (audit row 12 — the count of elements carrying a `style`
+   attribute). The last project-authored inline styles on #settings were one-off
+   declarations, not design values: a flexible 220px field basis, `space-between` on a
+   row, `margin: 0` on hint paragraphs, an 8px tag offset, a flush list, a full-width
+   control and two `min-width: 0` wrappers. Each is declared here ONCE, with the same
+   value for the same elements, so those elements stop carrying a `style` attribute
+   without any of them changing its computed style — nothing is hidden, shrunk or moved
+   out of the object set (the row's own subject is the visible element). Names follow the
+   local utility style (.pad / .grow / .muted); .row.between joins .row.end. */
+.flush { margin: 0; }
+.mb0 { margin-bottom: 0; }
+.ml8 { margin-left: 8px; }
+/* .row.tight declares `padding: 4px 0` at (0,2,0), so a bare `.pad0` would LOSE and the
+   element would gain 8px -- measured: #settings grew 100px. The carrier of the old inline
+   `padding: 0` therefore has to be at least as specific as the rule it replaces. */
+.row.tight.pad0 { padding: 0; }
+.minw0 { min-width: 0; }
+.w-full { width: 100%; }
+.chat-field.half { flex: 1 1 220px; }
+.conflict-list { margin: 0; padding-inline-start: 18px; }
+.cost-note { margin: 0 4px 6px; }
+/* The shell's three inline styles (App.tsx): they render on EVERY route, so the same
+   move applies there as on #settings -- same values, same elements, no layout change.
+   The theme's own `documentElement.style.colorScheme`/`background` assignment
+   (theme.tsx) is deliberately NOT moved: it is the theme mechanism itself, and rows
+   1/29/30 read what it produces. */
+.app-min-h { min-height: 100vh; }
+.app-menu { border-inline-end: none; padding-block: 4px; }
+.nav-item-label { display: inline-flex; align-items: center; gap: 8px; }
 /* Screen-reader-only text: the visual h1 every route owes the document
    outline, without touching the frozen .view-bar h2. */
 /* font: inherit matters: a 1x1 clipped <h1> is still a laid-out box, so the
@@ -582,6 +611,7 @@ h3.sec {
 .row.tight { gap: 8px; padding: 4px 0; }
 .row.wrap { flex-wrap: wrap; }
 .row.end { justify-content: flex-end; }
+.row.between { justify-content: space-between; }
 
 .row-btn {
   display: flex;
@@ -1233,7 +1263,16 @@ html[data-mode="dark"] .ant-btn:disabled { color: var(--ant-color-text-secondary
   font-variant-numeric: tabular-nums;
 }
 
-.inbox-card { box-shadow: inset 3px 0 0 var(--signal), var(--panel-shadow); }
+/* The cascade trap this rule fell into (audit `#inbox`, t170): the panel's own
+   `.ant-card { border: none; box-shadow: var(--panel-shadow); }` rule further down
+   this sheet declares `box-shadow` at the SAME specificity (0,1,0) but LATER, so a
+   bare `.inbox-card` lost the spine half of its declaration and the card kept only
+   the panel shadow -- the readout was "present in the source, absent in the
+   computed value". The compound selector (0,2,0) wins on specificity, so the spine
+   no longer depends on source order; the declaration is unchanged, and no `border`
+   is added (a border here would re-enter the row 4/38 count and, via
+   `--panel-shadow`, drop the ring row 30 judges). */
+.ant-card.inbox-card { box-shadow: inset 3px 0 0 var(--signal), var(--panel-shadow); }
 
 /* Home ---------------------------------------------------------------- */
 

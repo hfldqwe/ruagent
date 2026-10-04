@@ -425,7 +425,7 @@ function Shell() {
       ),
       label: link(
         "inbox",
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+        <span className="nav-item-label">
           {t("nav.inbox")}
           {inboxCount !== null && inboxCount > 0 && (
             <span className="nav-badge">{inboxCount}</span>
@@ -458,7 +458,7 @@ function Shell() {
       ];
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
+    <Layout className="app-min-h">
       <ToastBridge />
       <CommandPalette open={cmdk} onOpenChange={setCmdk} nav={nav} onNewTask={() => setCreating(true)} />
       <Sider
@@ -491,7 +491,7 @@ function Shell() {
             items={items}
             selectedKeys={[selected]}
             onClick={({ key }) => nav(String(key))}
-            style={{ borderInlineEnd: "none", paddingBlock: 4 }}
+            className="app-menu"
           />
         </div>
         <div className="sidebar-foot">
