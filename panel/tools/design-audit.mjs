@@ -972,15 +972,32 @@ const PROBE = (cfg) => {
       });
       const nSides = sideLive.filter(Boolean).length;
       const isHairline = bws.some((w, i) => sideLive[i] && w <= 1.5);
-      if (isHairline) { borders.hairline++; pushSample(borders.hairlineSamples, el, { px: Math.max(...bws) }); }
-      if (nSides === 4) { borders.fourSide++; pushSample(borders.fourSideSamples, el, {}); }
+      // t169 (V158-2 gap 1): the judgment above is ALPHA-GATED (`c.a > 0.04`), and the
+      // samples below used to carry only {sel, sides|px} -- so the gated half of the
+      // reading could not be re-derived from the artefact at all (a verifier had to
+      // replicate this predicate by hand, which is how the gap was found). Every border
+      // sample now names WHICH sides are live and EVERY side's colour alpha, including
+      // the ones the 0.04 gate rejected (they show up as 0.02/0/null).
+      // Evidence only: no threshold, no count, no criterion, no `pass` changes.
+      const sideLetters = ["T", "R", "B", "L"];
+      const borderEvidence = {
+        live: sideLetters.filter((_, i) => sideLive[i]).join(""),
+        // alpha per side, or null when that side has no width/live style (nothing to read)
+        alpha: cols.map((c, i) => {
+          if (!bws[i] || styles[i] === "none" || styles[i] === "hidden") return null;
+          const p = parseColor(c);
+          return p ? Math.round(p.a * 1000) / 1000 : null;
+        }),
+      };
+      if (isHairline) { borders.hairline++; pushSample(borders.hairlineSamples, el, { px: Math.max(...bws), ...borderEvidence }); }
+      if (nSides === 4) { borders.fourSide++; pushSample(borders.fourSideSamples, el, { sides: nSides, ...borderEvidence }); }
       if (isMdCell) borders.mdTableCells++;
       else if (rawSet.has(el)) borders.rawBlocks++;
       else if (!isControl) {
         borders.allBordered++;
         if (CONTAINER_TAGS.has(el.tagName) && nSides >= 2) {
           borders.strictContainers++;
-          pushSample(borders.strictSamples, el, { sides: nSides });
+          pushSample(borders.strictSamples, el, { sides: nSides, ...borderEvidence });
         }
       }
     }
@@ -4223,11 +4240,27 @@ const CHECKS = [
     judge: (c, l) => {
       const b = c.metrics.borders;
       const ex = c.metrics.extras;
+      // t169 (V158-2 gap 2): `inboxCards === 0` short-circuits ridgeOk to true, and the
+      // display used to OMIT the clause entirely in that case -- so "this route rendered
+      // an empty state (nothing to measure)" and "every card was already a ridge" printed
+      // the same thing. The counter's premise is NOT text: it is `visText`, i.e.
+      // visibility (design-audit.mjs:936), so a card whose text lives in children IS
+      // counted -- the clause is merely UNEXERCISED on a tree with no .inbox-card. Both
+      // cases are now named. `pass` is byte-identical to before, so no threshold and no
+      // semantics moved -- only the evidence states which case it is.
       const ridgeOk = ex.inboxCards === 0 || ex.inboxCardBordered === 0;
+      const ridgeShown = ex.inboxCards
+        ? ` · .inbox-card 带边框 ${ex.inboxCardBordered}/${ex.inboxCards}`
+        : " · .inbox-card 未测（该路由无 .inbox-card，空态）";
       return {
-        display: `${b.strictContainers} / ≤${l.max}${ex.inboxCards ? ` · .inbox-card 带边框 ${ex.inboxCardBordered}/${ex.inboxCards}` : ""}`,
+        display: `${b.strictContainers} / ≤${l.max}${ridgeShown}`,
         pass: b.strictContainers <= l.max && isComposerOnly(b) && ridgeOk,
-        note: [b.strictSamples.map((x) => x.sel).join(" | "), ridgeOk ? "" : ".inbox-card 出现 border（应为 box-shadow 脊线）"].filter(Boolean).join(" · "),
+        note: [
+          b.strictSamples.map((x) => `${x.sel}${x.live ? ` [live=${x.live} α=${(x.alpha ?? []).map((a) => (a === null ? "-" : a)).join("/")}]` : ""}`).join(" | "),
+          ex.inboxCards
+            ? (ridgeOk ? "" : ".inbox-card 出现 border（应为 box-shadow 脊线）")
+            : ".inbox-card 脊线条款本次未测：该路由没有 .inbox-card（空态）⇒ ridgeOk 由 inboxCards===0 短路为真",
+        ].filter(Boolean).join(" · "),
       };
     },
   },
@@ -6629,6 +6662,43 @@ function runSelfTest() {
     /el\.tagName === "H1" && vis\)/.test(PROBE.toString()), true);
   check("vis: row 12's inline-style count is visibility-gated",
     /if \(visText && styleAttr/.test(PROBE.toString()), true);
+
+  // ---- row 4's .inbox-card ridge clause (t169 / V158-2) ---------------------
+  // WHY THIS BLOCK EXISTS: the clause could go VACUOUS without anyone seeing it --
+  // `ridgeOk = inboxCards === 0 || inboxCardBordered === 0` is true by the FIRST
+  // disjunct whenever the route renders no card, and the display used to omit the
+  // clause in exactly that case. So the self-test pins BOTH directions: the clause
+  // must be able to FAIL (it is load-bearing), and its un-exercised state must be
+  // NAMED (so "nothing to measure" can never read as "measured and clean").
+  const row4 = CHECKS.find((r) => r.n === 4);
+  const limits4 = row4.parse({ text: "≤1 / 路由" });
+  const j4 = (strictContainers, inboxCards, inboxCardBordered, extra = {}) =>
+    row4.judge({
+      route: "inbox", mode: "dark", ...extra,
+      metrics: {
+        borders: { strictContainers, strictSamples: [], allBordered: 0, ...(extra.metrics?.borders ?? {}) },
+        extras: { inboxCards, inboxCardBordered, navBadge: 0 },
+      },
+    }, limits4, {});
+  check("t169 row4: a bordered .inbox-card -> FAIL (the ridge clause is load-bearing)",
+    j4(0, 2, 1).pass, false);
+  check("t169 row4: batched cards with no border -> PASS",
+    j4(0, 2, 0).pass, true);
+  check("t169 row4: zero cards NAMES the un-exercised clause instead of omitting it",
+    j4(0, 0, 0).display.includes("未测"), true);
+  check("t169 row4: zero cards says WHY in the note (not-measured is never silent)",
+    j4(0, 0, 0).note.includes("未测") && j4(0, 0, 0).note.includes("inboxCards===0"), true);
+  check("t169 row4: a card count is reported when there IS something to measure",
+    j4(0, 3, 0).display.includes("带边框 0/3"), true);
+  check("t169 row4: strict samples carry which sides are live (gap 1)",
+    /live: sideLetters\.filter/.test(PROBE.toString()), true);
+  check("t169 row4: strict samples carry per-side border-colour alpha (gap 1)",
+    /alpha: cols\.map/.test(PROBE.toString()) && /const p = parseColor\(c\);\s*return p \? Math\.round/.test(PROBE.toString()), true);
+  check("t169 row4: the .inbox-card counter's premise is visibility, never 'direct text' (gap 2)",
+    /const visText = vis && !clippedAway/.test(PROBE.toString())
+      && /if \(visText && cls\.includes\("inbox-card"\)\)/.test(PROBE.toString()), true);
+  check("t169 row4: the ridge clause's pass expression is unchanged (alpha gate untouched)",
+    /const ridgeOk = ex\.inboxCards === 0 \|\| ex\.inboxCardBordered === 0;/.test(row4.judge.toString()), true);
 
   // ---- row 37: only the designer's own values are judged (§12.6) -----------
   const row37 = CHECKS.find((r) => r.n === 37);
