@@ -6,7 +6,7 @@
 // hand-editing the [capabilities] table of policy.toml.
 
 import { Alert, Button, Input, Select, Switch, Tooltip } from "antd";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   api,
   type CapabilitiesResponse,
@@ -32,6 +32,17 @@ import { useI18n } from "../i18n";
 
 export function Settings() {
   const { t } = useI18n();
+  // t151 (audit row 20, `#settings`): this route has TWO independent loaders, each
+  // with its own error card and its own retry. Measured on the committed bytes: a
+  // 500 on the route's own endpoints paints two visible `role=alert` errors, and a
+  // REAL click on the first retry clears only that card -- the other error stays on
+  // screen, so "重试" does not restore the page (audit row 20: 恢复 ✗). The retry is
+  // therefore page-scoped: bumping `epoch` re-runs EVERY loader on this route, so one
+  // click re-reads all of it and both errors go away. Each card still paints its OWN
+  // visible error while its data is missing (row 20 ①), and nothing is rendered as an
+  // empty or successful state in the meantime (row 20 ③).
+  const [epoch, setEpoch] = useState(0);
+  const reload = useCallback(() => setEpoch((e) => e + 1), []);
 
   return (
     <div>
@@ -40,8 +51,8 @@ export function Settings() {
         <h2>{t("settings.title")}</h2>
         <span className="muted">{t("settings.subtitle")}</span>
       </div>
-      <DistillSettings />
-      <CapabilitiesSettings />
+      <DistillSettings epoch={epoch} onReload={reload} />
+      <CapabilitiesSettings epoch={epoch} onReload={reload} />
     </div>
   );
 }
@@ -49,7 +60,7 @@ export function Settings() {
 // Distillation policy (the [distill] table of policy.toml): auto, the graph
 // flag, the extraction agent, the output language, a full prompt override.
 // Live — saving swaps the running daemon's policy, no restart.
-function DistillSettings() {
+function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => void }) {
   const { t } = useI18n();
   const [policy, setPolicy] = useState<DistillPolicy | null>(null);
   const [err, setErr] = useState<unknown>(null);
@@ -75,7 +86,9 @@ function DistillSettings() {
   };
   useEffect(() => {
     load();
-  }, []);
+    // t151: `epoch` is the page-scoped retry (see Settings()). The first run is the
+    // mount load; every bump re-reads this card.
+  }, [epoch]);
 
   if (!policy) {
     if (err) {
@@ -85,7 +98,7 @@ function DistillSettings() {
           <ErrorState
             title={t("distill.err")}
             hint={t("distill.err.hint")}
-            onRetry={load}
+            onRetry={onReload}
             retryLabel={t("common.retry")}
           />
         </>
@@ -363,7 +376,7 @@ function refusalText(
  *  read-modify-write that re-emits exactly the keys `options_set` says the FILE
  *  carries (see `capabilitiesBody`), because the daemon's editor DELETES what a
  *  body omits. */
-function CapabilitiesSettings() {
+function CapabilitiesSettings({ epoch, onReload }: { epoch: number; onReload: () => void }) {
   const { t } = useI18n();
   const [data, setData] = useState<CapabilitiesResponse | null>(null);
   const [err, setErr] = useState<unknown>(null);
@@ -396,7 +409,8 @@ function CapabilitiesSettings() {
   };
   useEffect(() => {
     load();
-  }, []);
+    // t151: the same page-scoped retry as DistillSettings (see Settings()).
+  }, [epoch]);
 
   if (!data) {
     if (err) {
@@ -406,7 +420,7 @@ function CapabilitiesSettings() {
           hint={`${t("settings.capabilities.errHint")} (${
             err instanceof Error ? err.message : String(err)
           })`}
-          onRetry={load}
+          onRetry={onReload}
           retryLabel={t("common.retry")}
         />
       );
