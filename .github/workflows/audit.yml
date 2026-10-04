@@ -215,6 +215,7 @@ jobs:
           LOG="$RUNNER_TEMP/audit.log"
           METRICS="$RUNNER_TEMP/audit/metrics.json"
           COUNTS="$RUNNER_TEMP/counts.env"
+          DISCLOSURES="$RUNNER_TEMP/disclosures.md"
           if [ ! -f "$LOG" ]; then
             echo "::error::no audit log at $LOG -- the audit step did not run"
             exit 1
@@ -258,6 +259,51 @@ jobs:
           const failRows = nums("fail");
           const nmRows = nums("not_measured");
           const q = (s) => "'" + String(s).split("'").join("'\\''") + "'";
+          // ⓪b t188 -- THE INSTRUMENT'S OWN COVERAGE DECLARATIONS. `warnings[]` and
+          // `blindSpots[]` are what the tool says about ITSELF: which route it skipped, whose
+          // hash it could not reach, which §12 rows it has NO check for, and what it admits it
+          // cannot measure at all. They were in metrics.json and reached NO carrier, so a
+          // CI-only reader could not tell that 12 rows were absent altogether, that #graph was
+          // skipped in BOTH modes, or that .nav-badge's contrast failure was invisible this
+          // run. The counts below publish them; guardrails ③ ④ redden when two of them move.
+          const warnings = (Array.isArray(doc.warnings) ? doc.warnings : []).map(String);
+          const blind = Array.isArray(doc.blindSpots) ? doc.blindSpots : [];
+          const noReasonRe = /neither a check nor a stated reason/;
+          const noReason = warnings.filter((w) => noReasonRe.test(w));
+          const noReasonRows = (noReason.length ? noReason[0].split(":").pop().match(/\d+/g) || [] : [])
+          .map(Number)
+          .sort((a, b) => a - b);
+          // The signature EXCLUDES the "neither a check nor a stated reason" warning: guardrail
+          // ③ pins that one from `no_reason_raw` (its row list AND its presence), so one cause
+          // produces exactly one red rather than two. Everything else is VERBATIM, because a
+          // reworded or newly added warning is itself a change in what the instrument claims.
+          const warnSig = warnings.filter((w) => !noReasonRe.test(w)).sort();
+          const blindItems = blind.map((b) => (b && typeof b === "object" ? b.item : b)).map(String).sort();
+          // The human carrier: the same declarations, verbatim, as a markdown section the
+          // workflow appends to the step summary AND uploads as an artefact. Written BEFORE
+          // stdout on purpose -- if it cannot be written, counts.env stays empty and guardrail
+          // ① reddens: "the disclosure itself is missing" must not be a quiet run.
+          try {
+          const md = [
+          "### Coverage declarations the instrument itself made (t188)",
+          "",
+          "- warnings: **" + warnings.length + "** (`warn=" + warnings.length + "`)",
+          "- blind spots: **" + blind.length + "** (`blind=" + blind.length + "`)",
+          "",
+          "Every warning, verbatim:",
+          "",
+          ...warnings.map((w) => "- `" + w.split("`").join("\\`") + "`"),
+          "",
+          "Every blind spot -- what the instrument says it CANNOT measure -- verbatim:",
+          "",
+          ...blind.map((b) => "- `" + String(b && typeof b === "object" ? b.item : b).split("`").join("\\`") + "`" + (b && b.reason ? " -- " + String(b.reason) : "")),
+          "",
+          ].join("\n");
+          fs.writeFileSync(process.argv[3], md + "\n", "utf8");
+          } catch (e) {
+          console.error("could not write the disclosure file " + process.argv[3] + ": " + e.message);
+          process.exit(6);
+          }
           process.stdout.write(
           [
           "captures=" + q(captures.length),
@@ -269,12 +315,24 @@ jobs:
           "judged=" + q(checks.length - by("pending").length),
           "failing=" + q(failRows.join(", ")),
           "observed_raw=" + q(nmRows.join(" ")),
+          "warn=" + q(warnings.length),
+          "blind=" + q(blind.length),
+          "no_reason_raw=" + q(noReasonRows.join(" ")),
+          "warn_sig=" + q(warnSig.join(" | ")),
+          "blind_items=" + q(blindItems.join(" | ")),
           ].join("\n") + "\n",
           );
           COUNTS_CJS
           rm -f "$COUNTS"
+          rm -f "$DISCLOSURES"
           if [ -f "$METRICS" ]; then
-            node "$RUNNER_TEMP/counts.cjs" "$METRICS" > "$COUNTS" 2>"$RUNNER_TEMP/counts.err" || true
+            # argv: [node, counts.cjs, metrics.json, disclosures.md]; counts.env comes from
+            # STDOUT (as before t188). Passing a path for the counts too would have made
+            # argv[3] the counts file -- and counts.cjs writes its disclosure to argv[3], so
+            # that mistake overwrote counts.env with markdown. Caught by running this step
+            # locally against the real artefact before trusting it (rc=2, "unexpected EOF
+            # while looking for matching `'`" from `. "$COUNTS"`).
+            node "$RUNNER_TEMP/counts.cjs" "$METRICS" "$DISCLOSURES" > "$COUNTS" 2>"$RUNNER_TEMP/counts.err" || true
           else
             echo "metrics.json not found at $METRICS" > "$RUNNER_TEMP/counts.err"
           fi
@@ -396,12 +454,78 @@ jobs:
             exit 1
           fi
 
+          # ③ t188 -- THE SECOND LAYER OF "A SKIP MUST BE VISIBLE": A ROW THAT IS ABSENT
+          # ALTOGETHER. Guardrail ② pins the rows the tool TRIED and could not measure. This
+          # one pins the rows it has NO CHECK FOR and NO STATED REASON about -- the class the
+          # instrument reports as `§12 rows with neither a check nor a stated reason`. Such a
+          # row is a SILENT SKIP: nothing measures it and nothing says why, and until t188 that
+          # fact lived in metrics.json only, where no CI reader looks. Measured on run
+          # 37200876216 (head bb2d99ad): rows 60-71, twelve of §12's 77. The set is an
+          # EXPECTATION, exactly like the unmeasured set above -- if someone writes the missing
+          # reason (or a row leaves the contract), the set moves and THIS step is what wakes a
+          # human to update the pin with the new reading. An EMPTY set also reddens: the
+          # warning disappearing is not "no absent rows", it is the instrument no longer
+          # reporting on them.
+          EXPECTED_NO_REASON="60 61 62 63 64 65 66 67 68 69 70 71"
+          got_nr=$(norm "$no_reason_raw")
+          want_nr=$(norm "$EXPECTED_NO_REASON")
+          # ④ t188 -- THE REST OF THE INSTRUMENT'S WARNINGS, verbatim (sorted, joined), with
+          # the row-list warning EXCLUDED because ③ owns it. Pinned for the same reason as the
+          # unmeasured set: a warning that appears or disappears is a change in what the
+          # instrument claims about its own coverage, and a claim nobody reads is not a
+          # disclosure. Source: run 37200876216 (head bb2d99ad), 6 entries.
+          EXPECTED_WARN_SIG='#task skipped: could not resolve a task id (/api/v1/tasks empty or unreachable) | .nav-badge 本轮未渲染（inboxCount = 0）：它对白字 3.20:1 的对比度失败对本次审计不可见 —— 复测该行前必须先造出一条待处理权限 | chat/dark: hash mismatch: asked #chat, got #chat?agent=claude | chat/light: hash mismatch: asked #chat, got #chat?agent=claude | graph/dark: no content marker found (.graph-canvas) | graph/light: no content marker found (.graph-canvas)'
+          if [ "$got_nr" != "$want_nr" ]; then
+            {
+              echo ""
+              echo "### Guardrail ③ FAILED: the set of §12 rows with NEITHER a check NOR a stated reason moved"
+              echo ""
+              echo "- pinned expectation: \`#$want_nr\`"
+              echo "- this run observed: \`#$got_nr\`"
+              echo ""
+              echo "These rows are SILENT SKIPS: no check measures them and no reason is stated for"
+              echo "them. Moving the set is a red, not a remark -- either someone wrote the missing"
+              echo "reason (good: update the pin with this run as evidence) or a row was dropped,"
+              echo "renumbered or swallowed without anyone saying so (a defect in the contract or in"
+              echo "the instrument). An EMPTY set lands here too: it means the instrument stopped"
+              echo "reporting the class at all."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::the set of §12 rows with neither a check nor a stated reason moved: expected '#$want_nr', got '#$got_nr'"
+            exit 1
+          fi
+          want_ws_n=$(( $(printf '%s' "$EXPECTED_WARN_SIG" | tr -cd '|' | wc -c) + 1 ))
+          got_ws_n=0
+          if [ -n "$warn_sig" ]; then got_ws_n=$(( $(printf '%s' "$warn_sig" | tr -cd '|' | wc -c) + 1 )); fi
+          if [ "$warn_sig" != "$EXPECTED_WARN_SIG" ]; then
+            {
+              echo ""
+              echo "### Guardrail ④ FAILED: the instrument's warning set moved"
+              echo ""
+              echo "- pinned expectation ($want_ws_n entries):"
+              echo ""
+              echo '```'
+              printf '%s\n' "$EXPECTED_WARN_SIG" | sed 's/ | /\n/'
+              echo '```'
+              echo "- this run's signature ($got_ws_n entries; \`warn=$warn\` warnings in total, minus the one guardrail ③ pins):"
+              echo ""
+              echo '```'
+              printf '%s\n' "$warn_sig" | sed 's/ | /\n/'
+              echo '```'
+              echo ""
+              echo "A warning the instrument raises is a statement about its own coverage (a skipped"
+              echo "route, an unreachable hash, a blind spot it cannot see). A set that moved means"
+              echo "that statement changed -- update this pin from the run's \`disclosures.md\`"
+              echo "artefact if the change is intended, or fix the regression if it is not."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::the instrument's warning signature moved: expected $want_ws_n pinned entries, got a signature with $got_ws_n entries. Read disclosures.md (uploaded) and diff it against the pin in .github/workflows/audit.yml."
+            exit 1
+          fi
+
           {
             echo "### design-audit --check (advisory)"
             echo ""
             echo '```'
             if [ -n "$line" ]; then echo "$line"; else echo "[stdout carried no summary line: the log was truncated mid-report ($log_bytes bytes). The counts below come from metrics.json, which the tool writes BEFORE it prints the report (design-audit.mjs:8385 vs :8390).]"; fi
-            echo '```'
             echo ""
             echo "- audit exit code: **$exit_code** (advisory: recorded, not enforced)"
             echo "- counts source: **metrics.json** (structured artefact, complete even when the log is truncated); stdout summary line: $([ -n "$line" ] && echo present-and-agreeing || echo ABSENT) · log size: \`$log_bytes\` bytes"
@@ -416,6 +540,25 @@ jobs:
             echo "pinned, and the gate proves it can fail on every run."
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # ③④ t188 -- THE INSTRUMENT'S OWN COVERAGE DECLARATIONS, WHERE A CI READER CAN SEE
+          # THEM. Written by counts.cjs from metrics.json (verbatim, no paraphrase) and also
+          # uploaded as `disclosures.md`, so a reader who has only the CI page -- or only the
+          # artefact -- can see the same thing. This is the second layer of "a skip must be
+          # visible": ② prints the rows that were TRIED and not measured, this prints the rows
+          # that are ABSENT ALTOGETHER (no check, no reason), plus every route the instrument
+          # skipped and every blind spot it declares.
+          if [ -s "$DISCLOSURES" ]; then
+            cat "$DISCLOSURES" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::the disclosure file $DISCLOSURES was not written, so the instrument's own coverage declarations are missing from this run's summary. counts.cjs writes it before counts.env on purpose: a run whose disclosure cannot be published is not a green run."
+            exit 1
+          fi
+          {
+            echo "- rows with **neither a check nor a stated reason** (silent skips, pinned by guardrail ③): \`#$want_nr\`"
+            echo "- blind spots: \`blind=$blind\` published above and in \`disclosures.md\` (NOT pinned -- see the report's stated boundary: the list is the tool's own declaration of what it cannot measure, printed in full, and a pin I cannot re-verify against CI would redden the next audit run)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload the audit artefacts (always -- a failing run is the one worth keeping)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (2025-03-19)
@@ -428,6 +571,7 @@ jobs:
             ${{ runner.temp }}/counts.env
             ${{ runner.temp }}/counts.err
             ${{ runner.temp }}/counts.cjs
+            ${{ runner.temp }}/disclosures.md
             ${{ runner.temp }}/negctl
             ${{ runner.temp }}/daemon.log
           if-no-files-found: warn
