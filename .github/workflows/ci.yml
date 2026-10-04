@@ -257,12 +257,14 @@ jobs:
 
           # RUN by the step above (8). Their names are demanded there.
           covered=8
-          # DECLARED NOT COVERED here (8). CI has no ~/.ruagent database and no e5
-          # model; these instruments' subject IS the real history, so a synthetic
-          # fixture would not measure them (an empty copy is rejected by their own
-          # non-vacuity assertions, t33/t36) -- that is why they are named instead
-          # of faked.
-          declared_not_covered=8
+          # DECLARED NOT COVERED here (9). CI has no ~/.ruagent database, no real
+          # ~/.ruagent root and no e5 model; these instruments' subject IS the real
+          # history, so a synthetic fixture would not measure them (an empty copy is
+          # rejected by their own non-vacuity assertions, t33/t36) -- that is why they
+          # are named instead of faked. The ninth is memory's t75 inventory: it reads a
+          # NAMED real root, read-only, and is `#[ignore]`d since t165 so that its skip
+          # is counted here instead of passing on nothing.
+          declared_not_covered=9
           expected=$((covered + declared_not_covered))
 
           {
@@ -275,9 +277,10 @@ jobs:
             echo "| ignored test | disposition here |"
             echo "| --- | --- |"
             echo "| \`injection_e2e\`: 8 names | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`) |"
-            echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_…, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` = a migrated COPY of a real database (and for t25 a PRE-0024 copy). A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. |"
+            echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` (for live_copy_keeps_history_nullable and live_copy_bigram_backfill_at_scale) and \`RUAGENT_T25_LIVE_COPY\` (for live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, which needs a PRE-0024 copy) = migrated COPYs of a real database. A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. T6 and T25 must point at SEPARATE copies (t36). |"
             echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
             echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"
+            echo "| \`memory\`: the_real_root_inventory_is_read_when_it_is_named | NOT RUN: needs \`RUAGENT_T75_REAL_ROOT\` = a real ruagent root, read-only (it names that machine's backup files). Declared since t165: it used to print SKIPPED and return, which counted as \`passed\` while measuring nothing and which \`--ignored --list\` could not see. |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ "$found" -ne "$expected" ]; then

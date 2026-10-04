@@ -1937,16 +1937,24 @@ mod tests {
 
     /// The REAL machine, on request only: `RUAGENT_T75_REAL_ROOT` names a ruagent
     /// root, and this test prints each backup file with its size and how it was
-    /// judged. Read-only, and loud when it is not asked for (no silent skip).
+    /// judged. Read-only.
+    ///
+    /// ruagent-mem-gen2 t163/t165: it used to print `SKIPPED` and `return` when the
+    /// variable was absent -- so the aggregate counted it as **passed** while it had
+    /// measured nothing, AND, because it carried no `#[ignore]`, `cargo test --
+    /// --ignored --list` could not see it either. It is now the same shape as the
+    /// other instruments: `#[ignore]` (the count field says `ignored`, and the CI
+    /// manifest declares it) plus a body-head `expect` (running it with `-- --ignored`
+    /// and no root FAILS instead of passing on nothing).
+    #[ignore = "measures this machine's real backup inventory: needs \
+                RUAGENT_T75_REAL_ROOT=<a ruagent root> and runs with `-- --ignored`"]
     #[tokio::test]
     async fn the_real_root_inventory_is_read_when_it_is_named() {
-        let Ok(root) = std::env::var("RUAGENT_T75_REAL_ROOT") else {
-            println!(
-                "READING t75 real-root inventory SKIPPED: RUAGENT_T75_REAL_ROOT is not set \
-                 (set it to a ruagent root to read that machine's backups; nothing is written)"
-            );
-            return;
-        };
+        let root = std::env::var("RUAGENT_T75_REAL_ROOT").expect(
+            "this instrument has no state in which it passes without measuring: set \
+             RUAGENT_T75_REAL_ROOT=<a ruagent root> (read-only; it names that machine's \
+             backups) and run with `-- --ignored`",
+        );
         let root = std::path::PathBuf::from(root);
         let db = Db::open_in_memory().unwrap();
         let report = forget_report_at(&db, Some(&root), "no-such-hash-on-purpose")
@@ -1966,5 +1974,536 @@ mod tests {
         for line in &scan.inventory {
             println!("READING t75 real inventory {line}");
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // ruagent-mem-gen2 t163/t165 -- the three guards behind those findings.
+    //
+    // The gate t144/t65 built counts `#[ignore]`: it makes a skip VISIBLE in the
+    // count field and demands a declaration for it. t163 audited it and found the
+    // shape it cannot see -- a test that ANNOUNCES a skip and returns, which
+    // `--ignored --list` does not list and which the aggregate then counts as
+    // `passed`. One such test lived in this very file (it printed SKIPPED and
+    // returned); it is `#[ignore]`d above. Fixing the instance is the small half;
+    // these guards are the half that keeps it from coming back.
+    //
+    // Each guard carries the three parts a guard needs to be believably alive
+    // (B32): a SCANNING FLOOR (scanning nothing must FAIL -- a guard that reads no
+    // input passes for the wrong reason), a PLANTED CONTROL (a synthetic sample of
+    // exactly the forbidden shape must be REPORTED), and NAMED EXCLUSIONS with a
+    // reason each -- never "and then the test passed".
+
+    /// The repository root, from this crate's manifest dir. `expect` rather than a
+    /// fallback: a guard that quietly scans somewhere else is blind, and blind is
+    /// the failure mode this whole family exists to catch.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("the repository root must exist: these guards scan it")
+    }
+
+    /// Every `.rs` file under `<root>/<subdir>` as `(root-relative path, source)`,
+    /// sorted. The root is a PARAMETER so that the negative control can scan an
+    /// isolated temporary tree instead of the shared one.
+    fn rust_sources_under(root: &std::path::Path, subdir: &str) -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("a path under the repo root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let src = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                    out.push((rel, src));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&root.join(subdir), root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The forbidden shape found in a real tree: `path:line` for every hit.
+    fn skip_hits_in_tree(root: &std::path::Path) -> Vec<String> {
+        let mut hits = Vec::new();
+        for (path, src) in rust_sources_under(root, "crates") {
+            for line in skips_that_count_as_passed(&src) {
+                hits.push(format!("{path}:{line}"));
+            }
+        }
+        hits
+    }
+
+    /// Lines (1-based) where a test ANNOUNCES a skip and RETURNS without an
+    /// `#[ignore]` on the enclosing function -- the shape whose reading is `passed`
+    /// while nothing was measured.
+    ///
+    /// Shape, precisely: a NON-COMMENT line containing `println!` and `SKIPPED` or
+    /// `NOT MEASURED`, with a bare `return;` within the next six lines, inside a
+    /// function whose attribute block carries no `#[ignore]`. Comments are skipped
+    /// because this repository DESCRIBES the retired shape on purpose, and a
+    /// description is not the shape (see the named exclusions below).
+    fn skips_that_count_as_passed(src: &str) -> Vec<usize> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut hits = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains("println!") {
+                continue;
+            }
+            if !(line.contains("SKIPPED") || line.contains("NOT MEASURED")) {
+                continue;
+            }
+            if !lines[i + 1..].iter().take(6).any(|l| l.trim() == "return;") {
+                continue;
+            }
+            let fn_at = lines[..i].iter().rposition(|l| l.contains("fn "));
+            let ignored = fn_at.is_some_and(|at| {
+                lines[at.saturating_sub(8)..at]
+                    .iter()
+                    .any(|l| l.trim_start().starts_with("#[ignore"))
+            });
+            if !ignored {
+                hits.push(i + 1);
+            }
+        }
+        hits
+    }
+
+    /// The `Ignored-instrument manifest` step of `.github/workflows/ci.yml`,
+    /// verbatim. `expect`: no manifest means no accounting, and a guard cannot
+    /// certify accounting it did not read.
+    fn ci_manifest_step() -> String {
+        let path = repo_root().join(".github/workflows/ci.yml");
+        let yml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let start = yml
+            .find("Ignored-instrument manifest (what does NOT run here, and why)")
+            .expect("the manifest step must exist in ci.yml");
+        let rest = &yml[start..];
+        // The step ends at the first line indented LESS than 6 spaces -- i.e. the
+        // next job key (`  rust-windows:`) or a job-level comment. Everything inside
+        // this step is indented 6 (the `- name:` key), 8 (`run:`) or 10+ (its body).
+        // The first version of this rule cut at the first line indented >= 2, which
+        // matched the step's OWN `if: always()` line: the guard then read an empty
+        // declaration set. The scanning floor caught it (0 declared names) instead of
+        // letting the guard pass on nothing -- which is the whole reason the floor is
+        // asserted before the scan.
+        let mut end = rest.len();
+        let mut offset = 0;
+        for line in rest.split_inclusive('\n') {
+            if offset > 0 {
+                let bare = line.trim_end_matches(['\n', '\r']);
+                // A BLANK line is not a boundary: the step contains blank lines between
+                // its paragraphs, and treating them as `indent 0` cut the capture in
+                // half (the scanning floor reported 0 declared names -- again).
+                if !bare.trim().is_empty() {
+                    let indent = bare.len() - bare.trim_start_matches(' ').len();
+                    if indent < 6 {
+                        end = offset;
+                        break;
+                    }
+                }
+            }
+            offset += line.len();
+        }
+        rest[..end].to_string()
+    }
+
+    fn ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// Every `RUAGENT_*` token in `text`, deduplicated, in first-seen order.
+    ///
+    /// Iterates CHAR boundaries on purpose: a byte-wise `+1` walk lands inside a
+    /// multi-byte character (the elided name in the pre-t165 row ends in `…`) and
+    /// `&text[i..i + 7]` then panics on a non-boundary index. That is not academic --
+    /// the first version of this scanner died on exactly that input.
+    fn ruagent_names(text: &str) -> Vec<String> {
+        let bytes = text.as_bytes();
+        let mut out: Vec<String> = Vec::new();
+        for (i, _) in text.char_indices() {
+            if !text[i..].starts_with("RUAGENT") || (i > 0 && ident_byte(bytes[i - 1])) {
+                continue;
+            }
+            let mut j = i + 7;
+            while j < bytes.len() && ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let name = text[i..j].to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// Every `env::var("NAME")` name in `text`, deduplicated.
+    fn env_var_reads(text: &str) -> Vec<String> {
+        const NEEDLE: &str = "env::var(\"";
+        let mut out: Vec<String> = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find(NEEDLE) {
+            let after = &rest[at + NEEDLE.len()..];
+            if let Some(end) = after.find('"') {
+                let name = after[..end].to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            rest = after;
+        }
+        out
+    }
+
+    /// The mismatch set both ways, as a pure function so it can be given a planted
+    /// sample: names DECLARED but never read, and `_LIVE_COPY` names READ but never
+    /// declared. The second half is the one that catches a live-copy instrument
+    /// being added without a declaration.
+    fn manifest_mismatches(declared: &[String], reads: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in declared {
+            if !reads.contains(name) {
+                out.push(format!("declared but nothing reads it: {name}"));
+            }
+        }
+        for name in reads {
+            if name.ends_with("_LIVE_COPY") && !declared.contains(name) {
+                out.push(format!("read but never declared: {name}"));
+            }
+        }
+        out
+    }
+
+    /// Every `fn <name>` under the scanned tree, deduplicated. The advance past a
+    /// name stays on CHAR boundaries for the same reason `ruagent_names` does.
+    fn function_names(sources: &[(String, String)]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (_, src) in sources {
+            let bytes = src.as_bytes();
+            let mut from = 0;
+            while let Some(at) = src[from..].find("fn ") {
+                let start = from + at + 3;
+                let mut j = start;
+                while j < bytes.len() && ident_byte(bytes[j]) {
+                    j += 1;
+                }
+                if j > start {
+                    let name = src[start..j].to_string();
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+                from = if j > start { j } else { start } + 1;
+                while from < bytes.len() && !src.is_char_boundary(from) {
+                    from += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The test names the manifest's table declares, i.e. the tokens after
+    /// `` | `crate`: `` and before the next ` | `. The daemon row says "8 names"
+    /// instead of listing them (they are demanded in the step above), so tokens
+    /// containing " names" are not names.
+    fn declared_test_names(manifest: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for line in manifest.lines() {
+            let Some(at) = line.find("`: ") else { continue };
+            if !line.trim_start().starts_with("echo \"|") {
+                continue;
+            }
+            let Some(end) = line[at + 3..].find(" |") else {
+                continue;
+            };
+            for token in line[at + 3..at + 3 + end].split(", ") {
+                let token = token.trim();
+                if !token.is_empty() && !token.contains(" names") {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Declared names that do not resolve to exactly ONE function under `crates/`.
+    /// A name that resolves to none is fiction; one that resolves to several is not
+    /// a location. Both are why a reader cannot follow the declaration.
+    fn unresolved_names(declared: &[String], fns: &[String]) -> Vec<String> {
+        declared
+            .iter()
+            .filter(|name| fns.iter().filter(|f| f.contains(*name)).count() != 1)
+            .cloned()
+            .collect()
+    }
+
+    /// NAMED EXCLUSIONS (B32 part 3). These files mention the markers in COMMENTS,
+    /// so the comment rule above already skips them -- the marker check below keeps
+    /// this list from rotting into fiction, and each reason says what the mention
+    /// actually is. None of them may ever be "and then the test passed".
+    const SKIP_MENTION_EXCLUSIONS: &[(&str, &str, &str)] = &[
+        (
+            "crates/memory/src/lifecycle.rs",
+            "SKIPPED",
+            "comment: `-shm`/`-wal` are SKIPPED as SQLite sidecars of a copy",
+        ),
+        (
+            "crates/store/src/fts.rs",
+            "SKIPPED",
+            "doc comment: NON-HAN TERMS ARE SKIPPED on purpose in the bigram index",
+        ),
+        (
+            "crates/daemon/src/memembed.rs",
+            "SKIPPED",
+            "code comment: an unresolvable group scope is SKIPPED, never guessed",
+        ),
+        (
+            "crates/store/src/lib.rs",
+            "NOT MEASURED",
+            "doc comment describing the RETIRED t33 shape this guard is about",
+        ),
+        (
+            "crates/store/src/migrations.rs",
+            "NOT MEASURED",
+            "doc comments describing the RETIRED t33 shape",
+        ),
+        (
+            "crates/knowledge/tests/retrieval-gold-copy.rs",
+            "NOT MEASURED",
+            "doc comment describing the RETIRED shape it was changed out of",
+        ),
+        (
+            "crates/knowledge/tests/retrieval-gold-live.rs",
+            "NOT MEASURED",
+            "doc comment describing the RETIRED shape it was changed out of",
+        ),
+    ];
+
+    /// F3: no test may announce a skip and return while staying outside the count.
+    #[test]
+    fn no_test_announces_a_skip_and_returns_without_being_ignored() {
+        let root = repo_root();
+        let sources = rust_sources_under(&root, "crates");
+        assert!(
+            sources.len() >= 100,
+            "only {} .rs files scanned under crates/ -- the guard is blind, and a \
+             blind guard is the failure this family exists to catch",
+            sources.len()
+        );
+        let hits = skip_hits_in_tree(&root);
+        assert!(
+            hits.is_empty(),
+            "a test prints SKIPPED/NOT MEASURED and returns without `#[ignore]`: the \
+             aggregate then counts it as `passed` and `--ignored --list` does not list \
+             it, so the skip is invisible (ruagent-mem-gen2 t163). Either make it \
+             `#[ignore]` (so it enters the manifest and the CI count) or assert. Sites: {hits:?}"
+        );
+
+        // PLANTED CONTROLS, through the REAL tree scan on an ISOLATED root -- so the
+        // red proof costs the shared tree nothing. The sample text is ASSEMBLED
+        // rather than written literally so that this guard's own source is not a hit.
+        let marker = format!("SKI{}D: nothing to measure", "PPE");
+        let planted_body = format!(
+            "#[test]\nfn planted() {{\n    pr{}!(\"{marker}\");\n    return;\n}}\n",
+            "intln"
+        );
+        let ignored_body = format!(
+            "#[ignore = \"needs a real root\"]\n#[test]\nfn planted_ignored() {{\n    \
+             pr{}!(\"{marker}\");\n    return;\n}}\n",
+            "intln"
+        );
+        let scratch = std::env::temp_dir().join(format!(
+            "ruagent-mem-gen2-t165-control-{}",
+            std::process::id()
+        ));
+        let planted_dir = scratch.join("crates").join("planted").join("src");
+        std::fs::create_dir_all(&planted_dir).expect("creating the isolated control tree");
+        std::fs::write(planted_dir.join("lib.rs"), &planted_body).expect("planting the shape");
+
+        let control_hits = skip_hits_in_tree(&scratch);
+        assert_eq!(
+            control_hits,
+            vec!["crates/planted/src/lib.rs:3".to_string()],
+            "the tree scan MUST report the planted shape (line 3 of the isolated tree), \
+             or this guard cannot fail"
+        );
+
+        // ...and the exemption the fix relies on must keep it quiet.
+        std::fs::write(planted_dir.join("lib.rs"), &ignored_body)
+            .expect("planting the ignored shape");
+        assert!(
+            skip_hits_in_tree(&scratch).is_empty(),
+            "an `#[ignore]`d skip is the DECLARED shape and must not be reported"
+        );
+        std::fs::remove_dir_all(&scratch).expect("removing the isolated control tree by name");
+
+        // NAMED EXCLUSIONS: each must still be a comment, not a shape.
+        for (path, marker, reason) in SKIP_MENTION_EXCLUSIONS {
+            let (_, src) = sources.iter().find(|(p, _)| p == path).unwrap_or_else(|| {
+                panic!("exclusion names {path}, which no longer exists: {reason}")
+            });
+            assert!(
+                src.lines()
+                    .any(|l| l.trim_start().starts_with("//") && l.contains(marker)),
+                "{path} no longer carries `{marker}` in a comment, so this named \
+                 exclusion has rotted: {reason} -- update the list (or the file), do \
+                 not delete the guard"
+            );
+        }
+    }
+
+    /// F1: the manifest's declared `RUAGENT_*` names and the tree's reads must agree.
+    #[test]
+    fn the_manifest_declares_exactly_the_variables_the_instruments_read() {
+        let manifest = ci_manifest_step();
+        let sources = rust_sources_under(&repo_root(), "crates");
+        assert!(
+            sources.len() >= 100,
+            "only {} .rs files scanned -- the guard is blind",
+            sources.len()
+        );
+        let declared = ruagent_names(&manifest);
+        let reads: Vec<String> = sources.iter().flat_map(|(_, src)| env_var_reads(src)).fold(
+            Vec::new(),
+            |mut acc, name| {
+                if !acc.contains(&name) {
+                    acc.push(name);
+                }
+                acc
+            },
+        );
+        assert!(
+            declared.len() >= 4 && reads.len() >= 4,
+            "the guard read {} declared names and {} reads -- too few to mean anything. \
+             The manifest step captured {} bytes / {} lines, starting {:?}",
+            declared.len(),
+            reads.len(),
+            manifest.len(),
+            manifest.lines().count(),
+            manifest.lines().next().unwrap_or("")
+        );
+        let mismatches = manifest_mismatches(&declared, &reads);
+        assert!(
+            mismatches.is_empty(),
+            "the CI manifest and the instruments disagree (ruagent-mem-gen2 t163 F1): \
+             a name in the table that nothing reads sends the next reader to a variable \
+             that does not exist, and an undeclared `_LIVE_COPY` instrument is a skip \
+             nobody accounted for. {mismatches:?}"
+        );
+
+        // PLANTED CONTROLS, both directions, on synthetic text.
+        assert_eq!(
+            manifest_mismatches(
+                &["RUAGENT_T25_LIVE_COPY".to_string()],
+                &["RUAGENT_T6_LIVE_COPY".to_string()]
+            ),
+            vec![
+                "declared but nothing reads it: RUAGENT_T25_LIVE_COPY".to_string(),
+                "read but never declared: RUAGENT_T6_LIVE_COPY".to_string(),
+            ],
+            "the F1 checker must report BOTH directions"
+        );
+        assert!(
+            manifest_mismatches(
+                &["RUAGENT_T25_LIVE_COPY".to_string()],
+                &["RUAGENT_T25_LIVE_COPY".to_string()]
+            )
+            .is_empty(),
+            "an agreeing pair must stay quiet"
+        );
+
+        // THE HISTORICAL DEFECT, as text (t163 F1): the pre-t165 store row named only
+        // `RUAGENT_T6_LIVE_COPY` while the third instrument reads `RUAGENT_T25_LIVE_COPY`.
+        // The checker must call that out -- this is the guard's red proof, and it needs
+        // no mutation of the shared tree because the pre-fix text is the sample.
+        let pre_fix_row = "echo \"| \\`store\\`: live_copy_keeps_history_nullable, \
+                           live_copy_upgrades_…, live_copy_bigram_backfill_at_scale | \
+                           NOT RUN: needs \\`RUAGENT_T6_LIVE_COPY\\` = a migrated COPY. |\"";
+        let reads_now = vec![
+            "RUAGENT_T6_LIVE_COPY".to_string(),
+            "RUAGENT_T25_LIVE_COPY".to_string(),
+        ];
+        assert_eq!(
+            manifest_mismatches(&ruagent_names(pre_fix_row), &reads_now),
+            vec!["read but never declared: RUAGENT_T25_LIVE_COPY".to_string()],
+            "the pre-fix row must be reported, or this guard would not have caught F1"
+        );
+        assert!(
+            !ruagent_names(pre_fix_row).contains(&"RUAGENT_T25_LIVE_COPY".to_string()),
+            "sanity: the pre-fix row really did not name T25"
+        );
+    }
+
+    /// F2: every test name the manifest declares must resolve to one function.
+    #[test]
+    fn every_test_name_the_manifest_declares_resolves_to_one_function() {
+        let manifest = ci_manifest_step();
+        let sources = rust_sources_under(&repo_root(), "crates");
+        let fns = function_names(&sources);
+        assert!(
+            fns.len() >= 1000,
+            "only {} function names collected -- the guard is blind",
+            fns.len()
+        );
+        let declared = declared_test_names(&manifest);
+        assert!(
+            declared.len() >= 8,
+            "the manifest's table declared only {} test names -- the parser or the \
+             table changed shape. The step captured {} bytes / {} lines; table rows \
+             recognised: {}",
+            declared.len(),
+            manifest.len(),
+            manifest.lines().count(),
+            manifest
+                .lines()
+                .filter(|l| l.trim_start().starts_with("echo \"|"))
+                .count()
+        );
+        let unresolved = unresolved_names(&declared, &fns);
+        assert!(
+            unresolved.is_empty(),
+            "a declared ignored test does not resolve to exactly one function under \
+             crates/ (ruagent-mem-gen2 t163 F2): a name that resolves to none is \
+             fiction, one that resolves to several is not a location, and an ELIDED \
+             name (`live_copy_upgrades_…`) reads as declared while being \
+             unfollowable. {unresolved:?}"
+        );
+
+        // PLANTED CONTROL: the elided form must be reported, the full one must not --
+        // and the pre-t165 row is the sample, so the proof needs no tree mutation.
+        let full = "live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt";
+        assert_eq!(
+            unresolved_names(&["live_copy_upgrades_…".to_string()], &[full.to_string()]),
+            vec!["live_copy_upgrades_…".to_string()],
+            "the elided name must be reported"
+        );
+        assert!(
+            unresolved_names(&[full.to_string()], &[full.to_string()]).is_empty(),
+            "the full name must resolve"
+        );
+        let pre_fix_row = "            echo \"| \\`store\\`: live_copy_keeps_history_nullable, \
+                           live_copy_upgrades_…, live_copy_bigram_backfill_at_scale | NOT RUN |\"";
+        assert_eq!(
+            unresolved_names(
+                &declared_test_names(pre_fix_row),
+                &[
+                    full.to_string(),
+                    "live_copy_keeps_history_nullable".to_string(),
+                    "live_copy_bigram_backfill_at_scale".to_string(),
+                ]
+            ),
+            vec!["live_copy_upgrades_…".to_string()],
+            "the pre-fix row's elided name must be reported as unfollowable"
+        );
     }
 }
