@@ -94,8 +94,28 @@ switch ($Action) {
     $startup.ShowWindow = 0
     $res = ([wmiclass]'Win32_Process').Create($cmd, $null, $startup)
     if ($res.ReturnValue -ne 0) { throw "Win32_Process.Create failed: $($res.ReturnValue)" }
+    # t164: the health poll is the ONLY evidence that the daemon actually came up,
+    # and its outcome used to be DISCARDED -- an unhealthy start still printed
+    # `started ...` and exited 0, so a caller (or a person) reading the green line
+    # concluded "ready" while nothing was listening. Form (b): the word "started"
+    # is printed only once health has answered, because "started" is a claim about
+    # the daemon, not about the WMI call. The identity of the launched process is
+    # printed in BOTH paths on purpose: pid and log path are the WMI call's only
+    # return value, and dropping them from the failure path would be losing
+    # information, not adding rigour.
+    $healthy = $false
+    $healthStart = Get-Date
+    for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Test-Health) { $healthy = $true; break } }
+    if (-not $healthy) {
+      # Elapsed is MEASURED, not assumed: Test-Health has a 5s ceiling of its own,
+      # so a port held by a listener that accepts but never answers stretches this
+      # loop past the 20x500ms the sleeps alone would suggest.
+      $waited = [int]((Get-Date) - $healthStart).TotalSeconds
+      Write-Output "NOT healthy after ${waited}s (pid=$($res.ProcessId) log=$logPath) -- nothing answered $health. The process may have exited (read the log) or another listener may hold $Addr."
+      exit 1
+    }
     Write-Output "started pid=$($res.ProcessId) log=$logPath"
-    for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Milliseconds 500; if (Test-Health) { Write-Output 'health ok'; break } }
+    Write-Output 'health ok'
   }
   'stop' {
     # Only the pid recorded by the daemon itself: never a name or port sweep.

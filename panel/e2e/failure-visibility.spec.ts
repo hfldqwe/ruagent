@@ -174,8 +174,21 @@ test("P2 success control: 200 + [] shows no error text, and the view is byte-sta
   await page.route(RECALL_LOG, (r) =>
     r.fulfill({ status: 200, contentType: "application/json", body: EMPTY_LOG }),
   );
+  // t164 (E7): the two assertions below are ABSENCES, and an absence read off a
+  // page that has not rendered yet is the same observation as a product that is
+  // fine -- the old shape slept 1200ms and hoped. The audit view fetches its own
+  // data on mount (`GET /api/v1/memory/diffs`, Memory.tsx AuditView) and then
+  // shows exactly one terminal state, so waiting for that outcome is the positive
+  // anchor: it is attached BEFORE the click, so the response cannot be missed.
+  const auditLoaded = page.waitForResponse(
+    (r) => r.url().includes("/api/v1/memory/diffs") && r.status() === 200,
+    { timeout: 10_000 },
+  );
   await openAuditLog(page);
-  await page.waitForTimeout(1200);
+  await auditLoaded;
+  await expect(
+    page.locator(".content .card, .content .ant-empty, .content .error-state").first(),
+  ).toBeVisible();
 
   const view = content(page);
   const body = (await view.innerText()).replace(/\s+/g, " ");
@@ -247,7 +260,12 @@ test("P3 success control: a real 0 models is 'not probed', not an error, and byt
   );
   await page.goto("/#runtimes");
   await expect(cardOf(page, RT)).toBeVisible({ timeout: 15_000 });
-  await page.waitForTimeout(1800);
+  // t164 (E9, was `waitForTimeout(1800)`): this was a ② stacked on top of an
+  // already-correct wait -- `toBeVisible` proved the CARD existed, not that the
+  // probe's "0 models" answer had reached its own text. Waiting for that text is
+  // the fact (the same idiom the sibling test above uses for the failure chip),
+  // and it makes the two negative assertions below read off a SETTLED card.
+  await expect(cardOf(page, RT)).toHaveText(/未探测|not probed/, { timeout: 15_000 });
 
   const text = await cardText(page, RT);
   const body = (await content(page).innerText()).replace(/\s+/g, " ");

@@ -349,14 +349,42 @@ test("an out-of-range capability option is refused in #settings without reaching
   // The browser's own request log. "Refused locally" has to mean "no PUT went
   // out", and counting requests is the only way to read that -- the config after
   // a local refusal and after a daemon 400 look identical on disk.
+  //
+  // t164 (E10): an ABSENCE is only a reading if the instrument is shown to work
+  // in the same run -- otherwise "no PUT was sent" and "this listener saw
+  // nothing at all" are the same observation, and the test passes when it is
+  // broken. Two things are deliberately NOT done here:
+  //   * the positive control is NOT the `finally`'s restore: that goes through
+  //     `request.put(...)` (an APIRequestContext), which `page.on("request")`
+  //     cannot see -- it would never appear in `puts`;
+  //   * it is NOT a UI-driven PUT either: a real PUT is a real write to the
+  //     daemon's `policy.toml`, i.e. exactly the residue class this repo has had
+  //     to clean up before.
+  // So the control is ZERO-WRITE: the same URL, any method. The panel renders the
+  // capability editor from `GET /api/v1/capabilities`, so a page-issued request on
+  // THIS url must be observed before the editor can even appear; if the listener
+  // or that fetch is broken, the poll below fails and names it.
+  const capsRequests: string[] = [];
   const puts: string[] = [];
   page.on("request", (req) => {
-    if (req.method() === "PUT" && req.url().includes("/api/v1/capabilities")) puts.push(req.url());
+    if (!req.url().includes("/api/v1/capabilities")) return;
+    capsRequests.push(`${req.method()} ${req.url()}`);
+    if (req.method() === "PUT") puts.push(req.url());
   });
 
   await page.goto("/#settings");
   const editor = page.locator(`[data-options-for="${REFUSED_ROW}"]`);
   await expect(editor).toBeVisible({ timeout: 10_000 });
+  // The positive control, asserted where it is already guaranteed (the editor is
+  // on screen, so its data must have been fetched): ≥1 page-issued request to
+  // this URL means the collector works, so the narrow absence below is a reading.
+  await expect
+    .poll(() => capsRequests.length, {
+      timeout: 10_000,
+      message:
+        "the page issued no request to /api/v1/capabilities, so this collector cannot see ANY request there: an empty `puts` below would be unreadable, not a pass",
+    })
+    .toBeGreaterThan(0);
   const input = editor.locator(`[data-option="${REFUSED_KEY}"] .capability-option-input`);
   await expect(input).toBeVisible();
   await input.fill(REFUSED_TEXT);
@@ -372,8 +400,15 @@ test("an out-of-range capability option is refused in #settings without reaching
   // Nothing the user typed is lost by a refusal.
   await expect(input).toHaveValue(REFUSED_TEXT);
 
-  // The request event is delivered over CDP, so give it a beat before reading an
-  // ABSENCE -- a bounded wait on a negative assertion, not a sync crutch.
+  // The request event is delivered over CDP, and a PUT that the app *would* have
+  // sent is dispatched from the click handler -- so the absence is still read
+  // after a bounded window. What changed in t164 is that the window is no longer
+  // the ONLY thing standing behind the claim: the collector above has been shown
+  // to see this URL in this run, and this read prints what it did see, so a
+  // failure is diagnosable instead of looking like a bare timing guess.
   await page.waitForTimeout(500);
+  console.log(
+    `DOM READING E10 caps requests seen: ${JSON.stringify(capsRequests)} | PUTs: ${JSON.stringify(puts)}`,
+  );
   expect(puts, "a value refused before the request must never be sent").toEqual([]);
 });
