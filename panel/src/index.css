@@ -659,6 +659,17 @@ h3.sec {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* ruagent-mem-gen2 t162 (audit row 18 -- hit targets): a .tag that is a BUTTON is a
+   control, not a label, so it owes the 24px hit-target floor. The chip arithmetic above (11px /
+   line-height 16 / 2x2 padding = 20px) is the design's own for the span labels and
+   stays untouched -- this matches `button.tag` only, i.e. the two retry affordances
+   that became real buttons (t103's #runtimes "探测失败 · 重试", t128's MCP third state
+   on #agents). Measured before: 102x20 on both, 20 < 24 = the floor row 18 names.
+   padding-block, not min-height: min-height would leave the single 16px line at the
+   top of the box (text 2px from the top, 10px from the bottom); 16 + 2x4 = 24 keeps
+   the label vertically centred -- the same 4px block padding the row-18 fix below
+   already uses for `.hint summary`. */
+button.tag { padding-block: 4px; }
 /* Inside row layouts, cap tags so they never displace the title. */
 .row-btn .tag, .row .tag { max-width: 40%; }
 /* Phones: secondary metadata (counts, timestamps) yields so the name
@@ -1923,6 +1934,25 @@ button.ant-btn:focus-visible, button.ant-switch:focus-visible,
    tier is the standard height, so pin it there too - min-height, so a Select
    that legitimately holds more still grows. */
 .ant-select-sm { min-height: 32px; }
+/* ruagent-mem-gen2 t162 (audit row 18 -- hit targets): the Switch is a control root and
+   antd's track is 24px tall by default (measured 48x24 on all 13 switches of
+   #settings), so every one
+   of them lands in row 18's <32px bucket: that route's CONTENT-area count was 13
+   against a cap of 10, while the <24px floor was already met (24 is not < 24).
+   §12.7.2 already ruled that the switch's short height is to be CHANGED rather than
+   exempted, and .ant-select-outlined / .ant-select-sm above already pin the standard
+   control on 32px, so the Switch joins them. min-height (not height) so a switch that
+   legitimately holds more can still grow; antd declares an explicit height here, and
+   min-height wins over it, so this needs no !important.
+   The handle is absolutely positioned at a fixed 2px from the top (measured
+   inset-block-start: 2px, transform: none), which would leave it high of centre inside
+   a 32px track -- and an off-centre knob is a visual defect the row-18 fix must not
+   create. Re-centring uses the two properties antd leaves free: transform is `none`
+   on the handle, and the checked state moves it horizontally with inset-inline-start,
+   which this does not touch. Scope: every Switch in the panel, which is the point --
+   row 18 measures control boxes, not one view's layout. */
+.ant-switch { min-height: 32px; }
+.ant-switch .ant-switch-handle { inset-block-start: 50%; transform: translateY(-50%); }
 /* Inside the scrolling palette an outline drawn outside the box is clipped,
    so options ring inward. .cmdk-item is a frozen e2e selector: only its ring
    changed, never its name. */
