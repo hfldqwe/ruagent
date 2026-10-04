@@ -1,6 +1,7 @@
 # 首次 CI 读数收口：护栏的计数改从 `metrics.json` 来（t143）
 
 > 单号 **t143**（repair，成员 `wiki`）· attempt 1 · **2026-10-04 01:2x–02:0x（+08:00）**
+> **追加（2026-10-04，t143 结单之后）**：§1b 与 §7 已用**第二次运行** `37141491947` 的工件读数补成**实测**（读数由 captain 从工件提供）。**只改本报告**：`audit.yml` 与 `gen4-audit-gate-impl.md` 在结单后**未再动**；门禁已在**最终字节**上重跑（§9 末行）。
 > inScope 与实改：`.github/workflows/audit.yml`（**+134/−31**，443 行）· 本报告 · `docs/design/reviews/gen4-audit-gate-impl.md`（带日期的修订记录）。**未改** `crates/**`、`panel/**`（含 `panel/tools/**`）、`scripts/**`、`ci.yml`、`e2e.yml`、`release.yml`。
 > 纪律：**未** push / dispatch / rerun / cancel；**未**跑 rust 构建；未碰 8787。
 
@@ -22,10 +23,21 @@
 | `audit.log` | **67,938 B**，**在一句话中间被截断**（末行 `**⚠️ 这是惯例阈值**：**CIE76 的 JND ≈ 2.3 `） |
 | 计时 | 审计步 `16:48:30 → 16:58:33` = **10m03s**；单次捕获 **23.7s**（`[audit] dark home: 23745ms`） |
 
-**由此可判定的两件事（不是推测，是这次读数直接蕴含的）**：
-1. **护栏 ②（未测集与 pin 相同）本该绿**：CI 的未测集与 pin **逐项相同**；
-2. **护栏 ④（`judged == 65`）本该绿**：`metrics.json` 的 `checks total` 就是 65。
-它们没跑起来，是因为 ① 先 `exit 1` —— **红的是接线**。这一点我在本地用同一份「artefact 完整 + stdout 被截断」的输入**跑成了 0**（§5 格子 6），不是口头承诺。
+**⇒ 由此可判定的两件事（不是推测，是这次读数直接蕴含的）**：**②（未测集与 pin 相同）本该绿**、**④（`judged == 65`）本该绿**；它们没跑起来是因为 ① 先 `exit 1` —— **红的是接线**。这一点我在本地用同一份「artefact 完整 + stdout 被截断」的输入**跑成了 0**（§5 格子 6），不是口头承诺。
+
+## 1b 第二次运行 = t143 修复的 CI 验证（**实测**；run `37141491947`）
+
+`workflow_dispatch`，ref `main` = **`b1c59e7`**（含 t143 的字节）：**`completed` · `success` · 16m51s**；12 步全 `✓`，其中 **`✓ Design audit --check (ADVISORY)`**、**`✓ Guardrails`**、`✓ Upload`、`✓ Record the verdict`。工件 `design-audit` 的读数（captain 下载后提供）：
+
+| 工件 | 读数 | 含义 |
+| --- | --- | --- |
+| `audit.exit` | **1** | advisory 判定 = 1 —— 与首次 CI 相同（产品侧仍是 10 fail / 10 not measured） |
+| `counts.env` | `captures=24` · `checks=65` · `pass=45` · `fail=10` · `unmeas=10` · `pending=0` · **`judged=65`** · `failing='4, 6, 7, 12, 13, 14, 18, 20, 38, 75'` · `observed_raw='25 28 31 33 46 47 49 50 54 77'` | **护栏第一次在 CI 上拿到结构化计数**；未测集**逐项命中 pin**（⇒ ② 绿）、`judged == 65`（⇒ ④ 绿） |
+| `counts.err` | **0 B** | 读取器没有报错 ⇒ 「路径不同」那条嫌疑**不必再查**（它在 CI 上就是同一个 `$RUNNER_TEMP/audit/metrics.json`） |
+| `audit.log` | **67,938 B** | **与首跑被截断的字节数【完全相同】** ⇒ 截断**不是随机的** |
+| 护栏步自报 | 走了**第二支**：`counts source=metrics.json (structured) · stdout summary line ABSENT (log <N> bytes, truncated mid-report …)` | 正是我在本地格子 6 跑出来的那一行 ⇒ **本地复现的接线行为与 CI 一致** |
+
+⇒ **t143 的修法在 CI 上成立**：同一个「artefact 完整 + stdout 被截断」的形状，**首跑红（护栏 ①）、本次绿**，且 ②④ 的判据都直接可读。
 
 ## 2 载体差异的精确边界（这条要写清）
 
@@ -97,12 +109,22 @@
 
 ## 7 未覆盖什么
 
-1. **截断的原因未定**（§3 第 4 条）：进程死亡 vs 载体截断，本机无法判定；新护栏已把回答它需要的工件（`log_bytes`、`counts.err`、`audit.exit`、`counts.env`）写进 summary 与 artifact ⇒ 下一次 CI 运行可答。
-2. **我没有下载那个 run 的 artifacts**（不许 dispatch；也没用 `gh` 拉工件）⇒ §1 的 CI 数字是**转述**，而 §5 的格子是照同一份数字在我的机器上**复现**的。
-3. **本机跑护栏需要一个 node 桥接**（诚实披露）：这台机器唯一的 bash 是 WSL，里面**没有 Linux node**；WSL interop 能按绝对路径执行 Windows 的 `node.exe`，但**不翻译 argv 里的 `/mnt/c/...` 路径**（cwd 会翻译）。所以我给本地 harness 加了一个 `node` shim（`cd` 到脚本目录并传**相对路径**）。**CI 不需要它**（setup-node 把 node 放进 PATH）⇒ shim 只影响「本地怎么跑」，不影响脚本逻辑；但「在真正的 Linux node 上跑」这一条我**没有**在本地复现。
-4. **`panel/tools/**` 未动**：选项 ② 的配方见 §4，仍待 captain 决定是否另立单。
-5. **护栏 ③（负控）的改造未做**：它今天只断言「死端口 ⇒ exit 2 + 点名」（`audit.exit` 与 stdout 都够用）；我没有把它也改成读 artefact —— 因为它的失败输出只有两行、CI 上从未被截断（本次证据里它是绿的）。登记为**观察项**，不是缺口。
-6. **`metrics.json` 的 schema 未加版本断言**：新的读取器要求 `checks[].n` 是数字、`checks[].verdict` ∈ {pass, fail, not_measured, pending}（缺一个就红，格子 8 的邻居）；但**没有**校验 `meta`/`contract` 等字段。数值口径若变（例如 verdict 改名），这道护栏会红——那是**设计**（宁可红也不静默读错）。
+1. **截断的原因 —— 已把读数补成实测，但仍未定案（诚实状态）**。实测：`audit.exit = 1`、`audit.log = 67,938 B`（**两次独立 `workflow_dispatch` 逐字节相同**）、汇总行缺席、`metrics.json`/`counts.env` 完整。按我**事先登记**的决策表（在第二次运行之前发给 captain 的那张），这落在**「不可分」**那一格：
+   | `audit.exit` | 日志 | 汇总行 | 含义 |
+   | --- | --- | --- | --- |
+   | **1** | **67,938 B（两次同值）** | **无** | **① 进程跑完返回判定 1，载体丢了尾巴** ↔ **② 进程在打印中途撞 EPIPE（写端消失），Node 未捕获的流错误默认也是 exit 1** —— **两者同码，工件分不开** |
+   | 137/139/143 | — | 无 | 进程被杀 ⇒ 进程死亡（**本次不是**） |
+   | 2 | — | 无 | 工具自己的 catch ⇒ 进程死亡（**本次不是**） |
+   ⇒ **确定性**（两次同值）**不利于**「OOM/被杀」这类随机死亡；但它**本身不能**把 ① 与 ② 分开。
+2. **我试过一次机制实验，结果是【负】的（如实登记）**：假设是「Node 对**管道**是异步写，`process.exit()` 会丢掉未刷完的尾部；对**文件**是同步写，所以不丢」。用真 Node（**v24.13.0**）与真实的字节管道测了 **7 次**（`cmd.exe` 管道两端都是显式 `node.exe`；载荷 56.5 kB 与 **192.9 kB**；快速消费者 `tee` 与**慢消费者** `sleep 2; cat`；`process.exit(1)` 与 `process.exitCode=1` 两种收尾）⇒ **每一次都完整送达（含汇总行），file-redirect 参考值也相同** ⇒ **该机制在这台机器（Windows）上【不复现】**。Linux 侧的管道语义**我无法在本机测**（本机没有 Linux node）⇒ 这条假设**既未被推翻、也未被证实**；它的判据仍是 captain 定的「**C 项落地后再点一次 dispatch**」。
+3. **两个决定性探针（我登记，未动手；都需要改 `.github/workflows/audit.yml` 的审计步 ⇒ 由 captain 决定是否立单）**：
+   - **C**：把 `node … 2>&1 | tee "$RUNNER_TEMP/audit.log"` 换成**不经管道**的 `node … > "$RUNNER_TEMP/audit.log" 2>&1`（`PIPESTATUS[0]` 换成 `$?`）。⇒ 若日志变完整：机制是**管道/刷写**；若**仍然截断**：机制在**文件侧/工具侧的写入**，与管道无关。
+   - **D（更便宜，且能与 C 同时做）**：在管道后加一行 `echo "tee-exit=${PIPESTATUS[1]}"`。⇒ **tee 非 0**（如 141）说明**下游先断**（node 的 stdout 被关 ⇒ EPIPE 一侧）；**tee = 0 而文件仍短**说明是 **node 侧的写端提前结束**。这一行把 ① 与 ② 直接分开。
+4. **我没有下载那个 run 的 artifacts**（不许 dispatch；也没用 `gh` 拉工件）⇒ §1 的首次读数与 §3 的第 1 条都是**转述**；§1b 的第二次读数同样是 captain 下载后转述的。我亲手做的是：**照同一份数字在本地复现形状**（§5 全部格子）与**两次运行间的一致性核对**（未测集/判定集一字不差、日志字节数相同）。
+5. **本机跑护栏需要一个 node 桥接**（诚实披露）：这台机器唯一的 bash 是 WSL，里面**没有 Linux node**；WSL interop 能按绝对路径执行 Windows 的 `node.exe`，但**不翻译 argv 里的 `/mnt/c/...` 路径**（cwd 会翻译）。所以我给本地 harness 加了一个 `node` shim（`cd` 到脚本目录并传**相对路径**）。**CI 不需要它**（setup-node 把 node 放进 PATH）⇒ shim 只影响「本地怎么跑」，不影响脚本逻辑；但「在真正的 Linux node 上跑」这一条我**没有**在本地复现。§2 第 2 条那条机制实验后半段我把管道两端都换成**显式的 `C:\Dev\NodeJs\node.exe`**（不再经过 shim），所以那 7 次读数的 node 身份是确定的。
+6. **`panel/tools/**` 未动**：选项 ② 的配方见 §4，仍待 captain 决定是否另立单。
+7. **护栏 ③（负控）的改造未做**：它今天只断言「死端口 ⇒ exit 2 + 点名」（`audit.exit` 与 stdout 都够用）；我没有把它也改成读 artefact —— 因为它的失败输出只有两行、CI 上从未被截断（两次运行里它都是绿的）。登记为**观察项**，不是缺口。
+8. **`metrics.json` 的 schema 未加版本断言**：新的读取器要求 `checks[].n` 是数字、`checks[].verdict` ∈ {pass, fail, not_measured, pending}（缺一个就红，格子 8 的邻居）；但**没有**校验 `meta`/`contract` 等字段。数值口径若变（例如 verdict 改名），这道护栏会红——那是**设计**（宁可红也不静默读错）。
 
 ## 8 逐行分类（我动过的每一行）
 
@@ -136,4 +158,11 @@
 
 - **写入集合**：`.github/workflows/audit.yml`、本报告、`docs/design/reviews/gen4-audit-gate-impl.md`（修订记录）。其余 `git status` 条目都是队友的在途交付。
 - **未** push / dispatch / rerun / cancel；**未**跑 rust 构建；**未**碰 8787（本单不需要 daemon；唯一一次起进程是我自己的 python stub，已停并核对 `8898 listening: False`）。
-- 临时项：`%TEMP%\t143`（提取脚本、9 个 run 块、10 个格子、wrapper、node shim、stub）—— 收尾按**具体路径**删除。
+- 临时项：`%TEMP%\t143`（提取脚本、9 个 run 块、10 个格子、wrapper、node shim、stub）与 `%TEMP%\t143b`（机制实验的 writer/harness）—— 收尾按**具体路径**删除。
+
+**结单后的追加编辑（按 t20 的义务披露）**：本次只改了**本报告**（§1b 新增、§7 第 1–3 条补成实测并登记两个探针、§0 未动），`audit.yml` 与 `gen4-audit-gate-impl.md` **未再动**；门禁在**最终字节**上**重跑**如下（读数属于追加后的这一版）：
+| 门 | 命令 | 读数（追加后重跑） |
+| --- | --- | --- |
+| refs + 表达式 + YAML | `bash .github/workflows/scripts/check-workflow-refs.sh` | **exit 0**；`workflow path references checked: 22, not tracked/missing: 0`；四份 workflow 均 `parses as YAML (PyYAML)` |
+| 独立 YAML 回读 | `python -c yaml.safe_load` | `parses; steps = 14` / `timeout-minutes = 45`（未动） |
+| `audit.yml` 的字节是否动过 | `sha256(worktree)` vs `sha256(git show HEAD:.github/workflows/audit.yml)` + `git diff --numstat` | **两者相同 = `b88a33a29d449ffc72647c0baadf72c54f8ebbe4d4df9a118bceccaea67a1408`**（git blob `cc5c28ac927dd14cec6daf36f8a7f789b87dc3f0`，HEAD `d6ace1b`）；`git diff` **为空** ⇒ **我已交付的字节就是已提交的字节**，追加编辑**没有**碰工作流（结单时的 diff 是 **+134/−31**，那是**推送前**的读数） |
