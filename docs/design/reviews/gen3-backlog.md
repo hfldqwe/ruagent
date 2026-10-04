@@ -628,6 +628,8 @@ a SIBLING directory: component-wise containment must not confuse it
 
 | **C50** | **「钉住」必须钉在【工具真的读的那个载体】上** —— **一个工具不读的配置文件不是钉子** | 现场（`t152`，2026-10-04，用户决定「钉 Rust 工具链」）：`rust-toolchain.toml` 写 `channel = "1.95.0"` **只钉住了「命令跑什么」，钉不住 CI** —— `dtolnay/rust-toolchain` 的 README 明说**工具链由它的 `@rev` 决定、它不读仓内那份文件** ⇒ 必须**同时**给 action 加 `with: toolchain: "1.95.0"`（且保留 SHA pin）。**两个载体钉的是两件不同的事**：**文件钉「命令跑什么」**（机制读数 = `rustup show active-toolchain` 那行从 `stable-…` 变成 **`1.95.0-… (overridden by '…\rust-toolchain.toml')`**）、**输入钉「runner 装什么」**。**判据**：① 宣布「钉住了」之前，**必须有一份读数证明工具真的读了它**（本例就是那行 `overridden by`）——**读文档不算，读机制读数才算**；② **同一个值要在每个载体上各钉一次**，并**机器复核它们逐字同值**（t152 的 `EVERY toolchain carrier says {'1.95.0'} => SAME`）；③ 与「**绿只认证它跑过的字节与命令**」同族：**「我改了配置」不等于「所有载体都跟着变了」**。**顺带一条活的风险读数**：`rustup check` 实测 `1.95.0 → 1.99.0 (b940084d7 2026-09-28)` 可升 ⇒ **浮动 stable 意味着明天一次 CI 就是新编译器 + `-D warnings`，而代码零 diff**。 | mem-core（t152，本轮实测） |
 
+**附：钉版的**代价**是实测的（`37194596072`，2026-10-04）** —— `Rust (ubuntu)` **281s → 1183s（+902s / 4.2×）**、`Rust (windows)` 658→1125s、`Panel` 31→39s、**整 run 11m2s → 19m54s**、`E2E` 4m5s → 8m4s。**机制未证实**（按 C47 的口径：这是一次**没有前置红证的读数**）：最可能是 **`rust-cache` 的 key 随工具链版本变化 ⇒ 未命中 ⇒ 依赖被整体重建**（新 rustc 让 `target/` 里的依赖产物作废）+ 每个 job 装一次工具链；**判据 = 下一次推送**（回落 ~4-5 分钟 ⇒ 一次性；仍在 ~19 分钟 ⇒ **每跑的固定代价**，值得改形态）。**这条读数的另一半是它证明的事**：`toolchain:` input **被 action 认了**（runner 原文 `rustup toolchain install 1.95.0 … --no-self-update`，**无 `Unexpected input`**，`rustc 1.95.0 (59807616e)` 与本地逐字相同）⇒ **两个载体在 CI 上一致**，而这是**真跑**读数而不是推断。
+
 ## D. 纪律账
 
 本代把 22 条纪律写进了 `docs/design/reviews/gen2-integration-contract.md` §6.0（六族：**判据 / 绿红 / 解释 / 量词 / 声称面 / 异步面**）。此处**不复制**，只指向那份契约——**一个事实一个来源**。
