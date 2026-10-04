@@ -330,10 +330,19 @@ jobs:
           for (const s of r.suites || []) walk(s);
           const st = r.stats || {};
           const g = (k) => (st[k] === undefined ? "?" : st[k]);
+          // t178 (t174's F-1): the per-spec fields carry a `walk_` prefix ON PURPOSE.
+          // They used to be bare `passed=` / `flaky=` / `skipped=`, and `flaky=` and
+          // `skipped=` each have a `stats_*` twin LATER ON THE SAME LINE -- so the
+          // shell's greedy `.*flaky=` read `stats_flaky` instead of what this walk
+          // counted, and the self-check below ended up comparing the stats block with
+          // itself. A prefix that no `stats_*` token can contain removes the whole
+          // class: `walk_*` is what THIS script counted, `stats_*` is what the report
+          // says, and the two sides are now visibly two independent readings.
           console.log(
-            "JSON_COUNTS measured=" + (c.expected + c.unexpected + c.flaky) +
-            " passed=" + c.expected + " failed=" + c.unexpected + " flaky=" + c.flaky +
-            " skipped=" + c.skipped + " collected=" + c.total +
+            "JSON_COUNTS walk_measured=" + (c.expected + c.unexpected + c.flaky) +
+            " walk_passed=" + c.expected + " walk_failed=" + c.unexpected +
+            " walk_flaky=" + c.flaky + " walk_skipped=" + c.skipped +
+            " walk_collected=" + c.total +
             " stats_expected=" + g("expected") + " stats_unexpected=" + g("unexpected") +
             " stats_flaky=" + g("flaky") + " stats_skipped=" + g("skipped"),
           );
@@ -345,34 +354,68 @@ jobs:
             exit 1
           fi
           counts=$(cat "$RUNNER_TEMP/t65/json-counts.txt")
-          m_measured=$(printf '%s\n' "$counts" | sed -n 's/.*measured=\([0-9]*\).*/\1/p')
-          m_passed=$(printf '%s\n' "$counts" | sed -n 's/.*passed=\([0-9]*\).*/\1/p')
-          m_failed=$(printf '%s\n' "$counts" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')
-          m_flaky=$(printf '%s\n' "$counts" | sed -n 's/.*flaky=\([0-9]*\).*/\1/p')
-          m_skipped=$(printf '%s\n' "$counts" | sed -n 's/.*skipped=\([0-9]*\).*/\1/p')
-          m_collected=$(printf '%s\n' "$counts" | sed -n 's/.*collected=\([0-9]*\).*/\1/p')
+          # `walk_*` = what the per-spec walk above counted; `stats_*` = what the report's
+          # own stats block says. They are read with the same greedy `sed`, and they can no
+          # longer be confused because no `stats_*` token contains a `walk_` prefix (t178).
+          walk_measured=$(printf '%s\n' "$counts" | sed -n 's/.*walk_measured=\([0-9]*\).*/\1/p')
+          walk_passed=$(printf '%s\n' "$counts" | sed -n 's/.*walk_passed=\([0-9]*\).*/\1/p')
+          walk_failed=$(printf '%s\n' "$counts" | sed -n 's/.*walk_failed=\([0-9]*\).*/\1/p')
+          walk_flaky=$(printf '%s\n' "$counts" | sed -n 's/.*walk_flaky=\([0-9]*\).*/\1/p')
+          walk_skipped=$(printf '%s\n' "$counts" | sed -n 's/.*walk_skipped=\([0-9]*\).*/\1/p')
+          walk_collected=$(printf '%s\n' "$counts" | sed -n 's/.*walk_collected=\([0-9]*\).*/\1/p')
           s_expected=$(printf '%s\n' "$counts" | sed -n 's/.*stats_expected=\([^ ]*\).*/\1/p')
           s_unexpected=$(printf '%s\n' "$counts" | sed -n 's/.*stats_unexpected=\([^ ]*\).*/\1/p')
           s_flaky=$(printf '%s\n' "$counts" | sed -n 's/.*stats_flaky=\([^ ]*\).*/\1/p')
+          # SCANNING FLOOR (t178/B32). A field that did not come out of the counts line
+          # must FAIL BY NAME here rather than reach the arithmetic: with an empty
+          # `$walk_flaky`, `$(( … ))` either errors out or silently drops a term, and a
+          # guard that cannot tell "I read 0" from "I read nothing" is not a guard. This
+          # is the floor that makes the extraction itself a reading.
+          for pair in "walk_measured=$walk_measured" "walk_passed=$walk_passed" \
+                      "walk_failed=$walk_failed" "walk_flaky=$walk_flaky" \
+                      "walk_skipped=$walk_skipped" "walk_collected=$walk_collected"; do
+            name=${pair%%=*}
+            value=${pair#*=}
+            case "$value" in
+              ''|*[!0-9]*)
+                echo "::error::could not read $name out of the counts line (\`$counts\`). The per-spec walk is the left-hand side of the self-check below, so without it there is no second reading to compare against stats -- fix the extractor, do not let this pass."
+                exit 1
+                ;;
+            esac
+          done
+          # The `stats_*` side keeps today's tolerance ON PURPOSE: a report with no `stats`
+          # block yields the literal `?` (the node side substitutes it), and the self-check
+          # below is skipped in exactly that case -- it cannot compare against something the
+          # report did not state. An EMPTY value, by contrast, means the extraction failed
+          # and is a floor violation like any other.
+          for value in "$s_expected" "$s_unexpected" "$s_flaky"; do
+            if [ -z "$value" ]; then
+              echo "::error::the stats side of the counts line could not be read (\`$counts\`), so the self-check has only one reading; refusing to pass it on."
+              exit 1
+            fi
+          done
           # Two independent readings of the same fact must agree (the per-spec walk
           # and the report's own stats block). If they do not, the PARSER is what is
           # broken and a count is not a reading -- refuse it rather than pass it on.
-          if [ "$s_expected" != "?" ] && [ "$((m_passed + m_failed + m_flaky))" != "$((s_expected + s_unexpected + s_flaky))" ]; then
-            echo "::error::the JSON report disagrees with itself: per-spec statuses say $((m_passed + m_failed + m_flaky)) measured (passed=$m_passed failed=$m_failed flaky=$m_flaky) while stats says $((s_expected + s_unexpected + s_flaky)) (expected=$s_expected unexpected=$s_unexpected flaky=$s_flaky). Fix the parser before believing either."
+          # t178: left is `walk_*` (counted here), right is `stats_*` (stated by the
+          # report). Before the fix the left side read `stats_flaky`, so this compared
+          # the stats block with itself.
+          if [ "$s_expected" != "?" ] && [ "$((walk_passed + walk_failed + walk_flaky))" != "$((s_expected + s_unexpected + s_flaky))" ]; then
+            echo "::error::the JSON report disagrees with itself: per-spec statuses say $((walk_passed + walk_failed + walk_flaky)) measured (passed=$walk_passed failed=$walk_failed flaky=$walk_flaky) while stats says $((s_expected + s_unexpected + s_flaky)) (expected=$s_expected unexpected=$s_unexpected flaky=$s_flaky). Fix the parser before believing either."
             exit 1
           fi
           {
             echo ""
-            echo "| measured tests (passed + failed + flaky) | $m_measured |"
-            echo "| collected (measured + skipped) | $m_collected |"
+            echo "| measured tests (passed + failed + flaky) | $walk_measured |"
+            echo "| collected (measured + skipped) | $walk_collected |"
             echo "| reference floor for this suite | $E2E_MEASURED_FLOOR (six CI runs 2026-10-03/04, all \`62 passed\`) |"
           } >> "$GITHUB_STEP_SUMMARY"
           # `flaky` counts as MEASURED: a flaky test failed and was retried into a
           # pass, so the suite did exercise it. Excluding it would let a retry-heavy
           # run look smaller than it is; including it cannot hide an unmeasured test.
-          m_ran=$((m_passed + m_failed + m_flaky))
-          if [ "$m_ran" -lt "$E2E_MEASURED_FLOOR" ]; then
-            echo "::error::only $m_ran test(s) were MEASURED, below the floor of $E2E_MEASURED_FLOOR (passed=$m_passed failed=$m_failed flaky=$m_flaky skipped=$m_skipped of $m_collected collected). '0 failed' is not '0 measured': this run's green does not cover $((E2E_MEASURED_FLOOR - m_ran)) test(s) that the reference runs covered, and nothing else in this step failed. Find what turned them into skips (a fixture/mock-agent/wiki-data regression) -- or, if a test was deliberately deleted, raise the floor in the same commit WITH a new reading."
+          walk_ran=$((walk_passed + walk_failed + walk_flaky))
+          if [ "$walk_ran" -lt "$E2E_MEASURED_FLOOR" ]; then
+            echo "::error::only $walk_ran test(s) were MEASURED, below the floor of $E2E_MEASURED_FLOOR (passed=$walk_passed failed=$walk_failed flaky=$walk_flaky skipped=$walk_skipped of $walk_collected collected). '0 failed' is not '0 measured': this run's green does not cover $((E2E_MEASURED_FLOOR - walk_ran)) test(s) that the reference runs covered, and nothing else in this step failed. Find what turned them into skips (a fixture/mock-agent/wiki-data regression) -- or, if a test was deliberately deleted, raise the floor in the same commit WITH a new reading."
             exit 1
           fi
 
@@ -395,7 +438,7 @@ jobs:
               exit 1
             fi
           done
-          echo "measured: $m_ran test(s) >= floor $E2E_MEASURED_FLOOR; must-run set (recall, consumption, failure-visibility, chat, settings-capabilities) all executed"
+          echo "measured: $walk_ran test(s) >= floor $E2E_MEASURED_FLOOR; must-run set (recall, consumption, failure-visibility, chat, settings-capabilities) all executed"
 
           echo "playwright: exit 0, JSON says $json_skipped skipped / $named named, none of them registry.spec.ts"
 
