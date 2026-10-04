@@ -1956,7 +1956,14 @@ mod generating_tests {
             "id": "00000000-0000-0000-0000-000000000002",
             "name": "mock",
             "harness": "mock",
-            "command": format!("{} --behavior echo", mock.display()),
+            // `slowreply` is the SUBJECT this test needs: a turn that provably
+            // spans the delete (it runs 10s and ends only when nothing cancels
+            // it) and that emits NO message unless it completes. `echo` replied
+            // within milliseconds, so "delete WHILE GENERATING" was itself a
+            // race -- and the message it produced before the delete was merely
+            // DELIVERED after it, which is why the old shape read as a
+            // violation.
+            "command": format!("{} --behavior slowreply", mock.display()),
             "description": "test",
             "model": null,
             "reasoning_effort": null,
@@ -2011,38 +2018,96 @@ mod generating_tests {
         );
         assert_eq!(after.len(), before.len() - 1);
 
-        // The session is really gone. A broadcast channel reports Closed once
-        // every sender is dropped, so this only holds after OUR handle goes:
-        // that is the point. It proves the registry no longer holds the
-        // session, and that nothing else in-process does either.
+        // What the contract asks is that the deleted chat produces NO FURTHER
+        // MESSAGE -- and the END of teardown is an EVENT, not a duration.
         //
-        // In the daemon the SSE handler ALSO holds a Chat clone, so the
-        // channel alone cannot end an attached stream -- which is exactly why
-        // chat_events now polls the registry as a second liveness signal and
-        // sends the terminal end event when the chat disappears.
-        // What the contract asks is that the agent produces NO FURTHER
-        // MESSAGES. Two details make that measurable:
-        //   * the witness subscribed before the prompt, so its buffer holds
-        //     events from BEFORE the delete -- those are drained, not counted;
-        //   * teardown is asynchronous (Shutdown ends the turn), so a
-        //     Stop/cancel event may still land. A settle window absorbs that
-        //     tail; the QUIET WINDOW after it is the actual claim.
+        // The old shape was a fixed 1200 ms `settle` window followed by a
+        // 1200 ms window that counted EVERY event as a message. Under
+        // compile-scale load that is a mis-measurement, measured (V-B7, the
+        // same bytes passing alone and failing while a cold build ran):
+        //   * the in-flight prompt's own dispatch events -- `StateChanged
+        //     { Running }` and `UserMessage { "hello" }` -- were DELIVERED
+        //     2216 ms and 2373 ms after the delete, i.e. after the guess had
+        //     expired, and the quiet window counted them;
+        //   * the claim is about `RunEvent::AgentMessageChunk`; counting every
+        //     variant reports a control event as "producing another message".
+        // Neither was the product producing anything: no message arrives after
+        // the delete.
+        //
+        // The synchronization point is the run's OWN end-of-turn signal --
+        // `RunEvent::Stopped`/`RunEvent::Error`, the same pair the run-state
+        // watcher in `start` uses to clear `generating` -- or the session's
+        // sender going away (a broadcast channel reports Closed once every
+        // sender is dropped: `delete` -> `close` -> `ChatCommand::Shutdown`).
+        // Waiting for either is what the fixed duration was trying to guess.
+        //
+        // The BOUND is 5 s, and the number is not a taste: the subject is
+        // `--behavior slowreply`, whose own turn runs 10 s and ends only when
+        // nothing cancels it, so a run the delete did NOT stop cannot reach a
+        // terminal event inside it. The wait absorbs the load; the assertion
+        // keeps the claim.
         drop(victim);
-        let settle = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
-        while tokio::time::Instant::now() < settle {
-            let _ = witness.try_recv();
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        let quiet = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
-        let mut after_teardown = 0usize;
-        while tokio::time::Instant::now() < quiet {
-            if witness.try_recv().is_ok() {
-                after_teardown += 1;
+        const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+        let t_delete = tokio::time::Instant::now();
+        let deadline = t_delete + TEARDOWN_BOUND;
+        let mut messages = 0usize;
+        let mut torn_down = false;
+        let mut seen: Vec<String> = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            match witness.try_recv() {
+                Ok(ev) => {
+                    let kind = match ev {
+                        ruagent_core::RunEvent::AgentMessageChunk { .. } => {
+                            messages += 1;
+                            "AgentMessageChunk"
+                        }
+                        ruagent_core::RunEvent::Stopped { .. } => {
+                            torn_down = true;
+                            "Stopped"
+                        }
+                        ruagent_core::RunEvent::Error { .. } => {
+                            torn_down = true;
+                            "Error"
+                        }
+                        ruagent_core::RunEvent::StateChanged { .. } => "StateChanged",
+                        ruagent_core::RunEvent::UserMessage { .. } => "UserMessage",
+                        ruagent_core::RunEvent::UsageUpdate { .. } => "UsageUpdate",
+                        _ => "other",
+                    };
+                    seen.push(format!("{}ms:{kind}", t_delete.elapsed().as_millis()));
+                    if torn_down {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    torn_down = true;
+                    seen.push("Closed".to_string());
+                    break;
+                }
+                Err(_) => {}
             }
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            torn_down,
+            "delete must stop the live run BEFORE dropping the record: {TEARDOWN_BOUND:?} \
+             after the delete the run had produced neither its terminal event nor released \
+             its session (a `slowreply` turn ends at 10s, so this can only be a run that \
+             was never stopped); events seen after the delete: {seen:?}, messages={messages}"
+        );
+
+        // The tail after that signal: the same claim, bounded, and a message
+        // here can only come from a producer that outlived the run.
+        let quiet = tokio::time::Instant::now() + QUIET_WINDOW;
+        while tokio::time::Instant::now() < quiet {
+            if let Ok(ruagent_core::RunEvent::AgentMessageChunk { .. }) = witness.try_recv() {
+                messages += 1;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(
-            after_teardown, 0,
+            messages, 0,
             "a deleted chat must not produce another message"
         );
 
@@ -2170,6 +2235,14 @@ mod generating_tests {
     /// Both directions are asserted. (a) proves the rule was NOT relaxed: a
     /// chat with no message still reports 0 and is still hidden. (b) proves
     /// the fix: one message reports 1 at once, with no index row anywhere.
+    ///
+    /// (b) is bounded by the WRITER, not by a duration (t149): it waits for the
+    /// run's own transcript to carry the user's line -- the exact fact the count
+    /// is derived from -- and only then asserts, so a starved machine costs the
+    /// wait, never the assertion. It also asserts the premise the paragraph above
+    /// states and nothing checked: that the index has NOT caught up (if it had,
+    /// the count below could be the index's, and the assertion would be proving
+    /// less than it claims).
     #[tokio::test]
     async fn message_count_is_real_before_the_index_catches_up() {
         let Some(mock) = mock_agent() else {
@@ -2228,20 +2301,85 @@ mod generating_tests {
             .send_prompt(&db, embedder, "hello".into())
             .await
             .expect("send prompt");
-        // The transcript is written as the event lands, so poll briefly rather
-        // than assuming it is already flushed.
-        let mut seen = None;
-        for _ in 0..40 {
-            let h = chats.history(None, 50).await;
-            seen = h
+
+        // SYNC ON THE WRITER, THEN ASSERT (t149; the flake was `left: Some(0) /
+        // right: Some(1)` under a compile/link burst). What is waited for is a
+        // SIGNAL, not a duration: when the index has no row, `history` derives this
+        // count from the run's own transcript (`chat.rs:1566-1576` ->
+        // `ruagent_store::read_transcript`), and every append is flushed before it
+        // returns (`store/src/transcript.rs:36-47`), so the moment the line is
+        // readable the value the assertion reads is settled.
+        //
+        // The run's EVENT stream is not usable as this sync point, and that is read
+        // rather than preferred: the bus a test can subscribe to
+        // (`Chat::subscribe`, `chat.rs:278`) is fed by the ACP layer
+        // (`crates/acp/src/chat.rs:534` sends `RunEvent::UserMessage`), while the
+        // transcript is appended by the run loop (`runs.rs:1506` -> `emit` ->
+        // `append_event` -> `TranscriptWriter::append`) -- two different tasks, so
+        // "the event arrived" does not order the append. The file does.
+        //
+        // 5 s is not a taste: the writer is the same process and the append lands
+        // before the agent's own reply in the ordinary case (the subject is
+        // `--behavior echo`), so this bound sits orders of magnitude above the
+        // path's own latency; what it absorbs is the machine being starved, and it
+        // fails LOUDLY when even that is not enough instead of looping quietly.
+        const USER_MESSAGE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let transcript = chats.transcript_path(empty.id);
+        let deadline = tokio::time::Instant::now() + USER_MESSAGE_BOUND;
+        let landed = loop {
+            let n = ruagent_store::read_transcript(&transcript)
+                .unwrap_or_default()
                 .iter()
-                .find(|e| e.id == empty.id.to_string())
-                .and_then(|e| e.message_count);
-            if seen == Some(1) {
-                break;
+                .filter(|l| matches!(l.event, ruagent_core::RunEvent::UserMessage { .. }))
+                .count();
+            if n > 0 || tokio::time::Instant::now() >= deadline {
+                break n;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(
+            landed > 0,
+            "the run's writer must land the user's line within {USER_MESSAGE_BOUND:?} \
+             (`runs.rs:1506` -> `store/src/transcript.rs:45` appends AND flushes), so a \
+             timeout here is a signal that never arrived, not a duration that was too \
+             short: {} bytes at {}",
+            std::fs::metadata(&transcript).map(|m| m.len()).unwrap_or(0),
+            transcript.display()
+        );
+
+        // The premise the paragraph above the test STATES ("with NO index row at
+        // all") and nothing asserted: if the 60 s indexer (`sessions.rs:213`) had
+        // already written this key, the count below could be the index's rather than
+        // real state's. An unreadable index is not evidence of "no row" either, which
+        // is why this compares an Option instead of absorbing the error into a 0.
+        let h = chats.history(None, 50).await;
+        let entry = h.iter().find(|e| e.id == empty.id.to_string());
+        let key = entry.and_then(|e| e.session_key.clone());
+        let indexed: Option<i64> = match key {
+            Some(key) => db
+                .call(move |conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE key = ?1",
+                        rusqlite::params![key],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(ruagent_store::DbError::from)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok()),
+            None => None,
+        };
+        assert_eq!(
+            indexed,
+            Some(0),
+            "the index must not have caught up yet: this direction proves the count is \
+             REAL STATE and not the 60 s index's, so a row here (or an index that could \
+             not be read, which is not the same as 'no row') would leave the assertion \
+             below vacuous"
+        );
+
+        let seen = entry.and_then(|e| e.message_count);
         assert_eq!(seen, Some(1), "the count must be real at once");
     }
 }
