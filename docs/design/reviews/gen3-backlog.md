@@ -547,6 +547,29 @@ a SIBLING directory: component-wise containment must not confuse it
 
 **一条顺带的方法论**：AGENTS.md 对该 wrapper 的描述（「…then vite (L44)；任一步非零就退出且 dist 不变」）**方向正确但弱于字节** —— 这正是本代那条纪律的又一例：**宣称要回读字节**，因为「描述」通常只说对一半（这里漏掉的恰恰是最有价值的那一半：**成功路径也不清空 dist**）。
 
+## B34. 可照抄的范式：**只对该失败【类别】重试，且拒绝在可能藏着真红的类别上重试**（`ci.yml` 的 `rust-windows` 已落地，captain 本轮逐行读到）
+
+**现场**（`ci.yml:405`，windows job 的第二步）：
+
+```yaml
+- name: Test attempt 2 (only for the known build race)
+  if: failure() && steps.attempt1.outcome == 'failure'
+  run: |
+    if grep -qE 'panicked at|^test result: FAILED' "$log"; then
+      echo "::error::attempt 1 failed with a TEST-level failure. The documented flake is a BUILD race
+            (lance rmeta / E0786), which never shows as a test failure -- so retrying would hide a
+            real red behind a lucky second run. Stopping here with attempt 1's evidence above."
+      exit 1
+    fi
+    echo "attempt 1 failed without a test-level failure (build/toolchain level) -> retrying once"
+```
+
+1. **类别门槛**：先**判失败属于哪一类**（`panicked at` / `test result: FAILED` = 测试级），**不属于可重试的那一类就拒绝并 exit 1**。
+2. **拒绝时写明代价**：那句话就是判据本身 —— **「重试会把一个真红藏进一次幸运的第二次运行」**。
+3. **重试也要出证据**：attempt 2 **单独**跑 `test-evidence.sh`（`Rust (windows) -- attempt 2 (retry)`）⇒ 读的人**知道这个绿是第二次的**，而不是被一次不透明的重试抹平。
+
+**为什么值得单独记**：CI 里的重试是本代最怕的形状之一（**「绿」可能只是第二次运气好**），而这个仓**已经有了正确形态**，就在 windows job 里。⇒ 任何将来要加重试的地方（E2E、audit、将来别的慢门）**照这个抄**：**先判类别 → 不可重试的类别拒绝并把理由打出来 → 可重试的类别重试且单独出证据**。**与 C55 的关系**：C55 说「② 用时间代替判定 ⇒ 会翻面」；B34 管的是**重试**：**它是"用次数代替判定"**，同样会翻面 —— 除非像这里一样，**重试的类别在构造上不可能包含真红**。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
