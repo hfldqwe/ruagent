@@ -129,3 +129,27 @@ measured: 62 test(s) >= floor 62; must-run set (recall, consumption, failure-vis
 - **没启停活守护进程**：8787 / pid 14944 未触碰；我自己的临时守护进程按**自记 PID** 停（`alive=False`），临时 root 留作证据（`%TEMP%\t166\root`），临时脚本按**具体路径**删（提交前清理）。
 - `NO_PROXY`：Rust/curl 与浏览器走 `127.0.0.1,localhost,::1`；`gh` 用 `*`（两者未混用）。
 - 未跑 Rust 门禁（本单不改 Rust）；未用裸 `npx playwright test`。
+
+## 8 事后追记：C60 自查（本报告提交后追加；只加一节，上面读数一字未改）
+
+> ★ 起因：captain 在本单提交后转来 **C60**（复现 CI 的 E2E 会打**活 8787** + **写真配置** ⇒ 必须**显式给自己的 root 与端口**）。我在 §4 只写了「8787 未碰」并靠**端口存活**做旁证 —— 那**不够**（端口还在 ≠ 没人打过它）。故补做**机制 + 痕迹**两头核查，**结论：干净**。
+
+**(1) 机制**（`panel/playwright.config.ts:35-46`、`:76`）：`baseURL: e2eBaseUrl()`；`e2eBaseUrl()` = 有 `E2E_BASE_URL` 就用它；否则**只在 `CI` 下**才回落到 `http://127.0.0.1:8787`；**本地两者都没有时直接拒绝启动**（打印「no target it may safely drive … the LIVE daemon with your real `~/.ruagent` data」）⇒ **本地不可能静默打到活守护进程**。
+
+**(2) 我这次的实际目标**（保留的 stdout，`%TEMP%\t166\e2e-stdout.txt`）：
+```
+e2e target: http://127.0.0.1:19011 (writes armed via RUAGENT_E2E_ALLOW_WRITES=1)
+```
+⇒ 写保护武装的同时，目标就是**我自己的端口**。
+
+**(3) 痕迹（决定性）**：我的 E2E 窗口 = **2026-10-04 19:16:30–19:17:00**。若套件真打到 `~/.ruagent` 上的活守护进程，两个**写保护 spec** 会动到操作者的真配置、活库也会被写。实测 mtime：
+
+| 文件 | mtime | 落在窗口内？ |
+| --- | --- | --- |
+| `~/.ruagent/config/agents.toml` | **2026-09-29 04:55:13** | 否（早 5 天） |
+| `~/.ruagent/config/policy.toml` | **2026-09-20 08:06:16** | 否（早 14 天） |
+| `~/.ruagent/data/ruagent.db`（+`-wal`） | **2026-10-04 17:08:07** | 否（早 2 小时） |
+
+⇒ **没有一处落进窗口** ⇒ `registry.spec.ts`（写 `agents.toml`）与 `settings-capabilities.spec.ts`（写 `policy.toml`）**都没有碰操作者的配置**，活库也没被写。**§4 的「8787 未碰」由此从旁证升级为「机制 + 痕迹」双重核查。**
+
+**(4) 给下一个复现者的落地形态**（= C60 的具体做法）：不是「别打 8787」，而是**显式给出两侧的归属**——① 自己 `Start-Process` 一个守护进程并给 **`--root <temp>` + `--addr 127.0.0.1:<自己的端口>`**；② 给套件 **`E2E_BASE_URL=http://127.0.0.1:<同一端口>`**（否则本地直接拒跑）；③ 想更狠，同时把 `RUAGENT_HOME` 指向临时目录，让**任何**默认路径解析都出不了临时区。**「8787 还活着」不能证明没打过它** —— 这就是本节存在的理由。

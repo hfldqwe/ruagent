@@ -2,7 +2,7 @@
 
 > 单号 **t162**（repair，成员 `wiki`）· attempt 1 · **2026-10-04 19:37–20:2x（+08:00）**
 > 基线（rebase 目标）= `t159` 落地后的字节：`HEAD:panel/src/index.css` blob **`d904a55ac519228de65ef6eb28ceac0c17ceaf8d`**，`sha256 = d51a4134a2461210d97b6e94690201dede0188d3a145bef11469a1d7c1aae773`（工作树干净 = 落地字节，非在途）。
-> 写入集合（`git status --porcelain` 只此一项）：**`panel/src/index.css`**（+29/−0）。未改 `panel/tools/**`（`git status tools/` 为空）、`Settings.tsx`、`panel/src/i18n/**`、`panel/e2e/**`。
+> 写入集合（`git status --porcelain` 只此一项）：**`panel/src/index.css`**（**+30/−0**，按已入库的 `bb2d99a` 的 `--numstat` 读数）。未改 `panel/tools/**`（`git status tools/` 为空）、`Settings.tsx`、`panel/src/i18n/**`、`panel/e2e/**`。
 > 纪律：**未** push / dispatch / rerun / cancel；**未**跑 rust 构建；**未**碰 8787（活守护进程，只读它存在）；我自己的三个临时守护进程 8893/8894/8895/8896 用**临时 root + 临时端口 + `RUAGENT_PANEL_DIST`**，收尾按 PID 停。
 
 ## 0 结论
@@ -98,8 +98,14 @@
 
 我改完后又做了一次**纯注释**编辑（把新注释里的任务号按 `AGENTS.md` 的写法加世代前缀），它**没有进产物**（构建后的 `index-BvDMgDmx.css` sha256 前缀 `e82633bb3f916c28` 前后相同），但**入口 JS 的哈希动了**（`index-LMiLSpwe.js` → `index-BZR-Wwdb.js`）。按 t20 的规矩**不假定**读数可搬，**在最终树上重建并重跑了两臂**（`dist-post2`，守护进程 8893）：
 
-- 重跑读数：<!-- FINAL-ARM -->
-- 结论：**最终字节上的行 18 仍是 PASS，且 `settings` 内容区 `<32px` = 0、`runtimes` = 3（≤10）、`<24px` = 0（两档两区）**。
+- 重跑读数（4 次运行，20:00–20:04，`served chunk: index-BZR-Wwdb.js`）：
+  - `| 18 | PASS |`（判定原文见 §3，逐字相同）；
+  - 失败行 `[12]`；**逐行对照**：`runtimes,settings` 53 行**只有 18 变**、`home,graph` 54 行 **0 变**、`agents` 52 行 **0 变**（与 `dist-post` 那一臂完全一致 ⇒ 那次纯注释编辑确实没有挪动任何读数）；
+  - zone（工具 `--json`）：四个 capture 全 `hit24=0 / content24=0 / shell24=0`、`shell32=0`；`settings` 内容区 `<32px` = **0**、`runtimes` = **3**；
+  - section 5.12：**6 项 `button.tag 102×24`（目标 `<32px`）**，无任何「地板 `<24px`」项。
+- 结论：**最终字节上的行 18 仍是 PASS，且 `settings` 内容区 `<32px` = 0、`runtimes` = 3（≤10）、`<24px` = 0（两档 × 两区）。**
+- **这份最终字节已经入库**（captain 落的提交 `bb2d99a` *fix(panel): row 18 is two species with two fixes, and the exception list stays closed*）：`sha256(worktree) == sha256(HEAD:panel/src/index.css) == ed07224ae24ff68c773e36523dc70968ce6564b9eea319e222befa1d603f4ad0`，git blob **`b9fc5d0d59fcbc7bd535d5d1f0d6516e89a12718`**（HEAD `aa73348`，`git diff` 为空），三条规则在 HEAD 字节里逐条在位（3/3）⇒ **我交付的字节 = 已提交的字节 = 上面所有读数所属的字节**。
+- **面板门也属于这份字节**：最后一次编辑 `index.css` 19:56:16 → 构建 19:56:37（`dist-post2`）⇒ 门读数与审计读数同源。
 
 ## 4 判据没有被削弱、也没有带动别的路由（C56 第三条：逐行对照）
 
@@ -112,6 +118,7 @@
 - 判据正文 + `limits`：两臂**逐字相同**（`{"hard":24,"soft":32,"max":10}`；criterion 里的「无例外名单：已裁决 .ant-switch 的 21px 走「改」」也在原处）。
 - `panel/tools/design-audit.mjs` **未改**（`git status --porcelain -- panel/tools` 为空）。
 - **C56 的读法（给下一位省一次返工）**：行 18 的 `display`（`design-audit.mjs:4470-4478`）**只给计数、不给选择器**，而且**只有 FAIL 行才打印它**（PASS 行的 display 列是空的 ⇒ 修完之后那些数字只活在 `metrics.json` 的 `captures[].metrics.inter` 里，这正是 t143 那条「以工件为准」的同一个道理）。**逐个点名的样本在 `note`（`:4485`，来源 `it.hit24All`，每项带 `sel` + `via`（是否由内层上溯到控件根）+ `paint`（绘制口径））**；`design-audit.mjs:5550` 是**行 38**（严格口径描边容器）的 `display`，不是行 18 的 —— 不同行、不同字段。
+- **同一行里两个物种（本条判据的形态，值得下一位记住）**：行 18 的 6 个 `<24px` 与 13 个 `<32px` **不是同一种缺陷** —— 前者是「真的按钮太小」（102×20 的重试 chip，属**地板**），后者是「控件没到目标尺寸」（48×24 的开关，属**预算**）；一个修法是抬到地板（24），另一个必须抬到目标（32）才离开桶。**照搬任一修法到另一物种都会失败**（开关抬到 24 仍然 13 > 10；chip 抬到 32 是没必要的视觉改动）。
 - `metrics.json` 的 `inter.small32Samples` 我自己核过一遍：它给的是**修后**的 3 项 `button.tag 102×24`，与工具 5.12 一致 ⇒ 两处读数不矛盾。
 
 ## 5 门禁
@@ -120,7 +127,7 @@
 | --- | --- | --- |
 | 面板门（唯一保护 `panel/` 的门） | `npm --prefix panel run build` | **exit 0**（两轮：修后一轮、注释编辑后再一轮）。wrapper 内容：`i18n dictionary integrity — panel/src/i18n.tsx` ✓ + `tsc -b` ✓ + e2e tsconfig ✓ + vite `✓ 1853 modules transformed` / `✓ built in 4.00s` |
 | 工具未改 | `git status --porcelain -- panel/tools` | 空 |
-| 写入集合 | `git status --porcelain` | 只有 ` M panel/src/index.css`（+29/−0：新增两条规则 + 两段注释，0 删除） |
+| 写入集合 | `git status --porcelain` | 只有 ` M panel/src/index.css`（**+30/−0**：两条规则 + 两段注释，**0 删除**；我最后一次编辑是**纯注释**，构建后的 CSS 证明它没进产物） |
 
 **e2e：本单没有新增/修改任何 spec** ⇒ 没有跑 `npm run test:e2e`（要跑也**只能**走仓库入口）。理由：行 18 的仪器就是审计本身，为几何再写一份 e2e 会与它重复并随antd升级腐烂；判据原文记的也正是「用工具判定」这条路。
 
@@ -139,3 +146,4 @@
 1. **陷阱：守护进程的 `RUAGENT_PANEL_DIST` 指向仓库里的 `panel/dist` 时，重建会立刻换掉它服务的字节。** 我最初把「修前」的 `--json` 跑在 8896 上，而那时我已经重建过 ⇒ 那份文件虽然叫 `pre.json`，**实际服务的是修后的字节**（其读数与修后完全一致、`small32Samples` 里 `button.tag` 已经是 102×24，这就是证据）。处置：**作废它**，从重建前拷贝出来的 `dist-pre` 另起守护进程 8894 重跑修前臂（§1/§3 的修前读数全部来自 8894，入口 chunk `index-IXa0LMNu.js` = 修前字节）。**修后的两臂也用冻结拷贝**（dist-post / dist-post2），不依赖活目录。
 2. **工具把进度日志写到 stderr**；用 PowerShell 的 `2>&1 | Out-File` 会把 PowerShell 的 stderr 包装连同进度行**插进 JSON 文档**，`json.loads` 直接失败（我踩了一次）。正确写法是 `2>err.txt | Out-File json.txt`，两条流分开。
 3. **本机 bash 只有 WSL、里面没有 Linux node**：CI 不需要这个桥（setup-node 把 node 放进 PATH），但本地跑护栏/探针需要。我用的 shim（`cd` 到脚本目录 + 传相对路径）只为 harness 服务，不影响任何仓库脚本。
+4. **别人的变异窗口（t182，graph）与我这些读数的关系**：窗口内 `crates/acp/src/chat.rs` 与 `crates/daemon/src/chat.rs` 被临时变异（我 20:05:01 看到两者都是 `M`）。我**没有碰**这两个文件、**没有跑 rust 构建**、也**没有把它们算作任何证据**；我的三个审计臂用的是**预编译**的 `D:\rust_cache\debug\ruagent.exe` 与**只读的** `panel/dist*` 冻结拷贝，路由集是 `runtimes,settings / home,graph / agents`（**从不含 `#chat`**）⇒ 那些读数不依赖这两个文件的内容。**若窗口覆盖 20:00–20:04:15 这段，我的读数依然有效**（不受影响的原因如上），此处按 captain 的要求记下时间点。
