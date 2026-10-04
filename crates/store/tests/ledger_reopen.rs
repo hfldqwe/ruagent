@@ -12,9 +12,43 @@
 
 use ruagent_store::Db;
 use ruagent_store::migrations::SCHEMA_VERSION;
+use std::sync::Mutex;
+
+/// Which TAGS have leaked a root in this process (t173). `Drop` must not panic
+/// (a panic while the thread unwinds aborts the whole test binary -- t167
+/// re-checked that), so a leak is recorded here and the tests assert their OWN
+/// tag never appears. Keyed by tag, not by a global count, so a test that leaks
+/// ON PURPOSE (the marker test below) cannot redden a test running beside it.
+static LEAKED_TAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A marker OUTSIDE the directory that could not be deleted: the in-place one is
+/// only findable by looking at the very directory you are failing to remove, and
+/// a passing test's `eprintln!` is captured by the harness.
+fn leaked_roots_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("ruagent-leaked-roots")
+}
+
+fn leaked_tags() -> Vec<String> {
+    match LEAKED_TAGS.lock() {
+        Ok(t) => t.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Called at the END of a test that owns a root (after the root is dropped):
+/// a leak makes THIS TEST RED, which is the whole point -- before t173 a leak
+/// left exit code 0 as long as every other assertion passed.
+fn assert_own_root_did_not_leak(tag: &str, what: &str) {
+    let leaked = leaked_tags();
+    assert!(
+        !leaked.contains(&tag.to_string()),
+        "the test root `{tag}` leaked during {what}: a root that cannot be removed must \
+         fail its own test, not only leave a marker (leaked tags: {leaked:?})"
+    );
+}
 
 /// A private root under `%TEMP%`; removed on drop.
-struct Root(std::path::PathBuf);
+struct Root(std::path::PathBuf, String);
 
 impl Root {
     fn new(tag: &str) -> Self {
@@ -23,7 +57,7 @@ impl Root {
             std::fs::remove_dir_all(&dir).expect("wipe a previous t98 root");
         }
         std::fs::create_dir_all(dir.join("data")).expect("create the t98 root");
-        Root(dir)
+        Root(dir, tag.to_string())
     }
 
     fn db_path(&self) -> std::path::PathBuf {
@@ -79,6 +113,34 @@ impl Drop for Root {
             "t98 LEAKED ROOT after 20 attempts: {} (last error: {err}); marker: {}",
             self.0.display(),
             marker.display()
+        );
+        // VISIBLE BEYOND THE ROOT (t173): the marker above lives INSIDE the
+        // directory that could not be deleted, so on its own a leak still leaves
+        // exit code 0 (a passing test's stderr is captured by the harness). Two
+        // additions fix that without panicking here: a durable copy in a STABLE
+        // location, and this root's TAG on a list its owning test asserts
+        // against -- which is what turns "a leak happened" into "a test went red".
+        if let Ok(mut tags) = LEAKED_TAGS.lock() {
+            tags.push(self.1.clone());
+        }
+        let dir = leaked_roots_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let name = self
+            .0
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown-root".to_string());
+        let _ = std::fs::write(
+            dir.join(format!("{name}.txt")),
+            format!(
+                "t98/t173: this test root could not be removed after 20 attempts (~1s).\n\
+                 root: {}\n\
+                 last error: {err}\n\
+                 in-place marker: {}\n\
+                 Delete the directory once no test is running.\n",
+                self.0.display(),
+                marker.display()
+            ),
         );
     }
 }
@@ -142,6 +204,8 @@ async fn a_lost_maximum_version_row_still_boots() {
         "the re-applied migration must be recorded again"
     );
     drop(reopened);
+    drop(root);
+    assert_own_root_did_not_leak("max", "a_lost_maximum_version_row_still_boots");
 }
 
 /// The S2 acceptance reading, negative control included: a HOLE in the middle
@@ -180,6 +244,8 @@ async fn a_middle_hole_refuses_the_boot_by_name() {
     );
     drop(reopened);
     drop(db);
+    drop(root);
+    assert_own_root_did_not_leak("hole", "a_middle_hole_refuses_the_boot_by_name");
 }
 
 /// A database migrated by a NEWER binary is a superset, not a hole: it must still
@@ -202,6 +268,8 @@ async fn a_future_version_is_not_a_hole() {
     assert_eq!(versions(&reopened).await, expected);
     drop(reopened);
     drop(db);
+    drop(root);
+    assert_own_root_did_not_leak("future", "a_future_version_is_not_a_hole");
 }
 
 /// The residue's OWN test (t160): when the root cannot be removed, `Drop` must
@@ -247,6 +315,36 @@ fn a_root_that_cannot_be_removed_leaves_a_marker_instead_of_silence() {
         "the marker must name the failure, got: {text}"
     );
 
+    // t173: the leak is now VISIBLE and FAIL-ABLE, not only written down.
+    assert!(
+        leaked_tags().contains(&"leak-marker".to_string()),
+        "the leak must be recorded by tag, or the guard below cannot see it"
+    );
+    let stable = leaked_roots_dir().join(format!(
+        "{}.txt",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown-root".to_string())
+    ));
+    let stable_text = std::fs::read_to_string(&stable).expect("the stable marker is readable");
+    assert!(
+        stable_text.contains("could not be removed")
+            && stable_text.contains(&path.display().to_string()),
+        "the stable marker must name the failure AND the root, got: {stable_text}"
+    );
+    // The guard the OTHER tests run must redden for exactly this condition. It is
+    // caught here so this (intentionally leaking) test still passes; the point is
+    // that "visible" is not cosmetic -- the assertion really does fail.
+    let reddened =
+        std::panic::catch_unwind(|| assert_own_root_did_not_leak("leak-marker", "the t173 probe"))
+            .is_err();
+    assert!(
+        reddened,
+        "the leak guard must redden when a root leaked, or the leak is still only cosmetic"
+    );
+
     drop(held); // release the handle, then clean up by exact path
+    let _ = std::fs::remove_file(&stable);
+    let _ = std::fs::remove_dir(leaked_roots_dir());
     let _ = std::fs::remove_dir_all(&path);
 }

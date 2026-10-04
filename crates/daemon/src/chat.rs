@@ -1964,7 +1964,18 @@ mod generating_tests {
             Some(1),
             "an empty probe must not overwrite the cached catalog"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // NO SLEEP HERE (t167's residual A, closed in t173). "The row is still the
+        // one from step 1" is a NEGATIVE claim, and a fixed window in front of it
+        // is the one shape whose PASS depends on how long it waited (t157's family
+        // 2): too short and a wrongly spawned write is still in flight while the
+        // reader sees the old row -- a false green. What makes it decidable is the
+        // ARM, and that is byte-visible: `record_probe`'s `NotReportedInTime |
+        // ReportedNone` arm never reaches `persist_options` (`chat.rs:1820`), the
+        // only writer of `agent_options` (the spawn is in its `Reported` arm,
+        // `chat.rs:1831`) -- so nothing can land after this point. Step 1 above
+        // already proves the READER sees a spawned write (it polls for the row
+        // until it appears), so "unchanged" here is a difference between arms
+        // rather than an artefact of a clock.
         assert_eq!(
             persisted(&db, "mock").await,
             Some(1),
