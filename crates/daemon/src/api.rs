@@ -4823,6 +4823,13 @@ async fn agent_options(
         "agent": name,
         "options": entry.options,
         "cached": cached,
+        // t182/C4: "we were never told" must be tellable from "it has none".
+        // `known: false` says exactly that, so a picker can render "unknown /
+        // retry" instead of "0 models" -- the distinction the panel's t84 note
+        // (`Runtimes.tsx`) already argues for failed probes but could not apply
+        // here, because every answer used to look like a successful, empty
+        // catalogue.
+        "known": entry.known,
         "updated_at": entry.updated_at,
     })))
 }

@@ -104,6 +104,25 @@ pub(crate) fn extract_options(options: &[SessionConfigOption]) -> Vec<SessionOpt
         .collect()
 }
 
+/// The value the options channel should carry for a session's FIRST answer
+/// (t182/C1).
+///
+/// `config_options == None` means the ACP server said NOTHING about its session
+/// options; `Some(&[])` means it said there are none. Folding the first into the
+/// second (`as_deref().unwrap_or(&[])` -- the shape this replaced) made those two
+/// observably the same value, and the daemon's option tracker then cached AND
+/// persisted that emptiness as knowledge: a picker claiming "has none" for a
+/// runtime the daemon was simply never told about (t180).
+///
+/// Returning `None` keeps the channel at its initial `None`, which its own type
+/// (`watch::Receiver<Option<Vec<SessionOptionState>>>`) already models as "has
+/// not reported" -- the distinction the daemon's consumers depend on.
+fn advertised_options(
+    config_options: Option<&[SessionConfigOption]>,
+) -> Option<Vec<SessionOptionState>> {
+    config_options.map(extract_options)
+}
+
 /// Map a canonical option key to a runtime's advertised option:
 /// `mode` → permission mode (category `mode`), `effort` → thinking
 /// level (category `thought_level`); anything else matches an exact id.
@@ -441,8 +460,13 @@ async fn supervise_chat(
 
             // The agent advertises its session options here (model,
             // reasoning effort, permission mode, …).
-            let advertised = extract_options(session.config_options.as_deref().unwrap_or(&[]));
-            options_tx.send_replace(Some(advertised));
+            //
+            // NOT TOLD IS NOT "TOLD: NONE" (t182/C1): a server that says nothing
+            // must leave the channel at `None` ("has not reported") instead of
+            // publishing an empty advertisement that the tracker would persist.
+            if let Some(advertised) = advertised_options(session.config_options.as_deref()) {
+                options_tx.send_replace(Some(advertised));
+            }
             // Which advertised id addresses the model option ("model" unless
             // the agent names it differently).
             let model_config_id = session
@@ -639,4 +663,27 @@ async fn supervise_chat(
             },
         )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// t182/C1, mechanized: the daemon's pickers must be able to tell "the
+    /// server said nothing" from "the server said: none". Before this, both
+    /// arrived as `Some(vec![])` and the tracker persisted the empty catalog.
+    #[test]
+    fn a_silent_server_is_not_an_empty_advertisement() {
+        assert!(
+            advertised_options(None).is_none(),
+            "`config_options == None` (never told) must NOT publish an \
+             advertisement -- the channel's own `None` is the honest value"
+        );
+        assert_eq!(
+            advertised_options(Some(&[])).map(|v| v.len()),
+            Some(0),
+            "`config_options == Some([])` (told: none) IS an advertisement, and \
+             it is distinguishable from the silent case"
+        );
+    }
 }

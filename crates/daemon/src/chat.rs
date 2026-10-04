@@ -294,10 +294,19 @@ type AskDropper = Arc<dyn Fn(RunId) + Send + Sync>;
 
 /// One cached option catalog (what a runtime advertises) plus when the
 /// persisted copy was written — the panel shows the sync time.
+///
+/// `known` answers "did a first-hand report back these options?" (t182/C4).
+/// `options.is_empty() && !known` means the daemon was NEVER TOLD which options
+/// the runtime has -- and a picker must not render that as "this runtime has
+/// none": the panel already argues exactly this rule for failed probes
+/// (`Runtimes.tsx`'s t84 note: "a failed probe must not render as '0 models'",
+/// because it is "indistinguishable from a runtime that really has none").
+/// Making the distinction part of the value is what gives that guard a signal.
 #[derive(Debug, Clone)]
 pub struct CachedOptions {
     pub options: Vec<SessionOptionState>,
     pub updated_at: i64,
+    pub known: bool,
 }
 
 /// Result of one `Db::call` round-trip (the channel result wrapping the
@@ -947,14 +956,16 @@ impl ChatManager {
                     {
                         last = Some(state.clone());
                         let updated_at = Utc::now().timestamp_millis();
-                        cache.lock().expect("model cache lock").insert(
-                            runtime_key.clone(),
-                            CachedOptions {
-                                options: state.clone(),
-                                updated_at,
-                            },
-                        );
-                        persist_options(&db, &runtime_key, &state, updated_at);
+                        // t182/C2: only a REPORTED state is knowledge. `None` is
+                        // "the runtime has not reported" and must reach neither
+                        // the cache nor `agent_options`.
+                        if let Some(entry) = catalog_to_track(Some(state.as_slice()), updated_at) {
+                            cache
+                                .lock()
+                                .expect("model cache lock")
+                                .insert(runtime_key.clone(), entry.clone());
+                            persist_options(&db, &runtime_key, &entry.options, entry.updated_at);
+                        }
                     }
                     if watch.changed().await.is_err() {
                         return; // chat closed
@@ -1365,12 +1376,15 @@ impl ChatManager {
                 previous.unwrap_or(CachedOptions {
                     options: Vec::new(),
                     updated_at,
+                    // t182/C4: we were never told -- not an empty observation.
+                    known: false,
                 })
             }
             OptionsRead::Reported(options) => {
                 let entry = CachedOptions {
                     options: options.clone(),
                     updated_at,
+                    known: true,
                 };
                 self.model_cache
                     .lock()
@@ -1410,10 +1424,21 @@ impl ChatManager {
         let mut cache = self.model_cache.lock().expect("model cache lock");
         for (runtime, json, updated_at) in rows {
             if let Ok(options) = serde_json::from_str::<Vec<SessionOptionState>>(&json) {
+                // A STORED EMPTY IS NOT KNOWLEDGE (t182/C3): it is either a
+                // pre-t182 artifact of the `unwrap_or(&[])` fold or a runtime the
+                // daemon was told has none -- in neither case is it a first-hand
+                // reading in THIS process, and seeding it is what let an empty
+                // picker survive a restart (t192's outage). Leaving the runtime
+                // out of the cache keeps it UNKNOWN, which the route now reports
+                // as `known: false` instead of an authoritative empty list.
+                if options.is_empty() {
+                    continue;
+                }
                 // Don't overwrite entries a live chat already refreshed.
                 cache.entry(runtime).or_insert(CachedOptions {
                     options,
                     updated_at,
+                    known: true,
                 });
                 n += 1;
             }
@@ -1747,6 +1772,28 @@ async fn wait_options(chat: &Chat) -> OptionsRead {
     }
 }
 
+/// What the option tracker may learn from ONE observation of a session's
+/// channel (t182/C2).
+///
+/// `None` is "the runtime has not reported" -- NOT knowledge. The tracker's only
+/// criterion used to be "the value changed", so a channel that carried no
+/// advertisement still wrote an empty catalog into the cache AND persisted it,
+/// which is how a picker comes to assert "has none" for a runtime the daemon was
+/// never told about (t180's O1). Split out of the tracker loop, like
+/// `record_probe` was split out of `probe_options`, so the rule can be tested
+/// without an agent.
+fn catalog_to_track(
+    state: Option<&[SessionOptionState]>,
+    updated_at: i64,
+) -> Option<CachedOptions> {
+    let options = state?;
+    Some(CachedOptions {
+        options: options.to_vec(),
+        updated_at,
+        known: true,
+    })
+}
+
 /// Apply a role's canonical option defaults onto a live chat: wait for
 /// the runtime's advertised options, map canonical keys (`mode`,
 /// `effort`) onto the option ids this engine uses, set each.
@@ -2025,6 +2072,130 @@ mod generating_tests {
             Some(1),
             "a timeout must not persist over the stored catalog"
         );
+        assert!(
+            timed_out.known,
+            "keeping the LAST GOOD catalog is knowledge we already had, and the \
+             answer must say so rather than downgrade it (t182/C4)"
+        );
+        // The case that must NOT claim knowledge: a timeout for a runtime we
+        // have never heard from. That is "unknown", and it is what the route
+        // reports as `known: false` instead of an empty catalogue.
+        let never_told = chats.record_probe("cold-runtime", OptionsRead::NotReportedInTime, 9);
+        assert!(
+            !never_told.known && never_told.options.is_empty(),
+            "a timeout with NO prior report is `known: false`, not an \
+             authoritative empty catalogue (t180's O1)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t182/C2, the tracker's rule (the sibling of the probe rule above): only a
+    /// REPORTED state may reach the cache and the `agent_options` table.
+    ///
+    /// Before this, the tracker's only criterion was "the value changed", so the
+    /// channel's `None` -- "the runtime has not reported" -- still wrote an empty
+    /// catalogue and persisted it: the picker then asserted "has none" for a
+    /// runtime the daemon was never told about (t180's O1).
+    #[test]
+    fn the_tracker_tracks_only_what_a_runtime_reported() {
+        assert!(
+            catalog_to_track(None, 7).is_none(),
+            "`None` (never reported) must reach neither the cache nor \
+             `agent_options`; if this returns Some, the O1 path is back"
+        );
+        // A runtime that DID report -- even "none" -- is first-hand knowledge in
+        // this process, and is distinguishable from the case above by `known`.
+        let reported_none_state: Vec<SessionOptionState> = Vec::new();
+        let reported_none =
+            catalog_to_track(Some(&reported_none_state), 7).expect("a report is knowledge");
+        assert!(
+            reported_none.options.is_empty() && reported_none.known,
+            "a report of none is knowledge (`known: true`), not an unknown"
+        );
+        assert_eq!(reported_none.updated_at, 7);
+        let one = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "choices": [{ "value": "max", "name": "max" }],
+                "current": "max",
+            }))
+            .expect("session option"),
+        ];
+        let reported = catalog_to_track(Some(&one), 8).expect("a report is knowledge");
+        assert_eq!(reported.options.len(), 1);
+        assert_eq!(reported.updated_at, 8);
+    }
+
+    /// t182/C3: a catalog row that is EMPTY must not be seeded as knowledge at
+    /// boot -- that is what let an empty picker survive a restart (t192), and
+    /// the route now reports the difference (`known: false`).
+    #[tokio::test]
+    async fn an_empty_catalog_row_is_not_seeded_as_knowledge() {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-opts-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        // One runtime that was told "none" (stored as `[]`) and one real report.
+        let seed = db.clone();
+        let seeded = seed
+            .call(move |conn| -> Result<(), ruagent_store::DbError> {
+                conn.execute(
+                    "INSERT INTO agent_options (runtime, options, updated_at)
+                 VALUES ('silent', '[]', 11)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO agent_options (runtime, options, updated_at)
+                 VALUES ('real', ?1, 12)",
+                    rusqlite::params![
+                        serde_json::to_string(&vec![
+                            serde_json::from_value::<SessionOptionState>(serde_json::json!({
+                                "id": "model",
+                                "name": "Model",
+                                "category": "model",
+                                "choices": [{ "value": "max", "name": "max" }],
+                                "current": "max",
+                            }))
+                            .expect("session option")
+                        ])
+                        .expect("json")
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed the catalog rows");
+        drop(seeded);
+
+        chats.load_option_cache().await;
+
+        let cache = chats.model_cache.lock().expect("model cache lock");
+        assert!(
+            !cache.contains_key("silent"),
+            "an EMPTY stored catalog must stay unknown after boot, not be seeded \
+             as `known: true, options: []`"
+        );
+        let real = cache.get("real").expect("a real report IS seeded");
+        assert_eq!(real.options.len(), 1);
+        assert!(real.known, "a seeded real report is knowledge");
+        drop(cache);
         let _ = std::fs::remove_dir_all(&root);
     }
 
