@@ -293,6 +293,110 @@ jobs:
             echo "::error::Playwright run failed (exit $rc)"
             exit 1
           fi
+
+          # ---- the MEASURED count (t166) ---------------------------------------
+          # The guards above make a SKIP visible; none of them notices a run whose
+          # specs all "passed" because most of them never RAN. `0 failed` and
+          # `0 measured` are different facts, and only the first had a guard -- so a
+          # named, legitimate-looking skip (wiki.spec.ts with no wiki pages, chat
+          # with no mock agent registered, ...) could still leave a GREEN run whose
+          # summary hides that its coverage is gone.
+          #
+          # The floor below is a READING, not a taste: six consecutive successful
+          # E2E runs -- 37138197234, 37139111120, 37141299806, 37192592208,
+          # 37194596042, 37196424418 (2026-10-03/04) -- each printed
+          # `62 passed (...)`, 0 failed, 0 flaky and `JSON says 0 skipped / 0 named`
+          # in this very step. 62 is therefore what this suite measures on the CI
+          # daemon today. A rise is fine; a DROP is the thing this guard is for.
+          # Updating it is allowed ONLY with a new reading of the same kind.
+          E2E_MEASURED_FLOOR=62
+          set +e
+          node - "$json" > "$RUNNER_TEMP/t65/json-counts.txt" 2>&1 <<'NODE'
+          const fs = require("fs");
+          const r = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const c = { expected: 0, unexpected: 0, flaky: 0, skipped: 0, total: 0 };
+          const walk = (s) => {
+            for (const sp of s.specs || []) {
+              for (const t of sp.tests || []) {
+                c.total += 1;
+                if (t.status === "expected") c.expected += 1;
+                else if (t.status === "unexpected") c.unexpected += 1;
+                else if (t.status === "flaky") c.flaky += 1;
+                else if (t.status === "skipped") c.skipped += 1;
+              }
+            }
+            for (const ch of s.suites || []) walk(ch);
+          };
+          for (const s of r.suites || []) walk(s);
+          const st = r.stats || {};
+          const g = (k) => (st[k] === undefined ? "?" : st[k]);
+          console.log(
+            "JSON_COUNTS measured=" + (c.expected + c.unexpected + c.flaky) +
+            " passed=" + c.expected + " failed=" + c.unexpected + " flaky=" + c.flaky +
+            " skipped=" + c.skipped + " collected=" + c.total +
+            " stats_expected=" + g("expected") + " stats_unexpected=" + g("unexpected") +
+            " stats_flaky=" + g("flaky") + " stats_skipped=" + g("skipped"),
+          );
+          NODE
+          counts_rc=$?
+          set -e
+          if [ "$counts_rc" -ne 0 ]; then
+            echo "::error::the measured-test counts could not be read out of $json (node exit $counts_rc): $(head -3 "$RUNNER_TEMP/t65/json-counts.txt" | tr '\n' ' '). Without them this leg cannot tell '0 failed' from '0 measured', so it is not green."
+            exit 1
+          fi
+          counts=$(cat "$RUNNER_TEMP/t65/json-counts.txt")
+          m_measured=$(printf '%s\n' "$counts" | sed -n 's/.*measured=\([0-9]*\).*/\1/p')
+          m_passed=$(printf '%s\n' "$counts" | sed -n 's/.*passed=\([0-9]*\).*/\1/p')
+          m_failed=$(printf '%s\n' "$counts" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')
+          m_flaky=$(printf '%s\n' "$counts" | sed -n 's/.*flaky=\([0-9]*\).*/\1/p')
+          m_skipped=$(printf '%s\n' "$counts" | sed -n 's/.*skipped=\([0-9]*\).*/\1/p')
+          m_collected=$(printf '%s\n' "$counts" | sed -n 's/.*collected=\([0-9]*\).*/\1/p')
+          s_expected=$(printf '%s\n' "$counts" | sed -n 's/.*stats_expected=\([^ ]*\).*/\1/p')
+          s_unexpected=$(printf '%s\n' "$counts" | sed -n 's/.*stats_unexpected=\([^ ]*\).*/\1/p')
+          s_flaky=$(printf '%s\n' "$counts" | sed -n 's/.*stats_flaky=\([^ ]*\).*/\1/p')
+          # Two independent readings of the same fact must agree (the per-spec walk
+          # and the report's own stats block). If they do not, the PARSER is what is
+          # broken and a count is not a reading -- refuse it rather than pass it on.
+          if [ "$s_expected" != "?" ] && [ "$((m_passed + m_failed + m_flaky))" != "$((s_expected + s_unexpected + s_flaky))" ]; then
+            echo "::error::the JSON report disagrees with itself: per-spec statuses say $((m_passed + m_failed + m_flaky)) measured (passed=$m_passed failed=$m_failed flaky=$m_flaky) while stats says $((s_expected + s_unexpected + s_flaky)) (expected=$s_expected unexpected=$s_unexpected flaky=$s_flaky). Fix the parser before believing either."
+            exit 1
+          fi
+          {
+            echo ""
+            echo "| measured tests (passed + failed + flaky) | $m_measured |"
+            echo "| collected (measured + skipped) | $m_collected |"
+            echo "| reference floor for this suite | $E2E_MEASURED_FLOOR (six CI runs 2026-10-03/04, all \`62 passed\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # `flaky` counts as MEASURED: a flaky test failed and was retried into a
+          # pass, so the suite did exercise it. Excluding it would let a retry-heavy
+          # run look smaller than it is; including it cannot hide an unmeasured test.
+          m_ran=$((m_passed + m_failed + m_flaky))
+          if [ "$m_ran" -lt "$E2E_MEASURED_FLOOR" ]; then
+            echo "::error::only $m_ran test(s) were MEASURED, below the floor of $E2E_MEASURED_FLOOR (passed=$m_passed failed=$m_failed flaky=$m_flaky skipped=$m_skipped of $m_collected collected). '0 failed' is not '0 measured': this run's green does not cover $((E2E_MEASURED_FLOOR - m_ran)) test(s) that the reference runs covered, and nothing else in this step failed. Find what turned them into skips (a fixture/mock-agent/wiki-data regression) -- or, if a test was deliberately deleted, raise the floor in the same commit WITH a new reading."
+            exit 1
+          fi
+
+          # ---- the MUST-RUN set (t166) -----------------------------------------
+          # Not "no spec may skip": the data-dependent skips (no wiki pages, no
+          # enabled agent, no probe doc) are legitimate and stay legitimate -- this
+          # is what turns a skip from INVISIBLE-with-a-green-job into a red one.
+          # Each entry is here for its OWN reason. registry.spec.ts is enforced
+          # verbatim above (t65) and is deliberately not repeated.
+          for pair in \
+            "recall.spec.ts|the recall chain (query -> stubs -> inline expand) is that spec's subject alone; its old unconditional skip hid 'recall matched no memories' and t113's lesson is that a skip is not coverage" \
+            "consumption.spec.ts|it is the only spec that exercises all four consumption legs (a memory, a recall_log row, a document AND an entity) and asserts each one; skipping it silences the whole consumption surface while the job stays green" \
+            "failure-visibility.spec.ts|it asserts that failures are VISIBLE (error text, not an empty state) and that an absence is read through a bounded window -- skipping it silences that whole class, whose false-green is how this generation lost a measurement before" \
+            "chat.spec.ts|it needs a registered mock agent, so its skip is the fingerprint of a fixture regression that would also silence judge.spec.ts; a missing mock agent must not be a quieter green" \
+            "settings-capabilities.spec.ts|the second write-guarded spec: its skip means the daemon's policy.toml [capabilities] path was never exercised (same t65-class reason as registry.spec.ts, a different config file)"; do
+            spec="${pair%%|*}"
+            why="${pair#*|}"
+            if printf '%s\n' "$skip_list" | grep -q "$spec"; then
+              echo "::error::$spec was SKIPPED, but it is in the must-run set: $why. (t166: the skip is named -- that is not the problem; the problem is that a named skip still leaves this job green.)"
+              exit 1
+            fi
+          done
+          echo "measured: $m_ran test(s) >= floor $E2E_MEASURED_FLOOR; must-run set (recall, consumption, failure-visibility, chat, settings-capabilities) all executed"
+
           echo "playwright: exit 0, JSON says $json_skipped skipped / $named named, none of them registry.spec.ts"
 
       - name: Upload Playwright artefacts
