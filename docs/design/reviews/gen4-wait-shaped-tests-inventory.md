@@ -20,14 +20,41 @@ grep -rn --include=*.rs -F -- 'Instant::now()' crates  # 21
 grep -rn --include=*.rs -F -- 'recv_timeout'  crates   #  1
 grep -rn --include=*.rs -F -- 'wait_until'    crates   #  0（本仓没有这个名字的 helper）
 # 旁证
-grep -rn --include=*.rs -F -- '#[ignore'      crates   # 24  ← 与任务单引用的 t144「16 条」不一致，见 §7
+grep -rn --include=*.rs -F -- '#[ignore'      crates   # 24（= 16 真属性 + 8 散文，见下）
 grep -rn -F -- 'waitForTimeout' panel/e2e              # 19  （未逐条读，见 §7）
 grep -rn -F -- 'Start-Sleep'    scripts                #  3  （未逐条读，见 §7）
 ```
 
 **合并扫描（我用的形状正则，含 `sleep(` / `from_millis` / `for _ in 0..` / `timeout(` / `Instant::now()` / `recv_timeout` / `wait_until` / `poll`）**：原始命中 **153** 行；其中落在**测试上下文**（`*/tests/*.rs` 或 `#[cfg(test)]` 内的 `mod *_tests`）的是下面各表列出的那些；**其余命中属产品代码**（见 §7③）。
 
-**⚠️ 一条纪律（本轮亲身踩到）**：`grep -rn "#\[ignore"`（不加 `-F`）会因 `[` 被当成括号表达式而**报错**（`Unmatched [ …`），此时它**仍然返回 0 计数** ⇒ **0 是一个假读数**。同一命令加 `-F` 后得 **24**。⇒ 报告里的计数**只用 `-F` 的固定串检索**。
+**⚠️ 一条纪律（本轮亲身踩到，captain 已入账 C51）**：`grep -rn "#\[ignore"`（不加 `-F`）会因 `[` 被当成括号表达式而**报错**（`Unmatched [ …`），此时它**仍然返回 0 计数** ⇒ **0 是一个假读数**。同一命令加 `-F` 后得 **24**。⇒ 报告里的计数**只用 `-F` 的固定串检索**。
+
+### 1.1 「计数为 0」的判据（C51 的正确形态，含本单的实测控制组）
+
+一个计数要能当证据，**同一个调用形状**必须先通过三关（缺一不可）：
+
+```powershell
+$files = Get-ChildItem crates -Recurse -Filter *.rs      # 注意：-Path 'crates/**/*.rs' 不递归 ⇒ 会得到一个自信的 0
+# 1) 调用方式真的在跑（正对照：一个必然存在的串必须非零）
+($files | Select-String -Pattern 'fn '                        | Measure-Object).Count   # 2171 ✓
+# 2) 负对照（不可能的串必须为 0）
+($files | Select-String -Pattern '@@no-such-string-anywhere@@' | Measure-Object).Count   #    0 ✓
+# 3) 目标串；并且**转义要与匹配模式一致**（regex vs -SimpleMatch 是两个不同的字面量）
+($files | Select-String -Pattern '#\[ignore' | Measure-Object).Count                     #   24   ← regex
+($files | Select-String -Pattern '#[ignore' -SimpleMatch | Measure-Object).Count         #   24   ← 字面量（不带 `\`）
+```
+
+**本单在 C51 上的实测两例（都是「自信的 0」，但成因不同 —— 这个区分很重要）**：
+1. **工具不在**：`rg -n -F -- '#[ignore' crates` 在本机 **`rg` 不在 PATH**（`Get-Command rg` = False）⇒ **三条计数全为空**；若只跑目标串，得到的就是一个**自信的 0**。**正对照 `fn ` 同样为空 ⇒ 立刻暴露**（这正是正对照的价值）。
+2. **规格错，不是仪器错**：`Select-String '#\[ignore' -SimpleMatch` = **0** —— 字面量模式下 `\` 是**模式的一部分**，源码里不存在 `#\[ignore` 这个串 ⇒ **这个 0 是诚实的**（我给的串确实不在文件里）。⇒ 纪律：**换匹配模式就要换转义**；同一个「0」在「工具没跑」与「我要的串确实不在」之间，靠**正对照 + 模式一致性**区分。
+
+### 1.2 `#[ignore]` 的 24 vs 16：**captain 已结清（本单不再背）**
+
+```
+24 命中 = 16 条【真属性】（`^\s*#\[ignore`）+ 8 条【散文里提到 #[ignore] 的字面量】
+cargo test --workspace -- --ignored --list ⇒ 16     ← 与 t144 的清账逐字一致
+```
+⇒ **CI 的忽略门禁没有缺口**。本单独立复核（两种工具/两种模式交叉）：**属性形 = 16**、**任意形 = 24**、**差 = 8 散文**，与 captain 的结论一致。（散文 8 处由 captain 点名：`retrieval-gold-live.rs:26`、`injection_e2e.rs:84,:96`、`migrations.rs:1164,:1294`、`retrieval-gold-copy.rs:34`、`store/src/lib.rs:1286`、`graph/tests/live-after.rs:3`；我未逐处复核这些**散文**坐标。）
 
 ## 2. 分类判据（先把边界写清，避免「混类」）
 
@@ -66,7 +93,7 @@ grep -rn -F -- 'Start-Sleep'    scripts                #  3  （未逐条读，�
 | # | 项 | 为什么未解释 | 处置 |
 | --- | --- | --- | --- |
 | C1 | t154 的 **F2 触发时刻**（哪一次 pid 重用、哪个测试先跑） | 遗留目录已被「先清再建」中和，事后无法回放当时的 pid 映射 | **留成未解释项**（已在 `gen4-flaky-distill-registry-repair.md` §8 同样登记）：**不许**用绿读数收口 |
-| C2 | `#[ignore]` 属性命中 **24** 与任务单引用 t144 的「**16 条**」不一致 | 我没做到「属性 → 测试函数」的逐条核对（也读不出 t144 当时的口径） | **只登记**：差 8 条未核对；见 §7② |
+| C2 | ~~`#[ignore]` 属性命中 **24** 与任务单引用 t144 的「**16 条**」不一致~~ | **已结清（captain，2026-10-04）**：24 = **16 条真属性** + **8 条散文里提到 `#[ignore]` 的字面量**；`cargo test --workspace -- --ignored --list` = **16** ⇒ **CI 忽略门禁无缺口** | **关闭**；本单独立复核（两种工具 × 两种模式）得属性形 = **16**、任意形 = **24**、差 = 8 ⇒ 与结论一致。本条**不再作为未解释项**；检索纪律见 §1.1（C51） |
 
 ## 6. 表 D —— **仅形状可疑、无红证**（排序第 4 组；处置：只登记，**不据此宣布任何东西已修好**）
 
@@ -92,7 +119,7 @@ grep -rn -F -- 'Start-Sleep'    scripts                #  3  （未逐条读，�
 
 ## 7. 我【没有】覆盖的（点名，不静默省略）
 
-**① `#[ignore]` 的 24 处**：本盘点**没有**逐条读它们的处境（任务单说 t144 的 manifest 已说明各自处境）。**且计数不一致**：`grep -F '#[ignore'` = **24**，任务单引用的是「**16 条**」⇒ **差 8 条未核对**（我不知道 t144 当时是按属性还是按测试函数计）。⇒ **读不出的部分点名在此**，不假装覆盖。
+**① `#[ignore]`（**属性 16 条**）**：本盘点**没有**逐条读它们的处境（任务单说 t144 的 manifest 已说明各自处境）。**计数差异已结清**：`#[ignore` 任意形 = **24** = **16 条真属性 + 8 条散文提及**，`-- --ignored --list` = **16**（captain 结清；本单两工具交叉复核一致）⇒ **不再是未解释项**，见 §1.1/§1.2 与表 C2。**仍未逐条读**这一点保持登记。
 
 **② `panel/e2e/**`**：`grep -F 'waitForTimeout'` = **19** 处，`waitFor(` = 0；`scripts/**` 的 `Start-Sleep` = **3** 处。这些**都不在 crates 的检索面内**（本单 out of scope），**我一行都没读** ⇒ 它们既可能含本族成员，也可能是等 UI 事实；**需要 panel/scripts 属主另做一张同形表**。
 
