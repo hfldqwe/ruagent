@@ -2544,15 +2544,40 @@ mod t8_tests {
         .expect("distill_log is readable")
     }
 
+    /// Wait (bounded) until `distill_log` holds at least `want` rows.
+    ///
+    /// WHAT THE ROWS ARE, i.e. WHAT THIS WAITS FOR: one row per distillation
+    /// pass that RAN, written at the end of `auto_distill_now` in the task
+    /// `maybe_auto_distill` spawns. So the fact is "the pass the test just
+    /// started has finished".
+    ///
+    /// WHY 3s IS A BOUND AND NOT A JUDGEMENT: a pass writes its row AFTER the
+    /// extraction it is named for, and every call site in this module drives
+    /// either the deterministic rules tier (microseconds) or an ACP pass that
+    /// fails to spawn at all -- both orders of magnitude below 60 x 50ms, while a
+    /// pass that HUNG (the thing this must not paper over) is unbounded. The
+    /// exit condition is the row count; the budget is only the ceiling.
+    ///
+    /// EXHAUSTION IS A FAILURE, NOT A VALUE (t157 B2, fixed in t160). Returning
+    /// whatever was there made the caller's message read "len 0" -- a number
+    /// that cannot be told apart from "the pass ran and wrote nothing", which is
+    /// a different defect with a different owner.
     async fn wait_for_rows(db: &ruagent_store::Db, want: usize) -> Vec<(String, String, String)> {
+        let mut got = rows(db).await;
         for _ in 0..60 {
-            let got = rows(db).await;
             if got.len() >= want {
                 return got;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+            got = rows(db).await;
         }
-        rows(db).await
+        panic!(
+            "wait_for_rows: waited 3s for {want} `distill_log` row(s) (one per distillation \
+             pass that RAN) and found {}: {got:?}. Zero means no pass ever finished; fewer \
+             than {want} means fewer passes ran than the plan called for -- neither is \
+             \"the pass wrote nothing\".",
+            got.len()
+        );
     }
 
     #[tokio::test]
@@ -2593,8 +2618,24 @@ mod t8_tests {
 
         // (1) THE DEFAULT — legacy plane, auto = false: nothing runs at all,
         //     not even a failed attempt (a failed attempt WOULD log a row).
+        //
+        // NO SLEEP HERE (t157 B1). "Nothing was written" is a NEGATIVE claim, and
+        // a sleep in front of a negative assertion is the one shape in this
+        // family whose PASS depends on how long it waited: sleep too little and
+        // it reports "nothing happened" while a pass is still in flight. The fact
+        // that makes the claim decidable is the GATE, and the product reports it:
+        // `maybe_auto_distill` resolves `unattended_plan()` and RETURNS BEFORE
+        // `tokio::spawn` when the plan is empty -- with an empty plan there is no
+        // asynchronous producer to wait for. Asserting that premise is what
+        // replaces the sleep: if a pass were allowed through, THIS assertion is
+        // what goes red, and cases (2)/(4) below prove the same instrument does
+        // see rows when the plan is non-empty (so the case is not vacuous).
+        assert!(
+            manager.unattended_plan().is_empty(),
+            "the default plane must resolve to an EMPTY plan -- that is what makes \
+             'nothing ran' decidable without a clock"
+        );
         manager.maybe_auto_distill(id);
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             rows(&db).await.is_empty(),
             "the default configuration must distill nothing: {:?}",
@@ -2621,9 +2662,13 @@ mod t8_tests {
         // (3) OFF AGAIN — the same close writes nothing new: the capability has
         //     an observable effect in BOTH directions.
         manager.set_capabilities(crate::capability::CapabilityPlane::legacy());
+        // The premise of the negative claim, ASSERTED (t157 B1) -- and the reason
+        // no sleep follows it: an empty plan means `maybe_auto_distill` returned
+        // before the spawn, so nothing can add a row. Case (2) above is already
+        // synchronized on its own pass through `wait_for_rows`, so the single row
+        // it wrote is the only one in flight, and it has landed.
         assert!(manager.unattended_plan().is_empty());
         manager.maybe_auto_distill(id);
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(rows(&db).await.len(), 1, "off means no new row");
 
         // (4) THE LLM TIER IS THE ONLY ACP TRIGGER: with `[distill].auto = true`

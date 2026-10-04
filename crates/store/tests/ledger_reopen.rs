@@ -37,12 +37,49 @@ impl Drop for Root {
         // drops, and Windows refuses to remove a directory with an open file, so
         // retry briefly: a self-cleaning test that leaks its root is the residue
         // this crate has been asked about before.
+        let mut last: Option<std::io::Error> = None;
         for _ in 0..20 {
             match std::fs::remove_dir_all(&self.0) {
                 Ok(()) => return,
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
         }
+        // A TRACE, NOT A SILENCE (t157 B3, fixed in t160). Giving up quietly here
+        // is exactly how this crate earned its "leaks its root" reputation: the
+        // residue was real and nothing ever said so. Twenty attempts is ~1s; the
+        // bound is a ceiling on "the handle closes a moment after the drop", not a
+        // judgement about correctness.
+        //
+        // WHY NOT `panic!`: this runs in `Drop`. A panic while the thread is
+        // ALREADY unwinding from a failed assertion aborts the whole test binary,
+        // so one leaked root would take every other test in the process down with
+        // it -- a diagnosable residue turned into an undiagnosable crash. It would
+        // also fail an otherwise-passing test for a reason the test is not about.
+        // The durable marker below survives the process, which a swallowed
+        // `eprintln!` from a PASSING test does not (the harness captures it).
+        let err = last
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown (no error recorded)".to_string());
+        let marker = self.0.join("LEAKED-ROOT.txt");
+        let _ = std::fs::write(
+            &marker,
+            format!(
+                "t98: this test root could not be removed after 20 attempts (~1s).\n\
+                 root: {}\n\
+                 last error: {err}\n\
+                 This marker IS the fix: the residue is diagnosable instead of silent \
+                 (t157 B3 / t160). Delete the directory once no test is running.\n",
+                self.0.display()
+            ),
+        );
+        eprintln!(
+            "t98 LEAKED ROOT after 20 attempts: {} (last error: {err}); marker: {}",
+            self.0.display(),
+            marker.display()
+        );
     }
 }
 
@@ -165,4 +202,51 @@ async fn a_future_version_is_not_a_hole() {
     assert_eq!(versions(&reopened).await, expected);
     drop(reopened);
     drop(db);
+}
+
+/// The residue's OWN test (t160): when the root cannot be removed, `Drop` must
+/// leave a durable marker instead of silence.
+///
+/// WHY THIS IS A TEST AND NOT A COMMENT: the claim above ("a trace, not a
+/// silence") is only worth something if it can go red. The deterministic way to
+/// make `remove_dir_all` fail on Windows is to hold a file inside the root open
+/// with `share_mode(0)` (an EXCLUSIVE open) -- that is a real sharing violation,
+/// not a sleep, so the failure is guaranteed rather than observed.
+///
+/// WINDOWS-ONLY, and that is honest rather than convenient: on Unix an open file
+/// does not stop `remove_dir_all`, so this cannot be pressed there. The marker
+/// path itself is exercised on both platforms (every other test in this file
+/// runs it on the success branch); only the failure branch is Windows-only.
+#[cfg(windows)]
+#[test]
+fn a_root_that_cannot_be_removed_leaves_a_marker_instead_of_silence() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = Root::new("leak-marker");
+    let path = root.0.clone();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0) // EXCLUSIVE: any attempt to remove the dir must fail
+        .open(path.join("held-open"))
+        .expect("hold a file open inside the root");
+
+    drop(root); // 20 retries, ~1s, all of them must fail
+
+    let marker = path.join("LEAKED-ROOT.txt");
+    assert!(
+        marker.exists(),
+        "a root that could not be removed must leave a durable marker, or the leak \
+         is silent again (looked for {})",
+        marker.display()
+    );
+    let text = std::fs::read_to_string(&marker).expect("the marker is readable");
+    assert!(
+        text.contains("could not be removed") && text.contains("last error"),
+        "the marker must name the failure, got: {text}"
+    );
+
+    drop(held); // release the handle, then clean up by exact path
+    let _ = std::fs::remove_dir_all(&path);
 }
