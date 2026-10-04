@@ -533,6 +533,20 @@ a SIBLING directory: component-wise containment must not confuse it
 
 **为什么值得单独记**：本代记了太多「守卫静默失明」的缺陷（C32 pid 守卫 / F9 纯度清单 / §B29 第二份危险默认 / B31 未守卫的不变量），**却很少记「长对了的样子」**。这一处可以直接照抄到其它扫描型守卫（例如 `.github/workflows/scripts/*.sh` 的路径检查、`check-workflow-refs.sh` 的引用检查）：**下限 + 植入控制 + 具名排除**，三件缺一，扫描就会在某天变成空转。
 
+## B33. 可照抄的范式：**就地重建静态目录 ⇒ 分阶段 + 原子换入 + 植入的失败钩子**（`panel/scripts/build-panel.mjs` 已落地，captain 本轮逐行读到）
+
+**现场**（captain 亲自读的字节，不是转述 AGENTS.md）：`panel/package.json` 的 `build` = `node scripts/build-panel.mjs`，该 wrapper 的真实顺序是 ——
+
+1. `node e2e/i18n-check.mjs` → `npx tsc -b` → `npx tsc -p e2e/tsconfig.json --noEmit`，`run()` 对**任一步非零**立即 `exit`，并打印 **`dist untouched`**；
+2. 一个**故意的失败钩子** `PANEL_BUILD_FORCE_FAIL=1`（放在类型检查之后、vite 之前）⇒ 让人能**取到「构建失败时 dist 仍是旧可用版本」的读数**；
+3. `npx vite build --outDir dist-staging`（**dist 全程不被清空**）；
+4. 资产**只增**拷进 `dist/assets`；`index.html` 用 **write-then-rename 原子换入**（Windows 与 POSIX 上 rename 都原子）；
+5. 最后才删新 index 不再引用的旧资产。
+
+**为什么值得单独记（它比「失败时不动 dist」强一格）**：`vite build` 默认**先清空 outDir 再写** ⇒ 就地重建 `dist` 会有一个**几秒的 404 窗口**（t319 实测：构建期间紧 curl 能得到非 200）—— 而**每一个把 `npm run build` 当验证步骤的人都会替正在用面板的人打开这个窗口**。这个 wrapper 的形态把「**成功时也不会半写**」也做到了。**⇒ 可照抄到任何「被服务的静态目录就地重建」的场景**：**分阶段目录 + 只增资产 + 原子换 index + 最后清理**，并**自带一个失败钩子**，否则「失败不留半成品」这句话没有仪器。
+
+**一条顺带的方法论**：AGENTS.md 对该 wrapper 的描述（「…then vite (L44)；任一步非零就退出且 dist 不变」）**方向正确但弱于字节** —— 这正是本代那条纪律的又一例：**宣称要回读字节**，因为「描述」通常只说对一半（这里漏掉的恰恰是最有价值的那一半：**成功路径也不清空 dist**）。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
