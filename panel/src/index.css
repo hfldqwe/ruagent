@@ -816,6 +816,14 @@ html[data-mode="light"] .tag.err { color: #c4121c; background: #f9e7e8; }
   color: var(--ant-color-primary);
 }
 .step-num { margin-bottom: 10px; }
+/* audit rows 4/38 (`#home`): the rule above gives BOTH badge classes the same 1px
+   border, and the row counts that border as a "strict container" (the badge bears
+   direct text and is a DIV with 4 live sides). `.step-n` is also used by #task, so
+   the change is scoped to `.step-num` alone -- routing #task must not move. The
+   ring is KEPT, redrawn as an inset shadow: that is the mechanism the contract
+   already prescribes for `.inbox-card`'s spine (borderWidth === 0px), so the badge
+   looks the same while it stops being a bordered container. */
+.step-num { border: none; box-shadow: inset 0 0 0 1px var(--ant-color-primary-border); }
 /* 16px line-height + 4px block padding = 24px, the row-18 hard floor. A view
    cannot fix this from its side: wrapping the summary in a .row measured 50px
    (a 22px dead band from the native marker's line box) and was reverted. */
