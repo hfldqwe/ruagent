@@ -88,3 +88,40 @@
 - 改动：`rust-toolchain.toml`、`.github/workflows/ci.yml`、本报告。`crates/**`、`panel/**`、`scripts/**`、其余三份 workflow 一行未动。
 - 未 push / dispatch / rerun / cancel / 建 tag；未碰活守护进程。
 - 复核材料：`%TEMP%\ruagent-t152\`（`install.log`（失败的那次，含 rename 错误原文）、`clippy.out`、`test.out`（672 passed 的逐 target 行）、`gate-log.txt`（三次运行的时间戳与 exit code）、`check_pin.py`（三 carrier 同值 + 形状复核））。
+
+---
+
+## 9 修订记录 R-1（2026-10-04，t152 交回之后；**纯追加**）
+
+**为什么追加**：§7 里有两条只有**流水线**能回答的问题（② action 是否认输入；④ rust-cache 代价），t152 交回时都还是未测。captain 随后拿到了**真跑读数**（run `37194596072`），按本仓惯例把答案记进来，而不是让悬着的那句话留在记录里。**这是一次文档追加**：两个代码载体一字节未动 —— 追加前重取 sha256，`rust-toolchain.toml` 仍是 `240f110a…`、`ci.yml` 仍是 `9d1c06ff…`，**与 §4 三道门认证的那份字节逐字相同**（2026-10-04T18:36:12+08:00），所以 §4 的绿读数仍然描述当前字节。
+
+### R-1a §7-② 结案：输入**被认了**（真跑读数，不是推断）
+
+**旧文字（逐字，引自 §7-2）**：「**那个 SHA 上的 action 是否真的认 `toolchain:` 输入，我没有验证成功**：raw 取该 SHA 的 `action.yml` 两次超时、HTML 视图只回来导航栏 ⇒ **未读到**；README 只说「显式输入要用 `@master`」。」
+**答案（captain 转来的 runner 原文，run `37194596072`；不是我的读数，归属写清）**：
+```
+toolchain: 1.95.0
+##[start-action] Run rustup toolchain install 1.95.0 --component rustfmt --component clippy --profile minimal --no-self-update
+info: syncing channel updates for 1.95.0-x86_64-unknown-linux-gnu
+  1.95.0-x86_64-unknown-linux-gnu installed - rustc 1.95.0 (59807616e 2026-04-14)
+##[start-action] Run rustup default 1.95.0  ⇒ default toolchain set to 1.95.0-x86_64-unknown-linux-gnu
+```
+⇒ **没有 `Unexpected input` 警告**；runner 装的是 `1.95.0`，其 `rustc` 与本地**逐字同一个 commit**（`59807616e 2026-04-14`）；`Format` 在该 runner 上 **✓**，`Rust (ubuntu)` / `Rust (windows)` / `Panel` 三个 job **全 success** ⇒ **钉版没有把 CI 弄坏，两个载体在 CI 上也一致了**（action 装 1.95.0 + 文件让命令用它）。§7-② 那条「替代形态 `@1.95.0`」**不再需要**（它要求放弃 SHA pin，现在没有理由付那个代价）。
+
+### R-1b §7-④ 升级：从「未测量」到「**已测量**，归因待下一次跑判定」
+
+**旧文字（逐字，引自 §7-4）**：「`Swatinem/rust-cache` 的 key 会随工具链变化（缓存失效一次）——**未测量**，只是提醒下一个看到冷构建的人。」
+
+**实测（captain 给的两份 run 对照）**：
+
+| job | 钉版前 `37192592194` | 钉版后 `37194596072` | 差 |
+| --- | --- | --- | --- |
+| **Rust (ubuntu)** | **281s** | **1183s** | **+902s（4.2×）** |
+| Rust (windows) | 658s | 1125s | +467s |
+| Panel | 31s | 39s | +8s |
+| **整 run** | 11m2s | **19m54s** | +8m52s |
+| E2E | 4m5s | 8m4s | +3m59s |
+
+**机制（captain 明说他没有证据 ⇒ 我按纪律标成【未证实的假设】，不写成结论）**：最可能是 **`rust-cache` 的 key 随工具链版本变化 ⇒ 命中失败 ⇒ 依赖被整体重建**（工具链换了，`target/` 里旧编译器的产物作废），**叠加每个 job 各装一次工具链**。
+**判据（下一次推送就能判）**：若下一次 run 回到 ~4–5 分钟 ⇒ **一次性**（新 key 已建立，缓存重新装上）；若仍在 ~19 分钟 ⇒ **每次跑的固定代价** ⇒ 那时才值得讨论别的形态（把工具链纳入 cache / 只在需要时钉 / 别的取舍）。
+**给用户的一句话权衡**：这次钉版**用 CI 时长换可复现性** —— 目前看到的是**首次**缓存重建的代价（+8m52s，ubuntu 4.2×），**是否变成常态由下一次 run 判定**；若它成为常态，代价就从「一次性」变成「每次多 9 分钟」，届时需要重新取舍（而**现在还不该**按一次冷启动就回退：回退等于把 §3 里那条「新 stable 的新 lint 能让零改动提交变红」的风险再放回来）。
