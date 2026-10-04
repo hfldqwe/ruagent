@@ -570,6 +570,30 @@ a SIBLING directory: component-wise containment must not confuse it
 
 **为什么值得单独记**：CI 里的重试是本代最怕的形状之一（**「绿」可能只是第二次运气好**），而这个仓**已经有了正确形态**，就在 windows job 里。⇒ 任何将来要加重试的地方（E2E、audit、将来别的慢门）**照这个抄**：**先判类别 → 不可重试的类别拒绝并把理由打出来 → 可重试的类别重试且单独出证据**。**与 C55 的关系**：C55 说「② 用时间代替判定 ⇒ 会翻面」；B34 管的是**重试**：**它是"用次数代替判定"**，同样会翻面 —— 除非像这里一样，**重试的类别在构造上不可能包含真红**。
 
+## B35. 可照抄的范式：**「入口是门，不是习惯」——用一道门保护另一道门的【接线】**（`e2e.yml` 已落地，captain 本轮读到）
+
+**现场**（`.github/workflows/e2e.yml`，紧跟覆盖声明之后）：
+
+```yaml
+# The entry point is a GATE, not a habit (AGENTS.md, t65). If package.json
+# stops routing test:e2e through run-e2e.mjs, or run-e2e.mjs stops arming
+# the write flag, the suite would silently skip its only writing spec -- so
+# this step reads both files and fails loudly instead.
+- name: Entry-point guard (test:e2e must go through run-e2e.mjs)
+  run: |
+    script=$(node -e "console.log(require('./panel/package.json').scripts['test:e2e'])")
+    if [ "$script" != "node e2e/run-e2e.mjs" ]; then
+      echo "::error::panel test:e2e is '$script', not 'node e2e/run-e2e.mjs'. … a bare 'npx playwright test' skips it silently (AGENTS.md, t65)."
+      exit 1
+    fi
+    grep -q 'RUAGENT_E2E_ALLOW_WRITES' panel/e2e/run-e2e.mjs || { … }
+```
+
+1. **它保护的不是一次运行的产物，而是【接线】**：`package.json` 的 `test:e2e` 必须仍然指向 `run-e2e.mjs`，且 `run-e2e.mjs` 必须仍然**武装**写标志。
+2. **失败是响亮的**，并把**后果**写进错误里（「a bare `npx playwright test` skips it silently」），而不是只说「配置不对」。
+3. **为什么这一类门不可少**：本代所有「跳过必须可见」的门（`t165` 的忽略清单 · `t166` 的下限 + 必跑集合 · `t110/t104` 的未命名跳过）**都假定那条入口是通的** —— 而入口**只是一行字符串**，谁都能顺手改掉它，改掉之后**所有下游守卫都会安静地失去作用**（`registry.spec.ts` 会 skip，而 skip 是**带名字**的 ⇒ 现有守卫**抓不到**）。⇒ **保护「守卫赖以生效的接线」是独立的一类门**。
+4. **可机械化的判据**：① 找到你的守卫**依赖哪条接线**（入口脚本名、环境变量、某个文件里的某个串）；② **读它、与期望逐字比**，不一致 ⇒ **红并写清后果**；③ 与 B32 的区别：**B32 是「扫源码里有没有这个形状」，B35 是「读配置/接线看它是否仍然成立」** —— 前者防**新代码**，后者防**改配置**。
+
 ## C. 质量门与仓库工程
 
 | # | 事项 | 证据 | 状态 |
