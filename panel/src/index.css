@@ -824,6 +824,26 @@ html[data-mode="light"] .tag.err { color: #c4121c; background: #f9e7e8; }
    already prescribes for `.inbox-card`'s spine (borderWidth === 0px), so the badge
    looks the same while it stops being a bordered container. */
 .step-num { border: none; box-shadow: inset 0 0 0 1px var(--ant-color-primary-border); }
+/* audit rows 13/14 (t159): the two measured BODY-TEXT contrast failures, both fixed
+   by colour alone -- nothing is hidden, shrunk, or moved out of the object set.
+
+   1) LIGHT `#home`: the badge number above is `var(--ant-color-primary)` (#c88413)
+      on `var(--ant-color-primary-bg)` (#fff9e6) = 2.95:1 at 11px (measured).
+      The light primary-BORDER token is the same amber taken darker (#8a5600, 5.79:1
+      on the same tint) and is ALREADY the ring's colour, so the badge keeps its
+      identity and its hue. Scope is light + `.step-num` only: in DARK the same rule
+      measures 4.81:1 (#f0a93b on #564120) and must stay byte-identical, and `.step-n`
+      is shared with `#task` (TaskDetail.tsx:621), which this task does not touch.
+   2) DARK: a DISABLED antd button's label is `var(--ant-color-text-quaternary)`
+      (#838891), and the button lifts its own surface by `rgba(255,255,255,0.08)`,
+      which composites over the card to #2d3036 = 3.71:1 -- measured on `#home`
+      ("看 板" x1) and `#settings` ("应 用" x6), every one of them `disabled`.
+      The label moves to the SECONDARY text token (#adb2bb: 6.17:1 on #2d3036, and
+      >=5.1:1 on the lighter elevated surfaces this app puts buttons on). The disabled
+      STATE is still carried by the attribute, the not-allowed cursor and the lift.
+      LIGHT is untouched: #656a72 on #f1f1f2 already measures 4.81:1. */
+html[data-mode="light"] .step-num { color: var(--ant-color-primary-border); }
+html[data-mode="dark"] .ant-btn:disabled { color: var(--ant-color-text-secondary); }
 /* 16px line-height + 4px block padding = 24px, the row-18 hard floor. A view
    cannot fix this from its side: wrapping the summary in a .row measured 50px
    (a 22px dead band from the native marker's line box) and was reverted. */
