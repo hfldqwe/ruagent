@@ -1319,7 +1319,7 @@ impl ChatManager {
             }
         };
         let updated_at = Utc::now().timestamp_millis();
-        Ok(self.record_probe(runtime, &state, updated_at))
+        Ok(self.record_probe(runtime, state, updated_at))
     }
 
     /// Record what a probe reported.
@@ -1336,34 +1336,50 @@ impl ChatManager {
     /// Split out of `probe_options` so the rule can be tested without an agent
     /// that fails to advertise: the decision is the contract here, the spawn is
     /// not.
-    fn record_probe(
-        &self,
-        runtime: &str,
-        state: &[SessionOptionState],
-        updated_at: i64,
-    ) -> CachedOptions {
-        if state.is_empty() {
-            let previous = self
-                .model_cache
-                .lock()
-                .expect("model cache lock")
-                .get(runtime)
-                .cloned();
-            return previous.unwrap_or(CachedOptions {
-                options: Vec::new(),
-                updated_at,
-            });
+    fn record_probe(&self, runtime: &str, state: OptionsRead, updated_at: i64) -> CachedOptions {
+        // AN EXPLICIT, TOTAL MATCH (t172). The rule was never "empty means
+        // nothing happened" -- it is "an UNREPORTED probe is not evidence, and a
+        // report of none from a runtime we have never heard from is not evidence
+        // either". Both keep the last good catalog and neither is persisted
+        // (t192). The change is that each state is now a NAMED ARM, so a future
+        // caller cannot reach the rule by remembering it: the timeout has its own
+        // variant and cannot be mistaken for an observation.
+        match state {
+            OptionsRead::NotReportedInTime | OptionsRead::ReportedNone => {
+                if matches!(state, OptionsRead::NotReportedInTime) {
+                    // Diagnostic only, and the thing the old conflation could not
+                    // say: no report is a TIMEOUT, not a statement about options.
+                    tracing::debug!(
+                        runtime,
+                        wait = ?MODELS_WAIT,
+                        "option probe: the runtime did not report within the bound; \
+                         keeping the last known catalog"
+                    );
+                }
+                let previous = self
+                    .model_cache
+                    .lock()
+                    .expect("model cache lock")
+                    .get(runtime)
+                    .cloned();
+                previous.unwrap_or(CachedOptions {
+                    options: Vec::new(),
+                    updated_at,
+                })
+            }
+            OptionsRead::Reported(options) => {
+                let entry = CachedOptions {
+                    options: options.clone(),
+                    updated_at,
+                };
+                self.model_cache
+                    .lock()
+                    .expect("model cache lock")
+                    .insert(runtime.to_string(), entry.clone());
+                persist_options(&self.db, runtime, &options, updated_at);
+                entry
+            }
         }
-        let entry = CachedOptions {
-            options: state.to_vec(),
-            updated_at,
-        };
-        self.model_cache
-            .lock()
-            .expect("model cache lock")
-            .insert(runtime.to_string(), entry.clone());
-        persist_options(&self.db, runtime, state, updated_at);
-        entry
     }
 
     /// Seed the option cache from the `agent_options` table at boot —
@@ -1681,13 +1697,54 @@ impl ChatManager {
     }
 }
 
+/// What a BOUNDED wait for a session's advertised options concluded.
+///
+/// The session ALREADY distinguishes three states on its own channel
+/// (`options_watch() -> watch::Receiver<Option<Vec<SessionOptionState>>>`):
+/// `None` = has not reported, `Some(vec![])` = reported and advertises none,
+/// `Some([...])` = reported those options. `wait_options` used to project that
+/// onto a bare `Vec`, which made the FIRST and the SECOND state the same value
+/// -- so a cold start slower than `MODELS_WAIT` and a runtime that genuinely
+/// advertises nothing arrived at `record_probe` indistinguishable. The t192
+/// comment below records the outage that shape caused.
+///
+/// This enum makes the projection TOTAL: the timeout is its own variant and
+/// "reported none" is not it, so the downstream rule ("an unreported probe is
+/// not evidence") is a MATCH ARM instead of an `is_empty()` inference.
+///
+/// HARDENING, NOT A DEFECT FIX (t168 §3/§5, t172): the policy below is
+/// unchanged -- an unreported probe could not overwrite or persist before, and
+/// still cannot. What changes is that the defence is now the type and the
+/// branch instead of a convention every future caller had to remember.
+#[derive(Debug, Clone, PartialEq)]
+enum OptionsRead {
+    /// We waited up to `MODELS_WAIT` and the runtime still had not reported.
+    /// A TIMEOUT -- not an observation about which options it has.
+    NotReportedInTime,
+    /// The runtime reported, and advertises no options.
+    ReportedNone,
+    /// The runtime reported these options (never empty: an empty report is
+    /// `ReportedNone`, so a caller cannot silently receive "nothing" here).
+    Reported(Vec<SessionOptionState>),
+}
+
 /// Wait for a session to report its advertised options (bounded).
-async fn wait_options(chat: &Chat) -> Vec<SessionOptionState> {
+///
+/// The three returned states are the ones the session's channel distinguishes;
+/// the fourth possibility -- the channel is STILL `None` when the bound expires
+/// -- is `OptionsRead::NotReportedInTime`, deliberately NOT `ReportedNone`
+/// (t172, criterion 1: a cold-start timeout and a report of none must not be
+/// the same value).
+async fn wait_options(chat: &Chat) -> OptionsRead {
     let mut watch = chat.options_watch();
     if watch.borrow().is_none() {
         let _ = tokio::time::timeout(MODELS_WAIT, watch.changed()).await;
     }
-    watch.borrow_and_update().clone().unwrap_or_default()
+    match watch.borrow_and_update().clone() {
+        None => OptionsRead::NotReportedInTime,
+        Some(options) if options.is_empty() => OptionsRead::ReportedNone,
+        Some(options) => OptionsRead::Reported(options),
+    }
 }
 
 /// Apply a role's canonical option defaults onto a live chat: wait for
@@ -1700,10 +1757,26 @@ async fn apply_role_defaults(chat: &Chat, defaults: &std::collections::BTreeMap<
             .await
             .is_err()
     {
-        tracing::warn!(chat = %chat.id, "role defaults: runtime reported no options");
+        // SAY WHICH THING HAPPENED (t172): the old wording said the runtime
+        // "reported no options", which is a claim about its options. What was
+        // actually observed is that it did NOT report within the bound -- a
+        // timeout. The two point an operator at different causes.
+        tracing::warn!(
+            chat = %chat.id,
+            wait = ?MODELS_WAIT,
+            "role defaults: the runtime did NOT report its options within the bound \
+             (a timeout, not a report that it has none); skipping"
+        );
         return;
     }
     let Some(options) = watch.borrow_and_update().clone() else {
+        // Unreachable when `changed()` resolved (`Ok` means a new value exists),
+        // but not silent if it ever happens (t172): a channel that moved without
+        // reporting options IS the ambiguity this hardening is about.
+        tracing::debug!(
+            chat = %chat.id,
+            "role defaults: the option channel changed without a value; skipping"
+        );
         return;
     };
     for (canonical, value) in defaults {
@@ -1737,8 +1810,8 @@ async fn apply_role_defaults(chat: &Chat, defaults: &std::collections::BTreeMap<
                 tracing::warn!(chat = %chat.id, option = %opt.id, value, reason,
                     "role default rejected by runtime")
             }
-            _ => tracing::warn!(chat = %chat.id, option = %opt.id,
-                "role default: runtime did not answer"),
+            _ => tracing::warn!(chat = %chat.id, option = %opt.id, wait = ?MODELS_WAIT,
+                "role default: the runtime did not answer within the bound (a timeout)"),
         }
     }
 }
@@ -1864,7 +1937,7 @@ mod generating_tests {
         // 1. A good probe is recorded, in the cache and in the table. The cache
         //    write is synchronous; the table write is spawned, so wait for the
         //    row instead of racing it.
-        let good = chats.record_probe("mock", &[option("mock-pro")], 1);
+        let good = chats.record_probe("mock", OptionsRead::Reported(vec![option("mock-pro")]), 1);
         assert_eq!(good.options.len(), 1);
         assert_eq!(cached("mock").map(|c| c.options.len()), Some(1));
         let mut stored = None;
@@ -1880,7 +1953,7 @@ mod generating_tests {
         // 2. An empty probe must not touch either one. Its table write would be
         //    spawned too, so give that window a chance to (not) happen before
         //    asserting the row is still the one from step 1.
-        let after_empty = chats.record_probe("mock", &[], 2);
+        let after_empty = chats.record_probe("mock", OptionsRead::ReportedNone, 2);
         assert_eq!(
             after_empty.options.len(),
             1,
@@ -1900,7 +1973,7 @@ mod generating_tests {
 
         // 3. Cold + empty is not remembered as knowledge: nothing cached, so the
         //    next open probes again.
-        let cold = chats.record_probe("cold-runtime", &[], 3);
+        let cold = chats.record_probe("cold-runtime", OptionsRead::ReportedNone, 3);
         assert!(cold.options.is_empty());
         assert!(
             cached("cold-runtime").is_none(),
@@ -1908,12 +1981,39 @@ mod generating_tests {
         );
 
         // 4. The rule is not "never update": a real report still replaces it.
-        let after_real = chats.record_probe("mock", &[option("mock-max")], 4);
+        let after_real =
+            chats.record_probe("mock", OptionsRead::Reported(vec![option("mock-max")]), 4);
         assert_eq!(
             after_real.options.first().map(|o| o.current.clone()),
             Some(Some("mock-max".to_string()))
         );
         assert_eq!(cached("mock").map(|c| c.updated_at), Some(4));
+
+        // 5. t172, criterion 1: the TIMEOUT is not the same value as "reported
+        //    none" -- they are distinct variants, so a cold-start timeout can no
+        //    longer arrive here looking like an observation. And it obeys the
+        //    SAME rule t192 pinned: no overwrite, no restamp, no persist.
+        assert_ne!(
+            OptionsRead::NotReportedInTime,
+            OptionsRead::ReportedNone,
+            "a cold-start timeout and a report of none must not be the same value"
+        );
+        let timed_out = chats.record_probe("mock", OptionsRead::NotReportedInTime, 5);
+        assert_eq!(
+            timed_out.options.first().map(|o| o.current.clone()),
+            Some(Some("mock-max".to_string())),
+            "a timeout must leave the last good catalog alone"
+        );
+        assert_eq!(
+            cached("mock").map(|c| c.updated_at),
+            Some(4),
+            "a timeout must not restamp the cache with the time it gave up"
+        );
+        assert_eq!(
+            stored,
+            Some(1),
+            "a timeout must not persist over the stored catalog"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
