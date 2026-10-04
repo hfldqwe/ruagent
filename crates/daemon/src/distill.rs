@@ -1236,6 +1236,16 @@ mod t329_tests {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let p = std::env::temp_dir().join(format!("ruagent-t329-{tag}-{}-{n}", std::process::id()));
+        // A FRESH ROOT MEANS AN EMPTY ONE (t154). The name is `pid + seq`, and
+        // pids are REUSED: when the OS hands this process a pid an earlier run
+        // had, this path already exists, `Db::open` opens the OLD database, and
+        // the write under test is a duplicate BY CONSTRUCTION -- `written == 0`,
+        // the signature `t149`'s F2 reported (`left: 0 / right: 1`), reddening
+        // the WHOLE module at once because one reused pid hits every test's
+        // directory. Nothing ever removed these: 6202 leaked `ruagent-t329-*`
+        // dirs, every one of them holding a `ruagent.db` (measured 2026-10-04).
+        // So the wipe is not hygiene, it IS the fixture.
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -1351,6 +1361,21 @@ mod t329_tests {
     async fn a_distilled_body_carries_no_provenance_marker() {
         let root = root("t347-prefix");
         let d = distiller(&root).await;
+        // THE PREMISE, ASSERTED (t149 shape). This root is fresh, so the two
+        // `written == 0` causes below have to be told apart BEFORE the write:
+        // `write_memories` asks `merge_target` about the live rows in scope, and
+        // a row already there would make the write below a duplicate BY
+        // CONSTRUCTION rather than a defect. Without this assertion a leftover
+        // row reads exactly like a refused write.
+        let live_row = "SELECT count(*) FROM memories
+                        WHERE store = 'profile' AND namespace = 'user'
+                          AND superseded_at IS NULL";
+        assert_eq!(
+            count(&d.db, live_row).await,
+            0,
+            "the fresh root must start with no live `profile/user` row, or the \
+             `written == 1` below is a duplicate by construction"
+        );
         let out = d
             .write_memories(
                 &[mem("用户偏好使用简体中文交流。")],
@@ -1359,9 +1384,21 @@ mod t329_tests {
             .await
             .unwrap();
         let w = out.written;
+        // The write is SYNCHRONOUS (`write_memories` awaits
+        // `ruagent_memory::write::write_memory`, and `Db::call` awaits the
+        // single-writer actor's reply), so a zero here is not a timing race --
+        // but the two causes it CAN be are indistinguishable in the old message.
+        // Name them: this is the field a future reader needs when the load shape
+        // that reddened these six cases (`t149` F2) is reproduced again.
         assert_eq!(
-            w, 1,
-            "the write must land, or the assertion below is vacuous"
+            w,
+            1,
+            "the write must land, or the assertion below is vacuous: written={w} \
+             skipped={} episode_recorded={} -- a non-zero `skipped` on an empty root means \
+             `ruagent_memory::write::write_memory` judged the row a duplicate (content hash) \
+             or refused the namespace; see `crates/memory/src/write.rs`",
+            out.skipped,
+            out.episode.is_some()
         );
         assert!(
             out.episode.is_some(),

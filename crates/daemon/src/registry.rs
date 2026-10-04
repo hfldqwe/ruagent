@@ -381,15 +381,32 @@ mod tests {
         }
     }
 
+    /// A UNIQUE directory per call.
+    ///
+    /// The name used to be `pid + subsec_nanos()` — a SUB-SECOND clock reading,
+    /// i.e. only as unique as the clock's resolution. Two tests starting inside
+    /// one tick would share a directory, the second `create_dir_all` would
+    /// silently succeed on the first one's files, and the loser's
+    /// `TempDir::drop` would then delete `agents.toml` while the winner was
+    /// still reading it (`parse()` does `read_to_string(..).unwrap()`). A
+    /// per-process sequence cannot collide at all, and the pid keeps two test
+    /// binaries apart — the same shape `distill.rs`'s `t329_tests::root` uses.
+    ///
+    /// LABELS, so the next reader does not over-read this: MEASURED 2026-10-04,
+    /// 20000 consecutive `UtcNow` readings on this machine were 20000 DISTINCT
+    /// values, so the clock collision here is a LATENT hazard, NOT the proven
+    /// cause of any red observed so far (`t149`'s F2 mass-red is still
+    /// unexplained; see `docs/design/reviews/gen4-flaky-distill-registry-repair.md`).
     fn editor() -> (Editor, TempDir) {
-        let dir = std::env::temp_dir().join(format!(
-            "ruagent-reg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ruagent-reg-{}-{n}", std::process::id()));
+        // Same fixture rule as `distill.rs`'s `t329_tests::root`: the name is
+        // `pid + seq` and pids are REUSED, while `TempDir` only removes its
+        // directory on a SUCCESSFUL drop -- so a run that panicked leaves the
+        // name behind and the next run would reuse its stale `agents.toml`.
+        // Wipe first: "fresh" has to mean empty, not just "a name we like".
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("agents.toml"),
