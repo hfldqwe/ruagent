@@ -20,7 +20,7 @@
 
 **安静窗口证据**：窗口 `23:11:29 → 23:17:58`（6m29s）。跑前跑后各取一次工作树指纹：`git diff` 的 blob 哈希 **两次相同**（`de29f9d93022d3daa322847cd7ada7f167a06acf`），`git status --porcelain` **逐字节相同** ⇒ 窗口内无人编辑、无人重链接；本轮没有出现「doctest 工件缺失」或 spawn 类超时。
 
-**冻结字节哈希（我的读数，不是任何成员引用的快照）**：`api.rs 9e64c227` · `distill.rs af3f816a` · `sessions.rs 5f278faa` · `graph/lib.rs 9fd8df74` · `community.rs 9633b27c` · `mcp/lib.rs d562c6a0` · `mcp/tests/roundtrip.rs 1da558c0` · `store/migrations.rs 63022749` · `cli/src/main.rs e09670a3` · `scripts/ruagent-daemon.ps1 ca6e849a` · `docs/plans/capability-plugins-design.md 6830bcc1` · `skills/ruagent-operator/SKILL.md 076c23fa` · `AGENTS.md ff0c1c4d`。
+**冻结字节的内容指纹（我的读数；这一列都是 `git hash-object` 的 git blob 哈希，SHA-1，本仓库惯例）**：`api.rs 9e64c227` · `distill.rs af3f816a` · `sessions.rs 5f278faa` · `graph/lib.rs 9fd8df74` · `community.rs 9633b27c` · `mcp/lib.rs d562c6a0` · `mcp/tests/roundtrip.rs 1da558c0` · `store/migrations.rs 63022749` · `cli/src/main.rs e09670a3` · `scripts/ruagent-daemon.ps1 ca6e849a` · `docs/plans/capability-plugins-design.md 6830bcc1` · `skills/ruagent-operator/SKILL.md 076c23fa` · `AGENTS.md ff0c1c4d`。
 
 ## 2 逐条对照
 
@@ -144,14 +144,29 @@
 | 24 | t17-O1 已由 t26 落地（`ROUTE_WINDOW=10` 已删除） | 已完成 |
 | 25 | t26 越界最小改动（docs §14.4 如实化） | 已定 |
 | 26 | **新问题（未修，建议另开 issue）**：`POST /api/v1/memory/write` 对不允许的 store×namespace 组合返回 **200 + `outcome=RejectedNamespace`** 而非 4xx | 登记（t26 发现；会波及写路径既有调用方与 MCP 输出形状，需独立一轮） |
-| 27 | 修订归属警号（t26/t27 自报哈希与 captain 复测不一致） | 见 §4（**当前字节与成员自报一致，captain 的两组读数是中途快照**） |
+| 27 | 修订归属警号（成员自报值与 captain 复算值不同） | **已按 §4 更正为机制问题**：两组值描述**同一批字节**，只是哈希函数不同（成员/本报告用 **git blob**，captain 用 **md5**）；原先把它解释成「读数落在写入过程中」的那条机制性结论已撤回 |
 | 28 | 常驻 daemon 不由团队重启 | 已定（见 §5） |
 
 ## 4 哈希与归属纪律
 
-* 本报告引用的**唯一**哈希来自我在冻结字节上的读数（§1）。成员自报值与它们**一致**：`api.rs 9e64c227`（t26 自报）、`mcp/src/lib.rs d562c6a0`（t26 自报）、`mcp/tests/roundtrip.rs 1da558c0`（t27 自报）。
-* captain 复测得到的三组不同值（`e42c7707` @22:42:26、`0c65fe44` @22:47:00、`da89f22a` @22:53:41）**不是冻结树**：它们落在成员最后一笔写入**之前/期间**，属中途快照。因此「成员引用的哈希 ≠ 交付树」这一判断本轮**不成立**；成立的说法是「captain 的两组读数是中途快照，冻结树与成员自报一致」——**任何引用成员哈希的句子都必须连带说明这一点**。
-* 功能面已按冻结字节逐点复核：`match_window:1064`、`search_cut_keys:1111`、`search_remainder_note:1984`、`SEARCH_MATCH_CEILING:1035`、`matched_exact` 19 处、`ROUTE_WINDOW` 无赋值、`distill_scope_keeps:3280`、`roundtrip.rs:819/901`、`AT LEAST` 断言。
+* **先纠正一个机制（本条曾写错，现按实测改写）**：本报告与各成员引用的数值**都是 git blob 哈希**（`git hash-object`，SHA-1，本仓库惯例），而 captain 当时复算的是 **md5**。两者描述的是**同一批字节** —— 正确的说法是「同一批字节被两种哈希函数分别报告」。**没有任何文件在成员报数之后移动**（上表就是同字节实测）。此前把两组不同值归因于「读数先于最后一笔写入」，**以及据此认为成员自报值不代表交付内容的那条判断，都已撤回**：它把「两种哈希函数」读成了「两个时间点」。
+* 同字节对照（我在**工作树 == HEAD** 上实测，两列是同一份文件；前 3 行就是被误读成矛盾的那三对）：
+
+| 文件 | git blob（SHA-1，本仓库惯例） | md5 |
+| --- | --- | --- |
+| `crates/daemon/src/api.rs` | `9e64c227341c0365cd364d90244ac5e326ed45fd` | `e42c7707ab5d4211069b053bf2870a60` |
+| `crates/mcp/src/lib.rs` | `d562c6a0f697c3bb3ac5cfc27e1ba56545f88c5a` | `0c65fe44b029f309b2424cadd453a0ba` |
+| `crates/mcp/tests/roundtrip.rs` | `1da558c0c1cdc951b863b1f14f7a1fed5eb1f5c2` | `da89f22ab3b0103e1e9c5a2242a4f97f` |
+| `crates/daemon/src/distill.rs` | `af3f816a19bd3d666c59c1e9e9085364edb21052` | `e47139b78835eabf1c5456d38da34740` |
+| `crates/graph/src/lib.rs` | `9fd8df740c49fb0a12e3075fe8aec8aba98fc1f1` | `b6ead049a008c82a57d99344aa56d7c0` |
+| `crates/daemon/src/sessions.rs` | `5f278faae96fdf4d8093a970f634c17aaca8c15b` | `816b426e59f67ce4c28920bef6184e5b` |
+| `crates/store/src/migrations.rs` | `63022749ab52aba1ca6c4ae386f90886b2591c1f` | `5dd0755dc59e2f22e02c6b310ea78ed4` |
+| `cli/src/main.rs` | `e09670a36726e66aaaf2720186e9e8555b793e7a` | `d21466520dd421dcd9d8de805198c209` |
+| `scripts/ruagent-daemon.ps1` | `ca6e849a3e0a5b4dad269cc3e1b4e58a152cbd90` | `16347deb93556940213ad471c939dcc3` |
+| `crates/graph/src/community.rs` | `9633b27c83c2116c865f654c5eed6f4d4c73b316` | `4c6eea1ad9d5af43f37cd64a61c87a2e` |
+
+* captain 的三组值**逐对就是上表前三行的第二列**：`e42c7707` = api.rs 的 md5（成员报的是它的 blob `9e64c227`）、`0c65fe44` = mcp/src/lib.rs 的 md5（blob `d562c6a0`）、`da89f22a` = roundtrip.rs 的 md5（blob `1da558c0`）——**同字节，两种哈希**，双方读数都成立。
+* 纪律（照此执行）：**引用一个哈希必须写明是哪一种**；本仓库惯例是 **git blob 哈希**，本报告 §1 与各成员自报值都是这一种。crates/graph/src/community.rs 确在提交内：`git show --stat 253be47 -- crates/graph/src/community.rs` = 11 insertions / 3 deletions，committed 内容含 `one_entity_current_facts`。
 * **共享树事实（本轮最重要的一条诚实声明）**：工作树里另有**另一支在途工作**的未提交改动 —— `.github/workflows/e2e.yml` 与四个 `docs/design/reviews/gen{2,3,4}-*.md`，其内容引用 `t46/t169/t179/t185/t190/t191` 与 2026-10-04 的时间戳，与本代（`ruagent-issues-45-55`）无关。**本次提交不含这 5 个文件**（`git add` 逐个点名，见提交正文）；把它们扫进来会把别支的工作记到我们账上。
 * 本计划 inScope 对照：`git status` 中 37 条路径被任务 `changedPaths` 声明覆盖，另有 3 条属本计划但未在任务里声明（`AGENTS.md` = t19 收尾；`crates/mcp/tests/tool_surface.rs` 与 `skills/ruagent-operator/SKILL.md` = t12 的越界登记）；其余 5 条即上段的外支文件。
 
