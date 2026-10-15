@@ -30,7 +30,7 @@
 //! is an explicit human/agent instruction, so `ExtractPlan::explicit` runs what
 //! the caller asked for. Only the UNATTENDED path answers to the capability.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ruagent_extract::{EntityCandidate, Turn};
 use ruagent_extract::{ExtractLimits, MemoryCandidate, RelationCandidate};
@@ -160,6 +160,71 @@ fn session_limits(max_per_input: Option<u32>, min_confidence: Option<f64>) -> Ex
     }
 }
 
+/// What an agent reported about its OWN context window and cost, folded the way
+/// `runs.rs` folds the same events (ruagent-issues-45-55 t5 / issue #55).
+///
+/// THE FOLD IS THE CONTRACT, not an implementation detail. `runs.rs:1494-1501`
+/// keeps the LAST `UsageUpdate` WHOLE (`run.context_usage = Some(*usage)`) and
+/// overwrites the cost only when the event CARRIES one
+/// (`if usage.cost_usd.is_some() { run.cost_usd = usage.cost_usd }`). Both halves
+/// matter: an occupancy report is a SNAPSHOT of the window (so an earlier one is
+/// superseded, never summed), and the cumulative session cost is monotone (so a
+/// later event that omits it must not erase the last one the agent did report).
+/// The same two rules are applied here, and
+/// `tests::the_usage_fold_is_the_one_runs_rs_uses` pins them against the numbers
+/// the mock agent emits -- the values `mock-agent/tests/integration.rs:104-110`
+/// reads off the same event for the RunTimeline (used 120, size 200_000, cost
+/// 0.001).
+///
+/// WHY MIRRORED RATHER THAN SHARED: the only home a shared helper could have is
+/// `runs.rs` (out of this task's scope) or `ruagent-core`, whose `ContextUsage`
+/// is the event's payload rather than a policy about folding a stream. The mirror
+/// is four lines, and it is named here so the next reader can compare the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UsageReport {
+    /// The last `used`/`size` the agent reported. `None` = it reported no usage
+    /// at all, which is written to the ledger as NULL, never as 0.
+    pub last: Option<ruagent_core::ContextUsage>,
+    /// The last cost the agent reported, kept separately from `last` because a
+    /// later event may omit it (see the fold above).
+    pub cost: Option<f64>,
+}
+
+impl UsageReport {
+    /// Fold ONE `usage_update` in.
+    pub fn observe(&mut self, usage: ruagent_core::ContextUsage) {
+        if usage.cost_usd.is_some() {
+            self.cost = usage.cost_usd;
+        }
+        self.last = Some(usage);
+    }
+
+    /// Fold another report in (the window-to-window case): the same two rules.
+    pub fn merge(&mut self, other: &UsageReport) {
+        if other.last.is_some() {
+            self.last = other.last;
+        }
+        if other.cost.is_some() {
+            self.cost = other.cost;
+        }
+    }
+
+    /// Tokens in context at the last report, for `distill_log.tokens_used`.
+    pub fn tokens_used(&self) -> Option<i64> {
+        self.last.map(|u| u.used as i64)
+    }
+
+    /// The context window's size at the last report, for `context_size`.
+    pub fn context_size(&self) -> Option<i64> {
+        self.last.map(|u| u.size as i64)
+    }
+
+    /// The last cost the agent reported, for `cost_usd`.
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.cost
+    }
+}
+
 /// ONE extraction result, whichever tier produced it. This is the seam: the
 /// writer in `distill.rs` takes this shape and cannot tell the producers apart.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -178,6 +243,11 @@ pub struct ExtractBundle {
     /// candidate list cut at the cap reports true while a list that legitimately
     /// fills it reports false.
     pub truncated: bool,
+    /// What the agent said about its own context window and cost, when an agent
+    /// ran and said anything (issue #55). A rules-only pass leaves this default,
+    /// and `UsageReport`'s `None`s become NULL in `distill_log` -- "the provider
+    /// did not report" is not "0 tokens".
+    pub usage: UsageReport,
 }
 
 impl ExtractBundle {
@@ -188,6 +258,22 @@ impl ExtractBundle {
     /// Fold `other` into `self`, keeping the FIRST candidate per identity — so
     /// the fixed order Rules → Acp means a rule-derived candidate outlives an
     /// LLM paraphrase of the same sentence.
+    ///
+    /// THE IDENTITIES ARE THE ONES THE WRITE PATH USES, and two of them are
+    /// FIXED here for the windowed pass (ruagent-issues-45-55 t5 / issue #48):
+    ///
+    /// * ENTITIES: the same `norm_name` is ONE candidate, and the other's
+    ///   `aliases` are UNIONED into it. Keeping only the first spelling list loses
+    ///   spellings the extractor did find, and an alias list is exactly what the
+    ///   graph needs to resolve two mentions onto one node — so a windowed pass
+    ///   would otherwise hand the graph fewer aliases than a single-window pass
+    ///   over the same text.
+    /// * RELATIONS: keyed on `(src, dst, relation, fact_hash)`, not
+    ///   `(src, dst, relation)`. Two sentences about the same pair that say
+    ///   DIFFERENT things are two facts; collapsing them kept whichever came first
+    ///   and dropped the other, which is the very loss G7 counts at the write side
+    ///   ("we dropped 8 of your 20 relations"). Identical text still folds, because
+    ///   it hashes the same.
     pub fn merge(&mut self, other: &ExtractBundle) {
         let mut seen_memories: BTreeSet<String> = self.memories.iter().map(memory_key).collect();
         for m in &other.memories {
@@ -196,9 +282,25 @@ impl ExtractBundle {
             }
         }
         let mut seen_entities: BTreeSet<String> = self.entities.iter().map(entity_key).collect();
+        let mut at: BTreeMap<String, usize> = self
+            .entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (entity_key(e), i))
+            .collect();
         for e in &other.entities {
-            if seen_entities.insert(entity_key(e)) {
+            let key = entity_key(e);
+            if seen_entities.insert(key.clone()) {
+                at.insert(key, self.entities.len());
                 self.entities.push(e.clone());
+                continue;
+            }
+            let Some(&i) = at.get(&key) else { continue };
+            let kept = &mut self.entities[i];
+            for alias in &e.aliases {
+                if !kept.aliases.contains(alias) {
+                    kept.aliases.push(alias.clone());
+                }
             }
         }
         let mut seen_relations: BTreeSet<String> =
@@ -209,6 +311,7 @@ impl ExtractBundle {
             }
         }
         self.truncated |= other.truncated;
+        self.usage.merge(&other.usage);
         if other.source.is_some() {
             self.source = other.source;
         }
@@ -222,6 +325,8 @@ impl ExtractBundle {
             truncated: self.truncated,
             ..ExtractBundle::default()
         };
+        // The merge carries the usage fold too, so the deduped bundle reports the
+        // same numbers its parts did.
         out.merge(&self);
         out
     }
@@ -242,12 +347,18 @@ fn entity_key(c: &EntityCandidate) -> String {
     norm_key(&c.name)
 }
 
+/// The identity of one relation WITHIN a candidate set: the pair, the relation,
+/// and the FACT's own hash — see `ExtractBundle::merge` for why the fact is part
+/// of it (ruagent-issues-45-55 t5). `ruagent_graph::fact_hash` is the graph's own
+/// normalization of a fact sentence, so the seam and the writer cannot disagree
+/// about which two sentences are the same one.
 fn relation_key(c: &RelationCandidate) -> String {
     format!(
-        "{}\u{1f}{}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
         norm_key(&c.src),
         c.relation.relation_literal().to_lowercase(),
-        norm_key(&c.dst)
+        norm_key(&c.dst),
+        ruagent_graph::fact_hash(&c.fact)
     )
 }
 
@@ -503,6 +614,9 @@ pub fn extract_rules(cx: &ExtractCtx<'_>) -> ExtractBundle {
         relations: Vec::new(),
         source: Some(ExtractSource::Rules),
         truncated: pass.truncated || pass.turns_skipped > 0,
+        // No model ran, so there is no usage to report (issue #55). Left default
+        // rather than claimed as zero: the ledger writes NULL for it.
+        usage: UsageReport::default(),
     }
 }
 
@@ -517,18 +631,24 @@ pub struct AcpExtractor<'a> {
 }
 
 impl AcpExtractor<'_> {
-    /// One chat turn, one JSON object. Nothing else.
+    /// One chat turn, one JSON object — plus whatever the agent reported about its
+    /// own context window and cost (issue #55).
     pub async fn extract(&self, cx: &ExtractCtx<'_>) -> Result<ExtractBundle, ExtractError> {
         let prompt = format!("{}{}", self.distiller.compose_prompt(), cx.transcript);
-        let raw = self.ask(&prompt).await?;
-        let extraction = crate::distill::parse_extraction(&raw)
+        let reply = self.ask(&prompt).await?;
+        let extraction = crate::distill::parse_extraction(&reply.text)
             .map_err(|e| ExtractError::Malformed(format!("{e:#}")))?;
-        Ok(bundle_of_acp(&extraction, cx.session_key))
+        let mut bundle = bundle_of_acp(&extraction, cx.session_key);
+        // Carried on the bundle so it travels the same path the candidates do:
+        // one return value, so a caller cannot record the extraction and forget
+        // what it cost.
+        bundle.usage = reply.usage;
+        Ok(bundle)
     }
 
-    async fn ask(&self, prompt: &str) -> Result<String, ExtractError> {
+    async fn ask(&self, prompt: &str) -> Result<crate::distill::AgentReply, ExtractError> {
         self.distiller
-            .ask_agent(self.card, prompt)
+            .ask_agent_with_usage(self.card, prompt)
             .await
             .map_err(|e| ExtractError::Acp {
                 agent: self.card.name.clone(),
@@ -606,7 +726,12 @@ pub(crate) fn bundle_of_acp(
         entities,
         relations,
         source: Some(ExtractSource::Acp),
+        // The wire's own truncation flag: the extraction itself was not cut, and
+        // whether the INPUT was is the windowing caller's reading (issue #48).
         truncated: false,
+        // Filled in by the caller from the turn's own events: the mapping from
+        // wire JSON to candidates has no access to usage.
+        usage: UsageReport::default(),
     }
 }
 
@@ -635,8 +760,82 @@ fn acp_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// THE SEAM. Runs every ENABLED source in the fixed order Rules → Acp, merges
-/// the bundles (first candidate wins) and reports which ran.
+/// ONE input the seam can extract: the rendered text, plus the same material as
+/// typed turns for a plan that runs the free tier (issue #48's windows).
+pub struct ExtractInput<'a> {
+    pub transcript: &'a str,
+    pub turns: &'a [Turn],
+}
+
+/// What extracting over one or more inputs produced.
+pub struct WindowedExtraction {
+    pub bundle: ExtractBundle,
+    /// How many inputs were extracted: 1 for the ordinary pass, more when a
+    /// session was cut into windows at turn boundaries. This is the number
+    /// `distill_log.windows` records.
+    pub windows: u32,
+}
+
+/// Extract over EVERY input and merge the results (ruagent-issues-45-55 t5 /
+/// issue #48: a session longer than one input is READ IN WINDOWS rather than
+/// silently truncated, and the merge is the same identity-fold the two tiers
+/// already use).
+///
+/// A pass per window rather than a bigger prompt, because both bounds are real:
+/// the model's context window and the free tier's byte window. What the merge
+/// costs is stated where it happens — `ExtractBundle::merge` — and what the
+/// caller must know is the COUNT, which travels in `WindowedExtraction`.
+pub async fn extract_windows(
+    session_key: &str,
+    inputs: &[ExtractInput<'_>],
+    plan: ExtractPlan,
+    acp: Option<AcpExtractor<'_>>,
+) -> Result<WindowedExtraction, ExtractError> {
+    if plan.is_empty() {
+        return Err(ExtractError::NoSourceEnabled);
+    }
+    let mut out = ExtractBundle::default();
+    let mut windows = 0u32;
+    for input in inputs {
+        // The SAME cx shape as the single-window path, so the rules tier and the
+        // ACP prompt read the window exactly as they read a whole session: no
+        // second notion of "the text".
+        let cx = ExtractCtx {
+            session_key,
+            transcript: input.transcript,
+            turns: input.turns,
+            limits: plan.limits,
+        };
+        let mut part = ExtractBundle::default();
+        if plan.rules {
+            part.merge(&extract_rules(&cx));
+        }
+        if plan.acp {
+            let Some(acp) = acp.as_ref() else {
+                // A plan asking for the llm tier without an extractor is a
+                // programming error, and it must not silently degrade to the free
+                // tier: naming it is the only honest answer.
+                return Err(ExtractError::Acp {
+                    agent: String::new(),
+                    reason: "the plan enables the ACP tier but no extractor was supplied".into(),
+                });
+            };
+            part.merge(&acp.extract(&cx).await?);
+        }
+        out.merge(&part);
+        windows += 1;
+    }
+    Ok(WindowedExtraction {
+        bundle: out.dedup(),
+        windows,
+    })
+}
+
+/// THE SEAM, for ONE input. Runs every ENABLED source in the fixed order
+/// Rules → Acp, merges the bundles (first candidate wins) and reports which ran.
+///
+/// This is the single-input form of `extract_windows`, and it DELEGATES: there
+/// is one loop and one merge in this module, whichever shape the caller uses.
 ///
 /// `acp` is required exactly when `plan.acp` is set: a plan that does not enable
 /// the llm tier never touches the agent, so a caller cannot enable it by
@@ -646,26 +845,13 @@ pub async fn extract(
     plan: ExtractPlan,
     acp: Option<AcpExtractor<'_>>,
 ) -> Result<ExtractBundle, ExtractError> {
-    if plan.is_empty() {
-        return Err(ExtractError::NoSourceEnabled);
-    }
-    let mut out = ExtractBundle::default();
-    if plan.rules {
-        out.merge(&extract_rules(cx));
-    }
-    if plan.acp {
-        let Some(acp) = acp else {
-            // A plan asking for the llm tier without an extractor is a
-            // programming error, and it must not silently degrade to the free
-            // tier: naming it is the only honest answer.
-            return Err(ExtractError::Acp {
-                agent: String::new(),
-                reason: "the plan enables the ACP tier but no extractor was supplied".into(),
-            });
-        };
-        out.merge(&acp.extract(cx).await?);
-    }
-    Ok(out.dedup())
+    let inputs = [ExtractInput {
+        transcript: cx.transcript,
+        turns: cx.turns,
+    }];
+    Ok(extract_windows(cx.session_key, &inputs, plan, acp)
+        .await?
+        .bundle)
 }
 
 #[cfg(test)]
@@ -1420,5 +1606,204 @@ mod tests {
             extract_rules(&ctx(&turns, "transcript", limits)).truncated,
             "6 leading turns were not read, so this is not everything the session had"
         );
+    }
+
+    /// ruagent-issues-45-55 t5 / issue #55: the usage fold IS the one the
+    /// RunTimeline applies, checked against the numbers the mock agent emits.
+    ///
+    /// `runs.rs:1494-1501` keeps the LAST `UsageUpdate` whole and overwrites the
+    /// cost only when the event CARRIES one; `mock-agent/tests/integration.rs:104-110`
+    /// reads used 120 / size 200_000 / cost 0.001 off the event the mock agent
+    /// sends and asserts the run keeps it. Both halves are pinned here, including
+    /// the one a naive "last event wins for everything" reading gets WRONG: a later
+    /// event that omits the cost must not erase the cost already reported.
+    #[test]
+    fn the_usage_fold_is_the_one_runs_rs_uses() {
+        let mut report = UsageReport::default();
+        assert_eq!(
+            (
+                report.tokens_used(),
+                report.context_size(),
+                report.cost_usd()
+            ),
+            (None, None, None),
+            "an agent that said nothing leaves NULL, not 0"
+        );
+
+        // The mock agent's own report (integration.rs:104-110).
+        report.observe(ruagent_core::ContextUsage {
+            used: 120,
+            size: 200_000,
+            cost_usd: Some(0.001),
+        });
+        assert_eq!(report.tokens_used(), Some(120));
+        assert_eq!(report.context_size(), Some(200_000));
+        assert_eq!(report.cost_usd(), Some(0.001));
+
+        // A later event: a SNAPSHOT (last wins) and a cost that is absent (the
+        // earlier one stands). This is the case that separates the mirrored fold
+        // from "assign the whole struct from the last event".
+        report.observe(ruagent_core::ContextUsage {
+            used: 300,
+            size: 200_000,
+            cost_usd: None,
+        });
+        assert_eq!(
+            report.tokens_used(),
+            Some(300),
+            "the window occupancy moved"
+        );
+        assert_eq!(report.context_size(), Some(200_000));
+        assert_eq!(
+            report.cost_usd(),
+            Some(0.001),
+            "a later event without a cost must not erase the cost the agent reported"
+        );
+
+        // The window-to-window fold applies the same two rules.
+        let mut wider = UsageReport::default();
+        wider.merge(&report);
+        assert_eq!(wider, report);
+        let later_window = UsageReport {
+            last: Some(ruagent_core::ContextUsage {
+                used: 900,
+                size: 200_000,
+                cost_usd: Some(0.002),
+            }),
+            cost: Some(0.002),
+        };
+        wider.merge(&later_window);
+        assert_eq!(wider.tokens_used(), Some(900));
+        assert_eq!(wider.cost_usd(), Some(0.002));
+    }
+
+    /// ruagent-issues-45-55 t5 / issue #48: the merge identities a WINDOWED pass
+    /// depends on, in one reading.
+    ///
+    /// Three rules, each one a way the windowed pass could lose or invent
+    /// candidates: memories by normalized content, entities by `norm_name` WITH
+    /// their aliases UNIONED, and relations by `(src, dst, relation, fact_hash)` —
+    /// so the same pair saying two different things is two facts, while the same
+    /// sentence twice is one.
+    #[test]
+    fn the_merge_unions_aliases_and_separates_facts_by_their_hash() {
+        let memory = |content: &str| MemoryCandidate {
+            store: ruagent_extract::CandidateStore::Profile,
+            namespace: "user".to_string(),
+            content: content.to_string(),
+            confidence: ruagent_extract::CandidateConfidence::Unconfirmed,
+            rule: "acp",
+            origin: Default::default(),
+            source: String::new(),
+        };
+        let entity = |name: &str, aliases: &[&str]| EntityCandidate {
+            name: name.to_string(),
+            kind: Some("tool"),
+            summary: None,
+            aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+            score: 1.0,
+            rule: "acp",
+            origin: Default::default(),
+            source: String::new(),
+        };
+        let relation = |src: &str, dst: &str, name: &str, fact: &str| RelationCandidate {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            relation: ruagent_extract::RelationName::Model(name.to_string()),
+            fact: fact.to_string(),
+            valid_at: None,
+            score: 1.0,
+            rule: "acp",
+            origin: Default::default(),
+            source: String::new(),
+        };
+
+        let mut first = ExtractBundle {
+            memories: vec![memory("用户偏好简体中文。")],
+            entities: vec![entity("Rust", &["rust-lang"])],
+            relations: vec![relation("Rust", "Cargo", "uses", "Rust uses Cargo.")],
+            source: Some(ExtractSource::Acp),
+            truncated: false,
+            usage: UsageReport::default(),
+        };
+        let second = ExtractBundle {
+            // The SAME sentence as the first window's, so it is one memory.
+            memories: vec![memory("用户偏好简体中文。"), memory("项目使用 Rust。")],
+            // The same object under another spelling, with an alias the first
+            // window did not have.
+            entities: vec![entity("rust", &["rs"])],
+            relations: vec![
+                // The same sentence: one relation.
+                relation("RUST", "cargo", "uses", "Rust uses Cargo."),
+                // The same pair and relation, a DIFFERENT fact: a second relation.
+                relation("Rust", "Cargo", "uses", "Rust depends on Cargo."),
+            ],
+            source: Some(ExtractSource::Rules),
+            truncated: true,
+            usage: UsageReport::default(),
+        };
+        first.merge(&second);
+
+        assert_eq!(
+            first.memories.len(),
+            2,
+            "identical normalized content is ONE memory: {:?}",
+            first.memories
+        );
+        assert_eq!(
+            first.entities.len(),
+            1,
+            "one norm_name is one entity: {:?}",
+            first.entities
+        );
+        let mut aliases = first.entities[0].aliases.clone();
+        aliases.sort();
+        assert_eq!(
+            aliases,
+            vec!["rs".to_string(), "rust-lang".to_string()],
+            "the second window's aliases must be UNIONED, not dropped"
+        );
+        assert_eq!(
+            first.relations.len(),
+            2,
+            "same pair+relation with a different fact is a second relation: {:?}",
+            first.relations
+        );
+        assert!(
+            first.truncated,
+            "a cut in either part is a cut in the whole"
+        );
+    }
+
+    /// A pass over ONE input still goes through the window loop, and a plan that
+    /// enables nothing is still refused: the single-input form is a delegation, not
+    /// a second implementation.
+    #[tokio::test]
+    async fn one_input_is_one_window_and_an_empty_plan_is_still_refused() {
+        let turns = vec![turn(ruagent_extract::Role::User, "记住：以后用简体中文。")];
+        let inputs = vec![ExtractInput {
+            transcript: "记住：以后用简体中文。",
+            turns: &turns,
+        }];
+        let out = extract_windows(
+            "s-1",
+            &inputs,
+            ExtractPlan::explicit(Extractor::Rules),
+            None,
+        )
+        .await
+        .expect("a rules pass needs no extractor");
+        assert_eq!(out.windows, 1);
+        assert!(!out.bundle.memories.is_empty());
+
+        let empty = ExtractPlan {
+            rules: false,
+            acp: false,
+            limits: ExtractLimits::default(),
+        };
+        assert!(matches!(
+            extract_windows("s-1", &inputs, empty, None).await,
+            Err(ExtractError::NoSourceEnabled)
+        ));
     }
 }

@@ -183,7 +183,7 @@ async fn alias_table_hits_are_merged_into_the_one_object() {
         "no alias is registered yet"
     );
     assert!(
-        g::add_alias(&db.db, acp, "Zed Protocol", "human")
+        g::add_alias(&db.db, acp, "Zed Protocol", g::AliasSource::Human)
             .await
             .unwrap()
     );

@@ -5,6 +5,7 @@
 //! docs/plans/2026-09-14-distillation-design.md.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ruagent_acp::adapter::HarnessAdapter as _;
@@ -101,6 +102,23 @@ struct MemoryWriteOutcome {
     episode: Option<i64>,
 }
 
+/// The graph half's own reading of one write (ruagent-issues-45-55 t5 / #55).
+///
+/// It carries what the WRITER reported, not a recomputation of it: the write-side
+/// dedupe (G7) is the thing that knows a relation was already stated, and
+/// `refused` counts the names that state no relation at all. Before this, those
+/// two numbers were logged at INFO and thrown away, so "we dropped 8 of your 20
+/// relations" was unanswerable from the database.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct GraphOutcome {
+    entities: u32,
+    relations: u32,
+    /// Relations the write-side dedupe recognised as already stated.
+    duplicates: u32,
+    /// Relations refused because the name does not state a relation.
+    refused: u32,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DistillOutcome {
     pub session_key: String,
@@ -120,6 +138,43 @@ pub struct DistillOutcome {
     /// True when an input was cut to its bound: "we stopped reading" is a
     /// different fact from "there was nothing there".
     pub truncated: bool,
+    /// How many RETRIES this attempt needed (0 = the first try settled it).
+    ///
+    /// A READING, not a maximum: `0` says the first attempt is the one this row
+    /// records, which is a different story from a row that took three
+    /// (ruagent-issues-45-55 t4 / issue #45). This is the value the ledger keeps
+    /// in `distill_log.retries` (0028) -- 0 measured, not 0 by omission.
+    pub retries: u32,
+    /// How many EXTRACTION ROUNDS this pass ran (issue #48): 1 = the whole
+    /// transcript fitted one input, more = it was cut into windows at turn
+    /// boundaries and every window was extracted. `None` = the pass never read
+    /// anything (a refusal, a failure, a dry run that never got that far), which
+    /// the ledger writes as NULL -- "not measured" is not "measured as one".
+    pub windows: Option<u32>,
+    /// WHICH MESSAGES THE PASS READ, and under which byte budget (issue #48). The
+    /// same measurement `windows` counts, in the only form that can show a LOSS:
+    /// a session that was WINDOWED is still read end to end, while a message too
+    /// large for one window is CUT, and then `truncated` says text was dropped.
+    ///
+    /// WHY THE RANGE IS NOT A `distill_log` COLUMN: 0028's column set was fixed by
+    /// the schema task and `crates/store/` is outside this task's scope; the two
+    /// columns that DO exist there (`windows`, `truncated`) are this measurement's
+    /// numeric half, and the range rides the outcome the route returns.
+    pub coverage: Option<TranscriptCoverage>,
+    /// Tokens the agent reported in context, and the window it reported them
+    /// against (`ContextUsage.used`/`.size`). `None` = no agent reported any
+    /// usage -- a rules-only pass, or a provider that says nothing -- which the
+    /// ledger writes as NULL, never as 0 (issue #55).
+    pub tokens_used: Option<i64>,
+    pub context_size: Option<i64>,
+    /// The cumulative cost the agent last reported, in USD. `None` = not
+    /// reported, not "free".
+    pub cost_usd: Option<f64>,
+    /// Relations the graph recognised as already stated, and relations it refused
+    /// (issue #55). `None` = the graph half did not run (`[distill] graph = false`),
+    /// which is not the same reading as a measured 0.
+    pub relations_duplicate: Option<u32>,
+    pub relations_refused: Option<u32>,
     /// True for a `dry_run`: the extraction ran and the counts are what WOULD be
     /// written. A dry run writes nothing at all — no memory, no graph row, no
     /// episode and no `distill_log` row — which is what makes it safe to call at
@@ -142,9 +197,52 @@ impl Default for DistillOutcome {
                 .as_str()
                 .to_string(),
             truncated: false,
+            // The first attempt is the one a caller who does not say otherwise
+            // is describing; `pass_with_retries` overwrites it with the count it
+            // actually took.
+            retries: 0,
+            // Everything below is "not measured" until a pass measures it: a
+            // refusal or a failure must not report a window count, a coverage
+            // range or a token spend it never observed.
+            windows: None,
+            coverage: None,
+            tokens_used: None,
+            context_size: None,
+            cost_usd: None,
+            relations_duplicate: None,
+            relations_refused: None,
             dry_run: false,
         }
     }
+}
+
+/// Which part of a session one pass read (issue #48).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TranscriptCoverage {
+    /// The covered message indices: `from_message` inclusive, `to_message`
+    /// exclusive, in the list the pass actually read (the user-text filter runs
+    /// first, so this counts what the extractor saw).
+    pub from_message: usize,
+    pub to_message: usize,
+    /// How many messages that list had — the denominator of the range above.
+    pub total_messages: usize,
+    /// Bytes of rendered transcript handed to the extractor, summed over the
+    /// windows.
+    pub bytes: usize,
+    /// The per-window byte budget the windows were packed under.
+    pub budget_bytes: usize,
+}
+
+/// ONE window: a range of messages, its rendered text, and whether that text had
+/// to be CUT to fit the budget (issue #48).
+#[derive(Debug, Clone, PartialEq)]
+struct TranscriptWindow {
+    range: std::ops::Range<usize>,
+    text: String,
+    /// True when `text` is a PREFIX of the range's rendering: the text did not fit
+    /// the budget, so the tail was dropped. "We stopped reading" is a different
+    /// fact from "there was nothing there", and `distill_log.truncated` records it.
+    truncated: bool,
 }
 
 /// The [distill] policy from policy.toml. The graph flag arrives
@@ -195,6 +293,207 @@ pub fn select_agent<'a>(
         .or_else(|| agents.iter().find(|a| a.name == "dsh"))
         .or_else(|| agents.first())
         .ok_or_else(|| anyhow::anyhow!("no enabled agent available"))
+}
+
+/// What this entry is ALLOWED to say when a pass produced nothing
+/// (ruagent-issues-45-55 t4 / issue #45).
+///
+/// These two sentences ARE the user-visible text. Everything else -- the table
+/// name, the statement, rusqlite's own message -- stays in the daemon log, which
+/// is where a reader who can act on it looks. Measured before this: a chat with
+/// three turns whose index row had not been written yet failed with
+/// `Query returned no rows` -- rusqlite's message for a missing `query_row`,
+/// naming a table the user has never heard of and an action nobody can take. It
+/// was logged as a distillation failure 21 times in one window, with 0 real
+/// errors behind it (t313).
+pub const NOT_INDEXED_MESSAGE: &str = "该会话尚未进入索引，正在同步";
+pub const NO_CONTENT_MESSAGE: &str = "没有可蒸馏的内容";
+
+/// WHY a distillation produced nothing, in terms the caller can act on.
+///
+/// An ANSWER, not a defect -- which is why it is a TYPE and not a string built at
+/// the failure site: the ledger's status (0024's three states) and the message a
+/// route returns both derive from the KIND, so "there was nothing to distil"
+/// cannot be recorded as a failure and a real failure cannot be recorded as an
+/// empty session.
+#[derive(Debug)]
+pub enum DistillRefusal {
+    /// The session was READ and there is no conversation in it: no messages at
+    /// all, or nothing but turns the daemon marked as its own (an injected context
+    /// block, or one of our own job prompts).
+    ///
+    /// WHAT IT DOES NOT COVER (t23, finding t14-F1): an ASSISTANT-ONLY session is
+    /// not this refusal -- `user_turns` keeps the agent's turns, so that session is
+    /// distilled and answers `status = empty`. See the note at the refusal site in
+    /// `distill_once` for the open product question.
+    NoContent,
+    /// The session is not in the index even after a fresh pass: it has not been
+    /// written yet (the common case right after a chat closes), or no indexed
+    /// family holds it.
+    NotIndexed,
+}
+
+impl DistillRefusal {
+    /// The ledger STATUS for this answer (0024's three states).
+    ///
+    /// `empty` for [`DistillRefusal::NoContent`]: the pass read the session and
+    /// there was nothing in it -- the state 0020/0024 added the column for.
+    ///
+    /// `failed` for [`DistillRefusal::NotIndexed`]: NOTHING WAS READ, so this is
+    /// not a statement about the session's content. Recording it as `empty` would
+    /// say a session holds nothing when the truth is that we could not look, and a
+    /// batch pass asking "which sessions still need distilling?" would then skip
+    /// it for ever.
+    pub fn status(&self) -> &'static str {
+        match self {
+            DistillRefusal::NoContent => "empty",
+            DistillRefusal::NotIndexed => "failed",
+        }
+    }
+
+    /// `NoContent`, with the DIAGNOSIS sent to the daemon log.
+    ///
+    /// The cause is deliberately NOT part of the message: which turns were dropped
+    /// is our input handling, and mixing that into the sentence a user reads is
+    /// the habit that put the SQL text there in the first place.
+    fn no_content(session_key: &str, cause: &str) -> anyhow::Error {
+        tracing::debug!(session = %session_key, cause = %cause, "nothing to distil");
+        anyhow::Error::new(DistillRefusal::NoContent)
+    }
+
+    /// `NotIndexed`, with the session key in the daemon log.
+    fn not_indexed(session_key: &str) -> anyhow::Error {
+        tracing::debug!(session = %session_key, "the session is not in the index");
+        anyhow::Error::new(DistillRefusal::NotIndexed)
+    }
+}
+
+impl std::fmt::Display for DistillRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DistillRefusal::NoContent => f.write_str(NO_CONTENT_MESSAGE),
+            DistillRefusal::NotIndexed => f.write_str(NOT_INDEXED_MESSAGE),
+        }
+    }
+}
+
+impl std::error::Error for DistillRefusal {}
+
+/// What one ACP turn came back with: the reply text, plus whatever the agent said
+/// about its own context window and cost (ruagent-issues-45-55 t5 / issue #55).
+pub(crate) struct AgentReply {
+    pub text: String,
+    pub usage: crate::extract_plane::UsageReport,
+}
+
+/// The event fold of ONE ACP turn: text from `AgentMessageChunk`, usage from
+/// `UsageUpdate`, and the two terminal events.
+///
+/// IT IS A STRUCT WITH A TEST rather than a loop inside the spawned task, because
+/// this is the half of `ask_agent` that can be checked without spawning an agent:
+/// `entry_tests::the_usage_fold_is_the_one_runs_rs_uses` feeds it the same event
+/// sequence `runs.rs` folds and asserts the same numbers the mock agent emits.
+/// The task itself is then only a `recv` loop, which is not where the defects live.
+#[derive(Default)]
+struct ReplyCollector {
+    text: String,
+    usage: crate::extract_plane::UsageReport,
+    /// The last `Error` the stream reported, if any.
+    error: Option<String>,
+}
+
+impl ReplyCollector {
+    /// Fold ONE event in. `false` means the turn is over: stop reading.
+    fn observe(&mut self, event: &RunEvent) -> bool {
+        match event {
+            RunEvent::AgentMessageChunk { content } => {
+                for block in content {
+                    if let ruagent_core::ContentBlock::Text { text } = block {
+                        self.text.push_str(text);
+                    }
+                }
+            }
+            // THE USAGE HALF (issue #55), folded by `UsageReport::observe` — the ONE
+            // place the runs.rs rules (`runs.rs:1494-1501`) are expressed on this
+            // path.
+            RunEvent::UsageUpdate { usage } => self.usage.observe(*usage),
+            RunEvent::Stopped { .. } => return false,
+            RunEvent::Error { message } => {
+                self.error = Some(message.clone());
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+/// How long ONE fresh index pass may take before a distillation gives up on it.
+///
+/// That pass is what closes the 60 s index gap (issue #45), so it sits on the
+/// critical path of a chat that was just closed -- but a filesystem walk must not
+/// be able to hold an unattended spawn open indefinitely. Ten seconds is orders of
+/// magnitude above the cost (one stat per candidate file, a parse only for the
+/// ones that moved); reaching it means the machine, not the work.
+const INDEX_WAIT: Duration = Duration::from_secs(10);
+
+/// How many RETRIES one pass gets (so: up to three attempts), and the wait before
+/// the first of them. The waits are 400 ms then 800 ms -- increasing (so a
+/// systematic fault is not hammered) and short enough that a doomed pass is over
+/// in about a second.
+const RETRY_LIMIT: u32 = 2;
+const RETRY_FIRST_WAIT: Duration = Duration::from_millis(400);
+
+/// The wait before retry number `retry` (1-based): 400 ms, then 800 ms.
+fn retry_wait(retry: u32) -> Duration {
+    RETRY_FIRST_WAIT * 2u32.pow(retry.saturating_sub(1))
+}
+
+/// Whether a failed attempt gets another one.
+///
+/// `NoContent` does NOT: it is a fact about the session, read once, and re-reading
+/// the same empty conversation cannot change it. Everything else does, including
+/// `NotIndexed` -- that one exists because the index is a 60 s cache and the file
+/// may land between two attempts.
+fn is_retryable(e: &anyhow::Error) -> bool {
+    !matches!(
+        e.downcast_ref::<DistillRefusal>(),
+        Some(DistillRefusal::NoContent)
+    )
+}
+
+/// Run one fallible attempt, retrying it up to [`RETRY_LIMIT`] times, and report
+/// the result together with how many retries it took.
+///
+/// THE LOOP IS A FUNCTION OF ITS OWN (ruagent-issues-45-55 t4) so that the policy
+/// can be tested without a database, a clock or a filesystem: the test that
+/// proves "a failure that clears is carried over, a refusal is not retried, and a
+/// persistent failure stops at the bound" drives THIS code rather than a copy of
+/// it. `subject` is the session key the retry log names.
+async fn with_retries<F, Fut, T>(subject: &str, mut attempt: F) -> (Result<T>, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut retries = 0u32;
+    loop {
+        match attempt().await {
+            Ok(ok) => return (Ok(ok), retries),
+            Err(e) if retries < RETRY_LIMIT && is_retryable(&e) => {
+                retries += 1;
+                let wait = retry_wait(retries);
+                tracing::warn!(
+                    session = %subject,
+                    attempt = retries + 1,
+                    wait_ms = wait.as_millis() as u64,
+                    error = %e,
+                    "distillation attempt failed; retrying"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => return (Err(e), retries),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -281,51 +580,107 @@ impl Distiller {
         dry_run: bool,
     ) -> Result<DistillOutcome> {
         let prompt_hash = ruagent_memory::write::content_hash(&self.compose_prompt());
-        if dry_run {
-            // A price is not a purchase: no episode is created either, because a
-            // `run_turn` episode is what the panel reads as "this session was
-            // distilled".
-            let (outcome, _status) = self.distill_once(session_key, card, plan, true).await?;
-            return Ok(outcome);
-        }
-        match self.distill_once(session_key, card, plan, false).await {
-            Ok((outcome, status)) => {
-                self.log_outcome(&outcome, status, &prompt_hash, None)
-                    .await?;
+        let (result, retries) = self
+            .pass_with_retries(session_key, card, plan, dry_run)
+            .await;
+        match result {
+            Ok((mut outcome, status)) => {
+                // A READING, NOT A MAXIMUM: how many retries this pass needed (0
+                // when the first attempt settled it). `0028`'s `retries` column is
+                // NULL only for rows written before the retry path existed.
+                outcome.retries = retries;
+                if !dry_run {
+                    self.log_outcome(&outcome, status, &prompt_hash, None)
+                        .await?;
+                }
                 Ok(outcome)
             }
             Err(e) => {
-                let reason = e.to_string();
-                // A failure MUST NOT create an episode: the panel's "distilled"
-                // boolean is derived from episodes.kind = 'run_turn' (t350), so a
-                // failure row that materialised one would claim a distillation
-                // that did not happen.
-                if let Err(log_err) = self
-                    .log_outcome(
-                        &DistillOutcome {
-                            session_key: session_key.to_string(),
-                            // Empty when no card was resolved: a rules-only pass
-                            // has no agent to name, and inventing one would be a
-                            // worse lie than the absence. `source` says which
-                            // tier produced the row.
-                            agent: card.map(|c| c.name.clone()).unwrap_or_default(),
-                            source: plan.label().to_string(),
-                            ..DistillOutcome::default()
-                        },
-                        "failed",
-                        &prompt_hash,
-                        Some(&reason),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        session = %session_key, error = %log_err,
-                        "could not record the distillation failure"
-                    );
+                // A DRY RUN WRITES NOTHING, FAILURES INCLUDED: it prices an
+                // extraction, and a priced pass that produced no row is what makes
+                // the route safe to call at any time (§14.3). Preserved across the
+                // retry loop deliberately -- the loop changes how many times we
+                // try, not what a dry run leaves behind.
+                if !dry_run {
+                    // TWO KINDS OF "DID NOT WORK", AND THE LEDGER TELLS THEM
+                    // APART (issue #45). A REFUSAL is one of our own answers, with
+                    // a sentence written for whoever asked; anything else is a
+                    // defect and keeps its own cause, which is what an operator
+                    // acts on. Neither may be the storage layer's words.
+                    let reason = e.to_string();
+                    let status = match e.downcast_ref::<DistillRefusal>() {
+                        Some(refusal) => refusal.status(),
+                        None => "failed",
+                    };
+                    // A failure MUST NOT create an episode: the panel's
+                    // "distilled" boolean is derived from episodes.kind =
+                    // 'run_turn' (t350), so a failure row that materialised one
+                    // would claim a distillation that did not happen. This row is
+                    // the ledger's, and `..default()` keeps it empty of counts.
+                    if let Err(log_err) = self
+                        .log_outcome(
+                            &DistillOutcome {
+                                session_key: session_key.to_string(),
+                                // Empty when no card was resolved: a rules-only pass
+                                // has no agent to name, and inventing one would be a
+                                // worse lie than the absence. `source` says which
+                                // tier produced the row.
+                                agent: card.map(|c| c.name.clone()).unwrap_or_default(),
+                                source: plan.label().to_string(),
+                                retries,
+                                ..DistillOutcome::default()
+                            },
+                            status,
+                            &prompt_hash,
+                            Some(&reason),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session = %session_key, error = %log_err,
+                            "could not record the distillation failure"
+                        );
+                    }
                 }
                 Err(e)
             }
         }
+    }
+
+    /// ONE pass, with BOUNDED BACKOFF RETRIES (ruagent-issues-45-55 t4 / #45).
+    ///
+    /// Returns the pass's result and the number of RETRIES it took: `0` means the
+    /// first attempt settled it, whether it succeeded or was refused.
+    ///
+    /// WHY RETRY AT ALL, AND WHY ONLY TWICE. The failures this path actually meets
+    /// are RACES, not judgements: the session file lands a moment after the chat
+    /// closes and the index pass inside `load_messages` has not seen it yet, or
+    /// the single writer's lock is briefly held. A single attempt turns every one
+    /// of those into a recorded failure. Bounded, because the caller is an
+    /// unattended spawn or an HTTP request and an unbounded loop would hold it
+    /// open for as long as the fault lasts.
+    ///
+    /// WHICH FAILURES GET ANOTHER ATTEMPT is per-kind, and this is the reason the
+    /// refusal is a type:
+    ///   * `NoContent` is TERMINAL. Three attempts read the same empty
+    ///     conversation, and a `retries` of 2 on that row would claim a transient
+    ///     fault that never existed -- the "do not fabricate a reading" rule
+    ///     0028's columns are built on.
+    ///   * `NotIndexed` IS retried, because its cure is the index pass each
+    ///     attempt re-runs: this is the race the loop exists for.
+    async fn pass_with_retries(
+        &self,
+        session_key: &str,
+        card: Option<&ruagent_core::AgentCard>,
+        plan: crate::extract_plane::ExtractPlan,
+        dry_run: bool,
+    ) -> (Result<(DistillOutcome, &'static str)>, u32) {
+        // The loop itself lives in [`with_retries`], which is where the policy is
+        // tested; all this adds is which pass it retries.
+        with_retries(session_key, || {
+            self.distill_once(session_key, card, plan, dry_run)
+        })
+        .await
     }
 
     /// The body of one distillation, split out so `distill_plan` can record the
@@ -350,33 +705,76 @@ impl Distiller {
         // summarise, so the two tiers disagreed about whose words these are. A session
         // that has nothing of the user's in it is refused with the reason instead of
         // being distilled into memories attributed to a session the user never spoke in.
+        //
+        // WHAT THAT FILTER ACTUALLY DROPS (t23, correcting this note; finding t14-F1).
+        // `user_turns` drops a turn whose text AFTER the daemon's sentinel is EMPTY:
+        // an injected context block the user added nothing to, or one of our own job
+        // prompts (`ask_agent` marks those with `platform_prompt`, which appends the
+        // sentinel and nothing else). An ASSISTANT TURN IS NOT DROPPED, and this note
+        // used to claim it was. `sessions::user_text` returns a message with NO
+        // sentinel untouched, so the agent's own output is kept and rendered as
+        // `Agent: ...` like any other turn.
         let raw_turns = messages.len();
         let messages = user_turns(messages);
         if messages.is_empty() && raw_turns > 0 {
-            anyhow::bail!(
-                "session {session_key} carries no user text: every turn is platform \
-                 text (an injected block, or one of our own job prompts) or the agent's \
-                 own output — there is nothing of the user's in it to distil"
-            );
+            return Err(DistillRefusal::no_content(
+                session_key,
+                "every turn in it is text we marked as our own (an injected context \
+                 block, or one of our own job prompts), so none of it is the user's",
+            ));
         }
+        // OPEN QUESTION (t23, from t14-F1; escalated to the user by the captain): a
+        // session with NO user turn at all -- an assistant-only transcript -- reaches
+        // this point and is NOT refused. It is distilled, and MEASURED it answers
+        // `status = empty` with `memories_written = 0` and `windows = 1`
+        // (`entry_tests::an_assistant_only_session_is_distilled_and_answers_empty` pins
+        // exactly that, so the behaviour is deliberate rather than accidental).
+        //
+        // The question the code does not answer: SHOULD such a session be refused?
+        // Both sides are real, which is why it is a product decision rather than a
+        // bug fix. For refusing: the t21 concern -- memories attributed to a session
+        // the user never spoke in -- is not closed for the ACP tier, whose prompt
+        // hands the agent's own words to a model that may well return them as a
+        // "memory" (NOT measured here: the test named above uses the rules tier,
+        // which emits nothing for these turns). Against refusing: the pass is cheap and honest
+        // (the ledger's `empty` status already says nothing worth keeping was found),
+        // and a 4xx for a session the user can see and explicitly asked to distil is
+        // a different surprise. Until that is decided, this note describes the code.
         let transcript = render_transcript(&messages);
         if transcript.is_empty() {
-            anyhow::bail!("session has no messages to distill");
+            return Err(DistillRefusal::no_content(
+                session_key,
+                "the session's transcript is empty",
+            ));
         }
+        // THE WINDOWS (issue #48): the byte budget is the plan's own transcript
+        // bound (ExtractLimits::max_input_bytes, the value the free tier uses for
+        // "how much text is one input"), so a session that fits is ONE window whose
+        // text is byte-identical to the old render_transcript output and a longer
+        // one is cut between turns. The .max(1) guard is there because a budget of
+        // 0 would make transcript_windows emit empty text, and a silent empty
+        // prompt is worse than a one-byte one.
+        let budget = plan.limits.max_input_bytes.max(1);
+        let windows = transcript_windows(&messages, budget);
         // The free tier reads turns; the ACP tier reads the rendered transcript.
         // Loading turns only when the plan asks for them keeps today's path free
-        // of work it did not do before.
-        let turns: Vec<ruagent_extract::Turn> = if plan.rules {
-            turns_of(&messages)
+        // of work it did not do before -- and only for the windows that exist.
+        let window_turns: Vec<Vec<ruagent_extract::Turn>> = if plan.rules {
+            windows
+                .iter()
+                .map(|w| turns_of(&messages[w.range.clone()]))
+                .collect()
         } else {
             Vec::new()
         };
-        let cx = crate::extract_plane::ExtractCtx {
-            session_key,
-            transcript: &transcript,
-            turns: &turns,
-            limits: plan.limits,
-        };
+        let inputs: Vec<crate::extract_plane::ExtractInput<'_>> = windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| crate::extract_plane::ExtractInput {
+                transcript: &w.text,
+                turns: window_turns.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            })
+            .collect();
         // THE ACP IMPLEMENTATION EXISTS ONLY WHEN A CARD DOES (t14): a
         // rules-only plan passes `None` here, so no agent card is needed to run
         // it. A plan that enables the llm tier without a card is refused by the
@@ -387,34 +785,46 @@ impl Distiller {
             distiller: self,
             card,
         });
-        let bundle = crate::extract_plane::extract(&cx, plan, acp)
+        let extraction = crate::extract_plane::extract_windows(session_key, &inputs, plan, acp)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut bundle = extraction.bundle;
+        // THE USAGE (issue #55): read through ONE helper, so the fold's accessors
+        // have a single reader and a test can drive the same expression.
+        let usage = usage_columns(&bundle.usage);
+        // A CUT IS A CUT, WHICHEVER HALF MADE IT: the window builder knows about a
+        // turn too large for its window, and the producers know about their own
+        // bounds (the candidate cap, the turn window, the text window). One flag
+        // travels to the ledger, so a reader cannot be told "nothing was dropped"
+        // by a pass whose INPUT was sliced.
+        bundle.truncated |= windows.iter().any(|w| w.truncated);
+        let coverage = TranscriptCoverage {
+            from_message: windows.first().map(|w| w.range.start).unwrap_or(0),
+            to_message: windows.last().map(|w| w.range.end).unwrap_or(0),
+            total_messages: messages.len(),
+            bytes: windows.iter().map(|w| w.text.len()).sum(),
+            budget_bytes: budget,
+        };
 
         // A dry run reports what WOULD be written and writes nothing: no
         // episode, no memory, no graph row.
-        let (mem, ent_w, rel_w) = if dry_run {
-            (
-                MemoryWriteOutcome {
-                    written: bundle.memories.len() as u32,
-                    skipped: 0,
-                    episode: None,
-                },
-                bundle.entities.len() as u32,
-                bundle.relations.len() as u32,
-            )
+        let mem = if dry_run {
+            MemoryWriteOutcome {
+                written: bundle.memories.len() as u32,
+                skipped: 0,
+                episode: None,
+            }
         } else {
-            let mem = self
-                .write_memories(&bundle.memories, Some((session_key, &transcript)))
-                .await?;
-            // graph = false: memories only; entities/relations count 0 and
-            // the log still records the run.
-            let (ent_w, rel_w) = if self.graph {
-                self.write_extraction(&bundle, mem.episode).await?
-            } else {
-                (0, 0)
-            };
-            (mem, ent_w, rel_w)
+            self.write_memories(&bundle.memories, Some((session_key, &transcript)))
+                .await?
+        };
+        // graph = false: memories only. The graph's own report is then ABSENT
+        // (None), not zero: nothing counted duplicates or refusals, and writing 0
+        // would claim a measurement nobody took.
+        let graph = if dry_run || !self.graph {
+            None
+        } else {
+            Some(self.write_extraction(&bundle, mem.episode).await?)
         };
 
         // Three states, not two (D5): an extraction that returned NOTHING is a
@@ -426,14 +836,49 @@ impl Distiller {
                 session_key: session_key.to_string(),
                 memories_written: mem.written,
                 memories_skipped: mem.skipped,
-                entities_written: ent_w,
-                relations_written: rel_w,
+                // A dry run reports what the write WOULD have produced; the graph
+                // half's own reading is None in both the dry-run and the graph-off
+                // case (see above), so those two columns stay NULL there.
+                entities_written: graph.as_ref().map_or_else(
+                    || {
+                        if dry_run {
+                            bundle.entities.len() as u32
+                        } else {
+                            0
+                        }
+                    },
+                    |g| g.entities,
+                ),
+                relations_written: graph.as_ref().map_or_else(
+                    || {
+                        if dry_run {
+                            bundle.relations.len() as u32
+                        } else {
+                            0
+                        }
+                    },
+                    |g| g.relations,
+                ),
+                relations_duplicate: graph.as_ref().map(|g| g.duplicates),
+                relations_refused: graph.as_ref().map(|g| g.refused),
+                // THE WINDOWS AND THE USAGE (issues #48, #55): measured by this
+                // pass, so they are Some here -- including a measured 1 window and
+                // a measured "nothing was cut".
+                windows: Some(extraction.windows),
+                coverage: Some(coverage),
+                tokens_used: usage.0,
+                context_size: usage.1,
+                cost_usd: usage.2,
                 // Empty when no agent card was resolved, i.e. on a rules-only
                 // pass (t14): the free tier has no agent, and `source` is the
                 // field that says which implementation produced this row.
                 agent: card.map(|c| c.name.clone()).unwrap_or_default(),
                 source: plan.label().to_string(),
                 truncated: bundle.truncated,
+                // Filled in by `pass_with_retries`, which is the only thing that
+                // knows how many attempts this took: a body cannot count the
+                // retries that produced it.
+                retries: 0,
                 dry_run,
             },
             status,
@@ -477,7 +922,7 @@ impl Distiller {
         &self,
         bundle: &crate::extract_plane::ExtractBundle,
         episode: Option<i64>,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<GraphOutcome> {
         match self.write_graph(bundle, episode).await {
             Ok(counts) => Ok(counts),
             Err(e) => {
@@ -597,6 +1042,20 @@ impl Distiller {
 
     /// `status` is one of `ok` | `empty` | `failed` and is written on every
     /// attempt, and `prompt_hash` attributes it to the prompt that produced it.
+    /// WHAT EACH NEW COLUMN MEANS, in one place (ruagent-issues-45-55 t5):
+    ///
+    /// * `retries` is ALWAYS written: 0 is the measured "the first attempt
+    ///   settled this", which is a reading, not the absence of one.
+    /// * `windows`/`truncated` are written together and only when the caller
+    ///   MEASURED them (`DistillOutcome::windows` is `Some` exactly when an
+    ///   extraction loop ran). A refusal or a failure read nothing, so it leaves
+    ///   NULL -- "we did not look" -- rather than a 1/0 it never observed.
+    /// * `tokens_used`/`context_size`/`cost_usd` come from the agent's own
+    ///   `UsageUpdate`s; NULL means THE PROVIDER SAID NOTHING, which is not a
+    ///   measured 0 (a rules-only pass spends no tokens and reports none).
+    /// * `relations_duplicate`/`relations_refused` come from the graph writer's
+    ///   report; NULL means the graph half did not run (`[distill] graph = false`),
+    ///   which is not the same reading as a measured 0.
     async fn log_outcome(
         &self,
         outcome: &DistillOutcome,
@@ -613,8 +1072,10 @@ impl Distiller {
                 conn.execute(
                     "INSERT INTO distill_log
                          (session_key, distilled_at, memories_written, entities_written,
-                          relations_written, agent, status, failure_reason, prompt_hash)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                          relations_written, agent, status, failure_reason, prompt_hash,
+                          retries, windows, truncated, tokens_used, context_size, cost_usd,
+                          relations_duplicate, relations_refused)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     rusqlite::params![
                         log.session_key,
                         chrono::Utc::now().to_rfc3339(),
@@ -625,6 +1086,17 @@ impl Distiller {
                         status,
                         failure_reason,
                         prompt_hash,
+                        log.retries,
+                        // The two readings travel together: a row that names a
+                        // window count also says whether text was dropped, and a
+                        // row that read nothing says neither.
+                        log.windows.map(|w| w as i64),
+                        log.windows.map(|_| if log.truncated { 1i64 } else { 0i64 }),
+                        log.tokens_used,
+                        log.context_size,
+                        log.cost_usd,
+                        log.relations_duplicate.map(|d| d as i64),
+                        log.relations_refused.map(|r| r as i64),
                     ],
                 )
             })
@@ -632,38 +1104,116 @@ impl Distiller {
         Ok(())
     }
 
+    /// Record a pass that never READ anything: `empty`, with `retries` 0.
+    ///
+    /// WHY THIS EXISTS SEPARATELY (issue #45): the auto-distill gate knows a
+    /// chat's transcript holds no turns BEFORE any distillation is attempted
+    /// (t313), and the silent `return` that used to happen there left the ledger
+    /// with nothing to say about the session at all -- a chat opened and closed in
+    /// ten seconds appeared in no table, so "was this conversation ever considered
+    /// for distillation?" had no answer anywhere. `empty` (not `failed`) is the
+    /// truthful state: nothing went wrong, and nothing was read.
+    ///
+    /// `reason` is written down for the same reason a failure's is: a row that
+    /// says `empty` with no cause makes the reader guess which of "the transcript
+    /// was empty" and "there was nothing of the user's in it" happened.
+    pub async fn record_empty_attempt(&self, session_key: &str, reason: &str) -> Result<()> {
+        let prompt_hash = ruagent_memory::write::content_hash(&self.compose_prompt());
+        let outcome = DistillOutcome {
+            session_key: session_key.to_string(),
+            ..DistillOutcome::default()
+        };
+        self.log_outcome(&outcome, "empty", &prompt_hash, Some(reason))
+            .await
+    }
+
     /// Raw session messages: the sessions index holds the source and
     /// file path, the file is parsed on demand.
+    ///
+    /// INDEXES FIRST, THEN READS (issue #45). The row this needs is written by a
+    /// 60 s scanner, so "no row" usually means "not yet": `ensure_indexed` runs
+    /// one pass and asks again, and only when THAT finds nothing does the caller
+    /// get [`DistillRefusal::NotIndexed`] -- an actionable sentence instead of
+    /// rusqlite's `Query returned no rows` (which is what the old single
+    /// `query_row` propagated, because `??` unwrapped the inner error the
+    /// `map_err` above it had not touched).
+    ///
+    /// A DATABASE ERROR IS NOT A REFUSAL and is not rewritten as one: a writer
+    /// that is down, or a store that cannot be read, is a defect -- the cause is
+    /// kept so the operator sees it, while the two refusals above are sentences
+    /// written for the person who asked.
     async fn load_messages(
         &self,
         session_key: &str,
     ) -> Result<Vec<crate::sessions::SessionMessage>> {
-        let key = session_key.to_string();
-        let (source, ref_path): (String, String) = self
-            .db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT source, ref_path FROM sessions WHERE key = ?1",
-                    [&key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("session not indexed: {session_key}"))??;
+        let indexer = crate::sessions::SessionIndexer::for_daemon_root(self.db.clone(), &self.root);
+        let located =
+            match tokio::time::timeout(INDEX_WAIT, indexer.ensure_indexed(session_key)).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(e)) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("indexing `{session_key}` before distilling it")));
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        session = %session_key,
+                        wait_ms = INDEX_WAIT.as_millis() as u64,
+                        "the session index pass did not finish in time; refusing this pass as \
+                         not-yet-indexed rather than holding the caller open"
+                    );
+                    crate::sessions::SessionLookup::Missing
+                }
+            };
+        // THE THREE ANSWERS, EACH WITH ITS OWN SENTENCE (issue #45): a row to read,
+        // a file the pass read and found EMPTY (the index refuses such a file a row
+        // on purpose), and a key no family holds. Collapsing the last two would
+        // tell a chat opened and closed in ten seconds that it is "not indexed
+        // yet" -- which is both false and a reason a batch pass would keep coming
+        // back to it for.
+        let (source, ref_path) = match located {
+            crate::sessions::SessionLookup::Found(source, ref_path) => (source, ref_path),
+            crate::sessions::SessionLookup::Empty => {
+                return Err(DistillRefusal::no_content(
+                    session_key,
+                    "the session's file was read and holds no message",
+                ));
+            }
+            crate::sessions::SessionLookup::Missing => {
+                return Err(DistillRefusal::not_indexed(session_key));
+            }
+        };
         Ok(crate::sessions::parse_file_messages(
             &source,
             &PathBuf::from(&ref_path),
         ))
     }
 
-    /// One-shot ACP run: spawn the agent, ask, collect the reply.
-    /// Shared with the wiki builder (design §6.1: same single-call
-    /// discipline, no tool loops for unattended jobs).
+    /// One-shot ACP run: spawn the agent, ask, collect the reply's TEXT.
+    ///
+    /// The wiki builder's entry point (design §6.1: same single-call discipline,
+    /// no tool loops for unattended jobs). It is a thin wrapper over
+    /// [`Self::ask_agent_with_usage`] so there is ONE send, one collector and one
+    /// timeout, and a job that does not care about usage cannot drift from the job
+    /// that does.
     pub(crate) async fn ask_agent(
         &self,
         card: &ruagent_core::AgentCard,
         prompt: &str,
     ) -> Result<String> {
+        Ok(self.ask_agent_with_usage(card, prompt).await?.text)
+    }
+
+    /// One-shot ACP run, with what the agent reported about its own context window
+    /// and cost (ruagent-issues-45-55 t5 / issue #55).
+    ///
+    /// THE USAGE RIDES THE SAME RETURN VALUE AS THE TEXT, on purpose: a caller that
+    /// records the extraction and forgets what it cost is the defect this fixes,
+    /// and a second out-parameter is exactly how that happens.
+    pub(crate) async fn ask_agent_with_usage(
+        &self,
+        card: &ruagent_core::AgentCard,
+        prompt: &str,
+    ) -> Result<AgentReply> {
         let spec = ruagent_acp::adapter_for(card.harness)
             .spawn_spec(card)
             .with_context(|| format!("resolving spawn command for `{}`", card.name))?;
@@ -693,36 +1243,25 @@ impl Distiller {
         )
         .context("starting distillation agent")?;
 
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
-        let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<ReplyCollector>();
         let mut sub = session.subscribe();
         tokio::spawn(async move {
-            let mut text = String::new();
-            let mut done = false;
-            while !done {
+            // ONE fold for the whole stream, in `ReplyCollector::observe` — which is
+            // also what its unit test drives, so the text and the usage cannot be
+            // collected by two implementations that disagree.
+            let mut collector = ReplyCollector::default();
+            loop {
                 match sub.recv().await {
-                    Ok(RunEvent::AgentMessageChunk { content }) => {
-                        for block in content {
-                            if let ruagent_core::ContentBlock::Text { text: t } = block {
-                                text.push_str(&t);
-                            }
+                    Ok(event) => {
+                        if !collector.observe(&event) {
+                            break;
                         }
                     }
-                    Ok(RunEvent::Stopped { .. }) => {
-                        done = true;
-                    }
-                    Ok(RunEvent::Error { message }) => {
-                        let _ = err_tx.send(message);
-                        done = true;
-                    }
-                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => {
-                        done = true;
-                    }
+                    Err(_) => break,
                 }
             }
-            let _ = done_tx.send(text);
+            let _ = done_tx.send(collector);
         });
 
         // No context payload: distillation must not feed the memory
@@ -738,18 +1277,24 @@ impl Distiller {
             // measured empty injection (t137, contract §3.2).
             context_budget: None,
         })?;
-        let reply = match tokio::time::timeout(std::time::Duration::from_secs(300), done_rx).await {
-            Ok(Ok(text)) => text,
+        let collected = match tokio::time::timeout(Duration::from_secs(300), done_rx).await {
+            Ok(Ok(collected)) => collected,
             Ok(Err(_)) => anyhow::bail!("agent stream closed before reply"),
             Err(_) => anyhow::bail!("distillation agent timed out (5 min)"),
         };
-        if let Some(err) = err_rx.recv().await
-            && reply.trim().is_empty()
+        // The error the stream reported is only fatal when the turn produced no
+        // reply: an agent that errors after answering has still answered (this is
+        // the same reading the old two-channel version had).
+        if let Some(err) = collected.error.as_deref()
+            && collected.text.trim().is_empty()
         {
             anyhow::bail!("distillation agent error: {err}");
         }
         let _ = session.send(ChatCommand::Shutdown);
-        Ok(reply)
+        Ok(AgentReply {
+            text: collected.text,
+            usage: collected.usage,
+        })
     }
 
     /// Insert memories with near-duplicate skip (cosine >= 0.90 against
@@ -921,7 +1466,7 @@ impl Distiller {
         &self,
         bundle: &crate::extract_plane::ExtractBundle,
         episode: Option<i64>,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<GraphOutcome> {
         // ONE transaction for the whole graph half (t81, audit #1). Building the
         // graph item by item -- an `upsert_entity_with_aliases` per entity and an
         // `upsert_fact` per relation, each its own closure through the
@@ -959,10 +1504,15 @@ impl Distiller {
             })
             .collect();
 
-        let report =
-            ruagent_graph::apply_extraction(&self.db, &entities, &facts, "extraction", episode)
-                .await
-                .context("writing this extraction into the graph (all-or-nothing)")?;
+        let report = ruagent_graph::apply_extraction(
+            &self.db,
+            &entities,
+            &facts,
+            ruagent_graph::AliasSource::Extraction,
+            episode,
+        )
+        .await
+        .context("writing this extraction into the graph (all-or-nothing)")?;
 
         // NOT A SILENT SKIP (G7): a duplicate or a refused name is counted and
         // reported, because "we dropped 8 of your 20 relations" is a reading, not
@@ -977,7 +1527,15 @@ impl Distiller {
                 "graph write: deduped at the write side (G7)"
             );
         }
-        Ok((report.entities, report.relations))
+        // RETURNED, not only logged (issue #55): the ledger keeps the two counts,
+        // so the question the log line answered is now answerable from the
+        // database -- and per attempt rather than per daemon log window.
+        Ok(GraphOutcome {
+            entities: report.entities,
+            relations: report.relations,
+            duplicates: report.duplicates,
+            refused: report.refused,
+        })
     }
 }
 
@@ -1063,6 +1621,112 @@ fn render_transcript(messages: &[crate::sessions::SessionMessage]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// The three usage columns of one attempt, from the bundle's own report.
+///
+/// ONE READER, so the fold's accessors cannot be interpreted two ways
+/// (ruagent-issues-45-55 t5 / issue #55): `distill_once` and the test that proves
+/// the columns are populated both come through here.
+fn usage_columns(
+    usage: &crate::extract_plane::UsageReport,
+) -> (Option<i64>, Option<i64>, Option<f64>) {
+    (usage.tokens_used(), usage.context_size(), usage.cost_usd())
+}
+
+/// Cut `text` to at most `budget` BYTES, at a char boundary.
+///
+/// `floor_char_boundary` is unstable, and slicing a `&str` inside a multi-byte
+/// character PANICS: the cut has to walk back to the nearest boundary, which for
+/// Chinese text is one byte at worst and never a half character.
+fn cut_to_bytes(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        return text;
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Split the messages into windows of at most `budget_bytes` of rendered text,
+/// at TURN boundaries (ruagent-issues-45-55 t5 / issue #48).
+///
+/// WHY WINDOWS AT ALL. `render_transcript` used to render the whole session into
+/// one prompt: the ACP tier appended it unbounded (the model's own context limit
+/// was the only bound, and hitting it is a hard failure, not a shorter read), and
+/// the free tier silently kept only the newest turns its own byte window allowed.
+/// A session longer than one input is therefore READ IN WINDOWS here — cut where
+/// the conversation itself is cut, between turns — and extracted once per window.
+///
+/// WHAT IS GUARANTEED, in the order it matters:
+///
+/// 1. **A session that fits is ONE window whose text is byte-identical to
+///    `render_transcript`'s.** Not "equivalent": the same call, so the single-window
+///    prompt, its `prompt_hash` and every existing assertion about it are
+///    unchanged. A caller that wants the old rendering still gets it from
+///    `render_transcript`; this function is where a budget enters.
+/// 2. **A session that does not fit is cut BETWEEN turns**, newest-last, and every
+///    message is eventually extracted exactly once: the union of the ranges is
+///    `0..messages.len()`.
+/// 3. **A single message larger than the budget gets its own window, CUT at the
+///    budget**, with `truncated = true`. That is the "cannot be windowed any
+///    further" case, and it is REPORTED rather than silent: the caller ORs the flag
+///    into `ExtractBundle::truncated` so the ledger's `truncated` column says so.
+fn transcript_windows(
+    messages: &[crate::sessions::SessionMessage],
+    budget_bytes: usize,
+) -> Vec<TranscriptWindow> {
+    let budget = budget_bytes.max(1);
+    let mut windows: Vec<TranscriptWindow> = Vec::new();
+    let mut start = 0usize;
+    let mut start_bytes = 0usize;
+    for (i, m) in messages.iter().enumerate() {
+        // The turn's own rendered size: the same rendering the window will carry,
+        // so the packing cannot disagree with what it packs.
+        let turn_bytes = render_transcript(std::slice::from_ref(m)).len();
+        let would_be =
+            start_bytes + turn_bytes + if start_bytes == 0 { 0 } else { SEPARATOR_BYTES };
+        if i > start && would_be > budget {
+            windows.push(window_of(messages, start, i, budget));
+            start = i;
+            start_bytes = turn_bytes;
+        } else {
+            start_bytes = would_be;
+        }
+    }
+    if start < messages.len() {
+        windows.push(window_of(messages, start, messages.len(), budget));
+    }
+    windows
+}
+
+/// The separator `render_transcript` joins turns with, as a byte count: counted
+/// HERE rather than guessed, because the packing above is about bytes.
+const SEPARATOR_BYTES: usize = 2;
+
+/// One window's rendered text, CUT to the budget when a single turn is larger than
+/// it (see `transcript_windows`).
+fn window_of(
+    messages: &[crate::sessions::SessionMessage],
+    from: usize,
+    to: usize,
+    budget: usize,
+) -> TranscriptWindow {
+    let rendered = render_transcript(&messages[from..to]);
+    if rendered.len() <= budget {
+        return TranscriptWindow {
+            range: from..to,
+            text: rendered,
+            truncated: false,
+        };
+    }
+    TranscriptWindow {
+        range: from..to,
+        text: cut_to_bytes(&rendered, budget).to_string(),
+        truncated: true,
+    }
 }
 
 /// The same messages as the free tier's [`ruagent_extract::Turn`]s. The role is
@@ -1619,9 +2283,13 @@ mod t329_tests {
                 ),
             ],
         );
-        let (ent, rel) = d.write_graph(&ex, Some(episode)).await.unwrap();
-        assert_eq!(ent, 2);
-        assert_eq!(rel, 2);
+        let report = d.write_graph(&ex, Some(episode)).await.unwrap();
+        assert_eq!(report.entities, 2);
+        assert_eq!(report.relations, 2);
+        // The two counts issue #55 added: nothing here was a duplicate and nothing
+        // was refused, and both are MEASURED zeros (the write ran).
+        assert_eq!(report.duplicates, 0);
+        assert_eq!(report.refused, 0);
 
         let rows: Vec<EdgeRow> =
             d.db.call(|conn| -> Result<Vec<EdgeRow>, rusqlite::Error> {
@@ -1704,7 +2372,11 @@ mod t329_tests {
             },
             "failed",
             "hash-a",
-            Some("Query returned no rows"),
+            // THE REASON A REAL REFUSAL PRODUCES, used verbatim: this test is
+            // about the ledger PRESERVING whatever the entry recorded, and this
+            // sentence is what the entry records now that the missing-index-row
+            // case answers in words instead of rusqlite's message (issue #45).
+            Some(NOT_INDEXED_MESSAGE),
         )
         .await
         .unwrap();
@@ -1779,7 +2451,7 @@ mod t329_tests {
             "the success carries no failure reason"
         );
         assert_eq!(same_session[1].1, "failed");
-        assert_eq!(same_session[1].2.as_deref(), Some("Query returned no rows"));
+        assert_eq!(same_session[1].2.as_deref(), Some(NOT_INDEXED_MESSAGE));
         assert_eq!(
             same_session[1].3.as_deref(),
             Some("hash-a"),
@@ -1799,7 +2471,7 @@ mod t329_tests {
             },
             "failed",
             "hash-b",
-            Some("Query returned no rows"),
+            Some(NOT_INDEXED_MESSAGE),
         )
         .await
         .unwrap();
@@ -1817,7 +2489,7 @@ mod t329_tests {
             .unwrap();
         println!("READING a first-attempt failure: {failed:?}");
         assert_eq!(failed.0, "failed");
-        assert_eq!(failed.1.as_deref(), Some("Query returned no rows"));
+        assert_eq!(failed.1.as_deref(), Some(NOT_INDEXED_MESSAGE));
         assert_eq!(
             failed.2.as_deref(),
             Some("hash-b"),
@@ -2202,5 +2874,988 @@ mod t329_tests {
         // The graph half gained the two new fields.
         assert!(p.contains("\"aliases\": [\"...\"]"));
         assert!(p.contains("\"valid_at\":"));
+    }
+}
+
+/// The distillation ENTRY's own contract.
+///
+/// ruagent-issues-45-55 t4 / issue #45: index before you read, refuse in sentences
+/// a person can act on, and retry a failure a BOUNDED number of times while
+/// recording how many retries it took.
+///
+/// ruagent-issues-45-55 t5 / issues #48 and #55: read a long session in WINDOWS and
+/// record the coverage and whether anything was cut; carry the agent's own usage
+/// into the ledger; carry the graph writer's duplicate/refused counts the same way.
+/// The layout, distiller and ledger helpers above are shared by both halves on
+/// purpose: they are the same entry, and two fixtures would be two chances for the
+/// readings to disagree.
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+
+    /// (home, root) in the daemon's OWN layout: root is <home>/.ruagent,
+    /// transcripts live under <root>/data/transcripts, and the session index is
+    /// derived from the PARENT (see sessions::SessionIndexer::for_daemon_root). A
+    /// distiller built on this root can therefore only ever index the fixture: the
+    /// parent is a private temporary directory, so no pass can reach the real
+    /// machine's ~/.claude, ~/.dsh or ~/.codex stores.
+    ///
+    /// The wipe is the fixture and not hygiene (t154): the name carries the pid,
+    /// pids are reused, and a database left under a reused name makes every
+    /// assertion below a reading of somebody else's run.
+    fn daemon_layout(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let home =
+            std::env::temp_dir().join(format!("ruagent-t45-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join(".ruagent");
+        std::fs::create_dir_all(root.join("data").join("transcripts")).unwrap();
+        (home, root)
+    }
+
+    /// The transcript a real chat leaves behind, with a PREF marker so the
+    /// DETERMINISTIC tier has something to extract. Every pass in this module runs
+    /// the free tier: a plan with the ACP tier in it would spawn a real harness and
+    /// spend a real turn.
+    const TRANSCRIPT: &str = "{\"ts\":\"2026-09-26T14:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"记住：以后回答都要简洁，不要长篇大论。\"}}\n{\"ts\":\"2026-09-26T14:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"text\":\"understood\"}}\n";
+
+    /// A chat opened and closed inside ten seconds: the harness wrote its session
+    /// header and no turn was ever exchanged. The index refuses such a file a row
+    /// ON PURPOSE (a spawn that never got an answer is not a session), which is the
+    /// shape issue #45's second acceptance names.
+    const TEN_SECOND_TRANSCRIPT: &str =
+        "{\"ts\":\"2026-09-26T14:00:00Z\",\"seq\":0,\"event\":{\"type\":\"session_start\"}}\n";
+
+    fn rules_plan() -> crate::extract_plane::ExtractPlan {
+        crate::extract_plane::ExtractPlan::explicit(crate::extract_plane::Extractor::Rules)
+    }
+
+    /// The same plan, with the transcript's byte budget moved down so a NORMAL
+    /// fixture is longer than one input: the windowing path is otherwise
+    /// unreachable without a megabyte of text.
+    fn rules_plan_with_budget(bytes: usize) -> crate::extract_plane::ExtractPlan {
+        let mut plan = rules_plan();
+        plan.limits.max_input_bytes = bytes;
+        plan
+    }
+
+    /// A rules-tier candidate set for a graph write, built here because the free
+    /// tier produces entities and relations only for the knowledge path.
+    fn bundle_with(
+        entities: &[(&str, &[&str])],
+        relations: &[(&str, &str, &str, &str)],
+    ) -> crate::extract_plane::ExtractBundle {
+        crate::extract_plane::ExtractBundle {
+            memories: Vec::new(),
+            entities: entities
+                .iter()
+                .map(|(name, aliases)| ruagent_extract::EntityCandidate {
+                    name: (*name).to_string(),
+                    kind: Some("tool"),
+                    summary: None,
+                    aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+                    score: 1.0,
+                    rule: "acp",
+                    origin: Default::default(),
+                    source: String::new(),
+                })
+                .collect(),
+            relations: relations
+                .iter()
+                .map(
+                    |(src, dst, name, fact)| ruagent_extract::RelationCandidate {
+                        src: (*src).to_string(),
+                        dst: (*dst).to_string(),
+                        relation: ruagent_extract::RelationName::Model((*name).to_string()),
+                        fact: (*fact).to_string(),
+                        valid_at: None,
+                        score: 1.0,
+                        rule: "acp",
+                        origin: Default::default(),
+                        source: String::new(),
+                    },
+                )
+                .collect(),
+            source: Some(crate::extract_plane::ExtractSource::Acp),
+            truncated: false,
+            usage: crate::extract_plane::UsageReport::default(),
+        }
+    }
+
+    /// One user turn of a transcript fixture, at second `i` of a fixed minute.
+    fn user_turn(i: usize, text: &str) -> String {
+        format!(
+            "{{\"ts\":\"2026-09-26T14:{:02}:00Z\",\"seq\":{},\"event\":{{\"type\":\"user_message\",\"text\":\"{}\"}}}}\n",
+            i % 60,
+            i + 1,
+            text
+        )
+    }
+
+    fn distiller_at(root: &std::path::Path) -> Distiller {
+        Distiller {
+            db: ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap(),
+            root: root.to_path_buf(),
+            embedder: None,
+            // Empty on purpose and never consulted: the rules tier needs no agent.
+            registry: crate::distill::AgentRegistry::default(),
+            language: None,
+            prompt_override: None,
+            // Memories only. The graph half has its own tests, and a graph failure
+            // here would redden a test about retries for an unrelated reason.
+            graph: false,
+        }
+    }
+
+    fn write_transcript(root: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = root.join("data").join("transcripts").join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn indexer_for(d: &Distiller) -> crate::sessions::SessionIndexer {
+        crate::sessions::SessionIndexer::for_daemon_root(d.db.clone(), &d.root)
+    }
+
+    /// The NEWEST attempt's (status, reason, retries) for one session key.
+    /// retries is read through a sentinel, so a NULL (a row written before 0028)
+    /// cannot pass for a measured 0.
+    async fn newest_attempt(db: &ruagent_store::Db, key: &str) -> (String, String, i64) {
+        let key = key.to_string();
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COALESCE(status,'<null>'), COALESCE(failure_reason,''),
+                        COALESCE(retries,-1)
+                 FROM distill_log WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn attempts_of(db: &ruagent_store::Db, key: &str) -> i64 {
+        let key = key.to_string();
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM distill_log WHERE session_key = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The acceptance's own reading, in one place: none of the storage layer's
+    /// vocabulary reaches a text a user (or the panel) reads.
+    fn assert_sql_free(text: &str) {
+        for fragment in [
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "CREATE TABLE",
+            "sqlite",
+            "pragma",
+            "no such table",
+            "no such column",
+            "Query returned no rows",
+            "query_row",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "{text:?} must not carry the storage layer's {fragment:?}"
+            );
+        }
+    }
+
+    /// The user-visible vocabulary of a refusal is two sentences and nothing else,
+    /// and which LEDGER STATUS each one gets is part of the contract: an empty
+    /// session is not a failure, and a session we could not read is not empty.
+    #[test]
+    fn the_refusals_are_sentences_and_their_statuses_are_not_interchangeable() {
+        assert_eq!(NO_CONTENT_MESSAGE, "没有可蒸馏的内容");
+        assert_eq!(NOT_INDEXED_MESSAGE, "该会话尚未进入索引，正在同步");
+        assert_sql_free(NO_CONTENT_MESSAGE);
+        assert_sql_free(NOT_INDEXED_MESSAGE);
+        assert_eq!(DistillRefusal::NoContent.status(), "empty");
+        assert_eq!(DistillRefusal::NotIndexed.status(), "failed");
+        // A refusal is terminal or transient BY KIND, which is why it is a type:
+        // re-reading an empty conversation cannot change the answer, while the index
+        // pass every attempt re-runs is exactly what can heal a missing row.
+        assert!(!is_retryable(&anyhow::Error::new(
+            DistillRefusal::NoContent
+        )));
+        assert!(is_retryable(&anyhow::Error::new(
+            DistillRefusal::NotIndexed
+        )));
+    }
+
+    /// The backoff grows, and the budget is the one the documentation claims.
+    #[test]
+    fn the_retry_waits_grow_and_the_budget_is_bounded() {
+        assert_eq!(retry_wait(1), RETRY_FIRST_WAIT);
+        assert_eq!(retry_wait(2), RETRY_FIRST_WAIT * 2u32);
+        assert!(
+            retry_wait(2) > retry_wait(1),
+            "the waits must increase: {:?} then {:?}",
+            retry_wait(1),
+            retry_wait(2)
+        );
+        println!(
+            "READING t45 retry budget: {RETRY_LIMIT} retries, waits {:?} then {:?}",
+            retry_wait(1),
+            retry_wait(2)
+        );
+    }
+
+    /// ACCEPTANCE (issue #45): the entry INDEXES the session before it reads it.
+    ///
+    /// The fixture is a transcript on disk with NO sessions row and no scan -- the
+    /// state a chat is in the moment it closes, and the state that used to answer
+    /// "Query returned no rows". The pass must succeed, the index row must exist
+    /// afterwards, and the ledger must record the retries it actually took (0: the
+    /// first attempt found the file, because the entry indexed it).
+    #[tokio::test]
+    async fn the_entry_indexes_the_session_before_reading_it() {
+        let (home, root) = daemon_layout("index-first");
+        let d = distiller_at(&root);
+        let path = write_transcript(&root, "run-t45-a.jsonl", TRANSCRIPT);
+        let key = crate::sessions::session_key_of(&path);
+
+        // The PREMISE, asserted rather than assumed: no row yet, so a reader that
+        // only looked would have to report a session that does not exist.
+        let indexer = indexer_for(&d);
+        assert!(
+            indexer.locate(&key).await.unwrap().is_none(),
+            "the fixture must start UNINDEXED, or this test proves nothing"
+        );
+
+        let out = d
+            .distill_plan(&key, None, rules_plan(), false)
+            .await
+            .expect("the entry must index the session instead of failing on a missing row");
+        assert!(
+            out.memories_written > 0,
+            "the marked sentence must have been extracted, so this is a REAL pass: {out:?}"
+        );
+        assert_eq!(
+            out.retries, 0,
+            "the first attempt found the file: the entry indexed it before reading"
+        );
+
+        // The row the distiller needed is there now, written by its own pass.
+        let located = indexer.locate(&key).await.unwrap();
+        assert_eq!(
+            located.map(|(source, _)| source).as_deref(),
+            Some("ruagent"),
+            "the pass must have indexed the transcript it read"
+        );
+        let (status, reason, retries) = newest_attempt(&d.db, &key).await;
+        println!("READING unindexed-then-distilled: {status} {reason:?} retries={retries}");
+        assert_eq!(status, "ok");
+        assert_eq!(reason, "", "a success carries no reason");
+        assert_eq!(retries, 0);
+        assert_eq!(attempts_of(&d.db, &key).await, 1, "one pass, one row");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #45): the ten-second chat is RECORDED as "nothing to
+    /// distil", and the text is a sentence rather than the storage layer's.
+    ///
+    /// The refusal is terminal, so retries is 0: three attempts would read the same
+    /// empty conversation, and recording 2 would claim a transient fault that never
+    /// happened.
+    #[tokio::test]
+    async fn a_session_with_nothing_in_it_is_recorded_empty_not_failed() {
+        let (home, root) = daemon_layout("ten-seconds");
+        let d = distiller_at(&root);
+        let path = write_transcript(&root, "run-t45-empty.jsonl", TEN_SECOND_TRANSCRIPT);
+        let key = crate::sessions::session_key_of(&path);
+
+        let err = d
+            .distill_plan(&key, None, rules_plan(), false)
+            .await
+            .expect_err("a session with no turn in it is refused, not silently cleared");
+        println!("READING the ten-second chat: {err}");
+        assert_eq!(err.to_string(), NO_CONTENT_MESSAGE);
+        assert_sql_free(&err.to_string());
+
+        let (status, reason, retries) = newest_attempt(&d.db, &key).await;
+        assert_eq!(
+            status, "empty",
+            "nothing to distil is the EMPTY state, not a failure: {reason:?}"
+        );
+        assert_eq!(reason, NO_CONTENT_MESSAGE);
+        assert_sql_free(&reason);
+        assert_eq!(retries, 0, "a terminal refusal is not retried");
+        assert_eq!(attempts_of(&d.db, &key).await, 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #45): a failure is RETRIED, the ledger says how many
+    /// retries it took, and the reason is a sentence -- not "Query returned no
+    /// rows", which is what this exact case used to record.
+    #[tokio::test]
+    async fn a_doomed_session_is_retried_to_the_bound_and_reads_sql_free() {
+        let (home, root) = daemon_layout("doomed");
+        let d = distiller_at(&root);
+        let key = "ruagent:t45-never-indexed";
+
+        let started = std::time::Instant::now();
+        let err = d
+            .distill_plan(key, None, rules_plan(), false)
+            .await
+            .expect_err("a key no pass can resolve must not be reported as a success");
+        let elapsed = started.elapsed();
+        println!("READING a doomed pass: {err} (after {elapsed:?})");
+        assert_eq!(err.to_string(), NOT_INDEXED_MESSAGE);
+
+        let (status, reason, retries) = newest_attempt(&d.db, key).await;
+        assert_eq!(status, "failed");
+        assert_eq!(
+            reason, NOT_INDEXED_MESSAGE,
+            "the ledger must carry the actionable sentence, not the SQL machine's"
+        );
+        assert_sql_free(&reason);
+        assert_eq!(
+            retries, RETRY_LIMIT as i64,
+            "the first attempt plus {RETRY_LIMIT} retries"
+        );
+        assert!(
+            elapsed >= retry_wait(1) + retry_wait(2),
+            "the waits must have been TAKEN, not merely counted: {elapsed:?} for {:?} + {:?}",
+            retry_wait(1),
+            retry_wait(2)
+        );
+        assert_eq!(
+            attempts_of(&d.db, key).await,
+            1,
+            "retries are attempts INSIDE one pass, not one ledger row each"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #45): the retry loop carries a failure that CLEARS, does
+    /// NOT retry a refusal, and stops at the bound on a failure that never clears.
+    ///
+    /// THE ATTEMPTS ARE COUNTED BY THE CLOSURE, so this is a reading of the loop
+    /// itself: no clock, no database, no ordering assumption. It drives the real
+    /// \`with_retries\` -- the function every pass in \`distill_plan\` goes through --
+    /// rather than a copy of it.
+    ///
+    /// WHY THERE IS NO END-TO-END "healed pass" TEST BESIDE IT: a one-shot failure
+    /// cannot be injected through SQL here. \`RAISE(ABORT)\` rolls back the
+    /// transaction it fired in, so a trigger that decrements its own counter does
+    /// not decrement it; and an arm/disarm pair needs a statement that runs in the
+    /// SECOND attempt and not the first, which by construction does not exist --
+    /// attempt 2 finds the session row and the episode row attempt 1 wrote, so it
+    /// skips exactly the writes that could disarm it. The remaining option, a
+    /// spawned task that clears the fault after a sleep, would make this test's
+    /// outcome depend on how long it waited, which is the shape this repo refuses.
+    #[tokio::test]
+    async fn the_loop_retries_a_transient_failure_and_stops_at_the_bound() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // (1) A failure that CLEARS: one retry, then the value.
+        let calls = AtomicU32::new(0);
+        let (out, retries) = with_retries("ruagent:t45-loop", || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(anyhow::anyhow!("transient"))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 1, "the second attempt's value");
+        assert_eq!(retries, 1, "one failure, one retry, then success");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // (2) A REFUSAL is not retried: re-reading an empty conversation cannot
+        //     change the answer, and a count of 2 would claim a transient fault
+        //     that never existed.
+        let calls = AtomicU32::new(0);
+        let (out, retries) = with_retries("ruagent:t45-loop", || {
+            let _ = calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<(), _>(anyhow::Error::new(DistillRefusal::NoContent)) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(retries, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no second attempt");
+
+        // (3) A failure that never clears stops AT THE BOUND, and the waits are
+        //     taken. The elapsed check is a LOWER bound on sleeps the loop owes,
+        //     which is the only kind of timing assertion that cannot flake.
+        let calls = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let (out, retries) = with_retries("ruagent:t45-loop", || {
+            let _ = calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<(), _>(anyhow::anyhow!("permanent")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(retries, RETRY_LIMIT);
+        assert_eq!(calls.load(Ordering::SeqCst), RETRY_LIMIT + 1);
+        assert!(
+            started.elapsed() >= retry_wait(1) + retry_wait(2),
+            "the waits must have been taken, not merely counted: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// t23 (from t14-F1): an ASSISTANT-ONLY session is DISTILLED, not refused -- and
+    /// that is pinned here rather than left incidental.
+    ///
+    /// The note this test was written for used to claim the refusal covered "the
+    /// agent's own output". It does not: `user_turns` drops only a turn whose text
+    /// after the daemon's sentinel is empty, and `sessions::user_text` returns a
+    /// message with no sentinel untouched -- so an assistant turn is KEPT and read as
+    /// `Agent: ...`. What must hold is the whole reading, not just the absence of an
+    /// error: the entry answers Ok, the ledger says `empty` with NO reason (an empty
+    /// pass is an answer, not a failure), and the pass reports the window it read.
+    ///
+    /// The two turns say `understood` and `done, nothing to do` ON PURPOSE: neither
+    /// carries a rule marker (PREF/CORRECT/CONFIRM/...), so the zero memories below is
+    /// a reading about the FILTER, not about the rules tier declining one sentence.
+    /// Whether such a session SHOULD be refused is an open product question registered
+    /// at the refusal site; this test freezes the behaviour that exists so a later
+    /// decision changes it on purpose.
+    #[tokio::test]
+    async fn an_assistant_only_session_is_distilled_and_answers_empty() {
+        let (home, root) = daemon_layout("assistant-only");
+        let d = distiller_at(&root);
+        // The REAL transcript shape for an agent reply: chunks carry a `content`
+        // BLOCK ARRAY and are flushed into ONE assistant message by `stopped`
+        // (`sessions::parse_ruagent`). A chunk written with a bare `text` field is
+        // silently dropped by that parser, so a fixture spelled that way would prove
+        // nothing about an assistant turn -- it would produce a session with no
+        // messages at all.
+        let body = r#"{"ts":"2026-09-26T15:00:01Z","seq":1,"event":{"type":"agent_message_chunk","content":[{"type":"text","text":"understood"}]}}
+{"ts":"2026-09-26T15:00:02Z","seq":2,"event":{"type":"stopped"}}
+"#;
+        let path = write_transcript(&root, "run-t23-assistant-only.jsonl", body);
+        let key = crate::sessions::session_key_of(&path);
+
+        let out = d
+            .distill_plan(&key, None, rules_plan(), false)
+            .await
+            .expect(
+                "an assistant-only session is NOT refused (t23): user_turns keeps the                  agent's own turns",
+            );
+        println!("READING assistant-only pass: {out:?}");
+        assert_eq!(
+            out.memories_written, 0,
+            "the agent's turns carry no durable statement of the user's: {out:?}"
+        );
+        assert_eq!(
+            out.windows,
+            Some(1),
+            "the pass DID read the session -- one window -- so this is a pass, not a              refusal: {out:?}"
+        );
+        assert!(!out.truncated, "and nothing was cut: {out:?}");
+
+        let (status, reason, retries) = newest_attempt(&d.db, &key).await;
+        println!("READING assistant-only ledger: {status} {reason:?} retries={retries}");
+        assert_eq!(
+            status, "empty",
+            "read, and nothing worth keeping in it -- 0024's third state"
+        );
+        assert_eq!(
+            reason, "",
+            "an empty pass carries NO failure reason: a refusal would have recorded one              (the two are different rows with the same status)"
+        );
+        assert_eq!(retries, 0, "nothing failed, so nothing was retried");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #48): a session larger than one input is read IN WINDOWS,
+    /// and the ledger says how many and whether any text was lost.
+    ///
+    /// The fixture is 40 user turns (~4 KB) against a 1 KiB budget, so the split is
+    /// the SUBJECT rather than an accident. What is asserted is the whole reading:
+    /// more than one window ran, the windows' union is the whole session, the bytes
+    /// read exceed one budget (so it really was cut into several), nothing was LOST,
+    /// and the ledger carries the count with a MEASURED truncated = 0.
+    #[tokio::test]
+    async fn a_session_over_the_budget_is_read_in_windows_and_the_ledger_says_so() {
+        let (home, root) = daemon_layout("windows");
+        let d = distiller_at(&root);
+        let mut body = String::new();
+        for i in 0..40 {
+            // Distinct sentences on purpose: the writer's near-duplicate rule must
+            // not be what decides the count below.
+            body.push_str(&user_turn(
+                i,
+                &format!(
+                    "记住：约定 {i} — 服务器 server-{i} 的负责人是 operator-{i}，值班表编号 {i}。"
+                ),
+            ));
+        }
+        let path = write_transcript(&root, "run-t5-windows.jsonl", &body);
+        let key = crate::sessions::session_key_of(&path);
+
+        let out = d
+            .distill_plan(&key, None, rules_plan_with_budget(1024), false)
+            .await
+            .expect("a session over the budget must distil, in windows");
+        let windows = out
+            .windows
+            .expect("an extraction loop ran, so the window count is a reading");
+        let coverage = out.coverage.expect("and so is the coverage");
+        println!("READING windowed pass: windows={windows} coverage={coverage:?}");
+        assert!(windows > 1, "the fixture must exceed one window: {windows}");
+        assert_eq!(
+            coverage.from_message, 0,
+            "the range starts at the first turn"
+        );
+        assert_eq!(
+            coverage.to_message, coverage.total_messages,
+            "and ends at the last one: the union of the windows is the session"
+        );
+        assert!(
+            coverage.total_messages >= 40,
+            "the fixture's own turns: {coverage:?}"
+        );
+        assert_eq!(coverage.budget_bytes, 1024);
+        assert!(
+            coverage.bytes > 1024,
+            "the pass read MORE than one budget's worth, which is what windowing              means: {coverage:?}"
+        );
+        assert!(
+            !out.truncated,
+            "windowing is LOSSLESS: every turn went into a window, so nothing was cut"
+        );
+        assert!(
+            out.memories_written >= 2,
+            "several windows' candidates were written: {out:?}"
+        );
+
+        let (status, _, _) = newest_attempt(&d.db, &key).await;
+        assert_eq!(status, "ok");
+        let (w, t): (Option<i64>, Option<i64>) =
+            d.db.call_flat({
+                let key = key.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT windows, truncated FROM distill_log WHERE session_key = ?1 \
+                         ORDER BY id DESC LIMIT 1",
+                        [&key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(w, Some(windows as i64), "windows is the count that ran");
+        assert_eq!(
+            t,
+            Some(0),
+            "a MEASURED lossless read is 0, not NULL: the pass looked and nothing was cut"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #48): a turn too large for one window CANNOT be windowed
+    /// further, so it is CUT — and the cut is recorded rather than silent.
+    #[tokio::test]
+    async fn a_turn_larger_than_the_budget_is_cut_and_the_ledger_says_so() {
+        let (home, root) = daemon_layout("cut");
+        let d = distiller_at(&root);
+        let long = format!(
+            "记住：{}",
+            "这是一个很长的句子，用来超过字节预算。".repeat(80)
+        );
+        let body = user_turn(0, &long);
+        let path = write_transcript(&root, "run-t5-cut.jsonl", &body);
+        let key = crate::sessions::session_key_of(&path);
+
+        let out = d
+            .distill_plan(&key, None, rules_plan_with_budget(512), false)
+            .await
+            .expect("a session that cannot be windowed is still distilled");
+        let coverage = out.coverage.expect("the coverage is a reading");
+        println!("READING a cut pass: {out:?}");
+        assert_eq!(
+            out.windows,
+            Some(1),
+            "one turn is one window, however large"
+        );
+        assert!(
+            out.truncated,
+            "the text did not fit one window, so the tail was dropped -- and saying so              is the point"
+        );
+        assert!(
+            coverage.bytes <= 512 && coverage.bytes > 0,
+            "the window carries at most the budget: {coverage:?}"
+        );
+        assert_eq!(coverage.total_messages, 1);
+
+        let (status, _, _) = newest_attempt(&d.db, &key).await;
+        assert!(
+            status == "ok" || status == "empty",
+            "a cut is not a failure: {status}"
+        );
+        let (w, t): (Option<i64>, Option<i64>) =
+            d.db.call_flat({
+                let key = key.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT windows, truncated FROM distill_log WHERE session_key = ?1 \
+                         ORDER BY id DESC LIMIT 1",
+                        [&key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(w, Some(1));
+        assert_eq!(
+            t,
+            Some(1),
+            "the ledger must say text was dropped, not report a clean read"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #48 + B2): a failure raised BY THE FIRST WINDOW is retried
+    /// with the same bounded backoff, and the ledger says how many retries it took.
+    ///
+    /// The instrument is the seam's own refusal to run the ACP tier without an
+    /// extractor: a plan with BOTH tiers enabled and no card fails on the first
+    /// window of every attempt, which is exactly the shape "the first window failed"
+    /// takes. What must hold is that the failure is not recorded as one attempt, that
+    /// the retries are REAL (the elapsed check is a lower bound on the waits the loop
+    /// owes), and that nothing measured is claimed: windows/truncated are NULL,
+    /// because no pass ever completed a read.
+    #[tokio::test]
+    async fn a_first_window_failure_is_retried_and_the_ledger_says_how_often() {
+        let (home, root) = daemon_layout("first-window");
+        let d = distiller_at(&root);
+        let mut body = String::new();
+        for i in 0..10 {
+            body.push_str(&user_turn(i, &format!("记住：第 {i} 条约定。")));
+        }
+        let path = write_transcript(&root, "run-t5-fail.jsonl", &body);
+        let key = crate::sessions::session_key_of(&path);
+        // Both tiers, and NO card: the seam refuses window 1 of every attempt.
+        let mut plan = rules_plan_with_budget(256);
+        plan.acp = true;
+
+        let started = std::time::Instant::now();
+        let err = d
+            .distill_plan(&key, None, plan, false)
+            .await
+            .expect_err("a plan that enables the ACP tier with no extractor must fail");
+        let elapsed = started.elapsed();
+        println!("READING a first-window failure: {err} (after {elapsed:?})");
+
+        let (status, reason, retries) = newest_attempt(&d.db, &key).await;
+        assert_eq!(status, "failed");
+        assert!(
+            reason.contains("no extractor was supplied"),
+            "the reason must name the seam's own refusal: {reason:?}"
+        );
+        assert_eq!(
+            retries, RETRY_LIMIT as i64,
+            "the first attempt plus {RETRY_LIMIT} retries"
+        );
+        assert!(
+            elapsed >= retry_wait(1) + retry_wait(2),
+            "the waits must have been TAKEN: {elapsed:?}"
+        );
+        assert_eq!(
+            attempts_of(&d.db, &key).await,
+            1,
+            "retries are attempts inside ONE pass, not one ledger row each"
+        );
+        let measured: (Option<i64>, Option<i64>) =
+            d.db.call_flat({
+                let key = key.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT windows, truncated FROM distill_log WHERE session_key = ?1 \
+                         ORDER BY id DESC LIMIT 1",
+                        [&key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            measured,
+            (None, None),
+            "no pass completed a read, so the windowing was never measured -- NULL, not 0"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #55): the agent's own usage events reach the ledger, folded
+    /// the way the RunTimeline folds them.
+    ///
+    /// TWO HALVES, and the second is why the first is worth anything:
+    /// (a) ReplyCollector -- the fold the ACP turn runs, driven with the events an
+    ///     agent sends (the mock agent's own numbers 120/200_000/0.001, the values
+    ///     mock-agent/tests/integration.rs:104-110 reads off the same event);
+    /// (b) distill_log -- the columns those numbers land in, read through the SAME
+    ///     expression distill_once uses (usage_columns), plus the counter-case that
+    ///     a pass which measured nothing says NULL rather than 0.
+    #[tokio::test]
+    async fn the_agents_usage_events_reach_the_ledger_columns() {
+        let (home, root) = daemon_layout("usage");
+        let d = distiller_at(&root);
+
+        let mut collector = ReplyCollector::default();
+        assert!(
+            collector.observe(&RunEvent::UsageUpdate {
+                usage: ruagent_core::ContextUsage {
+                    used: 120,
+                    size: 200_000,
+                    cost_usd: Some(0.001),
+                },
+            }),
+            "a usage event is not the end of the turn"
+        );
+        collector.observe(&RunEvent::AgentMessageChunk {
+            content: vec![ruagent_core::ContentBlock::Text {
+                text: "{\"memories\":[]}".into(),
+            }],
+        });
+        collector.observe(&RunEvent::UsageUpdate {
+            usage: ruagent_core::ContextUsage {
+                used: 150,
+                size: 200_000,
+                cost_usd: None,
+            },
+        });
+        assert!(
+            !collector.observe(&RunEvent::Stopped {
+                stop_reason: ruagent_core::StopReason::EndTurn,
+            }),
+            "a stop event ends the turn"
+        );
+        assert_eq!(collector.text, "{\"memories\":[]}");
+        assert_eq!(
+            collector.usage.tokens_used(),
+            Some(150),
+            "the LAST occupancy is the reading (a snapshot, not a sum)"
+        );
+        assert_eq!(collector.usage.context_size(), Some(200_000));
+        assert_eq!(
+            collector.usage.cost_usd(),
+            Some(0.001),
+            "a later event without a cost must not erase the cost that was reported"
+        );
+
+        let (tokens, context, cost) = usage_columns(&collector.usage);
+        let measured = DistillOutcome {
+            session_key: "ruagent:t5-usage".into(),
+            agent: "mock".into(),
+            windows: Some(1),
+            tokens_used: tokens,
+            context_size: context,
+            cost_usd: cost,
+            ..DistillOutcome::default()
+        };
+        d.log_outcome(&measured, "ok", "hash-u", None)
+            .await
+            .unwrap();
+        let quiet = DistillOutcome {
+            session_key: "ruagent:t5-rules-only".into(),
+            windows: Some(1),
+            ..DistillOutcome::default()
+        };
+        d.log_outcome(&quiet, "empty", "hash-u", None)
+            .await
+            .unwrap();
+
+        let read = |key: &'static str| {
+            let db = d.db.clone();
+            async move {
+                db.call_flat(move |conn| {
+                    conn.query_row(
+                        "SELECT tokens_used, context_size, cost_usd FROM distill_log \
+                         WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                        [key],
+                        |r| {
+                            Ok((
+                                r.get::<_, Option<i64>>(0)?,
+                                r.get::<_, Option<i64>>(1)?,
+                                r.get::<_, Option<f64>>(2)?,
+                            ))
+                        },
+                    )
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let got = read("ruagent:t5-usage").await;
+        println!("READING the usage row: {got:?}");
+        assert_eq!(got, (Some(150), Some(200_000), Some(0.001)));
+        assert_eq!(
+            read("ruagent:t5-rules-only").await,
+            (None, None, None),
+            "a pass no agent reported usage for says NULL -- not 0 tokens and not $0.00"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #55): the graph writer's two loss counts reach the ledger.
+    ///
+    /// The fixture states three relations between one pair: the first is written, the
+    /// second is the SAME claim under another name of the same family (the write-side
+    /// dedupe, G7), and the third is not a relation at all (the must_ prefix). Before
+    /// this, those two counts existed only in an INFO log line.
+    #[tokio::test]
+    async fn the_graph_writers_duplicate_and_refused_counts_reach_the_ledger() {
+        let (home, root) = daemon_layout("graph-counts");
+        let mut d = distiller_at(&root);
+        d.graph = true;
+        let ex = bundle_with(
+            &[("Rust", &[]), ("Cargo", &[])],
+            &[
+                ("Rust", "Cargo", "uses", "Rust uses Cargo."),
+                ("Rust", "Cargo", "uses_protocol", "Rust depends on Cargo."),
+                (
+                    "Rust",
+                    "Cargo",
+                    "must_never_drop",
+                    "Rust must never drop Cargo.",
+                ),
+            ],
+        );
+        let report = d
+            .write_extraction(&ex, None)
+            .await
+            .expect("the graph write");
+        println!("READING the graph report: {report:?}");
+        assert_eq!(report.relations, 1, "the first claim is the one written");
+        assert_eq!(
+            report.duplicates, 1,
+            "the same-family re-naming is a duplicate"
+        );
+        assert_eq!(report.refused, 1, "must_never_drop states no relation");
+
+        let outcome = DistillOutcome {
+            session_key: "ruagent:t5-graph".into(),
+            relations_written: report.relations,
+            relations_duplicate: Some(report.duplicates),
+            relations_refused: Some(report.refused),
+            windows: Some(1),
+            ..DistillOutcome::default()
+        };
+        d.log_outcome(&outcome, "ok", "hash-g", None).await.unwrap();
+        let graph_off = DistillOutcome {
+            session_key: "ruagent:t5-nograph".into(),
+            windows: Some(1),
+            ..DistillOutcome::default()
+        };
+        d.log_outcome(&graph_off, "empty", "hash-g", None)
+            .await
+            .unwrap();
+
+        let read = |key: &'static str| {
+            let db = d.db.clone();
+            async move {
+                db.call_flat(move |conn| {
+                    conn.query_row(
+                        "SELECT relations_written, relations_duplicate, relations_refused \
+                         FROM distill_log WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                        [key],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, Option<i64>>(1)?,
+                                r.get::<_, Option<i64>>(2)?,
+                            ))
+                        },
+                    )
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let got = read("ruagent:t5-graph").await;
+        println!("READING the graph counts row: {got:?}");
+        assert_eq!(got, (1, Some(1), Some(1)));
+        assert_eq!(
+            read("ruagent:t5-nograph").await,
+            (0, None, None),
+            "with the graph half off nothing counted these, so they are NULL -- not 0"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #48, unchanged-behaviour half): a session that FITS is one
+    /// window whose text is byte-identical to the old rendering, and every window is
+    /// at most the budget. Both properties are asserted on the function the entry
+    /// calls, so the prompt, its prompt_hash and every existing assertion about the
+    /// single-window path are covered by construction.
+    #[test]
+    fn a_session_that_fits_renders_exactly_as_before() {
+        let messages: Vec<crate::sessions::SessionMessage> = (0..5)
+            .map(|i| crate::sessions::SessionMessage {
+                role: "user".into(),
+                text: format!("turn {i}"),
+                ts: 0,
+            })
+            .collect();
+
+        let roomy = transcript_windows(&messages, 1024 * 1024);
+        assert_eq!(roomy.len(), 1, "a session that fits is ONE window");
+        assert_eq!(roomy[0].range, 0..5);
+        assert_eq!(
+            roomy[0].text,
+            render_transcript(&messages),
+            "the single-window prompt must be BYTE-IDENTICAL to the old rendering"
+        );
+        assert!(!roomy[0].truncated);
+
+        let tight = transcript_windows(&messages, 8);
+        assert!(tight.len() > 1, "{tight:?}");
+        assert_eq!(tight.first().map(|w| w.range.start), Some(0));
+        assert_eq!(tight.last().map(|w| w.range.end), Some(messages.len()));
+        for w in &tight {
+            assert!(
+                w.text.len() <= 8,
+                "no window may exceed the budget: {} bytes",
+                w.text.len()
+            );
+        }
+        let mut expected = 0usize;
+        for w in &tight {
+            assert_eq!(w.range.start, expected, "windows must be contiguous");
+            expected = w.range.end;
+        }
+        assert_eq!(expected, messages.len(), "and they must cover every turn");
+    }
+
+    /// A DRY RUN still writes NOTHING, failures included -- asserted for the retry
+    /// loop's sake: the loop changes how many times a pass tries, not what a priced
+    /// query leaves behind (design 14.3).
+    #[tokio::test]
+    async fn a_dry_run_leaves_no_row_even_when_it_fails() {
+        let (home, root) = daemon_layout("dry-run");
+        let d = distiller_at(&root);
+        let err = d
+            .distill_plan("ruagent:t45-dry", None, rules_plan(), true)
+            .await
+            .expect_err("a key no pass can resolve is refused for a dry run too");
+        assert_eq!(err.to_string(), NOT_INDEXED_MESSAGE);
+        assert_eq!(
+            attempts_of(&d.db, "ruagent:t45-dry").await,
+            0,
+            "a dry run must not write a distill_log row, not even a failure"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

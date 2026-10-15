@@ -1,0 +1,37 @@
+-- 0029: "we decided these two stay separate" becomes a REMEMBERED decision
+-- (ruagent-issues-45-55 t3/t10; issue #50).
+--
+-- THE DEFECT THIS FIXES. `resolution_pending` (0021) records the pairs the
+-- mechanical judge would not merge, so that keeping them apart is a recorded
+-- decision rather than a silent one -- but the row is the ONLY record, and
+-- nothing can mark it as ANSWERED. A human who looked at a pair and decided
+-- they are NOT the same object has no way to say so, so the pair is queued
+-- again on every pass and the queue never shrinks: the reader cannot tell "not
+-- looked at yet" from "looked at, deliberately left apart".
+--
+-- `dismissed_at` is the answer's timestamp. NULL keeps its 0021 meaning: a
+-- pair waiting for a decision. Non-NULL means a human decided, and WHEN.
+--
+-- WHY A COLUMN ON THE PAIR AND NOT A DELETION. Deleting the row would lose the
+-- decision entirely: the mechanical judge RE-QUEUES the pair on the next pass
+-- (`ON CONFLICT(entity_a, entity_b) DO UPDATE SET reason = excluded.reason`,
+-- graph's `queue_pending_in`), so the row would silently come back and the
+-- human's answer would be gone. Keeping the row and stamping it makes the
+-- decision durable and the queue filter a plain `dismissed_at IS NULL`.
+--
+-- WHY NOT `entities`-side flags or a decision table: the decision is about the
+-- PAIR (a fact about the two entities' mutual non-identity), the pair's primary
+-- key already exists, and a second table keyed on the same pair would be a
+-- second place for the queue's own records to live.
+--
+-- NULLABLE, NO DEFAULT -- for the same reason as 0028's columns: every existing
+-- row is an UNDECIDED pair, and a default would have to invent either a
+-- decision or a decision time. NULL is exactly "nobody has answered yet".
+--
+-- IDEMPOTENT BY THE RUNNER: SQLite has no `ADD COLUMN IF NOT EXISTS`, so the
+-- statement relies on `migrations::apply_script`'s `pragma_table_info` probe,
+-- which skips it when the column is already present (a lost ledger row for
+-- this version must not make the next boot fail). Keep the one-statement-per
+-- line `ALTER TABLE <table> ADD COLUMN <column> <type>;` shape that guard
+-- parses.
+ALTER TABLE resolution_pending ADD COLUMN dismissed_at TEXT;

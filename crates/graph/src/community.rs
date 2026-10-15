@@ -351,10 +351,18 @@ pub async fn community_coverage(db: &Db, level: u32) -> Result<(u32, u32), DbErr
                 [level],
                 |r| r.get(0),
             )?;
+            // t24: THE SAME PREDICATE AS EVERY OTHER "CURRENT FACTS" READER, not a
+            // fourth hand-written copy of it. `one_entity_current_facts` is the one
+            // definition the facts list, the entity list's count and the resolution
+            // queue's per-pair counts already share, so "how many entities are
+            // non-isolated" cannot come to mean something other than "this entity
+            // appears in N current facts".
             let non_isolated: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT e.id) FROM entities e
-                 WHERE EXISTS (SELECT 1 FROM entity_edges x
-                                WHERE (x.src = e.id OR x.dst = e.id) AND x.invalid_at IS NULL)",
+                &format!(
+                    "SELECT COUNT(DISTINCT e.id) FROM entities e
+                     WHERE EXISTS (SELECT 1 FROM entity_edges x WHERE {})",
+                    crate::one_entity_current_facts("x", "e.id")
+                ),
                 [],
                 |r| r.get(0),
             )?;

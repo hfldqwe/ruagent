@@ -2267,6 +2267,227 @@ async fn distill_graph_toggle_controls_entity_extraction() {
 }
 
 // ---------------------------------------------------------------------------
+// Distillation usage accounting (#55): the agent's own numbers, end to end
+// ---------------------------------------------------------------------------
+
+/// Read the newest ATTEMPT's usage columns for one session.
+async fn newest_usage(
+    db: &Db,
+    key: &str,
+) -> (Option<String>, Option<i64>, Option<i64>, Option<f64>) {
+    let key = key.to_string();
+    db.call(move |conn| {
+        conn.query_row(
+            "SELECT status, tokens_used, context_size, cost_usd FROM distill_log \
+             WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+            [&key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+    })
+    .await
+    .expect("the distill_log query itself")
+    .expect("a distill_log row for this session")
+}
+
+/// The usage the mock agent reports in its echo behaviour
+/// (crates/mock-agent/src/main.rs), which is also what
+/// tests/integration.rs reads off the RunTimeline for the same event.
+const MOCK_USAGE_USED: i64 = 120;
+const MOCK_USAGE_SIZE: i64 = 200_000;
+const MOCK_USAGE_COST: f64 = 0.001;
+
+/// Issue #55, end to end: after a REAL (non-dry-run) distillation the ledger
+/// keeps the agent's own tokens/size/cost, and an agent that reports NOTHING
+/// leaves those columns NULL rather than a measured zero.
+///
+/// TWO AGENTS, ONE DAEMON, because the mock's two usable behaviours differ exactly
+/// in this: echo reports usage (120/200_000/$0.001) and replies with the prompt it
+/// was sent, while scripted replies from a marker-keyed file and reports no usage
+/// at all. Which one runs is the live [distill] policy's business, and the settings
+/// API swaps it (PUT /api/v1/distill), so both cases share one daemon and the agent
+/// selector is exercised with them. (The harness hands its ChatManager
+/// AutoDistill::default(), so a [distill] table in the policy FILE would not reach
+/// the manual route here -- the API is the path a real user has anyway.)
+///
+/// WHAT THIS COVERS THAT t5's UNIT TESTS COULD NOT: the fold from the agent's own
+/// UsageUpdate and the ledger columns each had a unit test, but the assignment
+/// joining them (bundle.usage = reply.usage) only had the compiler. Here the
+/// numbers travel mock -> ACP mapping -> ReplyCollector -> bundle -> distill_log
+/// and are read back out of SQLite.
+///
+/// WHY THE EXTRACTION JSON IS IN THE TRANSCRIPT. Because echo REPLIES WITH THE
+/// PROMPT, the reply carries the transcript back, and the session's
+/// [distill] prompt is a brace-free sentence: the object planted in the last
+/// transcript turn is then the FIRST and the LAST brace in the reply, so
+/// parse_extraction reads exactly one object and the pass is deterministic. (The
+/// alternative — letting the built-in prompt's own JSON example be parsed — would
+/// write the example's placeholder text as a memory, i.e. a fixture asserting
+/// junk.) No mock change is involved: the point is the WIRING, and the wiring is
+/// what is observed.
+#[tokio::test]
+async fn distill_records_the_agents_usage_and_leaves_it_null_when_unreported() {
+    // --- CASE 1: an agent that reports usage -------------------------------
+    let extraction = serde_json::json!({
+        "memories": [{
+            "store": "observation",
+            "namespace": "user",
+            "content": "用户喜欢深色主题",
+            "confidence": 0.9,
+        }],
+        "entities": [],
+        "relations": [],
+    });
+    let jsonl = format!(
+        "{}\n",
+        serde_json::json!({
+            "ts": "2026-09-20T10:00:00Z",
+            "seq": 1,
+            "event": {"type": "user_message", "text": extraction.to_string()},
+        })
+    );
+
+    // The harness hands its ChatManager `AutoDistill::default()`, so a
+    // `[distill]` table in the policy file does NOT reach the manual route here:
+    // the prompt override goes through the settings API instead, which is also
+    // what a real user does (PUT /api/v1/distill writes policy.toml AND swaps the
+    // live policy the distill route reads).
+    // ONE daemon, TWO agents: the choice is the live [distill] policy, which the
+    // settings API swaps (so the second case costs no second daemon, and the
+    // agent SELECTOR is exercised with it).
+    let replies_dir = std::env::temp_dir().join(format!(
+        "ruagent-distill-usage-{}-{}",
+        std::process::id(),
+        chrono_tag()
+    ));
+    std::fs::create_dir_all(&replies_dir).unwrap();
+    let replies_file = replies_dir.join("replies.json");
+    std::fs::write(
+        &replies_file,
+        serde_json::to_string(&serde_json::json!([{
+            // A DIFFERENT memory from case 1's: one daemon means one store, and a
+            // repeated content would be counted as a duplicate row (which is a
+            // memory-writer reading, not the usage reading under test).
+            "marker": "简洁的回答",
+            "reply": extraction_reply("用户偏好简洁的回答", "QuietAgent"),
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let bin = mock_bin();
+    let agents = format!(
+        "[agent.mock]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"reports usage\"\n\n[agent.quiet]\nharness = \"mock\"\ncommand = \"{bin} --behavior scripted --replies {replies}\"\ndescription = \"reports nothing\"\n",
+        replies = replies_file.to_string_lossy().replace('\\', "/"),
+    );
+    let d = start_daemon(&agents, "default = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+    let put: serde_json::Value = http
+        .put(format!("{}/api/v1/distill", d.url))
+        .json(&serde_json::json!({
+            "prompt": "Extract durable knowledge from the transcript below.",
+            "agent": "mock",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(put["ok"], true, "{put}");
+    let transcripts = d._root.join("data").join("transcripts");
+    let key = index_transcript(&d, &transcripts.join("run-usage.jsonl"), &jsonl).await;
+
+    let response = http
+        .post(format!("{}/api/v1/sessions/{key}/distill", d.url))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert!(
+        status.is_success(),
+        "the distill route refused the pass: {status} {text}"
+    );
+    let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+    println!("READING case 1 distill: {out}");
+    assert_eq!(
+        out["distilled"]["memories_written"], 1,
+        "a REAL (non-dry-run) pass must have written the extracted memory: {out}"
+    );
+
+    let (status, tokens, context, cost) = newest_usage(&d.db, &key).await;
+    println!("READING case 1 ledger: {status:?} {tokens:?} {context:?} {cost:?}");
+    assert_eq!(status.as_deref(), Some("ok"), "the attempt succeeded");
+    assert_eq!(
+        (tokens, context),
+        (Some(MOCK_USAGE_USED), Some(MOCK_USAGE_SIZE)),
+        "distill_log must carry the used/size the agent reported, in its own units"
+    );
+    assert!(
+        cost.is_some_and(|c| (c - MOCK_USAGE_COST).abs() < 1e-9),
+        "and its cost: {cost:?}"
+    );
+
+    // --- CASE 2: an agent that reports nothing -----------------------------
+    // The SAME daemon and the same extraction JSON, a different agent: the live
+    // policy now names the scripted one, whose replies file answers this prompt and
+    // which reports no usage at all.
+    let put: serde_json::Value = http
+        .put(format!("{}/api/v1/distill", d.url))
+        .json(&serde_json::json!({ "agent": "quiet" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(put["ok"], true, "{put}");
+    let quiet_key = index_transcript(
+        &d,
+        &transcripts.join("run-quiet.jsonl"),
+        "{\"ts\":\"2026-09-20T11:00:00Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"请记住：用户偏好简洁的回答\"}}\n",
+    )
+    .await;
+    let quiet_response = http
+        .post(format!("{}/api/v1/sessions/{quiet_key}/distill", d.url))
+        .send()
+        .await
+        .unwrap();
+    let quiet_status = quiet_response.status();
+    let quiet_text = quiet_response.text().await.unwrap();
+    assert!(
+        quiet_status.is_success(),
+        "the distill route refused the pass: {quiet_status} {quiet_text}"
+    );
+    let out: serde_json::Value = serde_json::from_str(&quiet_text).unwrap();
+    println!("READING case 2 distill: {out}");
+    assert_eq!(
+        out["distilled"]["agent"], "quiet",
+        "the live policy's agent selector picked the silent agent: {out}"
+    );
+    assert_eq!(
+        out["distilled"]["memories_written"], 1,
+        "the silent agent's extraction is written all the same -- only its USAGE is missing, which is the distinction under test: {out}"
+    );
+
+    let (status, tokens, context, cost) = newest_usage(&d.db, &quiet_key).await;
+
+    println!("READING case 2 ledger: {status:?} {tokens:?} {context:?} {cost:?}");
+    assert_eq!(status.as_deref(), Some("ok"));
+    assert_eq!(
+        (tokens, context, cost),
+        (None, None, None),
+        "an agent that reported no usage leaves NULL, never a measured 0: 0 tokens and \
+         $0.00 are readings nobody took"
+    );
+
+    let _ = std::fs::remove_dir_all(&replies_dir);
+}
+
+// ---------------------------------------------------------------------------
 // Chat project cwd (the dsh-web model: a session belongs to a workspace)
 // ---------------------------------------------------------------------------
 

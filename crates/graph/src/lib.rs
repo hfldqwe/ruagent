@@ -36,6 +36,20 @@ pub struct Entity {
     pub summary: Option<String>,
 }
 
+/// The session a fact was extracted from, when the row can name one.
+///
+/// `key` is `sessions.key` (`<source>:<hash of ref_path>`), reached through
+/// `entity_edges.source_episode` → `episodes.id` → `episodes.source_run` — the
+/// SAME link distillation writes and `memory::query::session_memories` reads,
+/// not a second one invented for this field. `title` is `sessions.title`, itself
+/// nullable: a session the indexer never titled answers `null` rather than a
+/// manufactured name.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EdgeSourceSession {
+    pub key: String,
+    pub title: Option<String>,
+}
+
 /// One edge (a dated fact).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Edge {
@@ -47,6 +61,25 @@ pub struct Edge {
     pub valid_at: String,
     pub invalid_at: Option<String>,
     pub source_episode: Option<i64>,
+    /// `entity_edges.event_time_source`, VERBATIM: `"extracted"` when the
+    /// extraction supplied an event time, `"recorded"` when the write clock
+    /// stamped it, `null` for a pre-0021 row whose writer recorded nothing.
+    ///
+    /// VERBATIM is the point: this field is not folded into `source_kind`, or a
+    /// reader could no longer tell "we know the clock stamped this" from "we
+    /// never recorded it". `source_kind` is the reading vocabulary; this is the
+    /// column.
+    pub event_time_source: Option<String>,
+    /// The session behind `source_episode`, when the episode names one. `null`
+    /// means "this read cannot name a session": either there is no episode
+    /// (a hand-written fact) or the episode carries no `source_run`.
+    pub source_session: Option<EdgeSourceSession>,
+    /// The reader's category for `event_time_source`: `"extraction"` |
+    /// `"manual"` | `"unknown"`. Derived in ONE place
+    /// (`EventTimeSource::kind_of`) instead of stored, so it cannot drift from
+    /// the column it describes; anything the vocabulary does not recognize —
+    /// including `null` — is honestly `"unknown"` and never guessed at.
+    pub source_kind: &'static str,
 }
 
 pub(crate) fn norm(name: &str) -> String {
@@ -110,10 +143,24 @@ fn upsert_entity_in(
     )
 }
 
-/// Add a fact. If a currently-valid edge with the same (src, dst,
-/// relation) exists, it is invalidated at this fact's `valid_at`
-/// (deterministic supersession — the same entity pair only, Graphiti's
-/// own complexity cut).
+/// Add a fact by hand (panel / API / CLI / MCP). If a currently-valid edge with
+/// the same (src, dst, relation) exists, it is invalidated at this fact's
+/// `valid_at` (deterministic supersession — the same entity pair only,
+/// Graphiti's own complexity cut).
+///
+/// THE MANUAL WRITER, AND IT SAYS SO. Its body is now a thin wrapper over
+/// `add_fact_with_source` with `EventTimeSource::Recorded`, so `entity_edges`
+/// has ONE insert path (`insert_fact_in`) no matter who writes: before this,
+/// `add_fact` carried its own INSERT and left `event_time_source` NULL, so the
+/// column could not answer "where did `valid_at` come from" for exactly the
+/// writes a human made. `recorded` is the honest answer here — a panel/CLI write
+/// did not come out of a transcript, so claiming `extracted` would be a lie, and
+/// NULL would be the absence of an answer rather than one.
+///
+/// The signature is frozen (gen2-graph-spec §D.3: three live call sites, and the
+/// id is all they want back), which is why the provenance is not a parameter
+/// here: a caller that KNOWS where an event time came from calls
+/// `add_fact_with_source` and says so.
 pub async fn add_fact(
     db: &Db,
     src: i64,
@@ -123,29 +170,17 @@ pub async fn add_fact(
     valid_at: Option<&str>, // None = now
     source_episode: Option<i64>,
 ) -> Result<i64, DbError> {
-    let relation = relation.to_string();
-    let fact_text = fact_text.to_string();
-    let valid_at = valid_at
-        .map(str::to_string)
-        .unwrap_or_else(|| Utc::now().to_rfc3339());
-    let now = Utc::now().to_rfc3339();
-    db.call(move |conn| -> Result<i64, rusqlite::Error> {
-        // Invalidate the currently-valid predecessor.
-        conn.execute(
-            "UPDATE entity_edges
-             SET invalid_at = ?5, expired_at = ?6
-             WHERE src = ?1 AND dst = ?2 AND relation = ?3 AND invalid_at IS NULL",
-            rusqlite::params![src, dst, relation, fact_text, valid_at, now],
-        )?;
-        conn.execute(
-            "INSERT INTO entity_edges (src, dst, relation, fact_text, valid_at, created_at, source_episode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![src, dst, relation, fact_text, valid_at, now, source_episode],
-        )?;
-        Ok(conn.last_insert_rowid())
-    })
-    .await?
-    .map_err(DbError::from)
+    add_fact_with_source(
+        db,
+        src,
+        dst,
+        relation,
+        fact_text,
+        valid_at,
+        EventTimeSource::Recorded,
+        source_episode,
+    )
+    .await
 }
 
 /// What a hard entity delete did. `edges_removed` counts EVERY incident
@@ -252,15 +287,39 @@ pub async fn delete_entity(db: &Db, id: i64) -> Result<EntityDeleteOutcome, DbEr
     .await
 }
 
+/// The ONE column list every edge read feeds `edge_from_row`, and the joins its
+/// provenance fields need.
+///
+/// WHY A CONSTANT: `current_facts`, `list_edges` and `facts_as_of` used to carry
+/// three copies of the same literal `SELECT id, src, dst, …`. Three copies of a
+/// column list are three places to forget a new column — which is exactly how a
+/// row would come back with `event_time_source` (or a session) missing from ONE
+/// endpoint while the others were fine. The columns are positional and
+/// `edge_from_row` is their only reader, so the list and the reader must change
+/// together: they are two halves of one contract, kept adjacent here.
+///
+/// The join is `entity_edges.source_episode` → `episodes.id` →
+/// `episodes.source_run` = `sessions.key` — the link distillation already writes
+/// (`memory::query::session_memories` reads the same one). LEFT JOINs, because a
+/// hand-written fact has no episode and an episode may have no session key: both
+/// are "unknown", not an error, and an INNER join would delete those rows from
+/// the answer.
+const EDGE_COLUMNS: &str = "e.id, e.src, e.dst, e.relation, e.fact_text, e.valid_at, e.invalid_at, \
+     e.source_episode, e.event_time_source, ep.source_run, s.title";
+const EDGE_SOURCE_JOIN: &str = " FROM entity_edges e \
+     LEFT JOIN episodes ep ON ep.id = e.source_episode \
+     LEFT JOIN sessions s ON s.key = ep.source_run";
+
 /// Currently-valid facts about an entity (either direction).
 pub async fn current_facts(db: &Db, entity: i64) -> Result<Vec<Edge>, DbError> {
     db.call(move |conn| -> Result<Vec<Edge>, rusqlite::Error> {
-        let mut stmt = conn.prepare(
-            "SELECT id, src, dst, relation, fact_text, valid_at, invalid_at, source_episode
-             FROM entity_edges
-             WHERE (src = ?1 OR dst = ?1) AND invalid_at IS NULL
-             ORDER BY valid_at DESC",
-        )?;
+        let sql = format!(
+            "SELECT {EDGE_COLUMNS}{EDGE_SOURCE_JOIN}
+             WHERE {}
+             ORDER BY e.valid_at DESC",
+            one_entity_current_facts("e", "?1")
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([entity], edge_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -286,13 +345,13 @@ pub async fn list_edges(db: &Db, limit: u32, offset: u32) -> Result<(Vec<Edge>, 
             [],
             |r| r.get(0),
         )?;
-        let mut stmt = conn.prepare(
-            "SELECT id, src, dst, relation, fact_text, valid_at, invalid_at, source_episode
-             FROM entity_edges
-             WHERE invalid_at IS NULL
-             ORDER BY id
-             LIMIT ?1 OFFSET ?2",
-        )?;
+        let sql = format!(
+            "SELECT {EDGE_COLUMNS}{EDGE_SOURCE_JOIN}
+             WHERE e.invalid_at IS NULL
+             ORDER BY e.id
+             LIMIT ?1 OFFSET ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params![limit, offset], edge_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -332,11 +391,9 @@ pub async fn facts_as_of(db: &Db, entity: i64, at: &str) -> Result<Vec<Edge>, Db
         ))
     })?;
     db.call_flat(move |conn| -> Result<Vec<Edge>, rusqlite::Error> {
-        let mut stmt = conn.prepare(
-            "SELECT id, src, dst, relation, fact_text, valid_at, invalid_at, source_episode
-             FROM entity_edges
-             WHERE (src = ?1 OR dst = ?1)",
-        )?;
+        let sql =
+            format!("SELECT {EDGE_COLUMNS}{EDGE_SOURCE_JOIN} WHERE (e.src = ?1 OR e.dst = ?1)");
+        let mut stmt = conn.prepare(&sql)?;
         // Filter in Rust: SQLite's text comparison cannot see that
         // `…18:38:15Z` and `…02:38:15+08:00` are the same moment, and that is
         // the whole defect.
@@ -422,32 +479,78 @@ pub async fn neighbors(db: &Db, entity: i64, hops: u32) -> Result<Vec<(Entity, u
 }
 
 /// List entities (id desc) with their current fact counts — the graph
-/// explorer's landing view.
-pub async fn list_entities(db: &Db, limit: u32) -> Result<Vec<(Entity, i64)>, DbError> {
-    db.call(move |conn| -> Result<Vec<(Entity, i64)>, rusqlite::Error> {
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.name, e.kind, e.summary,
-                    (SELECT COUNT(*) FROM entity_edges x
-                      WHERE (x.src = e.id OR x.dst = e.id) AND x.invalid_at IS NULL)
-             FROM entities e ORDER BY e.id DESC LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map([limit], |row| {
-                Ok((
-                    Entity {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        kind: row.get(2)?,
-                        summary: row.get(3)?,
-                    },
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
+/// explorer's landing view. PAGED, and the page comes back with the total it came
+/// out of.
+///
+/// WHY THE TOTAL IS RETURNED HERE rather than counted by the route: a page and the
+/// number it is a page OF must be the same query's answer, or the two drift the
+/// day a filter appears here (the live graph already needs one: 64 entities and a
+/// default page of 50 leaves 14 unreachable without an offset). This is the same
+/// shape `list_edges` already answers with, so a list route reads one contract.
+pub async fn list_entities(
+    db: &Db,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<(Entity, i64)>, i64), DbError> {
+    let limit = limit as i64;
+    let offset = offset as i64;
+    db.call(
+        move |conn| -> Result<(Vec<(Entity, i64)>, i64), rusqlite::Error> {
+            let total: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT e.id, e.name, e.kind, e.summary, {}
+                 FROM entities e ORDER BY e.id DESC LIMIT ?1 OFFSET ?2",
+                current_fact_count("e")
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit, offset], |row| {
+                    Ok((
+                        Entity {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            kind: row.get(2)?,
+                            summary: row.get(3)?,
+                        },
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((rows, total))
+        },
+    )
     .await?
     .map_err(DbError::from)
+}
+
+/// The predicate ONE entity's CURRENT facts satisfy: the edges that touch it in
+/// EITHER direction and have not been invalidated.
+///
+/// ONE DEFINITION, THREE READERS (t10): the facts list asks it of one entity, the
+/// entity list asks it of every row it returns (as a correlated COUNT), and the
+/// resolution queue asks it of BOTH ends of every queued pair -- a reviewer deciding
+/// "same object or not" needs to know how much each name actually carries, and
+/// separate expressions here would let the three answer differently. The alias and
+/// parameter are literals from the caller (never user input); the correlated form is
+/// what lets SQLite use the entity_edges indexes.
+fn one_entity_current_facts(alias: &str, param: &str) -> String {
+    format!("({alias}.src = {param} OR {alias}.dst = {param}) AND {alias}.invalid_at IS NULL")
+}
+
+/// The correlated subquery that counts ONE entity's CURRENT facts: the edges that
+/// touch `alias` in EITHER direction and have not been invalidated.
+///
+/// ONE DEFINITION, TWO READERS (t10): the entity list asks it of every row it
+/// returns, and the resolution queue asks it of BOTH ends of every queued pair --
+/// a reviewer deciding "same object or not" needs to know how much each name
+/// actually carries, and a second expression here would let the list and the queue
+/// disagree about how many facts an entity appears in. `alias` is a literal from the
+/// caller (never user input), and the correlated form is what lets SQLite use the
+/// `entity_edges` indexes.
+fn current_fact_count(alias: &str) -> String {
+    format!(
+        "(SELECT COUNT(*) FROM entity_edges x WHERE {})",
+        one_entity_current_facts("x", &format!("{alias}.id"))
+    )
 }
 
 /// One entity by id, or `None` when the id is not in the graph.
@@ -814,25 +917,87 @@ impl EventTimeSource {
             EventTimeSource::Recorded => "recorded",
         }
     }
+
+    /// The READER's category for a STORED `event_time_source` value:
+    /// `"extraction"` | `"manual"` | `"unknown"`.
+    ///
+    /// WHY a second name and not `as_str()`: the writer's vocabulary ("was there
+    /// an event time in the source material?") and the reader's ("who wrote this
+    /// row?") are different questions, and `null` — a pre-0021 row whose writer
+    /// recorded nothing — has no writer-side value at all. Folding the two into
+    /// one column would lose that third state.
+    ///
+    /// The two recognized values are compared against `as_str()`, not against
+    /// new string literals, so a renamer cannot move the column and leave this
+    /// mapping pointing at the old spelling. Anything else — including `null`,
+    /// and including a value a future writer invents — answers `"unknown"`: an
+    /// unrecognized provenance is not evidence for either of the two labels.
+    pub fn kind_of(stored: Option<&str>) -> &'static str {
+        match stored {
+            Some(s) if s == EventTimeSource::Extracted.as_str() => "extraction",
+            Some(s) if s == EventTimeSource::Recorded.as_str() => "manual",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Where an alias row came from — the `entity_aliases.source` column's whole
+/// vocabulary, as a type.
+///
+/// WHY A TYPE AND NOT FOUR STRING LITERALS: until this, four crates fed that
+/// column four bare `&str`s (`"extraction"` from the distillation path,
+/// `"knowledge"` from knowledge ingestion, `"human"` from a hand-written
+/// correction, `"merge"` from the merge route), so a typo, an unreviewed new
+/// spelling or a silently different case was not a compile error — and the
+/// column is the only record of who asserted a folded name. `as_str()` is what
+/// reaches the column, so the STORED TEXT IS UNCHANGED and existing rows keep
+/// meaning what they meant.
+///
+/// Four values, not "anything the caller likes": a caller with a genuinely new
+/// provenance must name it here, in one place, where the next reader of this
+/// column can see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasSource {
+    /// The extraction/resolution path folded this name while writing a
+    /// document or a session's facts.
+    Extraction,
+    /// Knowledge ingestion wrote it (`knowledge_graph::GRAPH_SOURCE`).
+    Knowledge,
+    /// A human asserted it: a panel/CLI correction, or a hand-written test.
+    Human,
+    /// A merge kept the absorbed entity's name resolvable onto the keeper
+    /// (`merge_entities`' route).
+    Merge,
+}
+
+impl AliasSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AliasSource::Extraction => "extraction",
+            AliasSource::Knowledge => "knowledge",
+            AliasSource::Human => "human",
+            AliasSource::Merge => "merge",
+        }
+    }
 }
 
 /// The extraction-side writer: records the fact's identity, where `valid_at`
 /// came from, and which episode the fact came from; supersedes the currently
 /// valid `(src, dst, relation)` predecessor exactly like `add_fact`.
 ///
-/// WHY this is a SECOND function instead of a parameter on `add_fact`:
-/// `add_fact` is a frozen interface (spec §D.3) with live call sites in
-/// `api.rs` and in this crate's own tests, and it must keep writing NULL for
-/// `event_time_source` -- a panel/CLI write did not go through extraction, so
-/// that writer genuinely does not know where the timestamp came from.
+/// WHY THIS EXISTS BESIDE `add_fact`: `add_fact` is a frozen interface
+/// (gen2-graph-spec §D.3) with live call sites, so a caller that knows where the
+/// event time came from — the extraction, which may or may not have found one in
+/// the transcript — must be able to say so. `add_fact` is now a thin wrapper over
+/// THIS function with `Recorded`, so both write through the same
+/// `insert_fact_in` and `entity_edges` has exactly one insert path.
 ///
 /// `valid_at: None` forces `Recorded`: a NULL event time means the clock
 /// stamped the value, so claiming `Extracted` would be a lie.
 ///
 /// The eight parameters are the eight fields of the row, named one by one on
 /// purpose: a struct here would let a caller forget `event_time_source` (the
-/// column whose absence is the whole finding), and the extraction writer is the
-/// only caller.
+/// column whose absence is the whole finding).
 #[allow(clippy::too_many_arguments)]
 pub async fn add_fact_with_source(
     db: &Db,
@@ -1312,17 +1477,20 @@ pub enum ResolveOutcome {
 }
 
 /// Record an alias so a later query for it resolves to `entity_id`.
+///
+/// `source` is an [`AliasSource`], not a `&str`: it is written verbatim into
+/// `entity_aliases.source`, which is the only record of who asserted the folded
+/// name, and a typo in a bare literal there was not a compile error.
 pub async fn add_alias(
     db: &Db,
     entity_id: i64,
     alias: &str,
-    source: &str,
+    source: AliasSource,
 ) -> Result<bool, DbError> {
     let alias = alias.to_string();
-    let source = source.to_string();
     db.call_flat(move |conn| {
         let tx = conn.transaction()?;
-        let n = add_alias_in(&tx, entity_id, &alias, &source)?;
+        let n = add_alias_in(&tx, entity_id, &alias, source)?;
         tx.commit()?;
         Ok(n)
     })
@@ -1335,7 +1503,7 @@ fn add_alias_in(
     conn: &rusqlite::Connection,
     entity_id: i64,
     alias: &str,
-    source: &str,
+    source: AliasSource,
 ) -> rusqlite::Result<bool> {
     let alias = alias.trim().to_string();
     if alias.is_empty() {
@@ -1347,7 +1515,7 @@ fn add_alias_in(
         "INSERT INTO entity_aliases (entity_id, alias, norm_alias, source, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(norm_alias) DO NOTHING",
-        rusqlite::params![entity_id, alias, norm_alias, source, now],
+        rusqlite::params![entity_id, alias, norm_alias, source.as_str(), now],
     )?;
     Ok(n > 0)
 }
@@ -1365,7 +1533,7 @@ pub async fn upsert_entity_with_aliases(
     kind: Option<&str>,
     summary: Option<&str>,
     aliases: &[String],
-    source: &str,
+    source: AliasSource,
 ) -> Result<ResolveOutcome, DbError> {
     if name.trim().is_empty() {
         return Err(DbError::from(rusqlite::Error::QueryReturnedNoRows));
@@ -1374,7 +1542,6 @@ pub async fn upsert_entity_with_aliases(
     let kind = kind.map(str::to_string);
     let summary = summary.map(str::to_string);
     let aliases = aliases.to_vec();
-    let source = source.to_string();
     db.call_flat(move |conn| {
         let tx = conn.transaction()?;
         let (outcome, _added) = resolve_entity_in(
@@ -1383,12 +1550,54 @@ pub async fn upsert_entity_with_aliases(
             kind.as_deref(),
             summary.as_deref(),
             &aliases,
-            &source,
+            source,
         )?;
         tx.commit()?;
         Ok(outcome)
     })
     .await
+}
+
+/// Resolve a NAME to an entity id by the two rules the extraction path probes
+/// with, in the same order: 1. the entity's own `norm_name`, 2. an alias the
+/// graph recorded for it.
+///
+/// This is the SAME rule `resolve_entity_in` applies before it consults the
+/// judge — it calls the same `entity_id_by_norm` — so a name written through the
+/// HTTP face lands on the entity the extraction would have chosen, instead of a
+/// second resolution policy living in the endpoint.
+///
+/// `None` means "no entity answers to this name". It does NOT create one: a
+/// write path that invents a node for a misspelling is how a graph grows two
+/// nodes for one object, and the caller can create the entity explicitly.
+pub async fn resolve_entity_id(db: &Db, name: &str) -> Result<Option<i64>, DbError> {
+    let n = norm(name);
+    if n.is_empty() {
+        return Ok(None);
+    }
+    db.call(move |conn| -> Result<Option<i64>, rusqlite::Error> { Ok(entity_id_by_norm(conn, &n)) })
+        .await?
+        .map_err(DbError::from)
+}
+
+/// The two identity probes, in order: an entity's own `norm_name`, then the
+/// alias table. ONE definition, because "what names does this graph answer to"
+/// is asked by both `resolve_entity_in` (before the judge) and
+/// `resolve_entity_id` (the HTTP face).
+fn entity_id_by_norm(conn: &rusqlite::Connection, norm_name: &str) -> Option<i64> {
+    if let Ok(id) = conn.query_row(
+        "SELECT id FROM entities WHERE norm_name = ?1",
+        [norm_name],
+        |r| r.get::<_, i64>(0),
+    ) {
+        return Some(id);
+    }
+    conn.query_row(
+        "SELECT entity_id FROM entity_aliases WHERE norm_alias = ?1",
+        [norm_name],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
 }
 
 /// `upsert_entity_with_aliases`' decision and writes, against a borrowed
@@ -1402,7 +1611,7 @@ fn resolve_entity_in(
     kind: Option<&str>,
     summary: Option<&str>,
     aliases: &[String],
-    source: &str,
+    source: AliasSource,
 ) -> rusqlite::Result<(ResolveOutcome, u32)> {
     let name_trimmed = name.trim().to_string();
     if name_trimmed.is_empty() {
@@ -1420,17 +1629,7 @@ fn resolve_entity_in(
     probes.dedup();
     let mut hit: Option<i64> = None;
     for p in &probes {
-        if let Ok(id) = conn.query_row("SELECT id FROM entities WHERE norm_name = ?1", [p], |r| {
-            r.get::<_, i64>(0)
-        }) {
-            hit = Some(id);
-            break;
-        }
-        if let Ok(id) = conn.query_row(
-            "SELECT entity_id FROM entity_aliases WHERE norm_alias = ?1",
-            [p],
-            |r| r.get::<_, i64>(0),
-        ) {
+        if let Some(id) = entity_id_by_norm(conn, p) {
             hit = Some(id);
             break;
         }
@@ -1501,7 +1700,7 @@ fn create_and_alias_in(
     kind: Option<&str>,
     summary: Option<&str>,
     aliases: &[String],
-    source: &str,
+    source: AliasSource,
 ) -> rusqlite::Result<(i64, u32)> {
     let id = upsert_entity_in(conn, name, kind, summary)?;
     let mut added = 0;
@@ -1544,19 +1743,158 @@ fn queue_pending_in(
     Ok(())
 }
 
-/// The undecided queue, for a report or a review UI.
-pub async fn pending_pairs(db: &Db) -> Result<Vec<(i64, i64, String)>, DbError> {
-    let out = db
-        .call_flat(|conn| -> Result<Vec<(i64, i64, String)>, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT entity_a, entity_b, COALESCE(reason, '') FROM resolution_pending
-                 ORDER BY entity_a, entity_b",
+/// One queued pair, with BOTH ends resolved and the numbers a reviewer needs.
+///
+/// ~a_facts~/~b_facts~ are ~current_fact_count~'s number for each end: the entity's
+/// CURRENT (not invalidated) facts, either direction. The 口径 travels with the
+/// number all the way to the HTTP response (~counts_note~), because a count whose
+/// definition lives only in here is a number the reader has to guess at.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PendingPair {
+    pub a: Entity,
+    pub b: Entity,
+    pub a_facts: i64,
+    pub b_facts: i64,
+    /// The mechanical judge's reason for queueing the pair.
+    pub reason: String,
+    pub created_at: Option<String>,
+}
+
+/// The UNDECIDED queue: every recorded pair a human has NOT answered, both ends
+/// resolved. Returns the queue and the number of REMEMBERED decisions
+/// (~dismissed_at IS NOT NULL~), so a reader can tell "nothing to decide" from
+/// "nothing to decide because everything was decided".
+///
+/// ~dismissed_at IS NULL~ IS THE ONLY DEFINITION OF UNDECIDED, and it is written
+/// once -- here (t10). Keeping the row instead of deleting it on dismissal is what
+/// makes the decision durable: ~queue_pending_in~ re-queues a pair with
+/// ~ON CONFLICT(entity_a, entity_b) DO UPDATE SET reason~, which does NOT touch
+/// ~dismissed_at~, so a later mechanical pass cannot resurrect a pair a human has
+/// already answered.
+///
+/// WHY THE JOIN IS NOT A LOSS: a pair whose entity row is gone is not in the queue,
+/// and the entity's own maintenance removes the pair with it (~delete_entity~ and
+/// ~merge_entities~ both delete the ~resolution_pending~ rows), so there is nothing
+/// left to resolve.
+pub async fn pending_queue(db: &Db) -> Result<(Vec<PendingPair>, i64), DbError> {
+    let a_facts = current_fact_count("ea");
+    let b_facts = current_fact_count("eb");
+    db.call(
+        move |conn| -> Result<(Vec<PendingPair>, i64), rusqlite::Error> {
+            let dismissed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM resolution_pending WHERE dismissed_at IS NOT NULL",
+                [],
+                |r| r.get(0),
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
-        .await?;
-    Ok(out)
+            let sql = format!(
+                "SELECT ea.id, ea.name, ea.kind, ea.summary,
+                    eb.id, eb.name, eb.kind, eb.summary,
+                    {a_facts}, {b_facts}, COALESCE(p.reason, ''), p.created_at
+               FROM resolution_pending p
+               JOIN entities ea ON ea.id = p.entity_a
+               JOIN entities eb ON eb.id = p.entity_b
+              WHERE p.dismissed_at IS NULL
+              ORDER BY p.entity_a, p.entity_b"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PendingPair {
+                        a: Entity {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            kind: row.get(2)?,
+                            summary: row.get(3)?,
+                        },
+                        b: Entity {
+                            id: row.get(4)?,
+                            name: row.get(5)?,
+                            kind: row.get(6)?,
+                            summary: row.get(7)?,
+                        },
+                        a_facts: row.get(8)?,
+                        b_facts: row.get(9)?,
+                        reason: row.get(10)?,
+                        created_at: row.get(11)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((rows, dismissed))
+        },
+    )
+    .await?
+    .map_err(DbError::from)
+}
+
+/// The same queue in its RAW tuple shape (~entity_a~, ~entity_b~, reason), in the
+/// table's own ~(entity_a, entity_b)~ order -- the shape ~resolution~'s own tests
+/// read. It is derived from ~pending_queue~ rather than reading the table again, so
+/// "pending" cannot come to mean two different sets of pairs.
+pub async fn pending_pairs(db: &Db) -> Result<Vec<(i64, i64, String)>, DbError> {
+    let (pairs, _) = pending_queue(db).await?;
+    Ok(pairs
+        .into_iter()
+        .map(|p| (p.a.id, p.b.id, p.reason))
+        .collect())
+}
+
+/// What a dismissal attempt did (t10 / #50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DismissOutcome {
+    /// The pair was waiting; it is answered now.
+    Dismissed,
+    /// It was already answered. The REPEAT of a decision, not an error: a client
+    /// retrying a request whose answer it never saw must not be told it did
+    /// something wrong.
+    AlreadyDismissed,
+    /// No such pair: nothing was queued for these two entities, so there is
+    /// nothing to keep apart.
+    NotQueued,
+}
+
+/// Remember "these two STAY SEPARATE" by stamping the queued pair (t10 / #50).
+///
+/// WHY IT EXISTS: until this, the queue could only shrink by merging, so a pair a
+/// human had looked at and judged different came back on every pass, and a reader
+/// could not tell "not looked at yet" from "looked at, deliberately left apart".
+///
+/// IDEMPOTENT BY CONSTRUCTION: the UPDATE only touches rows whose ~dismissed_at~ is
+/// NULL, and the outcome reports which of the three cases happened instead of
+/// letting a no-op write pass for a decision.
+///
+/// The ends are ordered the way ~queue_pending_in~ orders them (~lo~, ~hi~): the
+/// table's key is the unordered pair, so a caller that sent them the other way round
+/// would otherwise update nothing.
+pub async fn dismiss_pair(db: &Db, a: i64, b: i64) -> Result<DismissOutcome, DbError> {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let now = Utc::now().to_rfc3339();
+    db.call_flat(move |conn| {
+        use rusqlite::OptionalExtension as _;
+        let tx = conn.transaction()?;
+        let existing: Option<Option<String>> = tx
+            .query_row(
+                "SELECT dismissed_at FROM resolution_pending
+                  WHERE entity_a = ?1 AND entity_b = ?2",
+                rusqlite::params![lo, hi],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let outcome = match existing {
+            None => DismissOutcome::NotQueued,
+            Some(Some(_)) => DismissOutcome::AlreadyDismissed,
+            Some(None) => {
+                tx.execute(
+                    "UPDATE resolution_pending SET dismissed_at = ?3
+                      WHERE entity_a = ?1 AND entity_b = ?2 AND dismissed_at IS NULL",
+                    rusqlite::params![lo, hi, now],
+                )?;
+                DismissOutcome::Dismissed
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
+    })
+    .await
 }
 
 /// The pairs the judge says are the SAME object but that still exist as two
@@ -1599,7 +1937,6 @@ pub async fn merge_entities(db: &Db, keeper: i64, absorbed: i64) -> Result<u32, 
     if keeper == absorbed {
         return Ok(0);
     }
-    let now = Utc::now().to_rfc3339();
     let moved = db
         .call_flat(move |conn| -> Result<u32, rusqlite::Error> {
             let tx = conn.transaction()?;
@@ -1616,12 +1953,12 @@ pub async fn merge_entities(db: &Db, keeper: i64, absorbed: i64) -> Result<u32, 
                 "UPDATE entity_edges SET dst = ?1 WHERE dst = ?2",
                 rusqlite::params![keeper, absorbed],
             )? as u32;
-            tx.execute(
-                "INSERT INTO entity_aliases (entity_id, alias, norm_alias, source, created_at)
-                 VALUES (?1, ?2, ?3, 'merge', ?4)
-                 ON CONFLICT(norm_alias) DO NOTHING",
-                rusqlite::params![keeper, name, crate::norm(&name), now],
-            )?;
+            // THE ABSORBED NAME BECOMES AN ALIAS OF THE KEEPER -- through the SAME
+            // writer as every other alias (`add_alias_in`), so this statement cannot
+            // fall out of the `AliasSource` vocabulary. It used to write the enum's
+            // text as a SQL literal of its own, which is exactly what a rename of the
+            // enum would have missed silently (t13's F1 finding; repaired here).
+            add_alias_in(&tx, keeper, &name, AliasSource::Merge)?;
             // Aliases follow their entity. With the whole group in one
             // transaction this is no longer load-bearing for atomicity -- it is
             // here so the intermediate states inside the transaction are legal
@@ -1701,16 +2038,19 @@ pub struct ExtractionWrite {
 /// The per-item rules are NOT reimplemented: this drives the same
 /// `resolve_entity_in` / `upsert_fact_in` the single-item entry points drive, so
 /// the write-side dedupe (G7) and the alias/judge resolution apply identically.
+///
+/// `source` is an [`AliasSource`]: the two production callers are the session
+/// distillation path (`AliasSource::Extraction`) and knowledge ingestion
+/// (`AliasSource::Knowledge`), and the enum is where that vocabulary lives.
 pub async fn apply_extraction(
     db: &Db,
     entities: &[ExtractEntity],
     facts: &[ExtractFact],
-    source: &str,
+    source: AliasSource,
     source_episode: Option<i64>,
 ) -> Result<ExtractionWrite, DbError> {
     let entities = entities.to_vec();
     let facts = facts.to_vec();
-    let source = source.to_string();
     db.call_flat(move |conn| {
         let tx = conn.transaction()?;
         let mut report = ExtractionWrite::default();
@@ -1726,7 +2066,7 @@ pub async fn apply_extraction(
                 e.kind.as_deref(),
                 e.summary.as_deref(),
                 &e.aliases,
-                &source,
+                source,
             )?;
             match outcome {
                 ResolveOutcome::Merged { id, .. } | ResolveOutcome::Created { id } => {
@@ -1765,7 +2105,12 @@ pub async fn apply_extraction(
     .await
 }
 
+/// The single reader of `EDGE_COLUMNS`: positional, so the two must move
+/// together (they sit next to each other on purpose).
 fn edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Edge> {
+    let event_time_source: Option<String> = row.get(8)?;
+    let session_key: Option<String> = row.get(9)?;
+    let session_title: Option<String> = row.get(10)?;
     Ok(Edge {
         id: row.get(0)?,
         src: row.get(1)?,
@@ -1775,6 +2120,14 @@ fn edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Edge> {
         valid_at: row.get(5)?,
         invalid_at: row.get(6)?,
         source_episode: row.get(7)?,
+        source_kind: EventTimeSource::kind_of(event_time_source.as_deref()),
+        event_time_source,
+        // No session KEY means no session to name, whatever the title column
+        // says: a title with no key would be an unaddressable reference.
+        source_session: session_key.map(|key| EdgeSourceSession {
+            key,
+            title: session_title,
+        }),
     })
 }
 
@@ -1934,7 +2287,7 @@ mod tests {
         )
         .await
         .unwrap();
-        add_alias(&db, absorbed, "legacy-ruagent", "test")
+        add_alias(&db, absorbed, "legacy-ruagent", AliasSource::Merge)
             .await
             .unwrap();
 
@@ -2067,7 +2420,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let err = apply_extraction(&db, &entities, &facts, "extraction", None)
+        let err = apply_extraction(&db, &entities, &facts, AliasSource::Extraction, None)
             .await
             .expect_err("the poisoned extraction write must fail");
         let after = merge_snapshot(&db).await;
@@ -2086,7 +2439,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let report = apply_extraction(&db, &entities, &facts, "extraction", None)
+        let report = apply_extraction(&db, &entities, &facts, AliasSource::Extraction, None)
             .await
             .unwrap();
         let done = merge_snapshot(&db).await;
@@ -2257,5 +2610,78 @@ mod tests {
                 "the refusal must say why: {err}"
             );
         }
+    }
+
+    /// t21 (repairing t13's F1 finding): THE MERGE'S ALIAS SOURCE COMES FROM THE
+    /// AliasSource VOCABULARY, not from a copy of its text pasted into the SQL.
+    ///
+    /// WHY THIS IS A TEST AND NOT JUST A GREP: the defect is invisible to behaviour
+    /// until someone changes the enum's spelling — at which point the merge would be
+    /// the one writer still storing the old word, silently. So the pin has BOTH
+    /// halves: the stored text equals AliasSource::Merge.as_str() (a rename moves
+    /// this reading too), and that text is still "merge" (nothing moved today).
+    #[tokio::test]
+    async fn merge_writes_its_alias_source_through_the_alias_source_vocabulary() {
+        let db = Db::open_in_memory().unwrap();
+        let keeper = upsert_entity(&db, "t21-keeper", Some("tool"), None)
+            .await
+            .unwrap();
+        let absorbed = upsert_entity(&db, "t21-absorbed", Some("tool"), None)
+            .await
+            .unwrap();
+        // The absorbed entity already carries an alias of its own, so the merge's
+        // "aliases follow their entity" UPDATE is exercised in the same transaction.
+        add_alias(
+            &db,
+            absorbed,
+            "t21-alias-of-absorbed",
+            AliasSource::Extraction,
+        )
+        .await
+        .unwrap();
+
+        let moved = merge_entities(&db, keeper, absorbed).await.unwrap();
+        assert_eq!(moved, 0, "this fixture has no edges to move");
+
+        let source: String = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT source FROM entity_aliases
+                      WHERE entity_id = ?1 AND alias = 't21-absorbed'",
+                    [keeper],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source,
+            AliasSource::Merge.as_str(),
+            "the merge's alias source is the enum's own text, not a second copy of it"
+        );
+        assert_eq!(
+            source, "merge",
+            "and that text is unchanged, so the pinned behaviour did not move"
+        );
+        // The absorbed name resolves onto the keeper, which is WHY the alias is
+        // written at all.
+        assert_eq!(
+            resolve_entity_id(&db, "t21-absorbed").await.unwrap(),
+            Some(keeper)
+        );
+        let followed: i64 = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entity_aliases
+                      WHERE entity_id = ?1 AND alias = 't21-alias-of-absorbed'",
+                    [keeper],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(followed, 1, "the absorbed entity's own alias followed it");
     }
 }

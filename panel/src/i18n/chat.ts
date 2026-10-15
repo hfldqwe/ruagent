@@ -50,6 +50,9 @@ export const zh: Record<string, string> = {
   "chat.projectPh": "选择或输入项目路径…",
   "chat.runtimeGroup": "运行时（直连）",
   "chat.readonlyHistory": "历史会话（只读）",
+  "chat.messagesErr": "无法读取该会话的消息",
+  "chat.messagesErr.hint": "读不到消息：daemon 不可达，或者响应不符合契约。这不等于「这条会话没有消息」。",
+
   "chat.handoffNotice": "已切换到 {name}，先前对话已作为交接上下文带入",
   "chat.stop": "停止当前回复",
   "chat.injection": "上下文注入",
@@ -127,6 +130,9 @@ export const en: Record<string, string> = {
   "chat.projectPh": "pick or type a project path…",
   "chat.runtimeGroup": "Runtimes (direct)",
   "chat.readonlyHistory": "Past conversation (read-only)",
+  "chat.messagesErr": "Cannot read this conversation's messages",
+  "chat.messagesErr.hint": "Cannot read the messages: the daemon is unreachable, or its response does not match the contract. That is not the same as \"this conversation has no messages\".",
+
   "chat.handoffNotice": "Switched to {name}; the prior conversation rides along as handoff context",
   "chat.stop": "Stop the current reply",
   "chat.injection": "Context injection",

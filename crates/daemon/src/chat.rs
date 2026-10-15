@@ -427,6 +427,14 @@ pub struct ChatManager {
 /// such WARNs in one window, with 0 real ERRORs. A log that only ever shows
 /// false red teaches its reader to ignore red, and then a real failure is
 /// invisible (t313).
+///
+/// TWO DEFECTS, TWO FIXES, AND THIS COUNT IS ONLY ONE OF THEM (ruagent-issues-45-55
+/// t4 / issue #45). For a chat WITH turns and no index row — the other half — the
+/// same rusqlite message reached the ledger as the failure reason; the distiller
+/// now indexes before it reads and answers with an actionable sentence (see
+/// `distill::NOT_INDEXED_MESSAGE`). This count stays the caller's cheap gate: a
+/// transcript with no turns has nothing to read, so the pass is recorded `empty`
+/// without being attempted.
 fn transcript_turns(path: &std::path::Path) -> usize {
     crate::sessions::parse_file_messages("ruagent", path).len()
 }
@@ -460,6 +468,24 @@ async fn auto_distill_now(
     plan: crate::extract_plane::ExtractPlan,
 ) -> DistillAttempt {
     if turns == 0 {
+        // NOTHING TO DISTILL IS A RECORDED OUTCOME (ruagent-issues-45-55 t4 /
+        // issue #45). A chat opened and closed inside ten seconds is a session the
+        // ledger must be able to say something about, and the silent return that
+        // used to stand here left it absent from every table: "was this
+        // conversation ever considered for distillation?" had no answer anywhere.
+        //
+        // `empty`, not `failed`: nothing went wrong and nothing was read. The
+        // reason rides along because a bare `empty` row makes the reader guess
+        // which of the causes happened.
+        if let Err(e) = distiller
+            .record_empty_attempt(key, crate::distill::NO_CONTENT_MESSAGE)
+            .await
+        {
+            tracing::warn!(
+                session = %key, error = %e,
+                "could not record the empty attempt for a chat with no turns"
+            );
+        }
         // debug, not warn: nothing went wrong, and the caller asked for
         // nothing (a chat with no turns has nothing to extract).
         tracing::debug!(session = %key, "nothing to distill (this chat has no turns)");
@@ -1167,7 +1193,8 @@ impl ChatManager {
         if plan.is_empty() {
             return;
         }
-        let key = crate::sessions::session_key_of(&self.transcript_path(id));
+        let transcript = self.transcript_path(id);
+        let key = crate::sessions::session_key_of(&transcript);
         let agent = self
             .distill_policy
             .read()
@@ -1177,8 +1204,22 @@ impl ChatManager {
         // Read the turn count HERE, before the spawn: a chat with no turns has
         // nothing to distill, and asking the distiller about it anyway is what
         // produced the false WARNs (t313).
-        let turns = transcript_turns(&self.transcript_path(id));
+        let turns = transcript_turns(&transcript);
+        // THE SESSION IS INDEXED BEFORE IT IS DISTILLED (ruagent-issues-45-55 t4 /
+        // issue #45). The index is a 60 s cache and this transcript was written
+        // seconds ago, so the row the distiller reads into is usually not there
+        // yet. Indexing this ONE file is bounded by definition -- the path is in
+        // hand -- and idempotent: an unchanged (mtime, size) is a no-op, and a
+        // transcript with no turns leaves no row, which is the index's own
+        // empty-session rule and agrees with the `turns == 0` verdict below.
+        let indexer = crate::sessions::SessionIndexer::for_daemon_root(self.db.clone(), &self.root);
         tokio::spawn(async move {
+            if let Err(e) = indexer.index_path("ruagent", &transcript).await {
+                tracing::warn!(
+                    session = %key, error = %e,
+                    "could not index this chat before distilling it; the distiller runs its                      own pass as a second chance"
+                );
+            }
             auto_distill_now(&distiller, &key, agent.as_deref(), turns, plan).await;
         });
     }
@@ -2741,6 +2782,57 @@ mod t313_tests {
         let real = auto_distill_now(&distiller, "ruagent:t313-real", None, 3, plan).await;
         println!("READING turns=3 with no enabled agent => {real:?}");
         assert_eq!(real, DistillAttempt::Failed);
+    }
+
+    /// ACCEPTANCE (ruagent-issues-45-55 t4 / issue #45): a chat opened and closed
+    /// inside ten seconds is RECORDED, not silently dropped.
+    ///
+    /// Such a chat leaves a transcript with no turn in it, and the early return
+    /// that used to stand in `auto_distill_now` left the ledger with nothing to
+    /// say about it: "was this conversation ever considered for distillation?" had
+    /// no answer in any table. The row is `empty` -- nothing went wrong -- with
+    /// the actionable sentence, and `NothingToDistill` still describes the
+    /// attempt to its caller.
+    ///
+    /// NOTE THE PLAN: ACP-only, with an EMPTY registry. Without the turn gate the
+    /// pass would fail on agent selection and record `failed` -- a false red for a
+    /// chat with nothing in it, which is the t313 defect wearing a new hat. That is
+    /// why the gate stays even though the distiller can now recognise an empty
+    /// session by itself.
+    #[tokio::test]
+    async fn a_chat_without_turns_is_recorded_as_empty_rather_than_silently_dropped() {
+        let distiller = distiller_without_agents().await;
+        let key = "ruagent:t45-ten-seconds";
+        let attempt = auto_distill_now(
+            &distiller,
+            key,
+            None,
+            0,
+            crate::extract_plane::ExtractPlan::acp_only(),
+        )
+        .await;
+        assert_eq!(attempt, DistillAttempt::NothingToDistill);
+
+        let row: (String, String, i64) = distiller
+            .db
+            .call_flat(|conn| {
+                conn.query_row(
+                    "SELECT status, COALESCE(failure_reason,''), COALESCE(retries,-1)
+                     FROM distill_log WHERE session_key = 'ruagent:t45-ten-seconds'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+            .unwrap();
+        println!("READING the ten-second chat's ledger row: {row:?}");
+        assert_eq!(row.0, "empty", "nothing to distil is not a failure");
+        assert_eq!(row.1, crate::distill::NO_CONTENT_MESSAGE);
+        assert_eq!(
+            row.2, 0,
+            "no retry happened: this pass never read anything, so there is nothing \
+             transient to claim"
+        );
     }
 
     // The captured-log variant of this test lived here. It was removed because

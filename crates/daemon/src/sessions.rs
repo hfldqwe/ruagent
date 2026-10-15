@@ -51,6 +51,57 @@ struct Parsed {
     messages: Vec<SessionMessage>, // only when parsing for the viewer
 }
 
+/// What one file's indexing did (ruagent-issues-45-55 t4 / issue #45).
+///
+/// THREE VALUES, NOT TWO, because "this file has no row" has two causes a reader
+/// must not confuse: the file has nothing in it yet (a harness header and no
+/// turn), or the pass did not look at it at all. Only the first is a fact about
+/// the SESSION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileOutcome {
+    /// A row holds this file now: written, or already there and unchanged.
+    Indexed,
+    /// The file was READ and holds no message, so the index keeps no row for it
+    /// (on purpose -- see `index_file`).
+    Empty,
+    /// Not looked at: the file vanished between the walk and the stat.
+    Skipped,
+}
+
+/// What ONE index pass saw, for a caller that needs to know why a key has no row.
+#[derive(Debug, Default)]
+pub struct IndexPass {
+    /// Keys whose file the pass read and found EMPTY. The index writes no row for
+    /// those on purpose, so a caller that only looked at `sessions` cannot tell
+    /// them from a session that was never written at all.
+    empty_keys: std::collections::HashSet<String>,
+}
+
+impl IndexPass {
+    /// Was this key SEEN by the pass and refused as empty?
+    pub fn was_empty(&self, key: &str) -> bool {
+        self.empty_keys.contains(key)
+    }
+}
+
+/// Where a session is, for a reader that must say something useful when there is
+/// no index row (ruagent-issues-45-55 t4 / issue #45).
+///
+/// `Found` is not `Empty` is not `Missing`, and flattening any two of them
+/// produces a wrong sentence: "not indexed yet, syncing" is false for a chat with
+/// nothing in it, and "nothing to distil" is false for a session nobody has
+/// managed to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLookup {
+    /// The index holds a row: `(source, ref_path)`.
+    Found(String, String),
+    /// The pass READ this session's file and it holds no message -- a chat opened
+    /// and closed, or a spawn that never answered.
+    Empty,
+    /// No indexed file family holds a file for this key.
+    Missing,
+}
+
 pub struct SessionIndexer {
     db: Db,
     home: PathBuf,
@@ -72,7 +123,21 @@ impl SessionIndexer {
         }
     }
 
+    /// One pass of the index, exactly as the 60 s loop runs it.
     pub async fn scan(&self) -> Result<(), ruagent_store::DbError> {
+        self.scan_report().await.map(|_pass| ())
+    }
+
+    /// ONE PASS, AND WHAT IT SAW: [`Self::scan`] plus the answer to "why is
+    /// there no row for this key?" (ruagent-issues-45-55 t4 / issue #45).
+    ///
+    /// The report exists because the index REFUSES a row for a file with no
+    /// message -- deliberately (a spawn that never answered is not a session) --
+    /// so a row's absence has two causes a reader must not confuse: the file has
+    /// nothing in it, or it was never looked at. The 60 s loop does not care and
+    /// calls [`Self::scan`]; a reader that must say something useful asks here.
+    pub async fn scan_report(&self) -> Result<IndexPass, ruagent_store::DbError> {
+        let mut pass = IndexPass::default();
         let mut files: Vec<(String, PathBuf)> = Vec::new();
 
         // claude-code: ~/.claude/projects/<encoded-cwd>/<session>.jsonl
@@ -118,7 +183,9 @@ impl SessionIndexer {
         }
 
         for (source, path) in files {
-            self.index_file(&source, &path).await?;
+            if self.index_file(&source, &path).await? == FileOutcome::Empty {
+                pass.empty_keys.insert(make_key(&source, &path));
+            }
         }
 
         // opencode: one SQLite DB holding all sessions — index each
@@ -134,14 +201,125 @@ impl SessionIndexer {
         {
             tracing::debug!(error = %e, "opencode sessions not indexed");
         }
-        Ok(())
+        // NOTE: the report covers the FILE families. An opencode session lives in
+        // one shared SQLite database whose per-session rows this walk never sees,
+        // so a key of that family that produced no message reads as `Missing`
+        // rather than `Empty` -- the honest answer, since nothing here looked.
+        Ok(pass)
+    }
+
+    /// ONE PASS OF THE INDEX, NOW: the same scan the 60 s loop runs, awaited.
+    ///
+    /// WHY A CALLER NEEDS THIS (ruagent-issues-45-55 t4 / issue #45): the index
+    /// is a 60 s CACHE, so a session file written seconds ago has no row yet, and
+    /// a reader that insists on the row reports a defect for a session that
+    /// exists. The reader in question is the distiller -- `ensure_indexed` below
+    /// is what it calls -- and this is the bounded primitive underneath it.
+    ///
+    /// BOUNDED AND RE-ENTRANT: one pass over the families, not a loop; the
+    /// per-file work is already metadata-incremental (`index_file` re-parses only
+    /// when mtime/size moved); and concurrent passes are the NORMAL case, since
+    /// the 60 s loop is one of them (`INSERT OR REPLACE` keyed by `key` is what
+    /// makes that safe).
+    pub async fn index_now(&self) -> Result<IndexPass, ruagent_store::DbError> {
+        self.scan_report().await
+    }
+
+    /// Index ONE session file, now.
+    ///
+    /// The bounded form for a caller that KNOWS the file -- a chat closing knows
+    /// its own transcript, so scanning every family to find it is work nobody
+    /// asked for, and this walk is skipped entirely when that caller indexes it
+    /// first. Idempotent exactly as a scan is: an unchanged (mtime, size) is a
+    /// no-op, and a file with no messages leaves no row (the index's own rule: an
+    /// agent spawned and never answered is not a session).
+    pub async fn index_path(
+        &self,
+        source: &str,
+        path: &Path,
+    ) -> Result<(), ruagent_store::DbError> {
+        self.index_file(source, path).await.map(|_outcome| ())
+    }
+
+    /// The indexer for a daemon whose `root` is its own `~/.ruagent`.
+    ///
+    /// ONE DERIVATION (ruagent-issues-45-55 t4): the boot path builds its indexer
+    /// from `root.parent()`, because the stores this scans are the USER's
+    /// (`~/.claude`, `~/.dsh`, `~/.codex`, `~/.local/share/opencode`) while
+    /// `<root>/data/transcripts` is the daemon's own. The distill entry needs the
+    /// same indexer at a point where boot's handle is not in reach, and a second
+    /// spelling of that `.parent()` is how two indexers come to scan different
+    /// trees -- with the distiller then never seeing the chat it was asked about.
+    pub fn for_daemon_root(db: Db, root: &Path) -> Self {
+        Self::new(db, home_of(root))
+    }
+
+    /// The indexed `(source, ref_path)` for `key`, or `None` when no row holds it.
+    pub async fn locate(
+        &self,
+        key: &str,
+    ) -> Result<Option<(String, String)>, ruagent_store::DbError> {
+        let key = key.to_string();
+        self.db
+            .call_flat(move |conn| {
+                use rusqlite::OptionalExtension as _;
+                conn.query_row(
+                    "SELECT source, ref_path FROM sessions WHERE key = ?1",
+                    [&key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+            })
+            .await
+    }
+
+    /// The indexed `(source, ref_path)` for `key`, INDEXING FIRST when the row is
+    /// absent and then asking again (issue #45).
+    ///
+    /// THE ORDER IS THE FIX. "No row" and "no session" are different facts, and
+    /// the 60 s cadence makes the first one common; a reader that only looks at
+    /// the row turns an ordinary race into a defect report. Measured on the live
+    /// daemon: `Query returned no rows` -- rusqlite's message for the missing
+    /// `query_row`, naming a table the user has never heard of -- was the failure
+    /// logged for chats that plainly had turns (21 such WARNs in one window, 0
+    /// real errors; t313).
+    ///
+    /// THE THREE ANSWERS ARE DIFFERENT FACTS, which is why this returns
+    /// [`SessionLookup`] and not an `Option`: a row, a file the pass read and
+    /// found EMPTY (the index refuses it a row on purpose), and a key no family
+    /// holds at all. A caller that flattened the last two would tell a chat opened
+    /// and closed in ten seconds that it is "not indexed yet" -- a different
+    /// defect wearing the fix's clothes.
+    pub async fn ensure_indexed(&self, key: &str) -> Result<SessionLookup, ruagent_store::DbError> {
+        if let Some((source, ref_path)) = self.locate(key).await? {
+            return Ok(SessionLookup::Found(source, ref_path));
+        }
+        let pass = self.index_now().await?;
+        if let Some((source, ref_path)) = self.locate(key).await? {
+            return Ok(SessionLookup::Found(source, ref_path));
+        }
+        if pass.was_empty(key) {
+            return Ok(SessionLookup::Empty);
+        }
+        Ok(SessionLookup::Missing)
     }
 
     /// Index one file; skips parsing when mtime/size are unchanged.
-    async fn index_file(&self, source: &str, path: &Path) -> Result<(), ruagent_store::DbError> {
+    ///
+    /// Returns WHAT IT DID rather than `()`: [`FileOutcome::Empty`] is the fact
+    /// [`Self::scan_report`] collects, and it is the only thing that can tell a
+    /// caller "this session exists and has nothing in it" from "this session is
+    /// unknown" (issue #45). The two non-outcomes keep it honest: a file that
+    /// vanished before the stat was SKIPPED, not empty, and a row already there
+    /// and unchanged is INDEXED, not re-read.
+    async fn index_file(
+        &self,
+        source: &str,
+        path: &Path,
+    ) -> Result<FileOutcome, ruagent_store::DbError> {
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
-            Err(_) => return Ok(()), // raced with deletion
+            Err(_) => return Ok(FileOutcome::Skipped), // raced with deletion
         };
         let mtime = meta
             .modified()
@@ -181,7 +359,7 @@ impl SessionIndexer {
                 .as_ref()
                 .is_some_and(|(m, s, _)| *m == mtime && *s == size)
         {
-            return Ok(());
+            return Ok(FileOutcome::Indexed);
         }
 
         let bytes = std::fs::read(path).unwrap_or_default();
@@ -203,7 +381,7 @@ impl SessionIndexer {
             let _ = db
                 .call(move |conn| conn.execute("DELETE FROM sessions WHERE key = ?1", [&key]))
                 .await;
-            return Ok(());
+            return Ok(FileOutcome::Empty);
         }
 
         let source = source.to_string();
@@ -230,7 +408,7 @@ impl SessionIndexer {
                 )
             })
             .await??;
-        Ok(())
+        Ok(FileOutcome::Indexed)
     }
 
     /// The index, newest first.
@@ -669,6 +847,19 @@ fn parse_opencode_ref(path: &Path) -> Vec<SessionMessage> {
         return Vec::new();
     };
     opencode_session_messages(&conn, session_id)
+}
+
+/// The USER's home, for a daemon whose root is its own `~/.ruagent`.
+///
+/// See [`SessionIndexer::for_daemon_root`]: `<home>/.claude`, `<home>/.dsh`,
+/// `<home>/.codex` and `<home>/.ruagent/data/transcripts` are the trees this
+/// index covers, and every one of them hangs off the user's home -- so the parent
+/// of the daemon root is the home. A root with no parent (a bare relative path)
+/// falls back to itself, which scans nothing rather than the whole filesystem.
+fn home_of(root: &Path) -> PathBuf {
+    root.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf())
 }
 
 fn make_key(source: &str, path: &Path) -> String {

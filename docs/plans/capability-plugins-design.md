@@ -1754,7 +1754,10 @@ newly-added daemon route.
 | `distill_session` | `session_key: string`, `extractor?: "acp"\|"rules"\|"both"` (default `"acp"`), `dry_run?: boolean` (default false) | "Call this when the user asks to distill one session now: `extractor: \"rules\"` costs no tokens, `\"acp\"` (the default) runs the extraction agent, `dry_run: true` returns what would be written without writing." | `POST /api/v1/sessions/{key}/distill` |
 | `knowledge_graph_ingest` | `document?: string` (a document name; absent = sweep), `dry_run?: boolean` (default false) | "Call this when the user wants the knowledge base's entities and relations in the graph, or asks why a document's entities are missing: without `document` it sweeps up to the configured per-pass limit." | `POST /api/v1/knowledge/graph/ingest` |
 
-As landed (§21 item 10): the four tools exist and the surface is **18 tools**; the shipped
+As landed (§21 item 10): the four tools exist and the surface was **18 tools** at that
+increment — it is **21** since t12 added graph_fact_add, distill_status and
+graph_resolution_pending. See §14.4, which also writes down what the surface deliberately
+does NOT expose. The shipped
 `#[tool(description = …)]` strings are **supersets** of the one-liners above — they add a
 `WHEN:` clause and a `COST:` clause to each (e.g. `knowledge_graph_ingest`,
 `crates/mcp/src/lib.rs:431-433`), which is the intent of this column, not a divergence from
@@ -1861,6 +1864,54 @@ malformed body would silently become "no body" — a silent default, forbidden b
 the value and listing the three. Response: `{"distilled": {"session_key", "memories_written",
 "memories_skipped", "entities_written", "relations_written", "agent", "source", "truncated",
 "dry_run"}}` — the first six keys are today's exact shape (api.rs:2749).
+
+
+### 14.4 The surface since t12, and what it deliberately does NOT expose
+
+`ruagent-issues-45-55` t12 added three tools (issues #51, #54), bringing the surface to
+**21**. Each is a thin proxy to a route that already existed; no new write path was
+added.
+
+| tool | arguments (name: type) | one-line `when to call this` | route |
+| --- | --- | --- | --- |
+| `graph_fact_add` | `src?: integer`, `src_name?: string`, `dst?: integer`, `dst_name?: string`, `relation: string`, `fact_text: string`, `valid_at?: string` | "Write ONE fact between two EXISTING entities. Address each end by id or by name, exactly one form per end; a name that resolves to nothing is refused with the name quoted." | `POST /api/v1/graph/fact` |
+| `distill_status` | `session_key: string`, `limit?: integer` | "Is THIS session distilled, and what did its LAST attempt do? Free — it reads the ledger and never distils." | `GET /api/v1/distill/log?session=<key>` |
+| `graph_resolution_pending` | `action?: "list"\|"merge"\|"dismiss"`, `keeper?: integer`, `absorbed?: integer`, `a?: integer`, `b?: integer`, `show_redundant?: boolean` | "The pairs waiting for a MERGE DECISION — and where the decision is recorded. `merge`/dismiss are explicit, never automatic." | `GET /api/v1/graph/resolution/pending`, `POST …/merge`, `POST …/dismiss` |
+
+**Non-goals of the MCP surface — do not widen into these.** The platform may do these
+things; the *tool surface* must not. 非目标（一句话）：**社区发现/社区摘要写入与 LLM 实体
+合并裁决不在 MCP 暴露** —— 见下面三条，每条都写了为什么不暴露。
+
+1. **No community discovery and no community-summary writes.** `POST
+   /api/v1/graph/communities/build` and `POST /api/v1/graph/community/{id}/summary`
+   stay off the surface: they are maintenance passes over the whole graph, and a
+   summary is model-written text that would enter the graph as a fact-shaped row no
+   reader can verify. An agent that could trigger them would be able to spend the
+   user's tokens and mutate graph structure in one call, for a result nothing
+   downstream can check against sources.
+2. **No LLM adjudication of a merge.** `graph_resolution_pending` reports the
+   candidates and records a decision the CALLER made (`action: "merge"` or
+   `action: "dismiss"`); it never decides. The mechanical judge that fills the queue
+   is the daemon's own pass, and "these two names look alike" is not evidence a model
+   may act on by itself — a wrong merge is destructive and hard to audit afterwards.
+   This is the same rule as `graph_resolution_merge`'s own doc comment: EXPLICIT,
+   never automatic.
+3. **No new list tool.** `/graph/entities` is offset-paged with a total, and
+   `/api/v1/tasks`, `/api/v1/distill/log` and `/graph/edges` share that envelope;
+   the MCP surface exposes the task list (`list_tasks`, now paged through
+   `limit`/`offset`) and the ledger for one session (`distill_status`), and leaves
+   the panel its own entity list rather than adding a fourth spelling of "list the
+   graph". The two routes that used to publish no count do now (t26): `/graph/search`
+   honours `limit` and both it and `/memory/search` report `matched` (the pre-limit
+   match count), `matched_exact` (false = the route's own scan stopped at its ceiling,
+   so `matched` is a floor) and `truncated`/`truncated_sections` -- so the tools print
+   the REAL remainder, and say "AT LEAST" when the count is only a floor.
+
+**Every list-shaped answer states its cut** (#54's third acceptance): the reply ends
+with `shown N of T (limit, offset)` and, when rows were left out, `还有 N 条未显示`.
+For a WINDOW-shaped answer (recall's `top_n`) the reply names the section that was cut
+and the count the daemon publishes for it (`memory_legs.dropped_by_top_n`); where the
+route publishes no such count, the reply says so rather than printing an invented one.
 
 ---
 

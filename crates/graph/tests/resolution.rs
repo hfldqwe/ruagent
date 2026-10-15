@@ -179,7 +179,7 @@ async fn upsert_with_aliases_merges_or_queues_never_guesses() {
         Some("product"),
         None,
         &["dsh".to_string()],
-        "extraction",
+        g::AliasSource::Extraction,
     )
     .await
     .unwrap();
@@ -208,7 +208,7 @@ async fn upsert_with_aliases_merges_or_queues_never_guesses() {
         Some("tool"),
         Some("a viewer built on dsh"),
         &[],
-        "extraction",
+        g::AliasSource::Extraction,
     )
     .await
     .unwrap();
@@ -229,9 +229,15 @@ async fn upsert_with_aliases_merges_or_queues_never_guesses() {
     assert!(pending[0].2.contains("first-token"));
 
     // A genuinely new object is simply created.
-    let out =
-        g::upsert_entity_with_aliases(&db.db, "Zephyr", Some("tool"), None, &[], "extraction")
-            .await
-            .unwrap();
+    let out = g::upsert_entity_with_aliases(
+        &db.db,
+        "Zephyr",
+        Some("tool"),
+        None,
+        &[],
+        g::AliasSource::Extraction,
+    )
+    .await
+    .unwrap();
     assert!(matches!(out, g::ResolveOutcome::Created { .. }));
 }

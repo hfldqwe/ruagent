@@ -161,11 +161,16 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
         "capability_set",
         "distill_session",
         "knowledge_graph_ingest",
+        // t12 (issues #51, #54): the fact write, the ledger read, and the pending
+        // queue's decision sheet.
+        "graph_fact_add",
+        "distill_status",
+        "graph_resolution_pending",
     ];
     assert_eq!(
         expected.len(),
-        18,
-        "the declared consumption surface is 18 tools"
+        21,
+        "the declared consumption surface is 21 tools"
     );
     let mut got = names.clone();
     got.sort();
@@ -290,6 +295,663 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
     client.cancel().await.unwrap();
     let server = server_task.await.unwrap();
     server.cancel().await.unwrap();
+}
+
+/// Seed SQL through a SECOND connection to the test daemon's own database.
+///
+/// WHY A DIRECT INSERT IS LEGITIMATE HERE (t12): the two facts the tests below need
+/// -- "this session's ledger holds these attempts" and "the queue holds this pair" --
+/// are written by paths this crate does not drive (distill.rs's ledger writes, and the
+/// mechanical resolution pass that queues pairs), and both live in crates/daemon,
+/// outside this task. What IS under test is the READ: the tool, the route and the
+/// table. A row that failed to land would show up as a wrong reading, not as a silent
+/// pass, because every assertion below names a value it expects to read back.
+async fn seed(root: &std::path::Path, sql: &str) {
+    let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
+    let sql = sql.to_string();
+    db.call_flat(move |conn| conn.execute_batch(&sql))
+        .await
+        .unwrap();
+}
+
+async fn create_entity(http: &reqwest::Client, daemon_url: &str, name: &str) -> i64 {
+    let v: serde_json::Value = http
+        .post(format!("{daemon_url}/api/v1/graph/entity"))
+        .json(&serde_json::json!({ "name": name, "kind": "concept" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["id"].as_i64().expect("the entity route returns an id")
+}
+
+/// t12 / #51, acceptance 1: a fact written through MCP is readable BY THE SAME
+/// SESSION through graph_entity.
+///
+/// The entities are created through the daemon's own route on purpose: the fact tool
+/// never invents one (t1), so a fixture that pre-seeded them would hide the very
+/// behaviour this asserts.
+#[tokio::test]
+async fn a_fact_written_through_mcp_is_readable_by_graph_entity_in_the_same_session() {
+    let daemon_url = start_test_daemon().await;
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+    let http = reqwest::Client::new();
+    let src = create_entity(&http, &daemon_url, "t12-atlas-release").await;
+    let dst = create_entity(&http, &daemon_url, "t12-friday-shipment").await;
+
+    let out = client
+        .call_tool(call(
+            "graph_fact_add",
+            serde_json::json!({
+                "src_name": "t12-atlas-release",
+                "dst_name": "t12-friday-shipment",
+                "relation": "ships_on",
+                "fact_text": "the atlas release train ships on Fridays"
+            }),
+        ))
+        .await
+        .unwrap();
+    let written = text_of(&out);
+    assert!(
+        written.contains("event_time_source=recorded"),
+        "the write must report the event-time source the route recorded: {written}"
+    );
+    assert!(
+        written.contains(&format!("READ IT BACK with graph_entity(id: {src})")),
+        "the reply must name the id to read back: {written}"
+    );
+
+    // The SAME session reads it back, by id, through the read tool.
+    let out = client
+        .call_tool(call("graph_entity", serde_json::json!({ "id": src })))
+        .await
+        .unwrap();
+    let read = text_of(&out);
+    assert!(
+        read.contains("the atlas release train ships on Fridays"),
+        "the fact written through MCP must be readable by graph_entity: {read}"
+    );
+
+    // A name that resolves to nothing is REFUSED, naming the string (t1): this route
+    // never creates an entity, so a typo cannot invent a node.
+    let refused = failure(
+        client
+            .call_tool(call(
+                "graph_fact_add",
+                serde_json::json!({
+                    "src": src,
+                    "dst_name": "t12-no-such-entity-anywhere",
+                    "relation": "runs_on",
+                    "fact_text": "x"
+                }),
+            ))
+            .await,
+    );
+    assert!(
+        refused.contains("t12-no-such-entity-anywhere"),
+        "the refusal must quote the name that resolved to nothing: {refused}"
+    );
+
+    // The same end addressed BOTH ways is refused rather than silently resolved to
+    // one of them.
+    let refused = failure(
+        client
+            .call_tool(call(
+                "graph_fact_add",
+                serde_json::json!({
+                    "src": src, "src_name": "t12-atlas-release",
+                    "dst": dst, "relation": "ships_on", "fact_text": "x"
+                }),
+            ))
+            .await,
+    );
+    assert!(
+        refused.contains("exactly one of"),
+        "an ambiguous end must be refused, not guessed: {refused}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t12 / acceptance 2: the distillation ledger, read for ONE session.
+///
+/// Every reading the contract names for the ledger is asserted here against the
+/// DAEMON'S OWN ROUTE (not a stub): the verdict over the whole history, the newest
+/// attempt (which may be a later failure), the NULL-is-not-zero rule for every
+/// nullable column, and the window/truncation pair.
+#[tokio::test]
+async fn distill_status_reads_the_ledger_the_daemon_serves() {
+    let (daemon_url, root) =
+        start_test_daemon_with_policy("[permissions]\ndefault = \"ask\"\n").await;
+    seed(
+        &root,
+        r#"
+INSERT INTO distill_log (session_key, distilled_at, status, agent, memories_written,
+        entities_written, relations_written, tokens_used, context_size, cost_usd, retries,
+        windows, truncated)
+VALUES ('ruagent:t12-ok', '2026-10-01T00:00:00Z', 'ok', 'mock', 3, 1, 2, 1234, 200000,
+        0.0012, 0, 1, 0);
+INSERT INTO distill_log (session_key, distilled_at, status, failure_reason, agent)
+VALUES ('ruagent:t12-ok', '2026-10-02T00:00:00Z', 'failed',
+        'no content to distil: the session has no user messages', '');
+INSERT INTO distill_log (session_key, distilled_at) VALUES ('ruagent:t12-legacy',
+        '2026-09-01T00:00:00Z');
+INSERT INTO distill_log (session_key, distilled_at, status, windows, truncated)
+VALUES ('ruagent:t12-cut', '2026-10-03T00:00:00Z', 'ok', 3, 1);
+"#,
+    )
+    .await;
+    let mut many = String::new();
+    for i in 0..12 {
+        many.push_str(&format!(
+            "INSERT INTO distill_log (session_key, distilled_at, status) VALUES \
+             ('ruagent:t12-many', '2026-10-{i:02}T00:00:00Z', 'ok');\n"
+        ));
+    }
+    seed(&root, &many).await;
+
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    // 1. A session with a successful attempt AND a later failure: DISTILLED (the
+    //    verdict is over the whole history), newest attempt = the failure, and the
+    //    cumulative totals span BOTH rows.
+    let out = client
+        .call_tool(call(
+            "distill_status",
+            serde_json::json!({ "session_key": "ruagent:t12-ok" }),
+        ))
+        .await
+        .unwrap();
+    let ok = text_of(&out);
+    assert!(ok.contains("DISTILLED"), "{ok}");
+    assert!(
+        ok.contains("attempts recorded for this session: 2") && ok.contains("failed=1"),
+        "the three-state distribution must span the history: {ok}"
+    );
+    assert!(
+        ok.contains("status=failed"),
+        "the newest attempt is the LATER failure, and the verdict is not: {ok}"
+    );
+    assert!(
+        ok.contains("failure reason: no content to distil"),
+        "the failure reason must be readable: {ok}"
+    );
+    assert!(
+        ok.contains("tokens 1234"),
+        "the cumulative sum spans the whole history, not the page: {ok}"
+    );
+    assert!(ok.contains("$0.0012"), "{ok}");
+    assert!(
+        ok.contains("1 of 2 attempt(s) did not record one"),
+        "the count of unrecorded rows is the other half of the sum: {ok}"
+    );
+
+    // 2. A pre-0028 row: NULL status is the ledger's own word, and every nullable
+    //    column says NOT RECORDED instead of 0.
+    let out = client
+        .call_tool(call(
+            "distill_status",
+            serde_json::json!({ "session_key": "ruagent:t12-legacy" }),
+        ))
+        .await
+        .unwrap();
+    let legacy = text_of(&out);
+    assert!(legacy.contains("NOT DISTILLED"), "{legacy}");
+    assert!(
+        legacy.contains("status=not_recorded (NULL status"),
+        "a NULL status is the ledger's fourth state, not a fourth outcome: {legacy}"
+    );
+    assert!(
+        legacy.contains("tokens NOT RECORDED"),
+        "an unrecorded column must not print as 0: {legacy}"
+    );
+    assert!(
+        legacy.contains("windows/truncated NOT RECORDED"),
+        "neither window nor truncation was measured: {legacy}"
+    );
+
+    // 3. A LOSSY transcript: windows and truncated are read together, so "3 windows"
+    //    never reads as "nothing lost".
+    let out = client
+        .call_tool(call(
+            "distill_status",
+            serde_json::json!({ "session_key": "ruagent:t12-cut" }),
+        ))
+        .await
+        .unwrap();
+    let cut = text_of(&out);
+    assert!(cut.contains("windows=3, truncated=YES"), "{cut}");
+    assert!(
+        cut.contains("text was DROPPED"),
+        "a cut that lost text must say so: {cut}"
+    );
+
+    // 4. A session the ledger has never heard of is NOT DISTILLED, and the reply
+    //    says the ledger holds no row rather than inventing a reason.
+    let out = client
+        .call_tool(call(
+            "distill_status",
+            serde_json::json!({ "session_key": "ruagent:t12-none" }),
+        ))
+        .await
+        .unwrap();
+    let none = text_of(&out);
+    assert!(none.contains("NOT DISTILLED"), "{none}");
+    assert!(
+        none.contains("no attempt recorded for this session"),
+        "{none}"
+    );
+    assert!(
+        none.contains("distill_session"),
+        "the reply must name the free way to distil it: {none}"
+    );
+
+    // 5. A session with more attempts than the page: the remainder is STATED (the
+    //    limit is this tool's, and it says what it left out).
+    let out = client
+        .call_tool(call(
+            "distill_status",
+            serde_json::json!({ "session_key": "ruagent:t12-many", "limit": 2 }),
+        ))
+        .await
+        .unwrap();
+    let many = text_of(&out);
+    assert!(many.contains("shown 2 of 12"), "{many}");
+    assert!(many.contains("还有 10 条未显示"), "{many}");
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t12 / acceptance 3: the pending queue is listed AND both decisions are recorded,
+/// with the SAME semantics the HTTP route has (t10 / issue #50).
+#[tokio::test]
+async fn the_pending_queue_is_listed_and_decided_through_mcp() {
+    let (daemon_url, root) =
+        start_test_daemon_with_policy("[permissions]\ndefault = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+    let a1 = create_entity(&http, &daemon_url, "t12-kubernetes").await;
+    let b1 = create_entity(&http, &daemon_url, "t12-k8s").await;
+    let a2 = create_entity(&http, &daemon_url, "t12-postgres").await;
+    let b2 = create_entity(&http, &daemon_url, "t12-postgresql").await;
+    // The queue is filled by the mechanical pass (crates/daemon), which this crate
+    // does not drive; the rows are seeded with the schema's own columns.
+    seed(
+        &root,
+        &format!(
+            "INSERT INTO resolution_pending (entity_a, entity_b, reason, created_at) \
+             VALUES ({a1}, {b1}, 'names differ by a suffix', '2026-10-01T00:00:00Z');\n\
+             INSERT INTO resolution_pending (entity_a, entity_b, reason, created_at) \
+             VALUES ({a2}, {b2}, 'same product, two spellings', '2026-10-01T00:00:00Z');\n"
+        ),
+    )
+    .await;
+
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    // 1. The decision sheet: both pairs, both entities, both fact counts, and the
+    //    exact call that records each decision.
+    let out = client
+        .call_tool(call("graph_resolution_pending", serde_json::json!({})))
+        .await
+        .unwrap();
+    let listed = text_of(&out);
+    assert!(
+        listed.contains("merge decisions waiting: 2 pair(s)"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("t12-kubernetes") && listed.contains("t12-k8s"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("queued because: names differ by a suffix"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(&format!("keeper: {a1}, absorbed: {b1}")),
+        "the reply must carry the exact merge call: {listed}"
+    );
+    assert!(
+        listed.contains(&format!("a: {a1}, b: {b1}")),
+        "the reply must carry the exact dismiss call: {listed}"
+    );
+    assert!(
+        listed.contains("NO LIMIT WAS APPLIED"),
+        "the whole queue is returned, and the reply says so: {listed}"
+    );
+
+    // 2. Keep this pair apart, twice: the repeat is the same decision, not an error.
+    let out = client
+        .call_tool(call(
+            "graph_resolution_pending",
+            serde_json::json!({ "action": "dismiss", "a": a1, "b": b1 }),
+        ))
+        .await
+        .unwrap();
+    let dismissed = text_of(&out);
+    assert!(dismissed.contains("STAY SEPARATE"), "{dismissed}");
+    let out = client
+        .call_tool(call(
+            "graph_resolution_pending",
+            serde_json::json!({ "action": "dismiss", "a": b1, "b": a1 }),
+        ))
+        .await
+        .unwrap();
+    let again = text_of(&out);
+    assert!(
+        again.contains("already recorded"),
+        "the unordered pair repeats idempotently: {again}"
+    );
+
+    // 3. The queue is now one pair smaller, and the answered pair is COUNTED rather
+    //    than merely gone: "empty" and "worked through" are different readings.
+    let out = client
+        .call_tool(call("graph_resolution_pending", serde_json::json!({})))
+        .await
+        .unwrap();
+    let after_dismiss = text_of(&out);
+    assert!(
+        after_dismiss.contains("merge decisions waiting: 1 pair(s)"),
+        "{after_dismiss}"
+    );
+    assert!(
+        after_dismiss.contains("1 pair(s) already"),
+        "{after_dismiss}"
+    );
+
+    // 4. Merge the other pair: the keeper absorbs it, the absorbed name becomes an
+    //    alias (so the next pass cannot rebuild it), and the pair leaves the queue.
+    let out = client
+        .call_tool(call(
+            "graph_resolution_pending",
+            serde_json::json!({ "action": "merge", "keeper": a2, "absorbed": b2 }),
+        ))
+        .await
+        .unwrap();
+    let merged = text_of(&out);
+    assert!(merged.contains("was absorbed into"), "{merged}");
+    assert!(
+        merged.contains("is now an ALIAS of the keeper"),
+        "the absorbed name must become an alias of the keeper: {merged}"
+    );
+    // alias_written reports the SECOND write, not whether the alias exists: the merge
+    // records it inside its own transaction, so the honest claim is checked against
+    // the entity the daemon serves, not against that flag.
+    let keeper: serde_json::Value = http
+        .get(format!("{daemon_url}/api/v1/graph/entity/{a2}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aliases: Vec<&str> = keeper["aliases"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        aliases.contains(&"t12-postgresql"),
+        "the absorbed name must resolve to the keeper: {keeper}"
+    );
+    assert!(
+        merged.contains("alias_written="),
+        "the reply must still report what the second write did: {merged}"
+    );
+    let out = client
+        .call_tool(call("graph_resolution_pending", serde_json::json!({})))
+        .await
+        .unwrap();
+    let empty = text_of(&out);
+    assert!(
+        empty.contains("merge decisions waiting: 0 pair(s)"),
+        "{empty}"
+    );
+    assert!(
+        empty.contains("nothing to decide"),
+        "an empty queue says why it is empty: {empty}"
+    );
+
+    // 5. The refusals are the DAEMON'S (one rule, one message) except for the
+    //    argument check this tool owns.
+    let refused = failure(
+        client
+            .call_tool(call(
+                "graph_resolution_pending",
+                serde_json::json!({ "action": "merge", "keeper": a2 }),
+            ))
+            .await,
+    );
+    assert!(refused.contains("absorbed"), "{refused}");
+    assert!(refused.contains("needs BOTH"), "{refused}");
+
+    let refused = failure(
+        client
+            .call_tool(call(
+                "graph_resolution_pending",
+                serde_json::json!({ "action": "reconcile" }),
+            ))
+            .await,
+    );
+    assert!(refused.contains("reconcile"), "{refused}");
+    assert!(refused.contains("dismiss"), "{refused}");
+
+    let refused = failure(
+        client
+            .call_tool(call(
+                "graph_resolution_pending",
+                serde_json::json!({ "action": "dismiss", "a": a1, "b": a1 }),
+            ))
+            .await,
+    );
+    assert!(
+        refused.contains("same entity"),
+        "the daemon's own refusal must reach the caller: {refused}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t12 / acceptance 4: a list this tool cut SAYS SO. The old tool printed the first
+/// 20 rows of the response and nothing else, so a board with more rows than the page
+/// read exactly like a complete one.
+#[tokio::test]
+async fn a_cut_task_list_says_how_many_rows_it_left_out() {
+    let daemon_url = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    for i in 0..3 {
+        http.post(format!("{daemon_url}/api/v1/tasks"))
+            .json(&serde_json::json!({
+                "title": format!("t12 board row {i}"),
+                "intent": "x"
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    let out = client
+        .call_tool(call("list_tasks", serde_json::json!({ "limit": 2 })))
+        .await
+        .unwrap();
+    let page = text_of(&out);
+    assert!(page.contains("t12 board row"), "{page}");
+    assert!(
+        page.contains("shown 2 of 3 (limit=2, offset=0)"),
+        "the envelope's own counts must be printed: {page}"
+    );
+    assert!(
+        page.contains("还有 1 条未显示"),
+        "the remainder must be stated, in the acceptance's own words: {page}"
+    );
+
+    // The last page is complete, and says THAT as well -- so "no warning" is never
+    // the only evidence that nothing was left out.
+    let out = client
+        .call_tool(call(
+            "list_tasks",
+            serde_json::json!({ "limit": 2, "offset": 2 }),
+        ))
+        .await
+        .unwrap();
+    let last = text_of(&out);
+    assert!(last.contains("shown 3 of 3 (limit=2, offset=2)"), "{last}");
+    assert!(!last.contains("还有"), "nothing is left out: {last}");
+    assert!(
+        last.contains("2 earlier row(s) not shown"),
+        "a page that starts late says what is behind it: {last}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t27 / #54: the MCP search tools carry the DAEMON's remainder over the REAL seam.
+///
+/// WHY THIS EXISTS (t26's declared residual): t26 fixed the routes -- /graph/search now
+/// honours limit, and both it and /memory/search publish matched / matched_exact /
+/// truncated -- and pressed the tool end over a stub, but the chain "real daemon reading
+/// -> real MCP tool text" was never driven end to end. #54's acceptance is stated at the
+/// MCP boundary ("MCP 输出包含剩余条数"), so it can only be proved here: five matching
+/// rows per store, one real daemon, one real stdio MCP session.
+#[tokio::test]
+async fn a_cut_search_page_reports_the_real_remainder_through_mcp() {
+    let daemon_url = start_test_daemon().await;
+    let http = reqwest::Client::new();
+    for i in 0..5 {
+        // Through the daemon's OWN write routes: the corpus is real rows, not fixtures
+        // poked into the tables. observation x user is one of the allowed pairs (the
+        // write vocabulary refuses observation x global).
+        let resp = http
+            .post(format!("{daemon_url}/api/v1/memory/write"))
+            .json(&serde_json::json!({
+                "store": "observation",
+                "namespace": "user",
+                "content": format!("t27 probe memory {i}"),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+        create_entity(&http, &daemon_url, &format!("t27 probe entity {i}")).await;
+    }
+
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    // 1. REACHED: two rows of five matched, so the remainder is a REAL number.
+    for tool in ["graph_search", "memory_search"] {
+        let out = client
+            .call_tool(call(
+                tool,
+                serde_json::json!({ "query": "t27 probe", "limit": 2 }),
+            ))
+            .await
+            .unwrap();
+        let text = text_of(&out);
+        println!("READING t27 {tool} limit=2 -> {text}");
+        assert!(
+            text.contains("matched 5, this reply carries 2"),
+            "{tool} must print the daemon's pre-limit count: {text}"
+        );
+        assert!(
+            text.contains("还有 3 条未显示"),
+            "{tool} must print the remainder #54 is about: {text}"
+        );
+        assert!(
+            !text.contains("UNKNOWN"),
+            "{tool} must not hedge about a count the daemon publishes: {text}"
+        );
+    }
+
+    // 2. EXACTLY EQUAL (5 of 5) and 3. UNTOUCHED (a page wider than the corpus): neither
+    //    is a cut, so not one word about a remainder.
+    for limit in [5, 10] {
+        for tool in ["graph_search", "memory_search"] {
+            let out = client
+                .call_tool(call(
+                    tool,
+                    serde_json::json!({ "query": "t27 probe", "limit": limit }),
+                ))
+                .await
+                .unwrap();
+            let text = text_of(&out);
+            assert!(
+                text.contains("matched 5, this reply carries 5"),
+                "{tool} limit={limit}: {text}"
+            );
+            assert!(
+                !text.contains("还有"),
+                "{tool} limit={limit} must not claim a remainder it does not have: {text}"
+            );
+        }
+    }
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t27 / #54: when the widening scan hits its ceiling, the MCP tool says AT LEAST -- a
+/// floor, never dressed as an exact count (t25's rule, pressed end to end).
+///
+/// The corpus must be larger than the daemon's scan ceiling (api.rs:
+/// SEARCH_MATCH_CEILING = 5000), so it is seeded in ONE statement rather than 5005
+/// route calls. Both FTS indexes are trigger-maintained (0005_graph.sql /
+/// 0004_memory.sql), so a direct insert is indexed exactly like the route's own write.
+#[tokio::test]
+async fn the_widening_ceiling_is_reported_as_a_lower_bound_through_mcp() {
+    let (daemon_url, root) = start_test_daemon_with_policy(
+        r#"[permissions]
+default = "ask"
+"#,
+    )
+    .await;
+    seed(
+        &root,
+        "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 5005)
+         INSERT INTO entities (name, norm_name, kind, summary, created_at, updated_at)
+         SELECT 't27 ceiling entity ' || i, 't27 ceiling entity ' || i, 'probe', NULL,
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' FROM seq;
+         WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 5005)
+         INSERT INTO memories (store, namespace, content, content_hash, confidence,
+                               created_at, updated_at)
+         SELECT 'observation', 'user', 't27 ceiling memory ' || i, 't27c' || i, 0.9,
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' FROM seq;",
+    )
+    .await;
+
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+    for (tool, query) in [
+        ("graph_search", "t27 ceiling entity"),
+        ("memory_search", "t27 ceiling memory"),
+    ] {
+        let out = client
+            .call_tool(call(
+                tool,
+                serde_json::json!({ "query": query, "limit": 2 }),
+            ))
+            .await
+            .unwrap();
+        let text = text_of(&out);
+        println!("READING t27 ceiling {tool} limit=2 -> {text}");
+        assert!(
+            text.contains("matched AT LEAST 5000"),
+            "{tool} must report the floor as a floor: {text}"
+        );
+        assert!(
+            text.contains("至少还有 4998 条未显示"),
+            "{tool} must state the remainder as a lower bound: {text}"
+        );
+        assert!(
+            text.contains("exact match count is unknown"),
+            "{tool} must say WHY it cannot be exact: {text}"
+        );
+        assert!(
+            !text.contains("matched 5000, this reply carries 2"),
+            "{tool} must not print the scan's ceiling as an exact count: {text}"
+        );
+    }
+
+    shutdown_pair(client, server_task).await;
 }
 
 /// The message of a REFUSED tool call. A refusal that reads as a success is the

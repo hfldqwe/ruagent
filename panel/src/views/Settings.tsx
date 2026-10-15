@@ -5,12 +5,14 @@
 // capability plane, so a pipeline is switched here instead of by
 // hand-editing the [capabilities] table of policy.toml.
 
-import { Alert, Button, Input, Select, Switch, Tooltip } from "antd";
+import { Alert, Button, Input, Select, Switch, Table, Tooltip } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import {
   api,
   type CapabilitiesResponse,
   type CapabilityRow,
+  type DistillLedgerEntry,
+  type DistillLogPage,
   type DistillPolicy,
   type OptionSchemaEntry,
 } from "../api";
@@ -27,7 +29,20 @@ import {
   type OptionRefusal,
   type RowEdit,
 } from "../capability-options";
-import { ErrorState, Modal, Spinner } from "../ui";
+import {
+  ErrorState,
+  Modal,
+  ReadoutStrip,
+  RelTime,
+  Spinner,
+  StaleNotice,
+  fmtTokens,
+  fmtUsd,
+  readFailed,
+  readLoading,
+  readReady,
+  type LoadState,
+} from "../ui";
 import { useI18n } from "../i18n";
 
 export function Settings() {
@@ -52,6 +67,7 @@ export function Settings() {
         <span className="muted">{t("settings.subtitle")}</span>
       </div>
       <DistillSettings epoch={epoch} onReload={reload} />
+      <DistillLedger epoch={epoch} onReload={reload} />
       <CapabilitiesSettings epoch={epoch} onReload={reload} />
     </div>
   );
@@ -64,7 +80,11 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
   const { t } = useI18n();
   const [policy, setPolicy] = useState<DistillPolicy | null>(null);
   const [err, setErr] = useState<unknown>(null);
-  const [agents, setAgents] = useState<{ name: string }[] | null>(null);
+  /** The role list, as a three-state (#53): the Select below has a
+   *  `notFoundContent` that claims "没有可选角色", and the old
+   *  `.catch(() => setAgents([]))` made a FAILED read say exactly that. */
+  const [agents, setAgents] = useState<LoadState<{ name: string }[]>>(readLoading());
+
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [saveErr, setSaveErr] = useState<string | null>(null);
@@ -81,8 +101,10 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
       .catch((e) => setErr(e));
     api
       .agents()
-      .then((a) => setAgents(a.filter((x) => x.enabled).map((x) => ({ name: x.name }))))
-      .catch(() => setAgents([]));
+      .then((a) =>
+        setAgents(readReady(a.filter((x) => x.enabled).map((x) => ({ name: x.name })))),
+      )
+      .catch((e) => setAgents((prev) => readFailed(prev, e)));
   };
   useEffect(() => {
     load();
@@ -235,12 +257,16 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
             className="w-full"
             options={[
               { value: "", label: t("distill.agentDefault") },
-              ...(agents ?? []).map((a) => ({ value: a.name, label: a.name })),
+              ...(agents.data ?? []).map((a) => ({ value: a.name, label: a.name })),
             ]}
             // §5 empty: no enabled role must say so, not open an empty list.
             // The string belongs to THIS view's domain: a settings-only
             // message keyed under distill.* is copy that outlives its owner.
-            notFoundContent={t("settings.noRoles")}
+            // ... and a FAILED read must not borrow that sentence: the
+            // dropdown then says what actually happened.
+            notFoundContent={
+              agents.kind === "error" ? t("settings.agentsFailed") : t("settings.noRoles")
+            }
           />
         </label>
         <label className="chat-field half">
@@ -292,11 +318,280 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
         </Button>
       </div>
 
+      {agents.kind === "error" && agents.data === null ? (
+        // Nothing was ever read: the agent picker is not empty, it is UNKNOWN.
+        <ErrorState
+          title={t("settings.agentsErr")}
+          hint={`${t("settings.agentsErr.hint")} — ${String(agents.err).slice(0, 160)}`}
+          onRetry={load}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
+      {agents.kind === "error" && agents.data !== null ? (
+        // A later failure keeps the list it already read, and says so.
+        <StaleNotice err={agents.err} onRetry={load} />
+      ) : null}
+
       {saveErr ? <ErrorState title={t("distill.saveFailed")} hint={saveErr} /> : null}
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// The distillation LEDGER (t8 / issues #46 + #55)
+//
+// The policy card above says WHAT distillation is set to do; this card says what
+// it actually DID — one row per attempt, failures included, which is the only
+// place a failure REASON exists at all (#46's user-visible half).
+//
+// THREE STATES, NOT TWO. Every measurement 0028 added is nullable on purpose:
+// `null` = nobody recorded it (rows written before the migration), `0` = a
+// measured zero, a number = the reading. The card prints 未记录 for the first and
+// never folds it into 0 — "this cost nothing" and "nobody wrote it down" are
+// different readings, and a view that conflates them is the failure the NULL
+// discipline exists to prevent.
+// ---------------------------------------------------------------------------
+
+/** How many attempts the card lists. ONE page of the daemon's own envelope (its
+ *  default is 50, its ceiling 500); `total` is shown beside the rows so a reader
+ *  can see that more exists rather than assuming this is all of it. */
+const LEDGER_ROWS = 20;
+
+/** The ledger's four buckets, in the daemon's own vocabulary. `not_recorded` is
+ *  a NULL status (the pre-0024 rows), NOT a fourth outcome — the buckets are
+ *  shown side by side precisely so that distinction stays visible. */
+const LEDGER_BUCKETS = ["ok", "empty", "failed", "not_recorded"] as const;
+
+function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => void }) {
+  const { t } = useI18n();
+  // The same two-state shape DistillSettings above uses: `data` is what a
+  // successful read produced, `err` is the last failure. A failed refresh keeps
+  // the rows on screen and says they may be stale (audit row 20) instead of
+  // blanking a card that was showing real numbers a second ago.
+  const [page, setPage] = useState<DistillLogPage | null>(null);
+  const [lastFailure, setLastFailure] = useState<DistillLedgerEntry | null>(null);
+  const [err, setErr] = useState<unknown>(null);
+
+  const load = useCallback(() => {
+    Promise.all([
+      api.distillLog({ limit: LEDGER_ROWS }),
+      // The MOST RECENT failure, asked of the whole ledger rather than found
+      // inside the page above: "why did the last run fail" must not be answered
+      // by "the newest 20 attempts happened to succeed".
+      api.distillLog({ status: "failed", limit: 1 }),
+    ])
+      .then(([p, failures]) => {
+        setPage(p);
+        setLastFailure(failures.entries[0] ?? null);
+        setErr(null);
+      })
+      .catch((e) => setErr(e));
+  }, []);
+
+  useEffect(() => {
+    load();
+    // t151: `epoch` is the page-scoped retry, so one click on any error card on
+    // #settings re-reads every loader on the route.
+  }, [load, epoch]);
+
+  if (!page) {
+    return err ? (
+      <ErrorState
+        title={t("distill.ledger.err")}
+        hint={`${t("distill.ledger.err.hint")} — ${String(err).slice(0, 200)}`}
+        onRetry={onReload}
+        retryLabel={t("common.retry")}
+      />
+    ) : (
+      <Spinner label={t("distill.ledger")} />
+    );
+  }
+
+  const totals = page.totals;
+  /** A recorded number, or the ledger's own word for "nobody wrote it down". ONE
+   *  helper, so no cell of this card can accidentally print a null as 0. */
+  const measured = (v: number | null, render: (n: number) => string) =>
+    v == null ? t("distill.notRecorded") : render(v);
+
+  return (
+    <div className="card distill-ledger">
+      <div className="zone-head">
+        <div className="zone-title">{t("distill.ledger")}</div>
+        <span className="zone-note">{t("distill.ledger.rows", { n: page.total })}</span>
+        <span className="grow" />
+        <span className="muted micro">{t("distill.ledger.windowsNote")}</span>
+        <Button size="small" onClick={load}>
+          {t("distill.ledger.refresh")}
+        </Button>
+      </div>
+
+      {err ? (
+        // A refresh failed while rows are on screen: say so, and keep them.
+        <ErrorState
+          title={t("distill.ledger.err")}
+          hint={`${t("distill.ledger.err.hint")} — ${String(err).slice(0, 200)}`}
+          onRetry={onReload}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
+
+      {page.total === 0 ? (
+        <p className="muted pad">{t("distill.ledger.empty")}</p>
+      ) : (
+        <>
+          {/* #46: the REASON of the most recent failure, not just a count of
+              failures. `data-last-failure` carries that row's id (or `none`) and
+              `data-failure-reason` the text, so a test reads the reason itself
+              rather than the label beside it. */}
+          <div
+            className="row wrap"
+            data-last-failure={lastFailure ? String(lastFailure.id) : "none"}
+          >
+            <span className="muted micro">{t("distill.ledger.lastFailure")}</span>
+            {lastFailure ? (
+              <>
+                <span className="tag err">{t("distill.ledger.status.failed")}</span>
+                <span className="mono micro">{lastFailure.session_key}</span>
+                <span className="muted micro" title={lastFailure.distilled_at}>
+                  <RelTime iso={lastFailure.distilled_at} />
+                </span>
+                <span data-failure-reason="">
+                  {lastFailure.failure_reason ?? t("distill.ledger.noReason")}
+                </span>
+              </>
+            ) : (
+              <span className="muted micro">{t("distill.ledger.noneFailed")}</span>
+            )}
+          </div>
+
+          <ReadoutStrip
+            grid
+            items={[
+              { key: "rows", label: t("distill.ledger.totalLabel"), value: page.total },
+              {
+                key: "tokens",
+                label: t("distill.ledger.tokens"),
+                value: measured(totals.tokens_used, fmtTokens),
+              },
+              {
+                key: "cost",
+                label: t("distill.ledger.cost"),
+                value: measured(totals.cost_usd, fmtUsd),
+              },
+            ]}
+          />
+          <p className="muted micro">
+            {t("distill.ledger.totalsNote", {
+              t: totals.tokens_used_not_recorded,
+              c: totals.cost_usd_not_recorded,
+            })}
+          </p>
+
+          {/* The four buckets, each a MEASURED count — the daemon counts them
+              over the same filter as `total`, so a 0 here is a real zero and
+              the four add up to the number above. */}
+          <div className="row wrap">
+            {LEDGER_BUCKETS.map((b) => (
+              <span key={b} className={b === "failed" ? "tag err" : "tag"} data-bucket={b}>
+                {t(`distill.ledger.status.${b}`)} {page.by_status[b] ?? 0}
+              </span>
+            ))}
+          </div>
+
+          <Table
+            className="facts ledger"
+            size="small"
+            dataSource={page.entries}
+            rowKey="id"
+            pagination={false}
+            rowClassName={(e) => (e.status == null ? "row-old" : "")}
+            columns={[
+              {
+                title: t("distill.ledger.col.when"),
+                dataIndex: "distilled_at",
+                render: (v: string) => (
+                  <span className="muted micro" title={v}>
+                    <RelTime iso={v} />
+                  </span>
+                ),
+              },
+              {
+                title: t("distill.ledger.col.session"),
+                dataIndex: "session_key",
+                render: (v: string) => (
+                  <span className="mono micro" title={v}>
+                    {v}
+                  </span>
+                ),
+              },
+              {
+                title: t("distill.ledger.col.status"),
+                dataIndex: "status",
+                render: (v: string | null) => (
+                  <span
+                    className={v === "failed" ? "tag err" : v === "ok" ? "tag ok" : "tag"}
+                    data-status={v ?? "not_recorded"}
+                  >
+                    {t(`distill.ledger.status.${v ?? "not_recorded"}`)}
+                  </span>
+                ),
+              },
+              {
+                title: t("distill.ledger.col.reason"),
+                dataIndex: "failure_reason",
+                render: (v: string | null, e: DistillLedgerEntry) =>
+                  v != null ? (
+                    <span>{v}</span>
+                  ) : e.status === "failed" ? (
+                    <span className="muted micro">{t("distill.ledger.noReason")}</span>
+                  ) : (
+                    <span className="muted micro">—</span>
+                  ),
+              },
+              {
+                title: t("distill.ledger.col.usage"),
+                key: "usage",
+                render: (_: unknown, e: DistillLedgerEntry) => (
+                  <span className="mono micro">
+                    {measured(e.tokens_used, fmtTokens)}
+                    {" · "}
+                    {measured(e.cost_usd, fmtUsd)}
+                    {" · "}
+                    {measured(e.windows, (n) => t("distill.ledger.calls", { n }))}
+                    {e.truncated === true ? ` · ${t("distill.ledger.truncated")}` : ""}
+                  </span>
+                ),
+              },
+              {
+                title: t("distill.ledger.col.relations"),
+                key: "relations",
+                render: (_: unknown, e: DistillLedgerEntry) => (
+                  <span className="mono micro">
+                    {t("distill.ledger.relations", {
+                      w: e.relations_written,
+                      d: measured(e.relations_duplicate, String),
+                      r: measured(e.relations_refused, String),
+                    })}
+                  </span>
+                ),
+              },
+              {
+                title: t("distill.ledger.col.retries"),
+                dataIndex: "retries",
+                render: (v: number | null) => <span className="mono micro">{measured(v, String)}</span>,
+              },
+            ]}
+          />
+          {page.truncated ? (
+            <p className="muted micro pad">
+              {t("distill.ledger.rows", { n: page.total })}
+            </p>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
 // ---------------------------------------------------------------------------
 // The capability plane (the [capabilities] table of policy.toml)
 // ---------------------------------------------------------------------------

@@ -2,11 +2,31 @@
 // their currently-valid facts, with an inspector panel (bi-temporal facts,
 // as-of queries, neighbors). A plain list mode stays one toggle away.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Input, Popconfirm, Segmented, Table } from "antd";
 import { Icon, type IconName } from "../icons";
-import { api, type GraphEdge, type GraphEntity } from "../api";
-import { Empty, ErrorState, Modal, ReadoutStrip, Spinner, useToast } from "../ui";
+import {
+  api,
+  HttpError,
+  type GraphEdge,
+  type GraphEntity,
+  type ResolutionEntity,
+  type ResolutionQueue,
+} from "../api";
+import {
+  Empty,
+  ErrorState,
+  Modal,
+  ReadoutStrip,
+  Spinner,
+  StaleNotice,
+  readFailed,
+  readIsEmpty,
+  readLoading,
+  readReady,
+  useToast,
+  type LoadState,
+} from "../ui";
 import { Markdown } from "./lazy-markdown";
 import { dateOf, useI18n } from "../i18n";
 import { useThemeMode } from "../theme";
@@ -40,6 +60,132 @@ function kindIcon(kind: string | null) {
 
 function normalizeKind(kind: string | null): string {
   return kind === "organization" ? "org" : kind ?? "default";
+}
+
+/* ---------------------------------------------------------------------------
+   Provenance (#49 / #52): what a fact row says about WHERE it came from.
+   --------------------------------------------------------------------------- */
+
+/** The three values `source_kind` can carry, in the daemon's own vocabulary. */
+type FactSourceKind = "extraction" | "manual" | "unknown";
+
+/** Which of the three categories this edge is in.
+ *
+ *  `source_kind` is DERIVED on the daemon in one place
+ *  (`EventTimeSource::kind_of`), so the normal path is a straight read. The
+ *  fallback below exists because the field is ADDITIVE on the wire: a daemon
+ *  that predates it answers without the key, and a view that read that absence
+ *  as `"unknown"` would print 「来源未知」 for every row of a graph whose
+ *  provenance is in fact recorded — a reading the response never made.
+ *
+ *  The fallback repeats the daemon's MAPPING, never its storage: `extracted`
+ *  → extraction, `recorded` → manual, anything else (including `null`, and a
+ *  value a future writer invents) → unknown. It deliberately does NOT infer
+ *  from `source_episode`: an old row with an episode tells us it was written
+ *  by the distillation, but nothing about whether its timestamp was extracted,
+ *  and `source_kind` answers "who wrote this row?" — the question this column
+ *  shows. */
+function sourceKindOf(e: GraphEdge): FactSourceKind {
+  const k = e.source_kind;
+  if (k === "extraction" || k === "manual" || k === "unknown") return k;
+  if (e.event_time_source === "extracted") return "extraction";
+  if (e.event_time_source === "recorded") return "manual";
+  return "unknown";
+}
+
+/** The `<source>` segment of `sessions.key` (`<source>:<hash of ref_path>`),
+ *  or null when the key has no such segment. This is what makes the jump to
+ *  #sessions land on the right SOURCE tab instead of the whole index. */
+function sessionSourceOf(key: string): string | null {
+  const i = key.indexOf(":");
+  const s = i > 0 ? key.slice(0, i) : "";
+  return s || null;
+}
+
+/** The 「来源」 cell of the facts table: one cell per row, never blank.
+ *
+ *  Four cases, in the order the data selects them:
+ *    1. the row names a session → the session's title (its key when the
+ *       indexer never titled it) as a LINK to #sessions, narrowed to that
+ *       session's source;
+ *    2. distilled but no session can be named → says so;
+ *    3. written with the write clock (`source_kind = "manual"`) → 「手工记录」,
+ *       plus 「无来源会话」 when the row has no episode at all as well — the
+ *       two halves answer different questions (who wrote it / which session
+ *       it came from) and neither replaces the other;
+ *    4. provenance not recorded (`source_kind = "unknown"`, i.e.
+ *       `event_time_source IS NULL` — a row written before the column
+ *       existed, which is also the row whose `source_episode` is NULL) →
+ *       「来源未知」.
+ *
+ *  WHY the jump goes through #sessions rather than straight to the session:
+ *  the panel has no per-session deep link — SessionsView owns "which session
+ *  is open" as component state and reads only src/ws/when/sys/sort off the
+ *  hash, so a fabricated `#sessions/<key>` would be honoured by nobody. The
+ *  key is therefore carried where it cannot lie: in the link's own text (when
+ *  there is no title), in its `title` attribute, and in `data-session-key`,
+ *  which is the DOM hook a test reads. */
+function FactSource({ edge }: { edge: GraphEdge }) {
+  const { t } = useI18n();
+  const session = edge.source_session;
+  if (session) {
+    const source = sessionSourceOf(session.key);
+    const kind = sourceKindOf(edge);
+    return (
+      <span className="fact-source">
+        {/* A session AND `manual` at once is possible — a distillation that
+            found no event time writes the write clock while still naming its
+            episode — so the two rules are not exclusive: the category is shown
+            beside the session rather than instead of it. */}
+        {kind === "manual" ? (
+          <span className="tag">{t("graph.source.manual")}</span>
+        ) : null}
+        {/* An explicit space: `.tag` is an inline-block chip with no trailing
+            margin, so without it the chip and the session read as one word in
+            the cell's text (copyable text and a plain-text reader both see
+            "手工记录T2 …"). */}
+        {kind === "manual" ? " " : null}
+        <a
+          href={`#sessions${source ? `?src=${encodeURIComponent(source)}` : ""}`}
+          title={t("graph.source.openHint", { key: session.key })}
+          data-session-key={session.key}
+          // The KIND is the edge's own, read through the same mapping as every
+          // other cell instead of being inferred from the presence of a session.
+          data-source-kind={kind}
+        >
+          {session.title ?? session.key}
+        </a>
+      </span>
+    );
+  }
+  const kind = sourceKindOf(edge);
+  if (kind === "extraction") {
+    return (
+      <span className="muted micro" data-source-kind="extraction">
+        {t("graph.source.distilledNoSession")}
+      </span>
+    );
+  }
+  if (kind === "manual") {
+    return (
+      <span className="fact-source" data-source-kind="manual">
+        <span className="tag">{t("graph.source.manual")}</span>
+        {/* Same reason as the session+manual cell above: the chip carries no
+            trailing margin, so the space has to be in the text. */}
+        {edge.source_episode == null ? (
+          <>
+            {" "}
+            <span className="muted micro">{t("graph.source.noSession")}</span>
+          </>
+        ) : null}
+      </span>
+    );
+  }
+  return (
+    <span className="muted micro" data-source-kind="unknown">
+      {t("graph.source.unknown")}
+    </span>
+  );
 }
 
 /** The nine kinds, in one place: `readPalette` resolves a colour for each, the
@@ -335,6 +481,11 @@ export function Graph() {
   }, [creating, detailDialog]);
   const [err, setErr] = useState<unknown>(null);
   const [canvasFailed, setCanvasFailed] = useState(false);
+/** The merge queue (#50): its own read, its own three states. The count on the
+   *  entry button comes from here, and a FAILED read leaves the button without a
+   *  number rather than claiming a queue of 0 (see readIsEmpty's rule). */
+  const [queue, setQueue] = useState<LoadState<ResolutionQueue>>(readLoading());
+  const [queueOpen, setQueueOpen] = useState(false);
   const toast = useToast();
 
   // F2: `/graph/entity/<id>` is a per-entity endpoint, so prefetching the
@@ -347,6 +498,23 @@ export function Graph() {
   // t191: the edges are fetched with `EDGE_LIMIT`, never the endpoint's own
   // maximum of 5000 — the contract caps density at 600 edges and its remedy
   // past the cap is the valid_at window, not a bigger request.
+  /** Read the merge queue. A failure KEEPS whatever was read before (a
+   *  decision is not undone by a later failed read) and is never rendered as
+   *  "nothing to merge". */
+  const loadQueue = useCallback(() => {
+    api
+      .resolutionPending()
+      .then((q) => setQueue(readReady(q)))
+      .catch((e) => setQueue((prev) => readFailed(prev, e)));
+  }, []);
+
+  /** A decision was made: the queue shrank AND the graph changed (a merge moves
+   *  edges), so both readers are re-asked. */
+  const onDecided = () => {
+    loadQueue();
+    refresh();
+  };
+
   const refresh = () => {
     Promise.all([api.graphEntitiesAll(), api.graphEdges(EDGE_LIMIT)])
       .then(([ents, edgesRes]) => {
@@ -372,6 +540,10 @@ export function Graph() {
   useEffect(() => {
     refresh();
   }, []);
+
+  useEffect(() => {
+    loadQueue();
+  }, [loadQueue]);
 
   // A new selection drops the previous highlight; the batch edges stay on the
   // canvas (t191), so the graph never returns to being a point cloud.
@@ -450,6 +622,18 @@ export function Graph() {
         <h2>{t("graph.title")}</h2>
         <span className="muted">{t("graph.subtitle")}</span>
         <span className="grow" />
+        {/* #50: the merge queue the mechanical pass filled. The count is the
+            daemon's `pending_count`; a failed read leaves the number OFF the
+            button instead of printing a 0 that would read as "queue empty". */}
+        <Button
+          className="graph-resolution-entry"
+          onClick={() => setQueueOpen(true)}
+          aria-label={t("graph.resolution.title")}
+        >
+          {queue.kind === "ready"
+            ? t("graph.resolution.open", { n: queue.data.pending_count })
+            : t("graph.resolution.openPlain")}
+        </Button>
         <Segmented
           value={mode}
           onChange={(v) => setMode(v as "graph" | "list")}
@@ -646,6 +830,15 @@ export function Graph() {
         </div>
       )}
 
+      {queueOpen && (
+        <ResolutionQueueModal
+          state={queue}
+          onRetry={loadQueue}
+          onDecided={onDecided}
+          onClose={() => setQueueOpen(false)}
+        />
+      )}
+
       {creating && (
         <CreateEntityModal
           onClose={() => setCreating(false)}
@@ -656,6 +849,219 @@ export function Graph() {
         />
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The merge queue (#50 / t10's endpoint, t11's surface)
+// ---------------------------------------------------------------------------
+
+/** A pair's identity for React keys and for per-row messages: the table's key
+ *  is the UNORDERED pair, so the two ids sorted are the same identity the daemon
+ *  uses. */
+function pairKey(a: number, b: number): string {
+  return a < b ? `${a}:${b}` : `${b}:${a}`;
+}
+
+/** The queue the mechanical pass filled, and the two decisions a human can make.
+ *
+ *  WHY THE DIRECTION IS A CHOICE AND NOT A DEFAULT: merging is not symmetric —
+ *  the keeper keeps its identity and the absorbed name becomes one of its
+ *  aliases — so a panel that picked a direction for the user would be making an
+ *  identity decision on their behalf. Both buttons therefore name the keeper,
+ *  and nothing is merged until one of them is pressed.
+ *
+ *  The counts come from the response, never from the rows on screen: `pending`
+ *  is the queue, `dismissed` is how many decisions are remembered (so an empty
+ *  queue can be told from one that was worked through), and `counts_note` is the
+ *  daemon's own definition of the fact counts, printed verbatim rather than
+ *  restated in the panel's words. */
+function ResolutionQueueModal({
+  state,
+  onRetry,
+  onDecided,
+  onClose,
+}: {
+  state: LoadState<ResolutionQueue>;
+  onRetry: () => void;
+  onDecided: () => void;
+  onClose: () => void;
+}) {
+  const { t } = useI18n();
+  const toast = useToast();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<Record<string, string>>({});
+
+  const note = (key: string, text: string) =>
+    setMsg((m) => ({ ...m, [key]: text }));
+
+  /** A 404 means the pair left the queue between the read and the decision: an
+   *  ANSWER, not a failure — say so and refresh, exactly as the graph's own
+   *  delete path treats a 404. */
+  const goneOrFailed = (key: string, e: unknown) => {
+    if (e instanceof HttpError && e.status === 404) {
+      note(key, t("graph.resolution.gone"));
+      onDecided();
+    } else {
+      note(key, `${t("graph.resolution.failed")}${String(e).slice(0, 120)}`);
+    }
+  };
+
+  const mergeInto = async (keeper: ResolutionEntity, absorbed: ResolutionEntity) => {
+    const key = pairKey(keeper.id, absorbed.id);
+    setBusy(key);
+    try {
+      const r = await api.resolutionMerge(keeper.id, absorbed.id);
+      toast(
+        "ok",
+        t("graph.resolution.merged", {
+          moved: r.moved,
+          absorbed: r.alias,
+          keeper: keeper.name,
+        }),
+      );
+      onDecided();
+    } catch (e) {
+      goneOrFailed(key, e);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const keepApart = async (a: ResolutionEntity, b: ResolutionEntity) => {
+    const key = pairKey(a.id, b.id);
+    setBusy(key);
+    try {
+      const r = await api.resolutionDismiss(a.id, b.id);
+      toast(
+        "ok",
+        r.already_dismissed
+          ? t("graph.resolution.alreadyDismissed")
+          : t("graph.resolution.dismissedOk"),
+      );
+      onDecided();
+    } catch (e) {
+      goneOrFailed(key, e);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const pairs = state.data?.pending ?? [];
+
+  return (
+    <Modal title={t("graph.resolution.title")} onClose={onClose}>
+      {state.kind === "error" && state.data === null ? (
+        <ErrorState
+          title={t("graph.resolution.err")}
+          hint={`${t("graph.resolution.err.hint")} — ${String(state.err).slice(0, 200)}`}
+          onRetry={onRetry}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
+      {state.kind === "error" && state.data !== null ? (
+        // A failed refresh keeps the queue it already read, and says so.
+        <StaleNotice
+          err={state.err}
+          hint={t("graph.resolution.stale")}
+          onRetry={onRetry}
+        />
+      ) : null}
+      {state.data === null && state.kind !== "error" ? <Spinner /> : null}
+
+      {state.data !== null ? (
+        <>
+          <p className="muted micro">
+            {t("graph.resolution.counts", {
+              pending: state.data.pending_count,
+              dismissed: state.data.dismissed_count,
+            })}
+            {" "}
+            {state.data.counts_note}
+          </p>
+          {pairs.length === 0 ? (
+            <p className="muted pad">{t("graph.resolution.empty")}</p>
+          ) : (
+            <div className="card">
+              {pairs.map((p) => {
+                const key = pairKey(p.a.id, p.b.id);
+                const end = (e: ResolutionEntity, facts: number) => (
+                  <span className="row tight" data-resolution-end={e.id}>
+                    {e.kind ? <span className="tag">{e.kind}</span> : null}
+                    <strong data-resolution-name={e.name}>{e.name}</strong>
+                    <span className="muted micro">
+                      {t("graph.resolution.facts", { n: facts })}
+                    </span>
+                    {e.summary ? (
+                      <span className="muted micro truncated" title={e.summary}>
+                        {e.summary}
+                      </span>
+                    ) : null}
+                  </span>
+                );
+                return (
+                  <div key={key} className="row wrap" data-resolution-pair={key}>
+                    {end(p.a, p.a_facts)}
+                    <span className="muted micro">↔</span>
+                    {end(p.b, p.b_facts)}
+                    <span className="grow" />
+                    <span className="muted micro" data-resolution-busy={busy === key ? "true" : "false"}>
+                      {busy === key ? t("common.loading") : ""}
+                    </span>
+                    <Button
+                      size="small"
+                      disabled={busy === key}
+                      title={t("graph.resolution.mergeHint", {
+                        keeper: p.a.name,
+                        absorbed: p.b.name,
+                      })}
+                      onClick={() => void mergeInto(p.a, p.b)}
+                    >
+                      {t("graph.resolution.mergeInto", { name: p.a.name })}
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={busy === key}
+                      title={t("graph.resolution.mergeHint", {
+                        keeper: p.b.name,
+                        absorbed: p.a.name,
+                      })}
+                      onClick={() => void mergeInto(p.b, p.a)}
+                    >
+                      {t("graph.resolution.mergeInto", { name: p.b.name })}
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={busy === key}
+                      title={t("graph.resolution.keepApartHint")}
+                      onClick={() => void keepApart(p.a, p.b)}
+                    >
+                      {t("graph.resolution.keepApart")}
+                    </Button>
+                    {p.reason ? (
+                      <span className="muted micro" data-resolution-reason="">
+                        {t("graph.resolution.reason")}: {p.reason}
+                      </span>
+                    ) : null}
+                    {msg[key] ? (
+                      <p className="muted micro" role="status" data-resolution-msg="">
+                        {msg[key]}
+                      </p>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      ) : null}
+      <div className="row end">
+        <Button className="resolution-refresh" onClick={onRetry}>
+          {t("common.retry")}
+        </Button>
+        <Button onClick={onClose}>{t("common.close")}</Button>
+      </div>
+    </Modal>
   );
 }
 
@@ -1369,7 +1775,13 @@ function EntityDetail({
   const { t } = useI18n();
   const [facts, setFacts] = useState<GraphEdge[] | null>(null);
   const [factsErr, setFactsErr] = useState<unknown>(null);
-  const [neighbors, setNeighbors] = useState<[GraphEntity, number][] | null>(null);
+  /** The neighborhood read, as a three-state: a FAILED read keeps the last
+   *  successful list and says it may be out of date (#53's walkthrough). It used
+   *  to be `.catch(() => setNeighbors([]))`, which rendered a broken daemon as
+   *  「还没有连接。」 - the failure-shaped-as-emptiness this task exists to remove. */
+  const [neighbors, setNeighbors] = useState<LoadState<[GraphEntity, number][]>>(
+    readLoading(),
+  );
   /** This entity's OTHER names, read off the per-entity route.
    *
    *  `null` = not read yet, or unreadable — the row is simply absent then, which is
@@ -1384,6 +1796,16 @@ function EntityDetail({
   // t301: the entity's hard-delete entry (t276's DELETE route had no consumer).
   const [deleting, setDeleting] = useState(false);
   const [deleteMsg, setDeleteMsg] = useState<string | null>(null);
+  /** The daemon's OWN answer to the last 「添加事实」 this panel made: the row's
+   *  id and the `event_time_source` it now carries. A toast cannot carry this —
+   *  it is gone in seconds and it dies on the first navigation — and the row
+   *  itself only says 「手工记录」, which is the category, not the answer to
+   *  "where did this timestamp come from". So it is a line, it stays, and it
+   *  reads the SERVER's value rather than the form's assumption. */
+  const [receipt, setReceipt] = useState<{
+    id: number;
+    event_time_source: string | null;
+  } | null>(null);
   // Publish the dialog's open state upward; the cleanup also clears it on
   // unmount, so a stale `true` can never disable Escape for good.
   useEffect(() => {
@@ -1406,12 +1828,18 @@ function EntityDetail({
         setFactsErr(e);
       });
 
-  useEffect(() => {
-    loadFacts();
+  /** Read this entity's neighborhood. Defined outside the effect so the
+   *  stale banner's retry is the SAME read (one definition, two callers). */
+  const loadNeighbors = () => {
     api
       .graphNeighbors(entity.id, 2)
-      .then(setNeighbors)
-      .catch(() => setNeighbors([]));
+      .then((n) => setNeighbors(readReady(n)))
+      .catch((e) => setNeighbors((prev) => readFailed(prev, e)));
+  };
+
+  useEffect(() => {
+    loadFacts();
+    loadNeighbors();
     // The aliases come from the per-entity route — the only response that carries
     // the alias text. The entity passed in comes from the LIST route, whose rows do
     // not carry it, so this is the hop that makes the folded names visible.
@@ -1442,7 +1870,7 @@ function EntityDetail({
           title={t("graph.delete.title", { name: entity.name })}
           description={t("graph.delete.hint", {
             facts: (facts ?? []).filter((f) => f.invalid_at == null).length,
-            neighbors: neighbors?.length ?? 0,
+            neighbors: neighbors.data?.length ?? 0,
           })}
           okText={t("graph.delete.btn")}
           cancelText={t("common.cancel")}
@@ -1534,6 +1962,30 @@ function EntityDetail({
             </Button>
           ) : null}
         </div>
+        {receipt ? (
+          // role=status: the write already happened by the time this renders,
+          // so it is announced rather than waited on. `data-fact-receipt` is
+          // the hook a test reads, and it carries the value VERBATIM (or
+          // `none`), never a prettified guess at it.
+          <p
+            className="muted micro pad"
+            role="status"
+            data-fact-receipt={receipt.event_time_source ?? "none"}
+          >
+            {t("graph.addFact.receipt", {
+              id: receipt.id,
+              // A silent daemon is a VALUE here ("not returned"), not a dash
+              // the user has to interpret: the sentence beside it says what
+              // that silence means.
+              source: receipt.event_time_source ?? t("graph.addFact.receipt.none"),
+            })}{" "}
+            {receipt.event_time_source === "recorded"
+              ? t("graph.addFact.receipt.recorded")
+              : receipt.event_time_source === "extracted"
+                ? t("graph.addFact.receipt.extracted")
+                : t("graph.addFact.receipt.unrecorded")}
+          </p>
+        ) : null}
         {factsErr ? (
           <ErrorState
             title={t("graph.factsFailed")}
@@ -1556,6 +2008,19 @@ function EntityDetail({
             columns={[
               { title: t("graph.relation"), dataIndex: "relation", render: (v: string) => <span className="mono">{v}</span> },
               { title: t("graph.fact"), dataIndex: "fact_text" },
+              // The 来源 column sits AFTER the fact text ON PURPOSE:
+              // `.row-old td:nth-child(2)` in index.css strikes through the
+              // SECOND cell of a superseded row, so a column inserted before
+              // the fact text would move the strike-through onto provenance.
+              // `ellipsis` keeps the five columns inside the inspector's
+              // clamp(320px, 32vw, 460px) without a new inline style (audit row
+              // 12); the full text stays reachable as the link's `title`.
+              {
+                title: t("graph.source"),
+                key: "source",
+                ellipsis: true,
+                render: (_: unknown, f: GraphEdge) => <FactSource edge={f} />,
+              },
               { title: t("graph.valid"), dataIndex: "valid_at", render: (v: string) => <span className="muted mono">{dateOf(v)}</span> },
               {
                 title: t("graph.until"),
@@ -1574,33 +2039,51 @@ function EntityDetail({
         <div className="zone-head">
           <div className="zone-title">{t("graph.neighbors")}</div>
           <span className="zone-note">
-            {neighbors ? t("graph.rows", { n: neighbors.length }) : ""}
+            {neighbors.data ? t("graph.rows", { n: neighbors.data.length }) : ""}
           </span>
         </div>
-        {neighbors === null ? (
-          <Spinner />
-        ) : neighbors.length === 0 ? (
-          <p className="muted pad">{t("graph.noNeighbors")}</p>
-        ) : (
-          <div className="row wrap">
-            {neighbors.slice(0, NEIGHBORS_CAP).map(([n, d]) => (
-              <button key={n.id} className="neighbor" onClick={() => onSelectEntity(n)}>
-                {kindIcon(n.kind)} {n.name} <span className="muted">·{d}</span>
-              </button>
-            ))}
-          </div>
-        )}
-        {neighbors && neighbors.length > NEIGHBORS_CAP ? (
-          <p className="muted micro pad">{t("graph.capped", { n: NEIGHBORS_CAP })}</p>
+        {/* A failed read is a BANNER, never an empty list: the rows below are
+            whatever the last successful read found (or nothing, if there never
+            was one), and the banner carries the retry. */}
+        {neighbors.kind === "error" ? (
+          <StaleNotice
+            err={neighbors.err}
+            hint={t("graph.stale.hint")}
+            onRetry={loadNeighbors}
+          />
         ) : null}
+        {neighbors.data === null ? (
+          neighbors.kind === "error" ? null : <Spinner />
+        ) : (
+          <>
+            {readIsEmpty(neighbors, (n) => n.length === 0) ? (
+              <p className="muted pad">{t("graph.noNeighbors")}</p>
+            ) : (
+              <div className="row wrap">
+                {neighbors.data.slice(0, NEIGHBORS_CAP).map(([n, d]) => (
+                  <button key={n.id} className="neighbor" onClick={() => onSelectEntity(n)}>
+                    {kindIcon(n.kind)} {n.name} <span className="muted">·{d}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {neighbors.data.length > NEIGHBORS_CAP ? (
+              <p className="muted micro pad">{t("graph.capped", { n: NEIGHBORS_CAP })}</p>
+            ) : null}
+          </>
+        )}
       </div>
 
       {addingFact && (
         <AddFactModal
           source={entity}
           onClose={() => setAddingFact(false)}
-          onAdded={() => {
+          onAdded={(r) => {
             setAddingFact(false);
+            // Recorded BEFORE the reload lands: the receipt is about the write,
+            // not about the read, so a slow /facts response must not be able to
+            // swallow the daemon's answer to it.
+            setReceipt(r);
             loadFacts(at);
             onGraphChanged();
           }}
@@ -1671,7 +2154,11 @@ function AddFactModal({
 }: {
   source: GraphEntity;
   onClose: () => void;
-  onAdded: () => void;
+  /** Handed the daemon's ANSWER to the write, not a bare "it worked": the
+   *  caller shows the row's `event_time_source` (see `receipt` in
+   *  EntityDetail), and it must be the server's value — the panel cannot know
+   *  whether a future daemon keeps stamping `recorded`. */
+  onAdded: (receipt: { id: number; event_time_source: string | null }) => void;
 }) {
   const [targetName, setTargetName] = useState("");
   const [relation, setRelation] = useState("");
@@ -1709,6 +2196,11 @@ function AddFactModal({
         <span>{t("graph.addFact.valid")}</span>
         <Input className="mono" value={validAt} onChange={(e) => setValidAt(e.target.value)} placeholder={t("graph.datePh")} />
       </label>
+      {/* #49: the date field is optional because a write always HAS a
+          timestamp — the write clock — and the reader has to be told which one
+          it is before the write, not after. Stated here, next to the field it
+          governs, and again as the daemon's own answer in the receipt. */}
+      <p className="muted micro">{t("graph.addFact.timeNote")}</p>
       {err ? <ErrorState title={t("graph.addFactFailed")} hint={err} /> : null}
       <div className="row end">
         <Button
@@ -1720,7 +2212,7 @@ function AddFactModal({
             setErr(null);
             try {
               const target = await api.graphCreateEntity(targetName.trim());
-              await api.graphAddFact({
+              const written = await api.graphAddFact({
                 src: source.id,
                 dst: target.id,
                 relation: relation.trim(),
@@ -1728,7 +2220,11 @@ function AddFactModal({
                 valid_at: validAt.trim() || undefined,
               });
               toast("ok", t("toast.factAdded"));
-              onAdded();
+              // `?? null` keeps the two absences apart all the way to the
+              // receipt: `undefined` here would mean "this daemon does not
+              // answer the field", which the receipt must render as such
+              // rather than as a value it invented.
+              onAdded({ id: written.id, event_time_source: written.event_time_source ?? null });
             } catch (e) {
               // §5 error ③: a line that stays, and every field keeps its value.
               setErr(String(e));

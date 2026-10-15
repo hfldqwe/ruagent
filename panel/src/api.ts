@@ -161,6 +161,12 @@ export interface PendingPermission {
 /** Which archived sessions a list request should return. */
 export type ArchivedMode = "exclude" | "include" | "only";
 
+/** Which distillation standing a list request should return (`?only=`, t7 /
+ *  issue #47). The criterion is the LEDGER's (`status = 'ok'`), evaluated on
+ *  the daemon over its whole candidate window — not a panel-side guess over
+ *  the rows this page happens to hold, which answers a different question. */
+export type DistillScope = "undistilled" | "distilled";
+
 export interface SessionRecord {
   key: string;
   source: string; // claude-code | dsh | ruagent | opencode | codex
@@ -177,6 +183,22 @@ export interface SessionRecord {
   archived?: boolean;
   /** False for every source whose history file ruagent only indexes. */
   deletable?: boolean;
+  /** Whether the LEDGER says this session was successfully distilled: the
+   *  daemon derives it from `distill_log.status = 'ok'` on at least one
+   *  attempt (issue #47). ADDITIVE on the wire, so a daemon older than that
+   *  answers without it — absent renders as "no standing known", never as
+   *  "not distilled". `false` claims only "no successful attempt", which is
+   *  NOT the same claim as "never attempted": `distill_status` below carries
+   *  that half. */
+  distilled?: boolean;
+  /** The status of the NEWEST attempt on this session ("ok" | "empty" |
+   *  "failed"), `null` when that row recorded no status, `undefined` when the
+   *  daemon does not answer the field at all. */
+  distill_status?: string | null;
+  /** When the NEWEST attempt ran. Read it WITH `distill_status === null`: a
+   *  timestamp here separates "attempted, and that row recorded no status"
+   *  from "never attempted" (no ledger row at all, so no timestamp either). */
+  distilled_at?: string | null;
 }
 
 export interface RecallResult {
@@ -274,6 +296,132 @@ export interface DistillPolicy {
   language: string | null;
   prompt: string | null;
   builtin_prompt: string;
+}
+
+/** One attempt, from `GET /api/v1/distill/log` (t6 / issue #46). ONE ROW PER
+ *  ATTEMPT, newest first; the ledger keeps the failures too, which is what
+ *  makes "why did it fail" answerable at all.
+ *
+ *  EVERY measurement a writer may not have recorded is NULLABLE, and the three
+ *  states stay three: `null` = nobody recorded it (rows written before 0028),
+ *  `0` = a measured zero, a number = the reading. A view must not print a null
+ *  as 0, and must not add one into a sum. */
+export interface DistillLedgerEntry {
+  id: number;
+  session_key: string;
+  distilled_at: string;
+  /** "ok" | "empty" | "failed", or null when that row recorded no status —
+   *  the vocabulary's fourth state, NOT a fourth outcome. */
+  status: string | null;
+  /** WHY it failed, or why it wrote nothing, verbatim from the ledger (t4's
+   *  actionable messages) — the field this card exists to surface. */
+  failure_reason: string | null;
+  agent: string | null;
+  memories_written: number;
+  entities_written: number;
+  relations_written: number;
+  /** Relations the write path recognised as already present. */
+  relations_duplicate: number | null;
+  /** Relations the write path refused (a self-loop, a dangling end). */
+  relations_refused: number | null;
+  tokens_used: number | null;
+  /** The transcript context the model saw, in tokens. */
+  context_size: number | null;
+  cost_usd: number | null;
+  /** Bounded backoff retries this attempt needed (t4). */
+  retries: number | null;
+  /** MODEL CALLS this attempt cost: a transcript over the byte budget is split
+   *  into several windows and each window is one call (t5 / #48). This is the
+   *  count, not a byte size; null = not recorded. */
+  windows: number | null;
+  /** Whether any window lost transcript text. null = not recorded, false = a
+   *  measured, lossless pass. */
+  truncated: boolean | null;
+  prompt_hash: string | null;
+}
+
+/** `GET /api/v1/distill/log` — one page of the ledger plus the two summaries
+ *  beside it. `by_status` counts exactly the rows `total` counts (its four
+ *  buckets add up to `total`), so a bucket of 0 is a MEASURED zero. `totals`
+ *  sums only the RECORDED values: a null sum means "no row in this set recorded
+ *  one", and the `*_not_recorded` counts say how many rows that is. */
+export interface DistillLogPage {
+  entries: DistillLedgerEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+  /** The PAGE left rows out — a different field from an entry's own
+   *  `truncated`, which is about the transcript. */
+  truncated: boolean;
+  by_status: Record<string, number>;
+  totals: {
+    tokens_used: number | null;
+    cost_usd: number | null;
+    tokens_used_not_recorded: number;
+    cost_usd_not_recorded: number;
+  };
+}
+
+/** What a batch pass WOULD cost, from the same call with `dry_run=true`.
+ *  The daemon prices in the unit the ledger records (one attempt), and
+ *  `windows` is a sum of ceil(bytes / budget) — i.e. MODEL CALLS, not
+ *  sessions, because one over-budget transcript costs several. */
+export interface DistillEstimate {
+  sessions: number;
+  bytes: number;
+  windows: number;
+  /** The plan's byte bound for one model call (the window size). */
+  budget_bytes: number;
+  /** null = no successful attempt recorded one. NEVER 0 in that case. */
+  tokens_used: number | null;
+  cost_usd: number | null;
+  /** The daemon's own wording of how the number was derived. Printed
+   *  verbatim rather than paraphrased: a second wording drifts. */
+  method: string;
+  basis: {
+    ok_attempts: number;
+    windows_recorded: number;
+    windows_per_attempt: number | null;
+    tokens_recorded: number;
+    tokens_per_attempt: number | null;
+    cost_recorded: number;
+    cost_per_attempt: number | null;
+  };
+}
+
+/** What a batch pass DID cost: sums over the ledger rows that pass itself
+ *  wrote (id > the high-water mark it took when it started). */
+export interface DistillBatchActual {
+  rows: number;
+  windows: number | null;
+  tokens_used: number | null;
+  cost_usd: number | null;
+  windows_not_recorded: number;
+  tokens_used_not_recorded: number;
+  cost_usd_not_recorded: number;
+}
+
+/** `POST /api/v1/sessions/distill/batch` (t7 / issue #47). The SAME shape
+ *  answers the plan (`dry_run: true`) and the run, so the panel can put the
+ *  estimate and the actual reading side by side without translating between
+ *  two vocabularies. */
+export interface DistillBatchOutcome {
+  dry_run: boolean;
+  extractor: string;
+  /** How many sessions this pass would attempt (<= the requested limit). */
+  planned: number;
+  /** The daemon's own backlog size over its candidate window — the number the
+   *  entry button shows. Not derivable in the panel: it is decided by the index
+   *  and the ledger together. */
+  undistilled_total: number;
+  attempted: number;
+  ok: number;
+  empty: number;
+  failed: number;
+  estimated: DistillEstimate;
+  /** null on a dry run — nothing ran, so there is nothing to report. */
+  actual: DistillBatchActual | null;
+  results: { session_key: string; status: string; reason: string | null }[];
 }
 
 /** One capability's DECLARED options, RESOLVED: registry defaults merged with
@@ -652,6 +800,63 @@ export interface GraphEdge {
   valid_at: string;
   invalid_at: string | null;
   source_episode: number | null;
+  /** `entity_edges.event_time_source`, as STORED: `"extracted"` when the
+   *  extraction supplied an event time, `"recorded"` when the write clock
+   *  stamped it, `null` for a row whose writer recorded nothing.
+   *
+   *  ADDITIVE on the wire, the same rule `GraphEntity.aliases` above documents:
+   *  a daemon that predates the field answers without the key, so a reader
+   *  renders rather than requires. */
+  event_time_source?: string | null;
+  /** The session behind `source_episode`, when this read can name one —
+   *  `sessions.key`, reached through `source_episode` → `episodes.source_run`
+   *  → `sessions.key`, the same link distillation writes. `null` means exactly
+   *  "this read cannot name a session" (no episode at all, or an episode that
+   *  carries no `source_run`), never "there was none". */
+  source_session?: { key: string; title?: string | null } | null;
+  /** The READER's category for `event_time_source`: `"extraction"` |
+   *  `"manual"` | `"unknown"`, derived on the daemon in ONE place. `undefined`
+   *  on a daemon that predates the field — and absence is NOT `"unknown"`: the
+   *  view derives the same three values from `event_time_source` then (see
+   *  `sourceKindOf` in views/Graph.tsx), so an old response is never labelled
+   *  with a reading it did not make. */
+  source_kind?: string;
+}
+
+/** One end of a queued merge candidate: exactly what a decision needs. */
+export interface ResolutionEntity {
+  id: number;
+  name: string;
+  kind: string | null;
+  summary: string | null;
+}
+
+/** One pair the mechanical pass queued for a human (t10 / #50).
+ *
+ *  `a_facts`/`b_facts` are each entity's CURRENT facts, in the daemon's own
+ *  definition - and `counts_note` (below) ships that definition with the
+ *  numbers, so the panel shows the daemon's sentence instead of restating it
+ *  in its own words. */
+export interface ResolutionPair {
+  a: ResolutionEntity;
+  b: ResolutionEntity;
+  a_facts: number;
+  b_facts: number;
+  reason: string;
+  created_at: string;
+}
+
+/** `GET /api/v1/graph/resolution/pending`: the queue, the redundant pairs, and
+ *  the two counts. `pending_count` is the QUEUE's size (a decided pair is not
+ *  waiting); `dismissed_count` is how many decisions are remembered, so an
+ *  empty queue can be told from a queue that was worked through. */
+export interface ResolutionQueue {
+  pending: ResolutionPair[];
+  redundant: unknown[];
+  pending_count: number;
+  redundant_count: number;
+  dismissed_count: number;
+  counts_note: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,6 +1397,36 @@ export const api = {
     get<{ neighbors: [GraphEntity, number][] }>(
       `/api/v1/graph/entity/${id}/neighbors?hops=${hops}`,
     ).then((r) => r.neighbors),
+  /** The merge queue the mechanical pass filled (t10 / #50). A READ: it writes
+   *  nothing, and the two decisions below are the only ways it shrinks. */
+  resolutionPending: () => get<ResolutionQueue>("/api/v1/graph/resolution/pending"),
+  /** EXPLICIT merge: `keeper` absorbs `absorbed`, and the absorbed NAME becomes
+   *  an alias of the keeper (otherwise the next scan rebuilds what was merged).
+   *  Returns how many edges moved, so the caller can say what happened. */
+  resolutionMerge: (keeper: number, absorbed: number) =>
+    post("/api/v1/graph/resolution/merge", { keeper, absorbed }).then(
+      (r) =>
+        r.json() as Promise<{
+          keeper: number;
+          absorbed: number;
+          moved: number;
+          alias: string;
+          alias_written: boolean;
+        }>,
+    ),
+  /** "These two stay SEPARATE", as a remembered decision. Idempotent: a repeat
+   *  answers 200 with `already_dismissed: true`. A pair that was never queued is
+   *  a 404 (an HttpError with status 404) — there is nothing to keep apart. */
+  resolutionDismiss: (a: number, b: number) =>
+    post("/api/v1/graph/resolution/dismiss", { a, b }).then(
+      (r) =>
+        r.json() as Promise<{
+          a: number;
+          b: number;
+          dismissed: boolean;
+          already_dismissed: boolean;
+        }>,
+    ),
   graphFacts: (id: number, at?: string) =>
     get<{ facts: GraphEdge[] }>(
       `/api/v1/graph/entity/${id}/facts${at ? `?at=${encodeURIComponent(at)}` : ""}`,
@@ -1200,13 +1435,27 @@ export const api = {
     post("/api/v1/graph/entity", { name, kind, summary }).then(
       (r) => r.json() as Promise<{ id: number }>,
     ),
+  /** Every field below is `?:` because the response ECHOES what the write did:
+   *  `event_time_source` is the value the row now carries (`"recorded"` for
+   *  every panel write — this form has no event-time field), and it is the only
+   *  thing that can be said about the row's timestamp. Additive: the older
+   *  response carried `id` alone. */
   graphAddFact: (fact: {
     src: number;
     dst: number;
     relation: string;
     fact_text: string;
     valid_at?: string;
-  }) => post("/api/v1/graph/fact", fact).then((r) => r.json() as Promise<{ id: number }>),
+  }) =>
+    post("/api/v1/graph/fact", fact).then(
+      (r) =>
+        r.json() as Promise<{
+          id: number;
+          src?: number;
+          dst?: number;
+          event_time_source?: string | null;
+        }>,
+    ),
 
   // chat
   chatStart: (agent: string, model: string | null, cwd?: string) =>
@@ -1283,10 +1532,19 @@ export const api = {
   // session history (auto-synced)
   /** Full envelope — the list plus how many keys are hidden, so the filter
    *  bar can offer "show archived (N)" without a second request. */
-  sessionsList: (opts?: { archived?: ArchivedMode }) =>
-    get<{ sessions: SessionRecord[]; archived_count: number }>(
-      `/api/v1/sessions${opts?.archived ? `?archived=${opts.archived}` : ""}`,
-    ),
+  /** `only` is the SERVER-side distillation filter (t7 / issue #47): the
+   *  standing is decided against the ledger, so the page cannot answer it from
+   *  the rows it already holds. Both parameters ride one query string built
+   *  here — a second URL shape for the same route is how two callers drift. */
+  sessionsList: (opts?: { archived?: ArchivedMode; only?: DistillScope }) => {
+    const q = new URLSearchParams();
+    if (opts?.archived) q.set("archived", opts.archived);
+    if (opts?.only) q.set("only", opts.only);
+    const qs = q.toString();
+    return get<{ sessions: SessionRecord[]; archived_count: number }>(
+      `/api/v1/sessions${qs ? `?${qs}` : ""}`,
+    );
+  },
   /** Newest sessions, archived ones excluded — what Home and the command
    *  palette want. */
   sessions: () =>
@@ -1320,6 +1578,35 @@ export const api = {
           };
         }>,
     ),
+  /** `GET /api/v1/distill/log` — the distillation ledger (t6 / issue #46).
+   *  One row per ATTEMPT, newest first, through the same envelope as every
+   *  other list route. `status` is the ledger's own vocabulary: ok | empty |
+   *  failed | not_recorded. */
+  distillLog: (opts?: { status?: string; session?: string; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams();
+    if (opts?.status) q.set("status", opts.status);
+    if (opts?.session) q.set("session", opts.session);
+    if (opts?.limit != null) q.set("limit", String(opts.limit));
+    if (opts?.offset != null) q.set("offset", String(opts.offset));
+    const qs = q.toString();
+    return get<DistillLogPage>(`/api/v1/distill/log${qs ? `?${qs}` : ""}`);
+  },
+  /** `POST /api/v1/sessions/distill/batch` (t7 / issue #47). With `dryRun` the
+   *  daemon PLANS AND PRICES only: no extraction, no model call, no write —
+   *  which is what makes it safe to ask before the user commits, and the only
+   *  source of the global backlog count. `limit` is clamped by the daemon to its
+   *  own [1, 200]. */
+  distillBatch: (opts?: { limit?: number; dryRun?: boolean }) => {
+    const q = new URLSearchParams();
+    if (opts?.limit != null) q.set("limit", String(opts.limit));
+    if (opts?.dryRun) q.set("dry_run", "true");
+    const qs = q.toString();
+    // An empty JSON body: the route reads the body as raw bytes, so `{}` means
+    // "the defaults", the same thing an absent body means (t4/t7).
+    return post(`/api/v1/sessions/distill/batch${qs ? `?${qs}` : ""}`, {}).then(
+      (r) => r.json() as Promise<DistillBatchOutcome>,
+    );
+  },
   recall: (q: string, conservative: boolean, topN = 5) =>
     get<RecallResult>(
       `/api/v1/recall?q=${encodeURIComponent(q)}&strategy=${conservative ? "conservative" : "aggressive"}&top_n=${topN}`,

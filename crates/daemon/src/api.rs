@@ -59,10 +59,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/graph/entity/{id}/neighbors", get(graph_neighbors))
         .route("/api/v1/graph/entity/{id}/facts", get(graph_facts))
-        // DEP-4 (graph spec, wired in t19): the six multi-hop / community /
-        // resolution entry points. Everything here is READ-ONLY except the three
-        // explicit writes, and no write ever happens implicitly (a merge is a
-        // human/agent decision, never a background side effect).
+        // DEP-4 (graph spec, wired in t19): the multi-hop / community / resolution
+        // entry points. Everything here is READ-ONLY except the explicit writes --
+        // ~communities/build~, ~community/{id}/summary~, ~resolution/merge~ and
+        // ~resolution/dismiss~ -- and no write ever happens implicitly: a merge, or a
+        // "these two stay apart", is a human/agent decision, never a background side
+        // effect.
         .route("/api/v1/graph/retrieve", get(graph_retrieve))
         .route("/api/v1/graph/communities", get(graph_communities))
         .route(
@@ -80,6 +82,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/graph/resolution/merge",
             post(graph_resolution_merge),
+        )
+        .route(
+            "/api/v1/graph/resolution/dismiss",
+            post(graph_resolution_dismiss),
         )
         .route("/api/v1/memory/write", post(memory_write))
         .route("/api/v1/memory/supersede", post(memory_supersede))
@@ -158,6 +164,9 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/distill",
             get(distill_policy_get).put(distill_policy_put),
         )
+        // The ledger's READ face (t6): one row per attempt, filtered and paged
+        // through the same envelope as every other list route.
+        .route("/api/v1/distill/log", get(distill_log))
         // The capability plane (docs/plans/capability-plugins-design.md §14).
         // The handlers live in `crate::capability` so this file keeps only the
         // route lines; `GET` lists every capability, `PUT` replaces the whole
@@ -196,6 +205,13 @@ pub fn router(state: AppState) -> Router {
             post(session_archive).delete(session_unarchive),
         )
         .route("/api/v1/sessions/{key}/distill", post(session_distill))
+        // The BACKLOG pass (#47): the SAME distillation path, once per undistilled
+        // session, with a plan-only dry run. Registered beside the single-session
+        // route because the two must never become two implementations.
+        .route(
+            "/api/v1/sessions/distill/batch",
+            post(sessions_distill_batch),
+        )
         .route("/api/v1/recall", get(recall))
         .route("/api/v1/recall/log", get(recall_log))
         // INT46-1 (t47): the route the MCP tool `memory_forget_report` proxies.
@@ -415,6 +431,76 @@ impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, self.message).into_response()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pagination (t6 / issues #46, #54): ONE envelope, ONE implementation
+// ---------------------------------------------------------------------------
+
+/// THE pagination envelope: `{<items_key>: [...], total, limit, offset, truncated}`.
+///
+/// WHY ONE FUNCTION AND NOT ONE PER ROUTE: `/graph/edges` already answered
+/// `{edges, total, limit, offset}` and every other list route that paged did its
+/// own arithmetic, so "was this page cut short?" was answered by whoever wrote
+/// the route -- or not at all. A caller that has to remember which route spells
+/// which field will get it wrong once, and the mistake is silent (an empty page
+/// reads as "nothing there"). Every offset-paged list route below calls THIS:
+/// `/graph/edges`, `/graph/entities`, `/api/v1/tasks`, `/api/v1/distill/log`.
+///
+/// THE FOUR FIELDS MEAN EXACTLY ONE THING:
+///   * `total`     -- how many rows the FILTER matches, before `limit`/`offset`.
+///   * `limit`     -- the size this page was cut to, as answered (clamped value).
+///   * `offset`    -- how many matching rows were skipped before it.
+///   * `truncated` -- TRUE only when rows were actually left out of this page,
+///     i.e. `offset + <rows returned> < total`. A page that ends exactly at the
+///     last row is NOT truncated, and reporting one that is would train a reader
+///     to refetch a page that does not exist.
+///
+/// `items_key` names the route's own collection (`edges`, `entities`, `tasks`,
+/// `entries`): the envelope is shared, the collection name stays the route's, so
+/// this change is additive for every existing consumer.
+///
+/// WHAT DOES NOT GO THROUGH IT, AND WHY: `memory/list` and `recall?legs=` answer a
+/// WINDOW, not a page — they take `limit` and no `offset`, their `total` already
+/// means "rows in this response", and their `matched` is the pre-limit count.
+/// That shape is a contract the panel reads today (`panel/src/api.ts`,
+/// `memoryList`/`recall`), so folding it in here would change two meanings the
+/// panel depends on — a bigger change than this route convergence, and one whose
+/// readers live outside this task. They are noted rather than silently converted:
+/// neither is offset-paged, so neither is a second PAGE shape.
+///
+/// THEIR TRUNCATION IS STATED TOO (t22, #54's third acceptance): both carry
+/// `truncated` and `truncated_sections` -- additive keys, no existing key re-typed --
+/// so "the window was reached and rows were left over" is readable from the response
+/// instead of derivable from `matched` minus `total`. What they still do NOT have is
+/// `offset`, which is the whole reason they are not folded in here.
+fn page(
+    items_key: &str,
+    items: serde_json::Value,
+    total: i64,
+    limit: u32,
+    offset: u32,
+) -> serde_json::Value {
+    let returned = items.as_array().map_or(0, |rows| rows.len()) as i64;
+    let mut body = serde_json::json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "truncated": (offset as i64).saturating_add(returned) < total,
+    });
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(items_key.to_string(), items);
+    }
+    body
+}
+
+/// The `limit`/`offset` a list route got, resolved the same way everywhere:
+/// `limit` defaults to `default` and is clamped to `1..=max` (the daemon's
+/// existing convention -- `memory/list`, `chats`, `recall/log` all clamp), and
+/// `offset` defaults to 0. The CLAMPED pair is what the envelope reports, so a
+/// caller that asked for 0 sees the size it actually got.
+fn page_bounds(limit: Option<u32>, offset: Option<u32>, default: u32, max: u32) -> (u32, u32) {
+    (limit.unwrap_or(default).clamp(1, max), offset.unwrap_or(0))
 }
 
 /// THE daemon's ONE sentence for a refused recall-leg configuration (design
@@ -851,6 +937,10 @@ async fn knowledge_expand(
 struct GraphEntitiesQuery {
     #[serde(default)]
     limit: Option<u32>,
+    /// How many matching rows to skip -- the envelope's `offset` (t6). Without it
+    /// the entities past a 50-row page were unreachable through the API.
+    #[serde(default)]
+    offset: Option<u32>,
     /// Absent = off. Named for what it turns on, not for the mechanism.
     #[serde(default)]
     aliases: Option<bool>,
@@ -861,8 +951,18 @@ async fn graph_entities(
     Query(q): Query<GraphEntitiesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = state.mgr.db();
-    let entities = ruagent_graph::list_entities(db, q.limit.unwrap_or(50)).await?;
-    let mut body = serde_json::json!({ "entities": entities });
+    let (limit, offset) = page_bounds(q.limit, q.offset, 50, 5_000);
+    let (entities, total) = ruagent_graph::list_entities(db, limit, offset).await?;
+    // The page's own collection is `entities`, and the four envelope fields ride
+    // beside it. `total` is the count of ALL entities, so `truncated` can say
+    // whether this page is the whole graph or the first slice of it.
+    let mut body = page(
+        "entities",
+        serde_json::json!(entities),
+        total,
+        limit,
+        offset,
+    );
     if q.aliases == Some(true) {
         let ids: Vec<i64> = body["entities"]
             .as_array()
@@ -881,19 +981,31 @@ async fn graph_entities(
 /// fan out one request per node (design §12 row 39: K=1 ⇒ R<=4), so the edges
 /// come back together -- bounded by limit/offset with the total, so a large
 /// graph is paged instead of pulled whole.
+///
+/// THE FOUR SIZE FIELDS COME FROM THE DAEMON'S ONE ENVELOPE (t6, the helper
+/// `page` above), so this route and `/graph/entities`, `/api/v1/tasks` and
+/// `/api/v1/distill/log` cannot drift into four answers to "how big was this
+/// list?". `truncated` was added with that envelope and is the field that says
+/// whether a second request would return more; `edges`/`total`/`limit`/`offset`
+/// keep the meaning this route already had.
 async fn graph_edges(
     State(state): State<AppState>,
     Query(q): Query<EdgeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = q.limit.unwrap_or(500).min(5_000);
-    let offset = q.offset.unwrap_or(0);
+    let (limit, offset) = page_bounds(q.limit, q.offset, 500, 5_000);
     let (edges, total) = ruagent_graph::list_edges(state.mgr.db(), limit, offset).await?;
-    Ok(Json(serde_json::json!({
-        "edges": edges,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    })))
+    // The same envelope as every other paged list route, with this route's own
+    // collection name and one ADDED field: `truncated` (t6). `edges`/`total`/
+    // `limit`/`offset` keep the meaning they already had, so the panel's reader
+    // is unaffected; `truncated` is what a caller needs in order to know that a
+    // second request would return more.
+    Ok(Json(page(
+        "edges",
+        serde_json::json!(edges),
+        total,
+        limit,
+        offset,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -904,46 +1016,188 @@ struct EdgeQuery {
     offset: Option<u32>,
 }
 
-/// Entity search for the panel and the CLI: two passes, and the answer says
-/// which one produced it.
+/// The largest page either search route will serve, whatever the caller asks for
+/// (t26 / #54).
 ///
-/// The strict pass is the phrase pass (`search_entities`, the interface t250
-/// froze): it quotes the whole query into FTS5 phrases, and a phrase requires
-/// its tokens to be adjacent IN ONE COLUMN. `autohotkey-v2` therefore cannot
-/// reach the entity `AutoHotkey` whose summary says `v2.0.28` -- name and
-/// summary are different columns -- so the panel answered "no such entity" for
-/// an entity that was right there (t312 measured it; t320 fixes it here).
+/// A search page is a READING, not an export: `/graph/entities` (bounded at 5000) is
+/// where a full listing belongs. Before t26 `/graph/search` parsed `limit` and then
+/// ignored it (a fixed 10), and `/memory/search` passed it through unbounded.
+const SEARCH_PAGE_MAX: u32 = 200;
+
+/// How many matching rows a search route will WORK OUT before it stops counting and
+/// reports a lower bound (t26 / #54).
 ///
-/// When the strict pass finds nothing, the loose pass runs, and its results are
-/// reported as `candidate` rather than as hits: loose is a WIDENING pass (AND
-/// over tokens, then a single-token prefix OR, then LIKE), so it also answers
-/// for a name that does not exist at all (`zzz-not-a-real-name` matches on
-/// `"name"*`). Presenting those as plain hits would trade a silent miss for
-/// a silent false positive; `match` says which leg spoke.
+/// The count is read from the search itself (see `match_window`), which costs one
+/// widening query per step, so the loop needs a stop. A corpus that matches more rows
+/// than this is reported as "at least this many" (`matched_exact: false`) rather than
+/// read to the end -- the same discipline as the rest of this file: no key that reads
+/// like an exact count may carry a floor.
+const SEARCH_MATCH_CEILING: u32 = 5_000;
+
+/// The page size a search route will serve: the caller's `limit`, defaulted when
+/// absent and bounded either way.
+fn search_page_limit(asked: Option<u32>, default: u32) -> u32 {
+    asked.unwrap_or(default).clamp(1, SEARCH_PAGE_MAX)
+}
+
+/// One search page, plus how many rows matched BEFORE the page was cut.
+struct MatchWindow<T> {
+    /// The matching rows for this reply, in the search's own order.
+    page: Vec<T>,
+    /// Matching rows the search worked out; `page` is a prefix of them.
+    observed: u32,
+    /// Whether `observed` is the COMPLETE match count. False = the widen loop stopped
+    /// at `SEARCH_MATCH_CEILING`, so `observed` is a lower bound.
+    exact: bool,
+}
+
+/// Ask the search for one row MORE than the page, and keep asking for more while it
+/// answers with everything it was asked for (t26 / #54).
+///
+/// WHY NOT A COUNT(*) QUERY HERE: a search's predicate -- the FTS phrase builder, the
+/// legs, the dedupe, the "superseded/deleted" filters, the ordering -- belongs to the
+/// crate that owns the search. A COUNT written in this file would be a second spelling
+/// of it, and the day one of them changes, this route would report a count that
+/// silently contradicts the rows beside it. So the count is READ FROM THE SEARCH, by
+/// giving it a wider window until it says it is done: one extra row is the whole trick,
+/// and it costs at most one query per widening step.
+async fn match_window<T, F, Fut>(limit: u32, fetch: F) -> Result<MatchWindow<T>, ApiError>
+where
+    T: Send,
+    F: Fn(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<T>, ruagent_store::DbError>> + Send,
+{
+    let mut want = limit.saturating_add(1).max(1);
+    loop {
+        let rows = fetch(want).await?;
+        let observed = rows.len() as u32;
+        // FEWER ROWS THAN ASKED FOR = the search reached the end of its match set, so
+        // this count is the whole answer and needs no further query.
+        if observed < want {
+            return Ok(cut_to_page(rows, limit, observed, true));
+        }
+        // EVERY ROW ASKED FOR, at the ceiling: the exact count is unknowable from here
+        // without reading the rest of the corpus.
+        if want >= SEARCH_MATCH_CEILING {
+            return Ok(cut_to_page(rows, limit, observed, false));
+        }
+        want = want.saturating_mul(4).min(SEARCH_MATCH_CEILING);
+    }
+}
+
+/// Keep the page, remember the reading, drop the rows beyond the page.
+fn cut_to_page<T>(mut rows: Vec<T>, limit: u32, observed: u32, exact: bool) -> MatchWindow<T> {
+    rows.truncate(limit as usize);
+    MatchWindow {
+        page: rows,
+        observed,
+        exact,
+    }
+}
+
+/// The keys every search reply adds BESIDE its rows (t26 / #54), in one place so the
+/// two routes cannot drift into two spellings of "there is more":
+///
+/// * `matched` -- how many rows matched before the page was cut (the word the rest of
+///   the platform already uses for a pre-limit count),
+/// * `matched_exact` -- whether `matched` is that complete count; false means the
+///   search's own scan stopped at `SEARCH_MATCH_CEILING` and `matched` is a FLOOR
+///   (t25's rule: a lower bound must not be published under a key that reads exact),
+/// * `truncated` / `truncated_sections` -- t22's vocabulary, so a caller that
+///   already reads a cut from `/memory/list`, `/recall` or the session list needs no
+///   new rule. `truncated` is "rows counted > rows returned", and it is always
+///   PROVEN (the widen saw the extra rows), never inferred from "the page looks full".
+/// * `limit` -- the page size this route actually applied, after clamping.
+fn search_cut_keys(
+    returned: u32,
+    matched: u32,
+    exact: bool,
+    section: &'static str,
+    limit: u32,
+) -> Vec<(String, serde_json::Value)> {
+    let cut = matched > returned;
+    vec![
+        ("limit".to_string(), serde_json::json!(limit)),
+        ("matched".to_string(), serde_json::json!(matched)),
+        ("matched_exact".to_string(), serde_json::json!(exact)),
+        ("truncated".to_string(), serde_json::json!(cut)),
+        (
+            "truncated_sections".to_string(),
+            if cut {
+                serde_json::json!([section])
+            } else {
+                serde_json::json!([])
+            },
+        ),
+    ]
+}
+
+/// Entity search for the panel and the CLI: two passes, and the answer says which one
+/// produced it -- AND what the page left out (t26 / #54).
+///
+/// The strict pass is the phrase pass (`search_entities`, the interface t250 froze): it
+/// quotes the whole query into FTS5 phrases, and a phrase requires its tokens to be
+/// adjacent IN ONE COLUMN. `autohotkey-v2` therefore cannot reach the entity
+/// `AutoHotkey` whose summary says `@v2.0.28` -- name and summary are different columns
+/// -- so the panel answered "no such entity" for an entity that was right there (t312
+/// measured it; t320 fixes it here).
+///
+/// When the strict pass finds nothing, the loose pass runs, and its results are reported
+/// as `candidate` rather than as hits: loose is a WIDENING pass (AND over tokens, then a
+/// single-token prefix OR, then LIKE), so it also answers for a name that does not exist
+/// at all (`zzz-not-a-real-name` matches on @"name"*@). Presenting those as plain hits
+/// would trade a silent miss for a silent false positive; `match` says which leg spoke.
+///
+/// LIMIT AND THE READING (t26): this route used to parse `limit` and pass a FIXED 10 to
+/// both legs, so a caller could neither widen the page nor tell a cut from a complete
+/// answer. The page now honours `limit` (bounded by `SEARCH_PAGE_MAX`), and
+/// `match_window` reads the pre-limit count out of the SAME searches -- `matched`,
+/// `matched_exact`, `truncated`, `truncated_sections` and the applied `limit` ride
+/// beside `entities`.
 async fn graph_search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = state.mgr.db();
-    let strict = ruagent_graph::search_entities(db, &q.q, 10).await?;
-    let (entities, matched) = if !strict.is_empty() {
+    let limit = search_page_limit(q.limit, 10);
+    // The COUNT comes from the same call as the page: `match_window` asks for one row
+    // more than the page and keeps widening while the search fills the request.
+    let strict = match_window(limit, |want| ruagent_graph::search_entities(db, &q.q, want)).await?;
+    let (window, matched) = if !strict.page.is_empty() {
         (strict, "exact")
-    } else {
+    } else if q.q.trim().is_empty() {
         // An empty query has nothing to widen to: it is "none", not a fallback.
-        let loose = if q.q.trim().is_empty() {
-            Vec::new()
-        } else {
-            ruagent_graph::search_entities_loose(db, &q.q, 10).await?
-        };
-        if loose.is_empty() {
+        (
+            MatchWindow {
+                page: Vec::new(),
+                observed: 0,
+                exact: true,
+            },
+            "none",
+        )
+    } else {
+        let loose = match_window(limit, |want| {
+            ruagent_graph::search_entities_loose(db, &q.q, want)
+        })
+        .await?;
+        if loose.page.is_empty() {
             (loose, "none")
         } else {
             (loose, "candidate")
         }
     };
-    Ok(Json(
-        serde_json::json!({ "entities": entities, "match": matched }),
-    ))
+    let returned = window.page.len() as u32;
+    let mut body = serde_json::Map::new();
+    body.insert("entities".to_string(), serde_json::json!(window.page));
+    body.insert("match".to_string(), serde_json::json!(matched));
+    body.extend(search_cut_keys(
+        returned,
+        window.observed,
+        window.exact,
+        "entities",
+        limit,
+    ));
+    Ok(Json(serde_json::Value::Object(body)))
 }
 
 #[derive(Deserialize)]
@@ -1301,10 +1555,37 @@ async fn graph_create_entity(
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
+/// `POST /api/v1/graph/fact` — the manual fact write (panel / CLI / MCP / a person
+/// with `curl`).
+///
+/// EACH END IS ADDRESSED BY ID **OR BY NAME** (issue #52's write half), never by
+/// both: `src`/`dst` are entity ids, `src_name`/`dst_name` are names resolved by
+/// the SAME rule the extraction probes with — exact `norm_name`, then the alias
+/// table (`ruagent_graph::resolve_entity_id`, whose two probes are
+/// `resolve_entity_in`'s own). A name that resolves to nothing is a 400 that
+/// names the string: this route does not create entities, because a typo that
+/// invents a node is how one object becomes two.
+///
+/// THE RESPONSE CARRIES THE PROVENANCE IT WROTE. Every edge now records where
+/// `valid_at` came from (issue #49), and for this route the answer is always
+/// `recorded`: a panel/CLI write did not come out of a transcript, so there is no
+/// event time to claim even when `valid_at` was given explicitly. The graph
+/// crate's `EventTimeSource` is the definition of that vocabulary, so the value
+/// is taken from there rather than typed here as a literal.
 #[derive(Deserialize)]
 struct AddFactRequest {
-    src: i64,
-    dst: i64,
+    /// The source end, by entity id.
+    #[serde(default)]
+    src: Option<i64>,
+    /// The target end, by entity id.
+    #[serde(default)]
+    dst: Option<i64>,
+    /// The source end, by name (case/whitespace-insensitive, aliases included).
+    #[serde(default)]
+    src_name: Option<String>,
+    /// The target end, by name.
+    #[serde(default)]
+    dst_name: Option<String>,
     relation: String,
     fact_text: String,
     /// RFC3339 or ISO date; None = now.
@@ -1312,21 +1593,60 @@ struct AddFactRequest {
     valid_at: Option<String>,
 }
 
+/// One end of a fact, from either addressing form. Exactly one is required: an
+/// id silently ignored because a name was also sent would be a write against an
+/// endpoint the caller did not choose.
+async fn resolve_fact_end(
+    db: &ruagent_store::Db,
+    id: Option<i64>,
+    name: Option<&str>,
+    field: &str,
+) -> Result<i64, ApiError> {
+    match (id, name) {
+        (Some(id), None) => Ok(id),
+        (None, Some(name)) => ruagent_graph::resolve_entity_id(db, name)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "`{field}_name` {name:?} names no entity (matched neither a norm_name nor a \
+                     recorded alias); create it first, or pass `{field}` as an id"
+                ))
+            }),
+        (Some(_), Some(_)) => Err(ApiError::bad_request(format!(
+            "give exactly one of `{field}` and `{field}_name`"
+        ))),
+        (None, None) => Err(ApiError::bad_request(format!(
+            "give one of `{field}` and `{field}_name`"
+        ))),
+    }
+}
+
 async fn graph_add_fact(
     State(state): State<AppState>,
     Json(req): Json<AddFactRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let id = ruagent_graph::add_fact(
-        state.mgr.db(),
-        req.src,
-        req.dst,
+    let db = state.mgr.db();
+    let src = resolve_fact_end(db, req.src, req.src_name.as_deref(), "src").await?;
+    let dst = resolve_fact_end(db, req.dst, req.dst_name.as_deref(), "dst").await?;
+    let id = ruagent_graph::add_fact_with_source(
+        db,
+        src,
+        dst,
         &req.relation,
         &req.fact_text,
         req.valid_at.as_deref(),
+        ruagent_graph::EventTimeSource::Recorded,
         None,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "id": id })))
+    Ok(Json(serde_json::json!({
+        "id": id,
+        // Echoed back after the write: the caller can assert the row it just
+        // created says where its timestamp came from.
+        "src": src,
+        "dst": dst,
+        "event_time_source": ruagent_graph::EventTimeSource::Recorded.as_str(),
+    })))
 }
 
 /// The entity, its aliases and its facts.
@@ -1582,20 +1902,87 @@ async fn graph_community_summary(
     Ok(Json(serde_json::json!({ "id": id, "updated": updated })))
 }
 
-/// `GET /api/v1/graph/resolution/pending` — two SEPARATE readings: the queued
-/// pairs (a decision is waiting) and the pairs that are already the same object
-/// under two rows (a merge was missed).
+/// GET /api/v1/graph/resolution/pending — three SEPARATE readings: the queued
+/// pairs (a decision is waiting, each with the context that decision needs), the
+/// pairs that are already the same object under two rows (a merge was missed), and
+/// how many pairs have been ANSWERED (a remembered "these two stay apart", #50).
+///
+/// Each queued pair carries both ends as an object of id/name/kind/summary plus
+/// a_facts and b_facts: the number of CURRENT (not invalidated) facts each entity
+/// appears in, in either direction. The 口径 ships beside the numbers
+/// (counts_note), because a count nobody can define is a count nobody can act on --
+/// and it is the SAME definition the entity list reports (graph::current_fact_count).
+///
+/// pending_count is the size of the queue the caller is looking at, never the
+/// table's row count: a pair a human answered is not waiting, and dismissed_count
+/// says how many decisions are remembered, so "queue empty" can be told from "queue
+/// empty because it was worked through".
 async fn graph_resolution_pending(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let pending = ruagent_graph::pending_pairs(state.mgr.db()).await?;
+    let (pending, dismissed) = ruagent_graph::pending_queue(state.mgr.db()).await?;
     let redundant = ruagent_graph::redundant_pairs(state.mgr.db()).await?;
+    let pending_count = pending.len();
+    let redundant_count = redundant.len();
     Ok(Json(serde_json::json!({
         "pending": pending,
         "redundant": redundant,
-        "pending_count": pending.len(),
-        "redundant_count": redundant.len(),
+        "pending_count": pending_count,
+        "redundant_count": redundant_count,
+        "dismissed_count": dismissed,
+        "counts_note": "a_facts/b_facts are each entity's current facts (entity_edges rows with invalid_at IS NULL, either direction)",
     })))
+}
+
+#[derive(Deserialize)]
+struct DismissBody {
+    a: i64,
+    b: i64,
+}
+
+/// POST /api/v1/graph/resolution/dismiss -- "these two stay SEPARATE", as a
+/// REMEMBERED decision (t10 / #50).
+///
+/// WHY IT EXISTS: without it the queue could only shrink by merging, so a pair a
+/// human had looked at and judged different came back on every mechanical pass, and
+/// a reader could not tell "not looked at yet" from "looked at, deliberately left
+/// apart".
+///
+/// IDEMPOTENT: a repeat answers 200 with dismissed=false and already_dismissed=true
+/// -- the same decision twice is not a client error, and a client retrying a request
+/// whose answer it never saw must not be told it did something wrong. A pair that
+/// was never queued is a 404 instead: there is nothing to keep apart, and saying
+/// "done" would claim a decision the queue never held.
+///
+/// MERGE IS UNTOUCHED and is not blocked by a dismissal: both are explicit
+/// decisions, and a dismissal is what a human said about the pair, not a lock on the
+/// entities.
+async fn graph_resolution_dismiss(
+    State(state): State<AppState>,
+    Json(body): Json<DismissBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.a == body.b {
+        return Err(ApiError::bad_request("a and b are the same entity"));
+    }
+    let outcome = ruagent_graph::dismiss_pair(state.mgr.db(), body.a, body.b).await?;
+    match outcome {
+        ruagent_graph::DismissOutcome::NotQueued => Err(ApiError::not_found(format!(
+            "no queued pair for entities {} and {}",
+            body.a, body.b
+        ))),
+        ruagent_graph::DismissOutcome::Dismissed => Ok(Json(serde_json::json!({
+            "a": body.a,
+            "b": body.b,
+            "dismissed": true,
+            "already_dismissed": false,
+        }))),
+        ruagent_graph::DismissOutcome::AlreadyDismissed => Ok(Json(serde_json::json!({
+            "a": body.a,
+            "b": body.b,
+            "dismissed": false,
+            "already_dismissed": true,
+        }))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1647,8 +2034,13 @@ async fn graph_resolution_merge(
     let moved = ruagent_graph::merge_entities(state.mgr.db(), body.keeper, body.absorbed).await?;
     // The absorbed name must become an alias of the keeper, or the next scan
     // rebuilds the entity we just merged away.
-    let alias_written =
-        ruagent_graph::add_alias(state.mgr.db(), body.keeper, &absorbed_name, "merge").await?;
+    let alias_written = ruagent_graph::add_alias(
+        state.mgr.db(),
+        body.keeper,
+        &absorbed_name,
+        ruagent_graph::AliasSource::Merge,
+    )
+    .await?;
     Ok(Json(serde_json::json!({
         "keeper": body.keeper,
         "absorbed": body.absorbed,
@@ -2026,8 +2418,24 @@ async fn create_task(
 #[derive(Deserialize)]
 struct ListTasksQuery {
     status: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
 }
 
+/// The task list, PAGED through the daemon's shared envelope (t6).
+///
+/// WHY THE SLICE IS TAKEN HERE AND NOT IN SQL: `Store::list_tasks` is the frozen
+/// reader (crates/store), and it answers the whole filtered set. The count and the
+/// page must come from ONE answer -- a second LIMIT/OFFSET statement written here
+/// would be exactly the second paging implementation this change exists to remove
+/// -- so the filtered set is read once, counted, and sliced. At single-user scale
+/// that set is the daemon's own task list (25 rows on the live database).
+///
+/// `limit` defaults to 200 rather than "no bound": a page size the envelope can
+/// NAME is what makes `truncated` meaningful, and every other list route here has
+/// a default. A caller that needs more asks for it (max 1000).
 async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<ListTasksQuery>,
@@ -2040,8 +2448,21 @@ async fn list_tasks(
             ))
         })?),
     };
-    let tasks = state.mgr.db().list_tasks(status).await?;
-    Ok(Json(serde_json::json!({ "tasks": tasks })))
+    let all = state.mgr.db().list_tasks(status).await?;
+    let total = all.len() as i64;
+    let (limit, offset) = page_bounds(q.limit, q.offset, 200, 1_000);
+    let tasks: Vec<Task> = all
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(Json(page(
+        "tasks",
+        serde_json::json!(tasks),
+        total,
+        limit,
+        offset,
+    )))
 }
 
 async fn get_task(
@@ -2721,13 +3142,148 @@ async fn run_events(
 #[derive(Deserialize)]
 struct SessionsQuery {
     limit: Option<u32>,
+    /// ACCEPTED AND REFUSED, never ignored (t25 / #54): this list is a window, not a
+    /// paged list, and the reader behind it takes no offset. A caller that sends one
+    /// gets a 400 naming the parameter instead of a 200 with page one -- see the
+    /// handler.
+    offset: Option<u32>,
     /// exclude (default) | include | only
     archived: Option<String>,
+    /// undistilled | distilled (t7 / issue #47): narrows the page to sessions the
+    /// ledger says were, or were not, successfully distilled.
+    only: Option<String>,
+}
+
+/// One session's DISTILLATION standing, read from the ledger (t7 / issue #47).
+struct DistillStanding {
+    /// At least one attempt recorded `status = 'ok'`.
+    distilled: bool,
+    /// The status of the NEWEST attempt -- any status, and `None` when that row
+    /// recorded none (the vocabulary's fourth state, not a fourth outcome).
+    status: Option<String>,
+    /// When the newest attempt ran.
+    distilled_at: Option<String>,
+    /// The id of that newest row: the mark a batch call uses to recognise the row
+    /// ITS OWN attempt wrote, as opposed to the ones that were already there.
+    latest_id: Option<i64>,
+}
+
+/// The columns `distill_standing` reads for one session, in order: the key, whether
+/// any attempt recorded `ok`, the newest attempt's status and timestamp, and that
+/// row's id. A named type because the tuple is wide enough to be unreadable at the
+/// call site (clippy::type_complexity).
+type StandingRow = (String, i64, Option<String>, Option<String>, Option<i64>);
+
+/// The `(status, failure_reason)` of one ledger row.
+type AttemptRow = (Option<String>, Option<String>);
+
+/// The standing of MANY sessions in ONE query -- a page asks about every row it
+/// might return, so a per-row read would be N+1 against the single writer.
+///
+/// `distill_log.status = 'ok'` IS THE ONLY CRITERION for "this session was
+/// distilled" (issue #47), and WHY IT IS NOT `episodes.kind`:
+///   * the ledger is ONE ROW PER ATTEMPT with a written vocabulary
+///     (`ok` | `empty` | `failed`, 0020/0024) and it KEEPS every attempt, so both
+///     "did it ever succeed" and "what happened last time" are one query;
+///   * `episodes` is the MEMORY table. A `run_turn` row there is a side effect of
+///     a successful write path, and the failed-path case had to be made visible by
+///     relabelling it (`run_turn_failed`, distill.rs) -- i.e. the episode column
+///     answers the question only after a second kind was invented for it;
+///   * `episodes` also holds rows no session distillation produced (imported
+///     documents, and the t347 prefix migration's `manual` rows), so
+///     `kind = 'run_turn'` is a question about the memory table, not about a
+///     session key.
+///
+/// The criterion is interpreted in exactly ONE place (here) and BOTH readers call
+/// it: the session list and the batch planner.
+async fn distill_standing(
+    db: &ruagent_store::Db,
+    keys: &[String],
+) -> Result<std::collections::BTreeMap<String, DistillStanding>, ApiError> {
+    if keys.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let keys: Vec<String> = keys.to_vec();
+    let rows = db
+        .call(move |conn| -> Result<Vec<StandingRow>, rusqlite::Error> {
+            let marks = std::iter::repeat_n("?", keys.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT d.session_key,
+                            MAX(CASE WHEN d.status = 'ok' THEN 1 ELSE 0 END),
+                            (SELECT x.status FROM distill_log x
+                              WHERE x.session_key = d.session_key ORDER BY x.id DESC LIMIT 1),
+                            (SELECT x.distilled_at FROM distill_log x
+                              WHERE x.session_key = d.session_key ORDER BY x.id DESC LIMIT 1),
+                            MAX(d.id)
+                       FROM distill_log d
+                      WHERE d.session_key IN ({marks})
+                      GROUP BY d.session_key"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keys.len());
+            for key in &keys {
+                params.push(key);
+            }
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            rows.collect()
+        })
+        .await??;
+    Ok(rows
+        .into_iter()
+        .map(|(key, ok, status, distilled_at, latest_id)| {
+            (
+                key,
+                DistillStanding {
+                    distilled: ok != 0,
+                    status,
+                    distilled_at,
+                    latest_id,
+                },
+            )
+        })
+        .collect())
 }
 
 /// A session is only deletable by the tool that owns its history file.
 /// Everything else here is an index of a file we must not remove.
 const DELETABLE_SOURCE: &str = "ruagent";
+
+/// How many rows BEYOND the page `GET /api/v1/sessions` reads, and the ceiling that
+/// read may widen to (t25 / #54).
+///
+/// WHY A PEEK AND NOT A COUNT: this route's reader (`SessionIndexer::list`) takes a
+/// limit and nothing else -- no offset, no count -- and `daemon/src/sessions.rs` and
+/// `crates/store` are outside this task, so the daemon cannot ask "how many sessions
+/// are there". ONE ROW PAST THE PAGE is the whole proof: if it survives the filters,
+/// there is another session to show, and the response says so.
+///
+/// WHY IT WIDENS: the filters are not free -- a key can be tombstoned, archived, or
+/// dropped by `only=` -- so a page whose newest rows are filtered out would look
+/// short AND complete. The read is repeated wider until the filtered set reaches one
+/// row past the page or the index runs out. The ceiling bounds that loop
+/// (`SCAN_MAX`, or `limit + 1` when the caller asked for more than that, so a large
+/// explicit limit is not silently lowered). PAST THE CEILING the list reports what it
+/// saw rather than inventing a count: the same "no evidence, no claim" rule the
+/// window-shaped readers follow elsewhere (t22).
+const SESSIONS_LIST_PEEK: u32 = 1;
+const SESSIONS_LIST_SCAN_MAX: u32 = 4_000;
+
+/// Does this session pass the caller's `only=` filter?
+///
+/// ONE DEFINITION (t25): the widening loop COUNTS with it and the response loop
+/// SELECTS with it, so the number the truncation decision is made on and the rows that
+/// come back cannot disagree.
+fn distill_scope_keeps(only: Option<&str>, distilled: bool) -> bool {
+    match only {
+        Some("undistilled") => !distilled,
+        Some("distilled") => distilled,
+        _ => true,
+    }
+}
 
 async fn sessions_list(
     State(state): State<AppState>,
@@ -2739,6 +3295,26 @@ async fn sessions_list(
         return Err(ApiError::bad_request(format!(
             "archived must be one of exclude|include|only, got '{mode}'"
         )));
+    }
+    let only = q.only.as_deref();
+    if let Some(only) = only
+        && !matches!(only, "undistilled" | "distilled")
+    {
+        return Err(ApiError::bad_request(format!(
+            "only must be one of undistilled|distilled, got '{only}'"
+        )));
+    }
+    // t25 (#54's third acceptance): AN IGNORED PARAMETER IS WORSE THAN A REFUSED ONE.
+    // `offset` used to be dropped on the floor: a caller asking for page 2 received
+    // page 1, HTTP 200, and no way to tell. It is refused HERE, BY NAME, because this
+    // route's reader (`SessionIndexer::list`) takes no offset, and both
+    // `daemon/src/sessions.rs` and `crates/store` are outside this task -- writing a
+    // second sessions projection here is the duplication this effort exists to remove.
+    // What a caller CAN rely on is `truncated`, which says whether more sessions exist.
+    if q.offset.is_some() {
+        return Err(ApiError::bad_request(
+            "offset is not supported by /api/v1/sessions: this list is a window, not a paged list; send limit, and read truncated to learn whether more sessions exist",
+        ));
     }
     // Deleted sessions are gone in *every* mode: the tombstone exists so that
     // the indexer's next rescan (INSERT OR REPLACE, every 60s) cannot bring
@@ -2760,33 +3336,82 @@ async fn sessions_list(
         .into_iter()
         .filter(|k| !deleted.contains(k))
         .collect();
-    let mut sessions = state
-        .sessions
-        .list(limit)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-    // ruagent conversations carry the agent identity from the chats
-    // table (which role/runtime the user was talking to).
-    if sessions.iter().any(|s| s.source == "ruagent") {
-        let by_key = state.chats.session_keys_by_agent(limit).await;
-        for s in &mut sessions {
-            if s.source == "ruagent"
-                && let Some(agent) = by_key.get(s.key.as_str())
-            {
-                s.agent = Some(agent.clone());
+
+    // t25 (#54's third acceptance): THE WINDOW IS READ ONE ROW DEEPER THAN THE PAGE, so
+    // "there are more sessions than this page" is PROVEN rather than inferred. See
+    // `SESSIONS_LIST_PEEK` for why a count is not available and why the read widens.
+    let ceiling = limit
+        .saturating_add(SESSIONS_LIST_PEEK)
+        .max(SESSIONS_LIST_SCAN_MAX);
+    let mut want = limit.saturating_add(SESSIONS_LIST_PEEK);
+    let (visible, standing, truncated) = loop {
+        let mut sessions = state
+            .sessions
+            .list(want)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+        // Fewer rows than asked for means the INDEX RAN OUT -- the other half of the
+        // answer, and the only case in which "no more sessions" is certain.
+        let exhausted = (sessions.len() as u32) < want;
+        // ruagent conversations carry the agent identity from the chats
+        // table (which role/runtime the user was talking to).
+        if sessions.iter().any(|s| s.source == "ruagent") {
+            let by_key = state.chats.session_keys_by_agent(want).await;
+            for s in &mut sessions {
+                if s.source == "ruagent"
+                    && let Some(agent) = by_key.get(s.key.as_str())
+                {
+                    s.agent = Some(agent.clone());
+                }
             }
         }
-    }
-    // The archived flag is not part of the index (see the session_archives
-    // migration for why it cannot be a column), so it is added here rather
-    // than in the indexer's record.
-    let mut out = Vec::with_capacity(sessions.len());
-    for s in sessions {
-        if deleted.contains(&s.key) {
-            continue;
+        // The archived flag is not part of the index (see the session_archives
+        // migration for why it cannot be a column), so it is added here rather
+        // than in the indexer's record.
+        //
+        // THE VISIBLE SET IS BUILT FIRST, THEN THE STANDING IS READ FOR ALL OF IT
+        // (t7): the ledger is asked ONE question about the window's keys rather than
+        // one per row, and a filter placed before that read would have to decide on a
+        // value nothing has read yet.
+        let mut visible: Vec<(crate::sessions::SessionRecord, bool)> =
+            Vec::with_capacity(sessions.len());
+        for s in sessions {
+            if deleted.contains(&s.key) {
+                continue;
+            }
+            let is_hidden = hidden.contains(&s.key);
+            if (mode == "exclude" && is_hidden) || (mode == "only" && !is_hidden) {
+                continue;
+            }
+            visible.push((s, is_hidden));
         }
-        let is_hidden = hidden.contains(&s.key);
-        if (mode == "exclude" && is_hidden) || (mode == "only" && !is_hidden) {
+        let keys: Vec<String> = visible.iter().map(|(s, _)| s.key.clone()).collect();
+        let standing = distill_standing(state.mgr.db(), &keys).await?;
+        // The `only=` filter is the one that can drop ARBITRARILY many rows, so it
+        // takes part in the same decision, through the same predicate the response
+        // loop uses.
+        let kept = visible
+            .iter()
+            .filter(|(s, _)| {
+                let distilled = standing.get(&s.key).map(|st| st.distilled).unwrap_or(false);
+                distill_scope_keeps(only, distilled)
+            })
+            .count();
+        if kept > limit as usize || exhausted || want >= ceiling {
+            break (visible, standing, kept > limit as usize);
+        }
+        want = want.saturating_mul(2).min(ceiling);
+    };
+    // The page is the FIRST `limit` rows of the visible set: the peek row (and any row
+    // the widening needed) was read and counted, never returned.
+    let mut out = Vec::with_capacity(limit as usize);
+    for (s, is_hidden) in visible {
+        if out.len() >= limit as usize {
+            break;
+        }
+        let standing = standing.get(&s.key);
+        let distilled = standing.map(|st| st.distilled).unwrap_or(false);
+        if !distill_scope_keeps(only, distilled) {
             continue;
         }
         let mut v = serde_json::to_value(&s)
@@ -2797,12 +3422,41 @@ async fn sessions_list(
                 "deletable".into(),
                 serde_json::Value::Bool(s.source == DELETABLE_SOURCE),
             );
+            // DERIVED HERE, once per row (t7 / issue #47). `distilled` is the
+            // ledger's answer (see `distill_standing` for why it is not the episode
+            // kind); `distill_status`/`distilled_at` describe the NEWEST attempt, so
+            // a session that failed and then succeeded reads as distilled with
+            // status `ok` -- and an attempt whose row recorded no status reads as
+            // `null`, not as `ok`.
+            //
+            // A session with NO ledger row at all is `false`/`null`/`null`: never
+            // attempted, never guessed.
+            obj.insert("distilled".into(), serde_json::Value::Bool(distilled));
+            obj.insert(
+                "distill_status".into(),
+                serde_json::json!(standing.and_then(|st| st.status.clone())),
+            );
+            obj.insert(
+                "distilled_at".into(),
+                serde_json::json!(standing.and_then(|st| st.distilled_at.clone())),
+            );
         }
         out.push(v);
     }
     Ok(Json(serde_json::json!({
         "sessions": out,
         "archived_count": hidden.len(),
+        // t22's vocabulary, applied here (t25 / #54): one boolean plus the section it
+        // is about, so a caller that handles `recall` or `memory/list` handles this one
+        // the same way. WHY THERE IS NO TOTAL: this reader exposes no count (see
+        // `SESSIONS_LIST_PEEK`), and a number that is really a lower bound must not be
+        // published under a name that reads like an exact count.
+        "truncated": truncated,
+        "truncated_sections": if truncated {
+            serde_json::json!(["sessions"])
+        } else {
+            serde_json::json!([])
+        },
     })))
 }
 
@@ -3111,16 +3765,32 @@ fn distill_request(body: &[u8]) -> Result<(crate::extract_plane::ExtractPlan, bo
 /// `ExtractPlan::explicit(Acp)` — and `{"extractor":"rules"|"acp"|"both",
 /// "dry_run":bool}` names the implementation. `dry_run` extracts and reports
 /// without writing anything at all.
+///
+/// THE DISTILLER AND THE AGENT CARD COME FROM THE HELPERS BELOW (t7), so this route
+/// and `/sessions/distill/batch` cannot drift into two policy reads, two distillers
+/// or two card-resolution rules.
 async fn session_distill(
     State(state): State<AppState>,
     Path(key): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (plan, dry_run) = distill_request(&body)?;
-    // The live policy decides: its agent, else dsh, else the first
-    // enabled; its language/prompt ride the extraction prompt.
+    let card = distill_card(&state, plan)?;
+    let out = distiller_for(&state)
+        .distill_plan(&key, card.as_ref(), plan, dry_run)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "distilled": out })))
+}
+
+/// The daemon's distiller, from the LIVE policy: its agent, else dsh, else the
+/// first enabled; its language and prompt ride the extraction prompt.
+///
+/// ONE definition for both distillation routes: a batch that built its own
+/// distiller would run under a policy snapshot the single route never sees.
+fn distiller_for(state: &AppState) -> crate::distill::Distiller {
     let policy = state.chats.distill_policy_now();
-    let distiller = crate::distill::Distiller {
+    crate::distill::Distiller {
         db: state.mgr.db().clone(),
         root: state.config.root.clone(),
         embedder: Some(state.knowledge.embedder()),
@@ -3128,31 +3798,709 @@ async fn session_distill(
         language: policy.language,
         prompt_override: policy.prompt,
         graph: policy.graph,
-    };
-    // THE AGENT CARD IS RESOLVED LAZILY (t14): it is the ACP tier's business, so a
-    // plan the caller built from `{"extractor":"rules"}` must NOT need one. Until
-    // this, the free tier was unreachable on a machine with no enabled agent —
-    // the exact machine it is for — and answered 400 to a request that was never
-    // going to spawn anything. An ACP plan with no enabled agent still fails
-    // here, visibly, naming the reason; that requirement is unchanged.
-    let card = if plan.acp {
-        let agents = state.mgr.agents();
-        let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
-        Some(
-            crate::distill::select_agent(&enabled, policy.agent.as_deref())
-                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
-                .clone(),
-        )
-    } else {
-        None
-    };
-    let out = distiller
-        .distill_plan(&key, card.as_ref(), plan, dry_run)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    Ok(Json(serde_json::json!({ "distilled": out })))
+    }
 }
 
+/// THE AGENT CARD IS RESOLVED LAZILY (t14): it is the ACP tier's business, so a
+/// plan the caller built from `{"extractor":"rules"}` must NOT need one. Until this,
+/// the free tier was unreachable on a machine with no enabled agent — the exact
+/// machine it is for — and answered 400 to a request that was never going to spawn
+/// anything. An ACP plan with no enabled agent still fails here, visibly, naming
+/// the reason; that requirement is unchanged.
+///
+/// ONE definition, and the batch calls it ONCE per request rather than once per
+/// session: which agent runs a batch is a property of the request, and re-resolving
+/// it 200 times would let the registry change under a running loop.
+fn distill_card(
+    state: &AppState,
+    plan: crate::extract_plane::ExtractPlan,
+) -> Result<Option<ruagent_core::AgentCard>, ApiError> {
+    if !plan.acp {
+        return Ok(None);
+    }
+    let policy = state.chats.distill_policy_now();
+    let agents = state.mgr.agents();
+    let enabled: Vec<_> = agents.iter().filter(|a| a.enabled).cloned().collect();
+    Ok(Some(
+        crate::distill::select_agent(&enabled, policy.agent.as_deref())
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+            .clone(),
+    ))
+}
+
+/// What a batch call asks for: the contract's `limit` and `dry_run`.
+#[derive(Deserialize)]
+struct DistillBatchQuery {
+    /// How many undistilled sessions this call may attempt.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Plan-only. ORed with the body's `dry_run` -- see the handler.
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+/// How many undistilled sessions one batch call attempts by default, the ceiling a
+/// caller may ask for, and how many sessions the planner READS to find them.
+///
+/// WHY A DEFAULT AT ALL: the endpoint closes a backlog, and a pass that ran the
+/// whole index because the caller forgot a parameter would be an unbounded spend. 20
+/// is small enough to be safe on a database full of long sessions and large enough
+/// to finish a real backlog in a few calls.
+///
+/// WHY THE SCAN IS BOUNDED, and what it costs: the criterion ("no successful attempt
+/// recorded") is evaluated over the sessions the indexer returns, newest first.
+/// 2 000 is above the live index (688 sessions on this machine), and the response
+/// reports `undistilled_total` so a caller can see when the bound bites.
+const DISTILL_BATCH_DEFAULT_LIMIT: u32 = 20;
+const DISTILL_BATCH_MAX_LIMIT: u32 = 200;
+const DISTILL_BATCH_SCAN: u32 = 2_000;
+
+/// `POST /api/v1/sessions/distill/batch?limit=&dry_run=` — the BACKLOG pass (#47).
+///
+/// WHAT IT SELECTS: sessions with NO attempt that recorded `status = 'ok'`, newest
+/// first, minus the ones the session list hides (deleted and archived — the backlog
+/// is the same visible set, so "undistilled" means one thing in both places). The
+/// criterion is `distill_standing`'s, which is also the list route's: one
+/// definition, two readers.
+///
+/// EACH SESSION GOES THROUGH THE SINGLE ROUTE'S PATH: the same `distiller_for`, the
+/// same `distill_card`, the same `distill_plan`. Nothing about a per-session
+/// distillation is reimplemented here — including its retries, its ledger row and
+/// its refusals.
+///
+/// A FAILURE DOES NOT STOP THE PASS: the loop counts and continues, and every
+/// session's outcome is in `results[]` with the reason. A caller repairing a backlog
+/// wants the other sessions, not a 500.
+///
+/// WHAT `dry_run` MEANS HERE, and why it differs from the single route's: on the
+/// single route it EXTRACTS one session and reports what would be written. A batch
+/// of that would spend the tokens the caller is trying to price — N extractions for
+/// a question about N extractions. So the batch's dry run does not extract at all:
+/// it plans (which sessions, which bound) and estimates (bytes, model calls,
+/// tokens, cost), writes nothing, and reports `attempted: 0`. The `dry_run` flag is
+/// the OR of the query and the body: a caller who asked for it in either place does
+/// not get a write.
+///
+/// THE ESTIMATE'S BASIS IS IN THE RESPONSE (see `estimate_batch`): the number of
+/// model calls is derived from the sessions' BYTES and the plan's own byte bound,
+/// because after #48 a long transcript is cut into windows and EVERY window is its
+/// own call — "one call per session" is wrong for exactly the sessions a backlog is
+/// made of. Tokens and cost are the ledger's per-attempt means, reported with the
+/// number of attempts they rest on.
+async fn sessions_distill_batch(
+    State(state): State<AppState>,
+    Query(q): Query<DistillBatchQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // THE SAME BODY VOCABULARY as the single route (one parser, one refusal text for
+    // an unknown extractor).
+    let (plan, body_dry_run) = distill_request(&body)?;
+    let dry_run = body_dry_run || q.dry_run.unwrap_or(false);
+    let limit = q
+        .limit
+        .unwrap_or(DISTILL_BATCH_DEFAULT_LIMIT)
+        .clamp(1, DISTILL_BATCH_MAX_LIMIT);
+
+    let db = state.mgr.db();
+    // The hidden keys, read the way the list route reads them: a tombstoned session
+    // must not be distilled, and an archived one is not part of the visible backlog.
+    let deleted: std::collections::HashSet<String> = db
+        .deleted_session_keys()
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .collect();
+    let archived: std::collections::HashSet<String> = db
+        .archived_session_keys()
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .collect();
+    let candidates: Vec<crate::sessions::SessionRecord> = state
+        .sessions
+        .list(DISTILL_BATCH_SCAN)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?
+        .into_iter()
+        .filter(|s| !deleted.contains(&s.key) && !archived.contains(&s.key))
+        .collect();
+    let keys: Vec<String> = candidates.iter().map(|s| s.key.clone()).collect();
+    let standing = distill_standing(db, &keys).await?;
+    let undistilled: Vec<String> = candidates
+        .iter()
+        .filter(|s| !standing.get(&s.key).map(|st| st.distilled).unwrap_or(false))
+        .map(|s| s.key.clone())
+        .collect();
+    let undistilled_total = undistilled.len();
+    let planned: Vec<String> = undistilled.iter().take(limit as usize).cloned().collect();
+    let bytes = session_bytes(db, &planned).await?;
+    let means = ledger_means(db).await?;
+    let estimated = estimate_batch(&planned, &bytes, plan.limits.max_input_bytes, &means);
+
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "dry_run": true,
+            "extractor": plan.label(),
+            "planned": planned.len(),
+            "undistilled_total": undistilled_total,
+            "attempted": 0,
+            "ok": 0,
+            "empty": 0,
+            "failed": 0,
+            "estimated": estimated,
+            "actual": serde_json::Value::Null,
+            "results": [],
+        })));
+    }
+
+    // RESOLVED BEFORE THE LOOP, so a plan that cannot run fails the REQUEST (400,
+    // naming the reason) instead of writing N identical failures.
+    let card = distill_card(&state, plan)?;
+    let distiller = distiller_for(&state);
+    // The ledger's high-water mark: every row with a higher id was written by THIS
+    // batch, which is what makes "what did this pass actually cost" answerable
+    // without needing to know which attempts belonged to it.
+    let start_id: i64 = db
+        .call_flat(|conn| {
+            conn.query_row("SELECT COALESCE(MAX(id), 0) FROM distill_log", [], |r| {
+                r.get(0)
+            })
+        })
+        .await?;
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(planned.len());
+    let (mut ok, mut empty, mut failed) = (0u32, 0u32, 0u32);
+    for key in &planned {
+        let before = standing.get(key).and_then(|st| st.latest_id);
+        let attempt: Result<crate::distill::DistillOutcome, String> = distiller
+            .distill_plan(key, card.as_ref(), plan, false)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let written = attempt_written_since(db, key, before).await?;
+        let (status, reason) = classify_attempt(&attempt, written);
+        match status.as_str() {
+            "ok" => ok += 1,
+            "empty" => empty += 1,
+            "failed" => failed += 1,
+            // `not_recorded` is not one of the three outcomes: it is the ledger
+            // read's word for "no row recorded this", and it is reported per
+            // session rather than folded into a count it does not belong to.
+            _ => {}
+        }
+        results.push(serde_json::json!({
+            "session_key": key,
+            "status": status,
+            "reason": reason,
+        }));
+    }
+    let actual = batch_actual(db, start_id).await?;
+    Ok(Json(serde_json::json!({
+        "dry_run": false,
+        "extractor": plan.label(),
+        "planned": planned.len(),
+        "undistilled_total": undistilled_total,
+        "attempted": results.len(),
+        "ok": ok,
+        "empty": empty,
+        "failed": failed,
+        "estimated": estimated,
+        "actual": actual,
+        "results": results,
+    })))
+}
+
+/// The transcript BYTES of these sessions, from the INDEX'S OWN measurement.
+///
+/// `sessions.size_bytes` is what the indexer recorded for the file, so it is the
+/// size the distillation will read. It is read here rather than through
+/// `SessionIndexer` because `SessionRecord` does not carry it and
+/// `daemon/src/sessions.rs` is outside this task; a key with no row is ABSENT from
+/// the map — unknown is not zero bytes, and the estimate must not average it in.
+async fn session_bytes(
+    db: &ruagent_store::Db,
+    keys: &[String],
+) -> Result<std::collections::BTreeMap<String, i64>, ApiError> {
+    if keys.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let keys: Vec<String> = keys.to_vec();
+    let rows = db
+        .call(move |conn| -> Result<Vec<(String, i64)>, rusqlite::Error> {
+            let marks = std::iter::repeat_n("?", keys.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT key, size_bytes FROM sessions WHERE key IN ({marks})");
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keys.len());
+            for key in &keys {
+                params.push(key);
+            }
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            rows.collect()
+        })
+        .await??;
+    Ok(rows.into_iter().collect())
+}
+
+/// The per-attempt means a batch estimate extrapolates from, over the SUCCESSFUL
+/// attempts the ledger recorded (`status = 'ok'`).
+///
+/// WHY `status = 'ok'` ONLY: an `empty` attempt read a session with nothing in it
+/// (no model call, nothing to pay for) and a `failed` one did not do the work the
+/// batch is pricing. Including either would drag the mean toward zero and make the
+/// estimate a description of the past instead of a price for the planned work.
+///
+/// WHY THE RECORDED COUNTS COME BACK BESIDE THE MEANS: 0028's columns are NULL when
+/// nobody recorded them (the rules tier reports no usage at all, and every
+/// pre-0028 row predates the columns), and `AVG` over an all-NULL column is NULL. A
+/// caller has to be able to see whether a mean rests on forty attempts or on one.
+struct LedgerMeans {
+    ok_attempts: i64,
+    windows_recorded: i64,
+    windows_per_attempt: Option<f64>,
+    tokens_recorded: i64,
+    tokens_per_attempt: Option<f64>,
+    cost_recorded: i64,
+    cost_per_attempt: Option<f64>,
+}
+
+async fn ledger_means(db: &ruagent_store::Db) -> Result<LedgerMeans, ApiError> {
+    let row = db
+        .call_flat(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*), COUNT(windows), AVG(windows), COUNT(tokens_used),
+                        AVG(tokens_used), COUNT(cost_usd), AVG(cost_usd)
+                   FROM distill_log WHERE status = 'ok'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<f64>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Option<f64>>(6)?,
+                    ))
+                },
+            )
+        })
+        .await?;
+    Ok(LedgerMeans {
+        ok_attempts: row.0,
+        windows_recorded: row.1,
+        windows_per_attempt: row.2,
+        tokens_recorded: row.3,
+        tokens_per_attempt: row.4,
+        cost_recorded: row.5,
+        cost_per_attempt: row.6,
+    })
+}
+
+/// WHAT THE BATCH WILL COST, said in the units the ledger records.
+///
+/// WHY THE CALL COUNT IS DERIVED AND NOT ASSUMED (t5 + issue #47): after #48 a long
+/// transcript is cut into WINDOWS and every window is its own model call, so "one
+/// call per session" is wrong for exactly the sessions a backlog is made of.
+/// `windows` is therefore Σ ceil(bytes_i / budget), where `budget` is
+/// `ExtractPlan::limits.max_input_bytes` — the SAME bound the writer cuts on, read
+/// from the SAME plan this request hands to the distiller. The writer cuts at TURN
+/// boundaries and reads at most `max_turns` turns, so this is an upper-shaped
+/// estimate and the response says so in `method`.
+///
+/// A session with NO bytes contributes no call: the pass refuses an empty transcript
+/// ("nothing to distil") before any model is asked, so counting a call for it would
+/// over-price the batch by exactly the sessions that cost nothing.
+///
+/// WHY TOKENS AND COST ARE PER ATTEMPT: the ledger's `tokens_used` is the agent's
+/// LAST reported context reading for the whole attempt and `cost_usd` the last cost
+/// it reported — `UsageReport::merge` keeps the newest window's report instead of
+/// summing them (extract_plane.rs) — so the only mean the ledger can support is
+/// per-attempt, and the estimate is that mean × planned sessions. When no successful
+/// attempt recorded a value the estimate is `null` (never 0, the 0028 rule) and
+/// `basis` says how many attempts recorded nothing.
+fn estimate_batch(
+    planned: &[String],
+    bytes: &std::collections::BTreeMap<String, i64>,
+    budget_bytes: usize,
+    means: &LedgerMeans,
+) -> serde_json::Value {
+    let budget = budget_bytes.max(1) as i64;
+    let mut total_bytes: i64 = 0;
+    let mut windows: i64 = 0;
+    for key in planned {
+        let size = bytes.get(key).copied().unwrap_or(0);
+        total_bytes += size;
+        if size > 0 {
+            windows += (size + budget - 1) / budget;
+        }
+    }
+    let sessions = planned.len() as f64;
+    let extrapolate = |mean: Option<f64>| match mean {
+        Some(mean) => serde_json::json!(mean * sessions),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "sessions": planned.len(),
+        "bytes": total_bytes,
+        "windows": windows,
+        "budget_bytes": budget,
+        "tokens_used": extrapolate(means.tokens_per_attempt),
+        "cost_usd": extrapolate(means.cost_per_attempt),
+        "method": "windows = the sum over the planned sessions of ceil(transcript bytes / the \
+                   plan's byte bound), so one session can cost several model calls; tokens_used \
+                   and cost_usd = the mean recorded on successful attempts x the planned session \
+                   count (per attempt, the unit the ledger records). null means no successful \
+                   attempt recorded the value -- never 0.",
+        "basis": {
+            "ok_attempts": means.ok_attempts,
+            "windows_recorded": means.windows_recorded,
+            "windows_per_attempt": means.windows_per_attempt,
+            "tokens_recorded": means.tokens_recorded,
+            "tokens_per_attempt": means.tokens_per_attempt,
+            "cost_recorded": means.cost_recorded,
+            "cost_per_attempt": means.cost_per_attempt,
+        },
+    })
+}
+
+/// The ledger row THIS attempt wrote, if any.
+///
+/// `before` is the id of the newest row the planner saw for this session BEFORE the
+/// attempt started, so a row with a HIGHER id can only have been written by this
+/// attempt (one row per attempt, 0024). `None` means the attempt wrote nothing,
+/// which the caller reports rather than guesses about.
+async fn attempt_written_since(
+    db: &ruagent_store::Db,
+    key: &str,
+    before: Option<i64>,
+) -> Result<Option<(String, Option<String>)>, ApiError> {
+    let key = key.to_string();
+    let before = before.unwrap_or(0);
+    let row = db
+        .call(move |conn| -> Result<Option<AttemptRow>, rusqlite::Error> {
+            use rusqlite::OptionalExtension as _;
+            conn.query_row(
+                "SELECT status, failure_reason FROM distill_log
+                      WHERE session_key = ?1 AND id > ?2 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![key, before],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })
+        .await??;
+    Ok(row.map(|(status, reason)| {
+        // A row whose status is NULL is the ledger's fourth state; the batch says
+        // the same word the ledger read does instead of inventing "ok".
+        let status = status.unwrap_or_else(|| DISTILL_LOG_STATUSES[3].to_string());
+        (status, reason)
+    }))
+}
+
+/// What ONE batch entry reports, from the attempt and from the ledger row it wrote.
+///
+/// THE LEDGER DECIDES WHENEVER IT CAN: t4 writes one row per non-dry attempt, so its
+/// `status` is what happened and its `failure_reason` is why. This function speaks
+/// for itself only when there is no row, and then it keeps the two cases apart
+/// instead of merging them:
+///   * an attempt that returned an ERROR is `failed`, and the error text is the
+///     reason — the caller has to see it, and nothing else recorded it;
+///   * an attempt that returned Ok WITHOUT writing a row is `not_recorded`, the
+///     ledger read's own word for "nobody recorded this". Calling it `ok` would
+///     invent a confirmation the ledger does not have.
+fn classify_attempt(
+    attempt: &Result<crate::distill::DistillOutcome, String>,
+    written: Option<(String, Option<String>)>,
+) -> (String, Option<String>) {
+    match (attempt, written) {
+        (_, Some((status, reason))) => {
+            let reason = reason
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| match attempt {
+                    Err(e) => Some(e.clone()),
+                    Ok(_) => None,
+                });
+            (status, reason)
+        }
+        (Err(e), None) => ("failed".to_string(), Some(e.clone())),
+        (Ok(_), None) => (
+            "not_recorded".to_string(),
+            Some("the attempt returned without writing a distill_log row".to_string()),
+        ),
+    }
+}
+
+/// What THIS batch actually recorded, summed over the rows it wrote (`id > start`).
+///
+/// The same quantities the estimate is made of, in the same units — which is what
+/// makes the two comparable, and what "the dry-run estimate and the real counts
+/// speak the same language" means. The `*_not_recorded` counts are the other half of
+/// the 0028 rule: a NULL column is not a zero, so a sum with nothing to add is
+/// `null` and the count says why.
+async fn batch_actual(
+    db: &ruagent_store::Db,
+    start_id: i64,
+) -> Result<serde_json::Value, ApiError> {
+    let row = db
+        .call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*), SUM(windows), COUNT(windows), SUM(tokens_used),
+                        COUNT(tokens_used), SUM(cost_usd), COUNT(cost_usd)
+                   FROM distill_log WHERE id > ?1",
+                [start_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Option<f64>>(5)?,
+                        r.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+        })
+        .await?;
+    Ok(serde_json::json!({
+        "rows": row.0,
+        "windows": row.1,
+        "tokens_used": row.3,
+        "cost_usd": row.5,
+        "windows_not_recorded": row.0 - row.2,
+        "tokens_used_not_recorded": row.0 - row.4,
+        "cost_usd_not_recorded": row.0 - row.6,
+    }))
+}
+
+/// `GET /api/v1/distill/log` — THE distillation ledger, read (t6 / issues #46,
+/// #48, #55).
+///
+/// ONE ROW PER ATTEMPT (0024), newest first, filtered by `status` and/or
+/// `session`, paged through the SAME envelope as every other list route, with the
+/// ledger's two summaries beside it.
+///
+/// THE THREE-STATE RULE OF 0020/0028 IS THE READING CONTRACT HERE, and this
+/// endpoint does not collapse it. Every column a writer may not have recorded comes
+/// back `null`, and so do the sums: `totals.tokens_used` is the sum of the RECORDED
+/// values (`null` when no row in the filtered set recorded one), and
+/// `totals.tokens_used_not_recorded` says how many of those rows did not record
+/// one. Answering `0` for an attempt nobody measured would make "this cost nothing"
+/// and "nobody wrote it down" the same reading — the mistake 0028's columns were
+/// added to avoid ("NULL means NOBODY RECORDED THIS, never 0").
+///
+/// `by_status` counts the rows `total` counts, so its buckets always add up to
+/// `total`; `not_recorded` is a NULL status (the pre-0024 history — 33 of 33 rows
+/// on the live database), NOT a fourth outcome. `status=not_recorded` selects
+/// exactly those rows, so they are reachable rather than merely counted.
+///
+/// The row's own `truncated` (distill_log.truncated: the transcript lost text) and
+/// the envelope's `truncated` (this page left rows out) are DIFFERENT fields, kept
+/// in different namespaces: the row's is inside `entries[]`, the page's is beside
+/// `total`.
+#[derive(Deserialize)]
+struct DistillLogQuery {
+    /// ok | empty | failed | not_recorded. Absent = every row.
+    #[serde(default)]
+    status: Option<String>,
+    /// Exact `distill_log.session_key` match. Absent = every session.
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// The status vocabulary this route accepts, including the NULL-status selector.
+const DISTILL_LOG_STATUSES: [&str; 4] = ["ok", "empty", "failed", "not_recorded"];
+
+/// The ledger's WHERE clause, in ONE place: the page, the count, the distribution
+/// and the sums must all select the same rows, or `total` describes a different
+/// question than `entries` answers.
+///
+/// Two BOUND parameters (`?1` status, `?2` session) rather than an assembled
+/// string: one statement shape for every filter combination, and no path where a
+/// caller's text becomes SQL. `not_recorded` is a predicate on NULL, which is why
+/// the clause is not simply `status = ?1`.
+const DISTILL_LOG_FILTER: &str =
+    " WHERE (?1 IS NULL OR (?1 = 'not_recorded' AND status IS NULL) OR status = ?1)
+                                       AND (?2 IS NULL OR session_key = ?2)";
+
+/// The ledger's columns, in the order `distill_entry` reads them.
+const DISTILL_LOG_COLUMNS: &str = "id, session_key, distilled_at, status, failure_reason, agent, \
+     memories_written, entities_written, relations_written, relations_duplicate, \
+     relations_refused, tokens_used, context_size, cost_usd, retries, windows, truncated, \
+     prompt_hash";
+
+/// One read of the ledger, gathered inside ONE closure so the page, the total, the
+/// distribution and the sums all describe the same rows.
+struct DistillLedger {
+    entries: Vec<serde_json::Value>,
+    total: i64,
+    by_status: std::collections::BTreeMap<String, i64>,
+    /// Sum of the recorded values, or `None` when NO row recorded one — never 0.
+    tokens_used: Option<i64>,
+    cost_usd: Option<f64>,
+    /// How many rows in the filtered set did NOT record each of them.
+    tokens_not_recorded: i64,
+    cost_not_recorded: i64,
+}
+
+fn read_distill_ledger(
+    conn: &rusqlite::Connection,
+    status: Option<&str>,
+    session: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> rusqlite::Result<DistillLedger> {
+    let sql = format!(
+        "SELECT {DISTILL_LOG_COLUMNS} FROM distill_log{DISTILL_LOG_FILTER} ORDER BY id DESC \
+         LIMIT ?3 OFFSET ?4"
+    );
+    let entries = conn
+        .prepare(&sql)?
+        .query_map(
+            rusqlite::params![status, session, limit as i64, offset as i64],
+            distill_entry,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM distill_log{DISTILL_LOG_FILTER}"),
+        rusqlite::params![status, session],
+        |r| r.get(0),
+    )?;
+
+    // Every bucket starts at a MEASURED zero: this is a count over an explicit
+    // filter, not an unrecorded value. A reader can therefore index all four
+    // without a null check and still add them up to `total`.
+    let mut by_status: std::collections::BTreeMap<String, i64> =
+        ["ok", "empty", "failed", "not_recorded"]
+            .into_iter()
+            .map(|bucket| (bucket.to_string(), 0i64))
+            .collect();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT status, COUNT(*) FROM distill_log{DISTILL_LOG_FILTER} GROUP BY status"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![status, session], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (raw, n) = row?;
+            // A NULL status is the unrecorded bucket; a status the vocabulary does
+            // not know keeps its own name rather than being folded into one of the
+            // three (the buckets must still add up to `total`).
+            let bucket = raw.unwrap_or_else(|| "not_recorded".to_string());
+            *by_status.entry(bucket).or_insert(0) += n;
+        }
+    }
+
+    let (tokens_used, tokens_recorded, cost_usd, cost_recorded) = conn.query_row(
+        &format!(
+            "SELECT SUM(tokens_used), COUNT(tokens_used), SUM(cost_usd), COUNT(cost_usd) \
+               FROM distill_log{DISTILL_LOG_FILTER}"
+        ),
+        rusqlite::params![status, session],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+
+    Ok(DistillLedger {
+        entries,
+        total,
+        by_status,
+        tokens_used,
+        cost_usd,
+        tokens_not_recorded: total - tokens_recorded,
+        cost_not_recorded: total - cost_recorded,
+    })
+}
+
+/// One attempt, as the ledger holds it. Positional, so it and
+/// `DISTILL_LOG_COLUMNS` move together.
+///
+/// `truncated` and `windows` are tri-state on purpose: `null` = the attempt never
+/// recorded it, `false`/`0` = a measured, lossless single-window pass. Folding NULL
+/// into `false` would claim a measurement that never happened.
+fn distill_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "id": row.get::<_, i64>(0)?,
+        "session_key": row.get::<_, String>(1)?,
+        "distilled_at": row.get::<_, String>(2)?,
+        "status": row.get::<_, Option<String>>(3)?,
+        "failure_reason": row.get::<_, Option<String>>(4)?,
+        "agent": row.get::<_, Option<String>>(5)?,
+        "memories_written": row.get::<_, i64>(6)?,
+        "entities_written": row.get::<_, i64>(7)?,
+        "relations_written": row.get::<_, i64>(8)?,
+        "relations_duplicate": row.get::<_, Option<i64>>(9)?,
+        "relations_refused": row.get::<_, Option<i64>>(10)?,
+        "tokens_used": row.get::<_, Option<i64>>(11)?,
+        "context_size": row.get::<_, Option<i64>>(12)?,
+        "cost_usd": row.get::<_, Option<f64>>(13)?,
+        "retries": row.get::<_, Option<i64>>(14)?,
+        "windows": row.get::<_, Option<i64>>(15)?,
+        "truncated": row.get::<_, Option<i64>>(16)?.map(|measured| measured != 0),
+        "prompt_hash": row.get::<_, Option<String>>(17)?,
+    }))
+}
+
+async fn distill_log(
+    State(state): State<AppState>,
+    Query(q): Query<DistillLogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(s) if DISTILL_LOG_STATUSES.contains(&s) => Some(s.to_string()),
+        Some(s) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown status `{s}` ({})",
+                DISTILL_LOG_STATUSES.join("|")
+            )));
+        }
+    };
+    let session = q.session.clone();
+    let (limit, offset) = page_bounds(q.limit, q.offset, 50, 500);
+    let ledger = state
+        .mgr
+        .db()
+        .call_flat(move |conn| {
+            read_distill_ledger(conn, status.as_deref(), session.as_deref(), limit, offset)
+        })
+        .await?;
+    let mut body = page(
+        "entries",
+        serde_json::json!(ledger.entries),
+        ledger.total,
+        limit,
+        offset,
+    );
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("by_status".to_string(), serde_json::json!(ledger.by_status));
+        obj.insert(
+            "totals".to_string(),
+            serde_json::json!({
+                "tokens_used": ledger.tokens_used,
+                "cost_usd": ledger.cost_usd,
+                // The other half of the reading: a sum of nulls is null, so the
+                // COUNT of rows that did not record one is what makes it usable.
+                "tokens_used_not_recorded": ledger.tokens_not_recorded,
+                "cost_usd_not_recorded": ledger.cost_not_recorded,
+            }),
+        );
+    }
+    Ok(Json(body))
+}
 // ---------------------------------------------------------------------------
 // Recall — two strategies (aggressive: full content above threshold;
 // conservative: stubs only, agent pulls details on demand)
@@ -3393,8 +4741,19 @@ async fn recall(
     let (wiki_hits, hits): (Vec<_>, Vec<_>) = all_hits
         .into_iter()
         .partition(|h| h.document.starts_with("wiki/"));
+    // t22 (#54's third acceptance): THE COUNTS BEFORE THE CALLER'S WINDOW IS
+    // APPLIED are the only place "was this section cut" can be answered honestly.
+    // `hits` is consumed by the response loop below, and the response's own length
+    // is shorter than `hits` for reasons that are NOT truncation (the `min_score`
+    // filter), so the comparison has to happen at the window's own boundary.
+    //
+    // The MEMORY half needs no count here: the fusion already reports the rows its
+    // own window dropped (`memory_legs.dropped_by_top_n`).
+    let (wiki_available, knowledge_available) = (wiki_hits.len(), hits.len());
     let wiki_hits: Vec<_> = wiki_hits.into_iter().take(top_n as usize).collect();
     let hits: Vec<_> = hits.into_iter().take(top_n as usize).collect();
+    let knowledge_cut = knowledge_available > hits.len();
+    let wiki_cut = wiki_available > wiki_hits.len();
     // The wiki leg (§11.3): OFF ⇒ `"wiki": []` and `wiki::recall_stubs` is never
     // called. The partition above still keeps `wiki/…` documents out of
     // `knowledge` (that is a filter over hits already retrieved, not a query).
@@ -3861,8 +5220,35 @@ async fn recall(
             );
         }
     }
+    // t22 (#54's third acceptance): WHETHER THIS RESPONSE IS EVERYTHING THAT
+    // MATCHED, stated instead of left as arithmetic over two keys whose names do not
+    // say so. The bounded sections each already publish their own evidence
+    // (`scoring.candidates`/`leg_window` for the knowledge window,
+    // `memory_legs.dropped_by_top_n` for the fusion's); this is the one boolean a
+    // caller can branch on, and `truncated_sections` names the part(s) it is about --
+    // a list that badges "incomplete" needs to know WHICH list is incomplete.
+    //
+    // The GRAPH leg is deliberately NOT folded in: it already answers this question
+    // for itself in `graph.truncated_by` (which budget cut the walk), and two
+    // spellings of one answer is what this increment removes.
+    let mut truncated_sections: Vec<&'static str> = Vec::new();
+    if mem_legs.dropped_by_top_n > 0 {
+        truncated_sections.push("memories");
+    }
+    if knowledge_cut {
+        truncated_sections.push("knowledge");
+    }
+    if wiki_cut {
+        truncated_sections.push("wiki");
+    }
+    let truncated = !truncated_sections.is_empty();
     Ok(Json(serde_json::json!({
         "strategy": if conservative { "conservative" } else { "aggressive" },
+        // t22: the caller's window was reached AND rows were left over. When it was
+        // not reached -- including the case where it is exactly the number of
+        // matches -- this is false, so "false" never has to be read as "maybe".
+        "truncated": truncated,
+        "truncated_sections": truncated_sections,
         // The caller's declared source, echoed back: a caller can see that its
         // declaration was recorded, and a caller that declared nothing sees
         // null rather than a guessed label.
@@ -5006,17 +6392,38 @@ struct SearchQuery {
     legs: Option<bool>,
 }
 
+/// The keyword search over current memories -- and, since t26, what its page cut.
+///
+/// This route published only `hits`: a caller could not tell a full page from a page
+/// that was cut, and the MCP bridge could only report the remainder as UNKNOWN (#54).
+/// The count now comes out of the SAME search (`match_window`), so `matched`,
+/// `matched_exact`, `truncated`, `truncated_sections` and the applied `limit` ride
+/// beside `hits` -- additive: every pre-existing key keeps its name, type and meaning.
 async fn memory_search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let hits =
-        ruagent_memory::query::search_fts(state.mgr.db(), &q.q, q.limit.unwrap_or(8)).await?;
+    let db = state.mgr.db();
+    let limit = search_page_limit(q.limit, 8);
+    let window = match_window(limit, |want| {
+        ruagent_memory::query::search_fts(db, &q.q, want)
+    })
+    .await?;
+    let returned = window.page.len() as u32;
     // Same derivation as the list: the recall tab renders the same rows.
-    let ids: Vec<i64> = hits.iter().map(|m| m.id).collect();
-    let distilled = distilled_ids(state.mgr.db(), &ids).await?;
-    let hits = with_distilled(&hits, &distilled)?;
-    Ok(Json(serde_json::json!({ "hits": hits })))
+    let ids: Vec<i64> = window.page.iter().map(|m| m.id).collect();
+    let distilled = distilled_ids(db, &ids).await?;
+    let hits = with_distilled(&window.page, &distilled)?;
+    let mut body = serde_json::Map::new();
+    body.insert("hits".to_string(), serde_json::json!(hits));
+    body.extend(search_cut_keys(
+        returned,
+        window.observed,
+        window.exact,
+        "memories",
+        limit,
+    ));
+    Ok(Json(serde_json::Value::Object(body)))
 }
 
 #[derive(Deserialize)]
@@ -5121,6 +6528,14 @@ async fn memory_list(
     let ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
     let distilled = distilled_ids(state.mgr.db(), &ids).await?;
     let memories = with_distilled(&memories, &distilled)?;
+    // t22 (#54's third acceptance): THE WINDOW IS STATED. `matched` is the count
+    // before the limit and `total` is the count in this response, so truncation was
+    // always computable -- but "do arithmetic on two keys whose names do not say so"
+    // is not what the acceptance asks for, and a panel should not have to know what
+    // `total` means to badge a list. A limit EXACTLY equal to the number of matches
+    // is not truncation, and neither is one the filter never reached.
+    let returned = memories.len();
+    let truncated = matched > returned as i64;
     Ok(Json(serde_json::json!({
         "memories": memories,
         // total = the rows IN THIS RESPONSE; matched = how many rows the filter
@@ -5128,9 +6543,18 @@ async fn memory_list(
         // page: a caller that reads only one of them must not conclude the
         // store is empty (the failure this replaces: store=lesson returned 0
         // rows while counts reported 38).
-        "total": memories.len(),
+        "total": returned,
         "matched": matched,
         "limit": limit,
+        // t22: ONE boolean, and the section it is about -- the same pair the recall
+        // window reports, so a caller branches on `truncated` the same way for both.
+        // `matched > total` is the whole rule; there is no second subtraction.
+        "truncated": truncated,
+        "truncated_sections": if truncated {
+            serde_json::json!(["memories"])
+        } else {
+            serde_json::json!([])
+        },
         "store": q.store,
         "namespace": q.namespace,
         "counts": counts,
@@ -6721,9 +8145,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ruagent_graph::add_alias(&db, keeper, "AMBIGUOUS（模糊）", "knowledge")
-                .await
-                .unwrap()
+            ruagent_graph::add_alias(
+                &db,
+                keeper,
+                "AMBIGUOUS（模糊）",
+                ruagent_graph::AliasSource::Knowledge
+            )
+            .await
+            .unwrap()
         );
 
         // 1. the detail route: name/kind/aliases BESIDE the facts it already had.
@@ -6871,6 +8300,154 @@ mod tests {
         // Negative: purging an id that is gone is 404, not a silent 200.
         let (st4, _, raw4) = hit(&app, "DELETE", &format!("/api/v1/memory/{id}?purge=true")).await;
         assert_eq!(st4, StatusCode::NOT_FOUND, "{raw4}");
+    }
+
+    /// t26 / #54: both search routes honour a caller's limit and STATE what their page
+    /// left out -- the three boundaries t22/t25 fixed for every other list: REACHED
+    /// (a cut, with the real remainder), EXACTLY EQUAL (not a cut), UNTOUCHED (not a
+    /// cut). Before t26 /graph/search parsed limit and passed a fixed 10 to both passes,
+    /// and NEITHER route published a match count: that is why the MCP bridge could only
+    /// report the remainder as UNKNOWN (t12 found it; t17-O1 measured the mirrored
+    /// ROUTE_WINDOW constant that guessed at the same thing).
+    #[tokio::test]
+    async fn search_pages_honour_their_limit_and_state_their_cut() {
+        let (app, db, _root) = harness().await;
+        for i in 0..3 {
+            let (st, _, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/graph/entity",
+                Some(serde_json::json!({
+                    "name": format!("t26 probe entity {i}"),
+                    "kind": "probe",
+                })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+        }
+        for i in 0..3 {
+            let (st, _, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/memory/write",
+                Some(serde_json::json!({
+                    // The write vocabulary: observation allows user | project:<x> |
+                    // agent:<x>; the namespace "global" is NOT one of them, and the
+                    // daemon refuses the pair with 200 + outcome=RejectedNamespace (not
+                    // a 4xx), which would leave this fixture silently empty.
+                    "store": "observation",
+                    "namespace": "user",
+                    "content": format!("t26 probe memory {i}"),
+                })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+        }
+        // The fixtures are the ONLY matches: the harness root is unique per call.
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM entities WHERE name LIKE 't26 probe entity%'"
+            )
+            .await,
+            3
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memories WHERE content LIKE 't26 probe memory%'"
+            )
+            .await,
+            3
+        );
+
+        // --- /graph/search: the limit is HONOURED (it used to be a fixed 10) ----
+        // REACHED: 2 of 3 matched, so one row is left out and the reply says so.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/graph/search?q=t26%20probe&limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t26 /graph/search limit=2 -> {raw}");
+        assert_eq!(v["entities"].as_array().map(|a| a.len()), Some(2), "{raw}");
+        assert_eq!(v["limit"], 2, "{raw}");
+        assert_eq!(
+            v["matched"], 3,
+            "the count is the PRE-LIMIT match count: {raw}"
+        );
+        assert_eq!(v["matched_exact"], true, "{raw}");
+        assert_eq!(v["truncated"], true, "{raw}");
+        assert_eq!(
+            v["truncated_sections"],
+            serde_json::json!(["entities"]),
+            "{raw}"
+        );
+
+        // EXACTLY EQUAL: the page holds every match, so it is NOT a cut.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/graph/search?q=t26%20probe&limit=3").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["entities"].as_array().map(|a| a.len()), Some(3), "{raw}");
+        assert_eq!(v["matched"], 3, "{raw}");
+        assert_eq!(v["truncated"], false, "{raw}");
+        assert_eq!(v["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // UNTOUCHED: the default applies, it is STATED, and it is not a cut.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/graph/search?q=t26%20probe").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["limit"], 10, "the omitted limit is stated: {raw}");
+        assert_eq!(v["entities"].as_array().map(|a| a.len()), Some(3), "{raw}");
+        assert_eq!(v["matched"], 3, "{raw}");
+        assert_eq!(v["truncated"], false, "{raw}");
+
+        // ONE MATCH, ONE ROW: the strictest form of "exactly equal".
+        let (st, v, raw) = hit(
+            &app,
+            "GET",
+            "/api/v1/graph/search?q=t26%20probe%20entity%200&limit=1",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["entities"].as_array().map(|a| a.len()), Some(1), "{raw}");
+        assert_eq!(v["matched"], 1, "{raw}");
+        assert_eq!(v["truncated"], false, "{raw}");
+
+        // --- /memory/search: the same three boundaries, hits unchanged -------
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/memory/search?q=t26%20probe&limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t26 /memory/search limit=2 -> {raw}");
+        assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(2), "{raw}");
+        assert_eq!(v["matched"], 3, "{raw}");
+        assert_eq!(v["matched_exact"], true, "{raw}");
+        assert_eq!(v["truncated"], true, "{raw}");
+        assert_eq!(
+            v["truncated_sections"],
+            serde_json::json!(["memories"]),
+            "{raw}"
+        );
+        // ADDITIVE: every pre-existing key keeps its meaning -- each hit still carries
+        // the distilled flag the recall tab reads.
+        assert!(v["hits"][0]["distilled"].is_boolean(), "{raw}");
+
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/memory/search?q=t26%20probe&limit=3").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(3), "{raw}");
+        assert_eq!(v["matched"], 3, "{raw}");
+        assert_eq!(v["truncated"], false, "{raw}");
+        assert_eq!(v["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/memory/search?q=t26%20probe&limit=10").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(3), "{raw}");
+        assert_eq!(v["truncated"], false, "{raw}");
+
+        // An empty match set is a READING, and not a cut.
+        let (st, v, raw) = hit(
+            &app,
+            "GET",
+            "/api/v1/memory/search?q=t26-nothing-matches-this&limit=2",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(0), "{raw}");
+        assert_eq!(v["matched"], 0, "{raw}");
+        assert_eq!(v["truncated"], false, "{raw}");
     }
 
     /// The whole lifecycle through the real router: the routes, the query
@@ -7041,6 +8618,1750 @@ mod tests {
             StatusCode::OK,
             "store-backed routes must keep working after a caught panic"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One edge's stored `event_time_source`, read from the COLUMN — so an
+    /// assertion about provenance is not the handler's own echo checked against
+    /// itself.
+    async fn stored_event_time_source(db: &ruagent_store::Db, id: i64) -> Option<String> {
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT event_time_source FROM entity_edges WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Issues #49 + #52, through the real router over a throwaway root.
+    ///
+    /// WHAT THIS PINS, and what fails if it is removed: `POST /api/v1/graph/fact`
+    /// writing an edge whose `event_time_source` is NULL again (the column is read
+    /// with SQL, never the response body alone); an end addressed by NAME that
+    /// does not resolve through the same norm_name/alias rule the extraction uses;
+    /// and `GET /api/v1/graph/entity/{id}/facts` losing the session an extracted
+    /// fact came from, or calling an unknown provenance one of the two known kinds.
+    #[tokio::test]
+    async fn a_fact_written_by_name_records_recorded_and_the_read_names_its_session() {
+        let (app, db, root) = harness().await;
+        let key = "ruagent:t52-api";
+        seed(&db, key, "ruagent").await;
+
+        let (sst, sv, sraw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/entity",
+            Some(serde_json::json!({ "name": "t52-ruagent", "kind": "project" })),
+        )
+        .await;
+        assert_eq!(sst, StatusCode::OK, "{sraw}");
+        let a = sv["id"].as_i64().expect("an entity id");
+        let (dst, dv, draw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/entity",
+            Some(serde_json::json!({ "name": "t52-Codex", "kind": "tool" })),
+        )
+        .await;
+        assert_eq!(dst, StatusCode::OK, "{draw}");
+        let b = dv["id"].as_i64().expect("an entity id");
+
+        // 1. BY NAME, with an explicit valid_at: the response says `recorded` and
+        //    the COLUMN agrees.
+        let (st, v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/fact",
+            Some(serde_json::json!({
+                "src_name": "T52-RuAgent", // case/space-insensitive, as the extraction probes
+                "dst_name": "t52-codex",
+                "relation": "drives_model",
+                "fact_text": "t52 ruagent drives codex",
+                "valid_at": "2026-01-01T00:00:00Z",
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            v["src"], a,
+            "the name resolved to the entity it names: {raw}"
+        );
+        assert_eq!(v["dst"], b, "{raw}");
+        assert_eq!(v["event_time_source"], "recorded", "{raw}");
+        let by_name = v["id"].as_i64().expect("an edge id");
+        assert_eq!(
+            stored_event_time_source(&db, by_name).await.as_deref(),
+            Some("recorded"),
+            "a manual write must not leave the column NULL"
+        );
+
+        // 2. BY ID, with NO valid_at: the same answer, so the provenance does not
+        //    depend on whether the caller supplied a time.
+        let (st, v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/fact",
+            Some(serde_json::json!({
+                "src": a, "dst": b,
+                "relation": "touches",
+                "fact_text": "t52 ruagent touches codex",
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(v["event_time_source"], "recorded", "{raw}");
+        let by_id = v["id"].as_i64().expect("an edge id");
+        assert_eq!(
+            stored_event_time_source(&db, by_id).await.as_deref(),
+            Some("recorded")
+        );
+
+        // 3. A name that resolves to nothing is refused, and invents no node.
+        let entities_before = count(&db, "SELECT COUNT(*) FROM entities").await;
+        let edges_before = count(&db, "SELECT COUNT(*) FROM entity_edges").await;
+        let (st, _v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/fact",
+            Some(serde_json::json!({
+                "src_name": "t52-nobody-here", "dst": b,
+                "relation": "drives_model", "fact_text": "nobody drives codex",
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+        assert!(
+            raw.contains("t52-nobody-here"),
+            "the refusal names it: {raw}"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM entity_edges").await,
+            edges_before,
+            "a refused write writes nothing"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM entities").await,
+            entities_before,
+            "and it does not create the entity it could not resolve"
+        );
+
+        // 4. Both an id and a name for one end is ambiguous, not "the id wins".
+        let (st, _v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/fact",
+            Some(serde_json::json!({
+                "src": a, "src_name": "t52-ruagent", "dst": b,
+                "relation": "drives_model", "fact_text": "ambiguous end",
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+
+        // 5. The distillation shape: an episode that names the session, and a fact
+        //    written through the extraction writer.
+        let episode = db
+            .call_flat(move |conn| {
+                conn.execute(
+                    "INSERT INTO episodes (kind, content, content_hash, ref_time, ingested_at, source_run)
+                     VALUES ('run_turn', 'x', 'hash-t52-api', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?1)",
+                    [key],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        let write = ruagent_graph::apply_extraction(
+            &db,
+            &[
+                ruagent_graph::ExtractEntity {
+                    name: "t52-ruagent".into(),
+                    kind: Some("project".into()),
+                    summary: None,
+                    aliases: Vec::new(),
+                },
+                ruagent_graph::ExtractEntity {
+                    name: "t52-Codex".into(),
+                    kind: Some("tool".into()),
+                    summary: None,
+                    aliases: Vec::new(),
+                },
+            ],
+            &[ruagent_graph::ExtractFact {
+                src: "t52-ruagent".into(),
+                dst: "t52-Codex".into(),
+                relation: "uses_protocol".into(),
+                fact_text: "t52 ruagent uses the protocol".into(),
+                valid_at: Some("2026-01-02T00:00:00Z".into()),
+                event_time_source: ruagent_graph::EventTimeSource::Extracted,
+            }],
+            ruagent_graph::AliasSource::Extraction,
+            Some(episode),
+        )
+        .await
+        .unwrap();
+        assert_eq!(write.relations, 1, "the extraction path wrote the fact");
+        let extracted = db
+            .call_flat(|conn| {
+                conn.query_row(
+                    "SELECT id FROM entity_edges WHERE relation = 'uses_protocol'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        // ... and the legacy shape: no episode, no recorded source.
+        let legacy = db
+            .call_flat(move |conn| {
+                conn.execute(
+                    "INSERT INTO entity_edges (src, dst, relation, fact_text, valid_at, created_at, source_episode)
+                     VALUES (?1, ?2, 'legacy_link', 't52 pre-0021 row', '2025-06-01T00:00:00Z', '2025-06-01T00:00:00Z', NULL)",
+                    rusqlite::params![a, b],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+
+        let (st, v, raw) = hit(&app, "GET", &format!("/api/v1/graph/entity/{a}/facts")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let facts = v["facts"].as_array().expect("facts array");
+        let row = |id: i64| {
+            facts
+                .iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("edge {id} must be in the answer: {v}"))
+        };
+        println!(
+            "READING #52 (HTTP): extracted={} manual={} legacy={}",
+            row(extracted),
+            row(by_name),
+            row(legacy)
+        );
+
+        // ... the extracted row names the session and its title.
+        let ex = row(extracted);
+        assert_eq!(ex["event_time_source"], "extracted");
+        assert_eq!(ex["source_kind"], "extraction");
+        assert_eq!(ex["source_session"]["key"], key);
+        assert_eq!(
+            ex["source_session"]["title"], "t",
+            "the title comes from sessions.title: {ex}"
+        );
+
+        // ... the manual rows are `manual`, with no session invented for them.
+        let manual = row(by_name);
+        assert_eq!(manual["event_time_source"], "recorded");
+        assert_eq!(manual["source_kind"], "manual");
+        assert!(
+            manual["source_session"].is_null(),
+            "a hand-written fact has no session: {manual}"
+        );
+
+        // ... and the legacy row is honestly `unknown`, not `manual`.
+        let lg = row(legacy);
+        assert!(lg["event_time_source"].is_null(), "{lg}");
+        assert_eq!(lg["source_kind"], "unknown");
+        assert!(lg["source_session"].is_null(), "{lg}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t6 / issues #46 and #54: ONE pagination envelope, on every offset-paged
+    /// list route.
+    ///
+    /// WHAT THIS PINS: the four fields exist and AGREE on three different
+    /// collections (`entities`, `edges`, `tasks`); `offset` really moves the page
+    /// (page two holds different ids); and `truncated` is true exactly on the page
+    /// that was cut short and FALSE on the page that ended at the last row — the
+    /// distinction a reader uses to decide whether another request is worth making.
+    /// The key-set comparison is the "one implementation" half: a second envelope
+    /// shape would have to differ in its keys, and that is a failing assertion, not
+    /// a matter of taste.
+    #[tokio::test]
+    async fn one_envelope_answers_for_entities_edges_and_tasks() {
+        let (app, _db, root) = harness().await;
+        let mut entity_ids = Vec::new();
+        for i in 0..4 {
+            let (st, v, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/graph/entity",
+                Some(serde_json::json!({ "name": format!("t6-e{i}"), "kind": "concept" })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+            entity_ids.push(v["id"].as_i64().expect("an entity id"));
+        }
+        for (src, dst, relation) in [
+            (entity_ids[0], entity_ids[1], "links"),
+            (entity_ids[2], entity_ids[3], "links"),
+        ] {
+            let (st, _v, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/graph/fact",
+                Some(serde_json::json!({
+                    "src": src, "dst": dst,
+                    "relation": relation,
+                    "fact_text": format!("t6 fact {src}->{dst}"),
+                })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+        }
+        for i in 0..3 {
+            let (st, _v, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/tasks",
+                Some(serde_json::json!({
+                    "title": format!("t6 task {i}"),
+                    "intent": "paged by the shared envelope",
+                })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+        }
+
+        let (st, ents1, raw) = hit(&app, "GET", "/api/v1/graph/entities?limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let (st, ents2, raw2) = hit(&app, "GET", "/api/v1/graph/entities?limit=2&offset=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw2}");
+        let (st, edges1, raw3) = hit(&app, "GET", "/api/v1/graph/edges?limit=1").await;
+        assert_eq!(st, StatusCode::OK, "{raw3}");
+        let (st, edges2, raw4) = hit(&app, "GET", "/api/v1/graph/edges?limit=1&offset=1").await;
+        assert_eq!(st, StatusCode::OK, "{raw4}");
+        let (st, tasks1, raw5) = hit(&app, "GET", "/api/v1/tasks?limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw5}");
+        let (st, tasks2, raw6) = hit(&app, "GET", "/api/v1/tasks?limit=2&offset=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw6}");
+
+        println!(
+            "READING t6 [entities] page1={} page2={} | [edges] page1={} page2={} | [tasks] page1={} page2={}",
+            ents1, ents2, edges1, edges2, tasks1, tasks2
+        );
+
+        // 1. THE SAME ENVELOPE, key for key, on three different collections.
+        let envelope_keys = |v: &serde_json::Value, items: &str| {
+            let mut keys: Vec<String> = v
+                .as_object()
+                .expect("an envelope is an object")
+                .keys()
+                .filter(|k| k.as_str() != items)
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let shape = vec![
+            "limit".to_string(),
+            "offset".to_string(),
+            "total".to_string(),
+            "truncated".to_string(),
+        ];
+        assert_eq!(envelope_keys(&ents1, "entities"), shape, "{ents1}");
+        assert_eq!(envelope_keys(&edges1, "edges"), shape, "{edges1}");
+        assert_eq!(envelope_keys(&tasks1, "tasks"), shape, "{tasks1}");
+
+        // 2. total counts the FILTERED set, not the page; limit/offset are echoed.
+        assert_eq!(ents1["total"], 4, "{ents1}");
+        assert_eq!(ents1["limit"], 2, "{ents1}");
+        assert_eq!(ents1["offset"], 0, "{ents1}");
+        assert_eq!(
+            ents1["entities"].as_array().map(Vec::len),
+            Some(2),
+            "{ents1}"
+        );
+        assert_eq!(edges1["total"], 2, "{edges1}");
+        assert_eq!(tasks1["total"], 3, "{tasks1}");
+
+        // 3. truncated is TRUE when the page was cut and FALSE at the last row.
+        assert_eq!(ents1["truncated"], true, "{ents1}");
+        assert_eq!(ents2["truncated"], false, "{ents2}");
+        assert_eq!(edges1["truncated"], true, "{edges1}");
+        assert_eq!(edges2["truncated"], false, "{edges2}");
+        assert_eq!(tasks1["truncated"], true, "{tasks1}");
+        assert_eq!(tasks2["truncated"], false, "{tasks2}");
+        assert_eq!(
+            ents2["entities"].as_array().map(Vec::len),
+            Some(2),
+            "{ents2}"
+        );
+        assert_eq!(
+            tasks2["tasks"].as_array().map(Vec::len),
+            Some(1),
+            "{tasks2}"
+        );
+
+        // 4. offset MOVES the page: no row appears on both pages of one
+        //    collection. An entity row is [entity, fact_count], so its id is
+        //    NESTED; an edge id is a number and a task id is a ulid string, so the
+        //    comparison is on the JSON value rather than on a type.
+        let nested_ids = |v: &serde_json::Value, items: &str| -> Vec<String> {
+            v[items]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|row| {
+                    row.get(0)
+                        .and_then(|e| e.get("id"))
+                        .expect("a nested entity id")
+                        .to_string()
+                })
+                .collect()
+        };
+        let flat_ids = |v: &serde_json::Value, items: &str| -> Vec<String> {
+            v[items]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|row| row.get("id").expect("a row id").to_string())
+                .collect()
+        };
+        let page1 = nested_ids(&ents1, "entities");
+        let page2 = nested_ids(&ents2, "entities");
+        assert!(!page1.is_empty() && !page2.is_empty(), "{ents1} {ents2}");
+        assert!(
+            page1.iter().all(|id| !page2.contains(id)),
+            "page two must not repeat page one: {page1:?} {page2:?}"
+        );
+        let e1 = flat_ids(&edges1, "edges");
+        let e2 = flat_ids(&edges2, "edges");
+        assert_ne!(e1, e2, "the edge pages must differ: {edges1} {edges2}");
+        let t1 = flat_ids(&tasks1, "tasks");
+        let t2 = flat_ids(&tasks2, "tasks");
+        assert_ne!(t1, t2, "the task pages must differ: {tasks1} {tasks2}");
+
+        // 5. The entities row shape is untouched, and the aliases opt-in rides along.
+        assert_eq!(
+            ents1["entities"][0].as_array().map(|r| r.len()),
+            Some(2),
+            "an entity row is still [entity, fact_count]: {ents1}"
+        );
+        let (st, with_aliases, rawa) =
+            hit(&app, "GET", "/api/v1/graph/entities?limit=2&aliases=true").await;
+        assert_eq!(st, StatusCode::OK, "{rawa}");
+        assert!(with_aliases["aliases"].is_object(), "{with_aliases}");
+        assert_eq!(
+            envelope_keys(&with_aliases, "entities")
+                .into_iter()
+                .filter(|k| k != "aliases")
+                .collect::<Vec<_>>(),
+            shape,
+            "the alias opt-in adds its own top-level key and nothing else: {with_aliases}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t6 / issues #46, #48, #55: the distillation ledger is READABLE — by status,
+    /// with the failure reason, the duplicate/refused relation counts and the cost.
+    ///
+    /// The WRITER is `distill.rs` (one row per attempt, 0024) and the columns are
+    /// 0028's; what this route owns is the READ, so the rows are written here the
+    /// way 0024+0028 define them — including the three-state NULLs, which are the
+    /// part a reader gets wrong: `totals.tokens_used` must be `null` (not 0) when
+    /// no row in the set recorded one, and the separate
+    /// `tokens_used_not_recorded` count must say why.
+    #[tokio::test]
+    async fn the_distillation_ledger_is_readable_by_status_with_cost_and_counts() {
+        let (app, db, root) = harness().await;
+        let seed_ledger = |conn: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash,
+                     relations_duplicate, relations_refused, tokens_used, context_size,
+                     cost_usd, retries, windows, truncated)
+                 VALUES ('ruagent:t6-ok', '2026-01-01T00:00:01Z', 3, 2, 5, 'impl', 'ok', '',
+                         'hash-ok', 4, 1, 1200, 32000, 0.0125, 1, 1, 0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash)
+                 VALUES ('ruagent:t6-failed', '2026-01-01T00:00:02Z', 0, 0, 0, 'impl',
+                         'failed', 'the harness refused the turn', 'hash-failed')",
+                [],
+            )?;
+            // The pre-0028 shape: no status recorded at all, and no cost columns.
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash)
+                 VALUES ('ruagent:t6-unrecorded', '2026-01-01T00:00:03Z', 1, 1, 1, 'impl',
+                         NULL, NULL, 'hash-old')",
+                [],
+            )?;
+            Ok(())
+        };
+        db.call_flat(seed_ledger).await.unwrap();
+
+        // 1. The whole ledger: newest first, one envelope, the tallies beside it.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/distill/log").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t6 [distill/log] {v}");
+        assert_eq!(v["total"], 3, "{v}");
+        assert_eq!(v["limit"], 50, "{v}");
+        assert_eq!(v["offset"], 0, "{v}");
+        assert_eq!(v["truncated"], false, "{v}");
+        let entries = v["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 3, "{v}");
+        let ids: Vec<i64> = entries.iter().map(|e| e["id"].as_i64().unwrap()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(ids, sorted, "entries are newest first (id desc): {ids:?}");
+
+        // The success row: its counts and its cost are readable.
+        let ok = entries
+            .iter()
+            .find(|e| e["session_key"] == "ruagent:t6-ok")
+            .expect("the successful attempt is in the ledger");
+        assert_eq!(ok["status"], "ok", "{ok}");
+        assert_eq!(ok["relations_written"], 5, "{ok}");
+        assert_eq!(ok["relations_duplicate"], 4, "{ok}");
+        assert_eq!(ok["relations_refused"], 1, "{ok}");
+        assert_eq!(ok["tokens_used"], 1200, "{ok}");
+        assert_eq!(ok["context_size"], 32000, "{ok}");
+        assert_eq!(ok["cost_usd"], 0.0125, "{ok}");
+        assert_eq!(ok["retries"], 1, "{ok}");
+        assert_eq!(ok["windows"], 1, "{ok}");
+        assert_eq!(
+            ok["truncated"], false,
+            "a MEASURED lossless single-window attempt is false, not null: {ok}"
+        );
+        assert_eq!(ok["prompt_hash"], "hash-ok", "{ok}");
+
+        // The failure row: readable AS a failure, with the reason.
+        let failed = entries
+            .iter()
+            .find(|e| e["session_key"] == "ruagent:t6-failed")
+            .expect("the failed attempt is in the ledger");
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(
+            failed["failure_reason"], "the harness refused the turn",
+            "{failed}"
+        );
+        assert!(
+            failed["tokens_used"].is_null() && failed["cost_usd"].is_null(),
+            "an attempt that measured nothing says null, not 0: {failed}"
+        );
+        assert!(
+            failed["truncated"].is_null(),
+            "nothing was recorded about windows/truncation: {failed}"
+        );
+
+        // The unrecorded row: NULL status is counted, not guessed into 'ok'.
+        let unrecorded = entries
+            .iter()
+            .find(|e| e["session_key"] == "ruagent:t6-unrecorded")
+            .expect("the pre-0024 row is in the ledger");
+        assert!(unrecorded["status"].is_null(), "{unrecorded}");
+
+        // 2. by_status adds up to total, with not_recorded its own bucket.
+        assert_eq!(v["by_status"]["ok"], 1, "{v}");
+        assert_eq!(v["by_status"]["failed"], 1, "{v}");
+        assert_eq!(v["by_status"]["empty"], 0, "{v}");
+        assert_eq!(v["by_status"]["not_recorded"], 1, "{v}");
+        let bucket_sum: i64 = v["by_status"]
+            .as_object()
+            .expect("by_status object")
+            .values()
+            .map(|n| n.as_i64().unwrap())
+            .sum();
+        assert_eq!(bucket_sum, v["total"].as_i64().unwrap(), "{v}");
+
+        // 3. totals: the sum of what WAS recorded, and the count of what was not.
+        assert_eq!(v["totals"]["tokens_used"], 1200, "{v}");
+        assert_eq!(v["totals"]["cost_usd"], 0.0125, "{v}");
+        assert_eq!(v["totals"]["tokens_used_not_recorded"], 2, "{v}");
+        assert_eq!(v["totals"]["cost_usd_not_recorded"], 2, "{v}");
+
+        // 4. status= selects, and a failed page still carries its tally.
+        let (st, by_status, raw) = hit(&app, "GET", "/api/v1/distill/log?status=failed").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(by_status["total"], 1, "{by_status}");
+        assert_eq!(by_status["truncated"], false, "{by_status}");
+        assert_eq!(
+            by_status["entries"].as_array().map(Vec::len),
+            Some(1),
+            "{by_status}"
+        );
+        assert_eq!(by_status["by_status"]["failed"], 1, "{by_status}");
+        assert_eq!(by_status["by_status"]["ok"], 0, "{by_status}");
+        assert_eq!(
+            by_status["entries"][0]["failure_reason"], "the harness refused the turn",
+            "{by_status}"
+        );
+        assert!(
+            by_status["totals"]["tokens_used"].is_null(),
+            "no row in THIS set recorded tokens, so the sum is null — not 0: {by_status}"
+        );
+        assert_eq!(
+            by_status["totals"]["tokens_used_not_recorded"], 1,
+            "{by_status}"
+        );
+
+        // 5. status=not_recorded reaches the rows a NULL status would hide.
+        let (st, mids, raw) = hit(&app, "GET", "/api/v1/distill/log?status=not_recorded").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(mids["total"], 1, "{mids}");
+        assert_eq!(
+            mids["entries"][0]["session_key"], "ruagent:t6-unrecorded",
+            "{mids}"
+        );
+
+        // 6. session= selects one session's attempts; limit/offset page them.
+        let (st, one, raw) = hit(&app, "GET", "/api/v1/distill/log?session=ruagent:t6-ok").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(one["total"], 1, "{one}");
+        assert_eq!(one["entries"][0]["relations_duplicate"], 4, "{one}");
+        let (st, paged, raw) = hit(&app, "GET", "/api/v1/distill/log?limit=1&offset=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(paged["total"], 3, "{paged}");
+        assert_eq!(paged["offset"], 2, "{paged}");
+        assert_eq!(
+            paged["truncated"], false,
+            "offset 2 + one row IS the third and last row, so nothing was left out: {paged}"
+        );
+        let (st, first_page, raw) = hit(&app, "GET", "/api/v1/distill/log?limit=1").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            first_page["truncated"], true,
+            "the FIRST page of three rows at one row per page IS cut: {first_page}"
+        );
+
+        // 7. An unknown status is refused, and the refusal names the vocabulary.
+        let (st, _v, raw) = hit(&app, "GET", "/api/v1/distill/log?status=bogus").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+        assert!(raw.contains("not_recorded"), "{raw}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One `sessions` row with the fields a batch depends on under the test's own
+    /// control: which file it points at, how big the index thinks that file is, and
+    /// how recently it moved (which is what ORDERS the planner's candidates).
+    async fn seed_batch_session(
+        db: &ruagent_store::Db,
+        key: &str,
+        path: &std::path::Path,
+        updated_at: i64,
+        size_bytes: i64,
+    ) {
+        let (key, path) = (key.to_string(), path.to_string_lossy().into_owned());
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                     (key, source, title, project, ref_path, started_at, updated_at,
+                      mtime_ms, size_bytes, message_count, preview)
+                 VALUES (?1,'ruagent','t7','/w',?2,?3,?3,?3,?4,4,'p')",
+                rusqlite::params![key, path, updated_at, size_bytes],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    /// One ledger row, written the way a real attempt writes one: only the columns
+    /// this reading uses, in the states 0024+0028 define them.
+    async fn seed_attempt(
+        db: &ruagent_store::Db,
+        key: &str,
+        status: &str,
+        at: &str,
+        windows: Option<i64>,
+        tokens: Option<i64>,
+        cost: Option<f64>,
+    ) {
+        let key = key.to_string();
+        let (status, at) = (status.to_string(), at.to_string());
+        db.call_flat(move |conn| {
+            conn.execute(
+                "INSERT INTO distill_log
+                     (session_key, distilled_at, memories_written, entities_written,
+                      relations_written, agent, status, failure_reason, prompt_hash,
+                      windows, tokens_used, cost_usd)
+                 VALUES (?1,?2,1,0,0,'impl',?3,'','hash',?4,?5,?6)",
+                rusqlite::params![key, at, status, windows, tokens, cost],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn ledger_rows(db: &ruagent_store::Db) -> i64 {
+        db.call_flat(|conn| conn.query_row("SELECT COUNT(*) FROM distill_log", [], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    /// t7 / issue #47: THE BACKLOG PASS, at the size the acceptance names — a
+    /// database with 200 undistilled sessions — and the session list's derived
+    /// fields, which are the same criterion read a second way.
+    ///
+    /// WHAT THIS PINS: (a) `/api/v1/sessions` rows carry `distilled`,
+    /// `distill_status` and `distilled_at`, derived from the ledger; (b)
+    /// `only=undistilled` narrows to the sessions no successful attempt covers;
+    /// (c) a dry-run batch PLANS and ESTIMATES 200 sessions without writing a row,
+    /// spawning nothing and spending nothing; (d) the estimate's basis is the
+    /// ledger's own recorded means, with the model-call count derived from the
+    /// sessions' bytes rather than assumed to be one per session.
+    #[tokio::test]
+    async fn the_backlog_pass_plans_two_hundred_sessions_without_spending_anything() {
+        let (app, db, root) = harness().await;
+        let unfinished: Vec<String> = (0..200)
+            .map(|i| format!("ruagent:t7-backlog-{i}"))
+            .collect();
+        for key in &unfinished {
+            seed(&db, key, "ruagent").await;
+        }
+        // ONE SESSION BIGGER THAN THE BYTE BOUND, and newest so a limited page always
+        // contains it. Its size is what makes the estimate derive MORE THAN ONE model
+        // call for one session (t5's windowing): ceil(2 500 000 / 1 MiB) = 3.
+        let long = "ruagent:t7-long";
+        seed_batch_session(&db, long, &root.join("long.jsonl"), 3, 2_500_000).await;
+        // Two sessions that ARE distilled: their ledger rows are what the list's
+        // `distilled` field and the planner's exclusion both have to respect, and
+        // their recorded usage is what the estimate extrapolates from.
+        seed(&db, "ruagent:t7-done-a", "ruagent").await;
+        seed(&db, "ruagent:t7-done-b", "ruagent").await;
+        seed_attempt(
+            &db,
+            "ruagent:t7-done-a",
+            "ok",
+            "2026-01-01T00:00:01Z",
+            Some(1),
+            Some(100),
+            Some(0.01),
+        )
+        .await;
+        seed_attempt(
+            &db,
+            "ruagent:t7-done-b",
+            "ok",
+            "2026-01-01T00:00:02Z",
+            Some(3),
+            Some(300),
+            Some(0.03),
+        )
+        .await;
+        let rows_before = ledger_rows(&db).await;
+        let memories_before = memories_written_count(&db).await;
+
+        // (a) THE LIST: the derived fields, per row, from one ledger read.
+        let (st, listed, raw) = hit(&app, "GET", "/api/v1/sessions?limit=250").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let rows = listed["sessions"].as_array().expect("sessions array");
+        let row = |key: &str| {
+            rows.iter()
+                .find(|r| r["key"] == key)
+                .unwrap_or_else(|| panic!("{key} must be listed"))
+        };
+        let done = row("ruagent:t7-done-b");
+        println!(
+            "READING t7 [list] done={done} | open={}",
+            row(&unfinished[0])
+        );
+        assert_eq!(done["distilled"], true, "{done}");
+        assert_eq!(done["distill_status"], "ok", "{done}");
+        assert_eq!(done["distilled_at"], "2026-01-01T00:00:02Z", "{done}");
+        let open = row(&unfinished[0]);
+        assert_eq!(open["distilled"], false, "{open}");
+        assert!(open["distill_status"].is_null(), "{open}");
+        assert!(open["distilled_at"].is_null(), "{open}");
+
+        // (b) `only=undistilled` keeps the 200 and drops the two; `only=distilled`
+        //     is the other side of the same predicate.
+        let (st, open_only, raw) =
+            hit(&app, "GET", "/api/v1/sessions?limit=250&only=undistilled").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let open_rows = open_only["sessions"].as_array().expect("sessions array");
+        assert_eq!(open_rows.len(), 201, "{open_only}");
+        assert!(
+            open_rows.iter().all(|r| r["distilled"] == false),
+            "every row must be undistilled: {open_only}"
+        );
+        assert!(
+            !open_only.to_string().contains("ruagent:t7-done-"),
+            "the distilled sessions are not in the undistilled page: {open_only}"
+        );
+        let (st, done_only, raw) =
+            hit(&app, "GET", "/api/v1/sessions?limit=250&only=distilled").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            done_only["sessions"].as_array().map(Vec::len),
+            Some(2),
+            "{done_only}"
+        );
+        let (st, _v, raw) = hit(&app, "GET", "/api/v1/sessions?only=everything").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+
+        // (c) THE DRY-RUN PLAN: 200 sessions, an estimate, and NO effect at all.
+        let (st, planned, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sessions/distill/batch?dry_run=true&limit=200",
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t7 [batch dry_run] {planned}");
+        assert_eq!(planned["dry_run"], true, "{planned}");
+        assert_eq!(planned["planned"], 200, "{planned}");
+        assert_eq!(
+            planned["undistilled_total"], 201,
+            "the 200 backlog sessions plus the long one: {planned}"
+        );
+        assert_eq!(planned["attempted"], 0, "{planned}");
+        assert_eq!(planned["estimated"]["sessions"], 200, "{planned}");
+        assert_eq!(
+            planned["estimated"]["bytes"],
+            2_500_000 + 199 * 3,
+            "the long session's bytes plus 199 three-byte ones: {planned}"
+        );
+        assert_eq!(
+            planned["estimated"]["windows"], 202,
+            "3 model calls for the 2.4 MiB session (ceil(bytes / the 1 MiB bound)) and 1              each for the 199 small ones -- NOT one call per session: {planned}"
+        );
+        assert!(
+            planned["estimated"]["budget_bytes"].as_i64().unwrap_or(0) > 0,
+            "the byte bound the window count is derived from must be reported: {planned}"
+        );
+        assert_eq!(
+            planned["estimated"]["tokens_used"], 40000.0,
+            "(100 + 300) / 2 attempts = 200 per attempt, x 200 planned: {planned}"
+        );
+        assert_eq!(planned["estimated"]["cost_usd"], 4.0, "{planned}");
+        assert_eq!(planned["estimated"]["basis"]["ok_attempts"], 2, "{planned}");
+        assert_eq!(
+            planned["estimated"]["basis"]["tokens_recorded"], 2,
+            "{planned}"
+        );
+        assert_eq!(
+            planned["estimated"]["basis"]["windows_per_attempt"], 2.0,
+            "(1 + 3) / 2: {planned}"
+        );
+        assert!(
+            planned["estimated"]["method"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ceil"),
+            "the estimate states how the call count is derived: {planned}"
+        );
+        assert!(planned["actual"].is_null(), "{planned}");
+        assert_eq!(
+            planned["results"].as_array().map(Vec::len),
+            Some(0),
+            "{planned}"
+        );
+
+        // NOTHING WAS WRITTEN and NOTHING WAS SENT: the ledger did not grow, no
+        // memory appeared (the rules tier's own effect), and the sessions' standing
+        // is unchanged -- which is what "the dry run does not spend" has to mean.
+        assert_eq!(
+            ledger_rows(&db).await,
+            rows_before,
+            "the dry run wrote a row"
+        );
+        assert_eq!(
+            memories_written_count(&db).await,
+            memories_before,
+            "the dry run wrote a memory"
+        );
+        let (st, after, raw) = hit(&app, "GET", "/api/v1/sessions?limit=250").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let after_rows = after["sessions"].as_array().expect("sessions array");
+        assert_eq!(
+            after_rows.iter().filter(|r| r["distilled"] == true).count(),
+            2,
+            "the dry run must not make anything look distilled: {raw}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t7 / issue #47: the REAL batch run -- the same per-session path as the single
+    /// route, counted in the ledger's three states, one session's FAILURE not
+    /// stopping the rest.
+    ///
+    /// THE ORDER IS THE POINT: the session that fails is the NEWEST, so the planner
+    /// attempts it FIRST. A loop that stopped at the first failure would report
+    /// `ok: 0` and `empty: 0` below -- that is what the assertions check, not a
+    /// comment.
+    ///
+    /// THREE SESSIONS, THREE STATES, one call: `failed` (a write the storage layer
+    /// refuses), `ok` (a real transcript the free tier extracts) and `empty` (a
+    /// session whose file cannot be read, which is "nothing to distil" and not a
+    /// defect -- t4's split). The failing one is injected with a trigger on
+    /// `memories` that aborts only for the poisoned session's content, so the state
+    /// is produced by the real writer rather than by mocking the pass.
+    #[tokio::test]
+    async fn a_batch_counts_the_three_states_and_survives_a_failing_session() {
+        let (app, db, root) = harness().await;
+        // The session that will succeed: a real transcript with a PREF marker, which
+        // the deterministic tier extracts (without one the pass is `empty`).
+        let good = "ruagent:t7-good";
+        let good_file = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t7-good.jsonl");
+        std::fs::create_dir_all(good_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &good_file,
+            "{\"ts\":\"2026-09-26T14:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"记住：以后回答都要简洁，不要长篇大论。\"}}\n\
+             {\"ts\":\"2026-09-26T14:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"text\":\"understood\"}}\n",
+        )
+        .unwrap();
+        seed_batch_session(&db, good, &good_file, 1, 512).await;
+
+        // The session that will FAIL: its extracted memory content carries a marker
+        // the trigger below refuses. Newest, so it is planned first.
+        let poison = "ruagent:t7-poison";
+        let poison_file = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t7-poison.jsonl");
+        std::fs::write(
+            &poison_file,
+            "{\"ts\":\"2026-09-26T13:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"记住：t7-poison 这条记忆的写入会被拒绝。\"}}\n\
+             {\"ts\":\"2026-09-26T13:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"text\":\"ok\"}}\n",
+        )
+        .unwrap();
+        seed_batch_session(&db, poison, &poison_file, 9, 256).await;
+        // The session that reads as `empty`: an index row pointing at a file that is
+        // not there. Not a defect -- nothing to distil.
+        let nofile = "ruagent:t7-nofile";
+        seed_batch_session(&db, nofile, &root.join("does-not-exist.jsonl"), 5, 128).await;
+        // THE INJECTED FAILURE: only the poisoned session's content is refused, so the
+        // other two sessions are untouched by it.
+        let st_before = ledger_rows(&db).await;
+        db.call_flat(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER t7_poison BEFORE INSERT ON memories
+                 WHEN NEW.content LIKE '%t7-poison%'
+                 BEGIN SELECT RAISE(ABORT, 't7 injected write failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (st, ran, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sessions/distill/batch?limit=10",
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t7 [batch run] {ran}");
+        assert_eq!(ran["dry_run"], false, "{ran}");
+        assert_eq!(ran["extractor"], "rules", "{ran}");
+        assert_eq!(ran["planned"], 3, "{ran}");
+        assert_eq!(ran["attempted"], 3, "{ran}");
+        assert_eq!(ran["failed"], 1, "the refused write is a failure: {ran}");
+        assert_eq!(ran["ok"], 1, "the readable session distilled: {ran}");
+        assert_eq!(
+            ran["empty"], 1,
+            "the unreadable file is empty, not a failure: {ran}"
+        );
+        assert_eq!(
+            ran["ok"].as_i64().unwrap_or(0)
+                + ran["empty"].as_i64().unwrap_or(0)
+                + ran["failed"].as_i64().unwrap_or(0),
+            ran["attempted"].as_i64().unwrap_or(-1),
+            "the three states partition what was attempted: {ran}"
+        );
+
+        // THE ORDER AND THE CONTINUATION: the failure is first, and both later
+        // sessions were attempted anyway.
+        let results = ran["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 3, "{ran}");
+        assert_eq!(results[0]["session_key"], poison, "{ran}");
+        assert_eq!(results[0]["status"], "failed", "{ran}");
+        let reason = results[0]["reason"].as_str().unwrap_or_default();
+        assert!(
+            !reason.is_empty(),
+            "a failed attempt must say why, not just that it failed: {ran}"
+        );
+        assert_eq!(results[1]["session_key"], nofile, "{ran}");
+        assert_eq!(results[1]["status"], "empty", "{ran}");
+        assert_eq!(
+            results[1]["reason"],
+            crate::distill::NO_CONTENT_MESSAGE,
+            "the refusal is the actionable sentence: {ran}"
+        );
+        assert_eq!(results[2]["session_key"], good, "{ran}");
+        assert_eq!(results[2]["status"], "ok", "{ran}");
+
+        // THE LEDGER AGREES, per session: the batch's statuses are its rows, not a
+        // second opinion.
+        assert_eq!(
+            distill_statuses(&db, poison).await,
+            vec!["failed".to_string()],
+            "one failed row for the refused write"
+        );
+        assert_eq!(
+            distill_statuses(&db, nofile).await,
+            vec!["empty".to_string()]
+        );
+        assert_eq!(distill_statuses(&db, good).await, vec!["ok".to_string()]);
+        assert!(
+            ledger_rows(&db).await > st_before,
+            "the attempts wrote rows"
+        );
+
+        // ... and ACTUAL describes the rows THIS batch wrote, in the estimate's own
+        // units. The rules tier reports no usage, so the sums are null with counts.
+        assert_eq!(ran["actual"]["rows"], 3, "{ran}");
+        println!("READING t7 [actual] {}", ran["actual"]);
+        assert_eq!(
+            ran["actual"]["windows"], 1,
+            "only the successful rules pass measured a window: {ran}"
+        );
+        assert_eq!(ran["actual"]["windows_not_recorded"], 2, "{ran}");
+        assert!(
+            ran["actual"]["tokens_used"].is_null() && ran["actual"]["cost_usd"].is_null(),
+            "nothing reported usage, so the sums are null -- never 0: {ran}"
+        );
+        assert_eq!(ran["actual"]["tokens_used_not_recorded"], 3, "{ran}");
+
+        // THE BACKLOG DOES NOT FORGET: a second call plans the two sessions that
+        // still have no successful attempt. The one whose write is refused stays in
+        // the backlog -- reporting it as handled would be the lie.
+        let (st, second, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sessions/distill/batch?dry_run=true&limit=10",
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(second["planned"], 2, "{second}");
+        assert_eq!(second["undistilled_total"], 2, "{second}");
+        assert_eq!(second["estimated"]["sessions"], 2, "{second}");
+        let (st, done_only, raw) = hit(&app, "GET", "/api/v1/sessions?only=distilled").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            done_only["sessions"].as_array().map(Vec::len),
+            Some(1),
+            "{done_only}"
+        );
+        assert_eq!(done_only["sessions"][0]["key"], good, "{done_only}");
+        assert_eq!(
+            done_only["sessions"][0]["distill_status"], "ok",
+            "{done_only}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t10 / issue #50: the resolution queue as a CONSUMER surface — both ends
+    /// resolved, the counts a decision needs, and "these two stay apart" as a
+    /// decision the queue REMEMBERS.
+    ///
+    /// WHAT THIS PINS: (a) each queued pair carries both entities' name/kind/summary
+    /// and their current-fact counts, with the 口径 beside the numbers; (b) the count
+    /// is CURRENT edges only, so an invalidated edge does not count; (c) a dismissal
+    /// takes the pair out of the queue, is idempotent, survives the reverse argument
+    /// order and survives a mechanical RE-QUEUE; (d) a pair that was never queued is
+    /// a 404 and the same entity twice is a 400; (e) merge is untouched, is not
+    /// blocked by a dismissal, and removes the pair row for good.
+    #[tokio::test]
+    async fn the_resolution_queue_carries_both_ends_and_remembers_a_dismissal() {
+        let (app, db, _root) = harness().await;
+        let a = ruagent_graph::upsert_entity(&db, "t10-alpha", Some("tool"), Some("the first one"))
+            .await
+            .unwrap();
+        let b =
+            ruagent_graph::upsert_entity(&db, "t10-beta", Some("project"), Some("the second one"))
+                .await
+                .unwrap();
+        let c = ruagent_graph::upsert_entity(&db, "t10-gamma", Some("concept"), None)
+            .await
+            .unwrap();
+        // Two CURRENT facts touch alpha (one each way), one touches gamma, and beta's
+        // only edge is INVALIDATED: the queue must report 2 / 0 for the pair.
+        ruagent_graph::add_fact(&db, a, c, "uses", "alpha uses gamma", None, None)
+            .await
+            .unwrap();
+        ruagent_graph::add_fact(&db, c, a, "used-by", "gamma is used by alpha", None, None)
+            .await
+            .unwrap();
+        let stale =
+            ruagent_graph::add_fact(&db, b, c, "owns", "beta used to own gamma", None, None)
+                .await
+                .unwrap();
+        db.call_flat(move |conn| {
+            conn.execute(
+                "UPDATE entity_edges SET invalid_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+                [stale],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        ruagent_graph::queue_pending(&db, a, b, "first-token match: t10")
+            .await
+            .unwrap();
+
+        let (st, body, raw) = hit(&app, "GET", "/api/v1/graph/resolution/pending").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t10 [pending] {body}");
+        assert_eq!(body["pending_count"], 1, "{raw}");
+        assert_eq!(body["dismissed_count"], 0, "{raw}");
+        let pair = &body["pending"][0];
+        assert_eq!(pair["a"]["id"], a, "{raw}");
+        assert_eq!(pair["a"]["name"], "t10-alpha", "{raw}");
+        assert_eq!(pair["a"]["kind"], "tool", "{raw}");
+        assert_eq!(pair["a"]["summary"], "the first one", "{raw}");
+        assert_eq!(pair["b"]["id"], b, "{raw}");
+        assert_eq!(pair["b"]["name"], "t10-beta", "{raw}");
+        assert_eq!(pair["b"]["kind"], "project", "{raw}");
+        assert_eq!(pair["b"]["summary"], "the second one", "{raw}");
+        assert_eq!(
+            pair["a_facts"], 2,
+            "alpha's two current facts, counted in both directions: {raw}"
+        );
+        assert_eq!(
+            pair["b_facts"], 0,
+            "beta's only edge was invalidated, so it is not a current fact: {raw}"
+        );
+        assert!(
+            pair["reason"].as_str().unwrap_or_default().contains("t10"),
+            "the judge's reason rides along: {raw}"
+        );
+        assert!(pair["created_at"].is_string(), "{raw}");
+        assert!(
+            body["counts_note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid_at IS NULL"),
+            "the 口径 of the counts is stated where they are read: {raw}"
+        );
+        // The SAME definition the entity list reports: alpha's count there is 2 too.
+        let (st, entities, raw) = hit(&app, "GET", &format!("/api/v1/graph/entity/{a}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(entities["facts"].as_array().map(Vec::len), Some(2), "{raw}");
+
+        // (c) DISMISS: the pair is ANSWERED and leaves the queue.
+        let (st, out, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/resolution/dismiss",
+            Some(serde_json::json!({ "a": a, "b": b })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t10 [dismiss] {out}");
+        assert_eq!(out["dismissed"], true, "{raw}");
+        assert_eq!(out["already_dismissed"], false, "{raw}");
+        let (st, after, raw) = hit(&app, "GET", "/api/v1/graph/resolution/pending").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            after["pending_count"], 0,
+            "the dismissed pair is not waiting: {raw}"
+        );
+        assert_eq!(
+            after["dismissed_count"], 1,
+            "and the decision is remembered: {raw}"
+        );
+
+        // IDEMPOTENT, and not order-sensitive: the SAME decision sent again (with the
+        // pair the other way round, which is the same pair) is a 200 that reports a
+        // repeat rather than an error, and it does not count twice.
+        let (st, again, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/resolution/dismiss",
+            Some(serde_json::json!({ "a": b, "b": a })),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a repeated dismissal is the same decision, not a client error: {raw}"
+        );
+        assert_eq!(again["dismissed"], false, "{raw}");
+        assert_eq!(again["already_dismissed"], true, "{raw}");
+        let (st, after2, raw) = hit(&app, "GET", "/api/v1/graph/resolution/pending").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(after2["dismissed_count"], 1, "one decision, not two: {raw}");
+
+        // A MECHANICAL RE-QUEUE MUST NOT RESURRECT IT: the judge asking again upserts
+        // the reason and leaves the answer alone (0029's own design claim).
+        ruagent_graph::queue_pending(&db, a, b, "the judge asks again")
+            .await
+            .unwrap();
+        let (st, after3, raw) = hit(&app, "GET", "/api/v1/graph/resolution/pending").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            after3["pending_count"], 0,
+            "a pair a human answered cannot come back from a pass: {raw}"
+        );
+        assert!(
+            after3["pending"][0].is_null(),
+            "an empty queue is an empty list, not a row: {raw}"
+        );
+
+        // A pair that was NEVER queued has nothing to keep apart.
+        let (st, _v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/resolution/dismiss",
+            Some(serde_json::json!({ "a": a, "b": c })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{raw}");
+        assert!(raw.contains("no queued pair"), "{raw}");
+        // ... and the same entity twice is not a pair at all.
+        let (st, _v, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/resolution/dismiss",
+            Some(serde_json::json!({ "a": a, "b": a })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+
+        // (e) MERGE IS UNTOUCHED, is not blocked by the dismissal, and removes the
+        // pair row FOR GOOD: an answered pair stays answered, a merged pair is gone.
+        // One CURRENT fact on the absorbed side first, so the merge has something to
+        // carry across (and the invalidated edge above stays invalidated).
+        ruagent_graph::add_fact(&db, b, c, "owns", "beta owns gamma now", None, None)
+            .await
+            .unwrap();
+        let (st, merged, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/graph/resolution/merge",
+            Some(serde_json::json!({ "keeper": a, "absorbed": b })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t10 [merge] {merged}");
+        assert_eq!(
+            merged["moved"], 2,
+            "both of beta's edges follow the keeper, valid or not: {raw}"
+        );
+        let (st, end, raw) = hit(&app, "GET", "/api/v1/graph/resolution/pending").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(end["pending_count"], 0, "{raw}");
+        assert_eq!(
+            end["dismissed_count"], 0,
+            "the merge DELETES the pair row, so the decision is not merely answered: {raw}"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM resolution_pending").await,
+            0,
+            "no pair row survives the merge"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM entities WHERE name = 't10-beta'").await,
+            0,
+            "the absorbed entity is gone"
+        );
+        assert_eq!(
+            count(
+                &db,
+                &format!(
+                    "SELECT COUNT(*) FROM entity_aliases WHERE entity_id = {a} AND alias = 't10-beta'"
+                )
+            )
+            .await,
+            1,
+            "the absorbed name became an alias of the keeper"
+        );
+        // The keeper's CURRENT facts are now its own two plus the one the merge
+        // carried over -- and the invalidated one it also carried did NOT become
+        // current (the 口径 survives the merge).
+        let (st, after_merge, raw) = hit(&app, "GET", &format!("/api/v1/graph/entity/{a}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            after_merge["facts"].as_array().map(Vec::len),
+            Some(3),
+            "{raw}"
+        );
+        assert_eq!(after_merge["name"], "t10-alpha", "{raw}");
+    }
+
+    /// t22 / #54's third acceptance: THE WINDOW SAYS WHEN IT WAS CUT.
+    ///
+    /// THREE BOUNDARIES, and two of them are the ones a naive rule gets wrong: the
+    /// limit is reached with rows left over (true), the limit is never reached
+    /// (false), and the limit is EXACTLY the number of matches (false -- "we returned
+    /// everything there was" is not truncation).
+    #[tokio::test]
+    async fn memory_list_states_its_truncation() {
+        let (app, db, _root) = harness().await;
+        for i in 0..5 {
+            let write = ruagent_memory::write::MemoryWrite {
+                store: ruagent_memory::MemoryStore::Observation,
+                namespace: ruagent_memory::namespace::Namespace::parse("user").unwrap(),
+                content: format!("t22 window fixture row {i}"),
+                confidence: 0.9,
+                source_episode: None,
+                supersedes: None,
+            };
+            ruagent_memory::write::write_memory(&db, &write)
+                .await
+                .unwrap();
+        }
+
+        // 触达: 5 matches, a window of 2.
+        let (st, cut, raw) =
+            hit(&app, "GET", "/api/v1/memory/list?store=observation&limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t22 [memory/list limit=2] {}",
+            serde_json::json!({
+                "total": cut["total"], "matched": cut["matched"], "limit": cut["limit"],
+                "truncated": cut["truncated"], "truncated_sections": cut["truncated_sections"],
+            })
+        );
+        assert_eq!(cut["matched"], 5, "{raw}");
+        assert_eq!(cut["total"], 2, "{raw}");
+        assert_eq!(cut["limit"], 2, "{raw}");
+        assert_eq!(cut["memories"].as_array().map(Vec::len), Some(2), "{raw}");
+        assert_eq!(
+            cut["truncated"], true,
+            "the window was reached and rows were left over: {raw}"
+        );
+        assert_eq!(
+            cut["truncated_sections"],
+            serde_json::json!(["memories"]),
+            "and the section it is about is named: {raw}"
+        );
+        // THE KEYS THE PANEL READS TODAY ARE UNTOUCHED, and so is their meaning.
+        for key in [
+            "memories",
+            "total",
+            "matched",
+            "limit",
+            "store",
+            "namespace",
+            "counts",
+        ] {
+            assert!(
+                cut.get(key).is_some(),
+                "existing key {key} must survive: {raw}"
+            );
+        }
+
+        // 恰好相等: the window is exactly the matches.
+        let (st, exact, raw) =
+            hit(&app, "GET", "/api/v1/memory/list?store=observation&limit=5").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(exact["total"], 5, "{raw}");
+        assert_eq!(
+            exact["truncated"], false,
+            "a limit EXACTLY equal to the matches is not truncation: {raw}"
+        );
+        assert_eq!(exact["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // 未触达: the window is wider than anything the filter could return.
+        let (st, roomy, raw) = hit(
+            &app,
+            "GET",
+            "/api/v1/memory/list?store=observation&limit=10",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(roomy["total"], 5, "{raw}");
+        assert_eq!(
+            roomy["truncated"], false,
+            "a limit the filter never reached is not truncation: {raw}"
+        );
+        assert_eq!(roomy["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // A store with nothing in it is an empty list, never "truncated".
+        let (st, empty, raw) = hit(&app, "GET", "/api/v1/memory/list?store=lesson").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(empty["total"], 0, "{raw}");
+        assert_eq!(empty["matched"], 0, "{raw}");
+        assert_eq!(empty["truncated"], false, "{raw}");
+    }
+
+    /// t22 / #54's third acceptance, the RECALL half: the same boolean on the other
+    /// window-shaped read end, where one response carries FOUR bounded lists.
+    ///
+    /// The boundaries are read against the number of matching chunks MEASURED first
+    /// (one call with a wide window), not against a number this test assumes: the
+    /// fixture's chunk count is the chunker's business, and a test that hardcoded it
+    /// would break the day the chunker changes rather than the day truncation does.
+    #[tokio::test]
+    async fn recall_states_its_truncation() {
+        let (app, _db, _root) = harness().await;
+        for doc in ["t22-doc-a", "t22-doc-b"] {
+            let mut content = String::new();
+            for i in 0..3 {
+                content.push_str(&format!(
+                    "# {doc} section {i}\n\nt22marker appears in {doc} section {i} and nowhere else.\n\n"
+                ));
+            }
+            let (st, _, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/knowledge/ingest",
+                Some(serde_json::json!({ "name": doc, "content": content })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+        }
+
+        // 未触达 (and the measurement): a window wider than the fixture.
+        let (st, roomy, raw) = hit(&app, "GET", "/api/v1/recall?q=t22marker&top_n=20").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let available = roomy["knowledge"].as_array().map(Vec::len).unwrap_or(0);
+        println!(
+            "READING t22 [recall top_n=20] knowledge={available} truncated={} sections={} memory_legs={}",
+            roomy["truncated"], roomy["truncated_sections"], roomy["memory_legs"]
+        );
+        assert!(
+            available >= 2,
+            "the fixture must match more than one chunk for a window to cut: {raw}"
+        );
+        assert_eq!(
+            roomy["truncated"], false,
+            "an unreached window is not truncation: {raw}"
+        );
+        assert_eq!(roomy["truncated_sections"], serde_json::json!([]), "{raw}");
+        // THE KEYS THE PANEL READS TODAY ARE UNTOUCHED.
+        for key in [
+            "strategy",
+            "source",
+            "scoring",
+            "graph",
+            "legs_disabled",
+            "memory_fusion",
+            "memories",
+            "memory_legs",
+            "knowledge",
+            "wiki",
+            "entities",
+        ] {
+            assert!(
+                roomy.get(key).is_some(),
+                "existing key {key} must survive: {raw}"
+            );
+        }
+
+        // 触达: a window of 1 against the measured matches.
+        let (st, cut, raw) = hit(&app, "GET", "/api/v1/recall?q=t22marker&top_n=1").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t22 [recall top_n=1] knowledge={} truncated={} sections={}",
+            cut["knowledge"].as_array().map(Vec::len).unwrap_or(0),
+            cut["truncated"],
+            cut["truncated_sections"]
+        );
+        assert_eq!(
+            cut["knowledge"].as_array().map(Vec::len),
+            Some(1),
+            "the window is the caller's: {raw}"
+        );
+        assert_eq!(
+            cut["truncated"], true,
+            "the window cut the matching chunks: {raw}"
+        );
+        assert!(
+            cut["truncated_sections"]
+                .as_array()
+                .map(|s| s.iter().any(|v| v == "knowledge"))
+                .unwrap_or(false),
+            "so it names the section it cut: {raw}"
+        );
+
+        // 恰好相等: the window is exactly the matches.
+        let (st, exact, raw) = hit(
+            &app,
+            "GET",
+            &format!("/api/v1/recall?q=t22marker&top_n={available}"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            exact["knowledge"].as_array().map(Vec::len),
+            Some(available),
+            "a window equal to the matches returns them all: {raw}"
+        );
+        assert_eq!(
+            exact["truncated"], false,
+            "a window EXACTLY equal to the matches is not truncation: {raw}"
+        );
+        assert_eq!(exact["truncated_sections"], serde_json::json!([]), "{raw}");
+    }
+
+    /// t22 / #54's third acceptance, the MEMORY window of a recall response.
+    ///
+    /// WHAT THIS PINS, and why it is the honest reading: a full memory window is NOT
+    /// evidence of truncation. Each memory leg is called with the caller's `top_n`,
+    /// so a fixture whose matches come from one leg cannot show the FUSION dropping
+    /// rows -- and the response says nothing rather than inferring a cut from
+    /// `memories.len() == top_n`, an inference that would be wrong in exactly the
+    /// case the acceptance names (a limit equal to the number of matches). The
+    /// `memories` section is reported when the fusion's own drop count proves rows
+    /// were left over (`memory_legs.dropped_by_top_n`, the engine's reading, covered
+    /// by memembed's own tests), never from the returned length.
+    #[tokio::test]
+    async fn recall_does_not_claim_a_memory_cut_it_cannot_prove() {
+        let (app, db, _root) = harness().await;
+        for i in 0..3 {
+            let write = ruagent_memory::write::MemoryWrite {
+                store: ruagent_memory::MemoryStore::Observation,
+                namespace: ruagent_memory::namespace::Namespace::parse("user").unwrap(),
+                content: format!("t22marker fused window fixture row {i}"),
+                confidence: 0.9,
+                source_episode: None,
+                supersedes: None,
+            };
+            ruagent_memory::write::write_memory(&db, &write)
+                .await
+                .unwrap();
+        }
+
+        // A window of one over three matching memories: the returned list IS the
+        // window, and the fusion dropped nothing (the keyword leg was cut to the same
+        // one), so the response claims no cut.
+        let (st, cut, raw) = hit(&app, "GET", "/api/v1/recall?q=t22marker&top_n=1").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t22 [recall memories top_n=1] memories={} dropped={} truncated={} sections={}",
+            cut["memories"].as_array().map(Vec::len).unwrap_or(0),
+            cut["memory_legs"]["dropped_by_top_n"],
+            cut["truncated"],
+            cut["truncated_sections"]
+        );
+        assert_eq!(
+            cut["memories"].as_array().map(Vec::len),
+            Some(1),
+            "the fused window is the caller's top_n: {raw}"
+        );
+        assert_eq!(
+            cut["memory_legs"]["dropped_by_top_n"], 0,
+            "the leg and the fusion both stopped at the same one: {raw}"
+        );
+        assert_eq!(
+            cut["truncated"], false,
+            "a full window is not proof of a cut, so nothing is claimed: {raw}"
+        );
+        assert_eq!(cut["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // A window wider than the matches is not truncation either.
+        let (st, roomy, raw) = hit(&app, "GET", "/api/v1/recall?q=t22marker&top_n=20").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(roomy["memories"].as_array().map(Vec::len), Some(3), "{raw}");
+        assert_eq!(roomy["truncated"], false, "{raw}");
+        assert_eq!(roomy["truncated_sections"], serde_json::json!([]), "{raw}");
+        assert_eq!(roomy["memory_legs"]["dropped_by_top_n"], 0, "{raw}");
+    }
+
+    /// t22 / #54's third acceptance: the WIKI window is named too -- the same rule on
+    /// the third bounded list a recall response carries. Wiki documents are partitioned
+    /// out of `knowledge` before either window is applied, so this is a different
+    /// section with a different cut, not a second reading of the same one.
+    #[tokio::test]
+    async fn recall_truncation_names_the_wiki_window() {
+        let (app, _db, _root) = harness().await;
+        for doc in ["wiki/t22-wiki-a", "wiki/t22-wiki-b"] {
+            let mut content = String::new();
+            for i in 0..3 {
+                content.push_str(&format!(
+                    "# {doc} section {i}\n\nt22wikimarker appears in {doc} section {i} and nowhere else.\n\n"
+                ));
+            }
+            let (st, _, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/knowledge/ingest",
+                Some(serde_json::json!({ "name": doc, "content": content })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+        }
+
+        let (st, roomy, raw) = hit(&app, "GET", "/api/v1/recall?q=t22wikimarker&top_n=20").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t22 [recall wiki top_n=20] wiki={} knowledge={} truncated={} sections={}",
+            roomy["wiki"].as_array().map(Vec::len).unwrap_or(0),
+            roomy["knowledge"].as_array().map(Vec::len).unwrap_or(0),
+            roomy["truncated"],
+            roomy["truncated_sections"]
+        );
+        assert_eq!(
+            roomy["truncated"], false,
+            "a window of twenty over a handful of chunks: {raw}"
+        );
+        assert_eq!(roomy["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        let (st, cut, raw) = hit(&app, "GET", "/api/v1/recall?q=t22wikimarker&top_n=1").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t22 [recall wiki top_n=1] wiki={} knowledge={} truncated={} sections={}",
+            cut["wiki"].as_array().map(Vec::len).unwrap_or(0),
+            cut["knowledge"].as_array().map(Vec::len).unwrap_or(0),
+            cut["truncated"],
+            cut["truncated_sections"]
+        );
+        assert_eq!(
+            cut["knowledge"].as_array().map(Vec::len).unwrap_or(0),
+            0,
+            "wiki documents are partitioned out of knowledge: {raw}"
+        );
+        assert_eq!(
+            cut["truncated"], true,
+            "the wiki window was reached with rows left over: {raw}"
+        );
+        assert!(
+            cut["truncated_sections"]
+                .as_array()
+                .map(|s| s.iter().any(|v| v == "wiki"))
+                .unwrap_or(false),
+            "and the section it names is the one that was cut: {raw}"
+        );
+    }
+
+    /// t25 / #54's third acceptance: THE SESSION LIST DECLARES ITS WINDOW.
+    ///
+    /// FOUR BOUNDARIES (reached / not reached / exactly equal / empty index), plus the
+    /// second half of the finding: `offset` used to be silently ignored -- a caller
+    /// asking for page 2 received page 1 with a 200 and no way to tell -- so it is
+    /// either honoured or refused. Here it is REFUSED BY NAME, uniformly (including 0:
+    /// partial support is the thing that would make the next caller guess).
+    #[tokio::test]
+    async fn the_session_list_states_its_truncation_and_refuses_a_silent_offset() {
+        let (app, db, root) = harness().await;
+
+        // Empty index: nothing was indexed, so nothing can have been cut.
+        let (st, empty, raw) = hit(&app, "GET", "/api/v1/sessions?limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t25 [empty] {}",
+            serde_json::json!({
+                "rows": empty["sessions"].as_array().map(Vec::len),
+                "truncated": empty["truncated"],
+                "sections": empty["truncated_sections"],
+                "archived_count": empty["archived_count"],
+            })
+        );
+        assert_eq!(empty["sessions"].as_array().map(Vec::len), Some(0), "{raw}");
+        assert_eq!(
+            empty["truncated"], false,
+            "an empty index cannot be truncated: {raw}"
+        );
+        assert_eq!(empty["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // Three sessions, newest first (updated_at 3, 2, 1).
+        for (i, key) in ["ruagent:t25-1", "ruagent:t25-2", "ruagent:t25-3"]
+            .iter()
+            .enumerate()
+        {
+            seed_batch_session(
+                &db,
+                key,
+                &root.join(format!("t25-{i}.jsonl")),
+                (i + 1) as i64,
+                16,
+            )
+            .await;
+        }
+
+        // Reached: a window of two over three sessions.
+        let (st, cut, raw) = hit(&app, "GET", "/api/v1/sessions?limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t25 [limit=2] {}",
+            serde_json::json!({
+                "keys": cut["sessions"].as_array().map(|rows| rows.iter()
+                    .filter_map(|r| r["key"].as_str()).collect::<Vec<_>>()),
+                "truncated": cut["truncated"],
+                "sections": cut["truncated_sections"],
+                "archived_count": cut["archived_count"],
+            })
+        );
+        assert_eq!(cut["sessions"].as_array().map(Vec::len), Some(2), "{raw}");
+        assert_eq!(
+            cut["sessions"][0]["key"], "ruagent:t25-3",
+            "the window is ordered, newest first, and the peek did not disturb it: {raw}"
+        );
+        assert_eq!(
+            cut["truncated"], true,
+            "the window was reached and a third session exists: {raw}"
+        );
+        assert_eq!(
+            cut["truncated_sections"],
+            serde_json::json!(["sessions"]),
+            "and it names the section it cut, the vocabulary recall and memory/list use: {raw}"
+        );
+
+        // Exactly equal: the window is exactly the sessions on hand.
+        let (st, exact, raw) = hit(&app, "GET", "/api/v1/sessions?limit=3").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(exact["sessions"].as_array().map(Vec::len), Some(3), "{raw}");
+        assert_eq!(
+            exact["truncated"], false,
+            "a limit EXACTLY equal to the sessions on hand is not truncation: {raw}"
+        );
+        assert_eq!(exact["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // Not reached: a window wider than the index.
+        let (st, roomy, raw) = hit(&app, "GET", "/api/v1/sessions?limit=10").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(roomy["sessions"].as_array().map(Vec::len), Some(3), "{raw}");
+        assert_eq!(
+            roomy["truncated"], false,
+            "a window the index never reached is not truncation: {raw}"
+        );
+        assert_eq!(roomy["truncated_sections"], serde_json::json!([]), "{raw}");
+
+        // THE KEYS THE PANEL READS TODAY ARE UNTOUCHED: sessions (the only key
+        // panel/src/api.ts reads) and archived_count.
+        for reading in [&cut, &exact, &roomy, &empty] {
+            assert!(
+                reading["sessions"].is_array(),
+                "the sessions key must survive: {reading}"
+            );
+            assert!(
+                reading["archived_count"].is_number(),
+                "the archived_count key must survive: {reading}"
+            );
+        }
+
+        // THE IGNORED PARAMETER IS GONE: every spelling of offset is refused BY NAME,
+        // and the refusal does not carry a sessions list that would read like success.
+        // (Including offset=0: one rule for the parameter, so a caller cannot be left
+        // guessing which values are honoured.)
+        for uri in [
+            "/api/v1/sessions?offset=4",
+            "/api/v1/sessions?offset=0",
+            "/api/v1/sessions?limit=2&offset=2",
+        ] {
+            let (st, body, raw) = hit(&app, "GET", uri).await;
+            assert_eq!(
+                st,
+                StatusCode::BAD_REQUEST,
+                "{uri}: offset must be refused, not ignored: {raw}"
+            );
+            assert!(
+                raw.contains("offset"),
+                "{uri}: the refusal must NAME the parameter: {raw}"
+            );
+            assert!(
+                body.get("sessions").is_none(),
+                "{uri}: a refusal must not look like a page: {raw}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

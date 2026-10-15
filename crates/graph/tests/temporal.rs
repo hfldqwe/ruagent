@@ -1,10 +1,16 @@
 //! G4: the event-time axis must carry information, and "no event time" must be
 //! a DIFFERENT value from "the write clock".
 //!
-//! BEFORE: the frozen `add_fact` writes `event_time_source = NULL` for every row
-//! (measured live: 0/67 edges carried a source, and 66/67 had valid_at ==
-//! created_at within 1 second), so `retrieve` could only report the timestamp,
-//! never what it meant.
+//! BEFORE: the write clock stamped every new row and NOTHING said so. `add_fact`
+//! carried its own INSERT that wrote `event_time_source = NULL` (measured live:
+//! 0/67 edges carried a source, and 66/67 had valid_at == created_at within 1
+//! second), so `retrieve` could only report the timestamp, never what it meant.
+//!
+//! NOW: EVERY write path records where `valid_at` came from — `add_fact` writes
+//! `recorded` (a panel/API/CLI write did not come out of a transcript, so there
+//! is no event time to claim), the extraction writes `extracted` only when the
+//! transcript supplied one, and the third state — a pre-0021 row, whose writer
+//! recorded nothing — is still reachable and still means UNKNOWN.
 
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use ruagent_graph as g;
@@ -13,12 +19,13 @@ mod fixture;
 use fixture::{PathmapDb, json_file};
 
 #[tokio::test]
-async fn the_old_writer_leaves_the_source_unknown_and_the_new_one_records_it() {
+async fn every_writer_says_where_the_event_time_came_from() {
     let db = PathmapDb::live_shaped().await;
     let a = db.entity_id("ruagent").await;
     let b = db.entity_id("Codex").await;
 
-    // BEFORE: the frozen writer. Its signature and behaviour must not change.
+    // The manual writer (frozen signature). Every write now records a source, and
+    // for a hand-written fact the honest one is `recorded`: the clock stamped it.
     let old_id = g::add_fact(
         &db.db,
         a,
@@ -32,11 +39,24 @@ async fn the_old_writer_leaves_the_source_unknown_and_the_new_one_records_it() {
     .unwrap();
     let src = event_time_source_of(&db, old_id).await;
     assert_eq!(
-        src, None,
-        "the frozen writer must NOT start claiming a source"
+        src.as_deref(),
+        Some(g::EventTimeSource::Recorded.as_str()),
+        "a manual write states its provenance instead of leaving the column NULL"
     );
 
-    // AFTER: the extraction writer says where the timestamp came from.
+    // The source it claims is not simply hardcoded: the same writer fed `None`
+    // for valid_at (no event time at all) still answers `recorded`, and the
+    // extraction writer fed an event time answers `extracted`.
+    let manual_no_time = g::add_fact(&db.db, a, b, "t999-old-none", "no time at all", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        event_time_source_of(&db, manual_no_time).await.as_deref(),
+        Some("recorded"),
+        "valid_at absent means the clock stamped it"
+    );
+
+    // The extraction writer says where the timestamp came from.
     let ext_id = g::add_fact_with_source(
         &db.db,
         a,
@@ -69,6 +89,29 @@ async fn the_old_writer_leaves_the_source_unknown_and_the_new_one_records_it() {
         event_time_source_of(&db, rec_id).await.as_deref(),
         Some("recorded"),
         "valid_at=None means the clock stamped it; claiming 'extracted' would be a lie"
+    );
+
+    // The third state is NOT gone: a pre-0021 row whose writer recorded nothing
+    // keeps its NULL, and NULL is not silently upgraded to a claim. This is what
+    // makes `recorded` above informative -- a column that answered `recorded`
+    // for a row nobody recorded anything about would say nothing at all.
+    let unrecorded = db
+        .db
+        .call_flat(move |conn| {
+            conn.execute(
+                "INSERT INTO entity_edges
+                   (src, dst, relation, fact_text, valid_at, created_at, source_episode)
+                 VALUES (?1, ?2, 't999-pre0021', 'written before the column existed', ?3, ?3, NULL)",
+                rusqlite::params![a, b, "2026-01-03T00:00:00Z"],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        event_time_source_of(&db, unrecorded).await,
+        None,
+        "a row whose writer recorded nothing stays NULL -- unknown is a fact"
     );
 
     // The fact identity is recorded, and it is stable + whitespace/case-insensitive.
@@ -108,15 +151,19 @@ async fn the_old_writer_leaves_the_source_unknown_and_the_new_one_records_it() {
             .map(|e| format!("{:?}", e.temporal))
     };
     println!(
-        "temporal states: extracted={:?} recorded={:?} old(null)={:?}",
+        "temporal states: extracted={:?} recorded={:?} unrecorded(null)={:?}",
         state_of(ext_id).as_deref(),
         state_of(rec_id).as_deref(),
-        state_of(old_id).as_deref()
+        state_of(unrecorded).as_deref()
     );
     assert!(state_of(ext_id).unwrap().contains("Current"));
     assert!(state_of(rec_id).unwrap().contains("RecordedAtOnly"));
     assert!(
         state_of(old_id).unwrap().contains("RecordedAtOnly"),
+        "a manually written fact has no event time to report"
+    );
+    assert!(
+        state_of(unrecorded).unwrap().contains("RecordedAtOnly"),
         "an unknown source cannot be reported as a real event time"
     );
 }

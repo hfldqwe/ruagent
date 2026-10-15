@@ -85,8 +85,9 @@ use serde::Serialize;
 
 /// The `source` column value every row written by this path carries. Session
 /// distillation writes behind its own source; the two must stay distinguishable
-/// in the graph.
-pub const GRAPH_SOURCE: &str = "knowledge";
+/// in the graph. The vocabulary is `ruagent_graph::AliasSource`, so a caller
+/// cannot pass a spelling this path has never written.
+pub const GRAPH_SOURCE: ruagent_graph::AliasSource = ruagent_graph::AliasSource::Knowledge;
 
 /// What one ingestion pass may do. Every field is resolved by the CALLER from
 /// the `knowledge_ingest_graph` capability's options (§4.2: `max_per_input`

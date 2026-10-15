@@ -9,6 +9,10 @@ export const zh: Record<string, string> = {
   "settings.title": "设置",
   "settings.subtitle": "蒸馏策略、能力插件",
   "settings.noRoles": "没有可选角色",
+  "settings.agentsErr": "无法读取角色列表",
+  "settings.agentsErr.hint": "读不到角色：daemon 不可达，或者响应不符合契约。这不等于「没有角色」。",
+  "settings.agentsFailed": "角色列表读取失败——下拉里没有可选项，但这不是「没有角色」。",
+
 
   // ---- capability plane (docs/plans/capability-plugins-design.md §4) -------
   // The NAME of each capability is panel copy, so it is keyed here, one key per
@@ -77,6 +81,10 @@ export const en: Record<string, string> = {
   "settings.title": "Settings",
   "settings.subtitle": "distillation policy, capabilities",
   "settings.noRoles": "No roles available",
+  "settings.agentsErr": "Cannot read the role list",
+  "settings.agentsErr.hint": "Cannot read the roles: the daemon is unreachable, or its response does not match the contract. That is not the same as \"there are no roles\".",
+  "settings.agentsFailed": "The role list could not be read — the picker has nothing to offer, but that is not \"there are no roles\".",
+
 
   // ---- capability plane (docs/plans/capability-plugins-design.md §4) -------
   "settings.capabilities.title": "Capabilities",

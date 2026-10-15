@@ -34,8 +34,14 @@ import {
   RelTime,
   ResizeHandle,
   Spinner,
+  StaleNotice,
+  readFailed,
+  readIsEmpty,
+  readLoading,
+  readReady,
   useSidebarResize,
   useToast,
+  type LoadState,
 } from "../ui";
 import { Markdown } from "./lazy-markdown";
 import { msToIso } from "./Sessions";
@@ -2314,20 +2320,39 @@ function PastConversation({
   onNew: () => void;
 }) {
   const { t } = useI18n();
-  const [messages, setMessages] = useState<
-    { role: string; text: string }[] | null
-  >(null);
+  /** The transcript, as a three-state (#53): `.catch(() => setMessages([]))`
+   *  made a failed read print 「chat.empty」 - "this conversation has no
+   *  messages" - for a conversation nobody had read. */
+  const [messages, setMessages] = useState<LoadState<{ role: string; text: string }[]>>(
+    readLoading(),
+  );
+
+  const loadMessages = useCallback(() => {
+    if (!entry.session_key) {
+      // No transcript to read at all: an ANSWER, and the empty state is the
+      // honest reading of it (this is the pre-existing shape, kept).
+      setMessages(readReady([]));
+      return;
+    }
+    api
+      .sessionMessages(entry.session_key)
+      .then((m) => setMessages(readReady(m)))
+      .catch((e) => setMessages((prev) => readFailed(prev, e)));
+  }, [entry.session_key]);
+
+  /** Which transcript the state above belongs to. A DIFFERENT entry is a
+   *  different conversation: keeping the previous one's messages under the new
+   *  title would be showing someone else's data, so the state resets when the
+   *  entry changes - and NOT when the same entry is re-read (重试). */
+  const shownKeyRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
-    if (entry.session_key) {
-      api
-        .sessionMessages(entry.session_key)
-        .then(setMessages)
-        .catch(() => setMessages([]));
-    } else {
-      setMessages([]);
+    if (shownKeyRef.current !== entry.session_key) {
+      shownKeyRef.current = entry.session_key;
+      setMessages(readLoading());
     }
-  }, [entry.session_key]);
+    loadMessages();
+  }, [loadMessages, entry.session_key]);
 
   return (
     <div className="chat-log grow">
@@ -2342,23 +2367,39 @@ function PastConversation({
           + {t("chat.new")}
         </Button>
       </div>
-      {messages === null ? (
+      {messages.kind === "error" && messages.data === null ? (
+        // Nothing was ever read: an error with a retry, never 「还没有消息」.
+        <ErrorState
+          title={t("chat.messagesErr")}
+          hint={`${t("chat.messagesErr.hint")} — ${String(messages.err).slice(0, 160)}`}
+          onRetry={loadMessages}
+          retryLabel={t("common.retry")}
+        />
+      ) : messages.data === null ? (
         <Spinner />
-      ) : messages.length === 0 ? (
-        <div className="state empty">
-          <p>{t("chat.empty")}</p>
-        </div>
       ) : (
-        messages.map((m, i) => (
-          <div
-            key={i}
-            className={
-              m.role === "user" ? "chat-msg user" : "chat-msg agent"
-            }
-          >
-            {m.role === "user" ? m.text : <Markdown>{m.text}</Markdown>}
-          </div>
-        ))
+        <>
+          {messages.kind === "error" ? (
+            // A failed RE-read keeps the messages already on screen.
+            <StaleNotice err={messages.err} onRetry={loadMessages} />
+          ) : null}
+          {readIsEmpty(messages, (m) => m.length === 0) ? (
+            <div className="state empty">
+              <p>{t("chat.empty")}</p>
+            </div>
+          ) : (
+            messages.data.map((m, i) => (
+              <div
+                key={i}
+                className={
+                  m.role === "user" ? "chat-msg user" : "chat-msg agent"
+                }
+              >
+                {m.role === "user" ? m.text : <Markdown>{m.text}</Markdown>}
+              </div>
+            ))
+          )}
+        </>
       )}
       <div style={{ height: 40 }} />
     </div>

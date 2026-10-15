@@ -8,7 +8,7 @@
 // a hierarchy centre that is not decoration (D8), a visible Run.error (D16)
 // and a confirmed cancel (D17).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button, Checkbox, Input, Popconfirm, Segmented, Select } from "antd";
 import { Icon } from "../icons";
 import {
@@ -28,7 +28,11 @@ import {
   StatusPill,
   Zone,
   fmtUsd,
+  readFailed,
+  readLoading,
+  readReady,
   useToast,
+  type LoadState,
 } from "../ui";
 import { Markdown } from "./lazy-markdown";
 import { RunTimeline } from "./RunTimeline";
@@ -58,7 +62,12 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [landable, setLandable] = useState(false);
   const [landing, setLanding] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  /** The role list, as a three-state (#53): the RUN LAUNCHER renders
+   *  「没有可选角色」 when it has none, so a failed read must not reach that
+   *  state -- the old `.catch(() => {})` left `agents` at `[]` and made a
+   *  broken daemon indistinguishable from one with no roles configured. */
+  const [agents, setAgents] = useState<LoadState<AgentInfo[]>>(readLoading());
+
   const [launching, setLaunching] = useState(false);
   const [err, setErr] = useState<unknown>(null);
   const toast = useToast();
@@ -93,12 +102,20 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
         return null;
       });
 
+  /** Read the roles. Extracted so the failed state's retry is the SAME read. */
+  const loadAgents = useCallback(() => {
+    api
+      .agents()
+      .then((a) => setAgents(readReady(a)))
+      .catch((e) => setAgents((prev) => readFailed(prev, e)));
+  }, []);
+
   useEffect(() => {
-    api.agents().then(setAgents).catch(() => {});
+    loadAgents();
     refresh();
     const i = setInterval(refresh, 2000);
     return () => clearInterval(i);
-  }, [id]);
+  }, [id, loadAgents]);
 
   if (!task) {
     if (err) {
@@ -130,7 +147,7 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const failedRuns = runs.filter((r) => r.status === "failed").length;
   const selected = runs.find((r) => r.id === selectedRun) ?? null;
   const agentName = (r: Run) =>
-    agents.find((a) => a.id === r.params.agent)?.name ?? r.params.agent.slice(0, 8);
+    agents.data?.find((a) => a.id === r.params.agent)?.name ?? r.params.agent.slice(0, 8);
 
   return (
     <div>
@@ -158,7 +175,9 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
       <Launcher
         task={task}
-        agents={agents.filter((a) => a.enabled)}
+        agents={(agents.data ?? []).filter((a) => a.enabled)}
+        agentsErr={agents.kind === "error" ? agents.err : null}
+        onRetryAgents={loadAgents}
         onLaunched={(runId) => {
           if (runId) setSelectedRun(runId);
           refresh();
@@ -257,7 +276,9 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
           </Zone>
           <JudgeBar
             task={task}
-            agents={agents.filter((a) => a.enabled)}
+            agents={(agents.data ?? []).filter((a) => a.enabled)}
+            agentsErr={agents.kind === "error" ? agents.err : null}
+            onRetryAgents={loadAgents}
             runs={runs}
             judgement={judgement}
             judgeAgent={judgeAgent}
@@ -434,12 +455,20 @@ export function TaskDetail({ id, onBack }: { id: string; onBack: () => void }) {
 function Launcher({
   task,
   agents,
+  agentsErr,
+  onRetryAgents,
   onLaunched,
   busy,
   setBusy,
 }: {
   task: Task;
   agents: AgentInfo[];
+  /** Non-null when the role list could not be read. With no roles AND an
+   *  error, the launcher says so and offers the retry, instead of rendering
+   *  「没有可选角色」 - a claim about the daemon's configuration that the failed
+   *  read never made. */
+  agentsErr: unknown;
+  onRetryAgents: () => void;
   onLaunched: (runId: string | null) => void;
   busy: boolean;
   setBusy: (b: boolean) => void;
@@ -477,6 +506,10 @@ function Launcher({
   const [optMode, setOptMode] = useState("");
   const [optEffort, setOptEffort] = useState("");
   const [catalog, setCatalog] = useState<SessionOptionInfo[] | null>(null);
+  /** Non-null when the model catalogue could not be read (see the catch below). */
+  const [catalogErr, setCatalogErr] = useState<unknown>(null);
+  /** Re-read the catalogue for the CURRENT agent: the failed state's retry. */
+  const [catalogTries, setCatalogTries] = useState(0);
   const optAgent = mode === "fanout" ? (picked[0] ?? "") : agent;
   useEffect(() => {
     if (!optAgent) {
@@ -487,16 +520,24 @@ function Launcher({
     }
     let alive = true;
     setCatalog(null);
+    setCatalogErr(null);
     setOptMode("");
     setOptEffort("");
     api
       .agentOptions(optAgent)
       .then((r) => alive && setCatalog(r.options))
-      .catch(() => alive && setCatalog([]));
+      // A failed catalogue read used to become `[]`, so the mode/effort pickers
+      // simply had no options - indistinguishable from an agent that advertises
+      // none. It is recorded instead, and the launcher shows it with a retry.
+      .catch((e) =>
+        alive &&
+        (setCatalogErr(e), setCatalog([])),
+      );
     return () => {
       alive = false;
     };
-  }, [optAgent]);
+    // `catalogTries` is the retry: bumping it re-runs exactly this effect.
+  }, [optAgent, catalogTries]);
   const modeChoices =
     (catalog ?? []).find((o) => o.category === "mode" || o.id === "mode")?.choices ?? [];
   const effortChoices =
@@ -540,6 +581,16 @@ function Launcher({
     }
   };
 
+  if (agents.length === 0 && agentsErr) {
+    return (
+      <ErrorState
+        title={t("task.agentsErr")}
+        hint={`${t("task.agentsErr.hint")} — ${String(agentsErr).slice(0, 160)}`}
+        onRetry={onRetryAgents}
+        retryLabel={t("common.retry")}
+      />
+    );
+  }
   if (agents.length === 0) return <p className="muted pad">{t("launcher.noAgents")}</p>;
 
   return (
@@ -555,6 +606,17 @@ function Launcher({
           ]}
         />
       </div>
+
+      {catalogErr ? (
+        // The pickers below have no options because the READ failed, not
+        // because the agent advertises none. Say which, and offer the retry.
+        <ErrorState
+          title={t("task.catalogErr")}
+          hint={`${t("task.catalogErr.hint")} — ${String(catalogErr).slice(0, 160)}`}
+          onRetry={() => setCatalogTries((n) => n + 1)}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
 
       {mode === "single" && (
         <div className="row">
@@ -702,6 +764,8 @@ function Launcher({
 function JudgeBar({
   task,
   agents,
+  agentsErr,
+  onRetryAgents,
   runs,
   judgement,
   judgeAgent,
@@ -713,6 +777,10 @@ function JudgeBar({
 }: {
   task: Task;
   agents: AgentInfo[];
+  /** Non-null when the role list could not be read: an empty judge picker is
+   *  then an ERROR, not "this task has no角色 to judge with". */
+  agentsErr: unknown;
+  onRetryAgents: () => void;
   runs: Run[];
   judgement: Judgement | null;
   judgeAgent: string;
@@ -790,6 +858,16 @@ function JudgeBar({
         {verdictTag()}
         {judgement ? <StatusPill status={judgement.judge_run_status} /> : null}
       </div>
+      {agentsErr && agents.length === 0 ? (
+        // The picker above is empty because the READ failed. Say so (and offer
+        // the retry) instead of leaving a Select with nothing in it.
+        <ErrorState
+          title={t("task.agentsErr")}
+          hint={`${t("task.agentsErr.hint")} — ${String(agentsErr).slice(0, 160)}`}
+          onRetry={onRetryAgents}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
       {judgement?.rationale ? <Markdown>{judgement.rationale}</Markdown> : null}
     </div>
   );

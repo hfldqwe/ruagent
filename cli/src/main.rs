@@ -4,7 +4,7 @@ use std::io::BufRead;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -75,6 +75,53 @@ enum Cmd {
     Wiki {
         #[command(subcommand)]
         cmd: WikiCmd,
+    },
+    /// Distil a transcript into memories + graph facts.
+    ///
+    /// WHEN: after a long session (one distilled turn is cheaper than re-reading
+    /// it every time), or to close the backlog of sessions no successful pass was
+    /// ever recorded for -- `--unprocessed N` is that backlog pass.
+    ///
+    /// COST: a real pass spends model calls and writes memory/graph rows. One
+    /// session is NOT necessarily one call: a transcript over the plan's byte
+    /// budget is cut into windows and EVERY window is its own call, so a long
+    /// session costs several. Nothing runs for free here, which is why
+    /// `--dry-run` exists: with `--unprocessed` it prices the backlog WITHOUT
+    /// calling a model and WITHOUT writing anything. (With `--session` the route
+    /// still extracts once -- that is the endpoint's documented meaning of a dry
+    /// run: it tells you what WOULD be written -- and only then writes nothing.)
+    ///
+    /// EXIT CODE: 0 when nothing failed, non-zero when any attempt failed, so a
+    /// script can tell a pass that worked from one that did not.
+    #[command(group(
+        ArgGroup::new("target")
+            .required(true)
+            .args(["session", "unprocessed"])
+    ))]
+    Distill {
+        /// ONE session key, exactly as `ruagent status` / `/api/v1/sessions`
+        /// reports it.
+        #[arg(long)]
+        session: Option<String>,
+        /// Distil up to N sessions the ledger has no successful attempt for,
+        /// newest first. The daemon clamps this to its own per-pass ceiling and
+        /// the report prints how many of the undistilled total were planned.
+        #[arg(long)]
+        unprocessed: Option<u32>,
+        /// WHICH extractor runs, in the DAEMON'S OWN vocabulary: `rules` (free --
+        /// no model call at all), `acp` (one chat turn per window: the default and
+        /// the only implementation that costs money) or `both`. The CLI keeps no
+        /// second copy of that list: an unknown value is refused by the daemon,
+        /// which names the accepted ones.
+        #[arg(long)]
+        extractor: Option<String>,
+        /// Plan and price only; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the daemon's report as JSON (same shape for one session and for
+        /// the backlog) instead of the human summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -162,6 +209,20 @@ fn main() -> Result<()> {
         }
         Cmd::Run { prompt, agent } => run(&cli.url, &prompt, agent.as_deref()),
         Cmd::Wiki { cmd } => wiki_cmd(&cli.url, cmd),
+        Cmd::Distill {
+            session,
+            unprocessed,
+            extractor,
+            dry_run,
+            json,
+        } => distill_cmd(
+            &cli.url,
+            session.as_deref(),
+            unprocessed,
+            extractor.as_deref(),
+            dry_run,
+            json,
+        ),
         Cmd::Knowledge { cmd } => knowledge_cmd(&cli.url, cmd),
     }
 }
@@ -171,8 +232,22 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Response -> JSON with the daemon's {message} error body surfaced.
+///
+/// THE UNPARSEABLE-SUCCESS CASE CARRIES ITS LIKELY CAUSE (t9 / issue #46): a daemon
+/// built from an OLDER tree answers a path it does not serve with the PANEL's
+/// `index.html` and a 200, so `expected value at line 1 column 1` is what a stale
+/// `ruagent serve` looks like from here -- a message that names no action for the
+/// one thing the reader has to do (MEASURED against the live daemon at
+/// 127.0.0.1:8787, which serves `/api/v1/distill/log` as HTML). The hint names the
+/// action, and the content type plus the first bytes make the shape visible.
 fn api_json(resp: reqwest::blocking::Response) -> Result<serde_json::Value> {
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("(no content-type)")
+        .to_string();
     let text = resp.text().context("reading response")?;
     if !status.is_success() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
@@ -182,7 +257,12 @@ fn api_json(resp: reqwest::blocking::Response) -> Result<serde_json::Value> {
         }
         bail!("HTTP {status}: {text}");
     }
-    serde_json::from_str(&text).context("parsing response")
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "the daemon answered {status} {content_type} where JSON was expected — is the running daemon an OLDER build than this CLI? restart it (`ruagent serve`); it starts with: {}",
+            truncate_chars(text.trim(), 60)
+        )
+    })
 }
 
 fn wiki_cmd(url: &str, cmd: WikiCmd) -> Result<()> {
@@ -874,6 +954,352 @@ mod tests {
             "a probe recall must declare itself: {DOCTOR_RECALL_URL}"
         );
     }
+
+    /// t9 / issue #46: the distillation check must not PASS because it could not
+    /// ask. Without an answer it says 未检查 and is NOT ok, so `doctor` reports it
+    /// instead of omitting the line -- and the same reading is reached through a
+    /// real socket that refuses, not only by handing the function a None.
+    #[test]
+    fn doctor_distillation_check_says_not_checked_when_nobody_answers() {
+        let refused = get_json("http://127.0.0.1:1", "/api/v1/distill/log?limit=1");
+        assert!(
+            refused.is_err(),
+            "a dead port must not answer a ledger read"
+        );
+        // No daemon at all: the line names THAT cause.
+        let c = distill_check(false, refused);
+        assert!(
+            !c.ok,
+            "an unanswered check must not read as PASS: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("未检查"), "{}", c.detail);
+        assert!(c.detail.contains("daemon 不可达"), "{}", c.detail);
+
+        // A daemon that IS up but does not serve this endpoint is a DIFFERENT
+        // finding: an older build answers the path with the panel's HTML, and
+        // "daemon 不可达" would send the reader to the wrong machine.
+        let c = distill_check(true, Err("error decoding response body".into()));
+        assert!(!c.ok, "not answering is not a PASS either: {}", c.detail);
+        assert!(c.detail.contains("未检查"), "{}", c.detail);
+        assert!(!c.detail.contains("daemon 不可达"), "{}", c.detail);
+        assert!(
+            c.detail.contains("error decoding response body"),
+            "the cause must be readable: {}",
+            c.detail
+        );
+    }
+
+    /// t9 / #46: doctor's reading of a REACHABLE ledger -- the newest attempt and
+    /// the cumulative usage -- and the 0028 rule that a NULL column is not a zero.
+    #[test]
+    fn doctor_distillation_reading_keeps_nulls_out_of_the_numbers() {
+        let legacy = serde_json::json!({
+            "entries": [{
+                "id": 41,
+                "session_key": "k",
+                "distilled_at": "2026-01-02T03:04:05Z",
+                "status": serde_json::Value::Null,
+                "failure_reason": serde_json::Value::Null,
+            }],
+            "total": 33,
+            "totals": {
+                "tokens_used": serde_json::Value::Null,
+                "cost_usd": serde_json::Value::Null,
+                "tokens_used_not_recorded": 33,
+                "cost_usd_not_recorded": 33,
+            },
+        });
+        let line = distill_reading(&legacy);
+        assert!(line.contains("2026-01-02T03:04:05Z"), "{line}");
+        assert!(
+            line.contains("[not_recorded]"),
+            "a NULL status is the ledger's own word for it: {line}"
+        );
+        assert!(
+            line.contains("not recorded (33 of 33 attempt(s))"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("tokens 0") && !line.contains("$0.0000"),
+            "a NULL is not a measurement: {line}"
+        );
+
+        let measured = serde_json::json!({
+            "entries": [{
+                "id": 7,
+                "distilled_at": "2026-02-02T00:00:00Z",
+                "status": "failed",
+                "failure_reason": "no content to distil: the session has no user messages",
+            }],
+            "total": 4,
+            "totals": {
+                "tokens_used": 1240,
+                "cost_usd": 0.0012,
+                "tokens_used_not_recorded": 1,
+                "cost_usd_not_recorded": 1,
+            },
+        });
+        let line = distill_reading(&measured);
+        assert!(line.contains("[failed]"), "{line}");
+        assert!(
+            line.contains("no content to distil"),
+            "the failure reason must be readable: {line}"
+        );
+        assert!(line.contains("tokens 1240"), "{line}");
+        assert!(line.contains("$0.0012"), "{line}");
+
+        // An empty ledger is a REACHABLE ledger with nothing in it: ok, and said.
+        let empty = serde_json::json!({
+            "entries": [],
+            "total": 0,
+            "totals": {"tokens_used": serde_json::Value::Null, "cost_usd": serde_json::Value::Null,
+                       "tokens_used_not_recorded": 0, "cost_usd_not_recorded": 0},
+        });
+        let line = distill_reading(&empty);
+        assert!(line.contains("no attempts recorded yet"), "{line}");
+    }
+
+    /// t9 / #47: the CLI surface itself, without a daemon. Exactly one target is
+    /// required and the two are exclusive -- `--session <key>` and
+    /// `--unprocessed <n> --dry-run` are the two calls the contract names.
+    #[test]
+    fn distill_targets_are_exclusive_and_one_is_required() {
+        let one = Cli::try_parse_from(["ruagent", "distill", "--session", "sess/key"])
+            .expect("--session parses");
+        match one.cmd {
+            Cmd::Distill {
+                session,
+                unprocessed,
+                extractor,
+                dry_run,
+                json,
+            } => {
+                assert_eq!(session.as_deref(), Some("sess/key"));
+                assert!(unprocessed.is_none());
+                // Absent means "the daemon's default" (acp) rather than a value
+                // the CLI picked, so it must reach the request as absent.
+                assert!(extractor.is_none());
+                assert!(!dry_run && !json);
+            }
+            _ => panic!("distill must parse as Cmd::Distill"),
+        }
+
+        let backlog = Cli::try_parse_from([
+            "ruagent",
+            "distill",
+            "--unprocessed",
+            "5",
+            "--extractor",
+            "rules",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("--unprocessed --extractor --dry-run --json parses");
+        match backlog.cmd {
+            Cmd::Distill {
+                session,
+                unprocessed,
+                extractor,
+                dry_run,
+                json,
+            } => {
+                assert_eq!(unprocessed, Some(5));
+                assert_eq!(extractor.as_deref(), Some("rules"));
+                assert!(dry_run && json);
+                assert!(session.is_none());
+            }
+            _ => panic!("distill must parse as Cmd::Distill"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["ruagent", "distill"]).is_err(),
+            "a target is required: the CLI must not guess which pass to run"
+        );
+        assert!(
+            Cli::try_parse_from(["ruagent", "distill", "--session", "k", "--unprocessed", "2"])
+                .is_err(),
+            "one session and a backlog pass are different jobs and cannot be one call"
+        );
+    }
+
+    /// t9 / #46: the ledger decides what became of an attempt, and an attempt that
+    /// wrote nothing is never reported as `ok`.
+    #[test]
+    fn classify_prefers_the_ledger_row_and_never_invents_ok() {
+        let row = serde_json::json!({
+            "status": "empty",
+            "failure_reason": serde_json::Value::Null,
+        });
+        assert_eq!(classify_distill_attempt(Some(&row), None).0, "empty");
+        // The row wins even when the call ALSO errored -- the ledger is the
+        // receipt -- but the error is then the reason, so the cause is not lost.
+        let (status, reason) = classify_distill_attempt(Some(&row), Some("boom"));
+        assert_eq!(status, "empty");
+        assert_eq!(reason.as_deref(), Some("boom"));
+
+        // Ok without a row is NOT ok: the ledger holds no confirmation of it.
+        let (status, reason) = classify_distill_attempt(None, None);
+        assert_eq!(status, DISTILL_STATUS_NOT_RECORDED);
+        assert!(
+            reason
+                .unwrap()
+                .contains("without writing a distill_log row"),
+            "the fourth state must say what it means"
+        );
+
+        // Err without a row is `failed`, with the daemon's own text (t4 writes the
+        // refusal text; it carries no SQL vocabulary).
+        let (status, reason) = classify_distill_attempt(None, Some("no content to distil"));
+        assert_eq!(status, "failed");
+        assert_eq!(reason.as_deref(), Some("no content to distil"));
+
+        // A row whose status is NULL is the ledger's fourth state, not `ok`.
+        let null_row = serde_json::json!({"status": serde_json::Value::Null});
+        assert_eq!(
+            classify_distill_attempt(Some(&null_row), None).0,
+            DISTILL_STATUS_NOT_RECORDED
+        );
+    }
+
+    /// t9 / #46: the failure rule, in ONE place -- a pass that failed any attempt
+    /// must fail the command, and a pass that recorded none must not.
+    #[test]
+    fn a_failed_attempt_fails_the_command_and_a_clean_pass_does_not() {
+        let clean = serde_json::json!({
+            "dry_run": false, "attempted": 2, "ok": 1, "empty": 1, "failed": 0, "results": [],
+        });
+        assert!(
+            report_distill(&clean, false, vec![]).is_ok(),
+            "empty is an OUTCOME, not a failure: a backlog pass that found nothing to write must not fail the command"
+        );
+        let failed = serde_json::json!({
+            "dry_run": false, "attempted": 2, "ok": 0, "empty": 0, "failed": 2, "results": [],
+        });
+        let err = report_distill(&failed, false, vec![])
+            .expect_err("a failed attempt must make the command exit non-zero")
+            .to_string();
+        assert!(err.contains("2 of 2"), "{err}");
+        // A DRY RUN that planned fine is a success (nothing was attempted, so
+        // nothing failed), which is what makes `--unprocessed N --dry-run` usable
+        // in a script that checks the exit code.
+        let dry = serde_json::json!({
+            "dry_run": true, "attempted": 0, "ok": 0, "empty": 0, "failed": 0, "results": [],
+        });
+        assert!(report_distill(&dry, false, vec![]).is_ok());
+    }
+
+    /// t9: a ledger that cannot be read is an ERROR, not an empty ledger. The
+    /// distinction is the whole point: "this attempt recorded nothing" is a finding
+    /// about distillation, while "I could not ask" means nothing was checked.
+    #[test]
+    fn a_ledger_that_cannot_be_read_is_an_error_not_an_empty_one() {
+        assert!(
+            ledger_rows("http://127.0.0.1:1", "any/session", 5).is_err(),
+            "a dead daemon must not read as 'this session has no ledger rows'"
+        );
+        assert!(ledger_row_since("http://127.0.0.1:1", "any/session", 0).is_err());
+    }
+
+    /// t9 / #47: the backlog report prints the daemon's OWN counts (no second
+    /// classification), keeps the three states and the fourth apart, and never
+    /// prints an unrecorded sum as 0.
+    #[test]
+    fn batch_report_prints_three_states_and_keeps_nulls() {
+        let resp = serde_json::json!({
+            "dry_run": false,
+            "extractor": "acp",
+            "planned": 2,
+            "undistilled_total": 5,
+            "attempted": 2,
+            "ok": 1,
+            "empty": 0,
+            "failed": 1,
+            "estimated": {
+                "sessions": 2,
+                "bytes": 4096,
+                "windows": 2,
+                "budget_bytes": 1048576,
+                "tokens_used": serde_json::Value::Null,
+                "cost_usd": serde_json::Value::Null,
+                "basis": {"ok_attempts": 0, "windows_recorded": 0, "tokens_recorded": 0, "cost_recorded": 0},
+            },
+            "actual": {
+                "rows": 2,
+                "windows": serde_json::Value::Null,
+                "tokens_used": serde_json::Value::Null,
+                "cost_usd": serde_json::Value::Null,
+                "windows_not_recorded": 2,
+                "tokens_used_not_recorded": 2,
+                "cost_usd_not_recorded": 2,
+            },
+            "results": [
+                {"session_key": "a", "status": "ok", "reason": serde_json::Value::Null},
+                {"session_key": "b", "status": "failed", "reason": "no content to distil"},
+            ],
+        });
+        let joined = batch_report_lines(&resp).join("\n");
+        assert!(
+            joined.contains("three-state: ok=1 empty=0 failed=1 of 2 attempted (not_recorded=0)"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("[failed") && joined.contains("no content to distil"),
+            "every attempt's status and reason must be in the report: {joined}"
+        );
+        assert!(
+            joined.contains("not recorded by any of 0 successful attempt(s)"),
+            "the estimate says WHY it cannot price the pass: {joined}"
+        );
+        assert!(
+            !joined.contains("tokens 0") && !joined.contains("$0.0000"),
+            "an unrecorded sum is not 0: {joined}"
+        );
+        assert!(
+            joined.contains("3 more undistilled session(s)"),
+            "the pass's own limit must not hide the rest of the backlog: {joined}"
+        );
+        assert!(joined.contains("actual: 2 ledger row(s)"), "{joined}");
+    }
+
+    /// t9 / #47: a dry-run pass writes nothing, so it reports no `actual` row and no
+    /// per-attempt lines -- and says the model was never called.
+    #[test]
+    fn batch_dry_run_reports_a_plan_and_no_actuals() {
+        let resp = serde_json::json!({
+            "dry_run": true,
+            "extractor": "acp",
+            "planned": 1,
+            "undistilled_total": 1,
+            "attempted": 0,
+            "ok": 0,
+            "empty": 0,
+            "failed": 0,
+            "estimated": {
+                "sessions": 1,
+                "bytes": 2048,
+                "windows": 1,
+                "budget_bytes": 1048576,
+                "tokens_used": 1200.0,
+                "cost_usd": 0.003,
+                "basis": {"ok_attempts": 12, "windows_recorded": 12, "tokens_recorded": 12, "cost_recorded": 12},
+            },
+            "actual": serde_json::Value::Null,
+            "results": [],
+        });
+        let joined = batch_report_lines(&resp).join("\n");
+        assert!(joined.contains("DRY RUN"), "{joined}");
+        assert!(
+            joined.contains("three-state: ok=0 empty=0 failed=0 of 0 attempted"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("actual:"),
+            "a dry run wrote nothing, so it has no actuals: {joined}"
+        );
+        assert!(joined.contains("tokens 1200"), "{joined}");
+        assert!(joined.contains("$0.0030"), "{joined}");
+    }
 }
 
 fn client() -> reqwest::blocking::Client {
@@ -909,6 +1335,84 @@ fn self_has_cli_histories() -> bool {
     .any(|p| p.is_dir())
 }
 
+/// Doctor's distillation check (t9 / issue #46), from a ledger reading; `None`
+/// means the daemon did not answer.
+///
+/// WHY "NOT CHECKED" IS A FAILING CHECK: this command's whole output is a
+/// PASS/FAIL report, and a line that reports PASS because it could not ask is the
+/// one reading an operator cannot act on. The detail names the cause, so a red line
+/// here is a daemon problem and not a distillation one.
+fn distill_check(daemon_up: bool, reading: Result<serde_json::Value, String>) -> Check {
+    match (daemon_up, reading) {
+        (_, Ok(v)) => Check {
+            name: "distillation pipeline".into(),
+            ok: true,
+            detail: distill_reading(&v),
+        },
+        // NO DAEMON AT ALL: the cause is the daemon, and the line says so.
+        (false, Err(_)) => Check {
+            name: "distillation pipeline".into(),
+            ok: false,
+            detail: "未检查（daemon 不可达）— start it with `ruagent serve`".into(),
+        },
+        // A DAEMON THAT DOES NOT SERVE THIS ENDPOINT: NOT the same finding as an
+        // absent daemon. An older build answers the path with the panel's HTML (or
+        // a 404), and reporting "unreachable" there would send the reader to the
+        // wrong machine; the error text names what actually came back.
+        (true, Err(e)) => Check {
+            name: "distillation pipeline".into(),
+            ok: false,
+            detail: format!("未检查（endpoint failed: {e}）"),
+        },
+    }
+}
+
+/// The ledger's summary line: the newest attempt and the cumulative usage.
+///
+/// THE NULLS ARE THE POINT (0020/0028): an attempt nobody recorded a status for
+/// reads `not_recorded` -- the ledger read's own word, not a fourth outcome -- and
+/// a column nobody recorded reads "not recorded" WITH the count of rows that did not
+/// record it. Printing 0 for either would turn "we did not measure this" into a
+/// measurement, which is the mistake those columns were added to prevent.
+fn distill_reading(v: &serde_json::Value) -> String {
+    let total = v["total"].as_i64().unwrap_or(0);
+    let totals = &v["totals"];
+    let tokens = reading_int(
+        &totals["tokens_used"],
+        format!(
+            "not recorded ({} of {total} attempt(s))",
+            totals["tokens_used_not_recorded"].as_i64().unwrap_or(0)
+        ),
+    );
+    let cost = reading_cost(
+        &totals["cost_usd"],
+        format!(
+            "not recorded ({} of {total} attempt(s))",
+            totals["cost_usd_not_recorded"].as_i64().unwrap_or(0)
+        ),
+    );
+    let Some(entry) = v["entries"].as_array().and_then(|e| e.first()) else {
+        return format!(
+            "reachable, no attempts recorded yet (0 row(s)); cumulative tokens {tokens}, cost {cost}"
+        );
+    };
+    let status = entry["status"]
+        .as_str()
+        .unwrap_or(DISTILL_STATUS_NOT_RECORDED);
+    let reason = entry["failure_reason"]
+        .as_str()
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| format!(" — {}", truncate_chars(r, 120)))
+        .unwrap_or_default();
+    format!(
+        "last attempt {} [{status}]{reason} (of {total} recorded); cumulative tokens {tokens}, \
+         cost {cost}",
+        entry["distilled_at"]
+            .as_str()
+            .unwrap_or("at an unrecorded time"),
+    )
+}
+
 fn doctor(url: &str, cleanup: bool) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -937,9 +1441,14 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     };
     let mut checks: Vec<Check> = Vec::new();
 
-    // 1. daemon + embedder
+    // 1. daemon + embedder. `daemon_up` is kept because a LATER check has to tell
+    // "the daemon is not running" apart from "the daemon is running but this
+    // endpoint did not answer" -- two different findings with two different fixes
+    // (t9's distillation check is the reader).
+    let mut daemon_up = false;
     match get("/api/v1/knowledge/documents") {
         Some(v) => {
+            daemon_up = true;
             let embedder = v["embedder"].as_str().unwrap_or("?");
             checks.push(Check {
                 name: "daemon + knowledge".into(),
@@ -1088,8 +1597,16 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         });
     }
 
-    // 6. distillation pipeline (dry signal): last distill_log entry age
-    // (API has no distill_log endpoint yet — skip quietly when absent)
+    // 6. distillation pipeline (t9 / issue #46): the LEDGER is read, not guessed
+    // at. `/api/v1/distill/log` exists (t6), so this reports the LAST ATTEMPT
+    // (when, what status, and why it failed) and the CUMULATIVE tokens/cost. A
+    // daemon that does not answer is reported as NOT CHECKED -- the pre-t9 code
+    // printed this line's absence by saying nothing, which is the silent pass the
+    // issue is about ("skip quietly when absent").
+    checks.push(distill_check(
+        daemon_up,
+        get_json(url, "/api/v1/distill/log?limit=1"),
+    ));
 
     // Probe hygiene (t252): the removable probe document is deleted
     // BEFORE the report, so cleanup is part of running the command and not
@@ -1192,6 +1709,576 @@ fn status(url: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// distill: the CLI's face on the two distillation routes (issues #46/#47)
+// ---------------------------------------------------------------------------
+
+/// The ledger's FOURTH state: a NULL `distill_log.status` means nobody recorded
+/// what became of the attempt. Spelled once, because three surfaces read it (the
+/// per-attempt table, the JSON envelope and the exit code) and a second literal
+/// would let them disagree about what "the ledger says nothing" is called.
+const DISTILL_STATUS_NOT_RECORDED: &str = "not_recorded";
+
+/// A RECORDED number from the ledger, or `absent` when the column is NULL.
+///
+/// THE 0028 RULE REACHES THE CLI HERE: `tokens_used`, `cost_usd`, `windows`,
+/// `retries` and `truncated` are NULL when nobody measured them (a rules-only
+/// pass reports no usage at all; every pre-0028 row predates the columns), so a
+/// printed `0` would turn "we did not record this" into "this was zero" -- the
+/// one reading those columns were added to make impossible.
+fn reading_int(value: &serde_json::Value, absent: String) -> String {
+    value.as_i64().map(|n| n.to_string()).unwrap_or(absent)
+}
+
+/// The money half of the same rule: a sum with nothing to add is not `$0.0000`.
+fn reading_cost(value: &serde_json::Value, absent: String) -> String {
+    value.as_f64().map(|c| format!("${c:.4}")).unwrap_or(absent)
+}
+
+/// The same rule for an EXTRAPOLATED number.
+///
+/// WHY THIS IS NOT `reading_int`: the batch estimate is a mean multiplied by a
+/// count (`crates/daemon/src/api.rs`, `estimate_batch`), so the daemon sends a
+/// FLOAT even when the value happens to be whole (`as_i64()` would reject
+/// `1200.0` and report a price that exists as unrecorded). The fraction is kept
+/// when there is one -- rounding someone's bill to an integer is a number the
+/// daemon never computed.
+fn reading_number(value: &serde_json::Value, absent: String) -> String {
+    match value.as_f64() {
+        Some(n) if n.fract() == 0.0 => format!("{}", n as i64),
+        Some(n) => format!("{n:.1}"),
+        None => absent,
+    }
+}
+
+/// The same rule for a tri-state flag: `null` = never measured, and it must not
+/// print as "no" (that is a measurement nobody took).
+fn reading_bool(value: &serde_json::Value, absent: String) -> String {
+    match value.as_bool() {
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
+        None => absent,
+    }
+}
+
+/// Doctor's report is one line per check: a failure reason is a sentence, not a
+/// transcript.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
+}
+
+/// THE THREE-STATE COUNTS, spelled once so the two routes' reports cannot drift:
+/// `ok`/`empty`/`failed` are the ledger's outcomes and `not_recorded` is the
+/// fourth state the ledger read names (an attempt that wrote no row) -- it is NOT
+/// counted as one of the three, and the line prints it so the fourth is visible
+/// rather than folded away.
+fn three_state_line(attempted: u32, ok: u32, empty: u32, failed: u32, not_recorded: u32) -> String {
+    format!(
+        "  three-state: ok={ok} empty={empty} failed={failed} of {attempted} attempted \
+         (not_recorded={not_recorded})"
+    )
+}
+
+/// How many entries the response itself called `status`.
+///
+/// A COUNT OF THE WORDS THE DAEMON USED, not a re-classification: the daemon owns
+/// the vocabulary (its batch route classifies each attempt with the ledger in
+/// hand), and a client that re-derived the states could print a total its own rows
+/// do not add up to.
+fn count_status(results: &[serde_json::Value], status: &str) -> u32 {
+    results
+        .iter()
+        .filter(|r| r["status"].as_str() == Some(status))
+        .count() as u32
+}
+
+/// WHAT ONE ATTEMPT ENDED AS, in the ledger's own vocabulary.
+///
+/// THE LEDGER DECIDES WHENEVER THERE IS A ROW: its `status` is what happened and
+/// its `failure_reason` is why (t4 writes one row per non-dry attempt, 0024).
+/// The CLI speaks for itself only when the attempt recorded nothing, and then it
+/// keeps the two cases apart: an attempt that returned Ok without a row is
+/// `not_recorded` -- never `ok`, because calling it `ok` would invent a
+/// confirmation the ledger does not have -- while an attempt that ERRORED is
+/// `failed` with the daemon's own text as the reason.
+///
+/// WHY THIS RULE IS WRITTEN TWICE in this repository: the daemon's batch route
+/// applies it per attempt (`classify_attempt`, crates/daemon/src/api.rs) and the
+/// single route reports no status field at all, so a client asking the same
+/// question about one session has no way to call the server's private function.
+/// The vocabulary on both sides is the ledger's.
+fn classify_distill_attempt(
+    row: Option<&serde_json::Value>,
+    error: Option<&str>,
+) -> (String, Option<String>) {
+    if let Some(row) = row {
+        let status = row["status"]
+            .as_str()
+            .unwrap_or(DISTILL_STATUS_NOT_RECORDED)
+            .to_string();
+        // A row that says why keeps its own reason; when it recorded none, the
+        // error the call returned is the only cause anyone has.
+        let reason = row["failure_reason"]
+            .as_str()
+            .filter(|r| !r.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| error.map(str::to_owned));
+        return (status, reason);
+    }
+    match error {
+        Some(e) => ("failed".to_string(), Some(e.to_string())),
+        None => (
+            DISTILL_STATUS_NOT_RECORDED.to_string(),
+            Some("the attempt returned without writing a distill_log row".to_string()),
+        ),
+    }
+}
+
+/// ONE attempt's reading, from its LEDGER ROW -- the receipt a later reader
+/// queries -- rather than from the response body's echo of it.
+fn ledger_attempt_lines(row: &serde_json::Value) -> Vec<String> {
+    vec![
+        format!(
+            "  ledger #{} at {} — agent {}",
+            row["id"].as_i64().unwrap_or(0),
+            row["distilled_at"].as_str().unwrap_or("an unrecorded time"),
+            row["agent"].as_str().unwrap_or("none (rules only)"),
+        ),
+        format!(
+            "  wrote: {} memories, {} entities, {} relations (already stated {}, refused {})",
+            row["memories_written"].as_i64().unwrap_or(0),
+            row["entities_written"].as_i64().unwrap_or(0),
+            row["relations_written"].as_i64().unwrap_or(0),
+            reading_int(&row["relations_duplicate"], "not reported".into()),
+            reading_int(&row["relations_refused"], "not reported".into()),
+        ),
+        format!(
+            "  usage: tokens {} (context {}), cost {}, windows {}, truncated {}, retries {}",
+            reading_int(&row["tokens_used"], "not recorded".into()),
+            reading_int(&row["context_size"], "not recorded".into()),
+            reading_cost(&row["cost_usd"], "not recorded".into()),
+            reading_int(&row["windows"], "not recorded".into()),
+            reading_bool(&row["truncated"], "not recorded".into()),
+            reading_int(&row["retries"], "not recorded".into()),
+        ),
+    ]
+}
+
+/// ONE attempt's own report, from the distillation response (`distilled`) -- used
+/// when there is no ledger row to read, which is a dry run's normal case (it
+/// writes no row by design).
+fn outcome_lines(outcome: &serde_json::Value, verb: &str) -> Vec<String> {
+    let mut out = vec![
+        format!(
+            "  {verb}: {} memories ({} already known), {} entities, {} relations \
+             (already stated {}, refused {})",
+            outcome["memories_written"].as_u64().unwrap_or(0),
+            outcome["memories_skipped"].as_u64().unwrap_or(0),
+            outcome["entities_written"].as_u64().unwrap_or(0),
+            outcome["relations_written"].as_u64().unwrap_or(0),
+            reading_int(&outcome["relations_duplicate"], "not reported".into()),
+            reading_int(&outcome["relations_refused"], "not reported".into()),
+        ),
+        format!(
+            "  extraction: source {}, windows {}, truncated {}, tokens {}, cost {}",
+            outcome["source"].as_str().unwrap_or("?"),
+            reading_int(&outcome["windows"], "not measured".into()),
+            reading_bool(&outcome["truncated"], "not measured".into()),
+            reading_int(&outcome["tokens_used"], "not reported".into()),
+            reading_cost(&outcome["cost_usd"], "not reported".into()),
+        ),
+    ];
+    // WHICH MESSAGES WERE READ (issue #48): the CLI is the only surface that can
+    // show the range -- the ledger has no column for it -- and a cut transcript is
+    // a fact about the extraction, so it belongs beside `truncated`.
+    if !outcome["coverage"].is_null() {
+        let c = &outcome["coverage"];
+        out.push(format!(
+            "  coverage: messages {}..{} of {}, {} B rendered at a {} B budget per window",
+            c["from_message"].as_u64().unwrap_or(0),
+            c["to_message"].as_u64().unwrap_or(0),
+            c["total_messages"].as_u64().unwrap_or(0),
+            c["bytes"].as_u64().unwrap_or(0),
+            c["budget_bytes"].as_u64().unwrap_or(0),
+        ));
+    }
+    out
+}
+
+/// What a pass PLANNED to cost, with the basis it rests on.
+///
+/// `null` IS THE ANSWER when no successful attempt recorded usage (the 0028 rule):
+/// printing 0 would make a backlog look free. The basis line prints how many
+/// attempts recorded each number, so a mean over one attempt cannot pose as a mean
+/// over forty.
+fn estimate_lines(est: &serde_json::Value) -> Vec<String> {
+    if est.is_null() {
+        return vec!["  estimate: not available (the daemon returned none)".to_string()];
+    }
+    let sessions = est["sessions"].as_u64().unwrap_or(0);
+    let windows = est["windows"].as_u64().unwrap_or(0);
+    let bytes = est["bytes"].as_u64().unwrap_or(0);
+    let budget = est["budget_bytes"].as_u64().unwrap_or(0);
+    let basis = &est["basis"];
+    let ok_attempts = basis["ok_attempts"].as_u64().unwrap_or(0);
+    let absent = format!("not recorded by any of {ok_attempts} successful attempt(s)");
+    vec![
+        format!(
+            "  estimate: {windows} model call(s) for {sessions} session(s) — {bytes} B at a \
+             {budget} B budget per call; tokens {}, cost {}",
+            reading_number(&est["tokens_used"], absent.clone()),
+            reading_cost(&est["cost_usd"], absent),
+        ),
+        format!(
+            "  estimate basis: {ok_attempts} successful attempt(s); windows recorded on {}, \
+             tokens on {}, cost on {}",
+            basis["windows_recorded"].as_u64().unwrap_or(0),
+            basis["tokens_recorded"].as_u64().unwrap_or(0),
+            basis["cost_recorded"].as_u64().unwrap_or(0),
+        ),
+    ]
+}
+
+/// What a pass REALLY recorded, in the same units as the estimate (the ledger rows
+/// it wrote), with the other half of the 0028 rule beside it.
+fn actual_line(actual: &serde_json::Value) -> String {
+    if actual.is_null() {
+        return "nothing recorded (this pass wrote no ledger rows)".to_string();
+    }
+    let rows = actual["rows"].as_u64().unwrap_or(0);
+    if rows == 0 {
+        return "no ledger rows written by this pass".to_string();
+    }
+    let miss = |key: &str| actual[key].as_u64().unwrap_or(0);
+    format!(
+        "{rows} ledger row(s); windows {}, tokens {}, cost {}",
+        reading_int(
+            &actual["windows"],
+            format!("not recorded on {} row(s)", miss("windows_not_recorded")),
+        ),
+        reading_int(
+            &actual["tokens_used"],
+            format!(
+                "not recorded on {} row(s)",
+                miss("tokens_used_not_recorded")
+            ),
+        ),
+        reading_cost(
+            &actual["cost_usd"],
+            format!("not recorded on {} row(s)", miss("cost_usd_not_recorded")),
+        ),
+    )
+}
+
+/// The human report of a backlog response, line by line.
+///
+/// PURE, and it re-states nothing: the counts it prints are the ones the daemon
+/// sent (its route classified each attempt with the ledger in hand), so the table
+/// and the exit code cannot disagree with the response.
+fn batch_report_lines(resp: &serde_json::Value) -> Vec<String> {
+    let dry_run = resp["dry_run"].as_bool().unwrap_or(false);
+    let planned = resp["planned"].as_u64().unwrap_or(0);
+    let total = resp["undistilled_total"].as_u64().unwrap_or(0);
+    let mut out = vec![format!(
+        "distillation backlog: {planned} of {total} undistilled session(s) planned, extractor {}{}",
+        resp["extractor"].as_str().unwrap_or("?"),
+        if dry_run {
+            " — DRY RUN: no model call, nothing written"
+        } else {
+            ""
+        },
+    )];
+    out.extend(estimate_lines(&resp["estimated"]));
+    let results = resp["results"].as_array().cloned().unwrap_or_default();
+    for r in &results {
+        out.push(format!(
+            "  [{:<12}] {}{}",
+            r["status"].as_str().unwrap_or("?"),
+            r["session_key"].as_str().unwrap_or("?"),
+            r["reason"]
+                .as_str()
+                .map(|x| format!(" — {x}"))
+                .unwrap_or_default(),
+        ));
+    }
+    out.push(three_state_line(
+        resp["attempted"].as_u64().unwrap_or(0) as u32,
+        resp["ok"].as_u64().unwrap_or(0) as u32,
+        resp["empty"].as_u64().unwrap_or(0) as u32,
+        resp["failed"].as_u64().unwrap_or(0) as u32,
+        count_status(&results, DISTILL_STATUS_NOT_RECORDED),
+    ));
+    if !dry_run {
+        out.push(format!("  actual: {}", actual_line(&resp["actual"])));
+    }
+    if total > planned {
+        out.push(format!(
+            "  {} more undistilled session(s) are beyond this pass's limit",
+            total - planned
+        ));
+    }
+    out
+}
+
+/// ONE attempt's `actual`, in the SAME units as the batch's: the quantities the
+/// ledger recorded for it, plus the counts of what it did not record.
+fn actual_from_row(row: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(row) = row else {
+        return serde_json::json!({
+            "rows": 0,
+            "windows": serde_json::Value::Null,
+            "tokens_used": serde_json::Value::Null,
+            "cost_usd": serde_json::Value::Null,
+            "windows_not_recorded": 0,
+            "tokens_used_not_recorded": 0,
+            "cost_usd_not_recorded": 0,
+        });
+    };
+    let missing = |key: &str| i64::from(row[key].is_null());
+    serde_json::json!({
+        "rows": 1,
+        "windows": row["windows"],
+        "tokens_used": row["tokens_used"],
+        "cost_usd": row["cost_usd"],
+        "windows_not_recorded": missing("windows"),
+        "tokens_used_not_recorded": missing("tokens_used"),
+        "cost_usd_not_recorded": missing("cost_usd"),
+    })
+}
+
+/// One read of the ledger for one session, newest row first -- t6's endpoint
+/// (`/api/v1/distill/log`), through the same client as everything else here.
+///
+/// WHY THE ERROR IS PROPAGATED INSTEAD OF BECOMING AN EMPTY LIST: a ledger that
+/// cannot be READ must not look like a session with no rows. "this attempt
+/// recorded nothing" (a finding about distillation) and "I could not ask" (a
+/// failure of the check) are different answers, and collapsing them is how a
+/// broken daemon reads as a clean ledger.
+fn ledger_rows(url: &str, key: &str, limit: u32) -> Result<Vec<serde_json::Value>> {
+    let path = format!(
+        "/api/v1/distill/log?session={}&limit={limit}",
+        urlencoding::encode(key)
+    );
+    let v = api_json(
+        client()
+            .get(format!("{url}{path}"))
+            .send()
+            .context("daemon unreachable (is `ruagent serve` running?)")?,
+    )?;
+    Ok(v["entries"].as_array().cloned().unwrap_or_default())
+}
+
+/// The newest ledger row id for one session, read BEFORE an attempt. One row is
+/// written per attempt (0024), so the attempt's own row can only have a HIGHER id
+/// -- which is what makes "which row did THIS attempt write?" answerable without
+/// guessing from timestamps.
+fn newest_ledger_id(url: &str, key: &str) -> Result<i64> {
+    Ok(ledger_rows(url, key, 1)?
+        .first()
+        .and_then(|r| r["id"].as_i64())
+        .unwrap_or(0))
+}
+
+/// The ledger row this attempt wrote, if any: the newest row for the session whose
+/// id is above the pre-attempt high-water mark. `None` means the attempt recorded
+/// nothing, which the caller REPORTS rather than guessing about.
+fn ledger_row_since(url: &str, key: &str, before: i64) -> Result<Option<serde_json::Value>> {
+    Ok(ledger_rows(url, key, 5)?
+        .into_iter()
+        .find(|r| r["id"].as_i64().unwrap_or(0) > before))
+}
+
+/// Print the report -- the daemon's own JSON, or the human lines -- and turn a
+/// failure count into this process's exit code, in ONE place: both routes report
+/// the same way and both fail the same way.
+fn report_distill(resp: &serde_json::Value, json: bool, lines: Vec<String>) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(resp)?);
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    let failed = resp["failed"].as_u64().unwrap_or(0);
+    if failed > 0 {
+        bail!(
+            "{failed} of {} distillation attempt(s) failed; the reasons are in the report above",
+            resp["attempted"].as_u64().unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+/// `ruagent distill` (t9): one session, or the whole undistilled backlog.
+fn distill_cmd(
+    url: &str,
+    session: Option<&str>,
+    unprocessed: Option<u32>,
+    extractor: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    match (session, unprocessed) {
+        (Some(key), _) => distill_one(url, key, extractor, dry_run, json),
+        (None, Some(limit)) => distill_backlog(url, limit, extractor, dry_run, json),
+        // Unreachable: clap's ArgGroup requires exactly one target (see Cmd::Distill).
+        (None, None) => bail!("specify --session <key> or --unprocessed <n>"),
+    }
+}
+
+/// The POST body BOTH routes take, in t4's own vocabulary (`distill_request` reads
+/// it: an empty body means `ExtractPlan::explicit(Acp)` and no dry run).
+///
+/// `dry_run` rides the body on both routes, and the batch ALSO accepts it as a query
+/// parameter and ORs the two, so a caller never has to know which one to use. The
+/// extractor is passed through unvalidated on purpose: the daemon owns the
+/// vocabulary and its refusal names the accepted values.
+fn distill_body(extractor: Option<&str>, dry_run: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({ "dry_run": dry_run });
+    if let Some(extractor) = extractor {
+        body["extractor"] = serde_json::json!(extractor);
+    }
+    body
+}
+
+/// `--unprocessed N`: the BACKLOG pass (issue #47) through the batch route.
+///
+/// The daemon clamps N to its own per-pass ceiling and the report prints how many
+/// of the undistilled total it planned, so a clamped pass is visible rather than
+/// silent -- the CLI deliberately does not carry a second copy of that ceiling.
+fn distill_backlog(
+    url: &str,
+    limit: u32,
+    extractor: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let resp = api_json(
+        client()
+            .post(format!("{url}/api/v1/sessions/distill/batch?limit={limit}"))
+            .json(&distill_body(extractor, dry_run))
+            .send()
+            .context("daemon unreachable (is `ruagent serve` running?)")?,
+    )?;
+    report_distill(&resp, json, batch_report_lines(&resp))
+}
+
+/// `--session <key>`: ONE session, through the single route (issue #46).
+///
+/// THE THREE STATES COME FROM THE LEDGER, NOT FROM THE RESPONSE: the route returns
+/// the extraction's counts, and only `distill_log` records what became of the
+/// attempt. So the CLI reads this session's high-water mark BEFORE the call and
+/// looks for a row above it afterwards, then reports `not_recorded` when there is
+/// none -- the same rule the batch route's own entries are built on.
+fn distill_one(
+    url: &str,
+    key: &str,
+    extractor: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let before = newest_ledger_id(url, key)?;
+    let call = client()
+        .post(format!(
+            "{url}/api/v1/sessions/{}/distill",
+            urlencoding::encode(key)
+        ))
+        .json(&distill_body(extractor, dry_run))
+        .send()
+        .context("daemon unreachable (is `ruagent serve` running?)")?;
+    let mut outcome = serde_json::Value::Null;
+    // A refusal is a 4xx whose `message` is the text t4 wrote for it (no SQL
+    // vocabulary in it); it is the reason whenever the ledger recorded none.
+    let error: Option<String> = match api_json(call) {
+        Ok(v) => {
+            outcome = v["distilled"].clone();
+            None
+        }
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let row = ledger_row_since(url, key, before)?;
+
+    let (status, reason) = if dry_run && row.is_none() && error.is_none() {
+        // A dry run writes NO ledger row BY DESIGN (`DistillOutcome::dry_run`), so
+        // an absent row is not the `not_recorded` anomaly: nothing was recorded,
+        // because nothing was meant to be written.
+        (None, None)
+    } else {
+        let (status, reason) = classify_distill_attempt(row.as_ref(), error.as_deref());
+        (Some(status), reason)
+    };
+    let attempted = u32::from(status.is_some());
+    let ok = u32::from(status.as_deref() == Some("ok"));
+    let empty = u32::from(status.as_deref() == Some("empty"));
+    let failed = u32::from(status.as_deref() == Some("failed"));
+    let not_recorded = u32::from(status.as_deref() == Some(DISTILL_STATUS_NOT_RECORDED));
+
+    // THE SAME ENVELOPE the batch route returns, so `--json` has ONE shape for
+    // both targets and the exit-code rule reads one field in both cases. The
+    // inapplicable fields are `null` rather than absent, so a consumer can tell
+    // "not estimated for a single session" from "this key does not exist".
+    let envelope = serde_json::json!({
+        "dry_run": dry_run,
+        "session_key": key,
+        "extractor": outcome["source"].as_str(),
+        "planned": u32::from(!dry_run),
+        "undistilled_total": serde_json::Value::Null,
+        "attempted": attempted,
+        "ok": ok,
+        "empty": empty,
+        "failed": failed,
+        "status": status.clone(),
+        "reason": reason.clone(),
+        "estimated": serde_json::Value::Null,
+        "actual": actual_from_row(row.as_ref()),
+        "results": match &status {
+            Some(s) => vec![serde_json::json!({
+                "session_key": key,
+                "status": s,
+                "reason": reason.clone(),
+            })],
+            None => Vec::new(),
+        },
+        "outcome": outcome.clone(),
+    });
+
+    let lines = if dry_run {
+        let mut lines = vec![format!(
+            "session {key}: DRY RUN — the extraction ran; nothing was written"
+        )];
+        lines.extend(outcome_lines(&outcome, "would write"));
+        lines.push(three_state_line(attempted, ok, empty, failed, not_recorded));
+        lines
+    } else {
+        let word = status.as_deref().unwrap_or(DISTILL_STATUS_NOT_RECORDED);
+        let mut lines = vec![format!(
+            "session {key}: [{word}]{}{}",
+            reason
+                .as_deref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default(),
+            if word == DISTILL_STATUS_NOT_RECORDED {
+                " (the ledger recorded nothing for this attempt)"
+            } else {
+                ""
+            },
+        )];
+        match row.as_ref() {
+            // The ledger row is the receipt: print IT rather than the response's
+            // echo of the same counts.
+            Some(row) => lines.extend(ledger_attempt_lines(row)),
+            None => lines.extend(outcome_lines(&outcome, "the extraction reported")),
+        }
+        lines.push(three_state_line(attempted, ok, empty, failed, not_recorded));
+        lines
+    };
+    report_distill(&envelope, json, lines)
+}
 fn run(url: &str, prompt: &str, agent: Option<&str>) -> Result<()> {
     let http = client();
 

@@ -97,10 +97,42 @@ When a cheap and an expensive path both exist, take the cheap one first.
   it is off by default, so check with `capabilities_list` before promising
   graph results.
 
+## Knowledge graph (facts, and the merge queue)
+
+- `graph_fact_add` (`free`, but it WRITES) records ONE relation between two
+  entities that already exist: `src`/`dst` by id or `src_name`/`dst_name`
+  by name, exactly one form per end. A name that resolves to nothing is refused
+  with the name quoted — this tool never invents an entity. The write is always
+  recorded as `event_time_source: "recorded"`: only the extraction path can
+  claim a time came out of a transcript, so never present a fact you wrote this
+  way as something the transcript said.
+- `graph_resolution_pending` (`free`) lists the pairs waiting for a merge
+  decision, with both entities and how many current facts each has. Record the
+  decision with the same tool: `action: "merge"` (the keeper absorbs the other
+  one — its edges move over and its name becomes an alias of the keeper) or
+  `action: "dismiss"` (they stay separate, remembered, so a later pass cannot
+  re-queue the pair). Both are EXPLICIT decisions a human asked for: never merge
+  two entities on your own judgement, and repeat calls are harmless (a repeat
+  reports `already_dismissed`).
+
+## Distillation
+
+- `distill_status` (`free` — it never calls a model) answers "is this session
+  distilled, and what did its last attempt do?" for one session key: the verdict
+  covers the whole history (any successful attempt), while the "newest attempt"
+  block is the latest row, which may be a later failure whose reason is printed.
+  A null means NOT RECORDED, never 0 — say "not recorded", not "cost nothing".
+- Distil (or re-distil) a session with `distill_session`: `extractor: "rules"`
+  is `free`; `extractor: "acp"` (the default) is `llm` and costs one model
+  call per transcript window, so check `distill_status` before repeating a real
+  pass.
+
 ## Tasks (the platform's durable work items)
 
-- `list_tasks` (`free`, optionally filter by status) to see the board you and
-  the other agents share.
+- `list_tasks` (`free`, optionally filter by status, `limit`/`offset` to
+  page) to see the board you and the other agents share. The reply ends with how
+  many rows it did not show (还有 N 条未显示) — never report a page as the whole
+  board.
 
 ## Rules
 

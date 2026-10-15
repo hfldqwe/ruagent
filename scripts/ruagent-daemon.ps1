@@ -13,11 +13,15 @@
 #           which status/watch/stop all share (t340, discipline 7.92)
 #   status  health check + pid + log tail
 #   watch   start it only if the health check fails (this is what the task runs)
-#   install-task  register a scheduled task: at logon, and every 5 minutes, FOR THE
+#   install-task  register a scheduled task (-TaskName, default ruagent-daemon-watchdog):
+#                 at logon, and every 5 minutes, FOR THE
 #                 CURRENT USER (a per-user principal needs no elevation, where an
 #                 all-users one is denied in an ordinary shell). The success line is
 #                 printed only after reading the task back and checking its shape
-#                 (increment 7, t1: it used to claim 'registered' for a denied run)
+#                 (increment 7, t1: it used to claim 'registered' for a denied run).
+#                 Its action launches `conhost.exe --headless`, NOT powershell.exe:
+#                 a console window in the user's own session was this task's defect
+#                 (reported 2026-10-09) -- see the launcher comment in install-task.
 #
 # Logging: <root>/logs/daemon.log, appended, rotated to daemon.log.1 at 5 MB.
 # Stop:    refuses to run without -Force (a script cannot post to the team channel, so
@@ -32,6 +36,12 @@ param(
   [int]$MaxLogBytes = 5MB,
   [int]$MaxNoticeBytes = 256KB,
   [string]$Reason = '',
+  # The task install-task registers. A parameter, not a constant, so the installer
+  # can be verified against a THROWAWAY task name: registering one under a test name
+  # exercises the whole path (pre-flight, registration, read-back) and unregistering
+  # it restores the machine, where an installer that can only ever touch the ONE
+  # machine-wide name cannot be tested without changing what the machine runs.
+  [string]$TaskName = 'ruagent-daemon-watchdog',
   [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
@@ -217,11 +227,52 @@ switch ($Action) {
     # task instead of leaving two. The action keeps the script's OWN -Root/-Exe/-Addr
     # (dropping them would make `install-task -Exe <other>` register a watchdog that
     # ignores where it was pointed).
-    $taskName = 'ruagent-daemon-watchdog'
+    $taskName = $TaskName
     $userId = "$env:USERDOMAIN\$env:USERNAME"
     $scriptPath = $PSCommandPath
-    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" watch -Root `"$Root`" -Exe `"$Exe`" -Addr `"$Addr`""
-    $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+    # ── WHAT the action launches: a WINDOWLESS console host, not powershell.exe ────
+    # THE DEFECT THIS REPLACES (reported by this machine's user: 'a scheduled task keeps
+    # popping a window up, it makes the machine unpleasant to use'). The action used to be
+    # `powershell.exe -NoProfile -ExecutionPolicy Bypass -File … watch …`: a console
+    # application started in the user's INTERACTIVE session, which Windows hands to the
+    # machine's DEFAULT TERMINAL -- here Windows Terminal, because `HKCU:\Console\%%Startup`
+    # holds the all-zero 'let Windows decide' GUIDs for DelegationConsole and
+    # DelegationTerminal and wt.exe is installed. A VISIBLE terminal window therefore
+    # appeared in front of whoever was using the machine, every 5 minutes, for as long as
+    # the task stayed registered. What attributed it is the cadence plus the shape:
+    # watchdog.log carries one line per run at :00:xx and :05:xx all day, and the launch
+    # creates a console host in the interactive session.
+    #
+    # WHY NOT `-WindowStyle Hidden`: MEASURED, it is not enough. A powershell started with
+    # that flag still owns a VISIBLE (WS_VISIBLE) window -- class `PseudoConsoleWindow`,
+    # IsWindowVisible true -- because the window that ends up on screen belongs to the
+    # DELEGATED terminal, not to powershell: hiding powershell's own console cannot hide
+    # another process's window. `conhost.exe --headless` (Windows 11 22000+) runs the child
+    # under a console that has NO window and does not consult the default-terminal setting.
+    #
+    # MEASURED vs NOT MEASURED, because the difference decides what this comment is worth:
+    # measured = the 5-minute cadence, that this launch creates a console host in the
+    # interactive session, that `-WindowStyle Hidden` still leaves a visible window, and
+    # that `--headless` leaves none (the variants were driven through real scheduled tasks
+    # and enumerated with EnumWindows/IsWindowVisible); NOT measured = an enumeration of
+    # the Windows Terminal window itself, which the probe's process filter did not include.
+    # The attribution rests on the registry setting plus the observed console host; the
+    # remedy rests on --headless bypassing that delegation by design.
+    $consoleHost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    # Windows 10 has no `--headless` console host. Rather than register an action that
+    # cannot start at all there, the launcher degrades to powershell + -WindowStyle
+    # Hidden AND SAYS SO: on such a machine the window this task shows is reduced, not
+    # provably gone, and the success line below reports which launcher was registered.
+    $useHeadless = (Test-Path -LiteralPath $consoleHost -PathType Leaf) -and ([Environment]::OSVersion.Version.Build -ge 22000)
+    $inner = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" watch -Root `"$Root`" -Exe `"$Exe`" -Addr `"$Addr`""
+    if ($useHeadless) {
+      $actionExec = $consoleHost
+      $actionArgs = "--headless $inner"
+    } else {
+      $actionExec = 'powershell.exe'
+      $actionArgs = "-WindowStyle Hidden $inner"
+    }
+    $a = New-ScheduledTaskAction -Execute $actionExec -Argument $actionArgs
     $t1 = New-ScheduledTaskTrigger -AtLogOn -User $userId
     $t2 = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
@@ -409,13 +460,17 @@ switch ($Action) {
       $obsExec = [string]$taskAction.Execute
       $obsArgs = [string]$taskAction.Arguments
     }
-    $wantExec = 'powershell.exe'
+    $wantExec = $actionExec
     $wantedScript = $scriptPath
     if (-not (Test-RepoScript $scriptPath)) {
       $prevScript = Get-ActionScriptPath $prevArgs
       if ($prevScript -and (Test-RepoScript $prevScript)) { $wantedScript = $prevScript }
     }
-    $wantedArg = "-NoProfile -ExecutionPolicy Bypass -File `"$wantedScript`" watch -Root `"$Root`" -Exe `"$Exe`" -Addr `"$Addr`""
+    # Built from the SAME ($actionExec, $actionArgs) pair the registration used, with
+    # only the script path re-anchored (t12): a wanted shape computed independently of
+    # what was registered is a second spelling that can disagree with it.
+    $wantedInner = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$wantedScript`" watch -Root `"$Root`" -Exe `"$Exe`" -Addr `"$Addr`""
+    if ($useHeadless) { $wantedArg = "--headless $wantedInner" } else { $wantedArg = "-WindowStyle Hidden $wantedInner" }
     $logonTriggers = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
     $repeatTriggers = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and $_.Repetition.Interval })
     $logonUser = 'none'
@@ -495,7 +550,10 @@ switch ($Action) {
       Write-Output 'what to do: the machine is still protected by the task that is already there, but this run did not do what it was asked; fix the reason above and re-run.'
       Fail-InstallTask "install-task FAILED to (re)register '$taskName': $registerError"
     }
+    $launcherText = 'powershell + -WindowStyle Hidden (Windows 10 fallback: reduced, not provably gone)'
+    if ($useHeadless) { $launcherText = 'conhost --headless (no console window)' }
     Write-Output "scheduled task $taskName registered for $userId (at logon + every 5 min)"
+    Write-Output "launcher: $launcherText"
     Write-Output "verified by read-back: $observed"
     # The pre-flight's own boundary, stated where the claim is made: it established that the
     # action's -Exe EXISTS, not that it is the right binary. Saying nothing would let the

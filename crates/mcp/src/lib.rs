@@ -56,20 +56,26 @@ impl PlatformTools {
     // -- memory ---------------------------------------------------------
 
     #[tool(
-        description = "Search the user's long-term memories (facts, preferences, lessons learned across sessions). WHEN: before asking the user something they may have already told you, at the start of a task, or when a preference would change your approach. COST: free (zero model tokens). For ONE pass across memory + knowledge + wiki + graph, use memory_recall instead."
+        description = "Search the user's long-term memories (facts, preferences, lessons learned across sessions). WHEN: before asking the user something they may have already told you, at the start of a task, or when a preference would change your approach. COST: free (zero model tokens). For ONE pass across memory + knowledge + wiki + graph, use memory_recall instead. A CUT IS COUNTED AND NAMED: memory search is a page (limit, default 8, max 200) and the daemon reports how many rows matched BEFORE the page, so the reply ends with the remainder (还有 N 条未显示) -- and when that count is a floor rather than the whole answer it says AT LEAST instead of dressing a lower bound as a total."
     )]
     async fn memory_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<String, rmcp::ErrorData> {
         let url = format!("{}/api/v1/memory/search", self.config.daemon_url);
+        // THE WINDOW IS SENT EXPLICITLY, with the daemon's own default (8) as this
+        // tool's default: a request that names its page size is a reading, and the
+        // reply's own counts then say whether that page was cut (issue #54).
+        let window = params.limit.unwrap_or(8);
         let resp = json_of(
-            self.http.get(&url).query(&[("q", &params.query)]),
+            self.http
+                .get(&url)
+                .query(&[("q", &params.query), ("limit", &window.to_string())]),
             "memory_search",
             &self.config.daemon_url,
         )
         .await?;
-        Ok(hits_to_text(&resp["hits"]))
+        memory_search_to_text(&resp)
     }
 
     #[tool(
@@ -98,7 +104,7 @@ impl PlatformTools {
     }
 
     #[tool(
-        description = "Unified recall across long-term memories, knowledge base, generated wiki pages and the knowledge graph — ONE pass over all four, so prefer it over four separate searches when the question spans the user's facts and their documents. WHEN: at the start of a session or task that needs context, or when a question may be answered by memories, documents or entity relations. COST: free (zero model tokens; every leg is a local index query, no model is called). STRATEGY: strategy=aggressive (default) returns full content above the relevance threshold; strategy=conservative returns stubs only (titles, entity names, relation one-liners) — cheap to scan, then fetch what you need with memory_get / knowledge_expand / graph_entity. conservative=true is the older spelling of strategy=conservative; passing both with disagreeing values is refused, not silently resolved. PER-LEG CONTROL: the six retrieval legs are switched and weighted through the capability plane, not through this tool — capability_set(id=recall_leg_wiki, enabled=false) drops a leg. Their ids are recall_leg_memory_semantic, recall_leg_memory_fts, recall_leg_knowledge_semantic, recall_leg_knowledge_fts, recall_leg_wiki, recall_leg_graph (capabilities_list shows which are off). The reply carries legs_disabled, naming the legs this call skipped, so a thin result is explained rather than guessed at. Wiki pages are AGENT-GENERATED: verify against sources before trusting them."
+        description = "Unified recall across long-term memories, knowledge base, generated wiki pages and the knowledge graph — ONE pass over all four, so prefer it over four separate searches when the question spans the user's facts and their documents. WHEN: at the start of a session or task that needs context, or when a question may be answered by memories, documents or entity relations. COST: free (zero model tokens; every leg is a local index query, no model is called). STRATEGY: strategy=aggressive (default) returns full content above the relevance threshold; strategy=conservative returns stubs only (titles, entity names, relation one-liners) — cheap to scan, then fetch what you need with memory_get / knowledge_expand / graph_entity. conservative=true is the older spelling of strategy=conservative; passing both with disagreeing values is refused, not silently resolved. PER-LEG CONTROL: the six retrieval legs are switched and weighted through the capability plane, not through this tool — capability_set(id=recall_leg_wiki, enabled=false) drops a leg. Their ids are recall_leg_memory_semantic, recall_leg_memory_fts, recall_leg_knowledge_semantic, recall_leg_knowledge_fts, recall_leg_wiki, recall_leg_graph (capabilities_list shows which are off). The reply carries legs_disabled, naming the legs this call skipped, so a thin result is explained rather than guessed at. Wiki pages are AGENT-GENERATED: verify against sources before trusting them. IT SAYS WHEN IT WAS CUT: every section here is a WINDOW (top_n, no offset), and a reply that reached one ends with an INCOMPLETE line naming which section was cut and -- for memories -- 还有 N 条未显示, so a thin answer is never mistaken for a complete one."
     )]
     async fn memory_recall(
         &self,
@@ -117,7 +123,7 @@ impl PlatformTools {
             &self.config.daemon_url,
         )
         .await?;
-        Ok(recall_to_text(&resp))
+        recall_to_text(&resp)
     }
 
     #[tool(
@@ -141,20 +147,23 @@ impl PlatformTools {
     // -- knowledge ------------------------------------------------------
 
     #[tool(
-        description = "Search the knowledge base of ingested documents (hybrid semantic + keyword search). WHEN: the answer should come from the user's documents, notes or code — memory holds facts, knowledge holds documents. COST: free (zero model tokens)."
+        description = "Search the knowledge base of ingested documents (hybrid semantic + keyword search). WHEN: the answer should come from the user's documents, notes or code — memory holds facts, knowledge holds documents. COST: free (zero model tokens). THE CUT IS COUNTED: this route publishes how many hits matched before its window (matched), and the reply ends with 'matched M, this reply carries R' plus 还有 N 条未显示 when rows were left out."
     )]
     async fn knowledge_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<String, rmcp::ErrorData> {
         let url = format!("{}/api/v1/knowledge/search", self.config.daemon_url);
+        let limit = params.limit.unwrap_or(8);
         let resp = json_of(
-            self.http.get(&url).query(&[("q", &params.query)]),
+            self.http
+                .get(&url)
+                .query(&[("q", &params.query), ("limit", &limit.to_string())]),
             "knowledge_search",
             &self.config.daemon_url,
         )
         .await?;
-        Ok(hits_to_text(&resp["hits"]))
+        knowledge_hits_to_text(&resp)
     }
 
     #[tool(
@@ -286,7 +295,7 @@ impl PlatformTools {
     }
 
     #[tool(
-        description = "Search the knowledge graph's entities by name/summary (a flat name search, NOT multi-hop). WHEN: you want candidate entities by name; use graph_retrieve when the question needs a path between things. COST: free (zero model tokens)."
+        description = "Search the knowledge graph's entities by name/summary (a flat name search, NOT multi-hop). WHEN: you want candidate entities by name; use graph_retrieve when the question needs a path between things. COST: free (zero model tokens). PAGED AND COUNTED: limit is honoured (default 10, max 200) and the reply states how many entities matched before the page, with 还有 N 条未显示 when rows were left out (AT LEAST N when the route could not count to the end). Read match FIRST: candidate means the LOOSE widening pass answered, which can match a name that does not exist."
     )]
     async fn graph_search(
         &self,
@@ -298,7 +307,7 @@ impl PlatformTools {
             req = req.query(&[("limit", limit.to_string())]);
         }
         let resp = json_of(req, "graph_search", &self.config.daemon_url).await?;
-        Ok(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()))
+        graph_search_to_text(&resp)
     }
 
     #[tool(
@@ -410,7 +419,7 @@ impl PlatformTools {
     // -- the two trigger surfaces (§14.3) --------------------------------
 
     #[tool(
-        description = "Distill ONE session now: extract durable memories (and, when the distiller is configured for it, entities/relations) from that session's transcript. WHEN: the user says to remember a session or distill a conversation, or a session ended with something worth keeping that is not in memory yet. COST: extractor=rules is FREE -- zero model tokens, deterministic, no agent is spawned; extractor=acp (the default) SPENDS MODEL TOKENS -- it runs a full extraction-agent turn over the transcript; extractor=both runs rules and then acp. Pass dry_run=true first: it reports what would be written and writes nothing. This manual call is an explicit request and is never blocked by the distill_session capability -- that capability gates only the unattended session-close path."
+        description = "Distill ONE session now: extract durable memories (and, when the distiller is configured for it, entities/relations) from that session's transcript. WHEN: the user says to remember a session or distill a conversation, or a session ended with something worth keeping that is not in memory yet. COST: extractor=rules is FREE -- zero model tokens, deterministic, no agent is spawned; extractor=acp (the default) SPENDS MODEL TOKENS -- it runs a full extraction-agent turn over the transcript; extractor=both runs rules and then acp. Pass dry_run=true first: it reports what would be written and writes nothing. This manual call is an explicit request and is never blocked by the distill_session capability -- that capability gates only the unattended session-close path. This tool only TRIGGERS; to ask whether a session is ALREADY distilled and what its last attempt did, call distill_status (free -- it reads the ledger and never calls a model)."
     )]
     async fn distill_session(
         &self,
@@ -459,10 +468,166 @@ impl PlatformTools {
         ingest_to_text(&resp)
     }
 
+    // -- facts, the distill ledger, and the pending queue (t12: #51, #54) ---
+    //
+    // THREE tools, each a thin proxy to an EXISTING daemon route (this file's own
+    // rule: do not add a write path, add a tool). What is deliberately NOT here is
+    // written down once, in the non-goals section of
+    // docs/plans/capability-plugins-design.md §14.4: community discovery and
+    // community-summary writes, and any LLM adjudication of a merge, are NOT
+    // exposed through MCP.
+
+    #[tool(
+        description = "Write ONE fact between two EXISTING graph entities: src --relation--> dst, with the fact's own text. WHEN: the user states a durable relation the graph should hold (\"atlas ships on Fridays\", \"Dana owns the rollback\"), or you are completing/correcting the graph by hand -- knowledge_graph_ingest is how a DOCUMENT feeds the graph, this is how ONE fact does. COST: free (zero model tokens), but it WRITES one edge. Address each end by id (src/dst) or by name (src_name/dst_name), exactly ONE form per end: a name that resolves to nothing is REFUSED with the name quoted (this route never invents an entity -- create it first, or pass the id), and sending both forms for one end is refused too. THE TIME CONTRACT (#49): every write through this seam is event_time_source=recorded -- a tool call is not a transcript, so it can never claim the event time came out of the text; valid_at omitted means now. A refusal names the field and the value, so a typo cannot look like a successful write."
+    )]
+    async fn graph_fact_add(
+        &self,
+        Parameters(params): Parameters<FactAddParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "graph_fact_add";
+        let url = format!("{}/api/v1/graph/fact", self.config.daemon_url);
+        // ONLY THE KEYS THE CALLER SET. An absent end or an absent valid_at must
+        // reach the daemon as ABSENT: the route owns the "exactly one of id/name"
+        // rule and its own message for a name that resolves to nothing, and a
+        // second copy of that rule here would be the duplicate implementation this
+        // bridge exists to avoid.
+        let mut body = serde_json::Map::new();
+        body.insert("relation".into(), serde_json::json!(params.relation));
+        body.insert("fact_text".into(), serde_json::json!(params.fact_text));
+        for (key, value) in [
+            ("src", params.src.map(serde_json::Value::from)),
+            ("dst", params.dst.map(serde_json::Value::from)),
+            (
+                "src_name",
+                params.src_name.clone().map(serde_json::Value::from),
+            ),
+            (
+                "dst_name",
+                params.dst_name.clone().map(serde_json::Value::from),
+            ),
+            (
+                "valid_at",
+                params.valid_at.clone().map(serde_json::Value::from),
+            ),
+        ] {
+            if let Some(value) = value {
+                body.insert(key.to_string(), value);
+            }
+        }
+        let resp = json_of(
+            self.http.post(&url).json(&serde_json::Value::Object(body)),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        fact_added_to_text(&resp, &params.relation, params.valid_at.as_deref())
+    }
+
+    #[tool(
+        description = "Is THIS session distilled, and what did its LAST attempt do? Reads the distillation ledger (one row per attempt: outcome, failure reason, what it wrote, how the transcript was cut, what it cost). WHEN: the user asks whether a conversation has been distilled or why it produced nothing; BEFORE re-distilling a session (with extractor=acp a repeat is another model call); or when a 'distilled' badge disagrees with what you expect. COST: free (zero model tokens) -- this only reads the ledger, it never distils. TWO SEPARATE QUESTIONS, both answered: `distilled` is YES/NO over the session's WHOLE history (any attempt whose outcome was ok), while the newest-attempt block is the LATEST row, which may be a later failure. NULL MEANS NOT RECORDED, NEVER 0: tokens_used / cost_usd / windows / truncated / retries are null when nobody measured them (every pre-0028 row), and the last two must be read TOGETHER -- truncated=true with windows=1 is a LOSSY cut that dropped the transcript's tail, while windows=3 with truncated=false lost nothing. To distil it now call distill_session (extractor=rules is free)."
+    )]
+    async fn distill_status(
+        &self,
+        Parameters(params): Parameters<DistillStatusParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "distill_status";
+        // The same argument check `distill_session` makes, for the same reason: a
+        // `/` cannot be in a session key, and a URL built from one would ask the
+        // daemon about a session that cannot exist.
+        if params.session_key.is_empty() || params.session_key.contains('/') {
+            return Err(rmcp::ErrorData::internal_error(
+                format!(
+                    "distill_status: session_key `{}` is not a session key -- it must be non-empty and contain no `/`; the keys look like `ruagent:<hex>` and come from the sessions listing",
+                    params.session_key
+                ),
+                None,
+            ));
+        }
+        let limit = params.limit.unwrap_or(10).clamp(1, 100);
+        let url = format!("{}/api/v1/distill/log", self.config.daemon_url);
+        let resp = json_of(
+            self.http.get(&url).query(&[
+                ("session", &params.session_key),
+                ("limit", &limit.to_string()),
+            ]),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        distill_status_to_text(&resp, &params.session_key)
+    }
+
+    #[tool(
+        description = "The entity pairs waiting for a MERGE DECISION -- and the place the decision is recorded. A mechanical pass queues pairs that look like the same object under two rows; each pair carries both entities and how many CURRENT facts each has, so the decision can be made from this reply. WHEN: action=list (the default) when the user asks whether two entities should be merged, or the graph looks like one object under two names; action=merge when the user decides the two ARE the same entity (the keeper absorbs the other: its edges move over and its name becomes an alias of the keeper, so the next pass does not rebuild it); action=dismiss when the user decides they STAY SEPARATE -- remembered, so a later mechanical pass cannot re-queue the pair. COST: free (zero model tokens) for all three; merge and dismiss WRITE. MERGING IS EXPLICIT AND NEVER AUTOMATIC -- no model decides it on its own, and a dismissal is not a lock (merging a dismissed pair is still allowed). Decisions are IDEMPOTENT: repeating a dismissal reports already_dismissed instead of an error, and a pair that was never queued is refused rather than answered 'done'. The list is the WHOLE queue (that route applies no limit), so nothing is hidden here; pending_count is the queue's size and dismissed_count says how many decisions are already remembered."
+    )]
+    async fn graph_resolution_pending(
+        &self,
+        Parameters(params): Parameters<ResolutionParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "graph_resolution_pending";
+        let base = &self.config.daemon_url;
+        match params.action.as_deref() {
+            None | Some("list") => {
+                let url = format!("{base}/api/v1/graph/resolution/pending");
+                let resp = json_of(self.http.get(&url), what, base).await?;
+                pending_to_text(&resp, params.show_redundant.unwrap_or(false))
+            }
+            Some("merge") => {
+                // REFUSED HERE, not sent as a body the daemon's type cannot
+                // deserialize: the ids ARE what the action means, so a merge without
+                // them is an argument error and gets a sentence naming the action.
+                // (The daemon still owns every SEMANTIC rule: the same id twice, a
+                // missing entity, how many edges move.)
+                let (Some(keeper), Some(absorbed)) = (params.keeper, params.absorbed) else {
+                    return Err(rmcp::ErrorData::internal_error(
+                        "graph_resolution_pending: action=\"merge\" needs BOTH `keeper` (the entity that survives) and `absorbed` (the one merged away), as ids from the pending list"
+                            .to_string(),
+                        None,
+                    ));
+                };
+                let url = format!("{base}/api/v1/graph/resolution/merge");
+                let resp = json_of(
+                    self.http
+                        .post(&url)
+                        .json(&serde_json::json!({ "keeper": keeper, "absorbed": absorbed })),
+                    what,
+                    base,
+                )
+                .await?;
+                merge_result_to_text(&resp)
+            }
+            Some("dismiss") => {
+                let (Some(a), Some(b)) = (params.a, params.b) else {
+                    return Err(rmcp::ErrorData::internal_error(
+                        "graph_resolution_pending: action=\"dismiss\" needs BOTH `a` and `b` (the two entity ids from the pending list)"
+                            .to_string(),
+                        None,
+                    ));
+                };
+                let url = format!("{base}/api/v1/graph/resolution/dismiss");
+                let resp = json_of(
+                    self.http
+                        .post(&url)
+                        .json(&serde_json::json!({ "a": a, "b": b })),
+                    what,
+                    base,
+                )
+                .await?;
+                dismiss_result_to_text(&resp)
+            }
+            Some(other) => Err(rmcp::ErrorData::internal_error(
+                format!(
+                    "graph_resolution_pending: action `{other}` is not an action: use \"list\" (the default -- read the queue), \"merge\" (keeper absorbs absorbed) or \"dismiss\" (these two stay separate)"
+                ),
+                None,
+            )),
+        }
+    }
+
     // -- platform ops (the symmetric design, §7.2) -----------------------
 
     #[tool(
-        description = "List the platform's tasks (durable work items) with their status. Optionally filter by status: pending|in_progress|blocked|done|cancelled. WHEN: you need the shared board before creating or picking up durable work, or the user asks what is in flight. COST: free (zero model tokens)."
+        description = "List the platform's tasks (durable work items) with their status. Optionally filter by status: pending|in_progress|blocked|done|cancelled. WHEN: you need the shared board before creating or picking up durable work, or the user asks what is in flight. COST: free (zero model tokens). PAGED, AND ITS CUT IS STATED: limit (default 20) and offset walk the daemon's list envelope (total/limit/offset/truncated), and the reply ENDS with the counts -- shown N of T (limit, offset) plus 还有 N 条未显示 -- so a page that was cut can never read as a complete board."
     )]
     async fn list_tasks(
         &self,
@@ -473,21 +638,18 @@ impl PlatformTools {
         if let Some(status) = &params.status {
             req = req.query(&[("status", status)]);
         }
+        // THE PAGE SIZE IS SENT AND NAMED (t12 / issue #54). This used to print the
+        // first 20 rows of whatever came back and say nothing about the rest, so a
+        // board with 40 rows and one with 20 were the same reading. limit keeps
+        // today's 20 as the default; the envelope reports the value the daemon
+        // actually applied, and tasks_to_text prints the remainder.
+        let limit = params.limit.unwrap_or(20);
+        let offset = params.offset.unwrap_or(0);
+        let req = req
+            .query(&[("limit", limit.to_string())])
+            .query(&[("offset", offset.to_string())]);
         let resp = json_of(req, "list_tasks", &self.config.daemon_url).await?;
-        let tasks = resp["tasks"].as_array().cloned().unwrap_or_default();
-        let mut out = String::new();
-        for t in tasks.iter().take(20) {
-            out.push_str(&format!(
-                "[{}] {} ({})\n",
-                t["status"].as_str().unwrap_or("?"),
-                t["title"].as_str().unwrap_or("?"),
-                t["id"].as_str().unwrap_or("?")
-            ));
-        }
-        if out.is_empty() {
-            out.push_str("no tasks");
-        }
-        Ok(out)
+        tasks_to_text(&resp)
     }
 }
 
@@ -1242,6 +1404,688 @@ pub fn entity_exists(resp: &serde_json::Value) -> Result<bool, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// t12 renderers: the fact write, the distill ledger, the pending queue, and the
+// "this list was cut" note every list tool ends with
+// ---------------------------------------------------------------------------
+
+/// The currency mark, spelled once: a money reading that omitted it (or spelled it
+/// twice) would be a second answer to "what does this number mean".
+const MONEY: char = '$';
+
+fn field_i64(what: &str, obj: &serde_json::Value, key: &str) -> Result<i64, rmcp::ErrorData> {
+    obj.get(key)
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| drift(what, key, obj))
+}
+
+fn field_array<'a>(
+    what: &str,
+    obj: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>, rmcp::ErrorData> {
+    obj.get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| drift(what, key, obj))
+}
+
+/// A RECORDED number, or the honest alternative (the 0028 rule, issue #55).
+///
+/// NULL MEANS NOBODY RECORDED IT, and printing 0 for that would turn "we did not
+/// measure this" into "this was zero" -- the one reading 0028's columns exist to
+/// prevent. Every nullable ledger column goes through here or through
+/// [`reading_cost`], so the rule is applied once instead of once per field.
+fn reading_int(value: &serde_json::Value, absent: &str) -> String {
+    value
+        .as_i64()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| absent.to_string())
+}
+
+fn reading_cost(value: &serde_json::Value, absent: &str) -> String {
+    value
+        .as_f64()
+        .map(|c| format!("{MONEY}{c:.4}"))
+        .unwrap_or_else(|| absent.to_string())
+}
+
+/// WHAT A WINDOW MEASUREMENT SAYS, with `windows` and `truncated` READ TOGETHER.
+///
+/// They are two halves of one reading and are useless apart: a lossy single-window
+/// cut (windows=1, truncated=true) dropped the transcript's tail, while three
+/// windows with truncated=false lost nothing at all. A row that measured neither
+/// says so instead of reading as "one window, nothing lost".
+fn window_reading(row: &serde_json::Value) -> String {
+    let windows = row.get("windows").and_then(|v| v.as_i64());
+    let truncated = row.get("truncated").and_then(|v| v.as_bool());
+    match (windows, truncated) {
+        (Some(1), Some(true)) => {
+            "windows=1, truncated=YES -- the transcript was cut to one window and its TAIL WAS \
+             DROPPED"
+                .to_string()
+        }
+        (Some(1), Some(false)) => {
+            "windows=1, truncated=no -- the whole transcript fitted one window, nothing was lost"
+                .to_string()
+        }
+        (Some(n), Some(true)) => format!(
+            "windows={n}, truncated=YES -- one of the {n} windows was cut, so text was DROPPED"
+        ),
+        (Some(n), Some(false)) => {
+            format!("windows={n}, truncated=no -- {n} windows at turn boundaries, nothing was lost")
+        }
+        (Some(n), None) => format!(
+            "windows={n}, truncated=NOT RECORDED -- the window count is there but whether a cut \
+             lost text is not"
+        ),
+        (None, Some(true)) => "windows=NOT RECORDED, truncated=YES -- text was dropped, but how \
+                               many windows it took is not recorded"
+            .to_string(),
+        (None, Some(false)) => "windows=NOT RECORDED, truncated=no".to_string(),
+        (None, None) => "windows/truncated NOT RECORDED -- this attempt measured neither (every \
+                         pre-0028 row does)"
+            .to_string(),
+    }
+}
+
+/// HOW MANY ROWS AN ANSWER LEFT OUT (issue #54's third acceptance).
+///
+/// EVERY list tool ends with this line, because a list that was cut and a list that
+/// ended are otherwise the same reading: `shown` is where this page started plus what
+/// it carried, and the remainder is `total - shown`. The count is printed even when
+/// the list is complete ("shown 25 of 25"), so "nothing is missing" is a fact in the
+/// reply rather than an inference from the absence of a warning.
+fn unshown_note(shown: u64, total: u64, limit: Option<u64>, offset: Option<u64>) -> String {
+    let after = total.saturating_sub(shown);
+    // THE LABELS COME FROM WHERE THE NUMBERS CAME FROM, and the arithmetic is this
+    // one subtraction either way: an envelope route publishes total/limit/offset,
+    // while a search leg publishes its own match count and no page bounds.
+    let mut line = match (limit, offset) {
+        (Some(limit), Some(offset)) => {
+            format!("shown {shown} of {total} (limit={limit}, offset={offset})")
+        }
+        _ => format!("matched {total}, this reply carries {shown}"),
+    };
+    if after > 0 {
+        // THE HINT NAMES ONLY WHAT THE CALLER CAN DO (t26): a search leg has no offset,
+        // so "ask for offset=N" would be advice its reader cannot follow.
+        line.push_str(&format!(
+            "; 还有 {after} 条未显示 ({after} row(s) left -- raise limit{})",
+            match offset {
+                Some(offset) => format!(" or ask for offset={}", offset + shown),
+                None => String::new(),
+            }
+        ));
+    }
+    if let Some(offset) = offset.filter(|o| *o > 0) {
+        line.push_str(&format!(
+            "; {offset} earlier row(s) not shown (this page starts at offset {offset})"
+        ));
+    }
+    format!("\n{line}\n")
+}
+
+/// The report of ONE fact write, plus the two things an agent needs next: where to
+/// read it back, and what the write's event time MEANS (#49).
+fn fact_added_to_text(
+    resp: &serde_json::Value,
+    relation: &str,
+    valid_at: Option<&str>,
+) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "graph_fact_add";
+    let id = field_i64(WHAT, resp, "id")?;
+    let src = field_i64(WHAT, resp, "src")?;
+    let dst = field_i64(WHAT, resp, "dst")?;
+    let source = field_str(WHAT, resp, "event_time_source")?;
+    let when = match valid_at {
+        Some(v) => format!("valid_at={v}, as you passed it (the route does not echo it back)"),
+        None => "valid_at omitted, so the daemon recorded NOW as the event time".to_string(),
+    };
+    let mut out = format!(
+        "fact #{id} written: entity {src} -[{relation}]-> entity {dst}\n\
+         READ IT BACK with graph_entity(id: {src}) (or {dst}) -- this session sees the write \
+         immediately.\n\
+         EVENT TIME CONTRACT: event_time_source={source} -- a write through this tool is a \
+         RECORDED time ({when}). A tool call is not a transcript, so it cannot claim the time \
+         came OUT of the text; only the extraction path writes \"extracted\", and only when the \
+         transcript itself carries the time. A null in that column would mean the writer did not \
+         record one.\n"
+    );
+    if src == dst {
+        out.push_str(
+            "NOTE: both ends resolved to the SAME entity -- the edge is a self-relation. If you \
+             meant two entities, one of the names matched the wrong row.\n",
+        );
+    }
+    Ok(out)
+}
+
+/// WHAT THE LEDGER KNOWS ABOUT ONE SESSION (issue #46), from
+/// `GET /api/v1/distill/log?session=`.
+///
+/// TWO QUESTIONS, TWO ANSWERS, and they are not the same question: `distilled` is
+/// "did ANY attempt on this session end ok", taken from the route's `by_status`
+/// distribution -- which counts the session's WHOLE history, not the page -- while the
+/// "newest attempt" block describes the LATEST row, which may well be a later failure.
+/// A reader that took the newest row for the verdict would call a session undistilled
+/// because its last retry failed (or distilled because its older attempt succeeded).
+fn distill_status_to_text(
+    resp: &serde_json::Value,
+    session_key: &str,
+) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "distill_status";
+    let entries = field_array(WHAT, resp, "entries")?;
+    let total = field_u64(WHAT, resp, "total")?;
+    let limit = field_u64(WHAT, resp, "limit")?;
+    let offset = field_u64(WHAT, resp, "offset")?;
+    let by_status = resp
+        .get("by_status")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| drift(WHAT, "by_status", resp))?;
+    let totals = resp
+        .get("totals")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| drift(WHAT, "totals", resp))?;
+    // A bucket the daemon did not send is drift: the route always emits all four, and
+    // a default of 0 here would turn "the shape changed" into "no successful attempt".
+    let bucket = |name: &str| -> Result<u64, rmcp::ErrorData> {
+        by_status
+            .get(name)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| drift(WHAT, &format!("by_status.{name}"), resp))
+    };
+    let ok = bucket("ok")?;
+    let empty = bucket("empty")?;
+    let failed = bucket("failed")?;
+    let not_recorded = bucket("not_recorded")?;
+
+    let mut out = if ok > 0 {
+        format!("session {session_key}: DISTILLED ({ok} attempt(s) recorded an ok outcome).\n")
+    } else {
+        format!("session {session_key}: NOT DISTILLED (no attempt recorded an ok outcome).\n")
+    };
+
+    match entries.first() {
+        None => out.push_str(
+            "no attempt recorded for this session: the ledger holds NO row, so nothing recorded \
+             a failure reason either. A refusal or an empty transcript DOES write a row (t4), so \
+             'no row' means no attempt ran here at all -- or the session is older than the \
+             ledger.\n",
+        ),
+        Some(latest) => out.push_str(&attempt_block(latest)?),
+    }
+    // The pointer rides EVERY undistilled answer, the "no row at all" case included:
+    // that is the case where an agent most needs to know how to get one, and it is
+    // how distill_status covers the trigger half of this surface without a second,
+    // redundant trigger tool.
+    if ok == 0 {
+        out.push_str(
+            "To distil it now: distill_session(session_key: \"<key>\", extractor: \"rules\") is \
+             FREE (zero model tokens); extractor=\"acp\" spends one model call per transcript \
+             window.\n",
+        );
+    }
+
+    out.push_str(&format!(
+        "attempts recorded for this session: {total} (ok={ok} empty={empty} failed={failed} \
+         not_recorded={not_recorded})\n"
+    ));
+    // READ BEFORE THE EMPTY-HISTORY BRANCH: whether the totals carry their unrecorded
+    // COUNTS is a shape question, and a check that only ran for a session with rows
+    // would let a renamed key through on the empty case -- the case where the reader
+    // has the least to cross-check it against.
+    let tokens_missing = totals
+        .get("tokens_used_not_recorded")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| drift(WHAT, "totals.tokens_used_not_recorded", resp))?;
+    let cost_missing = totals
+        .get("cost_usd_not_recorded")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| drift(WHAT, "totals.cost_usd_not_recorded", resp))?;
+    out.push_str("cumulative over the WHOLE history (not only the page above):\n");
+    if total == 0 {
+        // A sum with nothing to add is not a zero. "0 of 0 attempts did not record
+        // one" would be arithmetic over an empty set dressed as a reading.
+        out.push_str(
+            "  no attempt is recorded, so there is nothing to sum: tokens and cost are \
+             unanswerable for this session (not 0).\n",
+        );
+        return Ok(format!(
+            "{out}{}",
+            unshown_note(
+                offset + entries.len() as u64,
+                total,
+                Some(limit),
+                Some(offset)
+            )
+        ));
+    }
+    out.push_str(&format!(
+        "  tokens {} ({} of {total} attempt(s) did not record one)\n",
+        reading_int(
+            totals
+                .get("tokens_used")
+                .unwrap_or(&serde_json::Value::Null),
+            "not recorded (nobody measured it)"
+        ),
+        tokens_missing
+    ));
+    out.push_str(&format!(
+        "  cost   {} ({} of {total} attempt(s) did not record one)\n",
+        reading_cost(
+            totals.get("cost_usd").unwrap_or(&serde_json::Value::Null),
+            "not recorded (no provider priced these attempts)"
+        ),
+        cost_missing
+    ));
+    out.push_str(&unshown_note(
+        offset + entries.len() as u64,
+        total,
+        Some(limit),
+        Some(offset),
+    ));
+    Ok(out)
+}
+
+/// ONE attempt, read from its ledger row. Every nullable field says "not recorded"
+/// rather than 0, and the transcript reading keeps `windows` beside `truncated`.
+fn attempt_block(row: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "distill_status";
+    let id = field_i64(WHAT, row, "id")?;
+    let at = field_str(WHAT, row, "distilled_at")?;
+    let status = row
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("not_recorded (NULL status: nobody recorded an outcome for this attempt)");
+    let agent = row
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or("none (no agent was spawned)");
+    let mut out = format!(
+        "  newest attempt #{id} at {at}: status={status} (agent {agent})\n  wrote: {m} memories, {e} entities, {r} relations (already stated {dup}, refused {ref})\n  usage: tokens {tok} (context {ctx}), cost {cost}, retries {retries}\n  transcript: {windows}\n",
+        m = reading_int(row.get("memories_written").unwrap_or(&serde_json::Value::Null), "not recorded"),
+        e = reading_int(row.get("entities_written").unwrap_or(&serde_json::Value::Null), "not recorded"),
+        r = reading_int(row.get("relations_written").unwrap_or(&serde_json::Value::Null), "not recorded"),
+        dup = reading_int(row.get("relations_duplicate").unwrap_or(&serde_json::Value::Null), "not reported"),
+        ref = reading_int(row.get("relations_refused").unwrap_or(&serde_json::Value::Null), "not reported"),
+        tok = reading_int(row.get("tokens_used").unwrap_or(&serde_json::Value::Null), "NOT RECORDED"),
+        ctx = reading_int(row.get("context_size").unwrap_or(&serde_json::Value::Null), "not recorded"),
+        cost = reading_cost(row.get("cost_usd").unwrap_or(&serde_json::Value::Null), "NOT RECORDED"),
+        retries = reading_int(row.get("retries").unwrap_or(&serde_json::Value::Null), "NOT RECORDED (predates the retry path)"),
+        windows = window_reading(row),
+    );
+    if let Some(reason) = row
+        .get("failure_reason")
+        .and_then(|v| v.as_str())
+        .filter(|r| !r.trim().is_empty())
+    {
+        out.push_str(&format!("  failure reason: {reason}\n"));
+    }
+    Ok(out)
+}
+
+/// THE PENDING QUEUE, AS A DECISION SHEET (issue #50, read through MCP).
+///
+/// Each pair prints BOTH entities and both CURRENT-fact counts, so the decision can
+/// be made from the reply alone -- the daemon's own counts_note says what those
+/// counts mean, and it is printed rather than paraphrased (a paraphrase would be a
+/// second definition of the same number).
+fn pending_to_text(
+    resp: &serde_json::Value,
+    show_redundant: bool,
+) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "graph_resolution_pending";
+    let pending = field_array(WHAT, resp, "pending")?;
+    let redundant = field_array(WHAT, resp, "redundant")?;
+    let pending_count = field_u64(WHAT, resp, "pending_count")?;
+    let redundant_count = field_u64(WHAT, resp, "redundant_count")?;
+    let dismissed_count = field_u64(WHAT, resp, "dismissed_count")?;
+    let counts_note = field_str(WHAT, resp, "counts_note")?;
+
+    let mut out = format!(
+        "merge decisions waiting: {pending_count} pair(s); {dismissed_count} pair(s) already \
+         answered (these two stay separate, remembered); {redundant_count} pair(s) are \
+         ALREADY the same object under two rows (no decision left to make -- merge them).\n\
+         counts: {counts_note}\n"
+    );
+    if pending.is_empty() {
+        out.push_str(if dismissed_count > 0 {
+            "nothing to decide: the queue is empty because every pair was worked through (see \
+             dismissed_count).\n"
+        } else {
+            "nothing to decide: nothing is queued and nothing has been dismissed.\n"
+        });
+    }
+
+    for (i, pair) in pending.iter().enumerate() {
+        let a = pair
+            .get("a")
+            .ok_or_else(|| drift(WHAT, "pending[].a", pair))?;
+        let b = pair
+            .get("b")
+            .ok_or_else(|| drift(WHAT, "pending[].b", pair))?;
+        let a_id = field_i64(WHAT, a, "id")?;
+        let b_id = field_i64(WHAT, b, "id")?;
+        let a_name = field_str(WHAT, a, "name")?;
+        let b_name = field_str(WHAT, b, "name")?;
+        let a_kind = a
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("kind not recorded");
+        let b_kind = b
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("kind not recorded");
+        let a_facts = reading_int(pair.get("a_facts").unwrap_or(&serde_json::Value::Null), "?");
+        let b_facts = reading_int(pair.get("b_facts").unwrap_or(&serde_json::Value::Null), "?");
+        let reason = pair
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no reason recorded)");
+        let since = pair
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("an unrecorded time");
+        out.push_str(&format!(
+            "{n}. #{a_id} {a_name:?} ({a_kind}) has {a_facts} current fact(s)   <->   #{b_id} {b_name:?} ({b_kind}) has {b_facts} current fact(s)\n   queued because: {reason} (since {since})\n   merge: graph_resolution_pending(action: \"merge\", keeper: {a_id}, absorbed: {b_id})\n   apart: graph_resolution_pending(action: \"dismiss\", a: {a_id}, b: {b_id})\n",
+            n = i + 1,
+        ));
+    }
+
+    if show_redundant && !redundant.is_empty() {
+        out.push_str("already the same object (merge these -- no judgement left):\n");
+        for row in redundant {
+            let ids: Vec<String> = row
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_i64().map(|i| i.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let reason = row
+                .as_array()
+                .and_then(|a| a.get(2))
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no reason recorded)");
+            out.push_str(&format!(
+                "  #{} and #{} -- {reason}\n",
+                ids.first().map(String::as_str).unwrap_or("?"),
+                ids.get(1).map(String::as_str).unwrap_or("?"),
+            ));
+        }
+    } else if !redundant.is_empty() {
+        out.push_str(
+            "(the redundant pairs are counted above; pass show_redundant: true to print their \
+             ids)\n",
+        );
+    }
+    out.push_str(
+        "NO LIMIT WAS APPLIED: this route returns the WHOLE queue, so nothing is hidden here \
+         (pending_count is the queue's size).\n",
+    );
+    Ok(out)
+}
+
+/// The result of an EXPLICIT merge, from the daemon's own report.
+fn merge_result_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "graph_resolution_pending";
+    let keeper = field_i64(WHAT, resp, "keeper")?;
+    let absorbed = field_i64(WHAT, resp, "absorbed")?;
+    let moved = field_u64(WHAT, resp, "moved")?;
+    let alias = field_str(WHAT, resp, "alias")?;
+    let alias_written = field_bool(WHAT, resp, "alias_written")?;
+    Ok(format!(
+        "merged: #{absorbed} was absorbed into #{keeper}; {moved} edge(s) moved over.\n\
+         the absorbed name {alias:?} is now an ALIAS of the keeper, which is what stops the next \
+         mechanical pass from rebuilding the entity just merged away. alias_written={alias_written} \
+         reports THIS second write: the merge itself records the alias in its own transaction, so \
+         false means the row was already there (read graph_entity(id: {keeper}) to see the alias \
+         list) -- it does NOT mean the alias is missing.\n\
+         the pair is gone from the pending queue; MERGING IS EXPLICIT -- nothing merged these two \
+         on its own.\n"
+    ))
+}
+
+/// The result of a dismissal, INCLUDING the idempotent repeat (#50).
+fn dismiss_result_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "graph_resolution_pending";
+    let a = field_i64(WHAT, resp, "a")?;
+    let b = field_i64(WHAT, resp, "b")?;
+    let dismissed = field_bool(WHAT, resp, "dismissed")?;
+    let already = field_bool(WHAT, resp, "already_dismissed")?;
+    if dismissed {
+        Ok(format!(
+            "recorded: entities #{a} and #{b} STAY SEPARATE. The queue row is stamped, not \
+             deleted, so a later mechanical pass cannot re-queue the pair. Merging them later is \
+             still allowed -- this is not a lock.\n"
+        ))
+    } else if already {
+        Ok(format!(
+            "already recorded: #{a} and #{b} were dismissed before. The repeat is the same \
+             decision twice, not an error (dismissed={dismissed}, already_dismissed={already}).\n"
+        ))
+    } else {
+        Err(drift(
+            WHAT,
+            "dismissed/already_dismissed (one of them must be true)",
+            resp,
+        ))
+    }
+}
+
+/// The task list, PAGED through the daemon's envelope (issue #54).
+///
+/// WHAT CHANGED AND WHY: this tool used to print only the first 20 rows of the
+/// response -- a silent cut, so a board with 40 rows and one with 20 read
+/// identically, and the agent could not tell "there are no more" from "I was not
+/// shown them". The page size is now NAMED and sent, the envelope's
+/// total/limit/offset are read from the daemon, and the reply ends with how many
+/// rows are not shown.
+fn tasks_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "list_tasks";
+    let tasks = field_array(WHAT, resp, "tasks")?;
+    let total = field_u64(WHAT, resp, "total")?;
+    let limit = field_u64(WHAT, resp, "limit")?;
+    let offset = field_u64(WHAT, resp, "offset")?;
+    let truncated = field_bool(WHAT, resp, "truncated")?;
+    let mut out = String::new();
+    for t in tasks {
+        out.push_str(&format!(
+            "[{}] {} ({})\n",
+            t.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+            t.get("title").and_then(|v| v.as_str()).unwrap_or("?"),
+            t.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("no tasks");
+    }
+    let shown = offset + tasks.len() as u64;
+    out.push_str(&unshown_note(shown, total, Some(limit), Some(offset)));
+    // The daemon computes its own flag from the same two numbers this note does
+    // (offset + rows returned < total). A disagreement means the rule moved, and the
+    // reader must see that rather than a note that quietly contradicts the flag.
+    if truncated != (total > shown) {
+        out.push_str(&format!(
+            "NOTE: the daemon reports truncated={truncated} while the counts say {}. One of the \
+             two changed meaning.\n",
+            total > shown
+        ));
+    }
+    Ok(out)
+}
+
+/// The knowledge hits plus the match count the route publishes (issue #54).
+fn knowledge_hits_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "knowledge_search";
+    let hits = field_array(WHAT, resp, "hits")?;
+    let matched = field_u64(WHAT, resp, "matched")?;
+    let mut out = hits_to_text(resp.get("hits").unwrap_or(&serde_json::Value::Null));
+    if !hits.is_empty() {
+        out.push_str(&unshown_note(hits.len() as u64, matched, None, None));
+    }
+    Ok(out)
+}
+
+/// The memory-search hits, plus the remainder the route now publishes (#54).
+///
+/// WHY THIS IS NOT A GUESS ANY MORE (t26): `GET /api/v1/memory/search` used to answer
+/// `{hits}` and nothing else -- no match count, no total -- so the bridge could only
+/// say that a full page MEANT the remainder was UNKNOWN (t12 read the handler and said
+/// exactly that). The route now publishes the pre-limit count (`matched`), whether that
+/// count is complete (`matched_exact`) and the cut in t22's vocabulary, so the number
+/// printed here is the daemon's reading; `search_remainder_note` owns the wording.
+fn memory_search_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "memory_search";
+    let hits = field_array(WHAT, resp, "hits")?;
+    let mut out = hits_to_text(resp.get("hits").unwrap_or(&serde_json::Value::Null));
+    if !hits.is_empty() {
+        out.push_str(&search_remainder_note(WHAT, resp, hits.len() as u64)?);
+    }
+    Ok(out)
+}
+
+/// The graph search's entities, with the route's own counts beside them (#54).
+///
+/// THE OLD CAVEAT IS GONE, MEASURED RATHER THAN ASSUMED (t26): t12 read `graph_search`
+/// in `crates/daemon/src/api.rs` and found a FIXED window of 10 with `q.limit` parsed
+/// and never read, plus no match count -- and said so in the tool description rather
+/// than pretend. The route now honours `limit` (bounded by its own
+/// `SEARCH_PAGE_MAX`) and publishes `matched` / `matched_exact` / `truncated` /
+/// `truncated_sections`, so what used to be a hard-coded warning is now the daemon's
+/// numbers. `match` still says which pass answered, which is the part a caller must
+/// read first: `candidate` comes from the loose widening pass.
+fn graph_search_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "graph_search";
+    let entities = field_array(WHAT, resp, "entities")?;
+    let matched_kind = field_str(WHAT, resp, "match")?;
+    let mut out = serde_json::to_string_pretty(resp).unwrap_or_else(|_| resp.to_string());
+    out.push_str(&format!(
+        "\nmatch={matched_kind}, {} entity/entities returned.",
+        entities.len()
+    ));
+    if !entities.is_empty() {
+        out.push_str(&search_remainder_note(WHAT, resp, entities.len() as u64)?);
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+/// THE REMAINDER FOR A SEARCH PAGE, taken from the daemon's own reading (t26 / #54).
+///
+/// WHY IT IS SHARED: `memory_search` and `graph_search` now publish the same four
+/// keys, and two renderers would be two spellings of "there is more" -- the duplication
+/// this effort exists to remove. The arithmetic stays in `unshown_note` (the single
+/// subtraction); what this adds is the one thing a search page needs beyond it: a count
+/// that is only a FLOOR is printed as a floor. That is t25's rule, applied to the one
+/// case where the route cannot count to the end of its match set.
+fn search_remainder_note(
+    what: &'static str,
+    resp: &serde_json::Value,
+    returned: u64,
+) -> Result<String, rmcp::ErrorData> {
+    let matched = field_u64(what, resp, "matched")?;
+    let exact = field_bool(what, resp, "matched_exact")?;
+    let truncated = field_bool(what, resp, "truncated")?;
+    // The daemon's flag and its counts answer ONE question, so a disagreement is drift
+    // rather than a warning to print: one of them has changed meaning.
+    let left = matched.saturating_sub(returned);
+    if truncated != (left > 0) {
+        return Err(drift(
+            what,
+            "truncated against matched/returned (they must agree)",
+            resp,
+        ));
+    }
+    if exact {
+        return Ok(unshown_note(returned, matched, None, None));
+    }
+    // The floor case: `matched` is what the route's scan REACHED, so the sentence says
+    // "at least" in both places and never turns a lower bound into a total.
+    Ok(format!(
+        "\nmatched AT LEAST {matched}, this reply carries {returned}; 至少还有 {left} 条未显示 ({left} row(s) left, and the route's own scan stopped at its ceiling -- the exact match count is unknown)\n"
+    ))
+}
+
+/// THE INCOMPLETENESS READING (issue #54) for a WINDOW-shaped answer.
+///
+/// memory_recall's sections are windows, not pages: they take top_n and no offset,
+/// so they cannot carry the envelope the paged routes share (the daemon says the same,
+/// api.rs's page doc). What they DO publish is truncated plus truncated_sections --
+/// which section was cut -- and the MEMORIES section additionally publishes how many
+/// rows the window dropped (memory_legs.dropped_by_top_n). That count is the
+/// per-section remainder; for the other sections the reply names the window's own
+/// numbers rather than inventing one, and says so.
+fn recall_cut_note(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "memory_recall";
+    let truncated = field_bool(WHAT, resp, "truncated")?;
+    let sections: Vec<&str> = resp
+        .get("truncated_sections")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| drift(WHAT, "truncated_sections", resp))?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // NOT TRUNCATED IS A READING TOO, and it is the one this route can make exactly:
+    // the daemon sets the flag only when the window was REACHED and rows were left
+    // over, so false never has to be read as "maybe".
+    if !truncated {
+        return Ok(String::new());
+    }
+    let mut out = format!(
+        "INCOMPLETE: the top_n window cut these section(s): {}. That is a WINDOW, not a page (no offset), so the reply cannot say how many more exist beyond what each section publishes:\n",
+        sections.join(", ")
+    );
+    let returned_knowledge = resp
+        .get("knowledge")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
+    for section in &sections {
+        match *section {
+            "memories" => {
+                let dropped = resp
+                    .get("memory_legs")
+                    .and_then(|m| m.get("dropped_by_top_n"))
+                    .and_then(|v| v.as_u64());
+                match dropped {
+                    Some(n) => out.push_str(&format!(
+                        " memories: 还有 {n} 条未显示 ({n} row(s) the window dropped). Raise top_n, or narrow the query.\n"
+                    )),
+                    None => out.push_str(
+                        " memories: the window was reached, but how many rows it dropped is not reported by this reply (memory_legs.dropped_by_top_n is absent).\n",
+                    ),
+                }
+            }
+            "knowledge" => {
+                let candidates = resp
+                    .get("scoring")
+                    .and_then(|s| s.get("candidates"))
+                    .and_then(|v| v.as_u64());
+                let window = resp
+                    .get("scoring")
+                    .and_then(|s| s.get("leg_window"))
+                    .and_then(|v| v.as_u64());
+                out.push_str(&format!(
+                    " knowledge: this reply carries {returned_knowledge} hit(s); the leg scored {} candidate(s) in a window of {} (scoring.candidates / scoring.leg_window). The candidates not returned are what the window or the relevance floor left out; raise top_n to see more.\n",
+                    candidates
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "an unreported number of".to_string()),
+                    window
+                        .map(|w| w.to_string())
+                        .unwrap_or_else(|| "an unreported".to_string()),
+                ));
+            }
+            other => out.push_str(&format!(
+                " {other}: cut by the window; this reply publishes no count for how many rows were left out.\n"
+            )),
+        }
+    }
+    Ok(out)
+}
+
 #[tool_handler]
 impl ServerHandler for PlatformTools {
     fn get_info(&self) -> ServerInfo {
@@ -1260,7 +2104,15 @@ impl ServerHandler for PlatformTools {
              distill_session distils one session (extractor=rules is free, \
              extractor=acp spends tokens, dry_run prices either), and \
              knowledge_graph_ingest fills the knowledge graph from the knowledge \
-             base (free, and off by default).",
+             base (free, and off by default). graph_fact_add writes ONE relation \
+             between two existing entities and reports its event time as RECORDED \
+             (only the extraction path can claim a time out of the text); \
+             distill_status reads the distillation ledger for one session (free, \
+             no model call: whether it is distilled and what its last attempt \
+             did); and graph_resolution_pending lists the pairs waiting for a \
+             merge decision and records either one (merge, or keep them \
+             separate) — explicit, never automatic. Lists STATE their cut: a \
+             reply that was limited ends with how many rows it did not show.",
         )
     }
 }
@@ -1283,7 +2135,9 @@ impl ServerHandler for PlatformTools {
 // tool does not declare now gets a HARD FAILURE — a tool result with `is_error: true`
 // carrying serde's `unknown field …` sentence — instead of silence. Nothing else
 // changes: no declared field was added, removed, renamed, retyped or re-defaulted, and
-// the 18 tool names are untouched. A tool that ships WITHOUT the attribute fails
+// the tool names are untouched (18 in the t21 generation this note is about; 21 since
+// t12 added graph_fact_add, distill_status and graph_resolution_pending). A tool that
+// ships WITHOUT the attribute fails
 // `crates/mcp/tests/tool_surface.rs::every_tool_refuses_fields_it_does_not_declare`,
 // which walks every published schema rather than naming the tools one by one.
 //
@@ -1291,7 +2145,8 @@ impl ServerHandler for PlatformTools {
 // rather than no parameter type at all: without a params type rmcp publishes
 // `{"type":"object","properties":{}}`, whose `additionalProperties` is unset, so those
 // two silently accepted and discarded ANY field. `NoParams` declares no field either —
-// the declared surface is unchanged — and it makes the refusal uniform across all 18.
+// the declared surface is unchanged — and it makes the refusal uniform across every
+// tool, whatever the surface's size.
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1302,7 +2157,9 @@ pub struct NoParams {}
 pub struct SearchParams {
     #[schemars(description = "What to look for")]
     pub query: String,
-    #[schemars(description = "Max results (default 8)")]
+    #[schemars(
+        description = "Rows to show (default 8, the daemon's maximum 200). Honoured (clamped); the reply states how many rows matched before this page and whether it was cut."
+    )]
     pub limit: Option<u32>,
 }
 
@@ -1335,7 +2192,9 @@ pub struct HashParams {
 pub struct GraphSearchParams {
     #[schemars(description = "Name/summary text to look for")]
     pub query: String,
-    #[schemars(description = "Max results (default 8)")]
+    #[schemars(
+        description = "Rows to ask for (default 10, the daemon's maximum 200). Honoured: the reply states how many entities matched before this page and what the page left out."
+    )]
     pub limit: Option<u32>,
 }
 
@@ -1400,6 +2259,14 @@ pub struct EntityParams {
 pub struct TaskFilterParams {
     #[schemars(description = "Optional status filter")]
     pub status: Option<String>,
+    #[schemars(
+        description = "Rows to show (default 20). The daemon clamps it; the reply reports the value it applied and how many rows are left."
+    )]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "Rows to skip before this page (default 0) -- how to reach the rows a limit left out"
+    )]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1518,10 +2385,71 @@ pub struct KnowledgeGraphIngestParams {
     pub dry_run: Option<bool>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FactAddParams {
+    #[schemars(description = "Source entity id. Give this OR src_name, never both.")]
+    pub src: Option<i64>,
+    #[schemars(
+        description = "Source entity NAME (matched against names and recorded aliases, case/whitespace-insensitive). Give this OR src, never both. A name that resolves to nothing is REFUSED with the name quoted -- this tool never creates an entity."
+    )]
+    pub src_name: Option<String>,
+    #[schemars(description = "Target entity id. Give this OR dst_name, never both.")]
+    pub dst: Option<i64>,
+    #[schemars(description = "Target entity NAME. Give this OR dst, never both.")]
+    pub dst_name: Option<String>,
+    #[schemars(description = "The relation, as a short verb phrase (e.g. \"owns\", \"ships_on\")")]
+    pub relation: String,
+    #[schemars(
+        description = "The fact in words, as it should read back (e.g. \"Dana owns the rollback procedure\")"
+    )]
+    pub fact_text: String,
+    #[schemars(
+        description = "RFC3339 date/time the fact became true; omitted = now. The write is always recorded as event_time_source=recorded: a tool call is not a transcript."
+    )]
+    pub valid_at: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DistillStatusParams {
+    #[schemars(description = "Session key as the sessions listing spells it (e.g. ruagent:<hex>)")]
+    pub session_key: String,
+    #[schemars(
+        description = "How many of the NEWEST attempts to print (default 10, max 100). The distilled verdict and the cumulative totals cover the session's WHOLE history either way, and the reply says how many attempts it did not show."
+    )]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionParams {
+    #[schemars(
+        description = "list (the default) = read the pending queue; merge = the keeper absorbs the absorbed entity; dismiss = these two stay separate. Anything else is refused."
+    )]
+    pub action: Option<String>,
+    #[schemars(description = "action=merge: the entity id that SURVIVES")]
+    pub keeper: Option<i64>,
+    #[schemars(
+        description = "action=merge: the entity id that is merged away (its edges move to the keeper, and its name becomes an alias of it)"
+    )]
+    pub absorbed: Option<i64>,
+    #[schemars(description = "action=dismiss: one end's entity id")]
+    pub a: Option<i64>,
+    #[schemars(
+        description = "action=dismiss: the other end's entity id (the pair is unordered -- the stored key is the ordered pair)"
+    )]
+    pub b: Option<i64>,
+    #[schemars(
+        description = "action=list: also print the pairs that are ALREADY the same object under two rows (default false; they are always counted)"
+    )]
+    pub show_redundant: Option<bool>,
+}
+
 /// Render a /recall response for an agent: sectioned, ids preserved
 /// (conservative stubs point at memory_get / knowledge_expand /
 /// graph_entity).
-fn recall_to_text(resp: &serde_json::Value) -> String {
+fn recall_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
     let mut out = Vec::new();
     for section in ["memories", "knowledge", "wiki", "entities"] {
         let items = resp[section].as_array().cloned().unwrap_or_default();
@@ -1605,14 +2533,19 @@ fn recall_to_text(resp: &serde_json::Value) -> String {
             disabled.join(", ")
         ));
     }
-    if out.is_empty() {
-        "no results".into()
+    let body = if out.is_empty() {
+        "no results".to_string()
     } else {
         format!(
             "{}\n(ids: #n = memory_get(n), &n = graph_entity(n), expand: n = knowledge_expand(n))",
             out.join("\n")
         )
-    }
+    };
+    // THE COMPLETENESS READING (issue #54) rides the answer, and it is REQUIRED
+    // rather than optional: a response whose truncation fields vanished would
+    // otherwise read as a complete one, which is the failure mode this note exists
+    // to remove. The daemon always emits both keys (t22).
+    Ok(format!("{body}{}", recall_cut_note(resp)?))
 }
 
 fn hits_to_text(hits: &serde_json::Value) -> String {
@@ -1718,47 +2651,7 @@ mod tests {
     /// CALLER sees: `Err(text)` for a refusal (JSON-RPC error or `is_error: true`),
     /// `Ok(text)` for a successful answer.
     async fn graph_entity_as_a_caller_sees_it(daemon_url: &str, id: i64) -> Result<String, String> {
-        use rmcp::ServiceExt;
-        let (server_t, client_t) = tokio::io::duplex(4096);
-        let url = daemon_url.to_string();
-        let server_task = tokio::spawn(async move {
-            PlatformTools::new(BridgeConfig { daemon_url: url })
-                .serve(server_t)
-                .await
-                .expect("mcp server starts")
-        });
-        let client = ToolClient.serve(client_t).await.unwrap();
-        let out = client
-            .call_tool(
-                rmcp::model::CallToolRequestParams::new("graph_entity".to_string()).with_arguments(
-                    serde_json::json!({ "id": id })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                ),
-            )
-            .await;
-        let seen = match out {
-            Err(e) => Err(e.to_string()),
-            Ok(r) => {
-                let text: String = r
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        rmcp::model::ContentBlock::Text(t) => Some(t.text.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-                if r.is_error == Some(true) {
-                    Err(text)
-                } else {
-                    Ok(text)
-                }
-            }
-        };
-        let _ = client.cancel().await;
-        let _ = server_task.await;
-        seen
+        tool_as_a_caller_sees_it(daemon_url, "graph_entity", serde_json::json!({ "id": id })).await
     }
 
     /// t118, direction 1 of 2: an id that is NOT in the graph is a REFUSAL that names
@@ -1835,8 +2728,13 @@ mod tests {
                         "stale": true, "chunk_id": 9, "hint": "verify" }],
             "entities": [{ "kind": "entity", "id": 1, "name": "Kubernetes",
                            "related": { "wiki": [{ "slug": "deploy-pipeline" }] } }],
+            // The completeness reading is REQUIRED by the renderer (t22 emits both
+            // keys on every recall), so a fixture without it is a shape the daemon
+            // cannot send.
+            "truncated": false,
+            "truncated_sections": [],
         });
-        let text = recall_to_text(&resp);
+        let text = recall_to_text(&resp).expect("a complete answer renders");
         assert!(text.contains("## memories"), "{text}");
         assert!(text.contains("#7 use sqlx"), "{text}");
         assert!(text.contains("## knowledge"), "{text}");
@@ -1861,9 +2759,12 @@ mod tests {
 
     #[test]
     fn recall_to_text_skips_empty_sections() {
-        let resp =
-            serde_json::json!({ "memories": [], "knowledge": [], "wiki": [], "entities": [] });
-        assert_eq!(recall_to_text(&resp), "no results");
+        let resp = serde_json::json!({ "memories": [], "knowledge": [], "wiki": [], "entities": [],
+                                       "truncated": false, "truncated_sections": [] });
+        assert_eq!(
+            recall_to_text(&resp).expect("a complete answer renders"),
+            "no results"
+        );
     }
 
     #[test]
@@ -1876,8 +2777,10 @@ mod tests {
             "wiki": [],
             "entities": [],
             "legs_disabled": ["recall_leg_graph", "recall_leg_wiki"],
+            "truncated": false,
+            "truncated_sections": [],
         });
-        let text = recall_to_text(&resp);
+        let text = recall_to_text(&resp).expect("a complete answer renders");
         assert!(
             text.contains("legs disabled by the capability plane"),
             "{text}"
@@ -2684,5 +3587,605 @@ mod tests {
         assert!(instructions.contains("confirm_cost"), "{instructions}");
         assert!(instructions.contains("free"), "{instructions}");
         assert!(instructions.contains("llm"), "{instructions}");
+    }
+
+    // -- t12: the fact write, the ledger reading, the pending queue ----------
+
+    /// t12 / #51: the write report names the id, the event-time SOURCE, and the way
+    /// to read the fact back -- and a caller-supplied valid_at is reported as the
+    /// CALLER's value, never as something the transcript said.
+    #[test]
+    fn a_fact_write_reports_its_source_and_how_to_read_it_back() {
+        let resp = serde_json::json!({
+            "id": 7, "src": 1, "dst": 2, "event_time_source": "recorded"
+        });
+        let text = fact_added_to_text(&resp, "ships_on", None).unwrap();
+        assert!(
+            text.contains("fact #7 written: entity 1 -[ships_on]-> entity 2"),
+            "{text}"
+        );
+        assert!(text.contains("event_time_source=recorded"), "{text}");
+        assert!(text.contains("graph_entity(id: 1)"), "{text}");
+        assert!(
+            text.contains("valid_at omitted, so the daemon recorded NOW"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cannot claim the time") && text.contains("extraction path"),
+            "the time contract must be stated on the write that follows it: {text}"
+        );
+
+        let text = fact_added_to_text(&resp, "ships_on", Some("2026-01-01T00:00:00Z")).unwrap();
+        assert!(text.contains("valid_at=2026-01-01T00:00:00Z"), "{text}");
+
+        // A response without the id cannot be reported as a successful write.
+        let bad = serde_json::json!({ "src": 1, "dst": 2, "event_time_source": "recorded" });
+        let err = fact_added_to_text(&bad, "r", None).expect_err("drift must be loud");
+        assert!(err.to_string().contains("id"), "{err}");
+
+        // Both ends resolving to one entity is flagged: it is a self-relation, not
+        // the two-entity fact the caller asked for.
+        let same = serde_json::json!({
+            "id": 9, "src": 4, "dst": 4, "event_time_source": "recorded"
+        });
+        let text = fact_added_to_text(&same, "relates_to", None).unwrap();
+        assert!(text.contains("SAME entity"), "{text}");
+    }
+
+    /// t12 / #46: the ledger reading -- verdict over the WHOLE history, newest
+    /// attempt from the newest row, and NULL-is-not-zero for every column.
+    #[test]
+    fn distill_status_reads_its_verdict_and_its_newest_attempt_apart() {
+        let resp = serde_json::json!({
+            "entries": [
+                { "id": 2, "distilled_at": "2026-10-02T00:00:00Z", "status": "failed",
+                  "failure_reason": "no content to distil", "agent": "",
+                  "memories_written": 0, "entities_written": 0, "relations_written": 0,
+                  "relations_duplicate": serde_json::Value::Null,
+                  "relations_refused": serde_json::Value::Null,
+                  "tokens_used": serde_json::Value::Null,
+                  "context_size": serde_json::Value::Null,
+                  "cost_usd": serde_json::Value::Null,
+                  "retries": 2, "windows": 1, "truncated": true },
+                { "id": 1, "distilled_at": "2026-10-01T00:00:00Z", "status": "ok",
+                  "agent": "mock", "memories_written": 3, "entities_written": 1,
+                  "relations_written": 2, "tokens_used": 1234, "context_size": 200000,
+                  "cost_usd": 0.0012, "retries": 0, "windows": 1, "truncated": false },
+            ],
+            "total": 2, "limit": 10, "offset": 0, "truncated": false,
+            "by_status": { "ok": 1, "empty": 0, "failed": 1, "not_recorded": 0 },
+            "totals": { "tokens_used": 1234, "cost_usd": 0.0012,
+                        "tokens_used_not_recorded": 1, "cost_usd_not_recorded": 1 },
+        });
+        let text = distill_status_to_text(&resp, "ruagent:abc").unwrap();
+        assert!(text.contains("DISTILLED (1 attempt(s)"), "{text}");
+        assert!(text.contains("newest attempt #2"), "{text}");
+        assert!(text.contains("status=failed"), "{text}");
+        assert!(
+            text.contains("failure reason: no content to distil"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "attempts recorded for this session: 2 (ok=1 empty=0 failed=1 not_recorded=0)"
+            ),
+            "{text}"
+        );
+        // The newest attempt measured a LOSSY single window: said in one breath.
+        assert!(
+            text.contains("windows=1, truncated=YES -- the transcript was cut to one window and its TAIL WAS DROPPED"),
+            "{text}"
+        );
+        assert!(text.contains("tokens NOT RECORDED"), "{text}");
+        assert!(text.contains(", cost NOT RECORDED,"), "{text}");
+        assert!(text.contains("retries 2"), "{text}");
+        // The totals span the history, with the unrecorded count beside them.
+        assert!(
+            text.contains("tokens 1234 (1 of 2 attempt(s) did not record one)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("$0.0012 (1 of 2 attempt(s) did not record one)"),
+            "{text}"
+        );
+        // never a fabricated zero for a column nobody measured
+        assert!(!text.contains("tokens 0 "), "{text}");
+        assert!(!text.contains("$0.0000"), "{text}");
+    }
+
+    /// t12: a session the ledger has no row for is NOT DISTILLED, says why the ledger
+    /// is silent, and points at the free way to distil it.
+    #[test]
+    fn distill_status_says_what_an_empty_ledger_means() {
+        let resp = serde_json::json!({
+            "entries": [], "total": 0, "limit": 10, "offset": 0, "truncated": false,
+            "by_status": { "ok": 0, "empty": 0, "failed": 0, "not_recorded": 0 },
+            "totals": { "tokens_used": serde_json::Value::Null,
+                        "cost_usd": serde_json::Value::Null,
+                        "tokens_used_not_recorded": 0, "cost_usd_not_recorded": 0 },
+        });
+        let text = distill_status_to_text(&resp, "ruagent:none").unwrap();
+        assert!(text.contains("NOT DISTILLED"), "{text}");
+        assert!(
+            text.contains("no attempt recorded for this session"),
+            "{text}"
+        );
+        assert!(
+            text.contains("distill_session"),
+            "the free way to distil it must be named: {text}"
+        );
+        assert!(
+            text.contains("tokens and cost are unanswerable for this session (not 0)"),
+            "an empty history has nothing to sum: {text}"
+        );
+    }
+
+    /// t12: the ledger's REQUIRED keys, and the drift rule that makes a renamed one
+    /// loud instead of silently "no successful attempt".
+    #[test]
+    fn distill_status_refuses_a_ledger_response_without_its_load_bearing_keys() {
+        let base = serde_json::json!({
+            "entries": [], "total": 0, "limit": 10, "offset": 0,
+            "by_status": { "ok": 0, "empty": 0, "failed": 0, "not_recorded": 0 },
+            "totals": { "tokens_used": serde_json::Value::Null,
+                        "cost_usd": serde_json::Value::Null,
+                        "tokens_used_not_recorded": 0, "cost_usd_not_recorded": 0 },
+        });
+        assert!(distill_status_to_text(&base, "k").is_ok());
+
+        for key in ["entries", "total", "limit", "offset", "by_status", "totals"] {
+            let mut thin = base.clone();
+            thin.as_object_mut().unwrap().remove(key);
+            let err = distill_status_to_text(&thin, "k")
+                .expect_err("a missing load-bearing key must be drift");
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+        // A MISSING BUCKET is drift too: defaulting it to 0 would turn "the shape
+        // changed" into "this session was never distilled".
+        let mut no_bucket = base.clone();
+        no_bucket["by_status"] = serde_json::json!({ "ok": 0, "empty": 0, "failed": 0 });
+        let err = distill_status_to_text(&no_bucket, "k").expect_err("missing bucket");
+        assert!(err.to_string().contains("by_status.not_recorded"), "{err}");
+        let mut no_missing = base.clone();
+        no_missing["totals"] = serde_json::json!({ "tokens_used": 1, "cost_usd": 0.1 });
+        let err = distill_status_to_text(&no_missing, "k").expect_err("missing count");
+        assert!(
+            err.to_string().contains("tokens_used_not_recorded"),
+            "{err}"
+        );
+    }
+
+    /// t12 / #50: the decision sheet -- both ends, both counts, and the exact calls.
+    #[test]
+    fn pending_to_text_prints_the_decision_sheet() {
+        let resp = serde_json::json!({
+            "pending": [{
+                "a": { "id": 12, "name": "Kubernetes", "kind": "concept", "summary": null },
+                "b": { "id": 31, "name": "k8s", "kind": "concept", "summary": null },
+                "a_facts": 4, "b_facts": 2, "reason": "one is an abbreviation of the other",
+                "created_at": "2026-10-01T00:00:00Z",
+            }],
+            "redundant": [[12, 40, "identical names"]],
+            "pending_count": 1, "redundant_count": 1, "dismissed_count": 2,
+            "counts_note": "a_facts/b_facts are each entity's current facts",
+        });
+        let text = pending_to_text(&resp, false).unwrap();
+        assert!(
+            text.contains("merge decisions waiting: 1 pair(s)"),
+            "{text}"
+        );
+        assert!(text.contains("2 pair(s) already"), "{text}");
+        assert!(
+            text.contains("1 pair(s) are ALREADY the same object"),
+            "{text}"
+        );
+        assert!(
+            text.contains("counts: a_facts/b_facts are each entity's current facts"),
+            "the daemon's own definition ships with the numbers: {text}"
+        );
+        assert!(
+            text.contains("#12 \"Kubernetes\" (concept) has 4 current fact(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("#31 \"k8s\" (concept) has 2 current fact(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("one is an abbreviation of the other"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "merge: graph_resolution_pending(action: \"merge\", keeper: 12, absorbed: 31)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("apart: graph_resolution_pending(action: \"dismiss\", a: 12, b: 31)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NO LIMIT WAS APPLIED"),
+            "the whole queue is returned, and the reply says so: {text}"
+        );
+        // The redundant rows are COUNTED but only printed on request.
+        assert!(!text.contains("#12 and #40"), "{text}");
+        assert!(text.contains("show_redundant: true"), "{text}");
+        let shown = pending_to_text(&resp, true).unwrap();
+        assert!(shown.contains("#12 and #40"), "{shown}");
+
+        // Drift: a queue response without its counts cannot be rendered.
+        let mut thin = resp.clone();
+        thin.as_object_mut().unwrap().remove("dismissed_count");
+        let err = pending_to_text(&thin, false).expect_err("drift must be loud");
+        assert!(err.to_string().contains("dismissed_count"), "{err}");
+    }
+
+    /// t12: the two decisions, including the idempotent repeat and the drift case.
+    #[test]
+    fn the_two_decisions_are_reported_from_the_daemons_own_answer() {
+        let merged = serde_json::json!({
+            "keeper": 12, "absorbed": 31, "moved": 5, "alias": "k8s", "alias_written": false
+        });
+        let text = merge_result_to_text(&merged).unwrap();
+        assert!(text.contains("#31 was absorbed into #12"), "{text}");
+        assert!(text.contains("5 edge(s) moved over"), "{text}");
+        assert!(
+            text.contains("alias_written=false reports THIS second write"),
+            "false must not read as 'the alias is missing': {text}"
+        );
+        assert!(text.contains("MERGING IS EXPLICIT"), "{text}");
+
+        let dismissed = serde_json::json!({
+            "a": 12, "b": 31, "dismissed": true, "already_dismissed": false
+        });
+        let text = dismiss_result_to_text(&dismissed).unwrap();
+        assert!(text.contains("#12 and #31 STAY SEPARATE"), "{text}");
+        assert!(text.contains("not a lock"), "{text}");
+
+        let again = serde_json::json!({
+            "a": 12, "b": 31, "dismissed": false, "already_dismissed": true
+        });
+        let text = dismiss_result_to_text(&again).unwrap();
+        assert!(text.contains("already recorded"), "{text}");
+
+        // Neither flag true cannot be reported as a decision.
+        let neither = serde_json::json!({
+            "a": 12, "b": 31, "dismissed": false, "already_dismissed": false
+        });
+        assert!(dismiss_result_to_text(&neither).is_err());
+    }
+
+    /// t12 / #54: the ONE remainder line, in both of its shapes -- and the acceptance
+    /// sentence (还有 N 条未显示) is what it prints.
+    #[test]
+    fn the_remainder_line_counts_what_a_cut_list_left_out() {
+        // The envelope shape: a page that was cut.
+        let cut = unshown_note(2, 3, Some(2), Some(0));
+        assert!(cut.contains("shown 2 of 3 (limit=2, offset=0)"), "{cut}");
+        assert!(cut.contains("还有 1 条未显示"), "{cut}");
+        assert!(cut.contains("raise limit or ask for offset=2"), "{cut}");
+
+        // A complete page still says it is complete, and what is behind it.
+        let whole = unshown_note(3, 3, Some(2), Some(2));
+        assert!(
+            whole.contains("shown 3 of 3 (limit=2, offset=2)"),
+            "{whole}"
+        );
+        assert!(!whole.contains("还有"), "{whole}");
+        assert!(whole.contains("2 earlier row(s) not shown"), "{whole}");
+
+        // The search-leg shape: a match count and no page bounds.
+        let search = unshown_note(8, 20, None, None);
+        assert!(
+            search.contains("matched 20, this reply carries 8"),
+            "{search}"
+        );
+        assert!(search.contains("还有 12 条未显示"), "{search}");
+    }
+
+    /// t26 / #54: a search page carries the route's OWN reading of what it left out,
+    /// in the three boundary shapes t22/t25 fixed for every other list -- reached (cut),
+    /// exactly equal (NOT a cut), untouched (not a cut) -- plus the one shape only a
+    /// search has: a count the route could not complete.
+    #[test]
+    fn a_search_page_prints_the_remainder_the_route_measured() {
+        // REACHED: two rows out of five matched, so three are left.
+        let cut = serde_json::json!({
+            "hits": [{"content": "a"}, {"content": "b"}],
+            "limit": 2, "matched": 5, "matched_exact": true,
+            "truncated": true, "truncated_sections": ["memories"],
+        });
+        let text = memory_search_to_text(&cut).unwrap();
+        assert!(text.contains("matched 5, this reply carries 2"), "{text}");
+        assert!(text.contains("还有 3 条未显示"), "{text}");
+
+        // EXACTLY EQUAL: the page holds every match, so it is NOT a cut -- the case a
+        // "the page looks full" rule gets wrong.
+        let exact = serde_json::json!({
+            "hits": [{"content": "a"}, {"content": "b"}],
+            "limit": 2, "matched": 2, "matched_exact": true,
+            "truncated": false, "truncated_sections": [],
+        });
+        let text = memory_search_to_text(&exact).unwrap();
+        assert!(text.contains("matched 2, this reply carries 2"), "{text}");
+        assert!(!text.contains("还有"), "{text}");
+
+        // UNTOUCHED: the same reading, and no warning noise.
+        let roomy = serde_json::json!({
+            "hits": [{"content": "a"}],
+            "limit": 8, "matched": 1, "matched_exact": true,
+            "truncated": false, "truncated_sections": [],
+        });
+        let text = memory_search_to_text(&roomy).unwrap();
+        assert!(text.contains("matched 1, this reply carries 1"), "{text}");
+        assert!(!text.contains("还有"), "{text}");
+
+        // A FLOOR IS PRINTED AS A FLOOR (t25): the route's scan stopped at its ceiling,
+        // so both the count and the remainder are lower bounds and say so.
+        let floored = serde_json::json!({
+            "hits": [{"content": "a"}],
+            "limit": 1, "matched": 5000, "matched_exact": false,
+            "truncated": true, "truncated_sections": ["memories"],
+        });
+        let text = memory_search_to_text(&floored).unwrap();
+        assert!(text.contains("matched AT LEAST 5000"), "{text}");
+        assert!(text.contains("至少还有 4999 条未显示"), "{text}");
+        assert!(text.contains("exact match count is unknown"), "{text}");
+
+        // The graph search renders the SAME reading from its own keys, and keeps saying
+        // which pass answered.
+        let entities: Vec<serde_json::Value> =
+            (0..2).map(|i| serde_json::json!({ "id": i })).collect();
+        let gs = serde_json::json!({
+            "entities": entities, "match": "candidate",
+            "limit": 2, "matched": 7, "matched_exact": true,
+            "truncated": true, "truncated_sections": ["entities"],
+        });
+        let text = graph_search_to_text(&gs).unwrap();
+        assert!(
+            text.contains("match=candidate, 2 entity/entities returned"),
+            "{text}"
+        );
+        assert!(text.contains("还有 5 条未显示"), "{text}");
+        // An empty answer is not a cut, and prints no remainder line.
+        let none = serde_json::json!({
+            "entities": [], "match": "none",
+            "limit": 10, "matched": 0, "matched_exact": true,
+            "truncated": false, "truncated_sections": [],
+        });
+        let text = graph_search_to_text(&none).unwrap();
+        assert!(!text.contains("还有"), "{text}");
+
+        // DRIFT: the daemon's flag and its counts answer ONE question, so a response
+        // where they disagree is not renderable as a single reading.
+        let disagreeing = serde_json::json!({
+            "hits": [{"content": "a"}],
+            "limit": 8, "matched": 4, "matched_exact": true,
+            "truncated": false, "truncated_sections": [],
+        });
+        let err = memory_search_to_text(&disagreeing).expect_err("a disagreement is drift");
+        assert!(err.to_string().contains("truncated"), "{err}");
+
+        // And the reading is REQUIRED: a route that stops publishing it cannot be
+        // reported as a complete answer.
+        let thin = serde_json::json!({ "hits": [{"content": "a"}] });
+        let err = memory_search_to_text(&thin).expect_err("a missing reading is drift");
+        assert!(err.to_string().contains("matched"), "{err}");
+
+        // The knowledge leg keeps its own engine-published count (unchanged by t26).
+        let kn = serde_json::json!({
+            "hits": [{"document": "d", "content": "c"}], "total": 1, "matched": 4
+        });
+        let text = knowledge_hits_to_text(&kn).unwrap();
+        assert!(text.contains("matched 4, this reply carries 1"), "{text}");
+        assert!(text.contains("还有 3 条未显示"), "{text}");
+        let no_hits = serde_json::json!({ "hits": [], "total": 0, "matched": 0 });
+        assert_eq!(knowledge_hits_to_text(&no_hits).unwrap(), "no results");
+    }
+
+    /// t12 / #54 for a WINDOW-shaped answer: the cut is named, per section, with the
+    /// count the daemon publishes and no invented number where it publishes none.
+    #[test]
+    fn the_recall_cut_note_names_the_section_and_what_it_dropped() {
+        let cut = serde_json::json!({
+            "memories": [], "knowledge": [], "wiki": [], "entities": [],
+            "truncated": true, "truncated_sections": ["memories", "wiki"],
+            "memory_legs": { "dropped_by_top_n": 7 },
+            "scoring": { "candidates": 12, "leg_window": 5 },
+        });
+        let note = recall_cut_note(&cut).unwrap();
+        assert!(note.contains("INCOMPLETE"), "{note}");
+        assert!(note.contains("memories, wiki"), "{note}");
+        assert!(note.contains("还有 7 条未显示"), "{note}");
+        assert!(
+            note.contains("this reply publishes no count"),
+            "an unpublished count is admitted, not invented: {note}"
+        );
+
+        let knowledge_cut = serde_json::json!({
+            "memories": [], "knowledge": [{"kind": "knowledge"}], "wiki": [], "entities": [],
+            "truncated": true, "truncated_sections": ["knowledge"],
+            "scoring": { "candidates": 12, "leg_window": 5 },
+        });
+        let note = recall_cut_note(&knowledge_cut).unwrap();
+        assert!(note.contains("12 candidate(s) in a window of 5"), "{note}");
+
+        // Not truncated is a reading, and it prints nothing extra.
+        let whole = serde_json::json!({
+            "truncated": false, "truncated_sections": [],
+        });
+        assert_eq!(recall_cut_note(&whole).unwrap(), "");
+
+        // The keys are load-bearing: without them the answer cannot be called
+        // complete OR cut, which is exactly the ambiguity #54 removes.
+        let no_flag = serde_json::json!({ "truncated_sections": [] });
+        assert!(recall_cut_note(&no_flag).is_err());
+        let no_sections = serde_json::json!({ "truncated": false });
+        assert!(recall_cut_note(&no_sections).is_err());
+    }
+
+    /// Call ONE tool over the real MCP seam (a duplex pipe) and return what the CALLER
+    /// sees: `Err(text)` for a refusal (JSON-RPC error or `is_error: true`), `Ok(text)`
+    /// for a successful answer.
+    async fn tool_as_a_caller_sees_it(
+        daemon_url: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<String, String> {
+        use rmcp::ServiceExt;
+        let (server_t, client_t) = tokio::io::duplex(65536);
+        let url = daemon_url.to_string();
+        let server_task = tokio::spawn(async move {
+            PlatformTools::new(BridgeConfig { daemon_url: url })
+                .serve(server_t)
+                .await
+                .expect("mcp server starts")
+        });
+        let client = ToolClient.serve(client_t).await.unwrap();
+        let out = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new(tool.to_string())
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await;
+        let seen = match out {
+            Err(e) => Err(e.to_string()),
+            Ok(r) => {
+                let text: String = r
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        rmcp::model::ContentBlock::Text(t) => Some(t.text.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                if r.is_error == Some(true) {
+                    Err(text)
+                } else {
+                    Ok(text)
+                }
+            }
+        };
+        let _ = client.cancel().await;
+        let _ = server_task.await;
+        seen
+    }
+
+    /// A stub serving the two search routes with the payload
+    /// `crates/daemon/src/api.rs` now produces: a corpus of five matches, a page of
+    /// `limit` rows, and the reading beside it (`matched`, `matched_exact`,
+    /// `truncated`, `truncated_sections`).
+    ///
+    /// WHY A STUB, AND WHERE THE REAL ROUTE IS PRESSED INSTEAD: the route's own readings
+    /// are asserted against a real database and real rows by the daemon's test
+    /// `search_pages_honour_their_limit_and_state_their_cut` (three boundaries plus the
+    /// empty case). What this presses is the TOOL end over the wire: that the number a
+    /// caller reads comes from those keys, rather than from a constant mirrored in this
+    /// crate -- which is what t17-O1 measured (a `ROUTE_WINDOW = 10` that guessed at the
+    /// daemon's window and drifted from it).
+    async fn search_stub_daemon() -> String {
+        use axum::{Router, routing::get};
+        /// A five-match corpus served `limit` rows to a page.
+        fn body(rows_key: &str, section: &str, limit: u64) -> serde_json::Value {
+            const MATCHED: u64 = 5;
+            let rows: Vec<serde_json::Value> = (0..limit.min(MATCHED))
+                .map(|i| {
+                    serde_json::json!({
+                        "id": i + 1,
+                        "content": format!("t26-stub-{i}"),
+                        "name": format!("t26-stub-{i}"),
+                    })
+                })
+                .collect();
+            let cut = limit < MATCHED;
+            let mut body = serde_json::Map::new();
+            body.insert(rows_key.to_string(), serde_json::json!(rows));
+            body.insert("limit".to_string(), serde_json::json!(limit));
+            body.insert("matched".to_string(), serde_json::json!(MATCHED));
+            body.insert("matched_exact".to_string(), serde_json::json!(true));
+            body.insert("truncated".to_string(), serde_json::json!(cut));
+            body.insert(
+                "truncated_sections".to_string(),
+                serde_json::json!(if cut {
+                    vec![section]
+                } else {
+                    Vec::<&str>::new()
+                }),
+            );
+            serde_json::Value::Object(body)
+        }
+        type Q = std::collections::HashMap<String, String>;
+        let graph = get(
+            |axum::extract::Query(q): axum::extract::Query<Q>| async move {
+                let limit: u64 = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(10);
+                let mut v = body("entities", "entities", limit);
+                v.as_object_mut()
+                    .expect("an object")
+                    .insert("match".to_string(), serde_json::json!("exact"));
+                axum::Json(v)
+            },
+        );
+        let memory = get(
+            |axum::extract::Query(q): axum::extract::Query<Q>| async move {
+                let limit: u64 = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(8);
+                axum::Json(body("hits", "memories", limit))
+            },
+        );
+        let app = Router::new()
+            .route("/api/v1/graph/search", graph)
+            .route("/api/v1/memory/search", memory);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// t26 / #54 at the CALLER's end of the wire: a cut page carries the REAL remainder,
+    /// a complete page carries none, and neither hedges with UNKNOWN any more.
+    #[tokio::test]
+    async fn a_cut_search_page_carries_the_real_remainder_over_the_mcp_seam() {
+        let url = search_stub_daemon().await;
+
+        // CUT: two rows out of five matched.
+        for tool in ["graph_search", "memory_search"] {
+            let text = tool_as_a_caller_sees_it(
+                &url,
+                tool,
+                serde_json::json!({ "query": "t26", "limit": 2 }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tool} must succeed: {e}"));
+            println!("READING t26 {tool} limit=2 -> {text}");
+            assert!(
+                text.contains("matched 5, this reply carries 2"),
+                "{tool}: {text}"
+            );
+            assert!(text.contains("还有 3 条未显示"), "{tool}: {text}");
+            assert!(
+                !text.contains("UNKNOWN"),
+                "{tool} must not hedge about the remainder any more: {text}"
+            );
+        }
+
+        // COMPLETE: five rows out of five -- no remainder is claimed.
+        for tool in ["graph_search", "memory_search"] {
+            let text = tool_as_a_caller_sees_it(
+                &url,
+                tool,
+                serde_json::json!({ "query": "t26", "limit": 5 }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tool} must succeed: {e}"));
+            assert!(
+                text.contains("matched 5, this reply carries 5"),
+                "{tool}: {text}"
+            );
+            assert!(
+                !text.contains("还有"),
+                "{tool} must not claim a remainder it does not have: {text}"
+            );
+        }
     }
 }

@@ -110,11 +110,89 @@ export function ErrorState({
   );
 }
 
-/** Any request resolves to one of three states - never to a wrong one. */
+/** Any request resolves to one of three states - never to a wrong one.
+ *
+ *  THE ERROR STATE KEEPS THE LAST GOOD READ. `data`/`at` on the error arm are
+ *  what a view shows when a LATER read fails: the earlier answer, plus when it
+ *  was read, so the page can say "this may be out of date" instead of either
+ *  blanking itself or pretending the failure never happened (MASTER §12 row
+ *  20). `data: null` on the error arm means exactly "nothing was ever read" -
+ *  which is why a view may claim "empty" only from the `ready` arm: a failed
+ *  read must never be rendered as "there is nothing" (see `readIsEmpty`).
+ *
+ *  One type, three states, for every view that reads something the user can
+ *  retry. Until t11 it was declared here and used NOWHERE, while five views
+ *  each hand-rolled a worse copy of it - two of which dropped the data on
+ *  failure, which is how a failed read became an empty list.
+ *
+ *  EVERY ARM CARRIES `data`/`at`, including `loading`: the three arms differ in
+ *  what the READ did, not in whether a value exists. So `state.data !== null`
+ *  means "there is something to show" in every arm, and a view never has to
+ *  write a spinner-vs-empty-vs-error triple to find out. */
 export type LoadState<T> =
-  | { kind: "loading" }
-  | { kind: "error"; err: unknown }
-  | { kind: "ready"; data: T };
+  | { kind: "loading"; data: T | null; at: number | null }
+  | { kind: "ready"; data: T; at: number }
+  | { kind: "error"; err: unknown; data: T | null; at: number | null };
+
+/** Nothing read yet. */
+export const readLoading = <T,>(): LoadState<T> => ({
+  kind: "loading",
+  data: null,
+  at: null,
+});
+
+/** A successful read: the value AND when it was read. */
+export const readReady = <T,>(data: T): LoadState<T> => ({
+  kind: "ready",
+  data,
+  at: Date.now(),
+});
+
+/** A failed read. Everything the previous state had survives: a failure is a
+ *  statement about THIS attempt, not about the data already on screen. */
+export const readFailed = <T,>(prev: LoadState<T>, err: unknown): LoadState<T> => ({
+  kind: "error",
+  err,
+  data: prev.data,
+  at: prev.at,
+});
+
+/** Whether a view is allowed to say "there is nothing here": only a SUCCESSFUL
+ *  read may, and only about its own result. The failed-with-no-earlier-data
+ *  case is an error, never an empty list. */
+export const readIsEmpty = <T,>(
+  state: LoadState<T>,
+  isEmpty: (data: T) => boolean,
+): boolean => state.kind === "ready" && isEmpty(state.data);
+
+/** The banner for a failure that still has earlier data on screen: it says the
+ *  data may be out of date, carries the reason, and offers the retry that
+ *  recovers. ONE component for that shape - the retired version was written by
+ *  hand in each view, and the retry it promised was sometimes not a control.
+ *
+ *  `hint` is the view's own sentence about WHAT is stale and how the refresh
+ *  happens (a poll re-reads it, or only the button does); the daemon's reason
+ *  is appended, because "stale" without a cause is not diagnosable. */
+export function StaleNotice({
+  err,
+  hint,
+  onRetry,
+}: {
+  err: unknown;
+  hint?: string;
+  onRetry: () => void;
+}) {
+  const { t } = useI18n();
+  const why = String(err ?? "").trim();
+  return (
+    <ErrorState
+      title={t("common.stale")}
+      hint={`${hint ?? t("common.stale.hint")}${why ? ` — ${why.slice(0, 200)}` : ""}`}
+      onRetry={onRetry}
+      retryLabel={t("common.retry")}
+    />
+  );
+}
 
 export function Empty({
   icon,

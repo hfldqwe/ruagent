@@ -26,12 +26,12 @@ async fn a_merged_name_comes_back_as_an_alias_of_the_entity_that_absorbed_it() {
     // ... and the folded name that missed both probes and was merged onto it, plus
     // the extraction's own alias for the same entity.
     assert!(
-        g::add_alias(&db, keeper, "AMBIGUOUS（模糊）", "knowledge")
+        g::add_alias(&db, keeper, "AMBIGUOUS（模糊）", g::AliasSource::Knowledge)
             .await
             .unwrap()
     );
     assert!(
-        g::add_alias(&db, keeper, "模糊", "knowledge")
+        g::add_alias(&db, keeper, "模糊", g::AliasSource::Knowledge)
             .await
             .unwrap()
     );
@@ -63,9 +63,10 @@ async fn a_merged_name_comes_back_as_an_alias_of_the_entity_that_absorbed_it() {
     // The negative the whole finding is about: the folded name is not a NAME, so
     // the entity list — the route that used to be the only way to look for it —
     // cannot show it. Before t22 no other response could either.
-    let listed: Vec<String> = g::list_entities(&db, 50)
+    let listed: Vec<String> = g::list_entities(&db, 50, 0)
         .await
         .unwrap()
+        .0
         .into_iter()
         .map(|(e, _)| e.name)
         .collect();
@@ -105,7 +106,7 @@ async fn an_alias_only_name_answers_with_the_entity_that_owns_it() {
     .await
     .unwrap();
     assert!(
-        g::add_alias(&db, owner, "k1（饱和参数）", "knowledge")
+        g::add_alias(&db, owner, "k1（饱和参数）", g::AliasSource::Knowledge)
             .await
             .unwrap()
     );
@@ -114,9 +115,10 @@ async fn an_alias_only_name_answers_with_the_entity_that_owns_it() {
     // no entity's text says it except the decoy's summary. If either changes, the
     // readings below stop being about the alias leg.
     let stripped = "k1（饱和参数）";
-    let named: Vec<String> = g::list_entities(&db, 50)
+    let named: Vec<String> = g::list_entities(&db, 50, 0)
         .await
         .unwrap()
+        .0
         .into_iter()
         .map(|(e, _)| e.name)
         .collect();
@@ -149,9 +151,14 @@ async fn an_alias_only_name_answers_with_the_entity_that_owns_it() {
     .await
     .unwrap();
     assert!(
-        g::add_alias(&db, arima, "ARIMA（自回归积分滑动平均模型）", "knowledge")
-            .await
-            .unwrap()
+        g::add_alias(
+            &db,
+            arima,
+            "ARIMA（自回归积分滑动平均模型）",
+            g::AliasSource::Knowledge
+        )
+        .await
+        .unwrap()
     );
     let hits = g::search_entities(&db, "ARIMA（自回归积分滑动平均模型）", 10)
         .await
@@ -170,7 +177,7 @@ async fn an_alias_only_name_answers_with_the_entity_that_owns_it() {
         .await
         .unwrap();
     assert!(
-        g::add_alias(&db, name_owner, "E-031-DayDream", "knowledge")
+        g::add_alias(&db, name_owner, "E-031-DayDream", g::AliasSource::Knowledge)
             .await
             .unwrap()
     );
@@ -196,9 +203,14 @@ async fn an_alias_only_name_answers_with_the_entity_that_owns_it() {
     .await
     .unwrap();
     assert!(
-        g::add_alias(&db, aqs, "AQS（AbstractQueuedSynchronizer）", "knowledge")
-            .await
-            .unwrap()
+        g::add_alias(
+            &db,
+            aqs,
+            "AQS（AbstractQueuedSynchronizer）",
+            g::AliasSource::Knowledge
+        )
+        .await
+        .unwrap()
     );
     let text_hits: i64 = db
         .call(|conn| {
@@ -233,7 +245,7 @@ async fn an_alias_only_name_answers_with_the_entity_that_owns_it() {
         "饱和参数"
     );
     assert_eq!(
-        g::list_entities(&db, 50).await.unwrap().len(),
+        g::list_entities(&db, 50, 0).await.unwrap().0.len(),
         6,
         "the search created no entity"
     );

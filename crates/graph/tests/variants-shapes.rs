@@ -113,7 +113,7 @@ async fn no_well_formed_name_panics_the_resolution_path() {
             valid_at: None,
             event_time_source: g::EventTimeSource::Recorded,
         }];
-        let out = g::apply_extraction(&db, &entities, &facts, "t15-property", None)
+        let out = g::apply_extraction(&db, &entities, &facts, g::AliasSource::Extraction, None)
             .await
             .unwrap_or_else(|e| panic!("apply_extraction refused {name:?}: {e}"));
         if !name.trim().is_empty() {
@@ -177,17 +177,30 @@ async fn the_corpus_shape_resolves_and_merges() {
     // exact norm_name only): the second spelling must MERGE, exactly as the ASCII
     // `DeepSeek Harness (dsh)` / `dsh` pair does.
     let db = Db::open_in_memory().unwrap();
-    let first =
-        g::upsert_entity_with_aliases(&db, "特质（trait）", Some("concept"), None, &[], "t15")
-            .await
-            .unwrap();
+    let first = g::upsert_entity_with_aliases(
+        &db,
+        "特质（trait）",
+        Some("concept"),
+        None,
+        &[],
+        g::AliasSource::Extraction,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(first, g::ResolveOutcome::Created { .. }),
         "the first spelling creates the object: {first:?}"
     );
-    let second = g::upsert_entity_with_aliases(&db, "trait", Some("concept"), None, &[], "t15")
-        .await
-        .unwrap();
+    let second = g::upsert_entity_with_aliases(
+        &db,
+        "trait",
+        Some("concept"),
+        None,
+        &[],
+        g::AliasSource::Extraction,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(second, g::ResolveOutcome::Merged { .. }),
         "the inner term of the full-width group is the same object: {second:?}"
@@ -195,13 +208,20 @@ async fn the_corpus_shape_resolves_and_merges() {
     assert_eq!(ids(&first), ids(&second), "one object, not two");
 
     // The ASCII shape the parenthetical rule was built for, as the control.
-    let ascii_a =
-        g::upsert_entity_with_aliases(&db, "DeepSeek Harness (dsh)", None, None, &[], "t15")
+    let ascii_a = g::upsert_entity_with_aliases(
+        &db,
+        "DeepSeek Harness (dsh)",
+        None,
+        None,
+        &[],
+        g::AliasSource::Extraction,
+    )
+    .await
+    .unwrap();
+    let ascii_b =
+        g::upsert_entity_with_aliases(&db, "dsh", None, None, &[], g::AliasSource::Extraction)
             .await
             .unwrap();
-    let ascii_b = g::upsert_entity_with_aliases(&db, "dsh", None, None, &[], "t15")
-        .await
-        .unwrap();
     assert!(matches!(ascii_a, g::ResolveOutcome::Created { .. }));
     assert!(matches!(ascii_b, g::ResolveOutcome::Merged { .. }));
     assert_eq!(ids(&ascii_a), ids(&ascii_b));

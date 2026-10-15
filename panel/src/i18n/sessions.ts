@@ -60,6 +60,23 @@ export const zh: Record<string, string> = {
   "sessions.search": "搜索标题、工作区、预览…",
   "sessions.filteredEmpty": "没有符合筛选条件的会话。",
   "sessions.filterClear": "清除筛选",
+
+  // ---- distillation standing on the list (t8 / #47) ----
+  // The daemon decides these from the LEDGER (distill_log.status = 'ok'), so
+  // the badge names the ledger's reading, not a guess over the visible rows.
+  "sessions.distill.state.ok": "已蒸馏",
+  "sessions.distill.state.failed": "蒸馏失败",
+  "sessions.distill.state.empty": "无内容",
+  "sessions.distill.state.none": "未蒸馏",
+  "sessions.distill.state.norecord": "结果未记录",
+  "sessions.distill.hint": "账本判定：{state}；最近一次尝试 {when}",
+  "sessions.distill.never": "从未尝试",
+  "sessions.distill.unsupported": "这个 daemon 不返回蒸馏状态（字段是后来加的），因此无法按它筛选。",
+  "sessions.filter.distill": "蒸馏状态",
+  "sessions.filter.distillAll": "全部蒸馏状态",
+  "sessions.filter.distillNone": "只看未蒸馏",
+  "sessions.filter.distillOk": "只看已蒸馏",
+  "sessions.batchFailed": "批量蒸馏失败：{e}",
 };
 
 export const en: Record<string, string> = {
@@ -117,4 +134,19 @@ export const en: Record<string, string> = {
   "sessions.search": "Search title, workspace, preview…",
   "sessions.filteredEmpty": "No sessions match these filters.",
   "sessions.filterClear": "Clear filters",
+
+  // ---- distillation standing on the list (t8 / #47) ----
+  "sessions.distill.state.ok": "Distilled",
+  "sessions.distill.state.failed": "Distill failed",
+  "sessions.distill.state.empty": "No content",
+  "sessions.distill.state.none": "Not distilled",
+  "sessions.distill.state.norecord": "Outcome not recorded",
+  "sessions.distill.hint": "Ledger says: {state}; last attempt {when}",
+  "sessions.distill.never": "never attempted",
+  "sessions.distill.unsupported": "This daemon does not answer the distillation standing (the field was added later), so it cannot be filtered on.",
+  "sessions.filter.distill": "Distillation",
+  "sessions.filter.distillAll": "Any distillation state",
+  "sessions.filter.distillNone": "Undistilled only",
+  "sessions.filter.distillOk": "Distilled only",
+  "sessions.batchFailed": "Batch distillation failed: {e}",
 };

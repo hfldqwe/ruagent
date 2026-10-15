@@ -6,8 +6,8 @@
 // The page's own notes live at the top of Sessions.tsx.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Dropdown, Input, Popconfirm, Segmented, Select } from "antd";
-import { api, type SessionRecord } from "../api";
+import { Button, Dropdown, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
+import { api, type DistillBatchOutcome, type DistillScope, type SessionRecord } from "../api";
 import { dateOf, useI18n } from "../i18n";
 import { Icon } from "../icons";
 import {
@@ -18,6 +18,8 @@ import {
   ReadoutStrip,
   RelTime,
   Spinner,
+  fmtTokens,
+  fmtUsd,
   useToast,
 } from "../ui";
 import { Markdown } from "./lazy-markdown";
@@ -39,6 +41,10 @@ const ROW_H = 40;
 const OVERSCAN = 2;
 /** The viewer is capped like the chat log: newest 400 messages. */
 const MSG_CAP = 400;
+/** The batch entry's page size. The daemon clamps to [1, 200] and defaults to
+ *  20, so this asks for exactly one daemon-default page of work instead of
+ *  inventing a second default that could drift from the route's. */
+const DISTILL_BATCH_LIMIT = 20;
 
 /** The name a session wears on this page (S9.4).
  *
@@ -124,6 +130,14 @@ function routeQuery(): URLSearchParams {
   return new URLSearchParams(i >= 0 ? h.slice(i + 1) : "");
 }
 
+/** #47's distillation filter, as THIS page carries it: the daemon's two
+ *  scopes (`?only=`) plus the panel's own "no scope" default. The value is
+ *  sent straight to the daemon — the standing is decided there, against the
+ *  ledger, because this page holds one window of the index and cannot answer
+ *  "was this ever distilled" from what it happens to be showing. */
+type DistillFilter = "all" | DistillScope;
+const DISTILL_FILTERS: DistillFilter[] = ["all", "undistilled", "distilled"];
+
 /** The view state as the URL carries it. An unknown enum value falls back to
  *  the default instead of reaching a Select, which would render empty. */
 function readViewState(): {
@@ -132,9 +146,11 @@ function readViewState(): {
   when: string;
   sort: SortKey;
   systemMode: SystemMode;
+  distill: DistillFilter;
 } {
   const p = routeQuery();
   const sys = p.get("sys");
+  const dis = p.get("distill");
   return {
     filter: p.get("src") ?? "all",
     ws: p.get("ws") ?? "all",
@@ -143,6 +159,9 @@ function readViewState(): {
     systemMode: SYS_MODES.includes(sys as SystemMode)
       ? (sys as SystemMode)
       : "exclude",
+    distill: DISTILL_FILTERS.includes(dis as DistillFilter)
+      ? (dis as DistillFilter)
+      : "all",
   };
 }
 
@@ -170,6 +189,16 @@ export function Sessions() {
   const [systemMode, setSystemMode] = useState<SystemMode>(fromUrl.systemMode);
   /** t179 — the order the user picked (row 58: it lives in the URL). */
   const [sort, setSort] = useState<SortKey>(fromUrl.sort);
+  /** #47 — which distillation standing to show. It rides the URL with the rest
+   *  of the view state (row 58), and it is a SERVER filter: see DistillFilter. */
+  const [distillScope, setDistillScope] = useState<DistillFilter>(fromUrl.distill);
+  /** The batch entry's own question, asked of the daemon's planner: how many
+   *  sessions are undistilled, and what a pass would cost. `null` until the
+   *  first answer — and it stays null on a failed read, so the button says
+   *  "batch distillation…" instead of inventing a backlog of 0. */
+  const [plan, setPlan] = useState<DistillBatchOutcome | null>(null);
+  const [planErr, setPlanErr] = useState<unknown>(null);
+  const [batchOpen, setBatchOpen] = useState(false);
   /** Key of the row whose archive/delete request is in flight. */
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState<SessionRecord | null>(null);
@@ -204,12 +233,13 @@ export function Sessions() {
     if (when !== "all") p.set("when", when);
     if (systemMode !== "exclude") p.set("sys", systemMode);
     if (sort !== "updated") p.set("sort", sort);
+    if (distillScope !== "all") p.set("distill", distillScope);
     const qs = p.toString();
     const next = loc.pathname + loc.search + "#sessions" + (qs ? "?" + qs : "");
     if (loc.pathname + loc.search + loc.hash !== next) {
       window.history.replaceState(window.history.state, "", next);
     }
-  }, [filter, ws, when, systemMode, sort]);
+  }, [filter, ws, when, systemMode, sort, distillScope]);
 
   /* The reverse direction while this page stays mounted: a hash edited in the
      address bar, or a back/forward to another "#sessions?…", changes the route
@@ -227,6 +257,7 @@ export function Sessions() {
       setWhen(v.when);
       setSystemMode(v.systemMode);
       setSort(v.sort);
+      setDistillScope(v.distill);
     };
     window.addEventListener("hashchange", apply);
     return () => window.removeEventListener("hashchange", apply);
@@ -240,9 +271,30 @@ export function Sessions() {
      leaving this page replaces the whole fragment and the state goes with it,
      leaving no query behind. */
 
+  /** The batch planner's answer, re-asked whenever the backlog could have
+   *  changed (a single distill, a batch run, a filter change). `dry_run` on the
+   *  daemon is a PLAN: no extraction, no model call, no write — which is what
+   *  makes it safe to ask from a page load, and it is the only source of the
+   *  global backlog count (the list holds a window, and its rows carry a
+   *  standing, not a total). */
+  const refreshPlan = useCallback(() => {
+    api
+      .distillBatch({ dryRun: true, limit: DISTILL_BATCH_LIMIT })
+      .then((p) => {
+        setPlan(p);
+        setPlanErr(null);
+      })
+      .catch((e) => setPlanErr(e));
+  }, []);
+
   const load = useCallback(async () => {
     try {
-      const r = await api.sessionsList({ archived: "exclude" });
+      const r = await api.sessionsList({
+        archived: "exclude",
+        // `all` means "no scope": sending the word would be a second spelling
+        // of the default the daemon already has.
+        only: distillScope === "all" ? undefined : distillScope,
+      });
       setState({ kind: "ready", rows: r.sessions, at: Date.now() });
       // `?? 0` is not defensive noise: an older daemon without the field
       // answered undefined, and the label rendered the literal string
@@ -262,7 +314,9 @@ export function Sessions() {
             },
       );
     }
-  }, []);
+    // `distillScope` is the request's own parameter, so a filter change must rebuild
+    // this callback — otherwise the poll would keep answering the previous scope.
+  }, [distillScope]);
 
   useEffect(() => {
     const timer = setTimeout(() => setSlow(true), 200);
@@ -273,6 +327,13 @@ export function Sessions() {
       clearInterval(i);
     };
   }, [load]);
+
+  // One plan read on mount; the mutation paths below re-ask it. Deliberately NOT
+  // polled with the list: it is a costing question, and the answer only moves when
+  // something distils — which this page already reacts to.
+  useEffect(() => {
+    refreshPlan();
+  }, [refreshPlan]);
 
   // "data may be stale · N seconds ago" has to actually tick.
   useEffect(() => {
@@ -295,6 +356,14 @@ export function Sessions() {
     () => (rows ?? []).filter(isSystemSession).length,
     [rows],
   );
+  /** Whether any row of this page answers the distillation STANDING at all.
+   *  `distilled` is additive on the wire, so a daemon older than it omits the
+   *  field, and `undefined` is then the honest reading of "this build cannot
+   *  tell you". The distill filter is disabled in that case rather than
+   *  silently showing every row under a scope nothing can apply. The test is
+   *  over the rows themselves: a page of rows that all lack the field, and a
+   *  page with no rows at all, are different situations. */
+  const hasStanding = (rows ?? []).some((s) => s.distilled !== undefined);
   /** Workspaces present in the current page of results, most used first.
    *  Capped: this is a filter, not an inventory.
    *  Temporary workspaces are left out (S7): the vision bridge alone files 46
@@ -435,6 +504,11 @@ export function Sessions() {
           a: d.agent,
         }),
       );
+      // This session's standing just changed, and the backlog shrank: re-read
+      // both rather than leaving a badge (or a count) describing the previous
+      // state. `void` because the toast above is already the user's answer.
+      void load();
+      refreshPlan();
     } catch (e) {
       toast("err", String(e));
     } finally {
@@ -497,6 +571,28 @@ export function Sessions() {
             { value: "30d", label: t("sessions.filter.time30d") },
           ]}
         />
+        {/* #47: the distillation axis. It is a SERVER filter (`?only=`), because
+            the standing is the ledger's — a client-side filter over this page
+            would answer "undistilled among the rows I happen to hold", which is
+            a different and wrong question. Disabled when no row answers the
+            field at all: that is a daemon older than the field, and offering a
+            filter it cannot honour would silently show everything. */}
+        <Tooltip
+          title={hasStanding ? undefined : t("sessions.distill.unsupported")}
+        >
+          <Select
+            className="sessions-distill"
+            value={distillScope}
+            onChange={(v) => setDistillScope(v as DistillFilter)}
+            disabled={!hasStanding}
+            aria-label={t("sessions.filter.distill")}
+            options={[
+              { value: "all", label: t("sessions.filter.distillAll") },
+              { value: "undistilled", label: t("sessions.filter.distillNone") },
+              { value: "distilled", label: t("sessions.filter.distillOk") },
+            ]}
+          />
+        </Tooltip>
         <span className="grow" />
         {/* t170 — the user's ruling: archived sessions are stored SEPARATELY
             and must not be shown back in this list. So there is no "show
@@ -550,6 +646,18 @@ export function Sessions() {
             { value: "created", label: t("sessions.sortCreated") },
           ]}
         />
+        {/* #47: the backlog pass. The count on the label is the daemon's own
+            `undistilled_total` (see refreshPlan), so the button states the size
+            of the job BEFORE it is opened — and says nothing rather than 0 when
+            the planner could not be read. */}
+        <Button
+          type="primary"
+          className="sessions-batch"
+          onClick={() => setBatchOpen(true)}
+          aria-label={t("distill.batch.title")}
+        >
+          {plan ? t("distill.batch.open", { n: plan.undistilled_total }) : t("distill.batch.openPlain")}
+        </Button>
       </div>
 
       {failed && (
@@ -660,6 +768,21 @@ export function Sessions() {
       )}
 
       {open && <SessionDetail session={open} onClose={closeRow} />}
+
+      {batchOpen && (
+        <BatchDistillModal
+          plan={plan}
+          planErr={planErr}
+          onReloadPlan={refreshPlan}
+          onClose={() => setBatchOpen(false)}
+          onDone={() => {
+            // The pass changed standings and the backlog; both readers are
+            // re-asked here rather than by a poll that may be 10s away.
+            void load();
+            refreshPlan();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -840,6 +963,33 @@ function RowList({
             </span>
           ) : null}
           <span className="title">{sessionName(s, t)}</span>
+          {/* #47: the row's distillation standing, from the daemon's own ledger
+              reading. Shown in BOTH widths (it is the page's answer to "which of
+              these still needs distilling"), but the SECOND chip — the newest
+              attempt's outcome, which is only interesting when it is not ok — is
+              dropped at <=520 where three chips leave the title its 5em floor and
+              nothing else. `data-distilled` carries the primary state so a test
+              reads the state, not the copy. */}
+          {s.distilled !== undefined ? (
+            <Tooltip title={standingHint(s, t)}>
+              <span
+                className={s.distilled ? "tag ok" : "tag"}
+                data-distilled={s.distilled ? "true" : "false"}
+              >
+                {t(s.distilled ? "sessions.distill.state.ok" : "sessions.distill.state.none")}
+              </span>
+            </Tooltip>
+          ) : null}
+          {!narrow && lastAttemptChip(s) ? (
+            <Tooltip title={standingHint(s, t)}>
+              <span
+                className={lastAttemptChip(s)!.cls}
+                data-distill-status={s.distill_status ?? "not_recorded"}
+              >
+                {t(lastAttemptChip(s)!.labelKey)}
+              </span>
+            </Tooltip>
+          ) : null}
           {!narrow && s.archived ? (
             <span className="tag">{t("sessions.archived")}</span>
           ) : null}
@@ -1077,6 +1227,250 @@ function RowList({
 
 /** Shown only when the first response is slower than 200ms, so the page is
  *  never a blank screen (view-sessions.md §5, loading). */
+/** The ledger statuses this build knows how to name. Anything else is printed
+ *  VERBATIM: a status a future daemon invents must not be silently mapped onto
+ *  one of these words, and must never reach `t()` as a missing key (which would
+ *  render the raw key string). */
+const LEDGER_STATUSES = ["ok", "empty", "failed", "not_recorded"];
+
+/** The chip for the NEWEST attempt, or null when there is nothing to say.
+ *
+ *  `distilled` answers "has a successful attempt covered this session" — the
+ *  ledger's criterion, and the axis the filter queries — while `distill_status`
+ *  is what happened LAST. The two can disagree (distilled last week, a failing
+ *  attempt today), and the page needs both: the first chip mirrors the filter,
+ *  the second reports the newest attempt without contradicting it. */
+function lastAttemptChip(s: SessionRecord): { labelKey: string; cls: string } | null {
+  if (s.distill_status === "ok") return null;
+  if (s.distill_status === "failed") {
+    return { labelKey: "sessions.distill.state.failed", cls: "tag err" };
+  }
+  if (s.distill_status === "empty") {
+    return { labelKey: "sessions.distill.state.empty", cls: "tag warn" };
+  }
+  if (s.distill_status == null && s.distilled_at) {
+    // A ledger row exists but recorded no status (the fourth state). Only then:
+    // with no row at all there is no attempt to report.
+    return { labelKey: "sessions.distill.state.norecord", cls: "tag" };
+  }
+  return null;
+}
+
+/** The badge's tooltip: the standing AND when the newest attempt ran — the date
+ *  the daemon answered for that row, or "never attempted". It is the same
+ *  sentence for both chips, because they are two halves of one reading. */
+function standingHint(
+  s: SessionRecord,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  return t("sessions.distill.hint", {
+    state: t(s.distilled ? "sessions.distill.state.ok" : "sessions.distill.state.none"),
+    when: s.distilled_at ? dateOf(s.distilled_at) : t("sessions.distill.never"),
+  });
+}
+
+/** #47's batch entry: the PLAN first, then the RUN.
+ *
+ *  The two halves come from the same endpoint shape (a dry run answers
+ *  `actual: null` and `attempted: 0`), which is what lets the estimate and the
+ *  reading be shown side by side without translating between two vocabularies.
+ *  Every unrecorded measurement prints 未记录 and never 0: a batch whose rows
+ *  recorded no cost must not read as a free batch. */
+function BatchDistillModal({
+  plan,
+  planErr,
+  onReloadPlan,
+  onClose,
+  onDone,
+}: {
+  plan: DistillBatchOutcome | null;
+  planErr: unknown;
+  onReloadPlan: () => void;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { t } = useI18n();
+  const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState<DistillBatchOutcome | null>(null);
+  const [err, setErr] = useState<unknown>(null);
+
+  /** A recorded number, or the ledger's own word for "nobody wrote it down". */
+  const measured = (v: number | null, render: (n: number) => string) =>
+    v == null ? t("distill.notRecorded") : render(v);
+  const statusLabel = (s: string) =>
+    LEDGER_STATUSES.includes(s) ? t(`distill.ledger.status.${s}`) : s;
+  const statusCls = (s: string) =>
+    s === "ok" ? "tag ok" : s === "failed" ? "tag err" : s === "empty" ? "tag warn" : "tag";
+
+  const run = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await api.distillBatch({ limit: DISTILL_BATCH_LIMIT });
+      setOutcome(res);
+      // No success toast: the block below IS the confirmation, and it stays on
+      // screen (the page's own rule for a mutation's answer — a 2s notice would
+      // be gone before the numbers were read).
+      onDone();
+    } catch (e) {
+      // A failed MUTATION still toasts, and the line below keeps it readable.
+      setErr(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const est = plan?.estimated;
+  const act = outcome?.actual;
+
+  return (
+    <Modal title={t("distill.batch.title")} onClose={onClose}>
+      {planErr && !plan ? (
+        <ErrorState
+          title={t("distill.batch.err")}
+          hint={`${t("distill.batch.err.hint")} — ${String(planErr).slice(0, 200)}`}
+          onRetry={onReloadPlan}
+          retryLabel={t("common.retry")}
+        />
+      ) : null}
+      {!plan && !planErr ? <Spinner /> : null}
+
+      {plan && est && !outcome ? (
+        <>
+          <p className="muted micro">{t("distill.batch.dryNote")}</p>
+          <p>
+            {t("distill.batch.planned", { n: plan.planned })}
+            {" · "}
+            {t("distill.batch.backlog", { n: plan.undistilled_total })}
+          </p>
+          <ReadoutStrip
+            grid
+            items={[
+              { key: "sessions", label: t("distill.batch.estSessions"), value: est.sessions },
+              { key: "windows", label: t("distill.batch.estWindows"), value: est.windows },
+              {
+                key: "tokens",
+                label: t("distill.batch.estTokens"),
+                value: measured(est.tokens_used, fmtTokens),
+              },
+              {
+                key: "cost",
+                label: t("distill.batch.estCost"),
+                value: measured(est.cost_usd, fmtUsd),
+              },
+            ]}
+          />
+          <p className="muted micro">
+            {t("distill.batch.budget", { n: est.budget_bytes })}
+            {" · "}
+            {t("distill.batch.basis", {
+              ok: est.basis.ok_attempts,
+              tr: est.basis.tokens_recorded,
+              cr: est.basis.cost_recorded,
+              wr: est.basis.windows_recorded,
+            })}
+          </p>
+          {/* The daemon's own wording of the method, verbatim: a second
+              paraphrase in the panel is a copy that drifts from the formula. */}
+          <details className="prompt-view">
+            <summary>{t("distill.batch.method")}</summary>
+            <p className="muted micro">{est.method}</p>
+          </details>
+          {plan.planned === 0 ? <p className="muted">{t("distill.batch.nothing")}</p> : null}
+        </>
+      ) : null}
+
+      {outcome ? (
+        <>
+          <p>
+            <strong>
+              {t("distill.batch.counted", {
+                n: outcome.attempted,
+                ok: outcome.ok,
+                empty: outcome.empty,
+                failed: outcome.failed,
+              })}
+            </strong>
+          </p>
+          {act ? (
+            <>
+              <div className="zone-head">
+                <div className="zone-title">{t("distill.batch.actual")}</div>
+              </div>
+              <ReadoutStrip
+                grid
+                items={[
+                  { key: "rows", label: t("distill.batch.actualRows"), value: act.rows },
+                  {
+                    key: "windows",
+                    label: t("distill.batch.actualWindows"),
+                    value: measured(act.windows, (n) => t("distill.ledger.calls", { n })),
+                  },
+                  {
+                    key: "tokens",
+                    label: t("distill.batch.actualTokens"),
+                    value: measured(act.tokens_used, fmtTokens),
+                  },
+                  {
+                    key: "cost",
+                    label: t("distill.batch.actualCost"),
+                    value: measured(act.cost_usd, fmtUsd),
+                  },
+                ]}
+              />
+              <p className="muted micro">{t("distill.batch.actualNote")}</p>
+            </>
+          ) : null}
+          <div className="zone-head">
+            <div className="zone-title">{t("distill.batch.results")}</div>
+            <span className="zone-note">{outcome.results.length}</span>
+          </div>
+          <div className="card">
+            {outcome.results.map((r) => (
+              <div
+                key={r.session_key}
+                className="row tight"
+                data-result-status={r.status}
+              >
+                <span className="mono micro truncated" title={r.session_key}>
+                  {r.session_key}
+                </span>
+                <span className={statusCls(r.status)}>{statusLabel(r.status)}</span>
+                <span className="grow" />
+                {r.reason ? <span className="muted micro">{r.reason}</span> : null}
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
+
+      {err ? (
+        <ErrorState
+          title={t("distill.batch.err")}
+          hint={`${t("distill.batch.err.hint")} — ${String(err).slice(0, 200)}`}
+        />
+      ) : null}
+
+      <div className="row end">
+        {outcome ? (
+          <Button onClick={onClose}>{t("common.close")}</Button>
+        ) : (
+          <>
+            <Button onClick={onClose}>{t("common.cancel")}</Button>
+            <Button
+              type="primary"
+              loading={busy}
+              disabled={busy || !plan || plan.planned === 0}
+              onClick={() => void run()}
+            >
+              {busy ? t("distill.batch.running") : t("distill.batch.start")}
+            </Button>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
 function CardSkeleton() {
   return (
     <div className="card" aria-busy="true" aria-hidden="true">

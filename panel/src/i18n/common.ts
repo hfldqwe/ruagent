@@ -25,6 +25,8 @@ export const zh: Record<string, string> = {
   "common.reject": "拒绝",
   "common.retry": "重试",
   "common.stale": "数据可能过期",
+  "common.stale.hint": "显示的是上一次成功读取的结果；重试可刷新。",
+
 };
 
 export const en: Record<string, string> = {
@@ -47,4 +49,6 @@ export const en: Record<string, string> = {
   "common.reject": "Reject",
   "common.retry": "Retry",
   "common.stale": "data may be stale",
+  "common.stale.hint": "Showing the last successful read; retry to refresh.",
+
 };

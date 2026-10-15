@@ -33,6 +33,8 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0025_query_eval_gold_unique.sql"),
     include_str!("migrations/0026_capability_ingest.sql"),
     include_str!("migrations/0027_entity_aliases_fts.sql"),
+    include_str!("migrations/0028_distill_ledger.sql"),
+    include_str!("migrations/0029_resolution_dismissed.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.
@@ -59,12 +61,7 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 /// `distill_log` -- measured on the live database before it was written), and it
 /// is the first migration here to replace a table outright.
 pub fn apply(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-             version INTEGER PRIMARY KEY,
-             applied_at TEXT NOT NULL
-         );",
-    )?;
+    ensure_ledger(conn)?;
     let versions = ledger_versions(conn)?;
     let current = versions.last().copied().unwrap_or(0);
 
@@ -120,6 +117,21 @@ pub fn apply(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         apply_one(conn, version, script)?;
         tracing::info!(version, "applied schema migration");
     }
+    Ok(())
+}
+
+/// Create `schema_migrations` if it is not there yet.
+///
+/// Split out of [`apply`] so a test can build a database at an EARLIER version
+/// by calling [`apply_one`] directly -- the upgrade path a real installation
+/// takes -- without re-stating this DDL as a fixture that could drift from it.
+fn ensure_ledger(conn: &rusqlite::Connection) -> Result<(), DbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+             version INTEGER PRIMARY KEY,
+             applied_at TEXT NOT NULL
+         );",
+    )?;
     Ok(())
 }
 
@@ -570,6 +582,11 @@ mod tests {
         // first and `session_key` is a plain, indexed column. The order is
         // asserted as well as the set: a reader that still assumes session_key is
         // the key has to notice.
+        //
+        // 0028 appends the attempt's COST and its write report (issues #45, #48,
+        // #55) after `prompt_hash`: the migration only ever adds to the end, so
+        // the column ORDER of the pre-0028 shape is pinned here unchanged, and a
+        // rewrite of the table (which is how a column would move) has to fail.
         assert_eq!(
             columns(&conn, "distill_log"),
             vec![
@@ -582,7 +599,28 @@ mod tests {
                 "agent",
                 "status",
                 "failure_reason",
-                "prompt_hash"
+                "prompt_hash",
+                "relations_duplicate",
+                "relations_refused",
+                "tokens_used",
+                "context_size",
+                "cost_usd",
+                "retries",
+                "windows",
+                "truncated"
+            ],
+        );
+        // 0029 appends the undecided queue's ANSWER (issue #50): every pre-0029
+        // row is a pair nobody has ruled on, so `dismissed_at` is the last column
+        // and NULL there is the queue's "still waiting".
+        assert_eq!(
+            columns(&conn, "resolution_pending"),
+            vec![
+                "entity_a",
+                "entity_b",
+                "reason",
+                "created_at",
+                "dismissed_at"
             ],
         );
         let pk: Vec<String> = {
@@ -631,6 +669,21 @@ mod tests {
             ("distill_log", "status"),
             ("distill_log", "failure_reason"),
             ("distill_log", "prompt_hash"),
+            // 0028: the attempt's cost and write report. Listed here (and not
+            // only in the column-order assertion above) so the NULLABLE /
+            // NO-DEFAULT rule is asserted for each one: a `DEFAULT 0` on any of
+            // them would have invented a reading for every historical attempt.
+            ("distill_log", "relations_duplicate"),
+            ("distill_log", "relations_refused"),
+            ("distill_log", "tokens_used"),
+            ("distill_log", "context_size"),
+            ("distill_log", "cost_usd"),
+            ("distill_log", "retries"),
+            ("distill_log", "windows"),
+            ("distill_log", "truncated"),
+            // 0029: the undecided queue's answer. NULL = not answered yet; a
+            // default would have to invent either the decision or its time.
+            ("resolution_pending", "dismissed_at"),
             ("entity_edges", "event_time_source"),
             ("entity_edges", "fact_hash"),
             ("entities", "embedding"),
@@ -664,6 +717,260 @@ mod tests {
                 "{table}.{column} must have NO default, got {dflt:?}"
             );
         }
+    }
+
+    /// t3 / issues #45, #48, #50, #55: the two ADDITIVE migrations read back on a
+    /// database that PRE-DATES them, and then re-applied on top of themselves.
+    ///
+    /// Three properties, each one a different way the change could be wrong:
+    ///
+    /// 1. **an old database upgrades.** The fixture is built by the SAME runner
+    ///    (`apply_one` for 1..=27), with a pre-existing row in each table, so the
+    ///    only path exercised here is the one a real installation takes. A
+    ///    migration that only worked on a fresh database would be invisible
+    ///    without this half.
+    /// 2. **a pre-existing row's new columns stay NULL.** `ALTER TABLE ... DEFAULT
+    ///    0` would have backfilled every historical attempt with a fabricated
+    ///    reading ("no tokens", "nothing was truncated") and marked every queued
+    ///    pair as decided -- assertions about attempts and decisions nobody made.
+    ///    The pre-0028/0029 values the row already held must survive untouched.
+    /// 3. **re-applying them is a no-op.** A lost `schema_migrations` row for 28
+    ///    or 29 means the scripts run again against a schema that already has the
+    ///    columns. SQLite has no `ADD COLUMN IF NOT EXISTS`, so this rests
+    ///    entirely on the runner's `pragma_table_info` guard: without it the boot
+    ///    dies with `duplicate column name: tokens_used`.
+    #[test]
+    fn the_ledger_and_dismissal_columns_upgrade_an_old_database_and_reapply_cleanly() {
+        const NEW_LEDGER_COLUMNS: &[&str] = &[
+            "relations_duplicate",
+            "relations_refused",
+            "tokens_used",
+            "context_size",
+            "cost_usd",
+            "retries",
+            "windows",
+            "truncated",
+        ];
+
+        // ---- 1. a database as it was BEFORE 0028/0029 -----------------------
+        // The two new versions are found by CONTENT rather than by a literal 28,
+        // so a migration inserted anywhere ahead of them cannot leave this test
+        // quietly building the wrong fixture -- and so the "appended IN ORDER,
+        // last" half of the requirement is asserted rather than assumed.
+        let v28 = MIGRATIONS
+            .iter()
+            .position(|s| s.contains("ADD COLUMN relations_duplicate"))
+            .expect("0028's script must be embedded in MIGRATIONS");
+        let v29 = MIGRATIONS
+            .iter()
+            .position(|s| s.contains("ADD COLUMN dismissed_at"))
+            .expect("0029's script must be embedded in MIGRATIONS");
+        assert_eq!(
+            (v28 + 1, v29 + 1),
+            (28, 29),
+            "0028/0029 must be MIGRATIONS[27]/[28]: the two NEWEST scripts, in order"
+        );
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_ledger(&conn).unwrap();
+        for (i, script) in MIGRATIONS.iter().take(v28).enumerate() {
+            apply_one(&mut conn, (i + 1) as i64, script).unwrap();
+        }
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            27,
+            "the fixture must NOT have seen the two new migrations"
+        );
+        for column in NEW_LEDGER_COLUMNS {
+            assert!(
+                !columns(&conn, "distill_log").iter().any(|c| c == column),
+                "the fixture is wrong: distill_log.{column} already exists before 0028"
+            );
+        }
+        assert!(
+            !columns(&conn, "resolution_pending")
+                .iter()
+                .any(|c| c == "dismissed_at"),
+            "the fixture is wrong: resolution_pending.dismissed_at already exists"
+        );
+
+        // One row of each kind, written the way a pre-0028 daemon wrote them:
+        // 0024's column list and nothing more, because nothing else existed.
+        conn.execute(
+            "INSERT INTO distill_log
+             (session_key, distilled_at, memories_written, entities_written,
+              relations_written, agent, status, failure_reason, prompt_hash)
+             VALUES ('s-pre', '2026-01-01T00:00:00Z', 7, 2, 3, 'agent', 'ok', NULL, 'ph')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, name, norm_name, kind, summary, created_at, updated_at)
+             VALUES (1, 'A', 'a', 'tool', NULL, 'now', 'now'),
+                    (2, 'B', 'b', 'tool', NULL, 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_pending (entity_a, entity_b, reason, created_at)
+             VALUES (1, 2, 'different kinds', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // ---- 2. upgrade through the runner's own path -----------------------
+        apply(&mut conn).unwrap();
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION must follow MIGRATIONS.len() onto the new head"
+        );
+
+        for column in NEW_LEDGER_COLUMNS {
+            assert!(
+                columns(&conn, "distill_log").iter().any(|c| c == column),
+                "0028 must have added distill_log.{column}"
+            );
+        }
+        assert!(
+            columns(&conn, "resolution_pending")
+                .iter()
+                .any(|c| c == "dismissed_at"),
+            "0029 must have added resolution_pending.dismissed_at"
+        );
+
+        // ... and the row that PRE-DATES them carries NO reading in any of them.
+        let unknown: i64 = conn
+            .query_row(
+                "SELECT (relations_duplicate IS NULL) + (relations_refused IS NULL)
+                      + (tokens_used IS NULL) + (context_size IS NULL)
+                      + (cost_usd IS NULL) + (retries IS NULL)
+                      + (windows IS NULL) + (truncated IS NULL)
+                 FROM distill_log WHERE session_key = 's-pre'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unknown,
+            NEW_LEDGER_COLUMNS.len() as i64,
+            "a pre-0028 row must read 'not recorded' in every new column; a DEFAULT \
+             would have backfilled a reading nobody took"
+        );
+        let (memories, status): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT memories_written, status FROM distill_log WHERE session_key = 's-pre'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(memories, 7, "the upgrade must not touch what the row said");
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM resolution_pending WHERE dismissed_at IS NULL"
+            ),
+            1,
+            "a pre-0029 pair is UNANSWERED, which is not the same as dismissed"
+        );
+
+        // A row written AFTER the migration can state the reading -- including a
+        // measured 0, which is how the new columns stay distinguishable from NULL.
+        conn.execute(
+            "INSERT INTO distill_log
+             (session_key, distilled_at, memories_written, entities_written, relations_written,
+              relations_duplicate, relations_refused, tokens_used, context_size, cost_usd,
+              retries, windows, truncated)
+             VALUES ('s-post', '2026-01-02T00:00:00Z', 0, 0, 0, 1, 0, 900, 8000, 0.0, 2, 1, 0)",
+            [],
+        )
+        .unwrap();
+        // Every new column is read back INDIVIDUALLY, as `Option<f64>`: one shape
+        // for all of them, and `None` has to remain visible to the comparison (a
+        // measured 0.0 and NULL must not compare equal).
+        let stated: &[(&str, Option<f64>)] = &[
+            ("relations_duplicate", Some(1.0)),
+            ("relations_refused", Some(0.0)),
+            ("tokens_used", Some(900.0)),
+            ("context_size", Some(8000.0)),
+            ("cost_usd", Some(0.0)),
+            ("retries", Some(2.0)),
+            ("windows", Some(1.0)),
+            ("truncated", Some(0.0)),
+        ];
+        for (column, want) in stated {
+            let got: Option<f64> = conn
+                .query_row(
+                    &format!("SELECT {column} FROM distill_log WHERE session_key = 's-post'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                got, *want,
+                "a post-0028 row must be able to STATE {column}; a measured 0 is a \
+                 reading, NULL is the absence of one, and they must not compare equal"
+            );
+        }
+
+        // ---- 3. the SAME two scripts, re-applied ----------------------------
+        // The lost-ledger-row case, and the one the `pragma_table_info` guard
+        // exists for: the version rows are gone while their columns remain, so
+        // `apply` runs both scripts a second time.
+        let before = schema_snapshot(&conn);
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version >= ?1",
+            rusqlite::params![(v28 + 1) as i64],
+        )
+        .unwrap();
+        apply(&mut conn).unwrap_or_else(|e| {
+            panic!("re-applying 0028/0029 must be a no-op, not `duplicate column name`: {e}")
+        });
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "the re-applied version rows must be recorded again"
+        );
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "a re-applied ADDITIVE migration must leave the schema IDENTICAL; a \
+             changed object here means the guard re-ran an ALTER instead of skipping it"
+        );
+        // The re-apply must not have rewritten data either.
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM distill_log WHERE session_key = 's-pre'
+                   AND tokens_used IS NULL AND cost_usd IS NULL AND windows IS NULL"
+            ),
+            1,
+            "the re-applied migration must not backfill the history"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM distill_log"),
+            2,
+            "the re-apply must not duplicate rows"
+        );
+
+        // NEGATIVE CONTROL for that reading, in-process and without touching any
+        // shared source: the SAME statement, run unguarded, IS an error. So the
+        // clean re-apply above is the runner's `pragma_table_info` probe doing
+        // its job -- not SQLite tolerating a duplicate ADD COLUMN, and not the
+        // test having skipped the second application altogether.
+        let unguarded =
+            conn.execute_batch("ALTER TABLE distill_log ADD COLUMN tokens_used INTEGER;");
+        assert!(
+            unguarded.is_err(),
+            "SQLite has no `ADD COLUMN IF NOT EXISTS`: an unguarded re-ALTER must fail, \
+             which is exactly why the guard has to skip it"
+        );
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "the failed control must leave the schema alone"
+        );
     }
 
     /// t25 / R-C DEP-3: one row per ATTEMPT.

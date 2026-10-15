@@ -35,6 +35,11 @@ export const zh: Record<string, string> = {
   "task.err": "无法加载任务",
   "task.err.hint": "daemon 不可达，或这个任务已经不存在。",
   "task.stale.hint": "显示的是上一次成功读取的结果，2 秒轮询正在重试。",
+  "task.agentsErr": "无法读取可选角色",
+  "task.agentsErr.hint": "读不到角色列表：daemon 不可达，或者响应不符合契约。这不等于「没有可选角色」。",
+  "task.catalogErr": "无法读取模型目录",
+  "task.catalogErr.hint": "读不到该角色的模型目录：这不等于「这个角色没有模型」。",
+
   "task.loading": "载入任务…",
   "task.runError": "运行错误",
   "task.fanoutCompare": "扇出对比",
@@ -72,6 +77,11 @@ export const en: Record<string, string> = {
   "task.err": "Cannot load this task",
   "task.err.hint": "The daemon is unreachable, or the task no longer exists.",
   "task.stale.hint": "Showing the last successful read; the 2s poll is retrying.",
+  "task.agentsErr": "Cannot read the available roles",
+  "task.agentsErr.hint": "Cannot read the role list: the daemon is unreachable, or its response does not match the contract. That is not the same as \"no roles available\".",
+  "task.catalogErr": "Cannot read the model catalogue",
+  "task.catalogErr.hint": "Cannot read this role's model catalogue: that is not the same as \"this role has no models\".",
+
   "task.loading": "Loading task…",
   "task.runError": "Run error",
   "task.fanoutCompare": "Fan-out comparison",

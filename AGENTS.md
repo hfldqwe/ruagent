@@ -325,7 +325,7 @@ The mock ACP agent (`crates/mock-agent`) is the backbone of CI: every orchestrat
 
 ### Processes this repo starts must not put a window on screen
 
-Two shapes have cost real time, and both are about the window rather than the work.
+Three shapes have cost real time, and all three are about the window rather than the work.
 
 **A WMI launch hands its child a console unless told otherwise.** The start action builds
 the command as `cmd.exe /c ...` (that is the redirection shape that appends to the log
@@ -338,6 +338,25 @@ $startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()
 $startup.ShowWindow = 0
 $res = ([wmiclass]'Win32_Process').Create($cmd, $cwd, $startup)
 ```
+
+**A scheduled task's action must not be a CONSOLE application.** `install-task` used to
+register `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script> watch …`. The
+principal is `Interactive`, so the task runs in the user's own session, and Windows hands a
+console application started there to the machine's **default terminal** — on this machine
+Windows Terminal (`HKCU:\Console\%%Startup` holds the all-zero "let Windows decide" GUIDs for
+`DelegationConsole`/`DelegationTerminal`, and `wt.exe` is installed). The result was a
+*visible* terminal window every 5 minutes; the user reported it as "a scheduled task keeps
+popping a window up", and the attribution came from the cadence (`watchdog.log`, one line per
+run at `:00:xx` and `:05:xx` all day) plus the console host observed at the launch.
+`-WindowStyle Hidden` is **not** the fix: measured through real scheduled tasks and enumerated
+with `EnumWindows`/`IsWindowVisible`, a powershell started with that flag still owns a
+`visible=True` `PseudoConsoleWindow`, because the window on screen belongs to the delegated
+terminal, not to powershell. The action therefore launches `conhost.exe --headless` (Windows
+11 22000+, which does not consult the default terminal at all; below that build `install-task`
+degrades to `-WindowStyle Hidden` and **says so** in its output). Measured for the headless
+shape: no visible window and no `WindowsTerminal`/`OpenConsole` process at all, with the
+watchdog still reaching its health check. `install-task -TaskName <throwaway>` exists so the
+registration and its read-back can be verified WITHOUT touching the machine's own task.
 
 **A killed tool call does not necessarily kill its descendants.** When a long probe is
 cancelled at a wall-clock ceiling, the `cmd.exe`, `node` and browser processes it started
