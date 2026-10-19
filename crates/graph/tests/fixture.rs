@@ -22,6 +22,200 @@ pub struct PathmapDb {
     root: PathBuf,
 }
 
+// ---------------------------------------------------------------------------
+// t30: the cleanup shape t27 introduced for the t16 roots, applied to this fixture.
+//
+// The text is a COPY, not an import: this module is compiled into seven test binaries of
+// this crate, the daemon's copy is private to that crate's unit tests, and the third copy
+// lives in mock-agent/tests/e2e_daemon.rs. The shape has three parts and all three matter:
+//   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+//   2. a REPORTING call site for a root whose holder is the test process itself;
+//   3. a PRUNER that removes, from the NEXT process, what the previous one could not.
+// ---------------------------------------------------------------------------
+
+/// Remove a root with a bounded retry, RETURNING the reason (t30).
+pub fn try_remove_test_root(
+    root: &std::path::Path,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t30 cleanup of {} waited {:.1} s for the handles to be released",
+                        root.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "{} could NOT be removed within {:.2} s: {e}",
+                        root.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Remove a root this fixture OWNS, or PANIC naming it (t30): a cleanup that cannot happen
+/// is a red test, not a directory nobody counts.
+pub fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+    if let Err(why) = try_remove_test_root(root, budget) {
+        panic!("{what}: {why}");
+    }
+}
+
+/// Try once, then REPORT -- never silently drop -- a root that is still held (t30).
+///
+/// This is the call for a root whose holder is the test process itself, where an assertion
+/// would red a test for a fact that is not its own.
+pub fn report_test_root_left_behind(root: &std::path::Path) {
+    if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t30 cleanup: {why} -- the root is held by THIS test process, so the \
+             failure is REPORTED rather than swallowed; prune_stale_graph_roots removes it \
+             in the next run"
+        );
+    }
+}
+
+/// Is a process with this pid alive? (t30)
+///
+/// WHY NOT THE DAEMON'S PRIMITIVE. ruagent_daemon::orphans::process_started_at_ms is exactly
+/// what this wants, but ruagent-daemon DEPENDS on this crate, so a test dev-dependency back
+/// at it would invert the dependency direction. The probe is therefore written here: /proc on
+/// unix, ONE parsed tasklist call on Windows.
+///
+/// WHAT IT DOES NOT DO: check the start time. A RECYCLED pid can therefore keep one stale
+/// root out of the pruner's reach until that process exits. That is bounded and harmless --
+/// from_snapshot_at removes a root before it writes, so a leftover is never INHERITED; the
+/// pruner is about the pile, not about correctness.
+pub fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(windows)]
+    {
+        LIVE_PIDS.get_or_init(live_pids).contains(&pid)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// The live pid set, asked ONCE per test process: a per-root tasklist spawn would cost
+/// seconds on a pile of thousands.
+#[cfg(windows)]
+static LIVE_PIDS: std::sync::OnceLock<std::collections::HashSet<u32>> = std::sync::OnceLock::new();
+
+/// One tasklist call, parsed. An EMPTY result means the tool could not be read, which the
+/// pruner treats as "no oracle" and refuses to prune on -- never delete on a guess.
+#[cfg(windows)]
+fn live_pids() -> std::collections::HashSet<u32> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    let Ok(text) = std::process::Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+    else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&text.stdout).lines() {
+        // "name","pid","session","#","mem" -- the pid is the second field, and a comma inside
+        // the LAST field cannot reach it.
+        let mut fields = line.split(',');
+        let _name = fields.next();
+        if let Some(pid) = fields
+            .next()
+            .and_then(|f| f.trim_matches('"').parse::<u32>().ok())
+        {
+            out.insert(pid);
+        }
+    }
+    out
+}
+
+/// Remove the roots of DEAD processes this fixture (and its stale-root test) left behind,
+/// once per test process (t30).
+///
+/// The safety rule is t27's: a root whose pid is still ALIVE may be evidence a run needs,
+/// and is left alone; a root of a pid that is gone can only be litter.
+pub fn prune_stale_graph_roots() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let me = std::process::id();
+        let mut candidates: Vec<(std::path::PathBuf, u32)> = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let rest = name
+                .strip_prefix("ruagent-graph-fixture-")
+                .or_else(|| name.strip_prefix("ruagent-graph-stale-"));
+            let Some(rest) = rest else { continue };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            candidates.push((e.path(), pid));
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // NO ORACLE, NO PRUNING: if the liveness question cannot be answered, every root
+        // looks dead and a concurrent run's live root would be deleted from under it.
+        #[cfg(windows)]
+        if LIVE_PIDS.get_or_init(live_pids).is_empty() {
+            eprintln!(
+                "READING t30 pruning SKIPPED: the live-pid probe returned nothing ({} candidate \
+                 root(s) left alone rather than guessed at)",
+                candidates.len()
+            );
+            return;
+        }
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for (path, pid) in candidates {
+            if pid_is_alive(pid) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t30 stale graph root {} could NOT be removed: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t30 pruned {pruned} stale ruagent-graph-* root(s) of dead test \
+                 processes; {failed} could not be removed"
+            );
+        }
+    });
+}
+
 impl PathmapDb {
     /// Build a fresh temp DB holding every entity and edge of the snapshot.
     pub async fn live_shaped() -> Self {
@@ -74,11 +268,17 @@ impl PathmapDb {
         // thing it measures. That is the "flaky test" this line removes: a run
         // was seen failing 2 of 5 tests in one target while passing every time
         // alone. Remove before creating, never inherit.
+        // t30: the pile this fixture leaves behind is bounded by a pruner the NEXT process
+        // runs, because the fixture's own Drop cannot remove a root whose connection is still
+        // open (see the Drop below).
+        prune_stale_graph_roots();
         let root = root.to_path_buf();
         if root.exists() {
-            std::fs::remove_dir_all(&root).unwrap_or_else(|e| {
-                panic!("removing a stale fixture root {root:?} (it must not be inherited): {e}")
-            });
+            remove_test_root(
+                &root,
+                &format!("removing a stale fixture root {root:?} (it must not be inherited)"),
+                std::time::Duration::from_millis(2_000),
+            );
         }
         std::fs::create_dir_all(&root).unwrap();
         let db = Db::open(root.join("graph.db")).unwrap();
@@ -181,7 +381,17 @@ impl Drop for PathmapDb {
         // it); this is just tidiness for the cases where the handle is already
         // free. Do not "fix" it by calling into the store: a fixture must not
         // need store-side cooperation to own its own input.
-        let _ = std::fs::remove_dir_all(&self.root);
+        //
+        // t30: the failure is REPORTED instead of swallowed -- a Drop cannot panic (it may be
+        // running while another panic unwinds), so the pile is made VISIBLE here and bounded
+        // by prune_stale_graph_roots, which the next process runs.
+        if let Err(why) = try_remove_test_root(&self.root, std::time::Duration::from_millis(200)) {
+            eprintln!(
+                "READING t30 cleanup: {why} -- this fixture's root could not be removed from its \
+                 own Drop (the connection is still open), so the failure is REPORTED; the next \
+                 run's pruner reclaims it"
+            );
+        }
     }
 }
 

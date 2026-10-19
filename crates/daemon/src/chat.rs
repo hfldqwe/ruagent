@@ -2615,7 +2615,7 @@ mod generating_tests {
             "a timeout with NO prior report is `known: false`, not an \
              authoritative empty catalogue (t180's O1)"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// t182/C2, the tracker's rule (the sibling of the probe rule above): only a
@@ -2725,7 +2725,7 @@ mod generating_tests {
         assert_eq!(real.options.len(), 1);
         assert!(real.known, "a seeded real report is knowledge");
         drop(cache);
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// ISSUE #60: A CLOSED CHAT'S AGENT CHILD MUST BE GONE. This is the fact that
@@ -3485,7 +3485,7 @@ mod t313_tests {
         assert_eq!(transcript_turns(&closed), 0);
         assert_eq!(transcript_turns(&missing), 0);
         assert!(transcript_turns(&real) > 0);
-        std::fs::remove_dir_all(&dir).ok();
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 
     /// Both directions of the decision: the no-op is not a failure, and a real
@@ -3594,7 +3594,7 @@ mod t8_tests {
         let home =
             std::env::temp_dir().join(format!("ruagent-t8-{tag}-{}-{n}", std::process::id()));
         let root = home.join(".ruagent");
-        let _ = std::fs::remove_dir_all(&home);
+        crate::test_cleanup::report_test_root_left_behind(&home);
         std::fs::create_dir_all(root.join("config")).unwrap();
         std::fs::create_dir_all(root.join("data").join("transcripts")).unwrap();
         std::fs::write(
@@ -3780,7 +3780,7 @@ mod t8_tests {
         let got = wait_for_rows(&db, 2).await;
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(got[1].1, "failed", "the ACP tier was attempted: {got:?}");
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// The other free-tier capability this file owns the gate for: the chat
@@ -3925,6 +3925,6 @@ mod t8_tests {
             before,
             "a plan that needs an agent must not write anything when it has none"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 }

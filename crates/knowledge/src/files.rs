@@ -841,6 +841,229 @@ pub fn document_name_for(
 
 #[cfg(test)]
 mod tests {
+
+    // t31: the cleanup shape for THIS unit-test module (the integration tests share
+    // crates/knowledge/tests/cleanup/mod.rs; a unit-test module cannot see that file, and
+    // ruagent-knowledge cannot depend on ruagent-daemon, so the oracle is written here).
+    //
+    // THE SHAPE is the one t27 fixed for the daemon's t16 tests and t30 spread to four more suites.
+    // Three parts, and a suite needs all three:
+    //   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+    //   2. a REPORTING call site for a root whose holder is the test process itself (the in-test
+    //      Knowledge handle keeps a LanceDB/SQLite file open inside the root, so the removal CANNOT
+    //      succeed from inside the test);
+    //   3. a PRUNER that removes, from the NEXT process, what the previous one could not.
+    //
+    // WHY THIS MODULE IS A COPY of the daemon's crate-internal one: an integration-test binary
+    // compiles against the public API of the crate under test only, and ruagent-knowledge does not
+    // depend on ruagent-daemon (the direction is the other way around), so the daemon's
+    // process_started_at_ms primitive is not available here. The liveness question is answered
+    // locally instead: /proc on unix, ONE parsed tasklist call on Windows. One copy for the whole
+    // directory rather than one per test file, because a subdirectory of tests/ is not itself a test
+    // binary.
+    #[allow(dead_code)] // each test binary uses a different subset
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Remove a root with a bounded retry, RETURNING the reason (t31).
+    ///
+    /// It returns instead of printing so a caller can assert on it, and it polls instead of sleeping
+    /// once because what it waits for is another task dropping a handle.
+    pub fn try_remove_test_root(root: &Path, budget: Duration) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => {
+                    if started.elapsed() > Duration::from_millis(250) {
+                        println!(
+                            "READING t31 cleanup of {} waited {:.1} s for the handles to be released",
+                            root.display(),
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    if started.elapsed() >= budget {
+                        return Err(format!(
+                            "{} could NOT be removed within {:.2} s: {e}",
+                            root.display(),
+                            budget.as_secs_f64()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    /// Remove a root test code OWNS, or PANIC naming it (t31).
+    ///
+    /// Unused in this module today (the asserting half is proven in the daemon's shared module and
+    /// in the knowledge tests' own copy); kept so this copy of the shape is complete.
+    #[allow(dead_code)]
+    pub fn remove_test_root(root: &Path, what: &str, budget: Duration) {
+        if let Err(why) = try_remove_test_root(root, budget) {
+            panic!("{what}: {why}");
+        }
+    }
+
+    /// Try once, then REPORT -- never silently drop -- a root that is still held (t31).
+    ///
+    /// WHY NOT AN ASSERTION HERE. The holder is the test process itself: the Knowledge handle lives
+    /// for the whole test, so the removal cannot succeed however long it waits, and a panic would red
+    /// a test for a fact that is not its own. The failure is made VISIBLE instead, and the pile is
+    /// bounded by the pruner below -- which this call also guarantees has run.
+    pub fn report_test_root_left_behind(root: &Path) {
+        prune_stale_test_roots(TEST_ROOT_PREFIXES, "knowledge");
+        if let Err(why) = try_remove_test_root(root, Duration::from_millis(500)) {
+            eprintln!(
+                "READING t31 cleanup: {why} -- the root is held by THIS test process, so the failure \
+             is REPORTED rather than swallowed; the next run's pruner removes it"
+            );
+        }
+    }
+
+    /// Every temp-root prefix the knowledge test binaries create, in ONE place.
+    pub const TEST_ROOT_PREFIXES: &[&str] = &[
+        "ruagent-t250-legs-",
+        "ruagent-t5-kb-weight-",
+        "ruagent-t5-kb-off-",
+        "ruagent-t5-kb-alloff-",
+        "ruagent-t7-window-",
+        "ruagent-t7-cjk-",
+        "ruagent-t7-resid-",
+        "ruagent-t245-",
+        "ruagent-t293-",
+        "ruagent-kbfiles-",
+        "ruagent-kbcorpus-",
+        "ra-t29-",
+    ];
+
+    /// Remove the roots of DEAD test processes for the given prefixes, once per label.
+    ///
+    /// THE SAFETY RULE, and why it is deliberately conservative: a root belongs to a run whose process
+    /// may still be read while it lives, so a root is pruned only when it has at least one numeric
+    /// field AND none of its numeric fields belongs to a live process. Root names put the pid in
+    /// different positions (tag first, or pid first), so the question is asked of every number in the
+    /// name; a number that happens to be a live process keeps the root, which costs disk and never a
+    /// run. Files are left alone: only directories are candidates.
+    pub fn prune_stale_test_roots(prefixes: &[&str], label: &str) {
+        static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut done = DONE.lock().expect("prune labels");
+            if done.iter().any(|l| l == label) {
+                return;
+            }
+            done.push(label.to_string());
+        }
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let me = std::process::id();
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !prefixes.iter().any(|p| name.starts_with(p)) {
+                continue;
+            }
+            let path = e.path();
+            if !path.is_dir() || !all_numeric_fields_are_dead(&name, me) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t31 stale root {} could NOT be removed: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t31 pruned {pruned} stale {label} root(s) of dead test processes; {failed} could not be removed"
+            );
+        }
+    }
+
+    /// True when every number in a root name is safe to prune on, and there is at least one.
+    pub fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
+        let mut seen = false;
+        for field in name.split(|c: char| !c.is_ascii_digit()) {
+            if field.is_empty() {
+                continue;
+            }
+            let Ok(n) = field.parse::<u32>() else {
+                continue;
+            };
+            // A number outside this range is NOT evidence about a run: below 1000 it is almost
+            // always part of a NAME (the 2 in ruagent-e2e-mock-bins, the 329 in a tag), and above
+            // 100_000_000 a nanosecond stamp cannot be a pid. A name with no pid in it is never
+            // pruned, however many of these numbers it carries.
+            if !(1000..=100_000_000).contains(&n) {
+                continue;
+            }
+            seen = true;
+            if n == me || pid_is_alive(n) {
+                return false;
+            }
+        }
+        seen
+    }
+
+    /// Is a process with this pid alive? /proc on unix, one parsed tasklist call on Windows.
+    pub fn pid_is_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        #[cfg(windows)]
+        {
+            LIVE_PIDS.get_or_init(live_pids).contains(&pid)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = pid;
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    static LIVE_PIDS: std::sync::OnceLock<std::collections::HashSet<u32>> =
+        std::sync::OnceLock::new();
+
+    /// One tasklist call, parsed. An EMPTY set means the tool could not be read, and the caller then
+    /// refuses to prune at all (an empty oracle makes every root look dead).
+    #[cfg(windows)]
+    fn live_pids() -> std::collections::HashSet<u32> {
+        use std::collections::HashSet;
+        let mut out = HashSet::new();
+        let Ok(text) = std::process::Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return out;
+        };
+        for line in String::from_utf8_lossy(&text.stdout).lines() {
+            // "name","pid","session","#","mem" -- the pid is the second field, and a comma inside the
+            // LAST field cannot reach it.
+            let mut fields = line.split(',');
+            let _name = fields.next();
+            if let Some(pid) = fields
+                .next()
+                .and_then(|f| f.trim_matches('"').parse::<u32>().ok())
+            {
+                out.insert(pid);
+            }
+        }
+        out
+    }
+
     use super::*;
 
     /// The naming rule, pinned: a second copy of it anywhere is the bug
@@ -949,8 +1172,8 @@ Nothing memorable here.
             hits.first().map(|h| h.document.as_str()) == Some("corpus/alpha"),
             "the ingested doc must be the top hit: {hits:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&corpus);
+        report_test_root_left_behind(&root);
+        report_test_root_left_behind(&corpus);
     }
 
     async fn test_kb(tag: &str) -> (Knowledge, std::path::PathBuf) {
@@ -984,7 +1207,7 @@ Nothing memorable here.
         assert_eq!(raw2, doc());
         let (docs, _) = kb.stats().await.unwrap();
         assert_eq!(docs, 1);
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1011,7 +1234,7 @@ Nothing memorable here.
         ] {
             assert!(kb.save(bad, "x").await.is_err(), "name {bad:?} must fail");
         }
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1110,7 +1333,7 @@ Nothing memorable here.
         std::fs::remove_file(wiki_dir.join("deploy-guide.md")).unwrap();
         let report = kb.scan().await.unwrap();
         assert_eq!(report.removed, 1, "{report:?}");
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1135,7 +1358,7 @@ Nothing memorable here.
         assert!(docs.iter().any(|d| d.name == "wiki/nested"));
         let hits = kb.search("nested content", 5).await.unwrap();
         assert!(hits.iter().any(|h| h.document == "wiki/nested"));
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1162,7 +1385,7 @@ Nothing memorable here.
         kb.delete_document_with_file(docs[0].id).await.unwrap();
         let (docs, _) = kb.stats().await.unwrap();
         assert_eq!(docs, 0);
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1209,7 +1432,7 @@ Nothing memorable here.
             hits.iter().all(|h| !h.content.contains("unrelated")),
             "deleted content must not be retrievable: {hits:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1223,7 +1446,7 @@ Nothing memorable here.
         assert_eq!(report.removed, 0);
         let (docs, _) = kb.stats().await.unwrap();
         assert_eq!(docs, 1);
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1247,7 +1470,7 @@ Nothing memorable here.
         assert!(chunks >= 3);
         let hits = kb.search("release.sh", 5).await.unwrap();
         assert!(!hits.is_empty(), "rebuild restores searchability");
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1299,7 +1522,7 @@ Nothing memorable here.
             revs.is_empty(),
             "rowid reuse must not leak revisions across documents: {revs:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1355,7 +1578,7 @@ Nothing memorable here.
         );
         let hits = kb.search("release.sh", 5).await.unwrap();
         assert!(!hits.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1378,7 +1601,7 @@ Nothing memorable here.
         let _ = kb.rollback_revision(revs[0].id).await.unwrap();
         let hits = kb.search("Jenkins", 5).await.unwrap();
         assert!(!hits.is_empty(), "rollback restores content");
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1400,6 +1623,6 @@ Nothing memorable here.
             parents.get(&hit.chunk_id).map(String::as_str),
             Some(expansion.section.as_str())
         );
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 }

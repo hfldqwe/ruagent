@@ -7778,6 +7778,127 @@ mod tests {
         ))
     }
 
+    // ---------------------------------------------------------------------------
+    // t30: the cleanup shape t27 introduced for the t16/e2e roots, applied here.
+    //
+    // The text is COPIED rather than imported because a test binary compiles against the
+    // crate's public API only: chat.rs's helpers are private to that crate's unit tests, and
+    // the other copy of this shape lives in mock-agent/tests/e2e_daemon.rs. Keep the three in
+    // step; the shape has three parts, and all three matter:
+    //   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+    //   2. a REPORTING call site for a root whose holder is the test process itself;
+    //   3. a PRUNER that removes what the previous run could not, from the next process.
+    // ---------------------------------------------------------------------------
+
+    /// Remove root with a bounded retry, RETURNING the reason (t30).
+    ///
+    /// It returns instead of printing so a caller can assert on it, and polls instead of
+    /// sleeping once because what it waits for is another task dropping a handle.
+    fn try_remove_test_root(
+        root: &std::path::Path,
+        budget: std::time::Duration,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => {
+                    if started.elapsed() > std::time::Duration::from_millis(250) {
+                        println!(
+                            "READING t30 cleanup of {} waited {:.1} s for the handles to be released",
+                            root.display(),
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    if started.elapsed() >= budget {
+                        return Err(format!(
+                            "{} could NOT be removed within {:.2} s: {e}",
+                            root.display(),
+                            budget.as_secs_f64()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    /// Remove a root test code OWNS, or PANIC naming it (t30).
+    ///
+    /// Unused in THIS file: it is the asserting half of the shape, and the test that
+    /// proves it lives in capabilities.rs. Kept so every copy of the shape stays complete.
+    #[allow(dead_code)]
+    fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+        if let Err(why) = try_remove_test_root(root, budget) {
+            panic!("{what}: {why}");
+        }
+    }
+
+    /// Try once, then REPORT -- never silently drop -- a root that is still held (t30).
+    ///
+    /// WHY THIS IS NOT AN ASSERTION. In this suite the holder is the TEST PROCESS itself: the
+    /// daemon is served in-process, so a live handle inside the root outlives the test body,
+    /// and the removal CANNOT succeed from inside one test however long it waits (measured on
+    /// Windows; the same root removes the moment the process is gone). A panic here would red a
+    /// test for a fact that is not its own. So the failure is made VISIBLE -- a READING line
+    /// with the OS error -- and the pile is bounded by the pruner below, which the NEXT run
+    /// performs.
+    fn report_test_root_left_behind(root: &std::path::Path) {
+        if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+            eprintln!(
+                "READING t30 cleanup: {why} -- the root is held by THIS test process, so the \
+                 failure is REPORTED rather than swallowed; the next run's pruner removes it"
+            );
+        }
+    }
+
+    /// Remove the roots THIS suite's DEAD processes left behind, once per process (t30).
+    ///
+    /// The safety rule is t27's: a root whose pid is still ALIVE may be evidence a run needs,
+    /// and is left alone; a root of a pid that is gone can only be litter. The pid is checked
+    /// against its START TIME, so a RECYCLED pid cannot protect a stranger's leftover forever
+    /// -- process_started_at_ms is the same primitive the daemon's own boot sweep uses.
+    fn prune_stale_api_test_roots() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            let (mut pruned, mut failed) = (0usize, 0usize);
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Some(rest) = name.strip_prefix("ruagent-api-test-") else {
+                    continue;
+                };
+                let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if crate::orphans::process_started_at_ms(pid).is_some() {
+                    continue;
+                }
+                match std::fs::remove_dir_all(e.path()) {
+                    Ok(()) => pruned += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!(
+                            "READING t30 stale ruagent-api-test root {} could NOT be removed: {err}",
+                            e.path().display()
+                        );
+                    }
+                }
+            }
+            if pruned > 0 || failed > 0 {
+                eprintln!(
+                    "READING t30 pruned {pruned} stale ruagent-api-test root(s) of dead test processes; {failed} could not be removed"
+                );
+            }
+        });
+    }
+
     async fn harness() -> (Router, ruagent_store::Db, std::path::PathBuf) {
         harness_with_agents(None).await
     }
@@ -7788,6 +7909,7 @@ mod tests {
     async fn harness_with_agents(
         agents_toml: Option<&str>,
     ) -> (Router, ruagent_store::Db, std::path::PathBuf) {
+        prune_stale_api_test_roots();
         let root = harness_root();
         std::fs::create_dir_all(root.join("config")).unwrap();
         if let Some(text) = agents_toml {
@@ -8136,7 +8258,7 @@ mod tests {
             (estatus.as_str(), ereason.as_str()),
             "a pass that wrote and a pass that found nothing are different rows"
         );
-        std::fs::remove_dir_all(&root).ok();
+        report_test_root_left_behind(&root);
     }
 
     /// ACCEPTANCE (issue #65), IN THE BATCH: both free-tier sessions are WRITTEN, the
@@ -8219,7 +8341,7 @@ mod tests {
                 .any(|(store, ns, _)| store == "lesson" && ns == "global"),
             "the lesson landed in a namespace it may write: {rows:?}"
         );
-        std::fs::remove_dir_all(&root).ok();
+        report_test_root_left_behind(&root);
     }
 
     /// t14: THE MANUAL ROUTE'S FREE TIER MUST NOT NEED AN AGENT.
@@ -8982,7 +9104,7 @@ mod tests {
             missing["facts"].as_array().is_some_and(Vec::is_empty),
             "{raw}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t276: `?purge=true` really removes the row; the default stays the t251
@@ -9755,7 +9877,7 @@ mod tests {
         }
         assert_eq!(db.deleted_session_keys().await.unwrap(), vec!["ruagent:aa"]);
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// Deleting a row must not leave a hide marker behind: a later session
@@ -9772,7 +9894,7 @@ mod tests {
             db.archived_session_keys().await.unwrap(),
             Vec::<String>::new()
         );
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// `health` must NOT answer ok while the data plane is dead
@@ -9844,7 +9966,7 @@ mod tests {
             "store-backed routes must keep working after a caught panic"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// One edge's stored `event_time_source`, read from the COLUMN — so an
@@ -10094,7 +10216,7 @@ mod tests {
         assert_eq!(lg["source_kind"], "unknown");
         assert!(lg["source_session"].is_null(), "{lg}");
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t6 / issues #46 and #54: ONE pagination envelope, on every offset-paged
@@ -10282,7 +10404,7 @@ mod tests {
             "the alias opt-in adds its own top-level key and nothing else: {with_aliases}"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t21 / issues #68, #67: THE LEDGER'S REFUSAL COUNT IS A READING AND A FILTER.
@@ -10419,7 +10541,7 @@ mod tests {
             raw_bad.contains("only|none|not_recorded"),
             "the 400 names the accepted values: {raw_bad}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t6 / issues #46, #48, #55: the distillation ledger is READABLE — by status,
@@ -10605,7 +10727,7 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
         assert!(raw.contains("not_recorded"), "{raw}");
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t4 / #58: THE RANGE AN ATTEMPT READ IS READABLE FROM THE LEDGER, and an attempt
@@ -10769,7 +10891,7 @@ mod tests {
         assert_eq!(none["totals"]["coverage_not_recorded"], 1, "{none}");
         assert!(none["entries"][0]["from_seq"].is_null(), "{none}");
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t4 / #58, END TO END: the range a REAL pass measured is the range this route
@@ -10834,7 +10956,7 @@ mod tests {
             "this row recorded a range, so the count of attempts that could not is 0: {v}"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// One `sessions` row with the fields a batch depends on under the test's own
@@ -11082,7 +11204,7 @@ mod tests {
             "the dry run must not make anything look distilled: {raw}"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t7 / issue #47: the REAL batch run -- the same per-session path as the single
@@ -11258,7 +11380,7 @@ mod tests {
             "{done_only}"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 
     /// t10 / issue #50: the resolution queue as a CONSUMER surface — both ends
@@ -11958,6 +12080,6 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_dir_all(&root);
+        report_test_root_left_behind(&root);
     }
 }

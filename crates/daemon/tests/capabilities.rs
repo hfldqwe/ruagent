@@ -11,13 +11,131 @@ use ruagent_daemon::config::DaemonConfig;
 use ruagent_daemon::runs::RunManager;
 use ruagent_store::Db;
 
+// ---------------------------------------------------------------------------
+// t30: the cleanup shape t27 introduced for the t16/e2e roots, applied here.
+//
+// The text is COPIED rather than imported because a test binary compiles against the
+// crate's public API only: chat.rs's helpers are private to that crate's unit tests, and
+// the other copy of this shape lives in mock-agent/tests/e2e_daemon.rs. Keep the three in
+// step; the shape has three parts, and all three matter:
+//   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+//   2. a REPORTING call site for a root whose holder is the test process itself;
+//   3. a PRUNER that removes what the previous run could not, from the next process.
+// ---------------------------------------------------------------------------
+
+/// Remove root with a bounded retry, RETURNING the reason (t30).
+///
+/// It returns instead of printing so a caller can assert on it, and polls instead of
+/// sleeping once because what it waits for is another task dropping a handle.
+fn try_remove_test_root(root: &std::path::Path, budget: std::time::Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t30 cleanup of {} waited {:.1} s for the handles to be released",
+                        root.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "{} could NOT be removed within {:.2} s: {e}",
+                        root.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Remove a root test code OWNS, or PANIC naming it (t30).
+fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+    if let Err(why) = try_remove_test_root(root, budget) {
+        panic!("{what}: {why}");
+    }
+}
+
+/// Try once, then REPORT -- never silently drop -- a root that is still held (t30).
+///
+/// WHY THIS IS NOT AN ASSERTION. In this suite the holder is the TEST PROCESS itself: the
+/// daemon is served in-process, so a live handle inside the root outlives the test body,
+/// and the removal CANNOT succeed from inside one test however long it waits (measured on
+/// Windows; the same root removes the moment the process is gone). A panic here would red a
+/// test for a fact that is not its own. So the failure is made VISIBLE -- a READING line
+/// with the OS error -- and the pile is bounded by the pruner below, which the NEXT run
+/// performs.
+fn report_test_root_left_behind(root: &std::path::Path) {
+    if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t30 cleanup: {why} -- the root is held by THIS test process, so the \
+             failure is REPORTED rather than swallowed; the next run's pruner removes it"
+        );
+    }
+}
+
+/// Remove the roots THIS suite's DEAD processes left behind, once per process (t30).
+///
+/// The safety rule is t27's: a root whose pid is still ALIVE may be evidence a run needs,
+/// and is left alone; a root of a pid that is gone can only be litter. The pid is checked
+/// against its START TIME, so a RECYCLED pid cannot protect a stranger's leftover forever
+/// -- process_started_at_ms is the same primitive the daemon's own boot sweep uses.
+fn prune_stale_capapi_roots() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let rest = name
+                .strip_prefix("ruagent-capapi-")
+                .or_else(|| name.strip_prefix("ruagent-capbad-"));
+            let Some(rest) = rest else {
+                continue;
+            };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if ruagent_daemon::orphans::process_started_at_ms(pid).is_some() {
+                continue;
+            }
+            match std::fs::remove_dir_all(e.path()) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t30 stale ruagent-capapi root {} could NOT be removed: {err}",
+                        e.path().display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t30 pruned {pruned} stale ruagent-capapi root(s) of dead test processes; {failed} could not be removed"
+            );
+        }
+    });
+}
+
 /// Boot the daemon with `policy_toml` as its `policy.toml`, exactly as
 /// `ruagent serve` does for the parts this surface touches.
 async fn start_test_daemon(policy_toml: &str) -> (String, std::path::PathBuf) {
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    prune_stale_capapi_roots();
     let root = std::env::temp_dir().join(format!("ruagent-capapi-{}-{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
@@ -477,7 +595,7 @@ async fn an_unknown_id_in_the_file_fails_the_boot_naming_it() {
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!("ruagent-capbad-{}-{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("config")).unwrap();
     std::fs::write(
         root.join("config").join("policy.toml"),
@@ -491,7 +609,7 @@ async fn an_unknown_id_in_the_file_fails_the_boot_naming_it() {
         msg.contains("distill_session"),
         "lists the known ids: {msg}"
     );
-    std::fs::remove_dir_all(&root).ok();
+    report_test_root_left_behind(&root);
 }
 
 #[test]
@@ -503,4 +621,76 @@ fn the_plane_can_only_narrow() {
         assert!(plane.gate(*id, true));
         assert!(!plane.gate(*id, false));
     }
+}
+
+/// t30: the cleanup shape's OWN proof, so a cleanup that cannot happen can never go quiet
+/// again (the same two halves t27 asserted for the t16 roots).
+///
+/// The root is named with THIS process's pid so the pruner above can still reclaim it if
+/// anything here leaves it behind, and it is released and removed at the end: a test written
+/// about the leftover pile must not join it.
+#[test]
+fn a_failed_cleanup_is_reported_and_the_asserting_half_panics() {
+    let root = std::env::temp_dir().join(format!(
+        "ruagent-capapi-{}-t30proof-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    // Hold the directory's database open, exactly as a live test does.
+    let hold = Db::open(root.join("data").join("ruagent.db")).unwrap();
+    // An open file does NOT block rmdir on unix, so the failure is made deterministic there
+    // the only other way it can be: make the directory itself read-only. This machine is
+    // Windows, so the unix branch is reasoned rather than measured here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&root, perms).unwrap();
+    }
+
+    // 1. The failure is RETURNED, and it NAMES the root it could not remove.
+    let why = try_remove_test_root(&root, std::time::Duration::from_millis(100))
+        .expect_err("a root holding an open database must NOT come back as removed");
+    println!("READING t30 deliberate cleanup failure: {why}");
+    assert!(
+        why.contains(&root.display().to_string()),
+        "the report must name the root it could not remove: {why}"
+    );
+
+    // 2. The call a test makes for a root it OWNS PANICS on it, so the cleanup that did not
+    //    happen is a RED TEST and not a directory nobody counts.
+    let panicked = std::panic::catch_unwind(|| {
+        remove_test_root(
+            &root,
+            "the t30 proof root",
+            std::time::Duration::from_millis(100),
+        )
+    })
+    .is_err();
+    assert!(
+        panicked,
+        "remove_test_root must PANIC on a root it could not remove, or the leftover pile is \
+         back in the dark"
+    );
+
+    // Release the handle and the unix permission trick, then remove it for real.
+    drop(hold);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&root, perms).unwrap();
+    }
+    remove_test_root(
+        &root,
+        "the t30 proof root, after releasing its handle",
+        std::time::Duration::from_millis(500),
+    );
+    println!("READING t30 after releasing the handle: the proof root was removed");
 }

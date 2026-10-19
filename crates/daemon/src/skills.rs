@@ -102,8 +102,13 @@ pub fn install_skill(skill_dir: &Path, target_base: &Path) -> Result<bool> {
     {
         return Ok(false); // already in sync
     }
-    // Wipe and re-copy for a clean refresh.
-    let _ = std::fs::remove_dir_all(&target);
+    // Wipe and re-copy for a clean refresh. A failure is REPORTED, not swallowed: a target
+    // that could not be wiped can leave stale skill files behind, and that is worth seeing.
+    if let Err(err) = std::fs::remove_dir_all(&target)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(target = %target.display(), error = %err, "wiping a skill target before re-sync failed");
+    }
     copy_dir(skill_dir, &target)?;
     Ok(true)
 }

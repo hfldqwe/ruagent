@@ -32,8 +32,12 @@ async fn count(db: &Db, sql: &'static str) -> i64 {
 async fn a_stale_fixture_root_is_emptied_not_inherited() {
     let snap = fixture::snapshot();
     let expected = snap.entities.len() as i64;
+    // t30: what the PREVIOUS run could not remove is removed here, and this test's own root
+    // is reported (not silently dropped) at the end -- it holds a live connection, so it
+    // cannot be removed from inside this test.
+    fixture::prune_stale_graph_roots();
     let root = std::env::temp_dir().join(format!("ruagent-graph-stale-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    fixture::report_test_root_left_behind(&root);
     std::fs::create_dir_all(&root).unwrap();
     let db_path = root.join("graph.db");
 
@@ -77,4 +81,6 @@ async fn a_stale_fixture_root_is_emptied_not_inherited() {
         rows, expected,
         "the rebuild must carry the snapshot exactly once, not the old rows plus the new ones"
     );
+    drop(second);
+    fixture::report_test_root_left_behind(&root);
 }

@@ -549,10 +549,25 @@ impl RunManager {
                         .output();
                     tracing::info!(run_id = %run.id, "worktree removed with task");
                 } else {
-                    let _ = std::fs::remove_dir_all(&dir);
+                    if let Err(err) = std::fs::remove_dir_all(&dir)
+                        && err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            error = %err,
+                            "removing an unregistered worktree directory failed"
+                        );
+                    }
                 }
-            } else if dir.starts_with(&workspaces) {
-                let _ = std::fs::remove_dir_all(&dir);
+            } else if dir.starts_with(&workspaces)
+                && let Err(err) = std::fs::remove_dir_all(&dir)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %err,
+                    "removing a workspace outside the registry failed"
+                );
             }
         }
     }
@@ -2451,7 +2466,7 @@ mod tests {
             "retry_head is not the block head: {:?}",
             retry_head()
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
     fn candidate(id: &str, result: &str) -> JudgeCandidate {
         JudgeCandidate {

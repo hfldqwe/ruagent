@@ -13,6 +13,8 @@ use ruagent_knowledge::{Embedder, HashEmbedder, Knowledge, rrf_weighted};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod cleanup;
+
 const DOCS: &[(&str, &str)] = &[
     (
         "kettle",
@@ -31,7 +33,7 @@ const DOCS: &[(&str, &str)] = &[
 async fn kb(tag: &str) -> (Knowledge, std::path::PathBuf) {
     let root =
         std::env::temp_dir().join(format!("ruagent-t250-legs-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
@@ -78,7 +80,7 @@ async fn both_legs_carry_their_own_raw_score() {
         // SQLite FTS5 bm25(): more negative is a better match.
         assert!(h.raw_score <= 0.0, "bm25 must be <= 0, got {}", h.raw_score);
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 #[tokio::test]
@@ -112,7 +114,7 @@ async fn fused_ranking_is_the_same_as_the_search_entry_point() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 #[tokio::test]
@@ -131,7 +133,7 @@ async fn the_legs_are_genuinely_separate() {
         !legs.semantic.is_empty(),
         "the semantic leg still returns nearest neighbours"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +153,7 @@ async fn keyword_leg_stage_is_precision_when_every_term_matches() {
     for h in &legs.keyword {
         assert!(h.raw_score.is_finite() && h.raw_score <= 0.0, "{:?}", h);
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// "kettles descaling": the token "kettles" is in NO document, so the AND form
@@ -173,7 +175,7 @@ async fn keyword_leg_stage_is_prefix_only_when_precision_found_nothing() {
     for h in &legs.keyword {
         assert!(h.raw_score.is_finite() && h.raw_score <= 0.0, "{:?}", h);
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// unicode61 makes the whole Han run "泡茶的水温很重要" ONE term, so no FTS query
@@ -217,7 +219,7 @@ async fn han_substring_is_not_served_by_the_full_table_scan() {
     );
     let terms = ruagent_store::fts::terms("水温");
     assert_eq!(terms, vec!["水温".to_string()]);
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +241,7 @@ async fn han_substring_is_not_served_by_the_full_table_scan() {
 #[tokio::test]
 async fn the_leg_window_does_not_follow_the_page_size() {
     let root = std::env::temp_dir().join(format!("ruagent-t7-window-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
@@ -298,7 +300,7 @@ async fn the_leg_window_does_not_follow_the_page_size() {
             "the first page must be a prefix of the longer page for {query:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// A pre-t7 behaviour check that is now vacuous must not silently disappear:
@@ -316,7 +318,7 @@ async fn the_page_argument_no_longer_changes_the_legs() {
         a, b,
         "the leg window is a constant, whatever the caller says"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +379,7 @@ async fn default_ranking_is_pinned_on_the_fixed_fixture() {
     assert_eq!(page.evidence.leg_window, 60);
     assert_eq!(page.evidence.candidates, 3);
     assert_eq!(page.evidence.keyword_stage, KeywordStage::Precision);
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// A query with no lexical presence must leave the leg EMPTY, and say so --
@@ -390,7 +392,7 @@ async fn keyword_leg_stage_is_empty_when_no_stage_matches() {
     assert!(legs.keyword.is_empty());
     // ... and the semantic leg is untouched by any of this.
     assert!(!legs.semantic.is_empty());
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +495,7 @@ async fn the_default_configuration_is_the_default_entry_point() {
             "the default leg configuration changed the page for {q:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// ACCEPTANCE: a disabled leg is never queried.
@@ -509,7 +511,7 @@ async fn the_default_configuration_is_the_default_entry_point() {
 #[tokio::test]
 async fn a_disabled_knowledge_leg_is_never_queried() {
     let root = std::env::temp_dir().join(format!("ruagent-t5-kb-off-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let (embedder, armed, calls) = ArmedEmbedder::new(64);
@@ -632,7 +634,7 @@ async fn a_disabled_knowledge_leg_is_never_queried() {
         keyword_on.is_err(),
         "the keyword leg must query the FTS tables when it is on"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// Every leg off: an empty page, no query, and the CONFIGURATION names the legs
@@ -640,7 +642,7 @@ async fn a_disabled_knowledge_leg_is_never_queried() {
 #[tokio::test]
 async fn all_knowledge_legs_off_is_an_empty_page_that_names_them() {
     let root = std::env::temp_dir().join(format!("ruagent-t5-kb-alloff-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let (embedder, _armed, calls) = ArmedEmbedder::new(64);
@@ -683,7 +685,7 @@ async fn all_knowledge_legs_off_is_an_empty_page_that_names_them() {
          endpoint maps them to the registry's capability ids)"
     );
     assert!(LegConfig::all_off().all_disabled());
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// A NON-DEFAULT knowledge weight changes the configured fusion, and the changes
@@ -697,7 +699,7 @@ async fn all_knowledge_legs_off_is_an_empty_page_that_names_them() {
 #[tokio::test]
 async fn a_non_default_weight_reorders_the_configured_fusion() {
     let root = std::env::temp_dir().join(format!("ruagent-t5-kb-weight-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
@@ -803,5 +805,5 @@ async fn a_non_default_weight_reorders_the_configured_fusion() {
             cfg.fusion()
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }

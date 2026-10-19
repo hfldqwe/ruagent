@@ -13,10 +13,12 @@
 use ruagent_knowledge::{Embedder, HashEmbedder, Knowledge, ResidualOrigin};
 use std::sync::Arc;
 
+mod cleanup;
+
 async fn kb(tag: &str) -> (Knowledge, std::path::PathBuf) {
     let root =
         std::env::temp_dir().join(format!("ruagent-t7-resid-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
@@ -73,7 +75,7 @@ async fn a_needle_in_the_index_only_is_reported_as_db() {
     assert!(h.chunk_id.is_some(), "the chunk-level match must be named");
     assert!(!page.truncated);
     assert_eq!(page.total, Some(1), "an exact total was asked for");
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// The case the whole scan exists for: the index no longer knows the text, but
@@ -101,7 +103,7 @@ async fn a_needle_only_on_disk_is_reported_as_file() {
     );
     assert_eq!(h.chunk_id, None);
     assert!(h.path.is_some());
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// Both copies: the index and the file still carry the needle.
@@ -119,7 +121,7 @@ async fn a_needle_in_both_copies_is_reported_as_both() {
     let page = k.residual_scan("ZULU-99", 10, true).await.unwrap();
     assert_eq!(page.hits.len(), 1, "{:?}", page.hits);
     assert_eq!(page.hits[0].origin, ResidualOrigin::Both);
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// Truncation must be VISIBLE, and the exact total must cost something: with
@@ -160,7 +162,7 @@ async fn truncation_is_distinguishable_from_a_complete_answer() {
     assert!(none.hits.is_empty());
     assert!(!none.truncated);
     assert_eq!(none.total, Some(0));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// `document_path` is the mapping the memory-side report needs to name a file.
@@ -173,5 +175,5 @@ async fn document_path_is_the_documented_mapping() {
             .join("wiki")
             .join("kubernetes-troubleshooting.md")
     );
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }

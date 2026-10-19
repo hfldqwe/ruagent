@@ -97,6 +97,8 @@ use ruagent_knowledge::{Embedder, HashEmbedder, Knowledge};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod cleanup;
+
 /// Bumped whenever QUERIES changes: a recall number is only comparable with
 /// another taken over the same query set. t245-v1 -> t293-v2 adds one CJK
 /// substring query and one counter-example query (both described in the header).
@@ -401,7 +403,7 @@ fn line(out: &mut String, indent: usize, s: &str) {
 async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
     let started = std::time::Instant::now();
     let root = std::env::temp_dir().join(format!("ruagent-t245-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
 
@@ -830,7 +832,7 @@ async fn run_once(tag: &str, real: bool) -> (String, ReadingCounts) {
         counts.substring_unexplained.len()
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     (out, counts)
 }
 
@@ -876,7 +878,7 @@ fn judge_is_falsifiable() {
 #[tokio::test]
 async fn single_char_ascii_never_reaches_like() {
     let root = std::env::temp_dir().join(format!("ruagent-t293-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
@@ -919,7 +921,7 @@ async fn single_char_ascii_never_reaches_like() {
             "the semantic leg is not affected by the keyword floor ({query:?})"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 #[tokio::test]

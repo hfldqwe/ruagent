@@ -32,6 +32,137 @@ use ruagent_knowledge::Knowledge;
 use ruagent_store::Db;
 
 // ---------------------------------------------------------------------------
+// t31: the cleanup shape t27 fixed and t30 spread to four more suites. This is the REPORTING half,
+// copied because an integration-test binary compiles against the daemon's public API only; the full
+// shape -- with the asserting half and the test that proves it -- lives in the daemon's
+// crate-internal test_cleanup module (crates/daemon/src/lib.rs).
+// ---------------------------------------------------------------------------
+
+/// Remove a root with a bounded retry, RETURNING the reason (t31).
+fn try_remove_test_root(root: &std::path::Path, budget: std::time::Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t31 cleanup of {} waited {:.1} s for the handles to be released",
+                        root.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "{} could NOT be removed within {:.2} s: {e}",
+                        root.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Try once, then REPORT -- never silently drop -- a root that is still held (t31).
+///
+/// The holder is the test process itself (this suite serves the daemon in-process, and its store
+/// keeps a handle inside the root), so the removal CANNOT succeed however long it waits: a panic
+/// would red a test for a fact that is not its own. The failure is made VISIBLE instead, and the
+/// pile is bounded by the pruner -- which this call also guarantees has run.
+fn report_test_root_left_behind(root: &std::path::Path) {
+    prune_stale_test_roots(TEST_ROOT_PREFIXES, "graph_ingest");
+    if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t31 cleanup: {why} -- the root is held by THIS test process, so the failure \
+             is REPORTED rather than swallowed; the next run's pruner removes it"
+        );
+    }
+}
+
+/// The temp-root prefixes THIS suite creates.
+const TEST_ROOT_PREFIXES: &[&str] = &["ruagent-t4-graphingest-", "ruagent-t4-graphingest-http-"];
+
+/// Remove the roots of DEAD test processes for these prefixes, once per process (t31).
+///
+/// THE SAFETY RULE, deliberately conservative: a root belongs to a run whose process may still be
+/// read while it lives, so it is pruned only when it has at least one numeric field AND none of its
+/// numeric fields belongs to a live process. Root names put the pid in different positions (tag
+/// first, or pid first), so the question is asked of every number in the name; a number that
+/// happens to be a live process keeps the root, which costs disk and never a run. Only
+/// directories are candidates.
+fn prune_stale_test_roots(prefixes: &[&str], label: &str) {
+    static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut done = DONE.lock().expect("prune labels");
+        if done.iter().any(|l| l == label) {
+            return;
+        }
+        done.push(label.to_string());
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let me = std::process::id();
+    let (mut pruned, mut failed) = (0usize, 0usize);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !prefixes.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        let path = e.path();
+        if !path.is_dir() || !all_numeric_fields_are_dead(&name, me) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => pruned += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                failed += 1;
+                eprintln!(
+                    "READING t31 stale root {} could NOT be removed: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if pruned > 0 || failed > 0 {
+        eprintln!(
+            "READING t31 pruned {pruned} stale {label} root(s) of dead test processes; {failed} could not be removed"
+        );
+    }
+}
+
+/// True when every number in a root name is safe to prune on, and there is at least one.
+fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
+    let mut seen = false;
+    for field in name.split(|c: char| !c.is_ascii_digit()) {
+        if field.is_empty() {
+            continue;
+        }
+        let Ok(n) = field.parse::<u32>() else {
+            continue;
+        };
+        // A number outside this range is NOT evidence about a run: below 1000 it is almost
+        // always part of a NAME (the 2 in ruagent-e2e-mock-bins, the 329 in a tag), and above
+        // 100_000_000 a nanosecond stamp cannot be a pid. A name with no pid in it is never
+        // pruned, however many of these numbers it carries.
+        if !(1000..=100_000_000).contains(&n) {
+            continue;
+        }
+        seen = true;
+        if n == me || ruagent_daemon::orphans::process_started_at_ms(n).is_some() {
+            return false;
+        }
+    }
+    seen
+}
+
+// ---------------------------------------------------------------------------
 // In-process half: the ingestion itself.
 // ---------------------------------------------------------------------------
 
@@ -446,7 +577,7 @@ async fn start_test_daemon(tag: &str) -> TestDaemon {
         "ruagent-t4-graphingest-http-{}-{tag}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(

@@ -2327,7 +2327,7 @@ mod t329_tests {
         // directory. Nothing ever removed these: 6202 leaked `ruagent-t329-*`
         // dirs, every one of them holding a `ruagent.db` (measured 2026-10-04).
         // So the wipe is not hygiene, it IS the fixture.
-        let _ = std::fs::remove_dir_all(&p);
+        crate::test_cleanup::report_test_root_left_behind(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -2591,7 +2591,7 @@ mod t329_tests {
         );
         assert!(episodes >= 1, "the transcript is recorded as an episode");
         assert_eq!(with_source, 4, "every row points at its episode");
-        std::fs::remove_dir_all(&root).ok();
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// t329 acceptance 4: the polarity pair is refused — and it is refused even
@@ -3335,7 +3335,7 @@ mod entry_tests {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let home =
             std::env::temp_dir().join(format!("ruagent-t45-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        crate::test_cleanup::report_test_root_left_behind(&home);
         let root = home.join(".ruagent");
         std::fs::create_dir_all(root.join("data").join("transcripts")).unwrap();
         (home, root)
@@ -3641,7 +3641,7 @@ mod entry_tests {
         assert_eq!(reason, "", "a success carries no reason");
         assert_eq!(retries, 0);
         assert_eq!(attempts_of(&d.db, &key).await, 1, "one pass, one row");
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #45): the ten-second chat is RECORDED as "nothing to
@@ -3683,7 +3683,7 @@ mod entry_tests {
             (-1, -1, -1),
             "a refused pass must leave all three coverage columns NULL, not 0"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #45): a failure is RETRIED, the ledger says how many
@@ -3734,7 +3734,7 @@ mod entry_tests {
             (-1, -1, -1),
             "a failed pass must leave all three coverage columns NULL, not 0"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #45): the retry loop carries a failure that CLEARS, does
@@ -3870,7 +3870,7 @@ mod entry_tests {
             "an empty pass carries NO failure reason: a refusal would have recorded one              (the two are different rows with the same status)"
         );
         assert_eq!(retries, 0, "nothing failed, so nothing was retried");
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// The NAMESPACE CONTRACT's store rows, PARSED back out of the prompt text:
@@ -4053,7 +4053,7 @@ mod entry_tests {
         assert_eq!(status, "ok", "{reason}");
         assert!(written >= 1, "{reason}");
         assert_eq!(reason, "", "a pass that wrote carries no reason: {reason}");
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #65): the SAME defect on the other two stores -- a free-tier
@@ -4108,7 +4108,7 @@ mod entry_tests {
                 "a {store} in a namespace it may write: {rows:?}"
             );
         }
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #63, second half): what must NOT be written still is not.
@@ -4153,7 +4153,7 @@ mod entry_tests {
         let (status, reason, written) = newest_row(&dam.db, &key).await;
         assert_eq!((status.as_str(), written), ("empty", 0), "{reason}");
         assert_eq!(reason, "", "an empty pass has no reason: {reason}");
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// Issue #62's ledger contract, at the level where a refusal can still be produced
@@ -4257,7 +4257,7 @@ mod entry_tests {
             (estatus.as_str(), ereason.as_str()),
             "a refusal and an empty pass must not be the same row"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (t3 / issue #58): the RANGE the pass read reaches the ledger,
@@ -4350,7 +4350,7 @@ mod entry_tests {
             Some(0),
             "a MEASURED lossless read is 0, not NULL -- unchanged by 0030"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #48): a session larger than one input is read IN WINDOWS,
@@ -4437,7 +4437,7 @@ mod entry_tests {
             Some(0),
             "a MEASURED lossless read is 0, not NULL: the pass looked and nothing was cut"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #48): a turn too large for one window CANNOT be windowed
@@ -4500,7 +4500,7 @@ mod entry_tests {
             Some(1),
             "the ledger must say text was dropped, not report a clean read"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #48 + B2): a failure raised BY THE FIRST WINDOW is retried
@@ -4573,7 +4573,7 @@ mod entry_tests {
             (None, None),
             "no pass completed a read, so the windowing was never measured -- NULL, not 0"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #55): the agent's own usage events reach the ledger, folded
@@ -4684,7 +4684,7 @@ mod entry_tests {
             (None, None, None),
             "a pass no agent reported usage for says NULL -- not 0 tokens and not $0.00"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #55): the graph writer's two loss counts reach the ledger.
@@ -4770,7 +4770,7 @@ mod entry_tests {
             (0, None, None),
             "with the graph half off nothing counted these, so they are NULL -- not 0"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 
     /// ACCEPTANCE (issue #48, unchanged-behaviour half): a session that FITS is one
@@ -4834,6 +4834,6 @@ mod entry_tests {
             0,
             "a dry run must not write a distill_log row, not even a failure"
         );
-        std::fs::remove_dir_all(&home).ok();
+        crate::test_cleanup::report_test_root_left_behind(&home);
     }
 }

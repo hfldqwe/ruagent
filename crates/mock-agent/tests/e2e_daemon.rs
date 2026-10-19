@@ -38,8 +38,14 @@ async fn start_daemon_with_routing(
     // NOT a cleanup (t27 / issue #69): this is the idempotent PRE-clean before
     // the root is created, where a leftover is exactly what it tolerates -- the
     // create_dir_all right after fails loudly if the path is really unusable. The
-    // cleanup that MUST happen is remove_test_root (see its note).
-    let _ = std::fs::remove_dir_all(&root);
+    // cleanup that MUST happen is remove_test_root (see its note). t31: the pre-clean no
+    // longer DROPS its error either; a root that could not be wiped is reported.
+    if let Err(why) = try_remove_test_root(&root, CLEANUP_BUDGET) {
+        eprintln!(
+            "READING t31 cleanup: {why} -- the pre-clean could not remove the root; the \
+             create_dir_all right after says whether that matters"
+        );
+    }
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("agents.toml"), agents_toml).unwrap();
@@ -151,7 +157,13 @@ fn mock_bin() -> String {
             if pid != std::process::id()
                 && ruagent_daemon::orphans::process_started_at_ms(pid).is_none()
             {
-                let _ = std::fs::remove_dir_all(e.path());
+                // t31: reported, not swallowed -- a stale copy that could not be removed is a
+                // fact about the pile, not a detail to drop.
+                if let Err(why) =
+                    try_remove_test_root(&e.path(), std::time::Duration::from_millis(500))
+                {
+                    eprintln!("READING t31 stale mock-bin copy could not be removed: {why}");
+                }
             }
         }
     }
@@ -249,24 +261,115 @@ fn try_remove_test_root(root: &std::path::Path, budget: std::time::Duration) -> 
 /// (and a concurrently running test binary's) are left alone, because they are exactly the
 /// evidence someone needs when a run failed. That bounds the pile to one directory per test
 /// per live run, cleaned by the next one.
+/// Every temp-root prefix THIS suite creates (t31). The single-root pruner below used to know
+/// only ruagent-e2e-<pid>-<tag>, so the git repos, project dirs and distill roots it also wrote
+/// were never reclaimed at all.
+const E2E_ROOT_PREFIXES: &[&str] = &[
+    "ruagent-e2e-",
+    "ruagent-repo-",
+    "ruagent-proj-",
+    "ruagent-orphan-",
+    "ruagent-distill-usage-",
+    "ruagent-distill-",
+];
+
+/// True when every number in a root name is safe to prune on, and there is at least one (t31).
+///
+/// The rule is deliberately conservative. Names put the pid in different positions
+/// (ruagent-e2e-<pid>-<tag> but ruagent-repo-<tag>-<pid>), so the question is asked of EVERY
+/// number in the name: a number that happens to be a live process keeps the root, which costs
+/// disk and never a run.
+fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
+    all_numeric_fields_are_dead_with(name, me, |pid| {
+        ruagent_daemon::orphans::process_started_at_ms(pid).is_some()
+    })
+}
+
+/// The rule with the liveness question passed IN, so the test can answer it
+/// deterministically instead of depending on which pids this machine happens to have
+/// live: Windows REUSES pids, and a reused one made the dead-pid case vacuous-red.
+fn all_numeric_fields_are_dead_with(name: &str, me: u32, alive: impl Fn(u32) -> bool) -> bool {
+    let mut seen = false;
+    for field in name.split(|c: char| !c.is_ascii_digit()) {
+        if field.is_empty() {
+            continue;
+        }
+        let Ok(n) = field.parse::<u32>() else {
+            continue;
+        };
+        // A number outside this range is NOT evidence about a run: below 1000 it is
+        // almost always part of a NAME (the 2 in ruagent-e2e-mock-bins, the 329 in a
+        // tag), and above 100_000_000 a nanosecond stamp cannot be a pid. A name with no
+        // pid in it is never pruned, however many of these numbers it carries.
+        if !(1000..=100_000_000).contains(&n) {
+            continue;
+        }
+        seen = true;
+        if n == me || alive(n) {
+            return false;
+        }
+    }
+    seen
+}
+
+/// t31 REGRESSION, measured: the first version of this rule treated ANY number in the name as a
+/// pid candidate, and every ruagent-e2e-* name contains the 2 of "e2e". A name with no pid at all
+/// (the mock-bin copies directory) therefore came back prunable, the pruner deleted the directory
+/// this suite keeps its per-test agent copies in, and the whole suite went red -- 6/6 tests with
+/// an EMPTY agent echo, which is what a run whose agent binary is gone looks like.
+#[test]
+fn a_name_whose_only_digits_are_inside_words_is_never_prunable() {
+    let me = std::process::id();
+    let never = |_pid: u32| false;
+    let pid_4242 = |pid: u32| pid == 4242;
+    // MEASURED: every ruagent-e2e-* name contains the 2 of "e2e", so the first version of this
+    // rule called ruagent-e2e-mock-bins prunable, deleted the directory this suite keeps its
+    // per-test agent copies in, and took the whole binary red -- 6/6 tests, empty agent echo.
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-e2e-mock-bins",
+        me,
+        never
+    ));
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-distill-usage",
+        me,
+        never
+    ));
+    // A real root: a plausible pid, and it is gone.
+    assert!(all_numeric_fields_are_dead_with(
+        "ruagent-e2e-4242-3",
+        me,
+        never
+    ));
+    // ... while a live number anywhere in the name keeps it.
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-e2e-4242-3",
+        me,
+        pid_4242
+    ));
+    assert!(!all_numeric_fields_are_dead_with(
+        &format!("ruagent-e2e-{me}-3"),
+        me,
+        never
+    ));
+}
+
 fn prune_stale_e2e_roots() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
             return;
         };
+        let me = std::process::id();
         let (mut pruned, mut failed) = (0usize, 0usize);
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            let Some(rest) = name.strip_prefix("ruagent-e2e-") else {
+            // The mock-bin copies directory (ruagent-e2e-mock-bins) and anything else that is
+            // not a root this suite creates is left alone.
+            if !E2E_ROOT_PREFIXES.iter().any(|p| name.starts_with(p)) {
                 continue;
-            };
-            // ruagent-e2e-<pid>-<tag>; anything else (e.g. the mock-bin copies directory)
-            // is not a test root and is left alone.
-            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-                continue;
-            };
-            if ruagent_daemon::orphans::process_started_at_ms(pid).is_some() {
+            }
+            if !e.path().is_dir() || !all_numeric_fields_are_dead(&name, me) {
                 continue;
             }
             match std::fs::remove_dir_all(e.path()) {
@@ -283,7 +386,7 @@ fn prune_stale_e2e_roots() {
         }
         if pruned > 0 || failed > 0 {
             eprintln!(
-                "READING t27 pruned {pruned} stale ruagent-e2e-* root(s) of dead test \
+                "READING t31 pruned {pruned} stale e2e-suite root(s) of dead test \
                  processes; {failed} could not be removed"
             );
         }
@@ -800,8 +903,13 @@ fn temp_git_repo(tag: &str) -> PathBuf {
     // NOT a cleanup (t27 / issue #69): this is the idempotent PRE-clean before
     // the root is created, where a leftover is exactly what it tolerates -- the
     // create_dir_all right after fails loudly if the path is really unusable. The
-    // cleanup that MUST happen is remove_test_root (see its note).
-    let _ = std::fs::remove_dir_all(&repo);
+    // cleanup that MUST happen is remove_test_root (see its note). t31: reported, not dropped.
+    if let Err(why) = try_remove_test_root(&repo, CLEANUP_BUDGET) {
+        eprintln!(
+            "READING t31 cleanup: {why} -- the git-repo pre-clean could not remove the root; the \
+             create_dir_all right after says whether that matters"
+        );
+    }
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("hello.txt"), "base").unwrap();
     let git = |args: &[&str]| {
@@ -1640,8 +1748,14 @@ fn prior_daemon_record_roundtrips() {
     // NOT a cleanup (t27 / issue #69): this is the idempotent PRE-clean before
     // the root is created, where a leftover is exactly what it tolerates -- the
     // create_dir_all right after fails loudly if the path is really unusable. The
-    // cleanup that MUST happen is remove_test_root (see its note).
-    let _ = std::fs::remove_dir_all(&root);
+    // cleanup that MUST happen is remove_test_root (see its note). t31: the pre-clean no
+    // longer DROPS its error either; a root that could not be wiped is reported.
+    if let Err(why) = try_remove_test_root(&root, CLEANUP_BUDGET) {
+        eprintln!(
+            "READING t31 cleanup: {why} -- the pre-clean could not remove the root; the \
+             create_dir_all right after says whether that matters"
+        );
+    }
     // First boot: no record.
     assert!(
         ruagent_daemon::orphans::read_prior(&root)

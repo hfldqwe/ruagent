@@ -44,10 +44,129 @@ struct WikiDaemon {
     replies: std::path::PathBuf,
 }
 
+// ---------------------------------------------------------------------------
+// t30: the cleanup shape t27 introduced for the t16/e2e roots, applied here.
+//
+// The text is COPIED rather than imported because a test binary compiles against the
+// crate's public API only: chat.rs's helpers are private to that crate's unit tests, and
+// the other copy of this shape lives in mock-agent/tests/e2e_daemon.rs. Keep the three in
+// step; the shape has three parts, and all three matter:
+//   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+//   2. a REPORTING call site for a root whose holder is the test process itself;
+//   3. a PRUNER that removes what the previous run could not, from the next process.
+// ---------------------------------------------------------------------------
+
+/// Remove root with a bounded retry, RETURNING the reason (t30).
+///
+/// It returns instead of printing so a caller can assert on it, and polls instead of
+/// sleeping once because what it waits for is another task dropping a handle.
+fn try_remove_test_root(root: &std::path::Path, budget: std::time::Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t30 cleanup of {} waited {:.1} s for the handles to be released",
+                        root.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "{} could NOT be removed within {:.2} s: {e}",
+                        root.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Remove a root test code OWNS, or PANIC naming it (t30).
+///
+/// Unused in THIS file: it is the asserting half of the shape, and the test that
+/// proves it lives in capabilities.rs. Kept so every copy of the shape stays complete.
+#[allow(dead_code)]
+fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+    if let Err(why) = try_remove_test_root(root, budget) {
+        panic!("{what}: {why}");
+    }
+}
+
+/// Try once, then REPORT -- never silently drop -- a root that is still held (t30).
+///
+/// WHY THIS IS NOT AN ASSERTION. In this suite the holder is the TEST PROCESS itself: the
+/// daemon is served in-process, so a live handle inside the root outlives the test body,
+/// and the removal CANNOT succeed from inside one test however long it waits (measured on
+/// Windows; the same root removes the moment the process is gone). A panic here would red a
+/// test for a fact that is not its own. So the failure is made VISIBLE -- a READING line
+/// with the OS error -- and the pile is bounded by the pruner below, which the NEXT run
+/// performs.
+fn report_test_root_left_behind(root: &std::path::Path) {
+    if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t30 cleanup: {why} -- the root is held by THIS test process, so the \
+             failure is REPORTED rather than swallowed; the next run's pruner removes it"
+        );
+    }
+}
+
+/// Remove the roots THIS suite's DEAD processes left behind, once per process (t30).
+///
+/// The safety rule is t27's: a root whose pid is still ALIVE may be evidence a run needs,
+/// and is left alone; a root of a pid that is gone can only be litter. The pid is checked
+/// against its START TIME, so a RECYCLED pid cannot protect a stranger's leftover forever
+/// -- process_started_at_ms is the same primitive the daemon's own boot sweep uses.
+fn prune_stale_wiki_roots() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("ruagent-wiki-") else {
+                continue;
+            };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if ruagent_daemon::orphans::process_started_at_ms(pid).is_some() {
+                continue;
+            }
+            match std::fs::remove_dir_all(e.path()) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t30 stale ruagent-wiki root {} could NOT be removed: {err}",
+                        e.path().display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t30 pruned {pruned} stale ruagent-wiki root(s) of dead test processes; {failed} could not be removed"
+            );
+        }
+    });
+}
+
 async fn start_wiki_daemon(replies: &serde_json::Value) -> WikiDaemon {
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    prune_stale_wiki_roots();
     let root = std::env::temp_dir().join(format!("ruagent-wiki-{}-{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     let replies_path = root.join("replies.json");
@@ -422,7 +541,7 @@ async fn dry_run_plan_then_confirmed_build_lands_pages() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 #[tokio::test]
@@ -480,7 +599,7 @@ async fn rebuild_updates_backup_edited_skip_and_delete() {
         "no backup for a skipped page"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 #[tokio::test]
@@ -529,7 +648,7 @@ async fn delete_action_removes_page_and_empty_scope_is_rejected() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 #[tokio::test]
@@ -576,7 +695,7 @@ async fn delete_guard_protects_pages_with_live_sources() {
         "the page survives the bogus delete"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +786,7 @@ async fn the_citation_gate_fails_a_page_whose_claims_cannot_be_traced() {
         // A failed page is not in the inventory either: the file is the truth.
         let pages = wiki_pages(&reqwest::Client::new(), &d.url).await;
         assert!(pages.is_empty(), "[{what}] {pages:?}");
-        let _ = std::fs::remove_dir_all(&d.root);
+        report_test_root_left_behind(&d.root);
     }
 }
 
@@ -706,7 +825,7 @@ async fn a_page_with_nothing_to_cite_fails_by_its_own_name() {
             .exists(),
         "an empty shell must not be written"
     );
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +917,7 @@ async fn dry_run_has_one_vocabulary_and_rejects_the_combined_request() {
         .unwrap();
     assert_eq!(builds["builds"].as_array().unwrap().len(), before);
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +1023,7 @@ async fn a_stale_page_is_repaired_even_when_the_plan_says_keep() {
         built_at_1
     );
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 /// A page that stays stale ACROSS a build (hand-edited, so §13-3 freezes it) is
@@ -991,7 +1110,7 @@ async fn a_page_that_stays_stale_records_since_and_says_why() {
     assert!(corrections[0].reason.contains("human-edited"));
     assert!(corrections[0].at.contains('T'));
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 /// A pin freezes the page whatever the plan says, and the reason travels with the
@@ -1083,7 +1202,7 @@ async fn a_pin_skips_the_page_and_the_reason_is_visible() {
     let pages = wiki_pages(&http, &d.url).await;
     assert!(pages[0]["frozen_by"].is_null(), "{pages:?}");
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,7 +1285,7 @@ async fn an_unanswerable_freshness_reading_is_unknown_never_fresh() {
         "an unanswerable reading must say why: {pages:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&_d.root);
+    report_test_root_left_behind(&_d.root);
 }
 
 /// RV-D-1's black-box criterion, on a page that HAS a recorded build reading: once
@@ -1272,7 +1391,7 @@ async fn an_unresolvable_anchor_cannot_keep_reporting_full_coverage() {
         );
     }
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,7 +1495,7 @@ async fn the_two_graph_endpoints_cannot_disagree() {
     assert_eq!(reading.self_links, 1, "{reading:?}");
     assert!(reading.read_at.contains('T'));
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 /// A page whose file disappears without a build deleting it leaves its hash row
@@ -1472,7 +1591,7 @@ async fn a_page_hash_with_no_page_is_swept_by_the_next_build() {
         "{hashes:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,5 +1667,5 @@ async fn a_rename_moves_the_topic_instead_of_destroying_it() {
         "the old slug is recorded on the survivor: {pages:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&d.root);
+    report_test_root_left_behind(&d.root);
 }

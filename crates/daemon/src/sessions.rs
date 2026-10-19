@@ -1559,7 +1559,7 @@ mod tests {
     /// the tree.
     fn opencode_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("ruagent-t10-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("opencode.db");
         let conn = rusqlite::Connection::open(&db).unwrap();
@@ -1668,7 +1668,7 @@ mod tests {
         );
         assert_eq!(b.len(), 1, "{b:?}");
         assert_eq!(b[0].text, "redacted turn B1");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 
     /// The shape the 305 rows indexed BEFORE t10 hold (the bare database path)
@@ -1682,7 +1682,7 @@ mod tests {
             msgs.is_empty(),
             "without a session id there is no way to know WHICH session this is: {msgs:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 
     /// The codex family was indexed but unreadable at this seam; the parser
@@ -1690,7 +1690,7 @@ mod tests {
     #[test]
     fn a_codex_rollout_parses_at_this_seam() {
         let dir = std::env::temp_dir().join(format!("ruagent-t10-codex-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout-redacted.jsonl");
         std::fs::write(
@@ -1707,7 +1707,7 @@ mod tests {
         assert_eq!(msgs.len(), 2, "{msgs:?}");
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 
     /// A family nobody has taught this seam stays REFUSED rather than guessed at:
@@ -1715,7 +1715,7 @@ mod tests {
     #[test]
     fn an_unknown_family_is_refused_not_guessed() {
         let dir = std::env::temp_dir().join(format!("ruagent-t10-unknown-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plausible-but-unknown.jsonl");
         std::fs::write(
@@ -1727,6 +1727,6 @@ mod tests {
             parse_file_messages("some-future-agent", &path).is_empty(),
             "an unknown family must produce no messages: a wrong guess becomes silently wrong distillation input"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 }

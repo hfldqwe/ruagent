@@ -11,6 +11,8 @@ use ruagent_knowledge::store::KeywordStage;
 use ruagent_knowledge::{Embedder, HashEmbedder, Knowledge, ScoreKind};
 use std::sync::Arc;
 
+mod cleanup;
+
 /// A corpus whose Han runs are LONG on purpose: unicode61 turns a whole run
 /// into ONE token, so `水温` inside `泡茶的水温很重要` is neither a token nor a
 /// token prefix — the exact case the bigram index exists for.
@@ -19,7 +21,7 @@ const ASCII: &str = "The kettle boils water. Kettle descaling uses vinegar.";
 
 async fn kb(tag: &str) -> (Knowledge, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("ruagent-t7-cjk-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
     std::fs::create_dir_all(root.join("data")).unwrap();
     let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
@@ -65,7 +67,7 @@ async fn a_two_char_han_substring_is_served_by_the_bigram_index() {
         hits.iter().any(|h| h.document == "tea"),
         "the tea page must come back for its own substring: {hits:?}"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// The ladder's ORDER, negative half: an exact Han token must stop at
@@ -77,7 +79,7 @@ async fn an_exact_han_token_stops_at_precision() {
     let legs = k.search_legs("泡茶的水温很重要", 5).await.unwrap();
     assert_eq!(legs.keyword_stage, KeywordStage::Precision);
     assert!(!legs.keyword.is_empty());
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// The bigram stage must not be entered at all for a query with no Han term:
@@ -94,7 +96,7 @@ async fn a_pure_ascii_query_never_uses_the_bigram_arm() {
         ruagent_store::fts::match_bigrams(&terms).is_empty(),
         "no Han term -> no bigram pattern"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// V-SCHEMA(t22) F6, pinned here so a later "simplification" cannot delete the
@@ -125,7 +127,7 @@ async fn a_one_char_han_query_still_needs_the_scan() {
             "the scan stage has no bm25 and must not invent one: {h:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// The write path fills `chunks.grams` (R-A E4 ①). Read back through a separate
@@ -174,7 +176,7 @@ async fn the_ingest_path_writes_grams() {
         })
         .unwrap();
     assert_eq!(nulls, 0, "every inserted chunk must carry grams");
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// The new surface's contract, as plain assertions: the wire literals that two
@@ -274,7 +276,7 @@ async fn the_legs_carry_the_window_and_fusion_they_were_computed_with() {
     // The page argument is ignored ON PURPOSE: 1 and 500 return the same legs.
     let tiny = k.search_legs("kettle descaling", 1).await.unwrap();
     assert_eq!(tiny, legs, "the window must not follow the page size");
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }
 
 /// The paged entry point: the same ranking as `search`, plus the evidence. This
@@ -331,5 +333,5 @@ async fn search_page_agrees_with_search_and_carries_the_evidence() {
             "an empty keyword leg must report None, not 0.0: {hit:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup::report_test_root_left_behind(&root);
 }

@@ -803,7 +803,7 @@ mod exit_trace_tests {
             exit_trace::silent_death(&root).is_none(),
             "this pid IS alive, so this is not a death"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// THE WHOLE POINT (issue #64): a daemon that was KILLED could not write
@@ -838,7 +838,7 @@ mod exit_trace_tests {
             .expect("a dead pid behind a running line IS the trace of a kill");
         println!("READING t20 silent death: {}", trace.describe());
         assert_eq!(trace.pid(), dead);
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// A clean exit replaces the boot line, so the two are distinguishable BY
@@ -867,7 +867,7 @@ mod exit_trace_tests {
             exit_trace::silent_death(&root).is_none(),
             "an exit record is not a silent death"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// A REAL panic, through the REAL hook: the message and its location have to
@@ -890,7 +890,7 @@ mod exit_trace_tests {
             }
             other => panic!("expected a panic record, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// The graceful stop of a daemon that HAS no console: a request file in the
@@ -916,7 +916,7 @@ mod exit_trace_tests {
         let reason = why.lock().unwrap().clone();
         println!("READING t20 stop request reason: {reason:?}");
         assert_eq!(reason.as_deref(), Some("stop-request"));
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
     }
 
     /// The file is read to EXPLAIN an unexplained death, so a torn or unknown line
@@ -953,6 +953,333 @@ mod exit_trace_tests {
             }
             other => panic!("expected an Exit record, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&root);
+        crate::test_cleanup::report_test_root_left_behind(&root);
+    }
+}
+
+/// Test-root cleanup for this crate's unit tests (t31).
+///
+/// THE SHAPE is the one t27 fixed for the t16 tests and t30 spread to four more suites. It has
+/// three parts and a suite needs all three:
+///   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+///   2. a REPORTING call site for a root whose holder is the test process itself (an in-process
+///      daemon, a live store connection: the removal CANNOT succeed from inside the test);
+///   3. a PRUNER that removes, from the NEXT process, what the previous one could not.
+///
+/// WHY IT LIVES HERE, AND WHERE THE COPIES ARE: an integration-test binary compiles against the
+/// public API only, so a cfg(test) module is invisible to it. The daemon's own integration tests
+/// (crates/daemon/tests/*.rs) carry the reporting half, and the knowledge crate's test binaries
+/// share one in crates/knowledge/tests/common/mod.rs; this module is the ONE place the daemon's
+/// unit tests use, so the crate has a single implementation of the rule.
+#[cfg(test)]
+pub(crate) mod test_cleanup {
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Every temp-root prefix this crate's unit tests create, in ONE place so the pruner cannot
+    /// be given a list that has drifted from the roots the suites write.
+    pub(crate) const TEST_ROOT_PREFIXES: &[&str] = &[
+        "ruagent-count-test-",
+        "ruagent-del-test-",
+        "ruagent-gen-test-",
+        "ruagent-opts-test-",
+        "ruagent-opts-seed-",
+        "ruagent-t313-",
+        "ruagent-t8-",
+        "ruagent-t329-",
+        "ruagent-t45-",
+        "ruagent-t20-",
+        "ruagent-t10-",
+        "ruagent-t326-",
+        "ruagent-cfg-",
+        "ruagent-cfg-cap-",
+        "ruagent-cfg-badcap-",
+        "ruagent-cap-edit-",
+        "ruagent-distill-edit-",
+        "ruagent-reg-",
+        "ruagent-skills-",
+        "ruagent-internal",
+        "ruagent-t16-reclaim-",
+        "ruagent-t16-midturn-",
+        "ruagent-t27-stuck-",
+    ];
+
+    /// Remove a root with a bounded retry, RETURNING the reason (t31).
+    ///
+    /// It returns instead of printing so a caller can assert on it, and it polls instead of
+    /// sleeping once because what it waits for is another task dropping a handle.
+    pub(crate) fn try_remove_test_root(root: &Path, budget: Duration) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => {
+                    if started.elapsed() > Duration::from_millis(250) {
+                        println!(
+                            "READING t31 cleanup of {} waited {:.1} s for the handles to be released",
+                            root.display(),
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    if started.elapsed() >= budget {
+                        return Err(format!(
+                            "{} could NOT be removed within {:.2} s: {e}",
+                            root.display(),
+                            budget.as_secs_f64()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    /// Remove a root test code OWNS, or PANIC naming it (t31): a cleanup that cannot happen is a
+    /// red test, not a directory nobody counts.
+    pub(crate) fn remove_test_root(root: &Path, what: &str, budget: Duration) {
+        if let Err(why) = try_remove_test_root(root, budget) {
+            panic!("{what}: {why}");
+        }
+    }
+
+    /// Try once, then REPORT -- never silently drop -- a root that is still held (t31).
+    ///
+    /// WHY NOT AN ASSERTION HERE. The holder is the test process itself (the in-process daemon
+    /// keeps a handle inside the root for the whole round), so the removal cannot succeed however
+    /// long it waits; a panic would red a test for a fact that is not its own. The failure is
+    /// made VISIBLE instead, and the pile is bounded by the pruner below -- which this call also
+    /// guarantees has run, so a suite that only ever cleans up still prunes.
+    pub(crate) fn report_test_root_left_behind(root: &Path) {
+        prune_stale_test_roots(TEST_ROOT_PREFIXES, "daemon unit-test");
+        if let Err(why) = try_remove_test_root(root, Duration::from_millis(500)) {
+            eprintln!(
+                "READING t31 cleanup: {why} -- the root is held by THIS test process, so the \
+                 failure is REPORTED rather than swallowed; the next run's pruner removes it"
+            );
+        }
+    }
+
+    /// Is a process with this pid alive? The daemon's own primitive, start time included, so a
+    /// RECYCLED pid is not mistaken for the process that made the root.
+    fn pid_is_alive(pid: u32) -> bool {
+        crate::orphans::process_started_at_ms(pid).is_some()
+    }
+
+    /// Remove the roots of DEAD test processes for the given prefixes, once per label.
+    ///
+    /// THE SAFETY RULE, and why it is deliberately conservative: a root belongs to a run whose
+    /// process may still be read while it lives, so a root is pruned only when it has at least one
+    /// numeric field AND none of its numeric fields belongs to a live process. Root names put the
+    /// pid in different positions ("ruagent-cfg-<pid>", "ruagent-t329-<tag>-<pid>-<n>"), so the
+    /// question is asked of every number in the name; a number that happens to be a live process
+    /// keeps the root, which costs disk and never a run. Files are left alone: the mock-agent
+    /// copies a suite writes are binaries, not directories.
+    pub(crate) fn prune_stale_test_roots(prefixes: &[&str], label: &str) {
+        static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut done = DONE.lock().expect("prune labels");
+            if done.iter().any(|l| l == label) {
+                return;
+            }
+            done.push(label.to_string());
+        }
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let me = std::process::id();
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !prefixes.iter().any(|p| name.starts_with(p)) {
+                continue;
+            }
+            let path = e.path();
+            if !path.is_dir() || !all_numeric_fields_are_dead(&name, me) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t31 stale root {} could NOT be removed: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t31 pruned {pruned} stale {label} root(s) of dead test processes; {failed} could not be removed"
+            );
+        }
+    }
+
+    /// True when every number in a root name is safe to prune on: no live process owns it, and it
+    /// is not OUR pid. A name with no number at all is NOT prunable (nothing identifies its run).
+    fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
+        all_numeric_fields_are_dead_with(name, me, pid_is_alive)
+    }
+
+    /// The rule with the liveness question passed IN, so the test can answer it
+    /// deterministically instead of depending on which pids this machine happens to have
+    /// live: Windows REUSES pids, and a reused one made the dead-pid case vacuous-red.
+    fn all_numeric_fields_are_dead_with(name: &str, me: u32, alive: impl Fn(u32) -> bool) -> bool {
+        let mut seen = false;
+        for field in name.split(|c: char| !c.is_ascii_digit()) {
+            if field.is_empty() {
+                continue;
+            }
+            let Ok(n) = field.parse::<u32>() else {
+                continue;
+            };
+            // A number outside this range is NOT evidence about a run: below 1000 it is
+            // almost always part of a NAME (the 2 in ruagent-e2e-mock-bins, the 329 in a
+            // tag), and above 100_000_000 a nanosecond stamp cannot be a pid. A name with no
+            // pid in it is never pruned, however many of these numbers it carries.
+            if !(1000..=100_000_000).contains(&n) {
+                continue;
+            }
+            seen = true;
+            if n == me || alive(n) {
+                return false;
+            }
+        }
+        seen
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// t31: the shape's OWN proof, so a cleanup that cannot happen cannot go quiet again.
+        ///
+        /// Two halves, both asserted: the bounded retry RETURNS a reason that NAMES the path, and
+        /// the asserting wrapper PANICS on it. The root is released and removed at the end -- a
+        /// test written about the leftover pile must not join it.
+        #[test]
+        fn a_failed_cleanup_is_reported_and_the_asserting_half_panics() {
+            let root = std::env::temp_dir().join(format!(
+                "ruagent-cfg-{}-t31proof-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            // Hold the directory's database open, exactly as a live test does.
+            //
+            // TEMPORARY t31 NEGATIVE CONTROL (env-gated, so the tree is never red by default;
+            // removed as soon as the red reading is taken). With the flag set the root is NOT
+            // held, the removal therefore SUCCEEDS, and this test MUST fail -- which is what
+            // proves the assertion below is about the failure and not vacuous.
+            let hold = std::env::var_os("RUAGENT_T31_CONTROL_NO_HOLD")
+                .is_none()
+                .then(|| ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap());
+            // An open file does NOT block rmdir on unix, so the failure is made deterministic
+            // there the only other way it can be: a read-only directory. This machine is Windows,
+            // so the unix branch is reasoned rather than measured here.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&root).unwrap().permissions();
+                perms.set_mode(0o555);
+                std::fs::set_permissions(&root, perms).unwrap();
+            }
+
+            // 1. The failure is RETURNED, and it NAMES the root it could not remove.
+            let why = try_remove_test_root(&root, Duration::from_millis(100))
+                .expect_err("a root holding an open database must NOT come back as removed");
+            println!("READING t31 deliberate cleanup failure: {why}");
+            assert!(
+                why.contains(&root.display().to_string()),
+                "the report must name the root it could not remove: {why}"
+            );
+
+            // 2. The call a test makes for a root it OWNS PANICS on it.
+            let panicked = std::panic::catch_unwind(|| {
+                remove_test_root(&root, "the t31 proof root", Duration::from_millis(100))
+            })
+            .is_err();
+            assert!(
+                panicked,
+                "remove_test_root must PANIC on a root it could not remove, or the leftover pile \
+                 is back in the dark"
+            );
+
+            // Release the handle and the unix permission trick, then remove it for real.
+            drop(hold);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&root).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&root, perms).unwrap();
+            }
+            remove_test_root(
+                &root,
+                "the t31 proof root, after releasing its handle",
+                Duration::from_millis(500),
+            );
+            println!("READING t31 after releasing the handle: the proof root was removed");
+        }
+
+        /// The pruner's rule, unit-tested without touching %TEMP%: a name is prunable only when
+        /// every number in it is dead, and a name with no number is never prunable.
+        #[test]
+        fn only_names_whose_numbers_are_all_dead_are_prunable() {
+            let me = std::process::id();
+            let never = |_pid: u32| false;
+            let pid_4242 = |pid: u32| pid == 4242;
+            // NO pid in the name: nothing identifies its run, so it is never pruned -- even
+            // though it carries digits. MEASURED REGRESSION: the first version of this rule
+            // treated ANY number as a pid candidate, so the 2 of "e2e" made the mock-agent
+            // copies directory prunable, and the pruner deleted a live suite's agent binaries.
+            assert!(!all_numeric_fields_are_dead_with(
+                "ruagent-e2e-mock-bins",
+                me,
+                never
+            ));
+            assert!(!all_numeric_fields_are_dead_with(
+                "ruagent-knowledge-probe",
+                me,
+                never
+            ));
+            // A number too large to be a pid is not evidence either way.
+            assert!(!all_numeric_fields_are_dead_with(
+                "ruagent-cfg-4294967280",
+                me,
+                never
+            ));
+            // A plausible pid that is GONE: prunable. This is the reading the pruner acts on.
+            assert!(all_numeric_fields_are_dead_with(
+                "ruagent-cfg-4242",
+                me,
+                never
+            ));
+            // ... and the same name with that pid ALIVE is kept, in whatever position the pid
+            // sits, which is what makes the rule safe.
+            assert!(!all_numeric_fields_are_dead_with(
+                "ruagent-cfg-4242",
+                me,
+                pid_4242
+            ));
+            assert!(!all_numeric_fields_are_dead_with(
+                "ruagent-t329-phrasings-4242-3",
+                me,
+                pid_4242
+            ));
+            // Our OWN pid is live by definition, so a root of this run is never pruned.
+            assert!(!all_numeric_fields_are_dead_with(
+                &format!("ruagent-cfg-{me}"),
+                me,
+                never
+            ));
+        }
     }
 }

@@ -377,7 +377,7 @@ mod tests {
     struct TempDir(std::path::PathBuf);
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            crate::test_cleanup::report_test_root_left_behind(&self.0);
         }
     }
 
@@ -406,7 +406,7 @@ mod tests {
         // directory on a SUCCESSFUL drop -- so a run that panicked leaves the
         // name behind and the next run would reuse its stale `agents.toml`.
         // Wipe first: "fresh" has to mean empty, not just "a name we like".
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("agents.toml"),

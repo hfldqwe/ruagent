@@ -894,7 +894,7 @@ enabled = false
     #[test]
     fn fresh_root_is_legacy_mode() {
         let dir = std::env::temp_dir().join(format!("ruagent-cfg-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         let cfg = DaemonConfig::load(&dir).unwrap();
         assert!(
             !cfg.capabilities.table_present(),
@@ -909,7 +909,7 @@ enabled = false
                 .gate(crate::capability::CapabilityId::MemoryInjectChat, false),
             "and a legacy mode gate can only narrow, never create work (L2)"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 
     #[test]
@@ -917,7 +917,7 @@ enabled = false
         // L3: a typo in a table name is a boot failure that names it, never a
         // silently ignored section.
         let dir = std::env::temp_dir().join(format!("ruagent-cfg-badcap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         std::fs::create_dir_all(dir.join("config")).unwrap();
         std::fs::write(
             dir.join("config").join("policy.toml"),
@@ -932,7 +932,7 @@ enabled = false
             "lists the known ids: {msg}"
         );
         assert!(msg.contains("policy.toml"), "names the file it read: {msg}");
-        std::fs::remove_dir_all(&dir).ok();
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 
     #[test]
@@ -970,7 +970,7 @@ servers = ["fs", "all"]
     #[test]
     fn config_load_creates_defaults() {
         let dir = std::env::temp_dir().join(format!("ruagent-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::test_cleanup::report_test_root_left_behind(&dir);
         let cfg = DaemonConfig::load(&dir).unwrap();
         assert!(dir.join("config/agents.toml").exists());
         assert_eq!(cfg.agents.len(), 4);
@@ -978,7 +978,7 @@ servers = ["fs", "all"]
         // t43 deleted `cfg.default_agent()`; the routing fallback's rule lives in api.rs now, so this
         // asserts the property that accessor existed for: the shipped config has an enabled agent.
         assert!(cfg.agents.iter().any(|a| a.enabled));
-        std::fs::remove_dir_all(&dir).ok();
+        crate::test_cleanup::report_test_root_left_behind(&dir);
     }
 }
 

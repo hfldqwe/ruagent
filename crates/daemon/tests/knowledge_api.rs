@@ -9,6 +9,124 @@ use ruagent_daemon::config::DaemonConfig;
 use ruagent_daemon::runs::RunManager;
 use ruagent_store::Db;
 
+// ---------------------------------------------------------------------------
+// t30: the cleanup shape t27 introduced for the t16/e2e roots, applied here.
+//
+// The text is COPIED rather than imported because a test binary compiles against the
+// crate's public API only: chat.rs's helpers are private to that crate's unit tests, and
+// the other copy of this shape lives in mock-agent/tests/e2e_daemon.rs. Keep the three in
+// step; the shape has three parts, and all three matter:
+//   1. a BOUNDED retry that RETURNS the reason, so a failure can be reported or asserted;
+//   2. a REPORTING call site for a root whose holder is the test process itself;
+//   3. a PRUNER that removes what the previous run could not, from the next process.
+// ---------------------------------------------------------------------------
+
+/// Remove root with a bounded retry, RETURNING the reason (t30).
+///
+/// It returns instead of printing so a caller can assert on it, and polls instead of
+/// sleeping once because what it waits for is another task dropping a handle.
+fn try_remove_test_root(root: &std::path::Path, budget: std::time::Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t30 cleanup of {} waited {:.1} s for the handles to be released",
+                        root.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "{} could NOT be removed within {:.2} s: {e}",
+                        root.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Remove a root test code OWNS, or PANIC naming it (t30).
+///
+/// Unused in THIS file: it is the asserting half of the shape, and the test that
+/// proves it lives in capabilities.rs. Kept so every copy of the shape stays complete.
+#[allow(dead_code)]
+fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+    if let Err(why) = try_remove_test_root(root, budget) {
+        panic!("{what}: {why}");
+    }
+}
+
+/// Try once, then REPORT -- never silently drop -- a root that is still held (t30).
+///
+/// WHY THIS IS NOT AN ASSERTION. In this suite the holder is the TEST PROCESS itself: the
+/// daemon is served in-process, so a live handle inside the root outlives the test body,
+/// and the removal CANNOT succeed from inside one test however long it waits (measured on
+/// Windows; the same root removes the moment the process is gone). A panic here would red a
+/// test for a fact that is not its own. So the failure is made VISIBLE -- a READING line
+/// with the OS error -- and the pile is bounded by the pruner below, which the NEXT run
+/// performs.
+fn report_test_root_left_behind(root: &std::path::Path) {
+    if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t30 cleanup: {why} -- the root is held by THIS test process, so the \
+             failure is REPORTED rather than swallowed; the next run's pruner removes it"
+        );
+    }
+}
+
+/// Remove the roots THIS suite's DEAD processes left behind, once per process (t30).
+///
+/// The safety rule is t27's: a root whose pid is still ALIVE may be evidence a run needs,
+/// and is left alone; a root of a pid that is gone can only be litter. The pid is checked
+/// against its START TIME, so a RECYCLED pid cannot protect a stranger's leftover forever
+/// -- process_started_at_ms is the same primitive the daemon's own boot sweep uses.
+fn prune_stale_kbapi_roots() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("ruagent-kbapi-") else {
+                continue;
+            };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if ruagent_daemon::orphans::process_started_at_ms(pid).is_some() {
+                continue;
+            }
+            match std::fs::remove_dir_all(e.path()) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t30 stale ruagent-kbapi root {} could NOT be removed: {err}",
+                        e.path().display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t30 pruned {pruned} stale ruagent-kbapi root(s) of dead test processes; {failed} could not be removed"
+            );
+        }
+    });
+}
+
 /// The `policy.toml` every test in this file starts from unless it says otherwise:
 /// permissions only, so the `[capabilities]` table is ABSENT (legacy mode, L1).
 const DEFAULT_TEST_POLICY: &str = "[permissions]\ndefault = \"ask\"\n";
@@ -25,8 +143,9 @@ async fn start_test_daemon() -> (String, std::path::PathBuf) {
 async fn start_test_daemon_with_policy(policy_toml: &str) -> (String, std::path::PathBuf) {
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    prune_stale_kbapi_roots();
     let root = std::env::temp_dir().join(format!("ruagent-kbapi-{}-{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
@@ -430,7 +549,7 @@ async fn markdown_truth_chunk_edits_and_parent_recall() {
         "{hits:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 // The self-link (`[[deploy-pipeline]]`) is the D.2/D.3 narrowing's falsifier: if
@@ -620,7 +739,7 @@ async fn wiki_pages_and_links_inventory() {
         "RFC3339 read stamp: {readings_at}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// §13-2: wiki hits come back as their own section, never inside
@@ -668,7 +787,7 @@ async fn recall_returns_wiki_section_separate_from_knowledge() {
         "wiki documents must not appear as knowledge hits: {resp:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// §12-2: entity recall stubs carry the wiki pages that cite them
@@ -715,7 +834,7 @@ async fn recall_entity_carries_related_wiki() {
     assert_eq!(wiki[0]["title"].as_str().unwrap(), "Deploy pipeline");
     assert_eq!(wiki[0]["stale"], serde_json::json!(true));
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// M6: every recall call lands in the usage log with per-section
@@ -760,7 +879,7 @@ async fn recall_calls_are_logged() {
         "{log:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1261,7 @@ async fn the_default_leg_configuration_reproduces_the_legacy_recall() {
         "the default leg configuration moved the recall ranking"
     );
     assert_eq!(configured["legs_disabled"], serde_json::json!([]));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// §11.3's wiki and graph rows: OFF ⇒ `"wiki": []`, `graph.entities == 0`,
@@ -1185,7 +1304,7 @@ async fn a_disabled_wiki_or_graph_leg_is_reported_and_leaves_its_section_empty()
     assert_eq!(knowledge_order(&off), knowledge_order(&on));
     assert_eq!(off["scoring"]["top_knowledge_score"], on_top_score);
     assert_eq!(off["memory_legs"], on["memory_legs"]);
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// §11.3's last row: ALL SIX legs off is a legal, EMPTY, 200 answer that NAMES every
@@ -1252,7 +1371,7 @@ async fn all_six_legs_off_is_an_empty_success_that_names_every_leg() {
         serde_json::json!("leg disabled")
     );
     assert_eq!(off["graph"]["entities"], serde_json::json!(0));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// Both STRATEGIES still work over the toggleable legs (the existing recall
@@ -1296,7 +1415,7 @@ async fn both_strategies_answer_over_the_toggleable_legs() {
         serde_json::json!(["recall_leg_memory_semantic"])
     );
     assert_eq!(aggressive["memory_legs"]["semantic"], serde_json::json!(0));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// A NON-DEFAULT weight moves the page: at the default 2:1 the keyword-ranked chunk
@@ -1363,7 +1482,7 @@ async fn a_non_default_leg_weight_reorders_the_recall_page() {
         reordered["knowledge"][0]["keyword_rank"],
         serde_json::Value::Null
     );
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// The `query_keyword_stage` label each knowledge hit carries, in page order.
@@ -1443,7 +1562,7 @@ async fn a_disabled_keyword_leg_reports_disabled_not_empty() {
         assert!(hit["keyword_rank"].is_null(), "{hit:?}");
         assert!(hit["keyword_score"].is_null(), "{hit:?}");
     }
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1709,7 @@ async fn the_memory_fusion_weights_are_recorded_in_the_response_and_the_log() {
         !top_legs_json.contains("memory_fusion"),
         "the additive key must not land in the per-hit array: {top_legs_json}"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// t2 (§20.2): a DISABLED memory leg contributes 0.0 — never the stale weight the
@@ -1659,7 +1778,7 @@ async fn a_disabled_memory_leg_records_zero_not_its_stale_weight() {
         before_write,
         "a refused write writes nothing"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 
     // READ/LOAD IS UNCHANGED: a policy.toml that ALREADY carries the row still boots
     // and still 400s at recall, naming the leg — no migration, no dead daemon.
@@ -1692,7 +1811,7 @@ async fn a_disabled_memory_leg_records_zero_not_its_stale_weight() {
         body.contains("memory semantic"),
         "the refusal names the leg it is about: {body}"
     );
-    let _ = std::fs::remove_dir_all(&root2);
+    report_test_root_left_behind(&root2);
 }
 
 /// t2 (§20.2): the new evidence is ADDITIVE, and the default run is unchanged.
@@ -1792,7 +1911,7 @@ async fn the_memory_fusion_label_is_additive_at_the_default_configuration() {
         "the default leg configuration moved the recall ranking"
     );
     assert_eq!(body["memory_fusion"], configured["memory_fusion"]);
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// THE CLOSURE TEST of the declared-option surface (design §11.5, increment 4). It
@@ -2083,7 +2202,7 @@ async fn the_panel_sees_every_declared_key_and_a_write_does_not_materialize_defa
         after_e.contains("weight = 1.0"),
         "the control must reproduce the re-materialization: {after_e}"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 }
 
 /// INCREMENT 5: THE WRITE DOOR COVERS EVERY LEG THE RUNTIME REFUSES, so the panel's
@@ -2158,7 +2277,7 @@ async fn the_write_door_refuses_a_newly_zeroed_leg_on_every_leg_the_runtime_weig
         ok["legs_disabled"],
         serde_json::json!(["recall_leg_knowledge_fts"])
     );
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
 
     // (d) READ/LOAD UNTOUCHED, AND THE FILE STAYS EDITABLE. A daemon that STARTS with
     // the refused row in its policy.toml boots, its recall 400s naming the leg, and a
@@ -2218,5 +2337,5 @@ async fn the_write_door_refuses_a_newly_zeroed_leg_on_every_leg_the_runtime_weig
         serde_json::json!(0.0),
         "the live plane kept the row exactly as the file had it: {accepted}"
     );
-    let _ = std::fs::remove_dir_all(&root2);
+    report_test_root_left_behind(&root2);
 }
