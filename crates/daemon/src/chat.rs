@@ -382,6 +382,24 @@ pub struct ChatManager {
     db: ruagent_store::Db,
     root: PathBuf,
     chats: Arc<Mutex<HashMap<RunId, Chat>>>,
+    /// The agent child each live chat was ATTRIBUTED at start (issue #60).
+    ///
+    /// HOW ATTRIBUTION WORKS, and why it is deliberately timid: the ACP child is
+    /// spawned inside the SDK's supervisor task, so the daemon cannot be handed
+    /// its pid -- it can only observe that a new child appeared after its own
+    /// snapshot, and match that child by IMAGE NAME when several appeared. If
+    /// both leave more than one candidate, NOTHING is recorded: killing a process
+    /// that might belong to another live session is worse than not knowing a pid,
+    /// and a close reclaims only what it can prove is its own.
+    /// This is the PRECISE case: the close path reports it with the full reading
+    /// (killed / already_gone / failed), which is how "the agent exited by
+    /// itself" and "we had to kill it" stay distinguishable numbers.
+    child_pids: Arc<Mutex<HashMap<RunId, u32>>>,
+    /// The reading of the LAST child reclamation this manager performed:
+    /// (what it was reclaiming, counts). A FIELD and not only a log line,
+    /// because the acceptance for issue #60 is that the path's OWN reading can
+    /// be asserted -- a log line is not a fact a test can read.
+    last_reclaim: Arc<Mutex<Option<(String, crate::orphans::Reclaim)>>>,
     park_ask: AskParker,
     /// Drops parked asks when a chat closes — wired to
     /// `RunManager::drop_pending_for` once both exist (chats are built
@@ -415,6 +433,18 @@ pub struct ChatManager {
     /// site keeps compiling and keeps today's behaviour.
     capabilities: std::sync::Arc<std::sync::RwLock<crate::capability::CapabilityPlane>>,
 }
+
+/// How long attribute_child looks for the session's new child before leaving
+/// that work to the close path's window fallback (issue #60). It only delays a
+/// BACKGROUND task -- chat start never waits on it.
+const ATTRIBUTION_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a close waits for the session's own teardown (the supervisor task
+/// returning, which is when the SDK's ChildGuard runs) before reclaiming its
+/// children anyway. A chat closed MID-PROMPT is the case this bound exists for:
+/// the shutdown command queues behind that prompt, and a closed chat must not
+/// keep its agent alive for however long the prompt takes.
+const SESSION_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How many turns this chat's transcript holds. ZERO IS NORMAL: a chat opened
 /// and closed without a conversation leaves one to three JSONL lines and no
@@ -562,6 +592,8 @@ impl ChatManager {
             db,
             root,
             chats: Arc::new(Mutex::new(HashMap::new())),
+            child_pids: Arc::new(Mutex::new(HashMap::new())),
+            last_reclaim: Arc::new(Mutex::new(None)),
             park_ask,
             drop_asks: Mutex::new(None),
             knowledge: Mutex::new(None),
@@ -918,6 +950,11 @@ impl ChatManager {
             });
         }
 
+        // ISSUE #60, attribution. Snapshot our own children immediately BEFORE
+        // the spawn: the difference afterwards is the only handle the daemon can
+        // have on a child the SDK spawns inside its own task.
+        let spawn_window = crate::orphans::live_children_of_self();
+        let program = spec.program.clone();
         let session = start_chat(
             ChatOptions {
                 program: spec.program,
@@ -1084,6 +1121,13 @@ impl ChatManager {
             .lock()
             .expect("chats lock")
             .insert(id, chat.clone());
+        // ISSUE #60, attribution -- and WHY IT RUNS HERE, at the very end:
+        // attribution distinguishes "this chat closed while we were still
+        // learning its pid" from "this chat is running", and its test for that
+        // is whether the id is in the registry above. Called any earlier, a
+        // chat that is merely still STARTING would look closed, and the child
+        // would be killed on the spot.
+        self.attribute_child(id, spawn_window, program);
         Ok(chat)
     }
 
@@ -1112,18 +1156,181 @@ impl ChatManager {
         self.knowledge.lock().expect("knowledge lock").clone()
     }
 
+    /// The attributed child pid of a live chat (issue #60).
+    pub fn child_pid(&self, id: RunId) -> Option<u32> {
+        self.child_pids
+            .lock()
+            .expect("child pids lock")
+            .get(&id)
+            .copied()
+    }
+
+    /// Every pid this manager still believes is a live chat's child. A close
+    /// REMOVES its entry, so anything left here after closes is itself the bug
+    /// issue #60 is about -- and a test can assert the list is empty.
+    pub fn attributed_child_pids(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .child_pids
+            .lock()
+            .expect("child pids lock")
+            .values()
+            .copied()
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The reading of the last child reclamation this manager performed, as
+    /// (what it was reclaiming, counts). None until one has run.
+    pub fn last_reclaim(&self) -> Option<(String, crate::orphans::Reclaim)> {
+        self.last_reclaim.lock().expect("last reclaim lock").clone()
+    }
+
+    /// Attribute the agent child of the session that was just started, without
+    /// ever blocking the caller (issue #60).
+    ///
+    /// The window (our live children, snapshotted just before the spawn) is the
+    /// WIDE tool: exactly one new child, and the answer is unambiguous. Several
+    /// (a session also spawns its MCP servers as OUR children) and the narrow
+    /// tool decides: the ones whose image name is THIS program's. If that still
+    /// leaves a choice, nothing is recorded and this chat's close reclaims
+    /// nothing -- the SDK's own guard, the daemon's kill-on-death job and the
+    /// next boot's sweep still cover it, and none of them can kill a live
+    /// session's agent by mistake.
+    fn attribute_child(&self, id: RunId, window: Vec<u32>, program: String) {
+        let chats = self.chats.clone();
+        let children = self.child_pids.clone();
+        let last = self.last_reclaim.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + ATTRIBUTION_WINDOW;
+            loop {
+                let found = crate::orphans::children_since(&window);
+                let pid = if found.len() == 1 {
+                    Some(found[0])
+                } else {
+                    let by_name = crate::orphans::matching_image(&found, &program);
+                    if by_name.len() == 1 {
+                        Some(by_name[0])
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pid) = pid {
+                    if chats.lock().expect("chats lock").contains_key(&id) {
+                        children.lock().expect("child pids lock").insert(id, pid);
+                    } else {
+                        // Closed while we were still learning its pid: there is
+                        // nobody left to reclaim it later, so do it here.
+                        let what = format!("chat {id}: closed before its child was attributed");
+                        let pids = vec![pid];
+                        let label = what.clone();
+                        let out = tokio::task::spawn_blocking(move || {
+                            crate::orphans::reclaim(&pids, &label)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        *last.lock().expect("last reclaim lock") = Some((what, out));
+                    }
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        chat = %id,
+                        candidates = found.len(),
+                        "no child could be attributed to this chat (several appeared and none matched its program); its close will reclaim nothing"
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+    }
+
+    /// Reclaim a closed chat's children, and REPORT what happened (issue #60).
+    ///
+    /// Two things happen here that never happened before. (1) We WAIT for the
+    /// session's own teardown: the supervisor task holds the event sender, so its
+    /// channel closing PROVES that task returned -- which is exactly when the
+    /// SDK's ChildGuard drops and kills the child. (2) We then VERIFY, and kill
+    /// whatever is still alive, so "the agent honoured the shutdown" and "we had
+    /// to kill it" arrive as different numbers instead of as a hope. Neither
+    /// t7's 10 leftovers nor "1 leaked in 2 runs out of 3" could produce any
+    /// reading before this, and that is what the reading is for.
+    fn reclaim_after_close(
+        &self,
+        id: RunId,
+        pid: Option<u32>,
+        witness: tokio::sync::broadcast::Receiver<RunEvent>,
+    ) {
+        let last = self.last_reclaim.clone();
+        tokio::spawn(async move {
+            let mut witness = witness;
+            let ended = tokio::time::timeout(SESSION_TEARDOWN_GRACE, async {
+                loop {
+                    match witness.recv().await {
+                        // Sender dropped = the supervisor returned.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
+                        // Lagged, or a normal event: the session is not done yet.
+                        Err(_) | Ok(_) => continue,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            // ONLY a pid this chat could prove was its own is reclaimed. An
+            // unattributed session gets a reading of zero and a WARN at start,
+            // never a guess -- see attribute_child.
+            let pids: Vec<u32> = pid.into_iter().collect();
+            let what = format!(
+                "chat {id}: children after its session {}",
+                if ended {
+                    "ended (teardown observed)"
+                } else {
+                    "did NOT end within the grace -- reclaiming anyway"
+                }
+            );
+            let label = what.clone();
+            let pids_for_kill = pids.clone();
+            let out = tokio::task::spawn_blocking(move || {
+                crate::orphans::reclaim(&pids_for_kill, &label)
+            })
+            .await
+            .unwrap_or_default();
+            tracing::info!(
+                chat = %id,
+                session_ended = ended,
+                pids = pids.len(),
+                killed = out.killed,
+                already_gone = out.already_gone,
+                failed = out.failed,
+                "chat child reclamation",
+            );
+            *last.lock().expect("last reclaim lock") = Some((what, out));
+        });
+    }
+
     /// Close one chat: shut the session down, drop its parked asks
     /// (fail-closed on the agent side, out of the inbox — issue #40),
     /// then maybe auto-distill.
+    ///
+    /// ISSUE #60: closing also RECLAIMS the session's child, deterministically
+    /// and with a reading (see reclaim_after_close). Before this a close was a
+    /// sent command plus a dropped handle: if the SDK's guard did not fire, or
+    /// fired late, the agent process outlived the chat and NOTHING said so.
     pub fn close(&self, id: RunId) -> bool {
         let chat = self.chats.lock().expect("chats lock").remove(&id);
         match chat {
             Some(c) => {
                 let _ = c.send(ChatCommand::Shutdown);
+                // The witness is taken while the session still exists: it is what
+                // proves, inside the reclaim task, that the supervisor ended.
+                let witness = c.subscribe();
+                let pid = self.child_pids.lock().expect("child pids lock").remove(&id);
                 if let Some(drop) = self.drop_asks.lock().expect("drop_asks lock").as_ref() {
                     drop(id);
                 }
                 self.maybe_auto_distill(id);
+                self.reclaim_after_close(id, pid, witness);
                 true
             }
             None => false,
@@ -1944,6 +2151,41 @@ mod generating_tests {
     use super::*;
 
     /// The mock ACP agent, built by the same workspace run.
+    /// Wait (bounded) for the manager to attribute the child of the chat just
+    /// started. None = the whole window passed without one, which a leak test
+    /// must treat as a FAILURE: a test that checks nothing is not a test.
+    async fn wait_for_child(chats: &Arc<ChatManager>, id: RunId) -> Option<u32> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            if let Some(pid) = chats.child_pid(id) {
+                return Some(pid);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait (bounded) for a reclamation reading that is NOT the previous one.
+    async fn wait_for_reclaim(
+        chats: &Arc<ChatManager>,
+        prev: Option<(String, crate::orphans::Reclaim)>,
+    ) -> (String, crate::orphans::Reclaim) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(now) = chats.last_reclaim()
+                && Some(&now) != prev.as_ref()
+            {
+                return now;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("no reclamation reading appeared within the bound (previous: {prev:?})");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     fn mock_agent() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?.parent()?; // target/<profile>
@@ -2237,6 +2479,198 @@ mod generating_tests {
         assert_eq!(real.options.len(), 1);
         assert!(real.known, "a seeded real report is knowledge");
         drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ISSUE #60: A CLOSED CHAT'S AGENT CHILD MUST BE GONE. This is the fact that
+    /// used to be invisible -- t7 measured 10 leftover ruagent-mock-agent.exe
+    /// after one e2e run, 1 leaked in each of 2 runs out of 3, and no log line
+    /// anywhere said so.
+    ///
+    /// HOW TO TRIGGER A LEAK ON PURPOSE (so a future reader can watch this test
+    /// go red): make close send Shutdown and return, i.e. drop the call to
+    /// reclaim_after_close. The child then outlives the chat and the assertion
+    /// below fails.
+    ///
+    /// WHY FIVE ROUNDS: the leak t7 measured was OCCASIONAL (1 in 2 runs out of
+    /// 3), so a single round would be a coin flip. Five rounds catch it with
+    /// roughly 97% probability, and each round prints its own reading.
+    ///
+    /// WHY THE BINARY IS COPIED FIRST: attribution narrows by IMAGE NAME, and
+    /// cargo runs the tests of this binary in parallel THREADS inside ONE
+    /// process -- another test's mock child can appear inside this test's window.
+    /// Under a name of this test's own, the reading stays about OUR child.
+    #[tokio::test]
+    async fn a_closed_chat_leaves_no_agent_child_behind() {
+        let Some(mock) = mock_agent() else {
+            panic!("mock agent binary not built next to the test exe");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-t16-reclaim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join(format!("ruagent-mock-agent-t16-{}.exe", std::process::id()));
+        std::fs::copy(&mock, &exe).expect("copying the mock binary under a name of our own");
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000016",
+            "name": "mock",
+            "harness": "mock",
+            "command": exe.display().to_string(),
+            "description": "test",
+            "model": null,
+            "reasoning_effort": null,
+            "context_window": null,
+            "mcp_profile": null,
+            "models": [],
+            "tags": [],
+            "enabled": true
+        }))
+        .expect("agent card");
+
+        let mut readings = Vec::new();
+        for round in 0..5 {
+            let chat = chats.start(&card, None, None).await.expect("start chat");
+            let cid = chat.id;
+            let pid = wait_for_child(&chats, cid).await.unwrap_or_else(|| {
+                panic!(
+                    "round {round}: the session's child was never attributed, so the \
+                     assertion below would be vacuous (see attribute_child)"
+                )
+            });
+            assert!(
+                crate::orphans::process_started_at_ms(pid).is_some(),
+                "round {round}: child {pid} is alive while the chat is open"
+            );
+            let prev = chats.last_reclaim();
+            // Drop OUR clone of the session before closing: the event channel
+            // closes when the last SENDER goes, so a test that keeps a clone
+            // alive would make the close path wait out its whole teardown grace
+            // and would never observe the teardown at all.
+            drop(chat);
+            assert!(chats.close(cid), "round {round}: the chat was live");
+            let (what, out) = wait_for_reclaim(&chats, prev).await;
+            println!("READING t16 chat close round {round}: pid {pid} -> {what} :: {out}");
+            assert_eq!(out.failed, 0, "round {round}: nothing survived the close");
+            assert!(
+                crate::orphans::process_started_at_ms(pid).is_none(),
+                "round {round}: child {pid} is GONE after the close ({out})"
+            );
+            assert!(
+                chats.attributed_child_pids().is_empty(),
+                "round {round}: a closed chat leaves no stale attribution"
+            );
+            readings.push((pid, out.killed, out.already_gone, out.failed));
+        }
+        println!(
+            "READING t16 five chat close cycles (pid, killed, already_gone, failed): {readings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ISSUE #60, the OTHER half of the reading: a chat closed MID-TURN, where
+    /// the session cannot shut down promptly (its supervisor is waiting on a
+    /// reply, so the shutdown command queues behind it). The child is alive well
+    /// inside the teardown grace, so the reclamation has to KILL it -- and the
+    /// reading has to say so instead of claiming nothing happened.
+    ///
+    /// The mock behaviour is slowreply BECAUSE that is what makes the case real:
+    /// a turn that provably spans the close (the delete test uses the same trick,
+    /// and for the same reason a fast reply made the old shape a race).
+    ///
+    /// The assertion does not demand killed == 1: a guard that wins the race
+    /// gives already_gone == 1, and BOTH are clean. What must hold is that the
+    /// child is GONE, that nothing survived, and that the close reported a
+    /// reading either way.
+    #[tokio::test]
+    async fn a_chat_closed_mid_turn_leaves_no_survivor() {
+        let Some(mock) = mock_agent() else {
+            panic!("mock agent binary not built next to the test exe");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-t16-midturn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join(format!(
+            "ruagent-mock-agent-t16mid-{}.exe",
+            std::process::id()
+        ));
+        std::fs::copy(&mock, &exe).expect("copying the mock binary under a name of our own");
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000017",
+            "name": "mock",
+            "harness": "mock",
+            "command": format!("{} --behavior slowreply", exe.display()),
+            "description": "test",
+            "model": null,
+            "reasoning_effort": null,
+            "context_window": null,
+            "mcp_profile": null,
+            "models": [],
+            "tags": [],
+            "enabled": true
+        }))
+        .expect("agent card");
+
+        let chat = chats.start(&card, None, None).await.expect("start chat");
+        let cid = chat.id;
+        let pid = wait_for_child(&chats, cid)
+            .await
+            .expect("the session's child was attributed");
+        let embedder: Arc<dyn ruagent_knowledge::embed::Embedder> =
+            Arc::new(ruagent_knowledge::embed::HashEmbedder::default());
+        chat.send_prompt(&db, embedder, "hello".into())
+            .await
+            .expect("send prompt");
+        assert!(chat.is_generating(), "the chat is mid-turn");
+        assert!(
+            crate::orphans::process_started_at_ms(pid).is_some(),
+            "child {pid} is alive during the turn"
+        );
+        let prev = chats.last_reclaim();
+        drop(chat);
+        assert!(chats.close(cid), "the chat was live");
+        let (what, out) = wait_for_reclaim(&chats, prev).await;
+        println!("READING t16 mid-turn close: pid {pid} -> {what} :: {out}");
+        assert_eq!(out.failed, 0, "nothing may survive a close: {out}");
+        assert_eq!(
+            out.total(),
+            1,
+            "the close accounted for exactly one child: {out}"
+        );
+        assert!(
+            crate::orphans::process_started_at_ms(pid).is_none(),
+            "child {pid} is GONE after the mid-turn close ({out})"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

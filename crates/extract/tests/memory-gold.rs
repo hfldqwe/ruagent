@@ -102,7 +102,10 @@ fn memory_gold_fixture_is_pinned() {
         assert_eq!(got.turns_skipped, 0, "case `{name}` must read every turn");
 
         // Every candidate is traceable to a turn of THIS transcript, and every
-        // one carries the namespace the free tier owns.
+        // one NAMES NO NAMESPACE (issue #63/#65): the free tier leaves that decision
+        // to the writer, which resolves it from the store through the one write
+        // vocabulary. Stamping one here was a second truth, and a wrong one for
+        // procedure/lesson.
         for candidate in &got.candidates {
             match &candidate.origin {
                 CandidateOrigin::Turn { index, .. } => {
@@ -115,7 +118,11 @@ fn memory_gold_fixture_is_pinned() {
                     panic!("case `{name}`: a transcript candidate has document origin {other:?}")
                 }
             }
-            assert_eq!(candidate.namespace, "user");
+            assert!(
+                candidate.namespace.is_empty(),
+                "case `{name}`: candidate `{}` names a namespace",
+                candidate.namespace
+            );
         }
     }
 }

@@ -60,6 +60,272 @@ fn remote_bind_allowed() -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// The exit trace (issue #64)
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. On 2026-10-17 the resident daemon vanished: the log ended on
+// an ordinary INFO line (chat idle, closing + mcp health ok), there was no
+// panic, no error, no shutdown record, the process was gone and the port
+// refused -- and every member's private daemon died in the same moment. A
+// symptom with no record cannot be diagnosed twice, because from the outside
+// "killed by a Windows job object" and "clean exit" look IDENTICAL when neither
+// of them writes anything.
+//
+// So every daemon writes ONE line into <root>/data/daemon.exit. At boot the line
+// says running; every path that KNOWS why it is leaving rewrites it with the
+// reason (a graceful stop, a console signal, a panic, a startup error). The
+// interesting case is the one that never gets to rewrite it -- TerminateProcess,
+// a job object's KILL_ON_JOB_CLOSE, a power loss. That case stays VISIBLE: the
+// file still says running for a pid that is no longer alive, so "no record" is
+// not "no evidence" -- it IS the evidence, and it is distinguishable from a
+// clean exit, both on the next boot (a WARN in the log) and in the launcher's
+// status command.
+pub mod exit_trace {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context, Result};
+
+    /// The file name, under <root>/data.
+    pub const FILE: &str = "daemon.exit";
+    /// The graceful-stop REQUEST a launcher writes (issue #64): a resident daemon
+    /// started by WMI has no console to send Ctrl-C to, so the launcher asks for a
+    /// clean exit through the root it already owns. Removed by its writer, and
+    /// removed at boot if a crash left one behind -- a stale request must never
+    /// kill the daemon that comes up after it.
+    pub const STOP_REQUEST: &str = "daemon.stop";
+
+    /// What the trace file said, when it was read.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Trace {
+        /// The daemon that wrote this line had not left yet.
+        Running { pid: u32, since: String },
+        /// It said why it left.
+        Exit {
+            reason: String,
+            pid: u32,
+            at: String,
+            detail: Option<String>,
+        },
+    }
+
+    impl Trace {
+        pub fn is_running(&self) -> bool {
+            matches!(self, Trace::Running { .. })
+        }
+
+        pub fn pid(&self) -> u32 {
+            match self {
+                Trace::Running { pid, .. } | Trace::Exit { pid, .. } => *pid,
+            }
+        }
+
+        /// One line for a human: what the file says, in words.
+        pub fn describe(&self) -> String {
+            match self {
+                Trace::Running { pid, since } => {
+                    format!("RUNNING pid={pid} since={since} (no exit record was written)")
+                }
+                Trace::Exit {
+                    reason,
+                    pid,
+                    at,
+                    detail,
+                } => match detail {
+                    Some(d) => format!("exit reason={reason} pid={pid} at={at} detail={d}"),
+                    None => format!("exit reason={reason} pid={pid} at={at}"),
+                },
+            }
+        }
+    }
+
+    pub fn path(root: &Path) -> PathBuf {
+        root.join("data").join(FILE)
+    }
+
+    pub fn stop_request_path(root: &Path) -> PathBuf {
+        root.join("data").join(STOP_REQUEST)
+    }
+
+    /// The timestamp format every trace line uses: RFC3339, UTC.
+    fn now() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// A detail is written as the REST of the line, so it must not be able to
+    /// break the record into two (a panic message contains newlines) or run away
+    /// with the file (a panic message can be long). Truncation is REPORTED in the
+    /// line rather than silently shortening the evidence.
+    fn sanitize(detail: &str) -> String {
+        let flat: String = detail
+            .chars()
+            .map(|c| {
+                if c == '\n' || c == '\r' || c == '\t' {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let flat = flat.trim();
+        const MAX: usize = 500;
+        if flat.chars().count() <= MAX {
+            return flat.to_string();
+        }
+        let cut: String = flat.chars().take(MAX).collect();
+        format!("{cut} [truncated]")
+    }
+
+    fn write(root: &Path, line: &str) -> Result<()> {
+        let path = path(root);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        // temp + rename, the discipline daemon.pid uses: a torn write must never
+        // be readable as a record.
+        let tmp = path.with_extension("exit.tmp");
+        std::fs::write(&tmp, line).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// This daemon is up: the line a silent death leaves behind.
+    pub fn record_running(root: &Path) -> Result<()> {
+        write(
+            root,
+            &format!("running pid={} since={}\n", std::process::id(), now()),
+        )
+    }
+
+    /// This daemon is leaving, and here is why.
+    ///
+    /// The reason is a SHORT token (graceful, stop-request, signal:console,
+    /// panic, error, server-returned); the detail is the free text that has to
+    /// survive (a panic message, an error, a launcher's note).
+    pub fn record_exit(root: &Path, reason: &str, detail: Option<&str>) -> Result<()> {
+        let mut line = format!(
+            "exit reason={} pid={} at={}",
+            reason.replace(' ', "-"),
+            std::process::id(),
+            now()
+        );
+        if let Some(d) = detail {
+            let d = sanitize(d);
+            if !d.is_empty() {
+                line.push_str(" detail=");
+                line.push_str(&d);
+            }
+        }
+        line.push('\n');
+        write(root, &line)
+    }
+
+    /// Parse one trace line. Tolerant by design: this file is read to EXPLAIN an
+    /// unexplained death, so an unreadable line comes back as None (and the caller
+    /// says so) rather than panicking in the reader.
+    pub fn parse(text: &str) -> Option<Trace> {
+        let text = text.trim();
+        let mut it = text.split_whitespace();
+        let kind = it.next()?;
+        let mut pid: Option<u32> = None;
+        let mut since: Option<String> = None;
+        let mut at: Option<String> = None;
+        let mut reason: Option<String> = None;
+        // The detail is the REST of the line: it may contain spaces.
+        let (head, detail) = match text.find("detail=") {
+            Some(i) => (&text[..i], Some(text[i + 7..].trim().to_string())),
+            None => (text, None),
+        };
+        for tok in head.split_whitespace().skip(1) {
+            match tok.split_once('=') {
+                Some(("pid", v)) => pid = v.parse::<u32>().ok(),
+                Some(("since", v)) => since = Some(v.to_string()),
+                Some(("at", v)) => at = Some(v.to_string()),
+                Some(("reason", v)) => reason = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        match kind {
+            "running" => Some(Trace::Running {
+                pid: pid?,
+                since: since?,
+            }),
+            "exit" => Some(Trace::Exit {
+                reason: reason?,
+                pid: pid?,
+                at: at?,
+                detail,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The last record, if the file exists and parses.
+    pub fn read(root: &Path) -> Option<Trace> {
+        let text = std::fs::read_to_string(path(root)).ok()?;
+        parse(&text)
+    }
+
+    /// The previous run's record, WHEN IT SAYS RUNNING AND THAT PID IS DEAD.
+    ///
+    /// This is the whole point of the file (issue #64): a daemon that was killed
+    /// could not write anything, so the trace it left is the one it wrote at boot
+    /// -- and the fact that its pid is gone makes that line a diagnosis instead of
+    /// a stale line. Note what is NOT claimed: an unreachable process table makes
+    /// the liveness check answer "not alive" for a daemon that may still be
+    /// running, so the caller LOGS this and never acts on it.
+    pub fn silent_death(root: &Path) -> Option<Trace> {
+        let trace = read(root)?;
+        if !trace.is_running() {
+            return None;
+        }
+        if crate::orphans::process_started_at_ms(trace.pid()).is_some() {
+            return None;
+        }
+        Some(trace)
+    }
+
+    /// Where the panic hook writes: a panic hook is PROCESS-wide, so the root it
+    /// can write to is process-wide too. Set once, at serve time.
+    static TRACE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    /// Install the panic hook, chained to whatever hook was installed before.
+    ///
+    /// Idempotent by Once: the first call installs, later calls only try to set a
+    /// root they cannot (the OnceLock is already set).
+    pub fn install_panic_hook(root: PathBuf) {
+        let _ = TRACE_ROOT.set(root);
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if let Some(root) = TRACE_ROOT.get() {
+                    // LOCATION AND MESSAGE, not a backtrace: this line has to be
+                    // readable in status, and the log already keeps the backtrace.
+                    let where_ = info
+                        .location()
+                        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                        .unwrap_or_else(|| "unknown location".into());
+                    let what = info
+                        .payload()
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "panic".into());
+                    let _ = record_exit(root, "panic", Some(&format!("{what} at {where_}")));
+                }
+                previous(info);
+            }));
+        });
+    }
+
+    /// Record a panic WITHOUT the hook, for a caller that has one to hand (the
+    /// tests, and any future path that catches an unwind itself).
+    pub fn record_panic(root: &Path, message: &str, location: &str) -> Result<()> {
+        record_exit(root, "panic", Some(&format!("{message} at {location}")))
+    }
+}
+
 pub async fn serve(root: PathBuf, addr: SocketAddr) -> Result<()> {
     serve_with_remote(root, addr, false).await
 }
@@ -73,9 +339,67 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
         )
         .init();
 
+    // Issue #64, the measurement the startup-method question needs: WAS THIS
+    // PROCESS ALREADY INSIDE A WINDOWS JOB OBJECT when it started? Asked BEFORE
+    // the orphan sweep, because that sweep creates a job of its own -- after it,
+    // the answer is always yes and the question is gone. A daemon handed to WMI
+    // and one started by a job-managing parent look identical from inside until
+    // you ask this, and "killed with no trace" is exactly what an outer job's
+    // KILL_ON_JOB_CLOSE looks like.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // BOOL is i32; spelled out rather than imported, the same way
+        // orphans.rs spells the exit-code out parameter.
+        let mut inside: i32 = 0;
+        let checked = unsafe {
+            IsProcessInJob(
+                GetCurrentProcess(),
+                std::ptr::null_mut(),
+                &mut inside as *mut i32,
+            )
+        };
+        if checked != 0 {
+            tracing::info!(
+                in_an_outer_job_object = inside != 0,
+                "startup job-object measurement (issue #64): true = this process was \
+                 already inside somebody else's job when it started"
+            );
+        } else {
+            tracing::warn!("startup job-object measurement (issue #64) could not be taken");
+        }
+    }
+
     // Orphan sweep (issue #44): a daemon that died leaves its agent
     // children running — kill them before anything new spawns.
     orphans::boot(&root);
+
+    // Issue #64: leave a trace a kill cannot erase. The PREVIOUS record is read
+    // first, because a "running" line whose pid is gone is exactly the shape the
+    // 2026-10-17 disappearance had -- and reading it here is what turns the next
+    // boot into the place the diagnosis becomes visible.
+    if let Some(dead) = exit_trace::silent_death(&root) {
+        tracing::warn!(
+            trace = %dead.describe(),
+            "the previous daemon left NO exit record: it was killed (job object / \
+             TerminateProcess / power loss), not shut down"
+        );
+    }
+    exit_trace::install_panic_hook(root.clone());
+    if let Err(e) = exit_trace::record_running(&root) {
+        tracing::warn!(error = %e, "writing the exit trace failed");
+    }
+    // A stop request left behind by a crashed run belongs to that run, never to
+    // this one: honouring it would make a restart impossible.
+    let stale_stop = exit_trace::stop_request_path(&root);
+    if stale_stop.is_file() {
+        tracing::warn!(
+            path = %stale_stop.display(),
+            "removing a stop request left by a previous run"
+        );
+        let _ = std::fs::remove_file(&stale_stop);
+    }
 
     let config = config::DaemonConfig::load(&root)?;
     let db = Db::open(root.join("data").join("ruagent.db")).with_context(|| "opening database")?;
@@ -365,6 +689,270 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
              reachable from the network and there is no authentication"
         );
     }
-    axum::serve(listener, app).await?;
-    Ok(())
+    // Issue #64: the server now has a SHUTDOWN path, and every way out of it
+    // writes the exit trace first -- so "the daemon is gone" and "why" stop being
+    // two different questions.
+    let why: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let (signal, gate) = shutdown_signal(root.clone(), std::sync::Arc::clone(&why));
+    let server = axum::serve(listener, app).with_graceful_shutdown(signal);
+    let served = tokio::select! {
+        r = server => r,
+        _ = async move {
+            gate.notified().await;
+            tokio::time::sleep(EXIT_DRAIN).await;
+        } => Ok(()),
+    };
+    match served {
+        Ok(()) => {
+            let reason = why
+                .lock()
+                .expect("exit reason lock")
+                .clone()
+                .unwrap_or_else(|| "server-returned".to_string());
+            if let Err(e) = exit_trace::record_exit(&root, &reason, None) {
+                tracing::warn!(error = %e, "writing the exit trace failed");
+            }
+            tracing::info!(reason = %reason, "daemon leaving: the exit trace was written");
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(werr) = exit_trace::record_exit(&root, "error", Some(&e.to_string())) {
+                tracing::warn!(error = %werr, "writing the exit trace failed");
+            }
+            tracing::error!(error = %e, "the server stopped with an error");
+            Err(anyhow::Error::new(e).context("serving the API"))
+        }
+    }
+}
+
+/// How long a graceful stop may take before the process leaves anyway.
+///
+/// A graceful shutdown waits for in-flight requests, and the panel's SSE streams
+/// do not end by themselves -- so an unbounded wait would turn a stop into a
+/// hang. EXIT_DRAIN is the whole budget, and the trace on disk already says why.
+const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The two ways a stop reaches a console-less daemon, as ONE future.
+///
+/// Returns the future the server shuts down on, plus a gate that fires at the
+/// same moment so the drain above can be bounded. The reason lands in the shared
+/// slot BEFORE the future resolves, so the exit trace cannot race it.
+fn shutdown_signal(
+    root: PathBuf,
+    why: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) -> (
+    impl std::future::Future<Output = ()>,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
+    let fired = std::sync::Arc::new(tokio::sync::Notify::new());
+    let gate = std::sync::Arc::clone(&fired);
+    let stop_request = exit_trace::stop_request_path(&root);
+    let signal = async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                // Console events: Ctrl-C, Ctrl-Break, and (through the same
+                // handler) console close / logoff / shutdown. This is the path a
+                // FOREGROUND daemon takes, and the one a machine shutdown leaves.
+                _ = tokio::signal::ctrl_c() => {
+                    *why.lock().expect("exit reason lock") = Some("signal:console".into());
+                    break;
+                }
+                _ = tick.tick() => {
+                    if stop_request.is_file() {
+                        *why.lock().expect("exit reason lock") = Some("stop-request".into());
+                        break;
+                    }
+                }
+            }
+        }
+        fired.notify_one();
+    };
+    (signal, gate)
+}
+
+#[cfg(test)]
+mod exit_trace_tests {
+    use super::exit_trace::{self, Trace};
+
+    fn unique_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-t20-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// The boot line, and the reason it is enough: a LIVE pid behind it means
+    /// nothing is wrong yet.
+    #[test]
+    fn a_boot_record_says_running_and_names_this_process() {
+        let root = unique_root("running");
+        exit_trace::record_running(&root).unwrap();
+        let raw = std::fs::read_to_string(exit_trace::path(&root)).unwrap();
+        println!("READING t20 boot record: {}", raw.trim());
+        let trace = exit_trace::read(&root).expect("a record");
+        assert!(trace.is_running(), "{trace:?}");
+        assert_eq!(trace.pid(), std::process::id());
+        assert!(
+            exit_trace::silent_death(&root).is_none(),
+            "this pid IS alive, so this is not a death"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE WHOLE POINT (issue #64): a daemon that was KILLED could not write
+    /// anything, so the trace it leaves is the boot line -- and a boot line whose
+    /// pid is gone IS the diagnosis. Measured against a pid that really is gone
+    /// (a child, reaped).
+    #[test]
+    fn a_dead_pid_behind_a_running_line_is_the_trace_of_a_kill() {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "exit", "0"]);
+            c
+        };
+        #[cfg(unix)]
+        let mut cmd = std::process::Command::new("true");
+        #[cfg(not(any(windows, unix)))]
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn a short-lived child");
+        let dead = child.id();
+        let _ = child.wait();
+        let root = unique_root("killed");
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(
+            exit_trace::path(&root),
+            format!("running pid={dead} since=2026-10-17T00:00:00.000Z\n"),
+        )
+        .unwrap();
+        let trace = exit_trace::silent_death(&root)
+            .expect("a dead pid behind a running line IS the trace of a kill");
+        println!("READING t20 silent death: {}", trace.describe());
+        assert_eq!(trace.pid(), dead);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A clean exit replaces the boot line, so the two are distinguishable BY
+    /// READING THE FILE -- which is the acceptance.
+    #[test]
+    fn a_clean_exit_reads_as_an_exit_not_as_a_silent_death() {
+        let root = unique_root("clean");
+        exit_trace::record_running(&root).unwrap();
+        exit_trace::record_exit(&root, "stop-request", Some("the launcher asked")).unwrap();
+        let raw = std::fs::read_to_string(exit_trace::path(&root)).unwrap();
+        println!("READING t20 clean record: {}", raw.trim());
+        match exit_trace::read(&root).expect("a record") {
+            Trace::Exit {
+                reason,
+                detail,
+                pid,
+                ..
+            } => {
+                assert_eq!(reason, "stop-request");
+                assert_eq!(detail.as_deref(), Some("the launcher asked"));
+                assert_eq!(pid, std::process::id());
+            }
+            other => panic!("expected an Exit record, got {other:?}"),
+        }
+        assert!(
+            exit_trace::silent_death(&root).is_none(),
+            "an exit record is not a silent death"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A REAL panic, through the REAL hook: the message and its location have to
+    /// survive, because "it panicked" without "where" is the same dead end the
+    /// 2026-10-17 disappearance was.
+    #[test]
+    fn the_panic_hook_writes_reason_panic_with_the_message_and_location() {
+        let root = unique_root("panic");
+        exit_trace::install_panic_hook(root.clone());
+        let handle = std::thread::spawn(|| panic!("t20 deliberate panic"));
+        assert!(handle.join().is_err(), "the thread did panic");
+        let raw = std::fs::read_to_string(exit_trace::path(&root)).unwrap();
+        println!("READING t20 panic record: {}", raw.trim());
+        match exit_trace::read(&root).expect("a record") {
+            Trace::Exit { reason, detail, .. } => {
+                assert_eq!(reason, "panic");
+                let d = detail.expect("the message survives");
+                assert!(d.contains("t20 deliberate panic"), "{d}");
+                assert!(d.contains("lib.rs"), "and its location: {d}");
+            }
+            other => panic!("expected a panic record, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The graceful stop of a daemon that HAS no console: a request file in the
+    /// root it owns. This is what the launcher's stop uses, and it is measured
+    /// here without starting a process.
+    #[tokio::test]
+    async fn a_stop_request_is_how_a_console_less_daemon_is_asked_to_leave() {
+        let root = unique_root("stop");
+        let why: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        let (signal, _gate) = super::shutdown_signal(root.clone(), std::sync::Arc::clone(&why));
+        let waiter = tokio::spawn(signal);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            why.lock().unwrap().is_none(),
+            "nothing has asked for a stop yet"
+        );
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(exit_trace::stop_request_path(&root), "stop\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), waiter)
+            .await
+            .expect("the stop request is noticed")
+            .unwrap();
+        let reason = why.lock().unwrap().clone();
+        println!("READING t20 stop request reason: {reason:?}");
+        assert_eq!(reason.as_deref(), Some("stop-request"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The file is read to EXPLAIN an unexplained death, so a torn or unknown line
+    /// must come back as nothing instead of panicking in the reader.
+    #[test]
+    fn a_torn_or_unknown_line_parses_as_nothing() {
+        assert!(exit_trace::parse("").is_none());
+        assert!(exit_trace::parse("garbage").is_none());
+        assert!(exit_trace::parse("running pid=notanumber since=x").is_none());
+        assert!(exit_trace::parse("exit pid=1 at=x").is_none(), "no reason");
+        assert!(exit_trace::parse("exit reason=panic pid=1 at=x").is_some());
+        // A detail with spaces (a panic message) survives whole.
+        match exit_trace::parse("exit reason=panic pid=1 at=x detail=boom happened here") {
+            Some(trace) => assert_eq!(
+                trace.describe(),
+                "exit reason=panic pid=1 at=x detail=boom happened here"
+            ),
+            None => panic!("a record with a spaced detail must parse"),
+        }
+    }
+
+    /// The detail is the rest of the line, so a newline in it must not be able to
+    /// turn one record into two unparseable ones.
+    #[test]
+    fn a_multiline_detail_stays_one_record() {
+        let root = unique_root("multiline");
+        exit_trace::record_exit(&root, "panic", Some("first\nsecond\tthird")).unwrap();
+        let raw = std::fs::read_to_string(exit_trace::path(&root)).unwrap();
+        println!("READING t20 flattened record: {}", raw.trim());
+        assert_eq!(raw.lines().count(), 1, "one line, whatever the detail held");
+        match exit_trace::read(&root).expect("a record") {
+            Trace::Exit { detail, .. } => {
+                assert_eq!(detail.as_deref(), Some("first second third"))
+            }
+            other => panic!("expected an Exit record, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

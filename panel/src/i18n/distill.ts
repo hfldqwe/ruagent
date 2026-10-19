@@ -80,6 +80,12 @@ export const zh: Record<string, string> = {
   "distill.ledger.status.empty": "无内容",
   "distill.ledger.status.failed": "失败",
   "distill.ledger.status.not_recorded": "未记录",
+  // #62: an attempt whose status is "ok" can still have written NOTHING, because
+  // the write vocabulary refused every candidate. Shown beside the status so an
+  // ok/0 row cannot be read as an ok/3 row, and never as the "empty" outcome —
+  // "empty" (没有内容) and "wrote nothing" are different facts.
+  "distill.ledger.wroteNothing": "0 写入",
+  "distill.ledger.wroteNothingHint": "这一趟跑了、也记了账，但一条记忆都没写。原因看「原因」列：整个 pass 被写入词表拒绝时，daemon 会把被拒的 store × namespace 写在那里。",
 
   // ---- batch distillation (t8 / #47) ----
   "distill.batch.open": "批量蒸馏未处理 {n} 条",
@@ -188,6 +194,11 @@ export const en: Record<string, string> = {
   "distill.ledger.status.empty": "empty",
   "distill.ledger.status.failed": "failed",
   "distill.ledger.status.not_recorded": "not recorded",
+  // #62: an "ok" attempt can still have written NOTHING when the write
+  // vocabulary refused every candidate. Shown beside the status so ok/0 cannot
+  // read as ok/3 -- and never as the "empty" outcome, which is a different fact.
+  "distill.ledger.wroteNothing": "0 written",
+  "distill.ledger.wroteNothingHint": "The pass ran and was recorded, but not one memory was written. See the Reason column: when the whole pass was refused by the write vocabulary, the daemon writes the refused store x namespace pairs there.",
 
   // ---- batch distillation (t8 / #47) ----
   "distill.batch.open": "Batch-distill {n} unprocessed",

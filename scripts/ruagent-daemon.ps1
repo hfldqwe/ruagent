@@ -26,8 +26,35 @@
 # Logging: <root>/logs/daemon.log, appended, rotated to daemon.log.1 at 5 MB.
 # Stop:    refuses to run without -Force (a script cannot post to the team channel, so
 #          it refuses to be silent instead); with -Force it first APPENDS a notice to
-#          <root>/logs/daemon-stop-notice.log (rotated to .1 at 256 KB) and then stops
-#          the recorded pid.
+#          <root>/logs/daemon-stop-notice.log (rotated to .1 at 256 KB), then ASKS for a
+#          clean exit (<root>/data/daemon.stop, 10s) and only then forces the pid.
+#
+# WHY A DAEMON THAT VANISHES NOW LEAVES EVIDENCE (issue #64, 2026-10-17).
+#   The resident daemon disappeared with no panic, no error and no shutdown line: the
+#   log ended on an ordinary INFO (chat idle, closing + mcp health ok), the process was
+#   gone and the port refused -- and every member's private daemon died with it. From
+#   outside, "a job object killed it" and "it exited cleanly" looked IDENTICAL, because
+#   neither wrote anything. Now every daemon writes <root>/data/daemon.exit at boot
+#   ("running pid=... since=...") and rewrites it with a reason on every path that knows
+#   why it is leaving ("exit reason=stop-request|signal:console|panic|error ..."). A
+#   KILLED daemon is the case that cannot rewrite it -- so the trace it leaves is its
+#   boot line, and "status" reads that line WITH the liveness of its pid and reports
+#   "DIED WITHOUT A TRACE". The next boot also logs a WARN about it.
+#
+# START METHOD, MEASURED (2026-10-19, this machine). "start" uses WMI
+# (Win32_Process.Create) because the child is owned by the WMI service rather than by
+# the calling shell: measured, the daemon is still alive after the calling shell's call
+# returns. A plain background start from that same shell does not survive it (t188), and
+# Start-Process -RedirectStandardOutput truncated the previous log, which destroyed the
+# evidence of the previous death. The scheduled task ("install-task") is the unattended
+# path and launches conhost.exe --headless -- see that comment for why a console
+# application there puts a window on screen.
+#   Whether to request job-object BREAKAWAY was left OPEN BY MEASUREMENT, not by
+#   preference: the daemon now logs, at every boot, whether it was already inside
+#   somebody else's job ("startup job-object measurement"), measured BEFORE the orphan
+#   sweep creates the daemon's own job. If the next disappearance shows a foreign job
+#   there, breakaway becomes the evidenced fix; requesting it now would also let the
+#   daemon escape a job that is deliberately containing it, on no measurement at all.
 param(
   [Parameter(Position=0)][ValidateSet('start','stop','status','watch','install-task')][string]$Action = 'status',
   [string]$Root = (Join-Path $env:USERPROFILE '.ruagent'),
@@ -49,6 +76,8 @@ $logDir = Join-Path $Root 'logs'
 $log    = Join-Path $logDir 'daemon.log'
 $pidRec = Join-Path $Root 'data\daemon.pid'
 $notice = Join-Path $logDir 'daemon-stop-notice.log'
+$trace  = Join-Path $Root 'data\daemon.exit'    # issue #64: WHY the last daemon left
+$stopReq = Join-Path $Root 'data\daemon.stop'   # issue #64: the graceful-stop request
 $health = "http://$Addr/api/v1/health"
 
 function Get-LogPath {
@@ -159,8 +188,28 @@ switch ($Action) {
     $reasonText = 'unspecified'
     if ($Reason) { $reasonText = $Reason }
     Add-Content -Path $noticePath -Value ('[' + $stamp + '] pid=' + $p + ' root=' + $Root + ' reason=' + $reasonText + ' announce=' + $announce)
-    Stop-Process -Id $p -ErrorAction SilentlyContinue
-    Write-Output "stopped pid=$p"
+    # Issue #64: ask for a CLEAN exit first, and force only what ignores the ask.
+    # A daemon started through WMI has NO console, so there is no Ctrl-C to send it:
+    # the request file under the root it already owns is the only channel it has, and
+    # the daemon polls it and leaves through its own shutdown path -- which is what
+    # writes "exit reason=stop-request ..." into data/daemon.exit. The forced path is
+    # kept, because a daemon that is wedged must still be stoppable -- and it is
+    # exactly the case that leaves NO exit record, which is how status tells them apart.
+    New-Item -ItemType Directory -Force -Path (Split-Path $stopReq) | Out-Null
+    Set-Content -Path $stopReq -Value ('stop requested by ' + $env:USERNAME + ' at ' + $stamp + ' reason=' + $reasonText)
+    $graceful = $false
+    for ($i = 0; $i -lt 40; $i++) {
+      Start-Sleep -Milliseconds 250
+      if (-not (Get-Process -Id $p -ErrorAction SilentlyContinue)) { $graceful = $true; break }
+    }
+    if ($graceful) {
+      Write-Output "stopped pid=$p (GRACEFUL: it honoured the stop request and wrote its exit trace)"
+    } else {
+      Stop-Process -Id $p -ErrorAction SilentlyContinue
+      Write-Output "stopped pid=$p (FORCED after 10s: a forced stop cannot write an exit trace)"
+    }
+    if (Test-Path $stopReq) { Remove-Item -Force $stopReq }
+    if (Test-Path $trace) { Write-Output ('exit trace: ' + (Get-Content -Path $trace -TotalCount 1)) }
     Write-Output ('notice appended: ' + $noticePath)
   }
   'status' {
@@ -177,6 +226,30 @@ switch ($Action) {
     }
     Write-Output "health: $healthText"
     Write-Output "pid:    $pidText"
+    # Issue #64: WHY the last daemon left -- and the one case that has no record.
+    # A killed daemon could not write anything, so the trace it left is the line it
+    # wrote at BOOT; read together with the liveness of that pid, that line is the
+    # diagnosis instead of a stale line. This is the whole difference the trace buys:
+    # "shut down" and "was killed" stop looking the same from outside.
+    if (Test-Path $trace) {
+      $line = (Get-Content -Path $trace -TotalCount 1)
+      Write-Output ("exit trace: " + $line)
+      $m = [regex]::Match($line, '^running\s')
+      if ($m.Success) {
+        $tp = [regex]::Match($line, 'pid=(\d+)')
+        if ($tp.Success) {
+          $tpid = [int]$tp.Groups[1].Value
+          $alive = Get-Process -Id $tpid -ErrorAction SilentlyContinue
+          if ($alive) {
+            Write-Output ("exit trace: pid $tpid is ALIVE, so that line is this daemon's boot record (it has not left)")
+          } else {
+            Write-Output ("exit trace: DIED WITHOUT A TRACE -- pid $tpid is gone and NO exit record was written: killed (job object / TerminateProcess / power loss), not shut down")
+          }
+        }
+      }
+    } else {
+      Write-Output 'exit trace: none (no data/daemon.exit on this root: no daemon has ever recorded one here)'
+    }
     if (Test-Path $log) { Write-Output 'log tail:'; Get-Content $log -Tail 8 }
   }
   'watch' {

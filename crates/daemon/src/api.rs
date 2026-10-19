@@ -442,6 +442,69 @@ impl From<ruagent_store::DbError> for ApiError {
     }
 }
 
+/// The governed write path's OWN error, mapped to the status its SHAPE deserves
+/// (issue #61 / ruagent-issues-56-59 t15).
+///
+/// WHY THIS IS NOT A `From<DbError>` DECISION. `DbError` says "the database failed"
+/// and 500 is the honest answer for it. A REFUSAL says "this request cannot be
+/// honoured as written": the caller is at fault and the answer has to say 4xx. Both
+/// used to arrive as `DbError::Sqlite(… SQLITE_CONSTRAINT …)`, because the pipeline
+/// BUILT its refusals as constraint-shaped failures -- so a caller who named a row
+/// that was no longer current was told the daemon had broken. The pipeline now NAMES
+/// them (`ruagent_memory::write::WriteError`) and this impl reads those names: it
+/// never reads `ruagent-store`'s message text, which is the shape issue #61 rejects
+/// (prose in one crate must not become another crate's contract).
+///
+/// 409 vs 422, and why each: "the row you named is not current" is a CONFLICT with
+/// the state the request was written against, and so is "that content's key is held
+/// by a dead tombstone"; a client branches on 409 for exactly that family, as it
+/// already does for the capability gate. "There is no such row at all" is a body
+/// that cannot be processed however often it is resent, which is what 422 means. A
+/// genuine storage failure stays a 500 (the last arm) -- that is the only case where
+/// the daemon is the one that broke.
+impl From<ruagent_memory::write::WriteError> for ApiError {
+    fn from(e: ruagent_memory::write::WriteError) -> Self {
+        use ruagent_memory::write::WriteError as W;
+        let message = e.to_string();
+        match e {
+            W::SupersedeNotCurrent {
+                old,
+                store,
+                namespace,
+            } => ApiError::json(
+                StatusCode::CONFLICT,
+                message.clone(),
+                serde_json::json!({
+                    "error": message,
+                    "store": store,
+                    "namespace": namespace,
+                    "supersedes": old,
+                    "audit_op": "supersede_refused",
+                }),
+            ),
+            W::SupersedeMissing { old } => ApiError::json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                message.clone(),
+                serde_json::json!({
+                    "error": message,
+                    "supersedes": old,
+                    "audit_op": "supersede_missing",
+                }),
+            ),
+            W::InsertBlockedByTombstone { tombstone } => ApiError::json(
+                StatusCode::CONFLICT,
+                message.clone(),
+                serde_json::json!({
+                    "error": message,
+                    "tombstone": tombstone,
+                    "audit_op": "insert_refused",
+                }),
+            ),
+            W::Db(_) | W::Sqlite(_) => ApiError::internal(message),
+        }
+    }
+}
+
 impl From<rusqlite::Error> for ApiError {
     fn from(e: rusqlite::Error) -> Self {
         Self {
@@ -727,6 +790,15 @@ async fn memory_supersede(
     State(state): State<AppState>,
     Json(req): Json<SupersedeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // THE SAME EMPTY-BODY RULE AS /memory/write (issue #61 / t15), for the same
+    // reason: superseding with nothing would retire the old row and store no
+    // replacement -- the fact is gone and the answer would say 200. Refused BEFORE
+    // the lookup, because a body this shape can be answered without touching storage.
+    if req.new_content.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "new_content is empty (or only whitespace): there is nothing to store, and superseding with nothing would retire the old row without a replacement",
+        ));
+    }
     let old = ruagent_memory::query::get_memory(state.mgr.db(), req.id)
         .await?
         .ok_or_else(|| ApiError::not_found("memory not found"))?;
@@ -3820,7 +3892,59 @@ async fn session_distill(
         .distill_plan(&key, card.as_ref(), plan, dry_run)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    Ok(Json(serde_json::json!({ "distilled": out })))
+    distill_answer(out)
+}
+
+/// THE ANSWER FOR ONE SESSION, in one place, so the status contract cannot drift from
+/// the test that pins it (issue #62).
+///
+/// THE DEFECT THIS CLOSES. A pass whose every memory candidate was refused by the WRITE
+/// VOCABULARY (the store×namespace matrix, design 6.2) wrote NOTHING, and this route
+/// answered 200 with memories_written = 0 -- byte-for-byte the same answer as a session
+/// that had nothing worth keeping. A caller could not tell "nothing to distil" from
+/// "the store refused everything we found", which is issue #56's defect on the
+/// distillation surface instead of the memory/write one.
+///
+/// 409 CONFLICT is the status this daemon already uses for "understood, well-formed, and
+/// refused by a RULE" (issue #56's memory/write refusal, the capability gate), so both
+/// refusals stay on one status a client can branch on. The body keeps EVERY key the 200
+/// carried -- the whole outcome rides in "distilled" -- plus the refusal as DATA (the
+/// pairs, what each store accepts, and the sentence), so a caller that read the old
+/// contract finds everything it used to read.
+///
+/// A PARTIAL PASS IS STILL A 200: when some memories landed, "refused two of ten" is a
+/// fact about the pass, not a failed request, and it is reported inside the outcome
+/// (memories_refused + refusals) rather than by hiding what did land.
+fn distill_answer(
+    out: crate::distill::DistillOutcome,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // A DRY RUN IS NEVER REFUSED. Nothing was supposed to be written, so "nothing was
+    // written" says nothing about the request; the refusal still rides the outcome
+    // (memories_refused/refusals), so a caller pricing a session sees that its
+    // candidates cannot land.
+    if out.dry_run || !out.write_refused_everything() {
+        return Ok(Json(serde_json::json!({ "distilled": out })));
+    }
+    let refused = out.memories_refused;
+    let written = out.memories_written;
+    let skipped = out.memories_skipped;
+    let pairs = out.refusals.clone();
+    let message = format!(
+        "nothing was written: this pass proposed {refused} memories and the write vocabulary refused every one of them (design 6.2). Each refusal names the store, the namespace and the rule"
+    );
+    Err(ApiError::json(
+        StatusCode::CONFLICT,
+        message.clone(),
+        serde_json::json!({
+            "error": message,
+            "outcome": format!("{:?}", ruagent_memory::write::WriteOutcome::RejectedNamespace),
+            "refused": pairs,
+            "memories_refused": refused,
+            "memories_written": written,
+            "memories_skipped": skipped,
+            "distilled": out,
+        }),
+    ))
 }
 
 /// The daemon's distiller, from the LIVE policy: its agent, else dsh, else the
@@ -3986,6 +4110,7 @@ async fn sessions_distill_batch(
             "attempted": 0,
             "ok": 0,
             "empty": 0,
+            "refused": 0,
             "failed": 0,
             "estimated": estimated,
             "actual": serde_json::Value::Null,
@@ -4010,6 +4135,15 @@ async fn sessions_distill_batch(
 
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(planned.len());
     let (mut ok, mut empty, mut failed) = (0u32, 0u32, 0u32);
+    // ISSUE #62's OWN CLASS, counted BESIDE the ledger's three words rather than as a
+    // fourth one. "status" stays the ledger's vocabulary ON PURPOSE: this daemon's
+    // readers enumerate it (the panel's LEDGER_STATUSES/LEDGER_BUCKETS and their i18n
+    // keys, the CLI's distill_one), and a new word would be silently dropped by them.
+    // So the axis is explicit instead: "refused" counts the entries whose status is ok
+    // and which nevertheless wrote NOTHING because every candidate was refused -- a
+    // SUBSET marker (refused <= ok), which is why ok + empty + failed == attempted
+    // still holds and every existing reader keeps its arithmetic.
+    let mut refused = 0u32;
     for key in &planned {
         let before = standing.get(key).and_then(|st| st.latest_id);
         let attempt: Result<crate::distill::DistillOutcome, String> = distiller
@@ -4018,6 +4152,21 @@ async fn sessions_distill_batch(
             .map_err(|e| format!("{e:#}"));
         let written = attempt_written_since(db, key, before).await?;
         let (status, reason) = classify_attempt(&attempt, written);
+        // What the ATTEMPT said about the write vocabulary, taken from the outcome
+        // rather than from the row (the ledger has no refusal column -- see
+        // DistillOutcome::refusal_reason), so the batch reports the same fact the
+        // single route's 409 does.
+        let (mem_written, mem_refused, refusals) = match &attempt {
+            Ok(out) => (
+                out.memories_written,
+                out.memories_refused,
+                serde_json::json!(out.refusals),
+            ),
+            Err(_) => (0, 0, serde_json::Value::Array(Vec::new())),
+        };
+        if mem_refused > 0 && mem_written == 0 {
+            refused += 1;
+        }
         match status.as_str() {
             "ok" => ok += 1,
             "empty" => empty += 1,
@@ -4031,6 +4180,9 @@ async fn sessions_distill_batch(
             "session_key": key,
             "status": status,
             "reason": reason,
+            "memories_written": mem_written,
+            "memories_refused": mem_refused,
+            "refusals": refusals,
         }));
     }
     let actual = batch_actual(db, start_id).await?;
@@ -4042,6 +4194,7 @@ async fn sessions_distill_batch(
         "attempted": results.len(),
         "ok": ok,
         "empty": empty,
+        "refused": refused,
         "failed": failed,
         "estimated": estimated,
         "actual": actual,
@@ -6423,9 +6576,11 @@ struct MemoryWriteRequest {
 /// well-formed, and refused by a RULE rather than by a malformed value" (the
 /// capability gate, `ApiError::conflict`). The pair is not a value error — each
 /// half is valid on its own — and it is not a format error to fix and retry. 422
-/// ("well-formed, semantically unprocessable") is the other defensible choice;
-/// in this daemon 422 currently comes only from axum's OWN `Json` extractor (a
-/// required field the body does not carry), so 409 keeps every refusal this
+/// ("well-formed, semantically unprocessable") is the other defensible choice, and
+/// the daemon now DOES use it for one refusal of its own (a `supersedes` id that
+/// exists nowhere -- see the `From<WriteError>` impl). A pair the governance matrix
+/// forbids is a conflict with the store's write VOCABULARY rather than a body that
+/// can never be processed, so it stays 409 beside the capability gate.
 /// daemon DECIDES on one status a client can branch on.
 ///
 /// `outcome` repeats the EXACT string the 200 body carried (`{:?}` of the
@@ -6474,9 +6629,11 @@ fn refused_store_namespace(
 /// | the store×namespace pair is not in the store's write vocabulary | **409** | `refused_store_namespace` above: the sentence names BOTH values, the store's vocabulary and the rule, and the JSON body carries `outcome` (the same string the old 200 carried), `store`, `namespace`, `reason`, `allowed_namespaces` |
 /// | pair allowed, content new | 200 | `{"outcome":"Inserted(<id>)"}` |
 /// | pair allowed, identical current content | 200 | `{"outcome":"SkippedDuplicate(<id>)"}` — nothing inserted, and the state is the one the caller asked for; the body names which row it already is |
-/// | pair allowed, `supersedes` names a row that is not a CURRENT row of that store+namespace | 500 | the pipeline's refusal travels as `DbError` (`crates/memory/src/write.rs`), so it arrives as an internal error. A KNOWN GAP, and NOT the class #56 is about: the caller still cannot read it as a write, but the fault is the CALLER's where a 5xx says the daemon broke. Recorded here rather than fixed here: the classification belongs to `ruagent-memory`, and deciding it in this file would mean matching that crate's message text |
-/// | pair allowed, `supersedes` names an id that does not exist | 500 | same shape (the FK violation on `memories.supersedes`) |
-/// | pair allowed, `content` empty | 200 | `{"outcome":"Inserted(<id>)"}`, an empty body row. A data-quality gap, deliberately UNCHANGED: an empty string is not the daemon refusing, and the pair IS allowed — answering 4xx would change what an allowed combination returns |
+/// | pair allowed, `content` empty or only whitespace | 400 | sentence naming `content` and why nothing can be stored; NO episode and NO audit row (the request never reached the pipeline -- the same shape as an unknown store) |
+/// | pair allowed, `supersedes` names a row that is not a CURRENT row of that store+namespace | **409** | `WriteError::SupersedeNotCurrent`: sentence naming the id, the store, the namespace and the rule, plus `store`/`namespace`/`supersedes`/`audit_op` (see the `From<WriteError>` impl above) |
+/// | pair allowed, `supersedes` names an id that exists NOWHERE | **422** | `WriteError::SupersedeMissing`: sentence naming the id, plus `supersedes`/`audit_op`. Was a 500 until issue #61 -- the FK violation on `memories.supersedes` was the only thing that knew, and a constraint-shaped `DbError` renders as "the daemon broke" |
+/// | pair allowed, the content's key is held by a tombstone that is ALSO superseded | **409** | `WriteError::InsertBlockedByTombstone`: sentence naming the tombstone, plus `tombstone`/`audit_op`. Was a 500 for the same reason |
+/// | the database itself fails (locked, closed, a statement error) | 500 | the daemon IS the one that broke, so the status says so: `WriteError::Db`/`Sqlite` keep the old rendering |
 /// | `store`/`namespace`/`content` missing, `null` or the wrong type | 422 | axum's `Json` rejection, before this handler runs |
 /// | body is not JSON at all | 400 | axum's `Json` rejection |
 /// | missing/wrong `Content-Type` | 415 | axum's `Json` rejection |
@@ -6506,6 +6663,18 @@ async fn memory_write(
             req.namespace
         )));
     };
+    // AN EMPTY BODY IS A REQUEST TO STORE NOTHING (issue #61 / t15). This route used
+    // to answer `200 {"outcome":"Inserted(<id>)"}` and insert the row: it occupied the
+    // unique key `(store, namespace, content_hash)` for ever, counted as a memory a
+    // pass "wrote", and carried no fact. The panel already refuses to submit one (its
+    // button is disabled on `!content.trim()`), so the API agreeing with its own UI is
+    // ONE rule instead of two. Refused BEFORE the episode and the audit row, like an
+    // unknown store: nothing happened yet, so there is nothing to record.
+    if req.content.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "content is empty (or only whitespace): there is nothing to store -- an empty body would occupy the (store, namespace, content_hash) key without carrying a memory",
+        ));
+    }
     let episode = ruagent_memory::episode::record_episode(
         state.mgr.db(),
         ruagent_memory::episode::EpisodeKind::McpWrite,
@@ -7639,6 +7808,35 @@ mod tests {
         .unwrap();
     }
 
+    /// The NEWEST attempt's (status, failure_reason as an empty string, memories_written)
+    /// for one session key. The reason is read as an EMPTY STRING so "no reason" is a
+    /// value the assertions can name rather than a NULL they have to special-case.
+    async fn ledger_row(db: &ruagent_store::Db, key: &str) -> (String, String, i64) {
+        let key = key.to_string();
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COALESCE(status,'<null>'), COALESCE(failure_reason,''), memories_written
+                 FROM distill_log WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Every memory row's (store, namespace, content) on this test's PRIVATE database.
+    async fn memory_rows(db: &ruagent_store::Db) -> Vec<(String, String, String)> {
+        db.call_flat(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT store, namespace, content FROM memories ORDER BY id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })
+        .await
+        .unwrap()
+    }
+
     /// The `distill_log` status of every attempt for one session, in write order.
     async fn distill_statuses(db: &ruagent_store::Db, key: &str) -> Vec<String> {
         let key = key.to_string();
@@ -7656,6 +7854,284 @@ mod tests {
         db.call_flat(|conn| conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)))
             .await
             .unwrap()
+    }
+
+    /// ISSUE #62: the RESPONSE LAYER's decision, asserted without an HTTP round trip --
+    /// which is what makes the refusal's status and body a reading rather than a
+    /// by-product of one route's plumbing.
+    ///
+    /// Built by hand on purpose: DistillOutcome is the value the route decides on, and
+    /// constructing it here (instead of driving a model) is what keeps this test
+    /// deterministic and free.
+    #[test]
+    fn a_refused_distillation_answers_409_and_a_partial_one_stays_200() {
+        let pair = crate::distill::RefusedMemory {
+            store: "lesson".to_string(),
+            namespace: "user".to_string(),
+            allowed_namespaces: vec!["project:<x>", "global"],
+            reason: "store 'lesson' cannot write namespace 'user' (it accepts project:<x>, global)"
+                .to_string(),
+        };
+
+        // (1) NOTHING WAS WRITTEN because the vocabulary refused everything: 4xx.
+        let all_refused = crate::distill::DistillOutcome {
+            session_key: "ruagent:t62".to_string(),
+            memories_refused: 2,
+            refusals: vec![pair.clone(), pair.clone()],
+            ..Default::default()
+        };
+        // NOT expect_err: ApiError is not Debug on purpose (its message is the whole
+        // story and its status is read here), so the two arms are matched out.
+        let err = match distill_answer(all_refused) {
+            Ok(_) => panic!("nothing was written: this is not a 200"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.status,
+            StatusCode::CONFLICT,
+            "issue #56's status for a rule-based refusal"
+        );
+        let body = err
+            .body
+            .clone()
+            .expect("the refusal publishes DATA, not only prose");
+        assert!(
+            body["outcome"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("RejectedNamespace"),
+            "the machine token stays the first word: {body}"
+        );
+        assert_eq!(body["memories_refused"], 2);
+        assert_eq!(body["memories_written"], 0);
+        assert_eq!(body["memories_skipped"], 0);
+        assert_eq!(body["refused"][0]["store"], "lesson");
+        assert_eq!(body["refused"][0]["namespace"], "user");
+        assert_eq!(body["refused"][0]["allowed_namespaces"][1], "global");
+        assert_eq!(
+            body["distilled"]["session_key"], "ruagent:t62",
+            "everything the 200 carried is still in the error body"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nothing was written"),
+            "{body}"
+        );
+
+        // (2) A PARTIAL PASS IS A 200: what landed is real, and the refusal is reported
+        // beside it rather than in place of it.
+        let partial = crate::distill::DistillOutcome {
+            session_key: "ruagent:t62b".to_string(),
+            memories_written: 8,
+            memories_refused: 2,
+            refusals: vec![pair.clone()],
+            ..Default::default()
+        };
+        let ok = match distill_answer(partial) {
+            Ok(ok) => ok,
+            Err(_) => panic!("a partial pass is not a failed request"),
+        };
+        assert_eq!(ok.0["distilled"]["memories_written"], 8);
+        assert_eq!(ok.0["distilled"]["memories_refused"], 2);
+        assert_eq!(ok.0["distilled"]["refusals"][0]["namespace"], "user");
+
+        // (3) AND THE ORDINARY CASE KEEPS ITS OLD SINGLE-KEY SHAPE.
+        let clean = crate::distill::DistillOutcome {
+            session_key: "ruagent:t62c".to_string(),
+            memories_written: 3,
+            ..Default::default()
+        };
+        let ok = match distill_answer(clean) {
+            Ok(ok) => ok,
+            Err(_) => panic!("a clean pass"),
+        };
+        assert_eq!(ok.0["distilled"]["memories_written"], 3);
+        assert_eq!(ok.0["distilled"]["memories_refused"], 0);
+    }
+
+    /// ACCEPTANCE (issue #65), THROUGH THE ROUTE: a free-tier LESSON is written and the
+    /// route answers 200 -- the fixture that used to be refused.
+    ///
+    /// WHAT THIS TEST USED TO PIN, AND WHY IT MOVED. It drove the same fixture to a 409,
+    /// because the free tier stamped namespace "user" on every candidate and
+    /// lesson/procedure accept only project:<x>/global: the refusal was REAL, and it was
+    /// the free tier's own bug (issue #63/#65). With that fixed, no zero-token
+    /// distillation can propose an illegal pair any more -- only a MODEL can, and the
+    /// daemon does not coerce a model's answer -- so the refusal branch is pinned where it
+    /// is still deterministic: `a_refused_distillation_answers_409_and_a_partial_one_stays_200`
+    /// (the route's own decision function) and the write path's own test.
+    ///
+    /// THE CONTROL STAYS: a session that distils and finds nothing is a 200 whose ledger
+    /// row is empty, so the two answers are still tellable apart.
+    #[tokio::test]
+    async fn the_distill_route_writes_a_free_tier_lesson_instead_of_refusing_it() {
+        let (app, db, root) = harness_with_agents(None).await;
+        let key = "ruagent:t63-lesson";
+        let file = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t63-lesson.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut body = String::from(
+            "{\"ts\":\"2026-09-26T14:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"今天天气不错。\"}}\n",
+        );
+        body.push_str("{\"ts\":\"2026-09-26T14:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"注意：这里的竞态很容易导致丢消息。\"}]}}\n");
+        body.push_str(
+            "{\"ts\":\"2026-09-26T14:00:03Z\",\"seq\":3,\"event\":{\"type\":\"stopped\"}}\n",
+        );
+        std::fs::write(&file, &body).unwrap();
+        seed_transcript(&db, key, &file).await;
+
+        let (st, json, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/sessions/{key}/distill"),
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        println!("READING #65 [route lesson] {st} {json}");
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the lesson must be written, not refused: {raw}"
+        );
+        assert_eq!(
+            json["distilled"]["memories_refused"], 0,
+            "nothing is refused: {raw}"
+        );
+        assert!(
+            json["distilled"]["memories_written"].as_u64().unwrap_or(0) >= 1,
+            "the lesson landed: {raw}"
+        );
+        let rows = memory_rows(&db).await;
+        println!("READING #65 [route lesson memories] {rows:?}");
+        assert!(
+            rows.iter()
+                .any(|(store, ns, _)| store == "lesson" && ns == "global"),
+            "a lesson in a namespace the matrix allows for it: {rows:?}"
+        );
+        let (status, reason, written) = ledger_row(&db, key).await;
+        assert_eq!(status, "ok", "{reason}");
+        assert!(written >= 1, "{reason}");
+        assert_eq!(reason, "", "a pass that wrote carries no reason: {reason}");
+
+        // THE CONTROL, same route: a session that distils and finds nothing worth keeping
+        // is a 200 whose row is EMPTY with no reason at all.
+        let plain = "ruagent:t63-plain";
+        let pfile = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t63-plain.jsonl");
+        std::fs::write(
+            &pfile,
+            "{\"ts\":\"2026-09-26T14:02:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"今天天气不错。\"}}\n",
+        )
+        .unwrap();
+        seed_transcript(&db, plain, &pfile).await;
+        let (st, json, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/sessions/{plain}/distill"),
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        println!("READING #63 [route empty control] {st} {json}");
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(json["distilled"]["memories_written"], 0, "{raw}");
+        assert_eq!(json["distilled"]["memories_refused"], 0, "{raw}");
+        let (estatus, ereason, ewritten) = ledger_row(&db, plain).await;
+        assert_eq!((estatus.as_str(), ewritten), ("empty", 0), "{ereason}");
+        assert_ne!(
+            (status.as_str(), reason.as_str()),
+            (estatus.as_str(), ereason.as_str()),
+            "a pass that wrote and a pass that found nothing are different rows"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ACCEPTANCE (issue #65), IN THE BATCH: both free-tier sessions are WRITTEN, the
+    /// refused class is empty, and the ledger's three words still partition what was
+    /// attempted.
+    ///
+    /// The `refused` counter was added by issue #62 and is still reported here; what
+    /// moved is the FIXTURE. It used to be the free tier's own illegal pair (a lesson
+    /// stamped "user"), which no longer exists -- see the route test above for why the
+    /// refusal branch is now pinned at the decision function instead.
+    #[tokio::test]
+    async fn the_batch_writes_both_free_tier_sessions_and_reports_no_refusal() {
+        let (app, db, root) = harness_with_agents(None).await;
+        let lesson = "ruagent:t65b-lesson";
+        let rfile = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t65b-lesson.jsonl");
+        std::fs::create_dir_all(rfile.parent().unwrap()).unwrap();
+        let mut rbody = String::from(
+            "{\"ts\":\"2026-09-26T13:00:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"今天天气不错。\"}}\n",
+        );
+        rbody.push_str("{\"ts\":\"2026-09-26T13:00:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"注意：这里的竞态很容易导致丢消息。\"}]}}\n");
+        rbody.push_str(
+            "{\"ts\":\"2026-09-26T13:00:03Z\",\"seq\":3,\"event\":{\"type\":\"stopped\"}}\n",
+        );
+        std::fs::write(&rfile, &rbody).unwrap();
+        seed_batch_session(&db, lesson, &rfile, 9, 512).await;
+
+        let good = "ruagent:t65b-good";
+        let gfile = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t65b-good.jsonl");
+        std::fs::write(
+            &gfile,
+            "{\"ts\":\"2026-09-26T13:10:01Z\",\"seq\":1,\"event\":{\"type\":\"user_message\",\"text\":\"记住：以后回答都要简洁，不要长篇大论。\"}}\n{\"ts\":\"2026-09-26T13:10:02Z\",\"seq\":2,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"understood\"}]}}\n",
+        )
+        .unwrap();
+        seed_batch_session(&db, good, &gfile, 8, 256).await;
+
+        let (st, ran, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sessions/distill/batch?limit=10",
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        println!("READING #65 [batch] {ran}");
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(ran["attempted"], 2, "{ran}");
+        assert_eq!(
+            ran["refused"], 0,
+            "nothing is refused once the namespace is resolved from the matrix: {ran}"
+        );
+        assert_eq!(
+            ran["ok"].as_i64().unwrap_or(0)
+                + ran["empty"].as_i64().unwrap_or(0)
+                + ran["failed"].as_i64().unwrap_or(0),
+            2,
+            "the three ledger states still partition what was attempted: {ran}"
+        );
+        let results = ran["results"].as_array().expect("results array");
+        for key in [lesson, good] {
+            let entry = results
+                .iter()
+                .find(|e| e["session_key"] == key)
+                .unwrap_or_else(|| panic!("{key} is reported: {ran}"));
+            assert_eq!(entry["status"], "ok", "{ran}");
+            assert_eq!(entry["memories_refused"], 0, "{ran}");
+            assert!(
+                entry["memories_written"].as_u64().unwrap_or(0) >= 1,
+                "{key} landed something: {ran}"
+            );
+        }
+        let rows = memory_rows(&db).await;
+        println!("READING #65 [batch memories] {rows:?}");
+        assert!(
+            rows.iter()
+                .any(|(store, ns, _)| store == "lesson" && ns == "global"),
+            "the lesson landed in a namespace it may write: {rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// t14: THE MANUAL ROUTE'S FREE TIER MUST NOT NEED AN AGENT.
@@ -8658,12 +9134,15 @@ mod tests {
             "the 400 names the namespace it refused: {raw5}"
         );
 
-        // Empty content on an ALLOWED pair: 200 with an empty row. CURRENT, NOT
-        // ENDORSED — it is a data-quality gap, not a refusal (the pair is legal, and
-        // an empty string is not the daemon saying no), so it is deliberately
-        // unchanged by #56 and pinned here only so it cannot move silently. A future
-        // task that refuses empty content must change THIS assertion on purpose.
-        let (st6, body6, raw6) = send_json(
+        // Empty content on an ALLOWED pair: 400, naming the FIELD. Until
+        // ruagent-issues-56-59 t15 (issue #61) this was a 200 `Inserted(<id>)`, i.e. a
+        // decision left open and pinned as a gap; the decision is now made: an empty
+        // body occupies the unique key `(store, namespace, content_hash)` for ever,
+        // counts as a memory that was written, and carries no fact. The panel already
+        // refuses to submit one (its write button is disabled on `!content.trim()`), so
+        // the API agreeing with its own UI is ONE rule instead of two. THIS ASSERTION IS
+        // THE CONTRACT.
+        let (st6, _body6, raw6) = send_json(
             &app,
             "POST",
             "/api/v1/memory/write",
@@ -8672,14 +9151,23 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(st6, StatusCode::OK, "{raw6}");
+        assert_eq!(st6, StatusCode::BAD_REQUEST, "{raw6}");
         assert!(
-            body6["outcome"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("Inserted("),
-            "{raw6}"
+            raw6.contains("content is empty"),
+            "the refusal names the field and the reason: {raw6}"
         );
+        // The same rule covers whitespace-only, which is not a body anyone meant to
+        // send either.
+        let (st6b, _, raw6b) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/write",
+            Some(serde_json::json!({
+                "store": "observation", "namespace": "user", "content": "   ",
+            })),
+        )
+        .await;
+        assert_eq!(st6b, StatusCode::BAD_REQUEST, "{raw6b}");
 
         // The extractor's own rejections, which happen before the handler runs:
         // a required field the body does not carry, a body that is not JSON, and a
@@ -8700,7 +9188,7 @@ mod tests {
 
         println!(
             "READING #56 memory/write statuses | refused pair(profile×global) -> {} {} | allowed \
-             pair -> {} {} | duplicate -> {} {} | empty content + allowed pair -> {} {} | \
+             pair -> {} {} | duplicate -> {} {} | empty content -> {} {} | \
              unknown store -> {} | empty project: -> {} | missing field -> {} | non-JSON body -> \
              {} | no content-type -> {} | memories rows at the end = {}",
             st.as_u16(),
@@ -8720,49 +9208,60 @@ mod tests {
         );
     }
 
-    /// THE KNOWN GAP, PINNED AS A READING AND NOT AS A BLESSING (see the route's
-    /// status table in `memory_write`): a `supersedes` id that is not a CURRENT row
-    /// of the caller's own store+namespace is the CALLER's mistake, and the pipeline
-    /// reports it as a `DbError` (crates/memory/src/write.rs: `supersede_refused` for
-    /// a row that exists but is no longer current, the FK violation on
-    /// `memories.supersedes` for an id that never existed). Both render as 500 through
-    /// `From<DbError> for ApiError` — "the daemon broke" for something the caller can
-    /// fix. It is NOT the #56 class (a caller cannot read either as a write), and it is
-    /// deliberately NOT fixed in this file: choosing 4xx there means deciding on
-    /// `ruagent-memory`'s message TEXT from the route, which would make one crate's
-    /// prose a contract in another. Measured, pinned, reported.
+    /// ISSUE #61 (ruagent-issues-56-59 t15): A CALLER'S MISTAKE IS NOT A 500.
+    ///
+    /// Two `supersedes` targets are the CALLER's to fix, and both used to arrive as a
+    /// constraint-shaped `DbError` -> `From<DbError> for ApiError` -> **500 "the daemon
+    /// broke"**. Each now has its own variant in `ruagent-memory` and its own status
+    /// here: an id that exists NOWHERE is 422 (no rewrite of the same body can ever be
+    /// processed), an id that exists but is no longer a CURRENT row of that
+    /// store+namespace is 409 (a conflict with the state the request was written
+    /// against). They are told apart by the VARIANT, never by matching anyone's prose
+    /// -- which is what #61 asked for, and why this test asserts the body's machine
+    /// keys and not only its sentence.
     #[tokio::test]
-    async fn a_supersede_of_a_row_that_is_not_current_still_answers_500() {
+    async fn a_refused_supersede_is_a_409_or_422_naming_the_target_never_a_500() {
         let (app, db, _root) = harness().await;
         let uri = "/api/v1/memory/write";
 
-        // (a) an id that never existed: the FK on `memories.supersedes` refuses it.
-        let (st_a, _, raw_a) = send_json(
+        // (a) an id that exists NOWHERE.
+        let (st_a, body_a, raw_a) = send_json(
             &app,
             "POST",
             uri,
             Some(serde_json::json!({
                 "store": "observation",
                 "namespace": "user",
-                "content": "t56 supersede probe",
+                "content": "t15 supersede probe",
                 "supersedes": 999_999,
             })),
         )
         .await;
         assert_eq!(
             st_a,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CURRENT reading (not endorsed): the FK violation arrives as a DbError: {raw_a}"
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a target that does not exist is the caller's mistake, not the daemon's: {raw_a}"
+        );
+        assert_eq!(body_a["supersedes"], 999_999, "{raw_a}");
+        assert_eq!(body_a["audit_op"], "supersede_missing", "{raw_a}");
+        let sentence = body_a["error"].as_str().unwrap_or_default();
+        assert!(
+            sentence.contains("no memory with id") && sentence.contains("999999"),
+            "the sentence names what was refused: {raw_a}"
+        );
+        assert_eq!(
+            memories_written_count(&db).await,
+            0,
+            "nothing may land: {raw_a}"
         );
 
-        // (b) an id that EXISTS but is not a current row of this pair any more: the
-        // pipeline's own `supersede_refused`, which also lands as a 500.
+        // (b) a row that IS current, then a supersede of it that is no longer valid.
         let (st_b, body_b, raw_b) = send_json(
             &app,
             "POST",
             uri,
             Some(serde_json::json!({
-                "store": "observation", "namespace": "user", "content": "t56 probe one",
+                "store": "observation", "namespace": "user", "content": "t15 supersede one",
             })),
         )
         .await;
@@ -8781,56 +9280,54 @@ mod tests {
             Some(serde_json::json!({
                 "store": "observation",
                 "namespace": "user",
-                "content": "t56 probe two",
+                "content": "t15 supersede two",
                 "supersedes": first,
             })),
         )
         .await;
-        assert_eq!(st_c, StatusCode::OK, "{raw_c}");
-        assert!(
-            raw_c.contains("Superseded"),
-            "the replacement itself is a normal 200: {raw_c}"
+        assert_eq!(
+            st_c,
+            StatusCode::OK,
+            "the legitimate supersede still works: {raw_c}"
         );
-        // `first` is superseded now, so naming it again is refused.
-        let (st_d, _, raw_d) = send_json(
+        let (st_d, body_d, raw_d) = send_json(
             &app,
             "POST",
             uri,
             Some(serde_json::json!({
                 "store": "observation",
                 "namespace": "user",
-                "content": "t56 probe three",
+                "content": "t15 supersede three",
                 "supersedes": first,
             })),
         )
         .await;
-
-        println!(
-            "READING #56 supersede | nonexistent id -> HTTP {} {} | row where the write landed -> \
-             HTTP {} {} | supersede of a row that is no longer current -> HTTP {} {} | \
-             supersede_refused audit rows = {} | memories rows = {}",
-            st_a.as_u16(),
-            raw_a.trim(),
-            st_c.as_u16(),
-            raw_c.trim(),
-            st_d.as_u16(),
-            raw_d.trim(),
-            count(
-                &db,
-                "SELECT COUNT(*) FROM memory_diffs WHERE op = 'supersede_refused'"
-            )
-            .await,
-            memories_written_count(&db).await
-        );
         assert_eq!(
             st_d,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CURRENT reading (not endorsed): the pipeline's supersede_refused arrives as a \
-             DbError: {raw_d}"
+            StatusCode::CONFLICT,
+            "a target that is no longer current is a CONFLICT with the state: {raw_d}"
         );
+        assert_eq!(body_d["supersedes"], first, "{raw_d}");
+        assert_eq!(body_d["store"], "observation", "{raw_d}");
+        assert_eq!(body_d["namespace"], "user", "{raw_d}");
+        assert_eq!(body_d["audit_op"], "supersede_refused", "{raw_d}");
         assert!(
-            raw_d.contains("supersede refused"),
-            "and the sentence still says what was refused: {raw_d}"
+            body_d["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("supersede refused"),
+            "and the sentence says what was refused: {raw_d}"
+        );
+
+        // BOTH refusals are audited under their OWN op, and neither wrote a row.
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memory_diffs WHERE op = 'supersede_missing'"
+            )
+            .await,
+            1,
+            "the missing-target refusal is recorded"
         );
         assert_eq!(
             count(
@@ -8839,12 +9336,104 @@ mod tests {
             )
             .await,
             1,
-            "the refusal is audited under its own op, not a supersede that did not happen"
+            "the not-current refusal is recorded, and only once"
         );
         assert_eq!(
             memories_written_count(&db).await,
             2,
-            "whatever the status, the refused row must NOT land: {raw_d}"
+            "the refused rows must NOT land: {raw_d}"
+        );
+        println!(
+            "READING t15 supersede | nonexistent id -> HTTP {} {} | legitimate -> HTTP {} {} | \
+             not-current -> HTTP {} {} | audit supersede_missing=1 supersede_refused=1 | memories \
+             rows = {}",
+            st_a.as_u16(),
+            raw_a.trim(),
+            st_c.as_u16(),
+            raw_c.trim(),
+            st_d.as_u16(),
+            raw_d.trim(),
+            memories_written_count(&db).await
+        );
+    }
+
+    /// ISSUE #61, the SECOND door onto an empty body: `POST /api/v1/memory/supersede`
+    /// carries `new_content`, and an empty one would retire the old row and store no
+    /// replacement -- so it is refused the same way, by FIELD NAME, and the target is
+    /// left exactly as it was.
+    #[tokio::test]
+    async fn an_empty_supersede_body_is_refused_by_field_name() {
+        let (app, db, _root) = harness().await;
+        let (st, body, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/write",
+            Some(serde_json::json!({
+                "store": "observation", "namespace": "user", "content": "t15 the target",
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let id: i64 = body["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("Inserted(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap_or_else(|e| panic!("no id in {raw}: {e}"));
+
+        for empty in ["", "   "] {
+            let (st, _, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/memory/supersede",
+                Some(serde_json::json!({ "id": id, "new_content": empty })),
+            )
+            .await;
+            assert_eq!(
+                st,
+                StatusCode::BAD_REQUEST,
+                "an empty replacement is refused: {raw}"
+            );
+            assert!(
+                raw.contains("new_content"),
+                "and the refusal names the FIELD: {raw}"
+            );
+        }
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memories WHERE superseded_at IS NOT NULL"
+            )
+            .await,
+            0,
+            "a request that stored nothing must not have retired the row"
+        );
+
+        let (st_ok, _, raw_ok) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/supersede",
+            Some(serde_json::json!({ "id": id, "new_content": "t15 the replacement" })),
+        )
+        .await;
+        assert_eq!(
+            st_ok,
+            StatusCode::OK,
+            "a real replacement still works: {raw_ok}"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memories WHERE superseded_at IS NOT NULL"
+            )
+            .await,
+            1,
+            "and THIS one retires the old row"
+        );
+        println!(
+            "READING t15 supersede empty body: 2 x HTTP 400, then HTTP {st_ok} {}",
+            raw_ok.trim()
         );
     }
 
@@ -10197,6 +10786,10 @@ mod tests {
             "the 200 backlog sessions plus the long one: {planned}"
         );
         assert_eq!(planned["attempted"], 0, "{planned}");
+        assert_eq!(
+            planned["refused"], 0,
+            "a dry run attempts nothing, so no session can be refused: {planned}"
+        );
         assert_eq!(planned["estimated"]["sessions"], 200, "{planned}");
         assert_eq!(
             planned["estimated"]["bytes"],

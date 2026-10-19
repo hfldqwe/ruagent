@@ -81,9 +81,43 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ruagent-daemon.ps1 s
 * Output goes to `~/.ruagent/logs/daemon.log`, **appended** (rotated to `daemon.log.1` at
   5 MB). A daemon whose output goes nowhere is undiagnosable: two deaths left no panic, no
   error and no process behind.
-* `status` prints the health check, the recorded pid and the log tail. `watch` starts the
-  daemon only when the health check fails, and `install-task` registers it as a scheduled
-  task (at logon + every 5 minutes) so nobody has to remember to restart it.
+* `status` prints the health check, the recorded pid, the **exit trace** and the log tail.
+  `watch` starts the daemon only when the health check fails, and `install-task` registers
+  it as a scheduled task (at logon + every 5 minutes) so nobody has to remember to restart it.
+* **A death leaves evidence: `<root>/data/daemon.exit`** (issue #64, ruagent-issues-56-59
+  t20). The daemon writes `running pid=... since=...` at boot and overwrites that line with
+  a reason on every path that knows why it is leaving (`stop-request`, `signal:console`,
+  `panic`, `error`, `server-returned`). A **killed** daemon is the one case that cannot
+  overwrite it, so the trace it leaves is its own boot line -- and the fact that its pid is
+  gone is what turns that line into a diagnosis: `status` prints the line and then either
+  `pid N is ALIVE, so that line is this daemon's boot record (it has not left)` or
+  `DIED WITHOUT A TRACE -- pid N is gone and NO exit record was written: killed (job object /
+  TerminateProcess / power loss), not shut down`. The next boot logs the same conclusion as a
+  WARN. Measured 2026-10-19 on a private root: a hard kill left `running pid=34352 since=...`
+  and `status` reported `DIED WITHOUT A TRACE`; a graceful stop left
+  `exit reason=stop-request pid=34068 at=2026-10-19T15:22:18.354Z`; a real panic through the
+  installed hook left `exit reason=panic ... detail=t20 deliberate panic at
+  crates/daemon/src/lib.rs:842:44`. The 2026-10-17 disappearance (the log ending on an
+  ordinary INFO line, no panic, no error, the process gone, the port refusing) is exactly the
+  shape the kill reading now names.
+* **`stop` asks for a clean exit before it forces one.** A WMI-started daemon has no console
+  to send Ctrl-C to, so `stop` writes `<root>/data/daemon.stop` and waits up to 10 s; the
+  daemon polls that file every 250 ms and leaves through its own shutdown path, writing
+  `exit reason=stop-request`. Only if the ask is ignored does `stop` force the process --
+  and the forced case is the one with NO exit record, which is how the two become
+  distinguishable. A stale request left behind by a crash is deleted at boot, so it can never
+  kill the daemon that comes up after it.
+* **Start method, measured (2026-10-19): WMI survives the caller; a shell-scoped start does
+  not.** A daemon started through `Win32_Process.Create` was still alive (checked with
+  `Get-Process` by image path) after the calling shell's call had returned, which is why
+  `start` uses it; `nohup ... &` from that same shell does not survive it. The daemon also
+  measures, at every boot, whether it was already inside somebody else's **job object** --
+  logged as `startup job-object measurement ... in_an_outer_job_object=true|false`, taken
+  BEFORE the orphan sweep creates the daemon's own job (after it, the answer is always yes).
+  Measured `false` for a WMI start, so **job-object breakaway is left OPEN BY MEASUREMENT,
+  not by preference**: requesting it on the strength of the 2026-10-17 symptom alone would also
+  let the daemon escape a job that is deliberately containing it. If a future disappearance
+  logs `in_an_outer_job_object=true`, breakaway becomes the evidenced fix.
 * `stop` stops the pid recorded in `~/.ruagent/data/daemon.pid` — never a sweep by process
   name or port.
 * `stop` **refuses to run without `-Force`**. A script cannot post to the team channel, so

@@ -35,7 +35,7 @@ pub use lifecycle::{
 };
 pub use namespace::{Namespace, NamespaceKind};
 pub use usage::{DECAY_LAMBDA, decay_score, record_usage};
-pub use write::{MemoryWrite, WriteOutcome, audit_merge_decision, write_memory};
+pub use write::{MemoryWrite, WriteError, WriteOutcome, audit_merge_decision, write_memory};
 
 /// The four SQLite-backed memory stores (design §6.1; the other two of
 /// the six are the entity graph and the decision log, which live in

@@ -437,7 +437,7 @@ impl PlatformTools {
     // -- the two trigger surfaces (§14.3) --------------------------------
 
     #[tool(
-        description = "Distill ONE session now: extract durable memories (and, when the distiller is configured for it, entities/relations) from that session's transcript. WHEN: the user says to remember a session or distill a conversation, or a session ended with something worth keeping that is not in memory yet. COST: extractor=rules is FREE -- zero model tokens, deterministic, no agent is spawned; extractor=acp (the default) SPENDS MODEL TOKENS -- it runs a full extraction-agent turn over the transcript; extractor=both runs rules and then acp. Pass dry_run=true first: it reports what would be written and writes nothing. This manual call is an explicit request and is never blocked by the distill_session capability -- that capability gates only the unattended session-close path. This tool only TRIGGERS; to ask whether a session is ALREADY distilled and what its last attempt did, call distill_status (free -- it reads the ledger and never calls a model)."
+        description = "Distill ONE session now: extract durable memories (and, when the distiller is configured for it, entities/relations) from that session's transcript. WHEN: the user says to remember a session or distill a conversation, or a session ended with something worth keeping that is not in memory yet. COST: extractor=rules is FREE -- zero model tokens, deterministic, no agent is spawned; extractor=acp (the default) SPENDS MODEL TOKENS -- it runs a full extraction-agent turn over the transcript; extractor=both runs rules and then acp. Pass dry_run=true first: it reports what would be written and writes nothing. This manual call is an explicit request and is never blocked by the distill_session capability -- that capability gates only the unattended session-close path. This tool only TRIGGERS; to ask whether a session is ALREADY distilled and what its last attempt did, call distill_status (free -- it reads the ledger and never calls a model). A PASS THE STORE REFUSED IS AN ERROR, NOT AN EMPTY ONE: when the write vocabulary refuses every memory the pass proposed, nothing is written and this call FAILS (HTTP 409) naming each refused store x namespace pair and what that store accepts, so the refusal is never reported as a stored session; a pass that simply found nothing worth keeping succeeds with 0 written."
     )]
     async fn distill_session(
         &self,
@@ -679,6 +679,90 @@ impl PlatformTools {
 // cost gate) instead of reqwest's "HTTP status client error (400 Bad Request)".
 // ---------------------------------------------------------------------------
 
+/// ONE READER FOR THE STRUCTURED REFUSALS' DATA (issues #56 and #62).
+///
+/// The daemon publishes WHAT it refused, not only that it refused:
+/// `POST /api/v1/memory/write` names one pair at the top level
+/// (`store`/`namespace`/`allowed_namespaces`), and the distill 409 puts the whole
+/// set under `refused` with `memories_refused`/`memories_written` beside it. Both
+/// shapes are read HERE so neither tool carries a second copy of the store x namespace
+/// matrix, and so a refusal names the thing a caller can fix.
+///
+/// `None` when the body is not that shape -- an ordinary refusal keeps its sentence
+/// and gains nothing.
+fn refusal_data(v: &serde_json::Value) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(refused) = v.get("memories_refused").and_then(|x| x.as_u64())
+        && refused > 0
+    {
+        let written = v
+            .get("memories_written")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        lines.push(format!(
+            "  refused: {refused} of {} memory candidate(s); nothing was written for them",
+            refused + written
+        ));
+    }
+    lines.extend(refused_pairs(v));
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  the daemon published what it refused (store x namespace governance, design 6.2):\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// The refused PAIRS, from whichever shape the route publishes them in: the
+/// `refused` array (distill) or the single top-level pair (memory/write).
+fn refused_pairs(v: &serde_json::Value) -> Vec<String> {
+    let accepts = |p: &serde_json::Value| -> String {
+        let allowed: Vec<&str> = p
+            .get("allowed_namespaces")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        if allowed.is_empty() {
+            "(no vocabulary row: the value is not a store this daemon knows)".to_string()
+        } else {
+            format!("{{{}}}", allowed.join(", "))
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    // TWO KEY SPELLINGS, BOTH THE DAEMON`S: the 409 publishes the set as `refused`
+    // (crates/daemon/src/api.rs, `distill_answer`), while the outcome OBJECT -- inside a
+    // 200, and echoed under `distilled` on the 409 -- serializes the same field as
+    // `refusals` (`DistillOutcome`). Reading both is what lets ONE reader serve the
+    // error path and the success path without a second copy of either spelling.
+    for key in ["refused", "refusals"] {
+        let Some(arr) = v.get(key).and_then(|a| a.as_array()) else {
+            continue;
+        };
+        for p in arr {
+            let store = p.get("store").and_then(|x| x.as_str()).unwrap_or("?");
+            let ns = p.get("namespace").and_then(|x| x.as_str()).unwrap_or("?");
+            out.push(format!(
+                "  store `{store}` cannot write namespace `{ns}`; it accepts {}",
+                accepts(p)
+            ));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let (Some(store), Some(ns)) = (
+        v.get("store").and_then(|x| x.as_str()),
+        v.get("namespace").and_then(|x| x.as_str()),
+    ) {
+        out.push(format!(
+            "  store `{store}` cannot write namespace `{ns}`; it accepts {}",
+            accepts(v)
+        ));
+    }
+    out
+}
+
 /// The message for a non-2xx daemon reply: the daemon's reason, verbatim, plus
 /// the concrete way out when it is a capability refusal.
 ///
@@ -687,8 +771,9 @@ impl PlatformTools {
 /// fallback is the common path. Pure, so the shaping is tested without a daemon.
 fn refusal_message(what: &str, status: u16, body: &str) -> String {
     let text = body.trim();
-    let detail = serde_json::from_str::<serde_json::Value>(text)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    let detail = parsed
+        .as_ref()
         .and_then(|v| {
             v.get("error")
                 .and_then(|e| e.as_str())
@@ -697,6 +782,14 @@ fn refusal_message(what: &str, status: u16, body: &str) -> String {
         })
         .unwrap_or_else(|| text.to_string());
     let mut msg = format!("{what} refused by the ruagent daemon (HTTP {status}): {detail}");
+    // THE REFUSAL AS DATA, BESIDE THE SENTENCE: which pair was refused and what that
+    // store DOES accept, so an agent corrects the request instead of paraphrasing
+    // prose. The daemon's `error` sentence already says "nothing was written"; this
+    // is the machine-readable half of the same body.
+    if let Some(note) = parsed.as_ref().and_then(refusal_data) {
+        msg.push('\n');
+        msg.push_str(&note);
+    }
     // A capability refusal must name the action, not just the refusal (t6
     // acceptance: "never an opaque transport error"). The cost gate's own
     // message already carries `confirm_cost`, and an unknown-id message already
@@ -1259,6 +1352,16 @@ fn distill_to_text(
         out.push_str(" (the transcript was truncated to the prompt budget)");
     }
     out.push('\n');
+    // A REFUSAL CAN STILL ARRIVE AS A 200, and then it must be visible HERE (issue #62):
+    // a DRY RUN is never refused (nothing was supposed to be written) and a PARTIAL
+    // pass is a fact about the pass rather than a failed request. Both carry
+    // `memories_refused`/`refusals`, read through the SAME reader the 409 uses, so
+    // "refused everything" and "found nothing to keep" cannot render alike. An
+    // all-refused, non-dry pass never reaches this line: the daemon answers 409.
+    if let Some(note) = refusal_data(d) {
+        out.push_str(&note);
+        out.push('\n');
+    }
     Ok(out)
 }
 
@@ -3386,6 +3489,143 @@ mod tests {
         );
         assert!(text.contains("DRY RUN"), "{text}");
         assert!(text.contains("truncated"), "{text}");
+    }
+
+    /// t13 / #62: a 200 CAN still carry refusals (a dry run is never refused, and a
+    /// partial pass is a fact about the pass), and then it says so -- while a pass
+    /// that found nothing to keep says nothing of the kind, so the two cannot render
+    /// alike.
+    #[test]
+    fn a_refusal_behind_a_200_is_named_and_an_empty_pass_is_not() {
+        let dry = serde_json::json!({ "distilled": {
+            "session_key": "ruagent:0f3a", "agent": "", "memories_written": 0,
+            "memories_skipped": 0, "memories_refused": 2, "refusals": [
+                { "store": "lesson", "namespace": "user",
+                  "allowed_namespaces": ["project:<x>", "global"],
+                  "reason": "store 'lesson' cannot write namespace 'user'" }
+            ],
+            "entities_written": 0, "relations_written": 0, "dry_run": true,
+        } });
+        let text = distill_to_text(&dry, true).unwrap();
+        assert!(
+            text.contains("refused: 2 of 2 memory candidate(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("store `lesson` cannot write namespace `user`"),
+            "{text}"
+        );
+        assert!(text.contains("{project:<x>, global}"), "{text}");
+
+        // NOTHING TO KEEP: no refusal wording at all.
+        let empty = serde_json::json!({ "distilled": {
+            "session_key": "ruagent:0f3a", "agent": "mock", "memories_written": 0,
+            "memories_skipped": 0, "memories_refused": 0, "refusals": [],
+            "entities_written": 0, "relations_written": 0, "dry_run": false,
+        } });
+        let text = distill_to_text(&empty, false).unwrap();
+        assert!(text.contains("0 memories written, 0 skipped"), "{text}");
+        assert!(
+            !text.contains("refused"),
+            "an empty pass must not read as a refusal: {text}"
+        );
+    }
+
+    /// t13's compatibility clause: the OLD shape -- a 200 success envelope carrying
+    /// `memories_skipped` and no refusal keys -- renders BYTE-FOR-BYTE as it did
+    /// before this task. The refusal reading is ADDITIVE, so a daemon built before #62
+    /// is not mis-read as refusing anything.
+    #[test]
+    fn the_old_200_envelope_renders_exactly_as_before() {
+        let old = serde_json::json!({ "distilled": {
+            "session_key": "ruagent:old", "agent": "mock", "memories_written": 4,
+            "memories_skipped": 1, "entities_written": 2, "relations_written": 3,
+        } });
+        assert_eq!(
+            distill_to_text(&old, false).unwrap(),
+            "distilled `ruagent:old` via mock: 4 memories written, 1 skipped, 2 entities, 3 relations\n"
+        );
+    }
+
+    /// The refusal's DATA, from BOTH shapes the daemon publishes (issues #56 / #62):
+    /// the `refused` array of the distill 409, and the single top-level pair of the
+    /// memory/write 409. ONE reader, so neither tool carries the matrix.
+    #[test]
+    fn the_refused_pair_is_read_from_both_published_shapes() {
+        let distill = serde_json::json!({
+            "error": "nothing was written", "memories_refused": 1, "memories_written": 0,
+            "refused": [{ "store": "lesson", "namespace": "user",
+                          "allowed_namespaces": ["project:<x>", "global"] }],
+        });
+        let note = refusal_data(&distill).expect("a refusal body publishes its data");
+        assert!(
+            note.contains("refused: 1 of 1 memory candidate(s)"),
+            "{note}"
+        );
+        assert!(
+            note.contains("store `lesson` cannot write namespace `user`"),
+            "{note}"
+        );
+        assert!(note.contains("{project:<x>, global}"), "{note}");
+
+        // #56: ONE pair at the top level, no counts and no array.
+        let write = serde_json::json!({
+            "error": "NOTHING WAS WRITTEN", "store": "profile", "namespace": "global",
+            "allowed_namespaces": ["user"],
+        });
+        let note = refusal_data(&write).expect("the single-pair shape is read too");
+        assert!(
+            note.contains("store `profile` cannot write namespace `global`"),
+            "{note}"
+        );
+        assert!(note.contains("{user}"), "{note}");
+        assert!(
+            !note.contains("candidate(s)"),
+            "no counts were published: {note}"
+        );
+
+        // A store this daemon does not know has no vocabulary row to publish, and that
+        // is said rather than left blank.
+        let unknown = serde_json::json!({
+            "store": "not-a-store", "namespace": "user", "allowed_namespaces": [],
+        });
+        let note = refusal_data(&unknown).expect("the pair is still named");
+        assert!(note.contains("not a store this daemon knows"), "{note}");
+
+        // NOT a refusal: nothing to say.
+        assert!(refusal_data(&serde_json::json!({ "outcome": "Inserted(7)" })).is_none());
+        assert!(
+            refusal_data(&serde_json::json!({ "memories_refused": 0, "refused": [] })).is_none()
+        );
+    }
+
+    /// The ERROR path carries the same data beside the daemon's sentence: #62's 409
+    /// reaches an agent with the pairs it must fix, not with the JSON it sent.
+    #[test]
+    fn a_structured_refusal_reaches_the_caller_with_its_pairs() {
+        let body = serde_json::json!({
+            "error": "nothing was written: this pass proposed 1 memories and the write vocabulary refused every one of them",
+            "outcome": "RejectedNamespace (this store does not allow that namespace; ...)",
+            "refused": [{ "store": "lesson", "namespace": "user",
+                          "allowed_namespaces": ["project:<x>", "global"] }],
+            "memories_refused": 1, "memories_written": 0, "memories_skipped": 0,
+        })
+        .to_string();
+        let msg = refusal_message("distill_session", 409, &body);
+        assert!(msg.contains("nothing was written"), "{msg}");
+        assert!(msg.contains("HTTP 409"), "{msg}");
+        assert!(
+            msg.contains("store `lesson` cannot write namespace `user`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("project:<x>, global"),
+            "the allowed set is named: {msg}"
+        );
+        assert!(
+            !msg.contains(r#""refused""#),
+            "the JSON must not be echoed: {msg}"
+        );
     }
 
     #[test]

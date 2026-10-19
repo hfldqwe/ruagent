@@ -104,6 +104,27 @@ export const zh: Record<string, string> = {
   "sessions.tier.run.calls.rules": "本档不调用模型：0 次模型调用。账本记录的 {n} 个窗口是分窗数（按字节预算切分），不是模型调用。",
   "sessions.tier.run.calls.acp": "本档会调用模型：账本记录了 {n} 个窗口，即 {n} 次模型调用。",
   "sessions.tier.run.mismatch": "⚠ 实跑回报的档位是 {x}，而请求的档位是 {y}——以 daemon 的回报为准。",
+
+  // ---- a REFUSED distillation is its own fact (#62) ----
+  // The daemon answers 409 when the write vocabulary (the store x namespace
+  // matrix, design 6.2) refused EVERY memory candidate a pass proposed. That is
+  // NOT "nothing to distil": the pass ran, measured and proposed; what it
+  // proposed cannot land. The copy below keeps those two readings apart on
+  // purpose, states nothing was written, and prints the store's writable
+  // vocabulary beside the refused pair -- without that list "lesson cannot write
+  // user" is not actionable.
+  "sessions.refused.title": "蒸馏被拒绝——本次什么都没写",
+  "sessions.refused.hint": "这与「没有可蒸馏的内容」是两件事：这一趟确实跑了、也提出了记忆候选，但写入词表（store × namespace 矩阵）把每一条都拒了，所以一条都没落库。ledger 里这行的状态仍是「成功」，原因写在「原因」列。",
+  "sessions.refused.pairs": "被拒的 store × namespace",
+  "sessions.refused.allowed": "可写：{list}",
+  "sessions.refused.allowedEmpty": "（该 store 没有可写的 namespace）",
+  "sessions.refused.measure": "本次计数：被拒 {r} · 写入 {w} · 重复跳过 {s}——被拒不是重复，词表拒绝与「已存在」是两件事。",
+  "sessions.refused.session": "会话",
+  "sessions.refused.toast": "蒸馏被拒绝：{n} 个 store × namespace 被写入词表拒绝，什么都没写。",
+  "sessions.refused.batch": "其中 {n} 条被写入词表全数拒绝（状态仍是「成功」，但一条记忆都没写）。",
+  "sessions.refused.batchSum": "成功 {ok} + 无内容 {empty} + 失败 {failed} = {sum} = 尝试 {attempted} 条——三态没有变，「被拒」不是第四种状态，而是「成功」里的一个子集标记。",
+  "sessions.refused.batchNotReported": "这个 daemon 不报告被拒计数（字段是后来加的），所以这里不写 0。",
+  "sessions.refused.result": "被拒 {n}",
 };
 
 export const en: Record<string, string> = {
@@ -197,4 +218,22 @@ export const en: Record<string, string> = {
   "sessions.tier.run.calls.rules": "This tier calls no model: 0 model calls. The {n} windows in the ledger are window SPLITS (cut by the byte budget), not model calls.",
   "sessions.tier.run.calls.acp": "This tier CALLS the model: the ledger recorded {n} windows, i.e. {n} model calls.",
   "sessions.tier.run.mismatch": "⚠ the run reported tier {x} while the request asked for {y} — the daemon's answer is authoritative.",
+
+  // ---- a REFUSED distillation is its own fact (#62) ----
+  // The daemon answers 409 when the write vocabulary refused EVERY candidate a
+  // pass proposed. That is not "nothing to distil" -- the pass ran, measured and
+  // proposed -- so the copy keeps the two apart, says nothing was written, and
+  // prints the store's writable vocabulary beside each refused pair.
+  "sessions.refused.title": "Distillation refused — nothing was written",
+  "sessions.refused.hint": "This is not ‘nothing to distil’: the pass did run and did propose memory candidates, but the write vocabulary (the store x namespace matrix) refused every one of them, so nothing landed. The ledger row still reads ‘ok’, with the reason in the Reason column.",
+  "sessions.refused.pairs": "refused store x namespace",
+  "sessions.refused.allowed": "accepts: {list}",
+  "sessions.refused.allowedEmpty": "(this store has no writable namespace)",
+  "sessions.refused.measure": "This pass: {r} refused · {w} written · {s} skipped as duplicates — a refusal is NOT a duplicate, and the vocabulary rejecting a pair is a different fact from the row already existing.",
+  "sessions.refused.session": "session",
+  "sessions.refused.toast": "Distillation refused: {n} store x namespace pair(s) rejected by the write vocabulary, nothing was written.",
+  "sessions.refused.batch": "{n} of them were refused by the write vocabulary outright (their status is still ‘ok’, but not one memory was written).",
+  "sessions.refused.batchSum": "ok {ok} + empty {empty} + failed {failed} = {sum} = {attempted} attempted — the three states are unchanged: ‘refused’ is not a fourth one, it is a subset marker inside ‘ok’.",
+  "sessions.refused.batchNotReported": "This daemon does not report a refused count (the field was added later), so this line does not claim 0.",
+  "sessions.refused.result": "refused {n}",
 };

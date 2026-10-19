@@ -33,9 +33,16 @@ Extract:
 2. entities: real-world objects mentioned (people, projects, tools, organizations, products). Entity identity = the real-world object, NOT its category. Merge only explicit aliases of the same object. Also list every OTHER spelling you saw for that same object in `aliases` (an abbreviation, its expansion, a Chinese/English variant) — that list is what lets two mentions of one object resolve to one node later.
 3. relations: durable facts between entities (src/dst by entity name). Set `valid_at` to the RFC3339 instant the fact became true ONLY when the transcript states or implies that time. If the transcript gives no time, `valid_at` MUST be null. NEVER put the current time there: null means "no event time is known", while the current clock means "this became true now", and those are different facts.
 
+NAMESPACE CONTRACT - every memory is written under a (store, namespace) PAIR, and the daemon checks that pair against this table when it writes; a pair outside it is REFUSED and nothing is written for it:
+  profile -> user
+  observation -> user | project:<x> | agent:<x>
+  procedure -> project:<x> | global
+  lesson -> project:<x> | global
+"<x>" is a project or agent name (e.g. project:ruagent, agent:reviewer). OMIT the "namespace" field and the daemon uses the store's default (profile -> user, observation -> user, procedure -> global, lesson -> global). Never name a namespace that is not listed for the store you chose.
+
 Respond with ONLY a JSON object, no markdown fences, no commentary:
 {
-  "memories": [{"store": "profile|observation|procedure|lesson", "namespace": "user|global|project:<name>", "content": "...", "confidence": 0.8}],
+  "memories": [{"store": "profile|observation|procedure|lesson", "namespace": "<optional: a namespace the chosen store accepts (see the NAMESPACE CONTRACT); omit for the store's default>", "content": "...", "confidence": 0.8}],
   "entities": [{"name": "...", "kind": "person|project|tool|org|product|concept", "summary": "one line", "aliases": ["..."]}],
   "relations": [{"src": "...", "dst": "...", "relation": "snake_case", "fact": "one sentence", "valid_at": "RFC3339 timestamp when the transcript says when it became true, else null"}]
 }
@@ -59,6 +66,13 @@ pub(crate) struct Extraction {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExtractedMemory {
     pub(crate) store: String,
+    /// THE NAMESPACE MAY BE OMITTED (issue #63). The contract the prompt carries tells
+    /// the model it may leave this decision to the daemon, and this attribute is what
+    /// makes that advice TRUE: without it a reply that omits the field fails to parse,
+    /// which would throw away the whole extraction over a field the model was invited to
+    /// skip. An omitted value arrives as "" and is resolved from the store by
+    /// `candidate_pair` -> `default_namespace` (both ask the write vocabulary).
+    #[serde(default)]
     pub(crate) namespace: String,
     pub(crate) content: String,
     /// 0.5–1.0, from answer-quality signals in the transcript.
@@ -104,7 +118,17 @@ pub(crate) struct ExtractedRelation {
 #[derive(Debug, Clone, PartialEq)]
 struct MemoryWriteOutcome {
     written: u32,
+    /// Candidates the write path recognised as ALREADY THERE (the unique
+    /// (store, namespace, content_hash) slot is held). One meaning only: a REFUSAL
+    /// is never counted here (issue #62).
     skipped: u32,
+    /// Candidates the WRITE VOCABULARY refused, with the reasons (issue #62).
+    /// Before this, a refusal was counted as a skip, so a caller that saw
+    /// memories_skipped = 1 could not tell "the store already had this row" from
+    /// "the store forbids this pair of values" -- and only the second one is a
+    /// shape to act on.
+    refused: u32,
+    refusals: Vec<RefusedMemory>,
     episode: Option<i64>,
 }
 
@@ -125,11 +149,53 @@ struct GraphOutcome {
     refused: u32,
 }
 
+/// ONE memory candidate the WRITE VOCABULARY refused, and why (issue #62).
+///
+/// WHY A STRUCT AND NOT A COUNTER: memories_skipped used to fold two different facts
+/// into one number -- "this row was already there" (a duplicate, nothing wrong) and
+/// "this store cannot write this namespace" (a refusal, a shape the caller may be
+/// able to fix). A bare count cannot tell them apart, and the PAIR is what a caller
+/// needs in order to understand the refusal.
+///
+/// allowed_namespaces is the same DATA POST /api/v1/memory/write publishes on its 409
+/// (issue #56), read from the same matrix (MemoryStore::allowed_kinds), so a caller
+/// corrects its request from the field and reads reason only for the sentence. It is
+/// empty when the value itself was not recognisable: there is no matrix row to
+/// publish for something that is not a store.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RefusedMemory {
+    /// The store the candidate asked for, normalized the way the write path
+    /// normalizes it -- this is what the matrix was asked about.
+    pub store: String,
+    /// The namespace it asked for, as the pass resolved it.
+    pub namespace: String,
+    /// What this store DOES accept (project:<x>/agent:<x> are the parameterised
+    /// spellings a caller writes).
+    pub allowed_namespaces: Vec<&'static str>,
+    /// The sentence a reader acts on: it names the store, the namespace and the rule,
+    /// so the ledger's reason column is readable without the response.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DistillOutcome {
     pub session_key: String,
     pub memories_written: u32,
+    /// Candidates the write path recognised as ALREADY THERE (a duplicate). It no
+    /// longer counts REFUSALS: those are memories_refused (issue #62).
     pub memories_skipped: u32,
+    /// Candidates the WRITE VOCABULARY refused: nothing was written for them, and
+    /// the cause is a store×namespace fact rather than a duplicate.
+    ///
+    /// ADDITIVE, and it is the field that makes a refusal MACHINE-READABLE (issue
+    /// #62): memories_written == 0 && memories_refused > 0 says "the store refused
+    /// everything this pass proposed", which is a different answer from "the pass
+    /// found nothing worth keeping" -- and on the wire the two used to be
+    /// indistinguishable, because both arrived as a 200 with a zero.
+    pub memories_refused: u32,
+    /// The refusals themselves, so a caller can correct the request without parsing
+    /// the daemon's prose.
+    pub refusals: Vec<RefusedMemory>,
     pub entities_written: u32,
     pub relations_written: u32,
     /// The agent this pass used. EMPTY when none did — a rules-only extraction
@@ -193,12 +259,61 @@ pub struct DistillOutcome {
     pub dry_run: bool,
 }
 
+impl DistillOutcome {
+    /// True when the pass proposed candidates and the WRITE VOCABULARY refused EVERY
+    /// one of them, so nothing was written and the refusal -- not the pass -- is why
+    /// (issue #62).
+    ///
+    /// THIS IS THE PREDICATE THE RESPONSE LAYER BRANCHES ON. A 200 with
+    /// memories_written = 0 reads as "we distilled it and there was nothing to keep",
+    /// which is the EMPTY case; this one is "we distilled it and the store would not
+    /// take any of it". Only the second is worth a status code.
+    pub fn write_refused_everything(&self) -> bool {
+        self.memories_refused > 0 && self.memories_written == 0
+    }
+
+    /// What the LEDGER's reason column says about this pass, or None when nothing was
+    /// refused (the ordinary case).
+    ///
+    /// WHY THE REASON COLUMN CARRIES IT: distill_log has no refusal column, and status
+    /// is the ledger's own three words (ok/empty/failed) -- a fourth word would be
+    /// dropped silently by every reader that enumerates them (the panel's
+    /// LEDGER_STATUSES/LEDGER_BUCKETS and their i18n keys), a reader-side change this
+    /// task does not own. An ok row whose failure_reason names the refusal is
+    /// therefore distinguishable from an empty row (whose reason is the no-content
+    /// sentence) and from an ordinary ok row (which carries no reason at all).
+    ///
+    /// IT IS WRITTEN FOR A PARTIAL PASS TOO: "8 of 10 memories landed" beside a silent
+    /// 2 would repeat the same defect at a smaller scale.
+    pub fn refusal_reason(&self) -> Option<String> {
+        if self.memories_refused == 0 {
+            return None;
+        }
+        let head = if self.write_refused_everything() {
+            format!(
+                "the write path REFUSED every memory this pass proposed ({} refused, none written)",
+                self.memories_refused
+            )
+        } else {
+            format!(
+                "the write path refused {} of {} memories this pass proposed",
+                self.memories_refused,
+                self.memories_refused + self.memories_written
+            )
+        };
+        let detail: Vec<&str> = self.refusals.iter().map(|r| r.reason.as_str()).collect();
+        Some(format!("{head}: {}", detail.join("; ")))
+    }
+}
+
 impl Default for DistillOutcome {
     fn default() -> Self {
         Self {
             session_key: String::new(),
             memories_written: 0,
             memories_skipped: 0,
+            memories_refused: 0,
+            refusals: Vec::new(),
             entities_written: 0,
             relations_written: 0,
             agent: String::new(),
@@ -601,7 +716,11 @@ impl Distiller {
                 // NULL only for rows written before the retry path existed.
                 outcome.retries = retries;
                 if !dry_run {
-                    self.log_outcome(&outcome, status, &prompt_hash, None)
+                    // ISSUE #62: the refusal reaches the LEDGER's reason column, so the
+                    // row of a pass whose every candidate was refused is not the row of a
+                    // session that had nothing in it. A dry run writes no row at all.
+                    let refusal = outcome.refusal_reason();
+                    self.log_outcome(&outcome, status, &prompt_hash, refusal.as_deref())
                         .await?;
                 }
                 Ok(outcome)
@@ -832,9 +951,23 @@ impl Distiller {
         // A dry run reports what WOULD be written and writes nothing: no
         // episode, no memory, no graph row.
         let mem = if dry_run {
+            // A DRY RUN ASKS THE SAME GOVERNANCE QUESTION WITHOUT WRITING (issue #62).
+            // Pricing a candidate the write vocabulary forbids as "would be written"
+            // would over-report what the caller's model call buys, and the evaluation
+            // is a pure predicate: no insert, no audit row, nothing written.
+            let refusals: Vec<RefusedMemory> = bundle
+                .memories
+                .iter()
+                .filter_map(|m| {
+                    let (store, namespace) = candidate_pair(m);
+                    governed_pair(&store, &namespace).err()
+                })
+                .collect();
             MemoryWriteOutcome {
-                written: bundle.memories.len() as u32,
+                written: bundle.memories.len() as u32 - refusals.len() as u32,
                 skipped: 0,
+                refused: refusals.len() as u32,
+                refusals,
                 episode: None,
             }
         } else {
@@ -859,6 +992,8 @@ impl Distiller {
                 session_key: session_key.to_string(),
                 memories_written: mem.written,
                 memories_skipped: mem.skipped,
+                memories_refused: mem.refused,
+                refusals: mem.refusals,
                 // A dry run reports what the write WOULD have produced; the graph
                 // half's own reading is None in both the dry-run and the graph-off
                 // case (see above), so those two columns stay NULL there.
@@ -1069,7 +1204,15 @@ impl Distiller {
     ///
     /// * `retries` is ALWAYS written: 0 is the measured "the first attempt
     ///   settled this", which is a reading, not the absence of one.
-    /// * `windows`/`truncated` are written together and only when the caller
+    /// * memories_written/memories_skipped/memories_refused are THREE different facts
+    ///   and the ledger keeps them apart (issue #62): written = a row landed;
+    ///   skipped = the row was already there (a duplicate); refused = the write
+    ///   vocabulary forbids this store×namespace pair, so nothing was written and the
+    ///   pair is named. A refusal is NEVER recorded as empty and never as a skip: the
+    ///   row stays ok -- the pass ran and measured -- with the refusal sentence in
+    ///   failure_reason, which is what makes the row readable as a refusal without
+    ///   inventing a fourth status word.
+    /// * windows/truncated are written together and only when the caller
     ///   MEASURED them (`DistillOutcome::windows` is `Some` exactly when an
     ///   extraction loop ran). A refusal or a failure read nothing, so it leaves
     ///   NULL -- "we did not look" -- rather than a 1/0 it never observed.
@@ -1383,13 +1526,13 @@ impl Distiller {
         };
         let mut written = 0u32;
         let mut skipped = 0u32;
+        let mut refused = 0u32;
+        let mut refusals: Vec<RefusedMemory> = Vec::new();
         for m in memories {
-            let store = normalize_store(m.store.as_str());
-            let namespace = if m.namespace.is_empty() {
-                default_namespace(&store).to_string()
-            } else {
-                m.namespace.clone()
-            };
+            // ONE definition of "the pair this candidate would be written under",
+            // shared with the dry run's governance evaluation (issue #62), so the price
+            // and the write cannot disagree about which pair was asked for.
+            let (store, namespace) = candidate_pair(m);
             // PROVENANCE IS A FIELD, NOT TEXT (t347). This used to be
             // format!("`[distilled] {}`", ...) -- a marker written into the body, which
             // every later reader had to strip again: 156 of 163 rows (96%) carried
@@ -1400,13 +1543,21 @@ impl Distiller {
             // The store/namespace must be resolved BEFORE the merge decision is
             // asked for: `judge_merge` (R-3) takes the typed store, and a
             // governance rejection must happen before anything is written.
-            let (store_t, ns_t) = match (
-                parse_store(&store),
-                ruagent_memory::namespace::Namespace::parse(&namespace),
-            ) {
-                (Some(s), Some(n)) => (s, n),
-                _ => {
-                    skipped += 1; // governance: bad store/namespace from the agent
+            // A PAIR THAT CANNOT BE RESOLVED AT ALL IS A REFUSAL, NOT A SKIP (issue #62):
+            // no write is attempted for it, it was never a duplicate, and counting it as
+            // one hid both the value and the cause.
+            //
+            // THE MATRIX ITSELF IS STILL ASKED BY write_memory, deliberately: that call is
+            // what writes the write audit's op='reject' row, so refusing here would trade a
+            // machine-readable answer for the loss of the audit trail (measured: with the
+            // check hoisted into this loop, the memory_diffs row disappeared). The refusal is
+            // COUNTED from what write_memory answered, which applies the same predicate
+            // (store.allows_namespace on the typed pair).
+            let (store_t, ns_t) = match typed_pair(&store, &namespace) {
+                Ok(pair) => pair,
+                Err(refusal) => {
+                    refused += 1;
+                    refusals.push(refusal);
                     continue;
                 }
             };
@@ -1495,12 +1646,19 @@ impl Distiller {
                     written += 1;
                 }
                 W::SkippedDuplicate(_) => skipped += 1,
-                W::RejectedNamespace => skipped += 1,
+                W::RejectedNamespace => {
+                    // The matrix said no. store_t/ns_t are in scope, so the reason comes
+                    // from the crate's OWN vocabulary row, not a second copy of it.
+                    refused += 1;
+                    refusals.push(forbidden_pair(store_t, &store, &namespace));
+                }
             }
         }
         Ok(MemoryWriteOutcome {
             written,
             skipped,
+            refused,
+            refusals,
             episode,
         })
     }
@@ -1604,6 +1762,96 @@ fn normalize_store(s: &str) -> String {
         "procedure" => "procedure".into(),
         "lesson" => "lesson".into(),
         _ => "observation".into(),
+    }
+}
+
+/// The pair a memory candidate would be written under, normalized ONCE for both the
+/// write loop and the dry run's governance evaluation (issue #62).
+fn candidate_pair(m: &ruagent_extract::MemoryCandidate) -> (String, String) {
+    let store = normalize_store(m.store.as_str());
+    let namespace = if m.namespace.is_empty() {
+        default_namespace(&store).to_string()
+    } else {
+        m.namespace.clone()
+    };
+    (store, namespace)
+}
+
+/// What one store DOES accept, from the crate's own matrix -- never a second list
+/// that could drift from the one write_memory enforces (t52's rule).
+fn allowed_namespaces_of(store: ruagent_memory::MemoryStore) -> Vec<&'static str> {
+    store.allowed_kinds().iter().map(|k| k.as_str()).collect()
+}
+
+/// The refusal for a pair whose two halves are valid and whose COMBINATION is not
+/// (design 6.2's namespace governance, enforced by store.allows_namespace).
+fn forbidden_pair(
+    store_t: ruagent_memory::MemoryStore,
+    store: &str,
+    namespace: &str,
+) -> RefusedMemory {
+    let allowed = allowed_namespaces_of(store_t);
+    RefusedMemory {
+        reason: format!(
+            "store '{store}' cannot write namespace '{namespace}' (it accepts {{{}}}); the write audit records the refusal as op='reject' and nothing was written for it",
+            allowed.join(", ")
+        ),
+        store: store.to_string(),
+        namespace: namespace.to_string(),
+        allowed_namespaces: allowed,
+    }
+}
+
+/// The typed pair, or the REFUSAL that says why the two VALUES cannot be resolved
+/// (issue #62) -- no matrix decision is taken here.
+///
+/// A value this daemon cannot recognise is refused BEFORE anything is consulted, because
+/// "this is not a store of ours" and "this store forbids that namespace" are different
+/// things to tell a caller, and the first has no matrix row to publish (which is why
+/// allowed_namespaces is empty there).
+fn typed_pair(
+    store: &str,
+    namespace: &str,
+) -> Result<(ruagent_memory::MemoryStore, ruagent_memory::Namespace), RefusedMemory> {
+    let Some(store_t) = parse_store(store) else {
+        return Err(RefusedMemory {
+            store: store.to_string(),
+            namespace: namespace.to_string(),
+            allowed_namespaces: Vec::new(),
+            reason: format!(
+                "'{store}' is not a memory store this daemon knows (profile, observation, procedure, lesson), so nothing was written"
+            ),
+        });
+    };
+    let Some(ns_t) = ruagent_memory::namespace::Namespace::parse(namespace) else {
+        return Err(RefusedMemory {
+            store: store.to_string(),
+            namespace: namespace.to_string(),
+            allowed_namespaces: allowed_namespaces_of(store_t),
+            reason: format!(
+                "'{namespace}' is not a namespace this daemon knows (user | global | project:<x> | agent:<x>), so nothing was written"
+            ),
+        });
+    };
+    Ok((store_t, ns_t))
+}
+
+/// The SAME predicate the write path applies, asked without writing: the typed pair, or
+/// the refusal the matrix implies (issue #62).
+///
+/// THE DRY RUN USES THIS, because it must price what a real pass would leave behind, and a
+/// candidate the vocabulary forbids would not land. The real pass asks write_memory
+/// instead, which computes the same thing (store.allows_namespace on the typed pair) and
+/// writes the audit row that says so.
+fn governed_pair(
+    store: &str,
+    namespace: &str,
+) -> Result<(ruagent_memory::MemoryStore, ruagent_memory::Namespace), RefusedMemory> {
+    let (store_t, ns_t) = typed_pair(store, namespace)?;
+    if store_t.allows_namespace(&ns_t) {
+        Ok((store_t, ns_t))
+    } else {
+        Err(forbidden_pair(store_t, store, namespace))
     }
 }
 
@@ -1796,8 +2044,28 @@ fn turns_of(messages: &[crate::sessions::SessionMessage]) -> Vec<ruagent_extract
         .collect()
 }
 
+/// The namespace a candidate is written under when it does not name one, ASKED OF THE
+/// GOVERNANCE MATRIX rather than declared next to it (issue #63/#65).
+///
+/// It used to be `if store == "profile" { "user" } else { "global" }` -- a
+/// hand-written second answer that the matrix CONTRADICTS for observation: that store
+/// accepts user/project:{x}/agent:{x} and never global, so the downgrade the extraction
+/// prompt prescribes (an Agent:-only fact becomes an observation) resolved to
+/// observation/global and the write path refused it. Asking `allows_namespace` means
+/// the default cannot disagree with the rule that enforces it:
+///
+///   profile -> user | observation -> user | procedure -> global | lesson -> global
+///
+/// The free tier relies on this too: it no longer names a namespace at all (see
+/// crates/extract), so its procedure/lesson candidates resolve here.
 fn default_namespace(store: &str) -> &'static str {
-    if store == "profile" { "user" } else { "global" }
+    match parse_store(store) {
+        Some(store_t) if store_t.allows_namespace(&ruagent_memory::Namespace::User) => "user",
+        // A store that accepts neither `user` nor `global` does not exist today
+        // (`allowed_kinds` is never empty); if one ever appears, `global` is refused
+        // by `write_memory` and the outcome NAMES the refusal instead of guessing.
+        _ => "global",
+    }
 }
 
 /// Strip markdown fences / commentary the agent may have added.
@@ -1822,6 +2090,14 @@ pub(crate) fn parse_extraction(raw: &str) -> Result<Extraction> {
 /// ships the dedup contract now.)
 /// The built-in extraction prompt — read-only reference for the panel's
 /// settings card, so users can see what `[distill] prompt` would replace.
+///
+/// IT IS ALSO THE PROMPT THE DAEMON SENDS, byte for byte (issue #63): the NAMESPACE
+/// CONTRACT that the response shape points at lives INSIDE this text rather than being
+/// appended by extraction_prompt, because the settings card and the version_points
+/// recomposition both read the base from the SOURCE and add only the optional language
+/// clause and the transcript tail. A block appended at compose time would make the
+/// PUBLISHED prompt differ from the SENT prompt — the same class of defect this issue is
+/// about — and would have to be published a second time to be checkable.
 pub fn builtin_extraction_prompt() -> &'static str {
     EXTRACTION_PROMPT
 }
@@ -2979,7 +3255,16 @@ mod t329_tests {
     fn the_memories_half_of_the_prompt_is_byte_identical() {
         let p = extraction_prompt(None, None);
         let memories_bullet = "1. memories: durable facts about the user (profile), observations, procedures (how-to knowledge), and lessons learned. Only things that generalize beyond this single session. Each memory carries a confidence (0.5\u{2013}1.0) from the signals above.";
-        let memories_json = "  \"memories\": [{\"store\": \"profile|observation|procedure|lesson\", \"namespace\": \"user|global|project:<name>\", \"content\": \"...\", \"confidence\": 0.8}],";
+        // THE MEMORIES HALF MOVED ONCE, DELIBERATELY (issue #63), and writing down why is
+        // the point of this gate: the old example published a FLAT namespace list
+        // ("user|global|project:<name>") that the WRITE VOCABULARY contradicts -- global is
+        // not writable in observation -- so a model that obeyed it wrote the observation the
+        // attribution rule prescribes as observation/global, which the writer REFUSED. The
+        // example now points at the NAMESPACE CONTRACT the daemon appends to EVERY prompt,
+        // rendered from that vocabulary. Gate 1 still guards what it always did: this
+        // BULLET must not move when the graph half gains fields, and the example keeps its
+        // shape (one object under "memories", with store/namespace/content/confidence).
+        let memories_json = "  \"memories\": [{\"store\": \"profile|observation|procedure|lesson\", \"namespace\": \"<optional: a namespace the chosen store accepts (see the NAMESPACE CONTRACT); omit for the store's default>\", \"content\": \"...\", \"confidence\": 0.8}],";
         assert!(
             p.contains(memories_bullet),
             "the memories bullet moved: gate 1 of mem-core's D3 review"
@@ -3170,6 +3455,41 @@ mod entry_tests {
                 [&key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The NEWEST attempt's (status, reason, memories_written) for one session key.
+    ///
+    /// The reason is read as an EMPTY STRING rather than left NULL: a row that carries
+    /// no reason reads as "no reason", which is what an ordinary `ok` row has, and
+    /// an assertion about a refusal needs the two to be tellable apart (issue #62).
+    async fn newest_row(db: &ruagent_store::Db, key: &str) -> (String, String, i64) {
+        let key = key.to_string();
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COALESCE(status,'<null>'), COALESCE(failure_reason,''), memories_written
+                 FROM distill_log WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Every memory row's (store, namespace, content). The tests that use this run on a
+    /// PRIVATE database (one layout per test), so the table IS the session's own output
+    /// and no join through the episode is needed to read what a pass wrote.
+    async fn memory_rows(db: &ruagent_store::Db) -> Vec<(String, String, String)> {
+        // call_flat's closure speaks rusqlite's error type: the conversion happens at the
+        // boundary, so the statements propagate their own errors unwrapped.
+        db.call_flat(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT store, namespace, content FROM memories ORDER BY id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
         .await
         .unwrap()
@@ -3528,6 +3848,393 @@ mod entry_tests {
             "an empty pass carries NO failure reason: a refusal would have recorded one              (the two are different rows with the same status)"
         );
         assert_eq!(retries, 0, "nothing failed, so nothing was retried");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The NAMESPACE CONTRACT's store rows, PARSED back out of the prompt text:
+    /// two leading spaces, a store, " -> ", then its namespaces separated by "|".
+    ///
+    /// Parsing the prompt is what gives the assertions below teeth: a table that drifted
+    /// from the matrix (a store gaining or losing a namespace, or the flat list coming
+    /// back) fails there, and no second list is written down here to compare against.
+    fn prompt_namespace_rows(prompt: &str) -> Vec<(String, Vec<String>)> {
+        prompt
+            .lines()
+            .filter(|l| l.starts_with("  "))
+            .filter_map(|l| {
+                let (store, kinds) = l.trim().split_once(" -> ")?;
+                Some((
+                    store.to_string(),
+                    kinds
+                        .split('|')
+                        .map(|k| k.trim().to_string())
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .collect()
+    }
+
+    /// ACCEPTANCE (issue #63): the prompt no longer publishes a FLAT list of namespace
+    /// values, and every namespace it offers a store is one that store may write.
+    ///
+    /// THE DEFECT: the response contract said '"namespace": "user|global|project:<name>"'
+    /// while the write path accepts (store, namespace) PAIRS -- so a model that followed
+    /// it and wrote the observation the attribution rule prescribes produced
+    /// observation/global, which the writer REFUSES (observation accepts
+    /// user/project:<x>/agent:<x>). t8 and t11 each left a reject(observation/global) row
+    /// as the evidence.
+    ///
+    /// THE CHECK IS A READING, not a literal comparison against a new hand-written list:
+    /// the table is parsed back out of the prompt and every row is compared with what the
+    /// matrix itself says (allowed_kinds) and with the vocabulary the writer publishes
+    /// (write_vocabulary, t52).
+    #[test]
+    fn the_prompt_publishes_the_write_vocabulary_not_a_flat_namespace_list() {
+        let prompt = extraction_prompt(None, None);
+        assert!(
+            !prompt.contains("user|global|project:<name>"),
+            "the flat list is gone (it advertised global in every store)"
+        );
+        assert!(prompt.contains("NAMESPACE CONTRACT"), "{prompt}");
+
+        let rows = prompt_namespace_rows(&prompt);
+        let stores: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            stores,
+            ruagent_memory::MemoryStore::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            "the table names every store, once, in the vocabulary's order: {prompt}"
+        );
+        for (store, kinds) in &rows {
+            let store_t =
+                parse_store(store).unwrap_or_else(|| panic!("{store} is not a memory store"));
+            let allowed: Vec<String> = store_t
+                .allowed_kinds()
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect();
+            assert_eq!(
+                kinds, &allowed,
+                "the prompt and the matrix disagree about {store}"
+            );
+            // AND THE SAME PAIR IS WHAT THE WRITER'S OWN VOCABULARY PUBLISHES.
+            let term = format!("{}×{{{}}}", store, allowed.join(","));
+            assert!(
+                ruagent_memory::write_vocabulary().contains(&term),
+                "the prompt and the write vocabulary disagree about {store}"
+            );
+            // EVERY VALUE IT OFFERS IS ONE THE WRITE PATH ACCEPTS, with a name
+            // substituted for the parameterised spellings.
+            for kind in kinds {
+                let concrete = kind.replace("<x>", "ruagent");
+                let ns = ruagent_memory::Namespace::parse(&concrete)
+                    .unwrap_or_else(|| panic!("{store}: {concrete} does not parse"));
+                assert!(
+                    store_t.allows_namespace(&ns),
+                    "{store} -> {concrete} is not in the write vocabulary"
+                );
+            }
+        }
+
+        // THE ROW THIS ISSUE IS ABOUT: observation must not offer global.
+        let observation = rows
+            .iter()
+            .find(|(s, _)| s == "observation")
+            .expect("the table names observation");
+        assert!(observation.1.iter().any(|k| k == "user"), "{observation:?}");
+        assert!(
+            !observation.1.iter().any(|k| k == "global"),
+            "observation cannot write global -- that is the defect: {observation:?}"
+        );
+
+        // AND THE DEFAULTS THE PROMPT ADVERTISES ARE THE ONES THE WRITE PATH USES,
+        // checked through the same resolver (not through the text).
+        for store in ruagent_memory::MemoryStore::ALL {
+            let default = default_namespace(store.as_str());
+            let ns = ruagent_memory::Namespace::parse(default)
+                .unwrap_or_else(|| panic!("{}: default {default} does not parse", store.as_str()));
+            assert!(
+                store.allows_namespace(&ns),
+                "{} -> {default} is not in the write vocabulary",
+                store.as_str()
+            );
+            assert!(
+                prompt.contains(&format!("{} -> {default}", store.as_str())),
+                "the prompt must advertise the default it uses"
+            );
+        }
+
+        // AN OVERRIDE REPLACES THE WHOLE BASE, table included -- that is what
+        // `[distill] prompt` MEANS, and the settings card shows exactly this text so
+        // it can be copied. The daemon therefore does not append the table behind an
+        // override, and an override that advertises an illegal pair gets issue #62's
+        // refusal, whose body NAMES the pair and the set the store accepts.
+        let custom = extraction_prompt(None, Some("You are a different extractor."));
+        assert!(
+            custom.starts_with("You are a different extractor."),
+            "{custom}"
+        );
+        assert!(!custom.contains("NAMESPACE CONTRACT"), "{custom}");
+    }
+
+    /// ACCEPTANCE (issue #63): an AGENT-only fact -- no User: line anywhere in the
+    /// transcript -- is WRITTEN as an observation, not refused by governance.
+    ///
+    /// THE FIXTURE NEEDS NO MODEL AND NO AGENT, which is the point: the free tier's hedge
+    /// rule has no role filter, so an assistant turn that hedges produces exactly the
+    /// downgrade the attribution rule prescribes (an agent-only fact becomes an
+    /// observation). The namespace that candidate resolves to is now asked of the matrix,
+    /// and observation accepts user.
+    #[tokio::test]
+    async fn an_agent_only_fact_is_written_as_an_observation_not_refused() {
+        let (home, root) = daemon_layout("observation-downgrade");
+        let dam = distiller_at(&root);
+        // NO user_message EVENT AT ALL: the transcript has one Agent: line and nothing else.
+        let mut body = String::new();
+        body.push_str("{\"ts\":\"2026-09-26T14:01:00Z\",\"seq\":1,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"我觉得这个接口大概是幂等的。\"}]}}\n");
+        body.push_str(
+            "{\"ts\":\"2026-09-26T14:01:01Z\",\"seq\":2,\"event\":{\"type\":\"stopped\"}}\n",
+        );
+        let path = write_transcript(&root, "run-t63-observation.jsonl", &body);
+        let key = crate::sessions::session_key_of(&path);
+
+        let out = dam
+            .distill_plan(&key, None, rules_plan(), false)
+            .await
+            .expect("an agent-only session with a durable fact must distil");
+        println!("READING #63 observation downgrade: {out:?}");
+        assert_eq!(
+            out.memories_refused, 0,
+            "the observation must NOT be refused by the vocabulary: {out:?}"
+        );
+        assert!(
+            out.memories_written >= 1,
+            "the downgrade must LAND, not merely not-be-refused: {out:?}"
+        );
+
+        // THE MEMORY ROW, which is the reading that proves it landed: store + namespace.
+        let rows = memory_rows(&dam.db).await;
+        println!("READING #63 memories: {rows:?}");
+        assert!(
+            rows.iter()
+                .any(|(store, ns, content)| store == "observation"
+                    && ns == "user"
+                    && content.contains("幂等")),
+            "an observation in a namespace it may write: {rows:?}"
+        );
+
+        // AND THE LEDGER AGREES: a pass that wrote is ok with no reason at all.
+        let (status, reason, written) = newest_row(&dam.db, &key).await;
+        println!("READING #63 ledger: {status} written={written} reason={reason}");
+        assert_eq!(status, "ok", "{reason}");
+        assert!(written >= 1, "{reason}");
+        assert_eq!(reason, "", "a pass that wrote carries no reason: {reason}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #65): the SAME defect on the other two stores -- a free-tier
+    /// procedure and a free-tier lesson are WRITTEN, not refused.
+    ///
+    /// Before this change the free tier stamped namespace "user" on every candidate, and
+    /// procedure/lesson accept only project:<x>/global: every procedural or lesson memory
+    /// the FREE tier could ever produce was refused by its own writer, so a zero-token
+    /// distillation could not record how-to knowledge at all. The pair is now resolved by
+    /// the writer from the store (crates/extract names no namespace), and the default it
+    /// resolves is `global` -- which the matrix allows for both stores.
+    #[tokio::test]
+    async fn a_free_tier_lesson_and_procedure_are_written_not_refused() {
+        let (home, root) = daemon_layout("free-tier-stores");
+        let dam = distiller_at(&root);
+        let mut lesson = String::new();
+        lesson.push_str("{\"ts\":\"2026-09-26T15:01:00Z\",\"seq\":1,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"注意：这个坑很容易踩，最好先看文档。\"}]}}\n");
+        lesson.push_str(
+            "{\"ts\":\"2026-09-26T15:01:01Z\",\"seq\":2,\"event\":{\"type\":\"stopped\"}}\n",
+        );
+        let mut procedure = String::new();
+        procedure.push_str("{\"ts\":\"2026-09-26T15:02:00Z\",\"seq\":1,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"首先要跑格式化，然后提交。\"}]}}\n");
+        procedure.push_str(
+            "{\"ts\":\"2026-09-26T15:02:01Z\",\"seq\":2,\"event\":{\"type\":\"stopped\"}}\n",
+        );
+
+        for (name, body) in [
+            ("run-t65-lesson.jsonl", lesson),
+            ("run-t65-procedure.jsonl", procedure),
+        ] {
+            let path = write_transcript(&root, name, &body);
+            let key = crate::sessions::session_key_of(&path);
+            let out = dam
+                .distill_plan(&key, None, rules_plan(), false)
+                .await
+                .expect("a free-tier pass over an agent-only transcript");
+            println!("READING #65 {name}: {out:?}");
+            assert_eq!(out.memories_refused, 0, "{name}: {out:?}");
+            assert!(out.memories_written >= 1, "{name}: nothing landed: {out:?}");
+            let (status, reason, written) = newest_row(&dam.db, &key).await;
+            assert_eq!(status, "ok", "{name}: {reason}");
+            assert!(written >= 1, "{name}: {reason}");
+        }
+
+        // THE ROWS: a lesson and a procedure, both in the namespace the writer resolves
+        // for those stores -- which is the one the matrix allows.
+        let rows = memory_rows(&dam.db).await;
+        println!("READING #65 memories: {rows:?}");
+        for store in ["lesson", "procedure"] {
+            assert!(
+                rows.iter().any(|(s, ns, _)| s == store && ns == "global"),
+                "a {store} in a namespace it may write: {rows:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (issue #63, second half): what must NOT be written still is not.
+    ///
+    /// An agent's own suggestion, plan or offer is skipped ENTIRELY (the attribution rule
+    /// in the prompt says so, and the_attribution_rule_is_in_the_extraction_prompt pins
+    /// that text). This is the free tier's half of the same rule: an Agent:-only turn that
+    /// states no durable fact produces no candidate at all, so nothing is written and the
+    /// row is the ledger's empty state -- NOT a refusal, and not a memory.
+    #[tokio::test]
+    async fn a_pure_agent_plan_is_skipped_not_written() {
+        let (home, root) = daemon_layout("agent-plan-skipped");
+        let dam = distiller_at(&root);
+        let mut body = String::new();
+        body.push_str("{\"ts\":\"2026-09-26T16:01:00Z\",\"seq\":1,\"event\":{\"type\":\"agent_message_chunk\",\"content\":[{\"type\":\"text\",\"text\":\"I will refactor this module tomorrow and summarize what changed.\"}]}}\n");
+        body.push_str(
+            "{\"ts\":\"2026-09-26T16:01:01Z\",\"seq\":2,\"event\":{\"type\":\"stopped\"}}\n",
+        );
+        let path = write_transcript(&root, "run-t63-plan.jsonl", &body);
+        let key = crate::sessions::session_key_of(&path);
+
+        let out = dam
+            .distill_plan(&key, None, rules_plan(), false)
+            .await
+            .expect("a readable session still answers");
+        println!("READING #63 agent plan: {out:?}");
+        assert_eq!(
+            (
+                out.memories_written,
+                out.memories_refused,
+                out.memories_skipped
+            ),
+            (0, 0, 0),
+            "a plan is neither written, refused nor a duplicate: {out:?}"
+        );
+        assert!(!out.write_refused_everything(), "{out:?}");
+        let rows = memory_rows(&dam.db).await;
+        assert!(
+            rows.is_empty(),
+            "nothing may reach the memories table: {rows:?}"
+        );
+        let (status, reason, written) = newest_row(&dam.db, &key).await;
+        assert_eq!((status.as_str(), written), ("empty", 0), "{reason}");
+        assert_eq!(reason, "", "an empty pass has no reason: {reason}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Issue #62's ledger contract, at the level where a refusal can still be produced
+    /// DETERMINISTICALLY: an illegal (store, namespace) pair built by hand.
+    ///
+    /// THE FIXTURE MOVED, AND WHY IS THE POINT. This test used to drive a real pass whose
+    /// free-tier lesson candidate carried namespace "user" -- a pair the matrix forbids --
+    /// so the refusal was produced by the free tier's own bug. That bug is fixed (issue
+    /// #63/#65: the tier names no namespace at all), and NOTHING in a zero-token
+    /// distillation can propose an illegal pair any more: only a MODEL can, and nothing in
+    /// the daemon coerces a model's answer. So the machinery is pinned where it is
+    /// deterministic -- the write path and the ledger row the response layer reads.
+    #[tokio::test]
+    async fn a_governance_refusal_is_recorded_as_a_refusal_not_as_an_empty_pass() {
+        let (home, root) = daemon_layout("refusal-ledger");
+        let dam = distiller_at(&root);
+        let key = "ruagent:t62-hand-built";
+        let candidate = ruagent_extract::MemoryCandidate {
+            store: ruagent_extract::CandidateStore::Lesson,
+            // THE ILLEGAL PAIR: lesson accepts project:<x>/global, never user.
+            namespace: "user".to_string(),
+            content: "注意：这个坑很容易踩。".to_string(),
+            confidence: ruagent_extract::CandidateConfidence::Unconfirmed,
+            rule: ruagent_extract::rules::RULE_LESSON_LEARNED,
+            origin: ruagent_extract::CandidateOrigin::Turn {
+                index: 0,
+                role: ruagent_extract::Role::Assistant,
+            },
+            source: key.to_string(),
+        };
+        let mem = dam
+            .write_memories(&[candidate], None)
+            .await
+            .expect("a refusal is an OUTCOME, not an error");
+        println!("READING #62 hand-built refusal: {mem:?}");
+        assert_eq!(
+            (mem.written, mem.skipped, mem.refused),
+            (0, 0, 1),
+            "a refusal is neither a write nor a duplicate: {mem:?}"
+        );
+        assert_eq!(mem.refusals.len(), 1, "{mem:?}");
+        let refusal = &mem.refusals[0];
+        assert_eq!(
+            (refusal.store.as_str(), refusal.namespace.as_str()),
+            ("lesson", "user")
+        );
+        assert_eq!(
+            refusal.allowed_namespaces,
+            vec!["project:<x>", "global"],
+            "the DATA a caller corrects its request with"
+        );
+        assert!(
+            memory_rows(&dam.db).await.is_empty(),
+            "nothing may be written"
+        );
+
+        // THE LEDGER ROW, written through the same call the pass uses.
+        let outcome = DistillOutcome {
+            session_key: key.to_string(),
+            memories_refused: mem.refused,
+            refusals: mem.refusals.clone(),
+            ..Default::default()
+        };
+        assert!(outcome.write_refused_everything(), "{outcome:?}");
+        let reason = outcome.refusal_reason().expect("a refusal has a reason");
+        dam.log_outcome(&outcome, "ok", "test-prompt", Some(&reason))
+            .await
+            .expect("the ledger row is written");
+        let (status, row_reason, written) = newest_row(&dam.db, key).await;
+        println!("READING #62 refusal ledger: {status} written={written} reason={row_reason}");
+        assert_eq!(status, "ok", "the pass RAN and measured: {row_reason}");
+        assert_eq!(written, 0, "{row_reason}");
+        assert!(row_reason.contains("REFUSED every memory"), "{row_reason}");
+        assert_ne!(
+            row_reason, NO_CONTENT_MESSAGE,
+            "a refusal must NEVER be recorded as 'nothing to distil'"
+        );
+
+        // THE CONTROL: a pass that finds nothing is empty with NO reason -- the two rows
+        // are tellable apart by machine.
+        let plain = write_transcript(
+            &root,
+            "run-t62-plain.jsonl",
+            &user_turn(0, "今天天气不错。"),
+        );
+        let plain_key = crate::sessions::session_key_of(&plain);
+        let none = dam
+            .distill_plan(&plain_key, None, rules_plan(), false)
+            .await
+            .expect("a readable session with no marker still answers");
+        assert!(
+            none.refusals.is_empty() && none.memories_refused == 0 && none.memories_written == 0,
+            "{none:?}"
+        );
+        let (estatus, ereason, ewritten) = newest_row(&dam.db, &plain_key).await;
+        assert_eq!(estatus, "empty", "{ereason}");
+        assert_eq!(ewritten, 0, "{ereason}");
+        assert_eq!(ereason, "", "an empty pass carries NO reason: {ereason}");
+        assert_ne!(
+            (status.as_str(), row_reason.as_str()),
+            (estatus.as_str(), ereason.as_str()),
+            "a refusal and an empty pass must not be the same row"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

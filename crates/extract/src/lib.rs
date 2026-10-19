@@ -234,10 +234,16 @@ impl Default for CandidateOrigin {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryCandidate {
     pub store: CandidateStore,
-    /// A canonical namespace string: "user" | "global" | "project:<name>" |
-    /// "agent:<name>". The free tier emits [`rules::NAMESPACE_USER`]; the
-    /// applier validates it through `ruagent_memory::namespace::Namespace::parse`
-    /// (used at distill.rs:683) and may narrow it.
+    /// A canonical namespace string ("user" | "global" | "project:<name>" |
+    /// "agent:<name>"), or EMPTY for "the writer decides" (issue #63/#65).
+    ///
+    /// EMPTY IS THE FREE TIER'S ONLY VALUE, and that is deliberate: which store may
+    /// write which namespace is the WRITE VOCABULARY's decision, enforced by the
+    /// applier, and a deterministic tier that named one itself (it stamped "user" on
+    /// everything) made its own procedure/lesson candidates unwritable -- those stores
+    /// accept project:{x}/global and never user. The applier resolves an empty value
+    /// from the store through that matrix, and validates a NAMED one through
+    /// `ruagent_memory::namespace::Namespace::parse`.
     pub namespace: String,
     /// The source sentence, verbatim (trimmed, whitespace-collapsed). Never
     /// rewritten or completed (design §7.4.3).

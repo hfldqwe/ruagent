@@ -6,10 +6,12 @@
 // The page's own notes live at the top of Sessions.tsx.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Dropdown, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
+import { Alert, Button, Dropdown, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
 import {
   api,
+  DistillRefusedError,
   type DistillBatchOutcome,
+  type DistillRefusedPayload,
   type DistillScope,
   type DistillTier,
   type SessionRecord,
@@ -224,6 +226,12 @@ export function Sessions() {
   /** issue #57: the extractor tier this page's distillation actions use. See
    *  DEFAULT_DISTILL_TIER for why it starts on the free one. */
   const [tier, setTier] = useState<DistillTier>(DEFAULT_DISTILL_TIER);
+  /** #62: the last distillation this page was REFUSED, kept as its own fact
+   *  until dismissed. A governed refusal (409 + refused[]) is not a failed
+   *  request and not an empty session, and a two-second toast plus
+   *  "409 Conflict: {json}" would say neither which pairs were refused nor
+   *  that NOTHING was written — so it gets a surface of its own. */
+  const [refusal, setRefusal] = useState<{ sessionKey: string; payload: DistillRefusedPayload } | null>(null);
   /** Key of the row whose archive/delete request is in flight. */
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState<SessionRecord | null>(null);
@@ -525,6 +533,9 @@ export function Sessions() {
 
   const distill = async (s: SessionRecord) => {
     setDistilling(s.key);
+    // A new attempt replaces the previous refusal: the card is about THIS page's
+    // latest distillation, not a log.
+    setRefusal(null);
     try {
       // issue #57: the row action runs the SAME tier as the batch control above
       // — one page-level choice, so a single distill cannot quietly buy an agent
@@ -553,7 +564,21 @@ export function Sessions() {
       // Same tier it was priced with: the row action ran THAT one.
       refreshPlan(tier);
     } catch (e) {
-      toast("err", String(e));
+      // #62: a governed refusal is a FACT about the write vocabulary, not a
+      // failed request. It gets the card (the pairs, what each store accepts,
+      // and "nothing was written") plus a short toast, because the click that
+      // caused it was on a row.
+      if (e instanceof DistillRefusedError) {
+        setRefusal({ sessionKey: s.key, payload: e.payload });
+        toast("err", t("sessions.refused.toast", { n: e.payload.refused.length }));
+        // The attempt DID write a ledger row (status ok, 0 written) and left the
+        // backlog, so both readers are re-asked rather than left describing the
+        // state before the click.
+        void load();
+        refreshPlan(tier);
+      } else {
+        toast("err", String(e));
+      }
     } finally {
       setDistilling(null);
     }
@@ -719,6 +744,71 @@ export function Sessions() {
           {plan ? t("distill.batch.open", { n: plan.undistilled_total }) : t("distill.batch.openPlain")}
         </Button>
       </div>
+
+      {/* #62: A REFUSED PASS KEEPS ITS OWN SURFACE. Not the page's error
+          state (nothing failed to load), not the empty state (this is the
+          opposite reading: the pass ran and proposed), and not a transient
+          toast. It states what was refused, what each store DOES accept, and
+          that nothing was written. */}
+      {refusal ? (
+        <Alert
+          className="distill-refused"
+          type="warning"
+          showIcon
+          data-refused-pairs={refusal.payload.refused.length}
+          data-refused-written={typeof refusal.payload.memories_written === "number" ? refusal.payload.memories_written : "not_recorded"}
+          message={
+            <span>
+              {t("sessions.refused.title")}
+              {" · "}
+              <span className="mono micro">{refusal.sessionKey}</span>
+            </span>
+          }
+          description={
+            <div>
+              <p className="micro flush">{t("sessions.refused.hint")}</p>
+              <p className="micro" data-refused-error="">
+                {refusal.payload.error}
+              </p>
+              <p className="micro flush">{t("sessions.refused.pairs")}</p>
+              {refusal.payload.refused.map((r) => (
+                <div
+                  className="row tight"
+                  key={r.store + ":" + r.namespace}
+                  data-refused-pair={r.store + " × " + r.namespace}
+                >
+                  <span className="mono micro">
+                    {r.store} × {r.namespace}
+                  </span>
+                  <span className="grow" />
+                  <span
+                    className="muted micro"
+                    data-allowed={r.allowed_namespaces.join(",")}
+                  >
+                    {t("sessions.refused.allowed", {
+                      list: r.allowed_namespaces.length
+                        ? r.allowed_namespaces.join(" / ")
+                        : t("sessions.refused.allowedEmpty"),
+                    })}
+                  </span>
+                </div>
+              ))}
+              <p className="micro">
+                {t("sessions.refused.measure", {
+                  r: typeof refusal.payload.memories_refused === "number" ? refusal.payload.memories_refused : t("distill.notRecorded"),
+                  w: typeof refusal.payload.memories_written === "number" ? refusal.payload.memories_written : t("distill.notRecorded"),
+                  s: typeof refusal.payload.memories_skipped === "number" ? refusal.payload.memories_skipped : t("distill.notRecorded"),
+                })}
+              </p>
+              <div className="row end">
+                <Button size="small" onClick={() => setRefusal(null)}>
+                  {t("common.close")}
+                </Button>
+              </div>
+            </div>
+          }
+        />
+      ) : null}
 
       {failed && (
         <ErrorState
@@ -1402,6 +1492,11 @@ function BatchDistillModal({
   /** Whether the tier that RAN calls the model. The daemon's own label decides:
    *  `rules` is the free one, `acp` and `rules+acp` are not. */
   const ranFree = outcome != null && outcome.extractor === "rules";
+  /** #62: the daemon's own count of attempts that answered ok and wrote NOTHING,
+   *  or null when this daemon does not report it at all. "Not reported" and
+   *  "measured 0" are different readings and the panel must not merge them. */
+  const refusedCount =
+    outcome && typeof outcome.refused === "number" ? outcome.refused : null;
   /** `rules` is free, so the estimate's windows/tokens/cost — priced from the
    *  ledger's means over historical attempts, i.e. from ACP runs — describe the
    *  OTHER tier. The suffix names which numbers those are; the tier note above
@@ -1546,6 +1641,34 @@ function BatchDistillModal({
               })}
             </strong>
           </p>
+          {/* #62: THE REFUSED CLASS, beside the ledger's three words rather than
+              as a fourth. "refused" is a subset of "ok" (an attempt that ran,
+              was recorded, and wrote nothing because the vocabulary refused every
+              candidate), so the sum below is the reading that says the three
+              states still add up. An older daemon omits the key and this says so
+              instead of printing a 0 it never measured. */}
+          <p
+            className="muted micro"
+            data-batch-refused={refusedCount == null ? "not_recorded" : String(refusedCount)}
+          >
+            {refusedCount == null
+              ? t("sessions.refused.batchNotReported")
+              : t("sessions.refused.batch", { n: refusedCount })}
+          </p>
+          <p
+            className="muted micro"
+            data-batch-sum={
+              String(outcome.ok + outcome.empty + outcome.failed) + "/" + String(outcome.attempted)
+            }
+          >
+            {t("sessions.refused.batchSum", {
+              ok: outcome.ok,
+              empty: outcome.empty,
+              failed: outcome.failed,
+              sum: outcome.ok + outcome.empty + outcome.failed,
+              attempted: outcome.attempted,
+            })}
+          </p>
           {act ? (
             <>
               <div className="zone-head">
@@ -1595,7 +1718,37 @@ function BatchDistillModal({
                   {r.session_key}
                 </span>
                 <span className={statusCls(r.status)}>{statusLabel(r.status)}</span>
+                {/* #62: the per-session subset marker. "ok" with 0 written is
+                    the shape a reader would otherwise take for a normal success. */}
+                {typeof r.memories_refused === "number" &&
+                r.memories_refused > 0 &&
+                (r.memories_written ?? 0) === 0 ? (
+                  <span className="tag warn" data-result-refused={r.memories_refused}>
+                    {t("sessions.refused.result", { n: r.memories_refused })}
+                  </span>
+                ) : null}
                 <span className="grow" />
+                {Array.isArray(r.refusals) && r.refusals.length ? (
+                  <span
+                    className="muted micro"
+                    data-result-pairs={r.refusals
+                      .map((x) => x.store + " × " + x.namespace)
+                      .join(", ")}
+                  >
+                    {r.refusals
+                      .map(
+                        (x) =>
+                          x.store +
+                          " × " +
+                          x.namespace +
+                          " → " +
+                          (x.allowed_namespaces.length
+                            ? x.allowed_namespaces.join(" / ")
+                            : t("sessions.refused.allowedEmpty")),
+                      )
+                      .join(" · ")}
+                  </span>
+                ) : null}
                 {r.reason ? <span className="muted micro">{r.reason}</span> : null}
               </div>
             ))}

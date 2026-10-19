@@ -107,14 +107,67 @@ enum Step {
     /// store+namespace, so the scoped UPDATE affected **0 rows**. Nothing was
     /// superseded, therefore nothing may claim it was.
     SupersedeRefused { old: i64 },
+    /// `supersedes` named an id that exists NOWHERE (issue #61): the scoped UPDATE
+    /// affected 0 rows AND no row carries that id. A DIFFERENT caller mistake from
+    /// the one above, and it is told apart where the difference is KNOWN (inside
+    /// this closure) instead of being inferred later from a constraint error --
+    /// which is how both cases used to arrive as one and the same failure.
+    SupersedeMissing { old: i64 },
     /// The content's unique key is held by a tombstone that is ALSO superseded:
     /// reviving it would not make it current, and a second row with the same key
     /// cannot exist. Refused, loudly — never silently dropped.
     InsertRefused { tombstone: i64 },
 }
 
+/// Why a governed write did not happen.
+///
+/// WHY THIS TYPE EXISTS (issue #61 / ruagent-issues-56-59 t15). Three of these
+/// variants are the CALLER's mistake, and until they were named they travelled as
+/// `DbError::Sqlite(… SQLITE_CONSTRAINT …)` -- which the daemon's `From<DbError> for
+/// ApiError` renders as a **500 "the daemon broke"** for a request the caller can fix.
+/// A status code is a statement about WHO is at fault, so the pipeline states it
+/// HERE, in a variant the route can match, instead of leaving the route to classify
+/// `ruagent-store`'s message text (the shape issue #61 rejects: prose in one crate must
+/// never become another crate's contract).
+///
+/// `Db`/`Sqlite` are NOT refusals: something on the storage side failed, and 5xx is
+/// the honest answer there. The three refusal variants below are the ones a caller
+/// can fix by reading the answer.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    /// The database itself failed (open, locked, closed, ledger…).
+    #[error("sqlite error: {0}")]
+    Db(#[from] DbError),
+    /// A statement INSIDE the write closure failed.
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// `supersedes` named a row that is not a CURRENT row of this store+namespace
+    /// (superseded, soft-deleted, or another pair's). Nothing was superseded, and
+    /// nothing may claim it was.
+    #[error(
+        "supersede refused: `{old}` is not a current row of store `{store}` namespace `{namespace}` -- the memory was NOT written (recorded in the write audit as op='supersede_refused')"
+    )]
+    SupersedeNotCurrent {
+        old: i64,
+        store: String,
+        namespace: String,
+    },
+    /// `supersedes` named an id that is in no row at all: there is nothing to act on.
+    #[error(
+        "supersede refused: no memory with id `{old}` exists -- the memory was NOT written (recorded in the write audit as op='supersede_missing')"
+    )]
+    SupersedeMissing { old: i64 },
+    /// The content's unique key is held by a tombstone that is ALSO superseded:
+    /// reviving it would not make it current, and a second row with the same key
+    /// cannot exist.
+    #[error(
+        "insert refused: the same content is held by tombstone id={tombstone} which is also superseded -- the memory was NOT written (recorded in the write audit as op='insert_refused')"
+    )]
+    InsertBlockedByTombstone { tombstone: i64 },
+}
+
 /// Run one write through the pipeline.
-pub async fn write_memory(db: &Db, write: &MemoryWrite) -> Result<WriteOutcome, DbError> {
+pub async fn write_memory(db: &Db, write: &MemoryWrite) -> Result<WriteOutcome, WriteError> {
     // 1. Namespace governance — enforced here, in code (design §6.2).
     if !write.store.allows_namespace(&write.namespace) {
         audit(
@@ -190,24 +243,30 @@ pub async fn write_memory(db: &Db, write: &MemoryWrite) -> Result<WriteOutcome, 
                     rusqlite::params![old_id, store, ns, now],
                 )?;
                 if affected == 0 {
-                    // Two very different cases share `affected == 0`:
-                    //   * the id does not exist  -> fall through, the FOREIGN KEY
-                    //     on `memories.supersedes` rejects the INSERT exactly as
-                    //     it did before this change;
+                    // Two very different CALLER MISTAKES share `affected == 0`, and
+                    // they are told apart HERE, where the difference is known
+                    // (issue #61):
                     //   * the id exists but is superseded/soft-deleted/another
-                    //     store's -> refuse. Inserting would create a row whose
-                    //     `supersedes` column claims a replacement that never
-                    //     happened, and the returned outcome plus the audit row
-                    //     would both say `supersede` (the t41 family: an evidence
-                    //     event must not exist for an event that did not).
+                    //     store's -> refuse, and say WHICH rule. Inserting would
+                    //     create a row whose `supersedes` column claims a replacement
+                    //     that never happened, and the returned outcome plus the
+                    //     audit row would both say `supersede` (the t41 family: an
+                    //     evidence event must not exist for an event that did not);
+                    //   * the id exists NOWHERE -> refuse and say THAT. It used to
+                    //     fall through to the FOREIGN KEY on `memories.supersedes`,
+                    //     which made both cases arrive as one constraint-shaped
+                    //     `DbError` -- the reason the daemon could only answer 500 for
+                    //     either of them.
                     let exists: bool = conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
                         [old_id],
                         |r| r.get(0),
                     )?;
-                    if exists {
-                        return Ok(Step::SupersedeRefused { old: old_id });
-                    }
+                    return Ok(if exists {
+                        Step::SupersedeRefused { old: old_id }
+                    } else {
+                        Step::SupersedeMissing { old: old_id }
+                    });
                 } else {
                     superseded = Some(old_id);
                 }
@@ -318,27 +377,37 @@ pub async fn write_memory(db: &Db, write: &MemoryWrite) -> Result<WriteOutcome, 
                 Some(&before),
                 None,
                 Some(format!(
-                    "0 rows superseded: `{old}` is not a current row of store `{}` namespace `{}` \
-                     (it is superseded, soft-deleted, or in another store); nothing was written",
+                    "0 rows superseded: `{old}` is not a current row of store `{}` namespace `{}` (it is superseded, soft-deleted, or in another store); nothing was written",
                     write.store.as_str(),
                     write.namespace
                 )),
             )
             .await?;
-            // The function's error type is `DbError` (store-owned); a refused
-            // supersede IS a constraint on this write, so it surfaces as a
-            // constraint-shaped failure with an explicit message -- the same
-            // class the nonexistent-id path already produced.
-            return Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            // TYPED (issue #61): this refusal is the CALLER's, so it must not reach
+            // the route as a constraint-shaped `DbError` -- which is exactly what made
+            // the daemon answer 500 ("the daemon broke") for "your `supersedes` names a
+            // row that is no longer current".
+            return Err(WriteError::SupersedeNotCurrent {
+                old,
+                store: write.store.as_str().to_string(),
+                namespace: write.namespace.to_string(),
+            });
+        }
+        Step::SupersedeMissing { old } => {
+            let before = format!("id={old}");
+            audit(
+                db,
+                "supersede_missing",
+                write.store.as_str(),
+                &write.namespace.to_string(),
+                Some(&before),
+                None,
                 Some(format!(
-                    "supersede refused: `{old}` is not a current row of store `{}` namespace `{}` \
-                     -- the memory was NOT written (recorded in the write audit as \
-                     op='supersede_refused')",
-                    write.store.as_str(),
-                    write.namespace
+                    "`supersedes` names id={old}, which exists NOWHERE: the scoped UPDATE affected 0 rows and no row carries that id; nothing was written"
                 )),
-            )));
+            )
+            .await?;
+            return Err(WriteError::SupersedeMissing { old });
         }
         Step::InsertRefused { tombstone } => {
             let before = format!("id={tombstone}");
@@ -350,20 +419,12 @@ pub async fn write_memory(db: &Db, write: &MemoryWrite) -> Result<WriteOutcome, 
                 Some(&before),
                 None,
                 Some(format!(
-                    "the content's unique key (store, namespace, content_hash) is held by \
-                     tombstone id={tombstone}, which is ALSO superseded: reviving it would not \
-                     make it current and a second row cannot exist; nothing was written"
+                    "the content's unique key (store, namespace, content_hash) is held by tombstone id={tombstone}, which is ALSO superseded: reviving it would not make it current and a second row cannot exist; nothing was written"
                 )),
             )
             .await?;
-            return Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-                Some(format!(
-                    "insert refused: the same content is held by tombstone id={tombstone} which is \
-                     also superseded -- the memory was NOT written (recorded in the write audit as \
-                     op='insert_refused')"
-                )),
-            )));
+            // TYPED (issue #61) for the same reason as the supersede refusal above.
+            return Err(WriteError::InsertBlockedByTombstone { tombstone });
         }
         Step::Outcome { outcome, revived } => {
             // 5. Audit the outcome that really happened. `op` names the DECISION
@@ -540,6 +601,90 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(audits, 5, "insert + skip + supersede + 2 rejects");
+    }
+
+    /// The pipeline's refusals are TYPED, and a storage failure is NOT one of them
+    /// (issue #61 / ruagent-issues-56-59 t15).
+    ///
+    /// WHAT THIS PINS, and why it is a memory-crate test rather than a route test:
+    /// the DIFFERENCE has to exist here first. Each caller mistake gets its own
+    /// variant, so the daemon can answer 409/422 by matching a NAME -- and the two
+    /// storage arms stay what they are, because "the database could not honour a
+    /// well-formed request" is the one case a 5xx is honest for.
+    #[tokio::test]
+    async fn refusals_are_typed_and_a_storage_failure_is_not_a_refusal() {
+        let db = Db::open_in_memory().unwrap();
+
+        // (a) an id that exists NOWHERE (used to be the FK's job).
+        let err = write_memory(&db, &{
+            let mut w = write(MemoryStore::Lesson, "project:t15", "ghost");
+            w.supersedes = Some(999_999);
+            w
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, WriteError::SupersedeMissing { old: 999_999 }),
+            "a nonexistent supersedes target has its own variant: {err:?}"
+        );
+
+        // (b) an id that exists but is no longer CURRENT for this pair.
+        let id = match write_memory(&db, &write(MemoryStore::Lesson, "project:t15", "v1"))
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Inserted(id) => id,
+            other => panic!("setup inserts, got {other:?}"),
+        };
+        let mut superseding = write(MemoryStore::Lesson, "project:t15", "v2");
+        superseding.supersedes = Some(id);
+        assert!(
+            matches!(
+                write_memory(&db, &superseding).await.unwrap(),
+                WriteOutcome::Superseded { .. }
+            ),
+            "the first supersede is legitimate"
+        );
+        // A THIRD write, with DIFFERENT content: the same content would be answered by
+        // the dedupe step (`SkippedDuplicate`) before the supersede is even looked at,
+        // which is why this case must not reuse the body above.
+        let mut again = write(MemoryStore::Lesson, "project:t15", "v3");
+        again.supersedes = Some(id);
+        let err = write_memory(&db, &again).await.unwrap_err();
+        match &err {
+            WriteError::SupersedeNotCurrent {
+                old,
+                store,
+                namespace,
+            } => assert_eq!(
+                (*old, store.as_str(), namespace.as_str()),
+                (id, "lesson", "project:t15"),
+                "the refusal carries WHAT was refused, not only a sentence: {err:?}"
+            ),
+            other => panic!("expected SupersedeNotCurrent, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("supersede refused"),
+            "and its sentence says so: {err}"
+        );
+
+        // (c) a SOURCE EPISODE that does not exist is a STORAGE failure, not a
+        //     refusal: the request was well-formed and the database refused to
+        //     honour it (the FK on `memories.source_episode`). It must keep the
+        //     5xx-shaped error, or the daemon would start blaming callers for the
+        //     storage plane.
+        let mut w = write(
+            MemoryStore::Observation,
+            "user",
+            "fact with a ghost episode",
+        );
+        w.source_episode = Some(999_999);
+        let err = write_memory(&db, &w).await.unwrap_err();
+        println!("READING t15 storage failure (source_episode FK): {err}");
+        assert!(
+            matches!(err, WriteError::Sqlite(_)),
+            "a failed statement is not a refusal: {err:?}"
+        );
     }
 
     #[tokio::test]

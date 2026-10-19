@@ -1330,6 +1330,40 @@ fn routed_naming_what_ran(
     }
 }
 
+/// How long a run looks for its own new child before giving up on attribution
+/// (issue #60). It only delays a BACKGROUND task; the run never waits on it.
+const RUN_CHILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Reclaim a run's agent child, with the reading the chat path reports too
+/// (issue #60): how many it had to kill, how many were already gone, and how
+/// many SURVIVED. Blocking work goes to a blocking thread; a caller spawns this
+/// rather than awaiting it, so a run's exit is never delayed by a teardown.
+async fn reclaim_run_child(child: Arc<Mutex<Option<u32>>>, run_id: String, reason: &'static str) {
+    let pid = child.lock().expect("run child lock").take();
+    let Some(pid) = pid else {
+        tracing::debug!(
+            run = %run_id,
+            reason,
+            "run ended with no attributed child to reclaim"
+        );
+        return;
+    };
+    let what = format!("run {run_id}: child after {reason}");
+    let label = what.clone();
+    let out = tokio::task::spawn_blocking(move || crate::orphans::reclaim(&[pid], &label))
+        .await
+        .unwrap_or_default();
+    tracing::info!(
+        run = %run_id,
+        reason,
+        pid,
+        killed = out.killed,
+        already_gone = out.already_gone,
+        failed = out.failed,
+        "run child reclamation"
+    );
+}
+
 /// transcript, applies the permission policy, and finalizes state.
 #[allow(clippy::too_many_arguments)]
 async fn supervise(
@@ -1444,6 +1478,46 @@ async fn supervise(
         &run,
         RunEvent::UserMessage { text: asked },
     );
+    // ISSUE #60, attribution -- the same two tools the chat path uses (a window
+    // of our own children, then the image name when the window is ambiguous),
+    // because the ACP child is spawned inside the SDK's task and this is the only
+    // evidence of ownership there is. A run whose child cannot be told apart is
+    // LEFT unattributed on purpose: reclaiming a process that might belong to
+    // another live session is worse than not knowing a pid.
+    let run_child: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    {
+        let child_window = crate::orphans::live_children_of_self();
+        let child_program = opts.program.clone();
+        let slot = run_child.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + RUN_CHILD_WINDOW;
+            loop {
+                let found = crate::orphans::children_since(&child_window);
+                let pid = if found.len() == 1 {
+                    Some(found[0])
+                } else {
+                    let by_name = crate::orphans::matching_image(&found, &child_program);
+                    if by_name.len() == 1 {
+                        Some(by_name[0])
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pid) = pid {
+                    *slot.lock().expect("run child lock") = Some(pid);
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::debug!(
+                        candidates = found.len(),
+                        "no child could be attributed to this run; its exit will reclaim nothing"
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+    }
     let mut driver = tokio::spawn(run_once(opts, ev_tx.clone(), ask_tx));
 
     let mut ev_open = true;
@@ -1576,6 +1650,15 @@ async fn supervise(
                 // marked Cancelled (issue #39). Parked asks fail closed:
                 // their oneshot senders drop, the acp side reads Cancel.
                 driver.abort();
+                // ISSUE #60: the abort drops the driver future, which is
+                // SUPPOSED to tear the child down (the SDK's ChildGuard) -- and
+                // nothing used to check whether it did. Reclaim it, and report
+                // the reading.
+                tokio::spawn(reclaim_run_child(
+                    run_child.clone(),
+                    run.id.to_string(),
+                    "the run was cancelled",
+                ));
                 done = true;
                 run.status = RunStatus::Cancelled;
                 run.stop_reason = Some(StopReason::Cancelled);
@@ -1632,6 +1715,18 @@ async fn supervise(
             }
         }
     }
+
+    // ISSUE #60: the run is terminal, so its child must be too -- and this is
+    // the NORMAL exit, not the exotic one. The driver task has just finished, so
+    // the SDK's ChildGuard has run; the reclaim VERIFIES that and kills what is
+    // still alive, so "the agent exited with the run" is a reading rather than an
+    // assumption. Spawned, not awaited: a teardown must never delay a run's
+    // finalization.
+    tokio::spawn(reclaim_run_child(
+        run_child.clone(),
+        run.id.to_string(),
+        "the run ended",
+    ));
 
     // Dead asks for a finished/cancelled run can never be answered
     // usefully; drop them so the inbox stays honest.

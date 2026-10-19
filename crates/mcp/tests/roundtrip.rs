@@ -37,25 +37,35 @@ fn call(name: &str, args: serde_json::Value) -> CallToolRequestParams {
 }
 
 async fn start_test_daemon() -> String {
-    start_test_daemon_with_policy("[permissions]\ndefault = \"ask\"\n")
-        .await
-        .0
+    start_test_daemon_with_policy(DEFAULT_POLICY).await.0
 }
+
+/// The one-agent config every test here starts from: an agent that exists and is
+/// DISABLED, so a plan that needs a card has to say so rather than borrow this one.
+const DEFAULT_AGENTS_TOML: &str = "[agent.mock]\nharness = \"mock\"\ncommand = \"mock-agent\"\ndescription = \"x\"\nenabled = false\n";
+
+const DEFAULT_POLICY: &str = "[permissions]\ndefault = \"ask\"\n";
 
 /// The daemon PLUS the config root it serves, so a test can read `policy.toml`
 /// itself: for a capability write the FILE is the witness, not the tool's reply.
 async fn start_test_daemon_with_policy(policy_toml: &str) -> (String, std::path::PathBuf) {
+    start_test_daemon_with(DEFAULT_AGENTS_TOML, policy_toml).await
+}
+
+/// The daemon with BOTH config files chosen by the caller: `agents.toml` decides
+/// which agents exist and whether they are enabled, which is what a test driving the
+/// ACP extraction tier has to control.
+async fn start_test_daemon_with(
+    agents_toml: &str,
+    policy_toml: &str,
+) -> (String, std::path::PathBuf) {
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!("ruagent-mcp-e2e-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(
-        config_dir.join("agents.toml"),
-        "[agent.mock]\nharness = \"mock\"\ncommand = \"mock-agent\"\ndescription = \"x\"\nenabled = false\n",
-    )
-    .unwrap();
+    std::fs::write(config_dir.join("agents.toml"), agents_toml).unwrap();
     std::fs::write(
         config_dir.join("mcp.toml"),
         "[profile.default]\nservers = []\n",
@@ -517,6 +527,390 @@ async fn stub_http_server(status: &str, body: &str) -> (String, tokio::task::Joi
         }
     });
     (format!("http://{addr}"), handle)
+}
+
+/// t13 / #62: a pass that found NOTHING TO KEEP is a SUCCESS with zeroes, and it must
+/// not read like the other shape — a pass the write vocabulary refused, which the daemon
+/// answers with 409 (the governed-refusal test below drives that live, and the 409 stub
+/// test pins the same decision deterministically).
+#[tokio::test]
+async fn an_empty_distillation_pass_is_a_success_not_a_refusal() {
+    let (daemon_url, root) = start_test_daemon_with_policy(DEFAULT_POLICY).await;
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    let key = "ruagent:t18-empty";
+    let file = root
+        .join("data")
+        .join("transcripts")
+        .join("t18-empty.jsonl");
+    // THE TRANSCRIPT SHAPE IS THE PARSER'S, NOT OURS (t13): an assistant turn is a run
+    // of agent_message_chunk events whose content blocks carry the text, CLOSED by a
+    // stopped event — the accumulated text is what becomes one message. A chunk with a
+    // bare text field is dropped in silence, and the route then answers its 400
+    // no-content refusal (measured), which is a different bug than this test's subject.
+    write_transcript(
+        &file,
+        &[
+            serde_json::json!({
+                "ts": "2026-10-19T10:00:03Z",
+                "seq": 1,
+                "event": {
+                    "type": "agent_message_chunk",
+                    "content": [{ "type": "text", "text": "The build finished at noon." }],
+                },
+            }),
+            serde_json::json!({ "ts": "2026-10-19T10:00:04Z", "seq": 2, "event": { "type": "stopped" } }),
+        ],
+    )
+    .await;
+    seed_session(&root, key, &file).await;
+
+    let text = text_of(
+        &client
+            .call_tool(call(
+                "distill_session",
+                serde_json::json!({
+                    "session_key": key, "extractor": "rules", "dry_run": false
+                }),
+            ))
+            .await
+            .expect("a session with nothing worth keeping is not a failure"),
+    );
+    assert!(
+        text.contains("0 memories written, 0 skipped"),
+        "the empty pass reports the zeroes it measured: {text}"
+    );
+    assert!(
+        !text.contains("refused"),
+        "and it must not read as a refused one: {text}"
+    );
+    assert_eq!(
+        count_rows(&root, "SELECT COUNT(*) FROM memories").await,
+        0,
+        "an empty pass writes nothing either"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// The mock binary, derived from THIS test binary's own location:
+/// target/profile/deps/test.exe -> target/profile/ruagent-mock-agent[.exe]. This crate
+/// cannot use CARGO_BIN_EXE_ruagent-mock-agent (that is defined only for the mock-agent
+/// package's own tests), which is why the precondition is a located path plus an honest
+/// `#[ignore]` rather than a hard dependency.
+fn mock_bin() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let name = if cfg!(windows) {
+        "ruagent-mock-agent.exe"
+    } else {
+        "ruagent-mock-agent"
+    };
+    let path = profile_dir.join(name);
+    path.is_file()
+        .then(|| path.display().to_string().replace('\\', "/"))
+}
+
+const NEEDS_MOCK: &str = "needs ruagent-mock-agent next to this test binary: build it with cargo build -p ruagent-mock-agent (or cargo test --workspace), then run this test with -- --ignored";
+
+/// t13 / #56 + #62: a GOVERNED REFUSAL reaches the MCP caller as an ERROR naming the
+/// pair the store refused — and it is NOT the reply an empty pass gets.
+///
+/// THE REFUSAL IS PRODUCED BY THE REAL DAEMON, not hand-built: the extraction tier is
+/// driven by this repository's own mock agent (--behavior scripted), whose reply proposes
+/// lesson x user — a pair the write vocabulary refuses (lesson accepts project:<x>/global
+/// and never user) and one the extraction prompt explicitly tells a model not to name.
+/// The free tier can no longer produce this shape at all: #63/#65 made every rules
+/// candidate writable by resolving its namespace from the store, so the ACP tier is the
+/// only live path to a refused pass.
+///
+/// WHY `#[ignore]` AND NOT AN EARLY RETURN: a missing precondition that returns early is
+/// a PASS in cargo's summary (t37). This test is reported as ignored, and an explicit
+/// `-- --ignored` run PANICS with the reason when the binary is absent.
+#[tokio::test]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with cargo build -p ruagent-mock-agent (or cargo test --workspace), then run this test with -- --ignored"]
+async fn a_governed_refusal_is_an_error_and_an_empty_pass_is_not() {
+    let mock = mock_bin().expect(NEEDS_MOCK);
+    let replies =
+        std::env::temp_dir().join(format!("ruagent-t18-replies-{}.json", std::process::id()));
+    std::fs::write(
+        &replies,
+        serde_json::json!([{
+            // A stable substring of the extraction prompt the daemon composes
+            // (`crates/daemon/src/distill.rs`, EXTRACTION_PROMPT's tail).
+            "marker": "TRANSCRIPT:",
+            "reply": serde_json::json!({
+                "memories": [{
+                    "store": "lesson",
+                    "namespace": "user",
+                    "content": "t18: the migration must run after the workspace backup",
+                    "confidence": 0.8,
+                }],
+                "entities": [],
+                "relations": [],
+            })
+            .to_string(),
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let replies_path = replies.display().to_string().replace('\\', "/");
+    let agents = format!(
+        "[agent.t18acp]\nharness = \"mock\"\ncommand = \"{mock} --behavior scripted --replies {replies_path}\"\ndescription = \"t18 scripted extraction\"\nenabled = true\n"
+    );
+    let (daemon_url, root) = start_test_daemon_with(&agents, DEFAULT_POLICY).await;
+    let http = reqwest::Client::new();
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    // (a) the session the scripted extraction reads. Its text does not decide the
+    //     outcome (the reply is scripted); the pass needs one message to read.
+    let key = "ruagent:t18-refused";
+    let file = root
+        .join("data")
+        .join("transcripts")
+        .join("t18-refused.jsonl");
+    write_transcript(
+        &file,
+        &[
+            serde_json::json!({
+                "ts": "2026-10-19T10:00:01Z",
+                "seq": 1,
+                "event": {
+                    "type": "agent_message_chunk",
+                    "content": [{ "type": "text", "text": "The deploy ran before the backup finished." }],
+                },
+            }),
+            serde_json::json!({ "ts": "2026-10-19T10:00:02Z", "seq": 2, "event": { "type": "stopped" } }),
+        ],
+    )
+    .await;
+    seed_session(&root, key, &file).await;
+
+    // (b) the daemon's OWN answer, read off HTTP, so the tool's refusal is compared
+    //     against the bytes the daemon actually sent (t2's discipline).
+    let raw = http
+        .post(format!("{daemon_url}/api/v1/sessions/{key}/distill"))
+        .json(&serde_json::json!({ "extractor": "acp", "dry_run": false }))
+        .send()
+        .await
+        .unwrap();
+    let status = raw.status().as_u16();
+    let raw_text = raw.text().await.unwrap();
+    assert_eq!(
+        status, 409,
+        "a pass the write vocabulary refused must not answer 200 (issue #62): {raw_text}"
+    );
+    // THE BODY IS PRINTED so it can be kept: the stub test in this file
+    // (`a_governed_refusal_body_from_the_live_daemon_is_an_error`) serves these exact
+    // bytes to the DEFAULT gate, which cannot build the mock agent. A reading nobody can
+    // copy is a reading nobody can re-check.
+    println!("READING t18 409 body -> {raw_text}");
+    let body: serde_json::Value = serde_json::from_str(&raw_text).expect("the 409 body is JSON");
+    assert_eq!(body["memories_refused"], 1, "{raw_text}");
+    assert_eq!(body["memories_written"], 0, "{raw_text}");
+    assert_eq!(body["refused"][0]["store"], "lesson", "{raw_text}");
+    assert_eq!(body["refused"][0]["namespace"], "user", "{raw_text}");
+    assert_eq!(
+        body["refused"][0]["allowed_namespaces"],
+        serde_json::json!(["project:<x>", "global"]),
+        "the daemon publishes what the store DOES accept: {raw_text}"
+    );
+    let daemon_sentence = body["error"]
+        .as_str()
+        .expect("the refusal body carries error")
+        .to_string();
+
+    // (c) the same call through the MCP tool: an ERROR, with the sentence AND the data.
+    let refused = failure(
+        client
+            .call_tool(call(
+                "distill_session",
+                serde_json::json!({ "session_key": key, "extractor": "acp", "dry_run": false }),
+            ))
+            .await,
+    );
+    assert!(
+        refused.contains(&daemon_sentence),
+        "the daemon's own sentence must reach the caller verbatim: {refused}"
+    );
+    assert!(
+        refused.contains("store `lesson` cannot write namespace `user`"),
+        "the refused PAIR is named, not just the fact of a refusal: {refused}"
+    );
+    assert!(
+        refused.contains("{project:<x>, global}"),
+        "and what that store accepts, so the request can be corrected: {refused}"
+    );
+    assert!(
+        !refused.contains("memories written,"),
+        "a refusal must not wear the receipt: {refused}"
+    );
+    assert_eq!(
+        count_rows(&root, "SELECT COUNT(*) FROM memories").await,
+        0,
+        "a refused pass writes no memory row"
+    );
+
+    // (d) THE CONTRAST, on the SAME daemon and the same tool: a session with nothing to
+    //     keep succeeds, and its reply is not the refusal's.
+    let empty_key = "ruagent:t18-empty";
+    let empty_file = root
+        .join("data")
+        .join("transcripts")
+        .join("t18-empty.jsonl");
+    write_transcript(
+        &empty_file,
+        &[
+            serde_json::json!({
+                "ts": "2026-10-19T10:00:05Z",
+                "seq": 1,
+                "event": {
+                    "type": "agent_message_chunk",
+                    "content": [{ "type": "text", "text": "The build finished at noon." }],
+                },
+            }),
+            serde_json::json!({ "ts": "2026-10-19T10:00:06Z", "seq": 2, "event": { "type": "stopped" } }),
+        ],
+    )
+    .await;
+    seed_session(&root, empty_key, &empty_file).await;
+    let kept = text_of(
+        &client
+            .call_tool(call(
+                "distill_session",
+                serde_json::json!({
+                    "session_key": empty_key, "extractor": "rules", "dry_run": false
+                }),
+            ))
+            .await
+            .expect("a session with nothing worth keeping is not a failure"),
+    );
+    assert!(
+        kept.contains("0 memories written, 0 skipped"),
+        "the empty pass reports the zeroes it measured: {kept}"
+    );
+    assert!(
+        !kept.contains("refused"),
+        "and it must not read as a refused one: {kept}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// t13's COMPATIBILITY clause, at the seam: an OLD daemon's 200 envelope — a success
+/// body carrying `memories_skipped` and none of #62's refusal keys — is still read as
+/// the receipt it always was, byte for byte. The new reading is ADDITIVE, so a daemon
+/// built before the refusal shape existed cannot be mis-read as refusing anything.
+#[tokio::test]
+async fn the_old_200_distill_envelope_still_reads_as_a_receipt() {
+    let (url, stub) = stub_http_server(
+        "200 OK",
+        &serde_json::json!({
+            "distilled": {
+                "session_key": "ruagent:old", "agent": "mock", "memories_written": 4,
+                "memories_skipped": 1, "entities_written": 2, "relations_written": 3,
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    let (client, server_task) = mcp_pair(&url).await;
+
+    let text = text_of(
+        &client
+            .call_tool(call(
+                "distill_session",
+                serde_json::json!({ "session_key": "ruagent:old", "extractor": "rules" }),
+            ))
+            .await
+            .expect("the pre-#62 envelope is a success"),
+    );
+    assert_eq!(
+        text,
+        "distilled `ruagent:old` via mock: 4 memories written, 1 skipped, 2 entities, 3 relations\n",
+        "the old shape renders exactly as it did before this task"
+    );
+
+    shutdown_pair(client, server_task).await;
+    stub.abort();
+}
+
+/// t13 / #56 + #62, DETERMINISTICALLY: the daemon 409 body captured from a LIVE run is
+/// an ERROR naming the refused pair, and it is not the receipt a 200 produces.
+///
+/// WHERE THE BYTES COME FROM: a live run of the governed-refusal test above
+/// (`--ignored --nocapture`) prints them as `READING t18 409 body -> ...`; the
+/// constant below is that line, byte for byte. The stub is how the DEFAULT gate --
+/// which cannot build the mock agent -- still reads the daemon words instead of a
+/// shape invented here.
+const LIVE_409_BODY: &str = r#"{"error":"nothing was written: this pass proposed 1 memories and the write vocabulary refused every one of them (design 6.2). Each refusal names the store, the namespace and the rule","outcome":"RejectedNamespace (this store does not allow that namespace; write vocabulary = profile×{user} | observation×{user,project:<x>,agent:<x>} | procedure×{project:<x>,global} | lesson×{project:<x>,global}; the refused pair is recorded in the write audit as op='reject')","refused":[{"store":"lesson","namespace":"user","allowed_namespaces":["project:<x>","global"],"reason":"store 'lesson' cannot write namespace 'user' (it accepts {project:<x>, global}); the write audit records the refusal as op='reject' and nothing was written for it"}],"memories_refused":1,"memories_written":0,"memories_skipped":0,"distilled":{"session_key":"ruagent:t18-refused","memories_written":0,"memories_skipped":0,"memories_refused":1,"refusals":[{"store":"lesson","namespace":"user","allowed_namespaces":["project:<x>","global"],"reason":"store 'lesson' cannot write namespace 'user' (it accepts {project:<x>, global}); the write audit records the refusal as op='reject' and nothing was written for it"}],"entities_written":0,"relations_written":0,"agent":"t18acp","source":"acp","truncated":false,"retries":0,"windows":1,"coverage":{"from_message":0,"to_message":1,"total_messages":1,"bytes":63,"budget_bytes":1048576},"tokens_used":null,"context_size":null,"cost_usd":null,"relations_duplicate":0,"relations_refused":0,"dry_run":false}}"#;
+
+#[tokio::test]
+async fn a_governed_refusal_body_from_the_live_daemon_is_an_error() {
+    let (url, stub) = stub_http_server("409 Conflict", LIVE_409_BODY).await;
+    let (client, server_task) = mcp_pair(&url).await;
+
+    let seen = failure(
+        client
+            .call_tool(call(
+                "distill_session",
+                serde_json::json!({ "session_key": "ruagent:t18-refused", "extractor": "acp" }),
+            ))
+            .await,
+    );
+    assert!(seen.contains("nothing was written"), "{seen}");
+    assert!(seen.contains("HTTP 409"), "{seen}");
+    assert!(
+        seen.contains("store `lesson` cannot write namespace `user`"),
+        "the refused pair is named: {seen}"
+    );
+    assert!(seen.contains("{project:<x>, global}"), "{seen}");
+    assert!(
+        seen.contains("refused: 1 of 1 memory candidate(s)"),
+        "and the counts the daemon published: {seen}"
+    );
+    assert!(
+        !seen.contains("memories written,"),
+        "a refusal must not wear the receipt: {seen}"
+    );
+    assert!(
+        !seen.contains(r#""refused""#),
+        "the JSON envelope must not be echoed: {seen}"
+    );
+
+    shutdown_pair(client, server_task).await;
+    stub.abort();
+}
+
+/// One transcript file: the JSONL shape the session reader parses, one line per
+/// event (several lines at once, so a fixture can spell a whole turn).
+async fn write_transcript(path: &std::path::Path, lines: &[serde_json::Value]) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let body: String = lines
+        .iter()
+        .map(|l| format!("{l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, body).unwrap();
+}
+
+/// The `sessions` row that points a key at a REAL transcript — what the distill route
+/// looks the key up in (`crates/daemon/src/sessions.rs`, and the daemon's own
+/// `seed_transcript` helper). A second connection, like `seed` above.
+async fn seed_session(root: &std::path::Path, key: &str, transcript: &std::path::Path) {
+    let path = transcript.to_string_lossy().replace('\\', "/");
+    seed(
+        root,
+        &format!(
+            "INSERT OR REPLACE INTO sessions
+                 (key, source, title, project, ref_path, started_at, updated_at,
+                  mtime_ms, size_bytes, message_count, preview)
+             VALUES ('{key}','ruagent','t13','/w','{path}',1,2,2,3,4,'p');"
+        ),
+    )
+    .await;
 }
 
 /// Seed SQL through a SECOND connection to the test daemon's own database.

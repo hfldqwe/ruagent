@@ -587,12 +587,30 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
               {
                 title: t("distill.ledger.col.status"),
                 dataIndex: "status",
-                render: (v: string | null) => (
-                  <span
-                    className={v === "failed" ? "tag err" : v === "ok" ? "tag ok" : "tag"}
-                    data-status={v ?? "not_recorded"}
-                  >
-                    {t(`distill.ledger.status.${v ?? "not_recorded"}`)}
+                render: (v: string | null, e: DistillLedgerEntry) => (
+                  <span className="row tight">
+                    <span
+                      className={v === "failed" ? "tag err" : v === "ok" ? "tag ok" : "tag"}
+                      data-status={v ?? "not_recorded"}
+                    >
+                      {t(`distill.ledger.status.${v ?? "not_recorded"}`)}
+                    </span>
+                    {/* #62: "ok" AND "0 written" is the shape a governed refusal
+                        leaves in the ledger (the pass ran and was recorded; the
+                        write vocabulary refused every candidate). Marked here so an
+                        ok/0 row cannot be read as an ok/3 row — and never as the
+                        "empty" outcome, which is the other reading entirely. The
+                        cause is not guessed: it is in the Reason column, where the
+                        daemon writes the refused pairs. */}
+                    {v === "ok" && e.memories_written === 0 ? (
+                      <span
+                        className="tag warn"
+                        data-wrote-nothing="1"
+                        title={t("distill.ledger.wroteNothingHint")}
+                      >
+                        {t("distill.ledger.wroteNothing")}
+                      </span>
+                    ) : null}
                   </span>
                 ),
               },

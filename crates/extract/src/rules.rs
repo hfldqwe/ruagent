@@ -33,11 +33,12 @@ pub const RULE_PROCEDURE_NOTE: &str = "procedure_note";
 pub const RULE_LESSON_LEARNED: &str = "lesson_learned";
 pub const RULE_HEDGED_STATEMENT: &str = "hedged_statement";
 
-/// The namespace the free tier writes into. It is the only namespace this crate
-/// can justify without reading config: a deterministic rule produces facts about
-/// the user. The applier still validates it through
-/// `ruagent_memory::namespace::Namespace::parse` (used at distill.rs:683).
-pub const NAMESPACE_USER: &str = "user";
+// THE FREE TIER HAS NO NAMESPACE CONSTANT ANY MORE (issue #63/#65). It carried
+// NAMESPACE_USER = "user" and memory.rs stamped it on every candidate -- a flat,
+// store-blind answer to a question the WRITE VOCABULARY owns, which made this
+// crate's own procedure/lesson candidates unwritable (they accept project:{x}/global,
+// never user). Candidates now leave the field EMPTY and the writer resolves it from
+// the store through that one matrix. A constant here would be a second truth again.
 
 /// `PREF` — the user stated a durable preference/instruction.
 ///

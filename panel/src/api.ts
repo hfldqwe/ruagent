@@ -429,6 +429,72 @@ export interface DistillBatchActual {
 
 export type DistillTier = "rules" | "acp";
 
+/** ONE store x namespace pair the WRITE VOCABULARY refused (#62, design 6.2).
+ *
+ *  This is the fact the panel used to lose: the daemon answers 409 when EVERY
+ *  memory candidate a pass proposed was refused by the store matrix, and the
+ *  body carries the pairs. `allowed_namespaces` is what makes it actionable --
+ *  "lesson cannot write user" is only useful beside "lesson accepts
+ *  project:<x> / global". */
+export interface DistillRefusal {
+  store: string;
+  namespace: string;
+  /** What this store MAY write. Empty is a legal answer (nothing is writable). */
+  allowed_namespaces: string[];
+  /** The daemon's own sentence for this pair, shown verbatim. */
+  reason: string;
+}
+
+/** What ONE distillation attempt answers on the 200 path. The 409's body carries
+ *  this whole object under `distilled`, so a caller that handled the old shape
+ *  keeps every key it read (#62). */
+export interface DistilledOutcome {
+  memories_written: number;
+  memories_skipped: number;
+  entities_written: number;
+  relations_written: number;
+  agent: string;
+  /** #62, additive: candidates the write matrix refused, and the pairs. An
+   *  older daemon omits both, and 0 is a MEASURED zero -- absent is not. */
+  memories_refused?: number;
+  refusals?: DistillRefusal[];
+}
+
+/** The 409 body of a pass that wrote NOTHING because the vocabulary refused
+ *  every candidate. Read it as a FACT, not as a failure: the pass ran and
+ *  measured; what it proposed cannot land. */
+export interface DistillRefusedPayload {
+  error: string;
+  outcome: string;
+  refused: DistillRefusal[];
+  memories_refused: number;
+  memories_written: number;
+  memories_skipped: number;
+  distilled?: DistilledOutcome;
+}
+
+/** The refusal of a single-session distillation, as an ERROR the view can
+ *  branch on instead of a sentence it has to parse. `message` is the daemon's
+ *  own sentence; `payload` is the structure. */
+export class DistillRefusedError extends Error {
+  constructor(readonly payload: DistillRefusedPayload) {
+    super(payload.error);
+    this.name = "DistillRefusedError";
+  }
+}
+
+/** The refusal inside a 409, or null when the error is something else (any
+ *  non-409, a text body, or a 409 whose body is not this shape -- an OLD daemon
+ *  answers 409 for other rules with plain text, and that must keep reaching the
+ *  caller as the error it always was). */
+function refusedPayload(e: unknown): DistillRefusedPayload | null {
+  if (!(e instanceof HttpError) || e.status !== 409) return null;
+  const body = e.body;
+  if (body == null || typeof body !== "object") return null;
+  if (!Array.isArray((body as { refused?: unknown }).refused)) return null;
+  return body as DistillRefusedPayload;
+}
+
 /** `POST /api/v1/sessions/distill/batch` (t7 / issue #47). The SAME shape
  *  answers the plan (`dry_run: true`) and the run, so the panel can put the
  *  estimate and the actual reading side by side without translating between
@@ -451,10 +517,25 @@ export interface DistillBatchOutcome {
   ok: number;
   empty: number;
   failed: number;
+  /** #62, additive: attempts that answered `ok` and wrote NOTHING because the
+   *  write matrix refused every candidate. A SUBSET MARKER, not a fourth state —
+   *  `refused <= ok`, and `ok + empty + failed == attempted` still holds, which
+   *  is why the panel prints the sum beside it. An older daemon omits the key:
+   *  absent is NOT 0 and the panel says so rather than printing a fake zero. */
+  refused?: number;
   estimated: DistillEstimate;
   /** null on a dry run — nothing ran, so there is nothing to report. */
   actual: DistillBatchActual | null;
-  results: { session_key: string; status: string; reason: string | null }[];
+  results: {
+    session_key: string;
+    status: string;
+    reason: string | null;
+    /** #62, additive: what the write vocabulary did for this session. Absent on
+     *  an older daemon (and absent means "not reported", never 0). */
+    memories_written?: number;
+    memories_refused?: number;
+    refusals?: DistillRefusal[];
+  }[];
 }
 
 /** One capability's DECLARED options, RESOLVED: registry defaults merged with
@@ -906,6 +987,13 @@ export class HttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** The response body PARSED, when it was JSON. A structured 4xx keeps its
+     *  data in the BODY (the distillation refusal's `refused[]` pairs, #62),
+     *  and the message is not a parsed shape -- so a caller that needs the facts
+     *  rather than the sentence reads this. A plain-text body (every 404/409
+     *  this panel handled before) leaves it undefined, and nothing that reads
+     *  only `message` changed. */
+    readonly body?: unknown,
   ) {
     super(message);
   }
@@ -1071,13 +1159,28 @@ const capabilitiesShape = (data: unknown): CapabilitiesResponse =>
     },
   );
 
+/// A failed response as HttpError's three arguments, in ONE place: the body is
+/// read as text (the message every caller already showed) and, when that text
+/// parses as JSON, ALSO passed parsed. Parsing is best-effort on purpose -- a
+/// text body must stay undefined rather than becoming a guessed shape.
+async function httpFailure(resp: Response): Promise<[string, number, unknown]> {
+  const text = (await resp.text()) || `${resp.status}`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  return [text, resp.status, parsed];
+}
+
 async function send(method: string, path: string, body?: unknown): Promise<Response> {
   const resp = await fetch(`${BASE}${path}`, {
     method,
     headers: { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!resp.ok) throw new HttpError((await resp.text()) || `${resp.status}`, resp.status);
+  if (!resp.ok) throw new HttpError(...(await httpFailure(resp)));
   return resp;
 }
 
@@ -1602,19 +1705,18 @@ export const api = {
    *  Same rule as the batch call below: the route reads an empty body as `acp`,
    *  so the tier is a required ARGUMENT rather than something a caller may
    *  forget to send. */
-  sessionDistill: (key: string, extractor: DistillTier) =>
-    post(`/api/v1/sessions/${key}/distill`, { extractor }).then(
-      (r) =>
-        r.json() as Promise<{
-          distilled: {
-            memories_written: number;
-            memories_skipped: number;
-            entities_written: number;
-            relations_written: number;
-            agent: string;
-          };
-        }>,
-    ),
+  sessionDistill: async (key: string, extractor: DistillTier) => {
+    try {
+      const r = await post(`/api/v1/sessions/${key}/distill`, { extractor });
+      return (await r.json()) as { distilled: DistilledOutcome };
+    } catch (e) {
+      // A governed refusal is its OWN outcome (#62): rethrown TYPED so the view
+      // renders the pairs instead of a generic error line.
+      const payload = refusedPayload(e);
+      if (payload) throw new DistillRefusedError(payload);
+      throw e;
+    }
+  },
   /** `GET /api/v1/distill/log` — the distillation ledger (t6 / issue #46).
    *  One row per ATTEMPT, newest first, through the same envelope as every
    *  other list route. `status` is the ledger's own vocabulary: ok | empty |

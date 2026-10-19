@@ -14,6 +14,10 @@
 //!   rows, so a `supersedes` id belonging to another store/namespace (or an
 //!   already-superseded row) produced `Superseded { old, new }` AND an
 //!   `op='supersede'` audit row while the target was still current.
+//!   The third case (an id that exists NOWHERE) is no longer the FK's to refuse:
+//!   ruagent-issues-56-59 t15 / issue #61 gave it its own variant, because a
+//!   constraint-shaped `DbError` reached the daemon as HTTP 500 for a caller's mistake
+//!   (see `a_nonexistent_supersedes_target_is_rejected_by_name` below).
 //!   Negative control = a legitimate supersede still reports `Superseded`, still
 //!   moves the old row out of `current_memories`, and still audits `supersede`.
 //!
@@ -22,7 +26,7 @@
 
 use ruagent_memory::lifecycle::delete_memory;
 use ruagent_memory::query::{current_memories, list_diffs};
-use ruagent_memory::write::{MemoryWrite, WriteOutcome, write_memory};
+use ruagent_memory::write::{MemoryWrite, WriteError, WriteOutcome, write_memory};
 use ruagent_memory::{MemoryStore, Namespace};
 use ruagent_store::Db;
 
@@ -347,10 +351,16 @@ async fn superseding_a_deleted_row_is_refused() {
     );
 }
 
-/// F2 UNCHANGED: a `supersedes` id that does not exist at all is still rejected by
-/// the FOREIGN KEY (this behaviour was not in scope to change).
+/// F2 CHANGED (ruagent-issues-56-59 t15 / issue #61): a `supersedes` id that exists
+/// NOWHERE is refused BY NAME, not by the FOREIGN KEY.
+///
+/// Why this test changed: the FK shape made this caller mistake indistinguishable
+/// from a storage failure (both arrived as `DbError::Sqlite(… SQLITE_CONSTRAINT …)`),
+/// so the daemon's `From<DbError> for ApiError` answered **500 "the daemon broke"** for
+/// a request the caller could fix. It is now `WriteError::SupersedeMissing`, which the
+/// route maps to 422 (crates/daemon/src/api.rs, `From<WriteError> for ApiError`).
 #[tokio::test]
-async fn a_nonexistent_supersedes_target_is_still_rejected() {
+async fn a_nonexistent_supersedes_target_is_rejected_by_name() {
     let db = Db::open_in_memory().unwrap();
     let out = write_memory(
         &db,
@@ -359,16 +369,25 @@ async fn a_nonexistent_supersedes_target_is_still_rejected() {
     .await;
     println!("READING t72 F2 nonexistent target: {out:?}");
     let err = out.expect_err("a nonexistent supersedes target must be rejected");
+    assert!(
+        matches!(err, WriteError::SupersedeMissing { old: 999_999 }),
+        "the refusal names the case AND the id: {err:?}"
+    );
     let text = err.to_string();
     assert!(
-        text.contains("FOREIGN KEY constraint failed"),
-        "the FK is still the rejecter for a nonexistent id: {text}"
+        text.contains("no memory with id `999999` exists"), // the id as Rust renders it
+        "and its sentence says which id: {text}"
+    );
+    assert!(
+        !text.contains("FOREIGN KEY"),
+        "the FK is no longer what refuses this: {text}"
     );
     assert_eq!(row_count(&db).await, 0, "nothing may be written");
+    // A refusal is AUDITED under its own op, like every other one: the audit has to
+    // say what happened, so it may not borrow a supersede that never happened.
+    let ops: Vec<String> = audit_rows(&db).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(ops, vec!["supersede_missing".to_string()], "{ops:?}");
 }
-
-/// F2 NEGATIVE CONTROL: a legitimate supersede still works, still moves the old
-/// row out of the read surface, and still writes the `supersede` audit row.
 #[tokio::test]
 async fn a_legitimate_supersede_still_works_and_is_audited() {
     let db = Db::open_in_memory().unwrap();

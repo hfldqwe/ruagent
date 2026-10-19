@@ -392,7 +392,18 @@ fn candidate(
 ) -> MemoryCandidate {
     MemoryCandidate {
         store,
-        namespace: rules::NAMESPACE_USER.to_string(),
+        // THE FREE TIER NAMES NO NAMESPACE (issue #63/#65). It used to stamp
+        // rules::NAMESPACE_USER on every candidate: a second, hand-written answer to a
+        // question the WRITE VOCABULARY already owns -- and a wrong one for
+        // procedure/lesson, which accept project:{x}/global and NEVER user. So every
+        // procedural or lesson candidate this tier produced was refused by its own
+        // writer, and the refusal was recorded as a skip (only a memory_diffs reject row
+        // survived). Empty means "the writer resolves it from the store"; that resolver
+        // reads the same matrix the write path enforces, so the two cannot disagree.
+        // This crate cannot look the matrix up itself: purity forbids the dependency
+        // (tests/bounded.rs), and a copy of it here would be exactly the second truth
+        // this change removes.
+        namespace: String::new(),
         content: content.to_string(),
         confidence,
         rule,

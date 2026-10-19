@@ -244,6 +244,35 @@ fn main() -> Result<()> {
 // wiki: compile sources into interlinked pages (thin client over the API)
 // ---------------------------------------------------------------------------
 
+/// THE DAEMON'S OWN REASON for a non-2xx, from the key the daemon actually uses.
+///
+/// `error` is the key the STRUCTURED refusals publish: issue #56's `memory/write`
+/// 409 and issue #62's distill 409 both answer `{"error": <sentence>, ...}`. `message`
+/// is the older, plainer spelling and `reason` is the same refusal in its shorter
+/// form; the three are read in that order because `error` is the one this daemon
+/// writes its refusals under, and the order is what makes ONE spelling of "the daemon
+/// said no" reach every command.
+///
+/// READING ONLY `message` (which is what this file did) made every structured refusal
+/// print as RAW JSON: the caller got a wall of `{"error":...}` instead of the one
+/// sentence the daemon wrote for them, at the one moment it mattered ("nothing was
+/// written, and why"). Measured against the real daemon: `POST
+/// /api/v1/sessions/<key>/distill` on a pass the write vocabulary refused answers 409
+/// with that body and no `message` key at all.
+///
+/// A body that is not JSON, or JSON naming none of the three, keeps today's
+/// `HTTP <status>: <body>`: the reason is the daemon's to give, not ours to invent.
+fn daemon_reason(status: reqwest::StatusCode, text: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        for key in ["error", "message", "reason"] {
+            if let Some(m) = v[key].as_str() {
+                return m.to_string();
+            }
+        }
+    }
+    format!("HTTP {status}: {text}")
+}
+
 /// Response -> JSON with the daemon's {message} error body surfaced.
 ///
 /// THE UNPARSEABLE-SUCCESS CASE CARRIES ITS LIKELY CAUSE (t9 / issue #46): a daemon
@@ -263,12 +292,7 @@ fn api_json(resp: reqwest::blocking::Response) -> Result<serde_json::Value> {
         .to_string();
     let text = resp.text().context("reading response")?;
     if !status.is_success() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(m) = v["message"].as_str()
-        {
-            bail!("{m}");
-        }
-        bail!("HTTP {status}: {text}");
+        bail!("{}", daemon_reason(status, &text));
     }
     serde_json::from_str(&text).with_context(|| {
         format!(
@@ -453,12 +477,7 @@ fn wiki_show(url: &str, slug: &str) -> Result<()> {
     let status = resp.status();
     let text = resp.text().context("reading response")?;
     if !status.is_success() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(m) = v["message"].as_str()
-        {
-            bail!("{m}");
-        }
-        bail!("HTTP {status}: {text}");
+        bail!("{}", daemon_reason(status, &text));
     }
     print!("{text}");
     Ok(())
@@ -1125,6 +1144,65 @@ mod tests {
             let default = Cli::try_parse_from(["ruagent", "status"]).expect("status parses");
             assert_eq!(default.url, "http://127.0.0.1:8787");
         }
+    }
+
+    /// t13 / #56 + #62: a STRUCTURED 4xx is the daemon's sentence, not its JSON.
+    ///
+    /// The bodies below are the two shapes this daemon actually publishes -- the keys
+    /// are the daemon's, so a rename there reddens this test rather than silently
+    /// turning refusals back into raw JSON. The plain-text and old-`message` paths
+    /// are asserted too: this is a widening, not a replacement.
+    #[test]
+    fn a_structured_refusal_prints_the_daemons_reason_not_its_json() {
+        // ISSUE #62: the distillation 409 (crates/daemon/src/api.rs, distill_answer).
+        let distill = serde_json::json!({
+            "error": "nothing was written: this pass proposed 1 memories and the write vocabulary refused every one of them (design 6.2). Each refusal names the store, the namespace and the rule",
+            "outcome": "RejectedNamespace (this store does not allow that namespace; ...)",
+            "refused": [{
+                "store": "lesson", "namespace": "user",
+                "allowed_namespaces": ["project:<x>", "global"],
+                "reason": "store 'lesson' cannot write namespace 'user' (it accepts project:<x>, global)",
+            }],
+            "memories_refused": 1, "memories_written": 0, "memories_skipped": 0,
+        })
+        .to_string();
+        let msg = daemon_reason(reqwest::StatusCode::CONFLICT, &distill);
+        assert!(msg.starts_with("nothing was written"), "{msg}");
+        assert!(
+            !msg.contains(r#""error""#),
+            "the JSON envelope must not be what the caller reads: {msg}"
+        );
+        assert!(msg.contains("write vocabulary refused"), "{msg}");
+
+        // ISSUE #56: the memory/write 409 publishes the same `error` key.
+        let write = serde_json::json!({
+            "error": "namespace governance (design 6.2): store `profile` writes only {user}, and `global` is not one of them. NOTHING WAS WRITTEN",
+            "store": "profile", "namespace": "global", "allowed_namespaces": ["user"],
+        })
+        .to_string();
+        let msg = daemon_reason(reqwest::StatusCode::CONFLICT, &write);
+        assert!(msg.contains("NOTHING WAS WRITTEN"), "{msg}");
+        assert!(!msg.contains("allowed_namespaces"), "{msg}");
+
+        // The older `message` spelling still works, and `reason` is read when it
+        // is the only key (the daemon's shorter form of the same refusal).
+        let old = serde_json::json!({ "message": "unknown store `profil`" }).to_string();
+        assert_eq!(
+            daemon_reason(reqwest::StatusCode::BAD_REQUEST, &old),
+            "unknown store `profil`"
+        );
+        let short =
+            serde_json::json!({ "reason": "the pair is outside the vocabulary" }).to_string();
+        assert_eq!(
+            daemon_reason(reqwest::StatusCode::CONFLICT, &short),
+            "the pair is outside the vocabulary"
+        );
+
+        // A PLAIN-TEXT body (every other route) keeps the status in front of it.
+        assert_eq!(
+            daemon_reason(reqwest::StatusCode::BAD_GATEWAY, "upstream is down"),
+            "HTTP 502 Bad Gateway: upstream is down"
+        );
     }
 
     /// t9 / #47: the CLI surface itself, without a daemon. Exactly one target is
