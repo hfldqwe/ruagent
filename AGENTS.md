@@ -264,6 +264,16 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   (`npm run test:e2e`) starts its own daemon and its proxy needs were NOT measured; assume neither
   value for it. The baseline-diff discipline above is unchanged, and this is that discipline one level
   down: the REMEDY has a scope too.
+  **And when the host itself is unreachable, `gh` is not `git`** (ruagent-issues-56-59, measured): during
+  that round `curl -4 https://github.com` returned 200 while `git push` failed with `Failed to connect to
+  github.com port 443` on six consecutive attempts over ~15 minutes -- and `Test-NetConnection github.com
+  -Port 443` was `False` while `api.github.com:443` was `True`, which is exactly why every `gh` command
+  kept working. The route that worked is SSH: `ssh -T git@github.com` authenticated (so did
+  `-p 443 git@ssh.github.com`), and `git push git@github.com:<owner>/<repo>.git main` succeeded on the
+  first attempt. Two consequences: a push over the SSH URL does NOT update `refs/remotes/origin/main`, so
+  `git status` keeps reporting 'ahead 1' after a push that landed -- align it with
+  `git update-ref refs/remotes/origin/main <sha>`; and the remote's real state is readable through the API
+  that still works (`gh api repos/<owner>/<repo>/commits/main -q .sha`).
 - **With `CARGO_NET_OFFLINE=true`, this workspace fails to LINK on ONNX — so it reads as a source
   regression in a crate you never touched** (ruagent-close-the-gaps t14, from the increment-7 migration
   work). `cargo test --workspace` dies at link time with `link.exe` **error 1120** and unresolved
