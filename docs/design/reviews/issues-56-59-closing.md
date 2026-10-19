@@ -204,3 +204,29 @@ Every row names a task; each task's `output` carries the exact commands, ports, 
 readings (`.agent-teams/ruagent-issues-56-59/`), and every member kept its evidence under
 `%TEMP%\<task>\`. The private daemons used for measurement are stopped; the fixtures that reports
 cite were deliberately left in place (AGENTS.md: never delete an artifact a report cites).
+## 9. What happened to the machine after the round closed
+
+* **The resident daemon was upgraded through the scheduled task, not from a session.** `stop -Force`
+  was needed because the running binary PREDATED the graceful-stop request file -- that file is one of
+  this round's own additions -- so "forced after 10 s" was the expected, explainable outcome rather
+  than a failure. The binary was rebuilt from the pushed tree and started with `Start-ScheduledTask`,
+  i.e. from a process whose parent is the Task Scheduler rather than a session of mine. It came up
+  healthy on `127.0.0.1:8787`, applied migration 0031 to the real database (`max=31`, `distill_log`
+  now ending in `memories_refused`), and serves the new read side (`totals.refused` /
+  `refused_not_recorded`, `?refused=only|none|not_recorded`, 400 on anything else). Its log immediately
+  shows the new instrumentation in production, including the accepted cost stated out loud:
+  `no child could be attributed to this chat ... its close will reclaim nothing` with
+  `children=0 killed=0 already_gone=0 failed=0`.
+* **The measurement instruments were removed** after the round closed: the baseline worktree
+  `D:\wt_flakebase` with its own target dir, and the round-4 verifier's control worktree
+  `D:\wt_t25ctl` with `D:\rust_cache_t25ctl` (~13 GB together). They are rebuildable rather than
+  unique -- SS5 and the task outputs carry the exact commands -- so their removal is RECORDED here
+  instead of being silent. The evidence the reports cite was not touched: the `%TEMP%\<task>\`
+  directories (including t9's, which the #56/#58 reads come from, and t20's exit-trace root) and the
+  fixture databases under `%TEMP%\ruagent-t5-panel\` stay where the reports left them.
+* **The private daemons were reaped by their recorded pids, never by a name or port sweep**: 8895 and
+  8897 honoured the graceful stop request -- an independent confirmation, on a real running daemon,
+  that the mechanism t20 added works -- while 8896 predated it and had to be terminated. The resident
+  daemon on 8787 was never touched.
+* **The E2E job now runs 68 tests where the reference floor is 62**: the six new cases are the
+  ledger-inconsistency spec, and the run that measured them passed 68/68 with 0 skipped.
