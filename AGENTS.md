@@ -340,6 +340,24 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   `%TEMP%\<task>\...` directory that is not cleaned mid-round) and leave the original alone until the
   round closes. The same applies to a task's private daemon roots: a fixture another task verifies
   against is evidence, not clutter.
+- **A green Rust gate on this machine is a WINDOWS reading; a unix-sensitive change needs a Linux one**
+  (ruagent-issues-56-59, measured twice in one round). `fmt`/`clippy`/`test` all run on Windows here, so
+  CI's `Rust (ubuntu)` job is the first place a unix-only path breaks -- and in that round it did: the
+  child-attribution work passed every local gate and failed 5 tests there. Two platform semantics, both
+  measured rather than inferred: a child killed but not yet reaped still has a `/proc` entry with state
+  `Z` and was counted as LIVE (Windows has no zombie state; measured `state=S` -> `Z` -> gone after
+  `waitpid`), and `/proc/stat`'s `btime` is WHOLE SECONDS, so a just-spawned child's computed start time
+  came out `delta_ms=996` early and the window filter excluded the session's own child. **WSL is NOT the
+  loop on this machine**: `wsl -d Ubuntu-22.04` starts but has no `cc/gcc/make/protoc` and `sudo` wants a
+  password, so rustc has no linker driver. The loop that worked is the existing podman machine with the
+  local `postgres:16` image as a Debian base (apt + rustup inside as root), **tuna mirrors** for
+  `static.rust-lang.org`/`index.crates.io` (direct is blocked from the container), the target dir in a
+  container VOLUME (never `/mnt`), and tests as a NON-root user (`-u 1000`: as root, the cleanup
+  assertions falsely red). The image `localhost/t28-rust:local` and the stopped container `t28b` are kept
+  for re-runs; the repeatable setup steps are in that task's output and in the round's closing notes.
+  Do not delete an `#[ignore]`d instrument to make a count match, and do not make a test skip on Linux --
+  both remove the evidence; CI's ignored-instrument manifest exists to make every `#[ignore]` accounted
+  for by name.
 
 ## E2E specs that write the daemon's real config
 
