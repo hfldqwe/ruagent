@@ -118,9 +118,53 @@ description = \"mock\"
     )
 }
 
-/// Forward-slash mock binary path, TOML-safe on Windows.
+/// The mock binary under a name of THIS CALL's own (t24), forward-slashed for TOML.
+///
+/// WHY EACH TEST NEEDS ITS OWN NAME. Every test in this file runs the daemon IN-PROCESS,
+/// so all of them spawn their mock agents as children of ONE process, and attribution
+/// (chat.rs / runs.rs, through orphans::attribute_child) identifies a session's child by
+/// the program's FILE NAME -- refusing to guess when that name is shared. With one shared
+/// ruagent-mock-agent.exe the guard therefore declines to attribute anything under the
+/// default test concurrency (harmless but vacuous), and the weaker rule it replaced
+/// claimed a pid another test had just spawned and killed a LIVE agent -- the failure that
+/// made this suite 6/6 red. A copy per call makes each test's agent identifiable by name,
+/// exactly what the chat-side t16 test already does for its own rounds.
 fn mock_bin() -> String {
-    env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/")
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let src = env!("CARGO_BIN_EXE_ruagent-mock-agent");
+    let dir = std::env::temp_dir().join("ruagent-e2e-mock-bins");
+    let _ = std::fs::create_dir_all(&dir);
+    // Drop a PREVIOUS run's copies: each is keyed by the pid that made it, and a pid whose
+    // process is gone cannot come back. Bounded by construction -- one directory per test
+    // process, removed by the next run.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let Some(pid) = e.file_name().to_string_lossy().parse::<u32>().ok() else {
+                continue;
+            };
+            if pid != std::process::id()
+                && ruagent_daemon::orphans::process_started_at_ms(pid).is_none()
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let own = dir.join(std::process::id().to_string());
+    let _ = std::fs::create_dir_all(&own);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let name = if cfg!(windows) {
+        format!("ruagent-mock-agent-e2e-{n}.exe")
+    } else {
+        format!("ruagent-mock-agent-e2e-{n}")
+    };
+    let dst = own.join(name);
+    if !dst.is_file() {
+        // A hard link costs nothing where the volumes allow it; a copy is the fallback.
+        if std::fs::hard_link(src, &dst).is_err() {
+            std::fs::copy(src, &dst).expect("copying the mock binary under a name of our own");
+        }
+    }
+    dst.to_string_lossy().replace('\\', "/")
 }
 
 /// Run a prompt on the mock agent and return (final text, sse dump).
@@ -422,7 +466,7 @@ async fn poll_until(
 // ---------------------------------------------------------------------------
 
 fn two_mock_agents_toml() -> String {
-    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let bin = mock_bin();
     format!(
         "[agent.mocka]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"echo mock\"\n\n[agent.mockb]\nharness = \"mock\"\ncommand = \"{bin} --behavior plan\"\ndescription = \"plan mock\"\n"
     )
@@ -507,7 +551,7 @@ async fn fanout_compares_and_selects() {
 
 #[tokio::test]
 async fn pipeline_hands_off_upstream_result() {
-    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let bin = mock_bin();
     let agents = format!(
         "[agent.mock]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"echo mock\"\n"
     );
@@ -560,7 +604,7 @@ async fn pipeline_hands_off_upstream_result() {
 
 #[tokio::test]
 async fn routing_rule_picks_agent_without_explicit_pin() {
-    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let bin = mock_bin();
     let agents = format!(
         "[agent.mocka]\nharness = \"mock\"\ncommand = \"{bin} --behavior echo\"\ndescription = \"a\"\n\n[agent.mockb]\nharness = \"mock\"\ncommand = \"{bin} --behavior plan\"\ndescription = \"b\"\n"
     );
@@ -925,7 +969,7 @@ async fn land_selected_worktree() {
 
 #[tokio::test]
 async fn approver_agent_answers_ask_unattended() {
-    let bin = env!("CARGO_BIN_EXE_ruagent-mock-agent").replace('\\', "/");
+    let bin = mock_bin();
     // worker: permission behavior (asks before writing)
     // approver: approve behavior (replies exactly ALLOW)
     let agents = format!(
@@ -1418,7 +1462,7 @@ fn orphan_sweep_finds_and_kills_children() {
     // primitive must take down the process tree.
     // Piped stdin: an inherited one hits EOF (no test stdin) and the
     // mock exits instead of parking — the whole point of the test.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ruagent-mock-agent"))
+    let mut child = std::process::Command::new(mock_bin())
         .args(["--behavior", "permission"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())

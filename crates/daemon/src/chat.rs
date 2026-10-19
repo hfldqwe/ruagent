@@ -386,15 +386,18 @@ pub struct ChatManager {
     ///
     /// HOW ATTRIBUTION WORKS, and why it is deliberately timid: the ACP child is
     /// spawned inside the SDK's supervisor task, so the daemon cannot be handed
-    /// its pid -- it can only observe that a new child appeared after its own
-    /// snapshot, and match that child by IMAGE NAME when several appeared. If
-    /// both leave more than one candidate, NOTHING is recorded: killing a process
-    /// that might belong to another live session is worse than not knowing a pid,
-    /// and a close reclaims only what it can prove is its own.
-    /// This is the PRECISE case: the close path reports it with the full reading
-    /// (killed / already_gone / failed), which is how "the agent exited by
-    /// itself" and "we had to kill it" stay distinguishable numbers.
-    child_pids: Arc<Mutex<HashMap<RunId, u32>>>,
+    /// its pid -- it can only observe that a new child appeared after its own snapshot
+    /// AND that it carries THIS program's image, an image no OTHER live child of ours
+    /// carries. When that is not the case, NOTHING is recorded: killing a process that
+    /// might belong to another live session is worse than not knowing a pid, and a close
+    /// reclaims only what it can prove is its own.
+    ///
+    /// Recorded as an IDENTITY -- pid plus start time (orphans::ChildRef) -- and not as a
+    /// bare pid (t24): a pid alone is not a process, and the OS hands a freed pid straight
+    /// to the next one. The reading a close then reports (killed / already_gone / failed)
+    /// is how "the agent exited by itself" and "we had to kill it" stay distinguishable
+    /// numbers.
+    children: Arc<Mutex<HashMap<RunId, crate::orphans::ChildRef>>>,
     /// The reading of the LAST child reclamation this manager performed:
     /// (what it was reclaiming, counts). A FIELD and not only a log line,
     /// because the acceptance for issue #60 is that the path's OWN reading can
@@ -438,6 +441,14 @@ pub struct ChatManager {
 /// that work to the close path's window fallback (issue #60). It only delays a
 /// BACKGROUND task -- chat start never waits on it.
 const ATTRIBUTION_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long the attribution pass waits before its next poll, and the ceiling that delay
+/// doubles up to (t24). A flat 25 ms over the whole 3 s window was up to 120 passes, each
+/// a machine-wide process snapshot (45-190 ms under e2e load) taken ON the async runtime;
+/// the first few milliseconds decide a healthy session, so a doubling delay keeps that
+/// resolution where it matters and spends almost nothing on the tail.
+const ATTRIBUTION_FIRST_POLL_MS: u64 = 20;
+const ATTRIBUTION_MAX_POLL_MS: u64 = 250;
 
 /// How long a close waits for the session's own teardown (the supervisor task
 /// returning, which is when the SDK's ChildGuard runs) before reclaiming its
@@ -592,7 +603,7 @@ impl ChatManager {
             db,
             root,
             chats: Arc::new(Mutex::new(HashMap::new())),
-            child_pids: Arc::new(Mutex::new(HashMap::new())),
+            children: Arc::new(Mutex::new(HashMap::new())),
             last_reclaim: Arc::new(Mutex::new(None)),
             park_ask,
             drop_asks: Mutex::new(None),
@@ -953,7 +964,17 @@ impl ChatManager {
         // ISSUE #60, attribution. Snapshot our own children immediately BEFORE
         // the spawn: the difference afterwards is the only handle the daemon can
         // have on a child the SDK spawns inside its own task.
-        let spawn_window = crate::orphans::live_children_of_self();
+        // The timestamp FIRST, then the snapshot: a child that starts after this instant is
+        // a candidate, and one that was in the snapshot is excluded by pid anyway.
+        let spawn_window_at = crate::orphans::now_unix_ms();
+        let spawn_window: Vec<u32> = tokio::task::spawn_blocking(|| {
+            crate::orphans::own_children()
+                .into_iter()
+                .map(|c| c.pid)
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
         let program = spec.program.clone();
         let session = start_chat(
             ChatOptions {
@@ -1127,7 +1148,7 @@ impl ChatManager {
         // is whether the id is in the registry above. Called any earlier, a
         // chat that is merely still STARTING would look closed, and the child
         // would be killed on the spot.
-        self.attribute_child(id, spawn_window, program);
+        self.attribute_child(id, spawn_window, spawn_window_at, program);
         Ok(chat)
     }
 
@@ -1158,7 +1179,13 @@ impl ChatManager {
 
     /// The attributed child pid of a live chat (issue #60).
     pub fn child_pid(&self, id: RunId) -> Option<u32> {
-        self.child_pids
+        self.child_ref(id).map(|c| c.pid)
+    }
+
+    /// The same attribution as an IDENTITY (pid + start time), which is what a
+    /// reclamation must be given (t24).
+    pub fn child_ref(&self, id: RunId) -> Option<crate::orphans::ChildRef> {
+        self.children
             .lock()
             .expect("child pids lock")
             .get(&id)
@@ -1170,11 +1197,11 @@ impl ChatManager {
     /// issue #60 is about -- and a test can assert the list is empty.
     pub fn attributed_child_pids(&self) -> Vec<u32> {
         let mut out: Vec<u32> = self
-            .child_pids
+            .children
             .lock()
             .expect("child pids lock")
             .values()
-            .copied()
+            .map(|c| c.pid)
             .collect();
         out.sort_unstable();
         out
@@ -1186,46 +1213,43 @@ impl ChatManager {
         self.last_reclaim.lock().expect("last reclaim lock").clone()
     }
 
-    /// Attribute the agent child of the session that was just started, without
-    /// ever blocking the caller (issue #60).
+    /// Attribute the agent child of the session that was just started (issue #60,
+    /// reworked by t24), without ever blocking the caller.
     ///
-    /// The window (our live children, snapshotted just before the spawn) is the
-    /// WIDE tool: exactly one new child, and the answer is unambiguous. Several
-    /// (a session also spawns its MCP servers as OUR children) and the narrow
-    /// tool decides: the ones whose image name is THIS program's. If that still
-    /// leaves a choice, nothing is recorded and this chat's close reclaims
-    /// nothing -- the SDK's own guard, the daemon's kill-on-death job and the
-    /// next boot's sweep still cover it, and none of them can kill a live
-    /// session's agent by mistake.
-    fn attribute_child(&self, id: RunId, window: Vec<u32>, program: String) {
+    /// THE DECISION LIVES IN orphans::attribute_child, so the chat path and the run path
+    /// cannot drift apart, and the pass itself (a machine-wide process snapshot plus a
+    /// handle per candidate) runs on a BLOCKING thread: it used to run inline on an async
+    /// worker, and under e2e load one pass measured 45-190 ms with up to 15 candidates.
+    ///
+    /// The poll delays DOUBLE up to a ceiling instead of a flat 25 ms, because the first
+    /// few milliseconds are the ones that decide a healthy session and the tail of the
+    /// window only needs to catch a very slow spawn.
+    fn attribute_child(&self, id: RunId, window: Vec<u32>, window_at_ms: i64, program: String) {
         let chats = self.chats.clone();
-        let children = self.child_pids.clone();
+        let children = self.children.clone();
         let last = self.last_reclaim.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + ATTRIBUTION_WINDOW;
+            let mut wait_ms = ATTRIBUTION_FIRST_POLL_MS;
             loop {
-                let found = crate::orphans::children_since(&window);
-                let pid = if found.len() == 1 {
-                    Some(found[0])
-                } else {
-                    let by_name = crate::orphans::matching_image(&found, &program);
-                    if by_name.len() == 1 {
-                        Some(by_name[0])
-                    } else {
-                        None
-                    }
-                };
-                if let Some(pid) = pid {
+                let window_c = window.clone();
+                let program_c = program.clone();
+                let found = tokio::task::spawn_blocking(move || {
+                    crate::orphans::attribute_child(&window_c, window_at_ms, &program_c)
+                })
+                .await
+                .unwrap_or(None);
+                if let Some(child) = found {
                     if chats.lock().expect("chats lock").contains_key(&id) {
-                        children.lock().expect("child pids lock").insert(id, pid);
+                        children.lock().expect("child pids lock").insert(id, child);
                     } else {
-                        // Closed while we were still learning its pid: there is
-                        // nobody left to reclaim it later, so do it here.
+                        // Closed while we were still learning its pid: there is nobody left
+                        // to reclaim it later, so do it here -- by IDENTITY, so a pid that
+                        // changed hands in the meantime is not ours to kill.
                         let what = format!("chat {id}: closed before its child was attributed");
-                        let pids = vec![pid];
                         let label = what.clone();
                         let out = tokio::task::spawn_blocking(move || {
-                            crate::orphans::reclaim(&pids, &label)
+                            crate::orphans::reclaim_refs(&[child], &label)
                         })
                         .await
                         .unwrap_or_default();
@@ -1236,12 +1260,12 @@ impl ChatManager {
                 if tokio::time::Instant::now() >= deadline {
                     tracing::warn!(
                         chat = %id,
-                        candidates = found.len(),
-                        "no child could be attributed to this chat (several appeared and none matched its program); its close will reclaim nothing"
+                        "no child could be attributed to this chat (the evidence never identified one of ours); its close will reclaim nothing"
                     );
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                wait_ms = (wait_ms * 2).min(ATTRIBUTION_MAX_POLL_MS);
             }
         });
     }
@@ -1259,7 +1283,7 @@ impl ChatManager {
     fn reclaim_after_close(
         &self,
         id: RunId,
-        pid: Option<u32>,
+        child: Option<crate::orphans::ChildRef>,
         witness: tokio::sync::broadcast::Receiver<RunEvent>,
     ) {
         let last = self.last_reclaim.clone();
@@ -1277,10 +1301,11 @@ impl ChatManager {
             })
             .await
             .unwrap_or(false);
-            // ONLY a pid this chat could prove was its own is reclaimed. An
-            // unattributed session gets a reading of zero and a WARN at start,
-            // never a guess -- see attribute_child.
-            let pids: Vec<u32> = pid.into_iter().collect();
+            // ONLY a child this chat could prove was its own is reclaimed, and only while
+            // the pid still holds THAT process (t24). An unattributed session gets a
+            // reading of zero and a WARN at start, never a guess -- see attribute_child.
+            let refs: Vec<crate::orphans::ChildRef> = child.into_iter().collect();
+            // before the reclaim consumes the list.
             let what = format!(
                 "chat {id}: children after its session {}",
                 if ended {
@@ -1289,17 +1314,16 @@ impl ChatManager {
                     "did NOT end within the grace -- reclaiming anyway"
                 }
             );
+            let count = refs.len();
             let label = what.clone();
-            let pids_for_kill = pids.clone();
-            let out = tokio::task::spawn_blocking(move || {
-                crate::orphans::reclaim(&pids_for_kill, &label)
-            })
-            .await
-            .unwrap_or_default();
+            let out =
+                tokio::task::spawn_blocking(move || crate::orphans::reclaim_refs(&refs, &label))
+                    .await
+                    .unwrap_or_default();
             tracing::info!(
                 chat = %id,
                 session_ended = ended,
-                pids = pids.len(),
+                children = count,
                 killed = out.killed,
                 already_gone = out.already_gone,
                 failed = out.failed,
@@ -1325,12 +1349,12 @@ impl ChatManager {
                 // The witness is taken while the session still exists: it is what
                 // proves, inside the reclaim task, that the supervisor ended.
                 let witness = c.subscribe();
-                let pid = self.child_pids.lock().expect("child pids lock").remove(&id);
+                let child = self.children.lock().expect("child pids lock").remove(&id);
                 if let Some(drop) = self.drop_asks.lock().expect("drop_asks lock").as_ref() {
                     drop(id);
                 }
                 self.maybe_auto_distill(id);
-                self.reclaim_after_close(id, pid, witness);
+                self.reclaim_after_close(id, child, witness);
                 true
             }
             None => false,
@@ -2487,10 +2511,19 @@ mod generating_tests {
     /// after one e2e run, 1 leaked in each of 2 runs out of 3, and no log line
     /// anywhere said so.
     ///
-    /// HOW TO TRIGGER A LEAK ON PURPOSE (so a future reader can watch this test
-    /// go red): make close send Shutdown and return, i.e. drop the call to
-    /// reclaim_after_close. The child then outlives the chat and the assertion
-    /// below fails.
+    /// HOW TO TRIGGER A LEAK ON PURPOSE (so a future reader can watch this test go
+    /// red). TWO triggers, both MEASURED in an isolated worktree of this tree (t24),
+    /// one mutation at a time, and neither touches an assertion:
+    ///   * drop the call to reclaim_after_close in close() -- the child outlives the
+    ///     chat and NO reclamation reading appears, so wait_for_reclaim panics with
+    ///     "no reclamation reading appeared within the bound (previous: None)";
+    ///   * make the attribution decline -- a second live child with this test's
+    ///     image name makes the image ambiguous, on purpose -- so wait_for_child
+    ///     returns None and the panic below reads "round 0: the session's child was
+    ///     never attributed, so the assertion below would be vacuous".
+    /// The assertion this test guards is the one at the END of each round: with a
+    /// reading in hand, nothing may have survived and the attributed child must be
+    /// gone.
     ///
     /// WHY FIVE ROUNDS: the leak t7 measured was OCCASIONAL (1 in 2 runs out of
     /// 3), so a single round would be a coin flip. Five rounds catch it with
@@ -2596,6 +2629,22 @@ mod generating_tests {
     /// gives already_gone == 1, and BOTH are clean. What must hold is that the
     /// child is GONE, that nothing survived, and that the close reported a
     /// reading either way.
+    ///
+    /// HOW TO TRIGGER A RED ON PURPOSE (the sibling of the first test's note, t24):
+    /// two manipulations, each with the failure it was MEASURED to produce (in an
+    /// isolated worktree of this tree, one mutation at a time) -- so a future reader
+    /// can watch this test fail instead of trusting that it could.
+    ///   * drop the call to reclaim_after_close in close() (the first test's
+    ///     trigger): NO reclamation reading appears at all, so wait_for_reclaim
+    ///     panics with "no reclamation reading appeared within the bound
+    ///     (previous: None)" -- measured, exit 101;
+    ///   * make the attribution decline -- e.g. keep a second live child of this
+    ///     process that carries the SAME image name as this test's copy of the
+    ///     mock (attribute_child needs the image to be unique among our live
+    ///     children, on purpose): the expect("the session's child was attributed")
+    ///     at the call site above panics -- measured, exit 101.
+    /// Both are reds of a REAL invariant, not of a timeout: nothing here is
+    /// relaxed to keep it green.
     #[tokio::test]
     async fn a_chat_closed_mid_turn_leaves_no_survivor() {
         let Some(mock) = mock_agent() else {

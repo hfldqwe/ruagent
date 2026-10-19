@@ -215,17 +215,47 @@ impl std::fmt::Display for Reclaim {
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(1000);
 const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Reclaim these pids (each with its tree) and LOG the reading.
+/// A pid TOGETHER WITH the start time that identifies THAT process -- not merely
+/// that pid (t24).
 ///
-/// BLOCKING: it waits (up to EXIT_GRACE) for a killed process to disappear, so
-/// an async caller must wrap it in spawn_blocking.
-pub fn reclaim(pids: &[u32], what: &str) -> Reclaim {
-    let out = reclaim_with(
-        pids,
-        EXIT_GRACE,
-        &|pid| process_started_at_ms(pid).is_some(),
-        &kill_tree,
-    );
+/// WHY THE START TIME IS PART OF THE IDENTITY: Windows (and unix) hand a freed pid
+/// straight back out, so between the moment a session's child is enumerated and the
+/// moment its close reclaims it -- a whole session lifetime -- the pid can belong to a
+/// DIFFERENT process, very often to another session's agent in the same daemon (or, in
+/// a test binary, in the same process). "Is there a process with this pid?" is
+/// therefore the wrong question to kill on, and it is what made a chat close kill a
+/// live mock agent under concurrency (the victim died with "Process exited with exit
+/// code: 1"). The start time is the OS's own answer to "is this still the process I
+/// saw?", the same primitive the boot sweep already uses to detect a reused pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildRef {
+    pub pid: u32,
+    /// The start time observed when this child was enumerated.
+    pub started_at_ms: i64,
+}
+
+impl ChildRef {
+    /// The identity of the process behind pid RIGHT NOW, or None if it is gone.
+    pub fn of(pid: u32) -> Option<Self> {
+        process_started_at_ms(pid).map(|started_at_ms| Self { pid, started_at_ms })
+    }
+
+    /// True when the pid still holds the SAME process (not a reused pid).
+    pub fn is_still_this_process(&self) -> bool {
+        process_started_at_ms(self.pid) == Some(self.started_at_ms)
+    }
+}
+
+/// Reclaim these children (each with its tree) and LOG the reading.
+///
+/// IDENTITY-SAFE: a pid whose start time is no longer the recorded one is NOT killed
+/// -- the process this pass means is already gone, and the pid now belongs to somebody
+/// else. It is counted `already_gone`, which is what it is.
+///
+/// BLOCKING: it waits (up to EXIT_GRACE) for a killed process to disappear, so an
+/// async caller must wrap it in spawn_blocking.
+pub fn reclaim_refs(refs: &[ChildRef], what: &str) -> Reclaim {
+    let out = reclaim_refs_with(refs, EXIT_GRACE, &process_started_at_ms, &kill_tree);
     if out.total() > 0 {
         if out.clean() {
             tracing::info!(
@@ -250,45 +280,111 @@ pub fn reclaim(pids: &[u32], what: &str) -> Reclaim {
     out
 }
 
-/// The reclamation rule, with liveness and the kill injected so all three
+/// The reclamation rule, with the identity query and the kill injected so all three
 /// outcomes are testable without a process that genuinely refuses to die.
 ///
-/// A pid that is gone when we look is already_gone. Otherwise we kill it and
-/// wait up to grace for it to leave the table: gone means killed, still there
-/// means failed. A kill that returns false for a process that IS gone is still
-/// killed -- the question is whether it died, not whether the call succeeded.
-fn reclaim_with(
-    pids: &[u32],
+/// A child whose start time is no longer the recorded one is already_gone: the pid does
+/// not hold THAT process any more (it is gone, or the pid was reused), and killing it
+/// would kill a stranger. Otherwise we kill it and wait up to grace for it to leave the
+/// table: gone means killed, still there means failed. A kill that returns false for a
+/// process that IS gone is still killed -- the question is whether it died, not whether
+/// the call succeeded.
+fn reclaim_refs_with(
+    refs: &[ChildRef],
     grace: std::time::Duration,
-    alive: &dyn Fn(u32) -> bool,
+    started: &dyn Fn(u32) -> Option<i64>,
     kill: &dyn Fn(u32) -> bool,
 ) -> Reclaim {
     let mut out = Reclaim::default();
-    for pid in pids {
-        if !alive(*pid) {
+    for child in refs {
+        let ours = |pid: u32| started(pid) == Some(child.started_at_ms);
+        if !ours(child.pid) {
             out.already_gone += 1;
             continue;
         }
-        let _ = kill(*pid);
+        let _ = kill(child.pid);
         let deadline = std::time::Instant::now() + grace;
-        let mut gone = !alive(*pid);
+        let mut gone = !ours(child.pid);
         while !gone && std::time::Instant::now() < deadline {
             std::thread::sleep(EXIT_POLL);
-            gone = !alive(*pid);
+            gone = !ours(child.pid);
         }
         if gone {
             out.killed += 1;
         } else {
             out.failed += 1;
-            tracing::warn!(pid, "child process survived its kill and is STILL alive");
+            tracing::warn!(
+                pid = child.pid,
+                "child process survived its kill and is STILL alive"
+            );
         }
     }
+    out
+}
+
+/// Reclaim these pids, taking each one's identity AT THIS MOMENT (t24).
+///
+/// For a caller that has just enumerated pids and wants them gone -- the boot sweep of
+/// a dead daemon's children, and tests. A caller that recorded a pid EARLIER (a
+/// session's child, attributed when the session started) must pass the recorded
+/// identity instead: see ChildRef and reclaim_refs.
+pub fn reclaim(pids: &[u32], what: &str) -> Reclaim {
+    let refs: Vec<ChildRef> = pids.iter().filter_map(|pid| ChildRef::of(*pid)).collect();
+    let mut out = reclaim_refs(&refs, what);
+    // A pid that is already gone never becomes a ChildRef, so it would vanish from the
+    // reading: keep it visible as already_gone, which is the honest count.
+    out.already_gone += pids.len() - refs.len();
     out
 }
 
 // ---------------------------------------------------------------------------
 // Attribution: whose child is that? (issue #60)
 // ---------------------------------------------------------------------------
+
+/// One live child of a parent, as ONE pass over the process table sees it: its pid,
+/// when that process started, and its image (executable) name.
+///
+/// WHY ONE PASS (t24). The machinery this replaces called child_pids_of (one full
+/// process-table snapshot), then process_started_at_ms per child, then matching_image
+/// per CANDIDATE -- and the last one opened a NEW machine-wide snapshot for every pid it
+/// looked at. Measured on this machine under load (24 e2e tests in one process,
+/// candidates up to 15): one attribution poll cost 45-190 ms, and the poll ran until its
+/// 3 s window expired. One pass returns the same evidence for the price of one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildProcess {
+    pub pid: u32,
+    /// Start time in unix milliseconds -- the child's identity, comparable to the value
+    /// now_unix_ms() returns.
+    pub started_at_ms: i64,
+    pub image: String,
+}
+
+/// The wall clock in unix milliseconds: the unit process_started_at_ms speaks, so a
+/// caller can compare a child's start time with the moment it took its window.
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Every live child of a parent, in one pass over the process table.
+pub fn child_processes(parent: u32) -> Vec<ChildProcess> {
+    #[cfg(windows)]
+    return windows_child_processes(parent);
+    #[cfg(unix)]
+    return unix_child_processes(parent);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = parent;
+        Vec::new()
+    }
+}
+
+/// Our own live children, in one pass.
+pub fn own_children() -> Vec<ChildProcess> {
+    child_processes(std::process::id())
+}
 
 /// Our own LIVE direct children, right now. The snapshot primitive: take one
 /// before a session spawns and one after, and the difference is what that
@@ -299,10 +395,7 @@ pub fn live_children_of_self() -> Vec<u32> {
 
 /// Live direct children of parent.
 pub fn live_children_of(parent: u32) -> Vec<u32> {
-    child_pids_of(parent)
-        .into_iter()
-        .filter(|pid| process_started_at_ms(*pid).is_some())
-        .collect()
+    child_processes(parent).into_iter().map(|c| c.pid).collect()
 }
 
 /// The live children that appeared since the snapshot before.
@@ -311,6 +404,99 @@ pub fn children_since(before: &[u32]) -> Vec<u32> {
         .into_iter()
         .filter(|pid| !before.contains(pid))
         .collect()
+}
+
+/// THE ONE ATTRIBUTION DECISION (t24), shared by the chat path and the run path.
+///
+/// The window is our live children taken immediately before the session spawned, and
+/// window_at_ms is when that snapshot was taken; program is the card's command.
+///
+/// IT NEVER GUESSES. A pid is claimed only when the evidence identifies it as THIS
+/// session's child:
+///
+///   * the candidate must be a live child of ours that was NOT in the window and that
+///     started at/after it (a child older than the window is not ours, and a REUSED pid
+///     that happens to be in the window is excluded by the start time, not by the list);
+///   * it must carry the program's image name -- and no OTHER live child of ours may
+///     carry that same image.
+///
+/// WHY BOTH CLAUSES, AND WHY NOTHING ELSE. An earlier shape also accepted "exactly one
+/// child appeared after my window", and under load that claimed a pid a CONCURRENT
+/// session had just spawned -- in a test binary that runs the whole daemon in-process,
+/// our children are every test's children, and the closing or cancelling owner then
+/// killed a live agent (the victim reported "Process exited with exit code: 1" while it
+/// was still being driven). A pid is claimed here only when the evidence names it, so a
+/// wrapped program (npx -> node), whose child's image the card cannot predict, goes
+/// UNATTRIBUTED. That costs a reading -- the close then reports a zero -- and it never
+/// costs a stranger's agent: the SDK's child guard, the kill-on-death job and the next
+/// boot's sweep still cover a child this function declines to claim.
+pub fn attribute_child(window: &[u32], window_at_ms: i64, program: &str) -> Option<ChildRef> {
+    let live = own_children();
+    let candidates: Vec<&ChildProcess> = live
+        .iter()
+        .filter(|c| !window.contains(&c.pid) && c.started_at_ms >= window_at_ms)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let named: Vec<&ChildProcess> = candidates
+        .iter()
+        .copied()
+        .filter(|c| image_matches(&c.image, program))
+        .collect();
+    // POSITIVE EVIDENCE ONLY. The image match AND its uniqueness among our live children
+    // are both required, and there is deliberately NO "the only new child must be mine"
+    // fallback: measured, that fallback claimed a LIVE agent belonging to a concurrently
+    // running session (a test process runs many daemons, so "our children" is everybody's),
+    // and the closing/cancelling owner then killed it -- the victim's session reported
+    // "Process exited with exit code: 1" while it was still being driven. A wrapped
+    // program (npx -> node) that the image cannot confirm therefore goes UNATTRIBUTED,
+    // which costs a reading and never a stranger's agent.
+    let pick: Option<&ChildProcess> = if named.len() == 1 && !image_is_shared(&live, named[0]) {
+        Some(named[0])
+    } else {
+        None
+    };
+    pick.map(|c| ChildRef {
+        pid: c.pid,
+        started_at_ms: c.started_at_ms,
+    })
+}
+
+/// True when another live child of ours carries the same image name as this one.
+fn image_is_shared(live: &[ChildProcess], this: &ChildProcess) -> bool {
+    live.iter()
+        .any(|o| o.pid != this.pid && image_eq(&o.image, &this.image))
+}
+
+/// Two image names naming the same program: case-insensitive on Windows, exact
+/// elsewhere (the rule matching_image has always applied).
+fn image_eq(a: &str, b: &str) -> bool {
+    #[cfg(windows)]
+    {
+        a.eq_ignore_ascii_case(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// True when an image name is the one a card's command names (its first word's file
+/// name) -- the criterion matching_image has always applied.
+fn image_matches(image: &str, program: &str) -> bool {
+    let want = program_file_name(program);
+    !want.is_empty() && image_eq(image, &want)
+}
+
+/// The FILE NAME of the program a card's command names, or an empty string when the
+/// command is empty.
+fn program_file_name(program: &str) -> String {
+    let first = program.split_whitespace().next().unwrap_or(program);
+    std::path::Path::new(first)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| first.to_string())
 }
 
 /// The image (executable) name of a live process -- the SECOND attribution
@@ -340,27 +526,14 @@ pub fn image_name(pid: u32) -> Option<String> {
 /// program. Case-insensitive on Windows, exact elsewhere; a program written with
 /// arguments (as an agent card may write it) is compared by its first word.
 pub fn matching_image(pids: &[u32], program: &str) -> Vec<u32> {
-    let first = program.split_whitespace().next().unwrap_or(program);
-    let want = std::path::Path::new(first)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| first.to_string());
+    let want = program_file_name(program);
     if want.is_empty() {
         return Vec::new();
     }
     pids.iter()
         .copied()
         .filter(|pid| match image_name(*pid) {
-            Some(name) => {
-                #[cfg(windows)]
-                {
-                    name.eq_ignore_ascii_case(&want)
-                }
-                #[cfg(not(windows))]
-                {
-                    name == want
-                }
-            }
+            Some(name) => image_eq(&name, &want),
             None => false,
         })
         .collect()
@@ -401,6 +574,87 @@ fn windows_image_name(pid: u32) -> Option<String> {
         CloseHandle(snap);
         found
     }
+}
+
+/// One pass over the Windows process table: every child of the given parent, with its
+/// image name, kept only if it is ALIVE (the snapshot lists a terminated process until
+/// its last handle closes).
+#[cfg(windows)]
+fn windows_child_processes(parent: u32) -> Vec<ChildProcess> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut raw: Vec<(u32, String)> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap as isize == -1 {
+            return Vec::new();
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ParentProcessID == parent && entry.th32ProcessID != parent {
+                    let end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|c| *c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    raw.push((
+                        entry.th32ProcessID,
+                        String::from_utf16_lossy(&entry.szExeFile[..end]),
+                    ));
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    raw.into_iter()
+        .filter_map(|(pid, image)| {
+            process_started_at_ms(pid).map(|started_at_ms| ChildProcess {
+                pid,
+                started_at_ms,
+                image,
+            })
+        })
+        .collect()
+}
+
+/// The unix twin: one /proc scan for the parent's children, their start time and their
+/// image.
+#[cfg(unix)]
+fn unix_child_processes(parent: u32) -> Vec<ChildProcess> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if read_stat_field(pid, 4).and_then(|f| f.parse::<u32>().ok()) != Some(parent) {
+            continue;
+        }
+        let Some(started_at_ms) = unix_process_start(pid) else {
+            continue;
+        };
+        out.push(ChildProcess {
+            pid,
+            started_at_ms,
+            image: unix_image_name(pid).unwrap_or_default(),
+        });
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -613,8 +867,28 @@ mod tests {
     #[test]
     fn reclaim_classifies_killed_already_gone_and_refused() {
         let calls: std::sync::Mutex<Vec<u32>> = Default::default();
-        let alive = |pid: u32| pid == 10 || pid == 30;
-        let out = reclaim_with(&[10, 20, 30], std::time::Duration::ZERO, &alive, &|pid| {
+        // 20 is gone (no start time); 10 and 30 are the processes we enumerated, and they
+        // stay in the table however hard we kill them.
+        let started = |pid: u32| match pid {
+            10 => Some(100),
+            30 => Some(300),
+            _ => None,
+        };
+        let refs = [
+            ChildRef {
+                pid: 10,
+                started_at_ms: 100,
+            },
+            ChildRef {
+                pid: 20,
+                started_at_ms: 200,
+            },
+            ChildRef {
+                pid: 30,
+                started_at_ms: 300,
+            },
+        ];
+        let out = reclaim_refs_with(&refs, std::time::Duration::ZERO, &started, &|pid| {
             calls.lock().unwrap().push(pid);
             pid == 10
         });
@@ -628,14 +902,178 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 2, "the dead pid is not killed");
     }
 
+    /// THE COST OF ONE ATTRIBUTION PASS: the shape t16 shipped against the shape t24
+    /// replaced it with (t24 / the e2e_daemon flake).
+    ///
+    /// WHY THIS IS MEASURED AND NOT ASSERTED: the number depends on the machine's process
+    /// table and its load, so an assertion on it would be a flake generator. What the
+    /// reading establishes is the SHAPE of the cost: the old narrowing tool
+    /// (`matching_image` -> `image_name` -> `windows_image_name`) opened a
+    /// MACHINE-WIDE process snapshot per CANDIDATE, while `attribute_child` pays for ONE
+    /// snapshot for all of them. Both shapes are still in this file, so they can be timed
+    /// back to back on ONE machine state -- which is what makes this a comparison rather
+    /// than a claim.
+    ///
+    /// Run it (it is `#ignore`d: it takes seconds and it is not a correctness test):
+    ///   cargo test -p ruagent-daemon --lib measure_attribution -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement harness: prints the old vs new attribution-pass cost"]
+    fn measure_attribution_pass_cost() {
+        /// How many candidates a loaded e2e run presents (the previous round measured up
+        /// to 15); 12 is in the same range and keeps the harness short.
+        const CANDIDATES: usize = 12;
+        /// Repetitions per shape. The per-call cost is a syscall round trip, so the
+        /// spread is wide and the AVERAGE is the number to read.
+        const ROUNDS: usize = 15;
+
+        let mut kids: Vec<std::process::Child> = (0..CANDIDATES).map(|_| sleeper()).collect();
+        let candidates: Vec<u32> = kids.iter().map(|k| k.id()).collect();
+        // The window is EMPTY and was taken a minute ago, so every sleeper is a candidate
+        // -- exactly what a loaded session's own pass sees, because the pass runs while
+        // other sessions spawn.
+        let window: Vec<u32> = Vec::new();
+        let window_at = now_unix_ms() - 60_000;
+        let program = if cfg!(windows) { "ping" } else { "sleep" };
+
+        let time = |label: &str, f: &dyn Fn() -> usize| -> (u128, u128, u128) {
+            let (mut best, mut worst, mut total) = (u128::MAX, 0u128, 0u128);
+            let mut last = 0usize;
+            for _ in 0..ROUNDS {
+                let t = std::time::Instant::now();
+                last = f();
+                let ms = t.elapsed().as_millis();
+                best = best.min(ms);
+                worst = worst.max(ms);
+                total += ms;
+            }
+            let avg = total / ROUNDS as u128;
+            println!(
+                "READING t24 {label}: min {best} ms, avg {avg} ms, max {worst} ms over {ROUNDS} rounds (last saw {last})"
+            );
+            (best, avg, worst)
+        };
+
+        println!(
+            "READING t24 attribution cost: {CANDIDATES} candidates, all live children of \
+             this test process (program {program}); own live children now = {}",
+            own_children().len()
+        );
+        let (_, widen_avg, _) = time("old children_since(window)", &|| children_since(&[]).len());
+        let (_, narrow_avg, _) = time("old matching_image(candidates)", &|| {
+            matching_image(&candidates, program).len()
+        });
+        let (_, new_avg, _) = time("new attribute_child(window)", &|| {
+            usize::from(attribute_child(&window, window_at, program).is_some())
+        });
+        // Derived from the two MEASURED per-poll costs and the poll counts each caller
+        // uses: the old callers polled a flat 25 ms across their 3 s window, the new ones
+        // double from 20 ms to a 250 ms ceiling (20+40+80+160+250*11 = 3.05 s).
+        println!(
+            "READING t24 per 3 s attribution window: old ~{} ms of blocking process-table              work (120 polls x {widen_avg}+{narrow_avg} ms), new ~{} ms (20 polls x {new_avg} ms)",
+            120 * (widen_avg + narrow_avg),
+            20 * new_avg
+        );
+
+        // Put the machine back the way we found it, and print the reclamation reading of
+        // the sleepers we made (the same reading the three exits report).
+        let out = reclaim(&candidates, "t24 measurement: sleepers");
+        println!("READING t24 measurement cleanup reclaim: {out}");
+        for kid in &mut kids {
+            let _ = kid.wait();
+        }
+    }
+
+    /// THE t24 GUARANTEE: a pid that now belongs to a DIFFERENT process is not killed,
+    /// and it is not counted as a kill either.
+    ///
+    /// This is the defect under-load e2e showed: a chat's recorded pid died, the OS handed
+    /// the pid to another session's agent, and the close killed THAT process (the victim
+    /// reported "Process exited with exit code: 1" while it was still being driven). The
+    /// start time is what makes the difference visible, so this test asks the injected
+    /// rule with a table where pid 10 now holds a younger process.
+    #[test]
+    fn a_reused_pid_is_not_killed_and_is_counted_already_gone() {
+        let calls: std::sync::Mutex<Vec<u32>> = Default::default();
+        let gone: std::sync::Mutex<Vec<u32>> = Default::default();
+        // pid 10 was OUR process at start time 100; the pid now holds one that started at
+        // 999 -- somebody else's. pid 20 is still exactly the process we recorded.
+        let started = |pid: u32| match pid {
+            10 => Some(999),
+            20 if !gone.lock().unwrap().contains(&20) => Some(200),
+            _ => None,
+        };
+        let refs = [
+            ChildRef {
+                pid: 10,
+                started_at_ms: 100,
+            },
+            ChildRef {
+                pid: 20,
+                started_at_ms: 200,
+            },
+        ];
+        let out = reclaim_refs_with(
+            &refs,
+            std::time::Duration::from_millis(200),
+            &started,
+            &|pid| {
+                calls.lock().unwrap().push(pid);
+                gone.lock().unwrap().push(pid);
+                true
+            },
+        );
+        println!("READING t24 reused pid: {out}");
+        assert_eq!(
+            (out.killed, out.already_gone, out.failed),
+            (1, 1, 0),
+            "the reused pid is already_gone; the one that is still ours is killed: {out}"
+        );
+        assert!(out.clean(), "nothing survived");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[20],
+            "NOTHING may be killed for a reused pid: pid 10 holds another process now"
+        );
+    }
+
+    /// The identity of a REAL process, through the real process table.
+    #[test]
+    fn the_start_time_identifies_a_real_process() {
+        let mut child = sleeper();
+        let pid = child.id();
+        let r = ChildRef::of(pid).expect("a live child has an identity");
+        assert_eq!(r.pid, pid);
+        assert!(r.is_still_this_process());
+        assert!(process_started_at_ms(pid).is_some());
+        let out = reclaim_refs(std::slice::from_ref(&r), "test: identity");
+        println!("READING t24 reclaim by identity: {out}");
+        assert_eq!(
+            (out.killed, out.already_gone, out.failed),
+            (1, 0, 0),
+            "{out}"
+        );
+        assert!(!r.is_still_this_process(), "and it is gone afterwards");
+        let _ = child.wait();
+    }
+
     /// The same rule with death actually happening on the kill.
     #[test]
     fn reclaim_counts_a_process_that_dies_as_killed() {
         let dead: std::sync::Mutex<Vec<u32>> = Default::default();
-        let out = reclaim_with(
-            &[10, 20],
+        let refs = [
+            ChildRef {
+                pid: 10,
+                started_at_ms: 100,
+            },
+            ChildRef {
+                pid: 20,
+                started_at_ms: 200,
+            },
+        ];
+        let out = reclaim_refs_with(
+            &refs,
             std::time::Duration::from_millis(200),
-            &|pid| pid == 10 && !dead.lock().unwrap().contains(&10),
+            &|pid| (pid == 10 && !dead.lock().unwrap().contains(&10)).then_some(100),
             &|pid| {
                 dead.lock().unwrap().push(pid);
                 true

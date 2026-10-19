@@ -1334,13 +1334,23 @@ fn routed_naming_what_ran(
 /// (issue #60). It only delays a BACKGROUND task; the run never waits on it.
 const RUN_CHILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The attribution pass's poll delays (t24), doubling up to a ceiling: the pass costs a
+/// machine-wide process snapshot, and a flat 25 ms over the whole window paid for up to
+/// 120 of them per run on the async runtime.
+const RUN_CHILD_FIRST_POLL_MS: u64 = 20;
+const RUN_CHILD_MAX_POLL_MS: u64 = 250;
+
 /// Reclaim a run's agent child, with the reading the chat path reports too
 /// (issue #60): how many it had to kill, how many were already gone, and how
 /// many SURVIVED. Blocking work goes to a blocking thread; a caller spawns this
 /// rather than awaiting it, so a run's exit is never delayed by a teardown.
-async fn reclaim_run_child(child: Arc<Mutex<Option<u32>>>, run_id: String, reason: &'static str) {
-    let pid = child.lock().expect("run child lock").take();
-    let Some(pid) = pid else {
+async fn reclaim_run_child(
+    child: Arc<Mutex<Option<crate::orphans::ChildRef>>>,
+    run_id: String,
+    reason: &'static str,
+) {
+    let child = child.lock().expect("run child lock").take();
+    let Some(child) = child else {
         tracing::debug!(
             run = %run_id,
             reason,
@@ -1350,7 +1360,10 @@ async fn reclaim_run_child(child: Arc<Mutex<Option<u32>>>, run_id: String, reaso
     };
     let what = format!("run {run_id}: child after {reason}");
     let label = what.clone();
-    let out = tokio::task::spawn_blocking(move || crate::orphans::reclaim(&[pid], &label))
+    let pid = child.pid;
+    // IDENTITY-SAFE (t24): a pid that has been handed to another process in the meantime
+    // is not ours to kill, and reclaim_refs is what refuses to.
+    let out = tokio::task::spawn_blocking(move || crate::orphans::reclaim_refs(&[child], &label))
         .await
         .unwrap_or_default();
     tracing::info!(
@@ -1478,43 +1491,49 @@ async fn supervise(
         &run,
         RunEvent::UserMessage { text: asked },
     );
-    // ISSUE #60, attribution -- the same two tools the chat path uses (a window
-    // of our own children, then the image name when the window is ambiguous),
-    // because the ACP child is spawned inside the SDK's task and this is the only
-    // evidence of ownership there is. A run whose child cannot be told apart is
-    // LEFT unattributed on purpose: reclaiming a process that might belong to
-    // another live session is worse than not knowing a pid.
-    let run_child: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // ISSUE #60, attribution -- ONE decision, shared with the chat path (t24):
+    // orphans::attribute_child takes the window, the instant it was taken and the card's
+    // program, and claims a pid only when the evidence identifies THIS run's child (the
+    // program's image, unique among our live children). A run whose child cannot be told
+    // apart is LEFT unattributed on purpose: reclaiming a process that might belong to
+    // another live session is worse than not knowing a pid. The pass is blocking work, so
+    // it goes to a blocking thread, and the poll delay doubles instead of staying at 25 ms.
+    let run_child: Arc<Mutex<Option<crate::orphans::ChildRef>>> = Arc::new(Mutex::new(None));
     {
-        let child_window = crate::orphans::live_children_of_self();
+        let child_window_at = crate::orphans::now_unix_ms();
+        let child_window: Vec<u32> = tokio::task::spawn_blocking(|| {
+            crate::orphans::own_children()
+                .into_iter()
+                .map(|c| c.pid)
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
         let child_program = opts.program.clone();
         let slot = run_child.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + RUN_CHILD_WINDOW;
+            let mut wait_ms = RUN_CHILD_FIRST_POLL_MS;
             loop {
-                let found = crate::orphans::children_since(&child_window);
-                let pid = if found.len() == 1 {
-                    Some(found[0])
-                } else {
-                    let by_name = crate::orphans::matching_image(&found, &child_program);
-                    if by_name.len() == 1 {
-                        Some(by_name[0])
-                    } else {
-                        None
-                    }
-                };
-                if let Some(pid) = pid {
-                    *slot.lock().expect("run child lock") = Some(pid);
+                let window = child_window.clone();
+                let program = child_program.clone();
+                let found = tokio::task::spawn_blocking(move || {
+                    crate::orphans::attribute_child(&window, child_window_at, &program)
+                })
+                .await
+                .unwrap_or(None);
+                if let Some(child) = found {
+                    *slot.lock().expect("run child lock") = Some(child);
                     return;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     tracing::debug!(
-                        candidates = found.len(),
                         "no child could be attributed to this run; its exit will reclaim nothing"
                     );
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                wait_ms = (wait_ms * 2).min(RUN_CHILD_MAX_POLL_MS);
             }
         });
     }
