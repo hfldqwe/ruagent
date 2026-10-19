@@ -230,3 +230,51 @@ cite were deliberately left in place (AGENTS.md: never delete an artifact a repo
   daemon on 8787 was never touched.
 * **The E2E job now runs 68 tests where the reference floor is 62**: the six new cases are the
   ledger-inconsistency spec, and the run that measured them passed 68/68 with 0 skipped.
+
+## 10. The Linux half: what a Windows-only gate cannot see
+
+Round 3's child-attribution work passed every gate this machine has -- `fmt`, `clippy`, the whole
+workspace suite at default concurrency, the panel build -- and then failed **five tests in CI's
+`Rust (ubuntu)` job**. That is the same lesson as SS5 arriving from the other side: a gate certifies
+the bytes it ran on, and these bytes were never run on Linux here, because all three Rust gates on
+this machine are Windows readings.
+
+**Getting a Linux reading took two attempts.** WSL is installed (`Ubuntu-22.04` starts) but is not a
+usable loop: it has no `cc`/`gcc`/`make`/`protoc` and `sudo` wants a password, so rustc has no linker
+driver. What worked is the existing podman machine: the local `postgres:16` image as a Debian
+bookworm base, `apt` + `rustup` inside as root, **tuna mirrors** for `static.rust-lang.org` and
+`index.crates.io` (direct is blocked from the container), the target dir in a container volume rather
+than `/mnt`, and the tests run as a NON-root user -- as root, the round's own cleanup assertions
+falsely redden. The image `localhost/t28-rust:local` and the stopped container `t28b` are kept so the
+loop can be re-entered; the six setup steps are in that task's output.
+
+**Two root causes, both platform semantics, both measured with /proc probes rather than inferred:**
+
+1. **A zombie is not a live process.** A child killed but not yet reaped still has a `/proc` entry,
+   with state `Z`; the liveness check read `/proc/<pid>/stat` and therefore called a just-killed child
+   alive, reporting `failed=1` in the reclaim reading. Measured in the container: before `SIGKILL`
+   `state=S`, after `SIGKILL` unreaped `state=Z`, and the entry disappears only after `waitpid`.
+   Windows has no zombie state, which is exactly why no Windows gate could see it.
+2. **`btime` is whole seconds.** A child's start time is `btime + starttime/USER_HZ`, and `/proc/stat`'s
+   `btime` has one-second granularity, so a just-spawned child's computed start came out `delta_ms=996`
+   EARLIER than the instant it really started -- and `attribute_child`'s window filter then excluded
+   the session's OWN child ('never attributed'). The fix is `START_SLACK_MS = if cfg!(windows) { 0 }
+   else { 1_000 }`, and the comment records why the clock is not simply swapped for `uptime`/`now`:
+   identity must be derivable from two identical formulas, or a live child can drift into
+   'already_gone'.
+
+Readings: Linux (container) `cargo test -p ruagent-daemon` exits 0 -- orphans 6 passed/0 failed/
+1 ignored, chat 3/0, lib 221 passed; Windows, the same suite exits 0 and `e2e_daemon` is 3/3 green at
+default concurrency. The repair changed **zero** assertion lines (`git diff -U0 orphans.rs | grep -c
+'^[+-].*assert'` = 0). And the authoritative reading is CI's own: the next push's `Rust (ubuntu)`
+job ran its Test step GREEN -- the only red left was the ignored-instrument manifest, i.e. the
+accounting for the two `#[ignore]` instruments this round added, which is what that step exists to
+demand.
+
+**One thing the fix did not explain, recorded so it is not mistaken for explained:** the CI panic for
+`the_image_name_narrows_attribution_to_the_programs_own_children` quoted
+`Some("ruagent_daemon-1295b3a061310cbd")`, and that exact failure was NOT reproduced in the container
+-- there the same test failed at its reclaim assertion while the image assertion passed, and it goes
+green after the fix. If CI prints that string again, the next task gets that run's full stdout, not a
+summary of it.
+
