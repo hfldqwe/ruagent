@@ -406,6 +406,23 @@ pub fn children_since(before: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// How much SLACK the "started at/after the window" test allows (t28 / the linux CI red).
+///
+/// MEASURED on linux: a process's start time is computed as `btime + starttime/USER_HZ`,
+/// and /proc/stat's `btime` is in WHOLE SECONDS -- so the computed start of a
+/// just-spawned child came out `delta_ms=996` EARLIER than the instant it really started.
+/// A window taken milliseconds before the spawn therefore EXCLUDED the session's OWN child,
+/// and both chat tests read "the session's child was never attributed" (the same tests are
+/// green on windows, whose start time is the process CREATION time in milliseconds).
+///
+/// WHY SLACK RATHER THAN A FINER CLOCK: the identity check (`ChildRef`) compares TWO
+/// computations of the same formula, so it must stay exactly reproducible; deriving the boot
+/// instant from /proc/uptime or the current time would make it drift between calls and turn
+/// every live child into `already_gone`. A second of slack in the WINDOW test costs
+/// nothing: the window only excludes pids we already knew, while the image name and its
+/// uniqueness among our live children are what actually NAME the child.
+const START_SLACK_MS: i64 = if cfg!(windows) { 0 } else { 1_000 };
+
 /// THE ONE ATTRIBUTION DECISION (t24), shared by the chat path and the run path.
 ///
 /// The window is our live children taken immediately before the session spawned, and
@@ -434,7 +451,7 @@ pub fn attribute_child(window: &[u32], window_at_ms: i64, program: &str) -> Opti
     let live = own_children();
     let candidates: Vec<&ChildProcess> = live
         .iter()
-        .filter(|c| !window.contains(&c.pid) && c.started_at_ms >= window_at_ms)
+        .filter(|c| !window.contains(&c.pid) && c.started_at_ms + START_SLACK_MS >= window_at_ms)
         .collect();
     if candidates.is_empty() {
         return None;
@@ -826,6 +843,22 @@ fn unix_children(parent: u32) -> Vec<u32> {
 
 #[cfg(unix)]
 fn unix_process_start(pid: u32) -> Option<i64> {
+    // A ZOMBIE IS DEAD (t28 / the linux CI red). /proc KEEPS the entry of a process that has
+    // exited but has NOT been reaped -- whose state is `Z` -- and this function is the
+    // codebase's answer to "is that process still there?".
+    //
+    // MEASURED, in a container on this kernel, with a C probe that kills a child and does not
+    // reap it (the /proc readings this fix is based on):
+    //   before SIGKILL: state=S
+    //   after SIGKILL, child NOT reaped: state=Z   <- the entry is STILL THERE
+    //   after waitpid (reaped): the entry is gone
+    // So without this check a child we JUST KILLED counts as still alive until its parent
+    // reaps it -- which is exactly the reading the linux run produced in three reclamation
+    // tests: `killed=0 already_gone=0 failed=1` (windows has no zombie state: a killed
+    // process leaves the table at once, and the same code was green there).
+    if matches!(unix_process_state(pid)?.as_str(), "Z" | "X" | "x") {
+        return None;
+    }
     // stat field 22 (starttime): clock ticks since boot.
     let ticks: i64 = read_stat_field(pid, 22)?.parse().ok()?;
     let hz: i64 = 100; // USER_HZ on every mainstream linux
@@ -839,6 +872,13 @@ fn unix_process_start(pid: u32) -> Option<i64> {
                 .and_then(|v| v.parse::<i64>().ok())
         })?;
     Some(boot_secs * 1000 + ticks * 1000 / hz)
+}
+
+/// /proc/<pid>/stat's state field: `R` running, `S` sleeping, `Z` a zombie -- a
+/// process that HAS exited and is waiting to be reaped (t28).
+#[cfg(unix)]
+fn unix_process_state(pid: u32) -> Option<String> {
+    read_stat_field(pid, 3)
 }
 
 #[cfg(unix)]

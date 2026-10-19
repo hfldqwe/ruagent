@@ -2178,6 +2178,228 @@ mod generating_tests {
     /// Wait (bounded) for the manager to attribute the child of the chat just
     /// started. None = the whole window passed without one, which a leak test
     /// must treat as a FAILURE: a test that checks nothing is not a test.
+    /// Report a cleanup that could NOT happen, instead of swallowing it (t27 / issue #69).
+    ///
+    /// WHY THESE TWO TESTS REPORT RATHER THAN PANIC -- MEASURED, not preferred. A t16 root is
+    /// held by an in-process handle for the whole life of the test process: with a 60 s
+    /// polling budget both tests still got `os error 32` ("another program is using this
+    /// file"), and the very same root removes from a shell the moment that process is gone
+    /// (measured: red at 60.60 s and 63.51 s with the assertion in place, then `rm -rf`
+    /// succeeded on the leftovers). A removal from INSIDE the test therefore cannot succeed,
+    /// and an assertion here would red the two tests for a fact that is not theirs to fix.
+    ///
+    /// WHAT IS DONE INSTEAD, so the failure is neither invisible nor unbounded:
+    ///   * this REPORTS it -- a READING line naming the root and the OS error; the swallowing
+    ///     `let _ =` is gone;
+    ///   * `prune_stale_t16_roots` removes the roots of DEAD test processes, bounding the
+    ///     pile at one run's worth instead of letting it grow (measured before the fix: 56
+    ///     directories when issue #69 was filed, 69 while writing this);
+    ///   * the PANICKING wrapper `remove_test_root` is still the call a test makes when the
+    ///     root IS its own to remove, and its panic is proved by
+    ///     a_cleanup_that_cannot_succeed_is_reported_and_would_panic.
+    fn report_test_root_left_behind(root: &std::path::Path) {
+        // One short attempt: what is missing here is not patience but a process to release
+        // the handle, and that process is this one.
+        if let Err(why) = try_remove_test_root(root, std::time::Duration::from_millis(500)) {
+            eprintln!(
+                "READING t27 cleanup: {why} -- the root is held by THIS test process (measured: \
+                 it survives a 60 s wait and removes as soon as the process exits), so the \
+                 failure is REPORTED rather than swallowed; prune_stale_t16_roots removes it \
+                 in the next run"
+            );
+        }
+    }
+
+    /// Remove the `ruagent-t16-*` roots of dead test PROCESSES (t27 / issue #69), once per
+    /// test process.
+    ///
+    /// The safety rule is the one the e2e pruner uses: a root whose pid is still ALIVE is
+    /// evidence of a run that may need reading, and is left alone; a root of a pid that is
+    /// gone can only be litter. The pid is checked against its START TIME, so a reused pid
+    /// does not protect somebody else's leftover forever.
+    fn prune_stale_t16_roots() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            let (mut pruned, mut failed) = (0usize, 0usize);
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let rest = name
+                    .strip_prefix("ruagent-t16-reclaim-")
+                    .or_else(|| name.strip_prefix("ruagent-t16-midturn-"));
+                let Some(rest) = rest else { continue };
+                let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if crate::orphans::process_started_at_ms(pid).is_some() {
+                    continue;
+                }
+                match std::fs::remove_dir_all(e.path()) {
+                    Ok(()) => pruned += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!(
+                            "READING t27 stale t16 root {} could NOT be removed: {err}",
+                            e.path().display()
+                        );
+                    }
+                }
+            }
+            if pruned > 0 || failed > 0 {
+                eprintln!(
+                    "READING t27 pruned {pruned} stale ruagent-t16-* root(s) of dead test \
+                     processes; {failed} could not be removed"
+                );
+            }
+        });
+    }
+
+    /// Remove a test's own temporary root, or PANIC with the reason (t27 / issue #69).
+    ///
+    /// WHY THIS IS NOT `let _ = remove_dir_all(...)` ANY MORE. Windows refuses to remove a
+    /// directory while a handle inside it is open, and these tests hold their database for
+    /// the whole round -- so the removal FAILED, the error was dropped on the floor, and the
+    /// only evidence was a pile of `%TEMP%\ruagent-t16-*` roots that grew run after run
+    /// (measured: 56 when issue #69 was filed, 66 when this fix was written). A cleanup that
+    /// silently does not happen is not a cleanup; it is disk growth nobody can see.
+    ///
+    /// WHAT IT DOES INSTEAD: the CALLER releases its handles first (`drop(chats)`,
+    /// `drop(db)`) -- that is what makes the removal possible at all on Windows -- a few
+    /// bounded retries absorb a handle another task is still releasing, and a root that is
+    /// STILL there PANICS with the path and the OS error, so "it did not clean up" is a RED
+    /// TEST rather than a directory nobody counts.
+    fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+        if let Err(why) = try_remove_test_root(root, budget) {
+            panic!("{what}: {why}");
+        }
+    }
+
+    /// The same removal, REPORTED instead of panicking: `Ok` when the root is gone (a
+    /// NotFound counts -- it was already gone), `Err` carrying the LAST OS error, the path,
+    /// and how long it waited otherwise.
+    ///
+    /// It polls instead of sleeping once, because what it is waiting for is another task --
+    /// the session teardown above -- to drop the last handle, and it prints how long that
+    /// took when it had to wait: the wait IS the measurement.
+    fn try_remove_test_root(
+        root: &std::path::Path,
+        budget: std::time::Duration,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => {
+                    if started.elapsed() > std::time::Duration::from_millis(250) {
+                        println!(
+                            "READING t27 cleanup of {} waited {:.1} s for the handles to be \
+                             released",
+                            root.display(),
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    // The FRESHEST error is the one worth reporting: an earlier iteration's
+                    // error may describe a handle that has since been released.
+                    if started.elapsed() >= budget {
+                        return Err(format!(
+                            "the test root {} could not be removed within {:.1} s: {e} (a \
+                             leftover root is the visible half of issue #69 -- see \
+                             remove_test_root)",
+                            root.display(),
+                            budget.as_secs_f64()
+                        ));
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// THE CLEANUP FAILURE IS NO LONGER SWALLOWED, proved by MAKING IT FAIL (t27 / #69).
+    ///
+    /// The failure is not hypothetical: it is the SAME mechanism the two t16 tests were
+    /// losing their cleanup to -- an open SQLite connection inside the directory (Windows
+    /// opens those without FILE_SHARE_DELETE, so RemoveDirectoryW/DeleteFile refuse). Two
+    /// facts are asserted, and the second is the one the acceptance asks for:
+    ///   1. `try_remove_test_root` RETURNS an error that names the path -- the failure is
+    ///      reported, not dropped;
+    ///   2. `remove_test_root` -- the call the tests make -- PANICS on it, so a cleanup
+    ///      that cannot succeed REDS a test instead of growing %TEMP% silently.
+    ///
+    /// The directory this test deliberately sticks is released and removed at the end: a test
+    /// written for issue #69 must not become issue #69. (The unix branch makes the failure
+    /// deterministic there the only way it can be: an open file does NOT block `rmdir` on
+    /// unix, so the root is made read-only instead. This machine is Windows, so the unix
+    /// branch is reasoned rather than measured.)
+    #[test]
+    fn a_cleanup_that_cannot_succeed_is_reported_and_would_panic() {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-t27-stuck-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // Hold the directory's database open, exactly as a live test does.
+        let hold = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&root).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&root, perms).unwrap();
+        }
+
+        // A SHORT budget on purpose: the deliberate failure must be quick. The two t16 tests
+        // call report_test_root_left_behind instead, and say there why the assertion form is
+        // not available to them.
+        let why = try_remove_test_root(&root, std::time::Duration::from_millis(100))
+            .expect_err("a root holding an open database must NOT come back as removed");
+        println!("READING t27 deliberate cleanup failure: {why}");
+        assert!(
+            why.contains(&root.display().to_string()),
+            "the report must name the root it could not remove: {why}"
+        );
+        let panicked = std::panic::catch_unwind(|| {
+            remove_test_root(
+                &root,
+                "the t27 proof root",
+                std::time::Duration::from_millis(100),
+            )
+        })
+        .is_err();
+        assert!(
+            panicked,
+            "remove_test_root must PANIC on a root it could not remove, or issue #69 is back \
+             in the dark"
+        );
+
+        // Release the handle, undo the unix permission trick, and clean up: this root must
+        // not join the pile it exists to prevent.
+        drop(hold);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&root).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&root, perms).unwrap();
+        }
+        remove_test_root(
+            &root,
+            "the t27 proof root, after releasing its handle",
+            std::time::Duration::from_millis(500),
+        );
+        println!("READING t27 after releasing the handle: the proof root was removed");
+    }
+
     async fn wait_for_child(chats: &Arc<ChatManager>, id: RunId) -> Option<u32> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
         loop {
@@ -2538,6 +2760,9 @@ mod generating_tests {
         let Some(mock) = mock_agent() else {
             panic!("mock agent binary not built next to the test exe");
         };
+        // t27 / issue #69: clear the litter of previous runs first, so this run's own root
+        // is the only one this process leaves behind.
+        prune_stale_t16_roots();
         let root = std::env::temp_dir().join(format!(
             "ruagent-t16-reclaim-{}-{}",
             std::process::id(),
@@ -2612,7 +2837,13 @@ mod generating_tests {
         println!(
             "READING t16 five chat close cycles (pid, killed, already_gone, failed): {readings:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        // t27 / issue #69: release the handles FIRST, then REQUIRE the removal. The
+        // database lives inside this root, and Windows refuses to remove a directory while
+        // a handle inside it is open -- which is why `let _ =` here used to fail silently
+        // and leave one more %TEMP%\ruagent-t16-* root behind per run.
+        drop(chats);
+        drop(db);
+        report_test_root_left_behind(&root);
     }
 
     /// ISSUE #60, the OTHER half of the reading: a chat closed MID-TURN, where
@@ -2650,6 +2881,9 @@ mod generating_tests {
         let Some(mock) = mock_agent() else {
             panic!("mock agent binary not built next to the test exe");
         };
+        // t27 / issue #69: clear the litter of previous runs first, so this run's own root
+        // is the only one this process leaves behind.
+        prune_stale_t16_roots();
         let root = std::env::temp_dir().join(format!(
             "ruagent-t16-midturn-{}-{}",
             std::process::id(),
@@ -2720,7 +2954,11 @@ mod generating_tests {
             crate::orphans::process_started_at_ms(pid).is_none(),
             "child {pid} is GONE after the mid-turn close ({out})"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        // t27 / issue #69: same shape as the sibling test -- handles released, removal
+        // required, so a cleanup that cannot succeed REDS instead of accumulating.
+        drop(chats);
+        drop(db);
+        report_test_root_left_behind(&root);
     }
 
     /// Delete removes the HISTORY ROW, and does it without disturbing

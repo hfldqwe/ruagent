@@ -33,6 +33,12 @@ async fn start_daemon_with_routing(
         std::process::id(),
         chrono_tag()
     ));
+    // t27 / issue #69: bound the pile before creating another root in it. Once per process.
+    prune_stale_e2e_roots();
+    // NOT a cleanup (t27 / issue #69): this is the idempotent PRE-clean before
+    // the root is created, where a leftover is exactly what it tolerates -- the
+    // create_dir_all right after fails loudly if the path is really unusable. The
+    // cleanup that MUST happen is remove_test_root (see its note).
     let _ = std::fs::remove_dir_all(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -165,6 +171,123 @@ fn mock_bin() -> String {
         }
     }
     dst.to_string_lossy().replace('\\', "/")
+}
+
+/// Remove a test's own temporary root, or PANIC with the reason (t27 / issue #69).
+///
+/// WHY THIS IS NOT `let _ = remove_dir_all(...)` ANY MORE. Windows refuses to remove a
+/// directory while a handle inside it is open, and a test that seeds data behind the API's
+/// back holds such a handle for the whole round -- so the removal failed, the error was
+/// dropped on the floor, and the only evidence was a growing pile of roots in %TEMP% that
+/// nobody counted. Measured on this machine while filing #69: 4838 `ruagent-e2e-*`
+/// directories (plus 3902 `ruagent-kbapi-*`, 2854 `ruagent-graph-fixture-*`, 2214
+/// `ruagent-capapi-*`, 2063 `ruagent-wiki-*` from sibling suites with the same habit).
+/// A cleanup that silently does not happen is not a cleanup; it is disk growth nobody sees.
+///
+/// WHAT IT DOES INSTEAD: a few bounded retries absorb a handle some background task is
+/// still releasing, and a root that is STILL there PANICS with the path and the OS error,
+/// so "it did not clean up" is a RED TEST rather than a directory.
+fn remove_test_root(root: &std::path::Path, what: &str) {
+    if let Err(why) = try_remove_test_root(root, CLEANUP_BUDGET) {
+        panic!("{what}: {why}");
+    }
+}
+
+/// How long one of THESE cleanups waits for a handle to be released before it calls the
+/// failure real (t27 / issue #69). These roots (a worktree repo, an outbox directory, a
+/// project directory, the orphan-record root) belong to the test, but the daemon runs
+/// IN-PROCESS and may still be finishing a turn against them; 10 s of polling is bounded
+/// and generous for a handle that is on its way out.
+const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The same removal, REPORTED instead of panicking (the local twin of chat.rs's helper, with
+/// the same signature: the two test crates cannot share a test-support item, so each keeps
+/// its own copy). `Ok` when the root is gone (a NotFound counts -- it was already gone),
+/// `Err` carrying the last OS error, the path and the wait otherwise.
+fn try_remove_test_root(root: &std::path::Path, budget: std::time::Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t27 cleanup of {} waited {:.1} s for the handles to be released",
+                        root.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                // The FRESHEST error is the one worth reporting: an earlier iteration's error
+                // may describe a handle that has since been released.
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "the test root {} could not be removed within {:.1} s: {e} (a leftover \
+                         root is the visible half of issue #69 -- see remove_test_root)",
+                        root.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Remove the roots of PREVIOUS test processes (t27 / issue #69), once per test process.
+///
+/// WHY A PRUNER AND NOT A `Drop`: a `TestDaemon` runs the daemon IN-PROCESS, so the
+/// database it seeded is held by a server task that outlives the test's own handle -- the
+/// root of the CURRENT run therefore cannot be removed from the test that owns it (this is
+/// the one case `remove_test_root` is not called on, deliberately: it would red every
+/// e2e test for a file the running daemon still holds). What must not happen is that
+/// nothing ever removes it, which is what the 4838 directories measured above were.
+///
+/// SAFETY RULE: only a root whose pid is NO LONGER ALIVE is pruned -- this run's own roots
+/// (and a concurrently running test binary's) are left alone, because they are exactly the
+/// evidence someone needs when a run failed. That bounds the pile to one directory per test
+/// per live run, cleaned by the next one.
+fn prune_stale_e2e_roots() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let (mut pruned, mut failed) = (0usize, 0usize);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("ruagent-e2e-") else {
+                continue;
+            };
+            // ruagent-e2e-<pid>-<tag>; anything else (e.g. the mock-bin copies directory)
+            // is not a test root and is left alone.
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if ruagent_daemon::orphans::process_started_at_ms(pid).is_some() {
+                continue;
+            }
+            match std::fs::remove_dir_all(e.path()) {
+                Ok(()) => pruned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    eprintln!(
+                        "READING t27 stale e2e root {} could NOT be removed: {err}",
+                        e.path().display()
+                    );
+                }
+            }
+        }
+        if pruned > 0 || failed > 0 {
+            eprintln!(
+                "READING t27 pruned {pruned} stale ruagent-e2e-* root(s) of dead test \
+                 processes; {failed} could not be removed"
+            );
+        }
+    });
 }
 
 /// Run a prompt on the mock agent and return (final text, sse dump).
@@ -674,6 +797,10 @@ fn temp_git_repo(tag: &str) -> PathBuf {
     let seq = REPO_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let repo =
         std::env::temp_dir().join(format!("ruagent-repo-{tag}-{}-{seq}", std::process::id()));
+    // NOT a cleanup (t27 / issue #69): this is the idempotent PRE-clean before
+    // the root is created, where a leftover is exactly what it tolerates -- the
+    // create_dir_all right after fails loudly if the path is really unusable. The
+    // cleanup that MUST happen is remove_test_root (see its note).
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("hello.txt"), "base").unwrap();
@@ -800,7 +927,7 @@ async fn fanout_with_repo_gives_each_run_its_own_worktree() {
         "branches must be deleted"
     );
 
-    let _ = std::fs::remove_dir_all(&repo);
+    remove_test_root(&repo, "the test root of this test");
 }
 
 // ---------------------------------------------------------------------------
@@ -960,7 +1087,7 @@ async fn land_selected_worktree() {
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
 
-    let _ = std::fs::remove_dir_all(&repo);
+    remove_test_root(&repo, "the test root of this test");
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,6 +1637,10 @@ fn prior_daemon_record_roundtrips() {
             .unwrap()
             .subsec_nanos()
     ));
+    // NOT a cleanup (t27 / issue #69): this is the idempotent PRE-clean before
+    // the root is created, where a leftover is exactly what it tolerates -- the
+    // create_dir_all right after fails loudly if the path is really unusable. The
+    // cleanup that MUST happen is remove_test_root (see its note).
     let _ = std::fs::remove_dir_all(&root);
     // First boot: no record.
     assert!(
@@ -1521,7 +1652,7 @@ fn prior_daemon_record_roundtrips() {
     // Our own pid round-trips with its start time.
     let prior = ruagent_daemon::orphans::read_prior(&root).unwrap().unwrap();
     assert_eq!(prior.pid, std::process::id());
-    let _ = std::fs::remove_dir_all(&root);
+    remove_test_root(&root, "the test root of this test");
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,7 +2438,7 @@ async fn distill_graph_toggle_controls_entity_extraction() {
         .unwrap();
     assert_eq!(entities, 1, "graph=true writes the extracted entity");
 
-    let _ = std::fs::remove_dir_all(&replies_dir);
+    remove_test_root(&replies_dir, "the test root of this test");
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,7 +2659,7 @@ async fn distill_records_the_agents_usage_and_leaves_it_null_when_unreported() {
          $0.00 are readings nobody took"
     );
 
-    let _ = std::fs::remove_dir_all(&replies_dir);
+    remove_test_root(&replies_dir, "the test root of this test");
 }
 
 // ---------------------------------------------------------------------------
@@ -2677,5 +2808,5 @@ async fn chat_runs_in_its_project_cwd() {
         project.display()
     );
 
-    let _ = std::fs::remove_dir_all(&project);
+    remove_test_root(&project, "the test root of this test");
 }
