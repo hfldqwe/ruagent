@@ -1,0 +1,79 @@
+-- 0030: the distillation ledger learns WHICH MESSAGES an attempt read
+-- (ruagent-issues-56-59 t3 / issue #58).
+--
+-- THE DEFECT THIS FIXES, stated as the operator's question. 0028 gave
+-- `distill_log` the NUMERIC half of issue #48's coverage measurement --
+-- `windows` (how many inputs the transcript was cut into) and `truncated`
+-- (whether text had to be dropped to fit) -- but not the other half: the RANGE
+-- of messages those windows covered. That range existed ONLY in the HTTP
+-- response of the pass that produced it (`DistillOutcome::coverage`, a
+-- `TranscriptCoverage`), so "which part of this session did the attempt at
+-- 09:14 actually read?" was unanswerable the moment the response was gone. A
+-- ledger row saying `windows = 3, truncated = 0` cannot be checked against the
+-- session, and a row saying `memories_written = 0` cannot be told apart from
+-- "the pass read a fraction of the transcript".
+--
+-- WHY COLUMNS ON THE ATTEMPT AND NOT A SIDE TABLE: same reason as 0028. The
+-- range is a property OF the attempt (it already has one row per attempt since
+-- 0024), the reader's question is answered by ONE row, and a side table would
+-- key on `distill_log.id` and turn that read into a join.
+--
+-- ⚠ ALL THREE COLUMNS ARE NULLABLE WITH **NO DEFAULT**, and that is again the
+-- whole reading rule: NULL means NOBODY RECORDED THIS, never 0. `ALTER TABLE
+-- ... DEFAULT 0` would stamp a fabricated range onto every historical row
+-- ("this attempt read message 0 to message 0") -- the same assertion 0020
+-- refused to make with `default 'ok'`, 0024 refused with `status`, and 0028
+-- refused with its eight columns. A reader must therefore not write
+-- `COALESCE(from_seq, 0)` and call the result a range.
+--
+-- THE THREE COLUMNS TRAVEL TOGETHER. They are three readings of ONE measurement
+-- (`TranscriptCoverage`), so a row either carries all three or none: a row with
+-- `total_messages` and no range would be a half-measurement nobody can read,
+-- and the writer below writes them under a single `Option`.
+--
+-- THE UNIT, said plainly, because the column name alone would mislead: these
+-- are INDICES INTO THE MESSAGE LIST THE PASS READ -- the filter
+-- `sessions::user_turns` runs first -- and NOT the transcript's own `seq` field.
+--   * `from_seq`        INCLUSIVE start of the covered range.
+--   * `to_seq`          EXCLUSIVE end (so `from_seq == to_seq` is an empty
+--                       range, which the writer never produces: a pass that read
+--                       nothing is a refusal and leaves all three NULL).
+--   * `total_messages`  the DENOMINATOR: how many messages that list had. It is
+--                       what makes the range interpretable ("read 0 of 120" vs
+--                       "read 120 of 120"), and it is why a session that was
+--                       WINDOWED still reads end to end -- windowing is lossless,
+--                       `truncated` is the column that says something was cut.
+-- The rendering `TranscriptCoverage` fields are named `from_message` /
+-- `to_message` / `total_messages`; the column names `from_seq` / `to_seq` are
+-- this contract's (t3 / #58), and the read end exposes them under those names.
+--
+-- WHICH PATHS RECORD IT, and which must not: the success path writes all three
+-- from the coverage it MEASURED (the extraction loop ran, so a range exists
+-- even when the pass found nothing to keep -- `status = 'empty'` with a range is
+-- a pass that looked). A REFUSAL or a FAILURE read nothing, so it leaves the
+-- three NULL -- "we did not look" -- rather than a 0 it never observed; that is
+-- the same discipline `windows`/`truncated` already follow one migration up.
+--
+-- IDEMPOTENT BY THE RUNNER, not by SQL: SQLite has NO `ADD COLUMN IF NOT
+-- EXISTS`, so an `ALTER` cannot guard itself. `migrations::apply_script` probes
+-- `pragma_table_info(<table>)` for every `ALTER TABLE ... ADD COLUMN` statement
+-- and SKIPS the ones whose column is already there, which is what makes a lost
+-- `schema_migrations` row for this version harmless. The statements below must
+-- therefore stay in the exact shape that guard parses -- `ALTER TABLE <table>
+-- ADD COLUMN <column> <type>;`, one statement per line -- or the probe misses
+-- them and a re-apply fails with `duplicate column name`.
+--
+-- RELATION: nothing new is added to the runner by this migration. The shape is
+-- the one `the_guard_parses_the_shapes_it_claims_to` already pins and the ~38
+-- ALTERs in 0003..0029 use; 0030 is an ALTER-only, purely ADDITIVE migration,
+-- so a pre-0030 database upgrades in place with no rebuild and no data copy
+-- (`rebuild_already_done` is for 0024 alone).
+
+-- INCLUSIVE start of the covered range, in messages of the list the pass read.
+ALTER TABLE distill_log ADD COLUMN from_seq INTEGER;
+
+-- EXCLUSIVE end of that range.
+ALTER TABLE distill_log ADD COLUMN to_seq INTEGER;
+
+-- The denominator of the range: how many messages the list had.
+ALTER TABLE distill_log ADD COLUMN total_messages INTEGER;

@@ -297,6 +297,228 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
     server.cancel().await.unwrap();
 }
 
+/// issue #56 / t2: a REFUSED store×namespace pair is an ERROR to the MCP caller,
+/// carrying the daemon's own sentence — never a success envelope — and NOTHING is
+/// written. The allowed pairs keep the receipt they had.
+///
+/// BOTH branches are measured through the real seam: the daemon's 409 body is read
+/// off HTTP in the same test so the tool's failure can be compared against it
+/// VERBATIM (a paraphrase would pass a substring test written only from the tool
+/// side), and the tool runs over an in-process rmcp pipe against the real routes.
+/// `profile` × `global` is outside the store's write vocabulary
+/// (`MemoryStore::allowed_kinds`), while `observation` × `user` is inside it.
+#[tokio::test]
+async fn a_refused_memory_write_fails_with_the_daemons_own_words_through_mcp() {
+    let (daemon_url, root) =
+        start_test_daemon_with_policy("[permissions]\ndefault = \"ask\"\n").await;
+    let http = reqwest::Client::new();
+    let (client, server_task) = mcp_pair(&daemon_url).await;
+
+    let refused_args = serde_json::json!({
+        "store": "profile",
+        "namespace": "global",
+        "content": "t2 the owner prefers tea to coffee",
+    });
+    let before = count_rows(&root, "SELECT COUNT(*) FROM memories").await;
+
+    // -- (1) the daemon's OWN answer, read off the HTTP route the tool calls: the
+    //        status that makes the refusal a failure, and the words it must carry.
+    let raw = http
+        .post(format!("{daemon_url}/api/v1/memory/write"))
+        .json(&refused_args)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.status().as_u16(),
+        409,
+        "a store×namespace refusal must not answer 2xx (issue #56)"
+    );
+    let body: serde_json::Value = raw.json().await.unwrap();
+    let daemon_sentence = body["error"]
+        .as_str()
+        .expect("the refusal body carries `error`")
+        .to_string();
+    assert_eq!(body["store"], "profile", "{body}");
+    assert_eq!(body["namespace"], "global", "{body}");
+    assert_eq!(
+        body["allowed_namespaces"],
+        serde_json::json!(["user"]),
+        "the refusal publishes the store's own vocabulary: {body}"
+    );
+
+    // -- (2) the same call through the MCP tool: an ERROR, carrying that sentence.
+    let seen = failure(client.call_tool(call("memory_write", refused_args)).await);
+    assert!(
+        seen.contains(&daemon_sentence),
+        "the daemon's own sentence must reach the caller verbatim: {seen}"
+    );
+    assert!(seen.contains("HTTP 409"), "{seen}");
+    assert!(
+        seen.contains("`profile`") && seen.contains("`global`"),
+        "the refusal names the store and the namespace: {seen}"
+    );
+    assert!(
+        seen.contains("user"),
+        "and what that store MAY write, so the caller can retry: {seen}"
+    );
+    // The false success this task exists to remove.
+    assert!(
+        !seen.starts_with("memory write: "),
+        "a refusal must not wear the receipt: {seen}"
+    );
+    assert!(
+        !seen.contains("Inserted") && !seen.contains("SkippedDuplicate"),
+        "{seen}"
+    );
+
+    // -- (3) NOTHING WAS WRITTEN. The table is the witness, not the sentence.
+    assert_eq!(
+        count_rows(&root, "SELECT COUNT(*) FROM memories").await,
+        before,
+        "a refused write must not insert a row"
+    );
+
+    // -- (4) the ALLOWED branch: same tool, same receipt key and shape as before.
+    let allowed = serde_json::json!({
+        "store": "observation",
+        "namespace": "user",
+        "content": "t2 the owner prefers tea to coffee",
+    });
+    let ok = text_of(
+        &client
+            .call_tool(call("memory_write", allowed.clone()))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        ok.starts_with("memory write: Inserted("),
+        "the receipt shape and key are unchanged: {ok}"
+    );
+    assert_eq!(
+        count_rows(&root, "SELECT COUNT(*) FROM memories").await,
+        before + 1,
+        "an allowed pair writes exactly one row: {ok}"
+    );
+    let dup = text_of(
+        &client
+            .call_tool(call("memory_write", allowed))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        dup.starts_with("memory write: SkippedDuplicate("),
+        "a duplicate is still a success, and it says which row it is: {dup}"
+    );
+
+    // -- (5) the tool description no longer claims a vocabulary the daemon owns: it
+    //        used to say "Namespaces: user, global, project:<name>, agent:<name>",
+    //        which reads as `global` being writable everywhere.
+    let tools = client.list_all_tools().await.unwrap();
+    let described = tools
+        .iter()
+        .find(|t| t.name == "memory_write")
+        .map(|t| t.description.clone().unwrap_or_default())
+        .expect("memory_write is on the surface");
+    assert!(
+        !described.contains("Namespaces:"),
+        "the description must not restate the write matrix: {described}"
+    );
+    assert!(
+        described.contains("allowed_namespaces"),
+        "it must say the REFUSAL names what the store may write: {described}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+/// THE NEGATIVE CONTROL for the test above (issue #56) — and nothing else.
+///
+/// It is not there to bless a behaviour: it exists so that "the refusal reaches the
+/// caller as an error" cannot be a vacuous claim. The pre-#56 daemon answered a
+/// refused pair `200 {"outcome":"RejectedNamespace (...)"}`, and under THAT body no
+/// bridge can tell a refusal from a write — the caller sees a receipt. So this test
+/// serves the old body from a stub and shows the receipt, which is the distinction
+/// the fix bought: the tool's honesty is bounded by the status the daemon sends, and
+/// the status is what changed (`crates/daemon/src/api.rs`, t1).
+///
+/// The control is what makes the assertions above load-bearing: on THIS result
+/// [`failure`] panics instead of passing (its own `Ok(r) => panic!(...)` arm), so the
+/// test above can only be green because the daemon now answers 409 — not because the
+/// check it uses is lenient.
+#[tokio::test]
+async fn the_pre_56_200_refusal_body_would_have_read_as_a_receipt() {
+    let (url, stub) = stub_http_server(
+        "200 OK",
+        &serde_json::json!({
+            "outcome": "RejectedNamespace (this store does not allow that namespace; write \
+                        vocabulary = profile: user; observation: user, project:<x>, agent:<x>; \
+                        procedure: project:<x>, global; lesson: project:<x>, global)",
+        })
+        .to_string(),
+    )
+    .await;
+    let (client, server_task) = mcp_pair(&url).await;
+
+    let out = client
+        .call_tool(call(
+            "memory_write",
+            serde_json::json!({
+                "store": "profile",
+                "namespace": "global",
+                "content": "t2 control: this pair is refused by the daemon",
+            }),
+        ))
+        .await;
+    // 200 + that body -> a SUCCESS to the caller. Not endorsed: this is the shape the
+    // bridge cannot see through, and the reason #56 is a write-side issue.
+    let seen = text_of(&out.expect("a 200 is a success as far as the bridge can tell"));
+    assert!(
+        seen.starts_with("memory write: RejectedNamespace"),
+        "the old body arrives as a receipt, which is the false success the test above \
+         must catch: {seen}"
+    );
+    assert!(!seen.contains("refused by the ruagent daemon"), "{seen}");
+
+    shutdown_pair(client, server_task).await;
+    stub.abort();
+}
+
+/// A stub HTTP server answering EVERY request with `status` and `body` (one
+/// connection per request), so a tool can be pointed at a "daemon" that answers
+/// exactly what the test needs and nothing else. Returns the base URL and the
+/// accept loop's handle.
+async fn stub_http_server(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let status = status.to_string();
+    let body = body.to_string();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let status = status.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                // The request body is irrelevant: every call gets the same answer.
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
 /// Seed SQL through a SECOND connection to the test daemon's own database.
 ///
 /// WHY A DIRECT INSERT IS LEGITIMATE HERE (t12): the two facts the tests below need
@@ -312,6 +534,19 @@ async fn seed(root: &std::path::Path, sql: &str) {
     db.call_flat(move |conn| conn.execute_batch(&sql))
         .await
         .unwrap();
+}
+
+/// ONE count from the test daemon's own database, through a second connection.
+///
+/// The witness for "nothing was written" has to be the TABLE: a refusal's own
+/// sentence says NOTHING WAS WRITTEN, and a test that only reads that sentence
+/// would pass on a daemon that wrote the row and said otherwise.
+async fn count_rows(root: &std::path::Path, sql: &str) -> i64 {
+    let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
+    let sql = sql.to_string();
+    db.call_flat(move |conn| conn.query_row(&sql, [], |r| r.get(0)))
+        .await
+        .unwrap()
 }
 
 async fn create_entity(http: &reqwest::Client, daemon_url: &str, name: &str) -> i64 {

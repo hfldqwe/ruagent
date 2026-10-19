@@ -79,7 +79,15 @@ impl PlatformTools {
     }
 
     #[tool(
-        description = "Store a long-term memory about the user, a project, or a lesson learned. Stores: profile (user facts), observation (general), procedure (how-to, project/global), lesson (project/global). Namespaces: user, global, project:<name>, agent:<name>. Optionally pass supersedes=<memory id> to replace it. WHEN: the user asks you to remember something, or states a durable preference, decision or correction worth keeping beyond this session. COST: free (zero model tokens)."
+        // THE DESCRIPTION DOES NOT RESTATE THE WRITE VOCABULARY (issue #56, t2). It
+        // used to say "Namespaces: user, global, project:<name>, agent:<name>", which
+        // reads as *every* namespace being writable everywhere -- but each store has
+        // its own write vocabulary (`MemoryStore::allowed_kinds`, design 6.2), so that
+        // sentence was a SECOND copy of a matrix the daemon already owns, and it was
+        // wrong. The tool now states the RULE (the daemon adjudicates, a pair outside
+        // the vocabulary FAILS) and points at the refusal, which names the store, the
+        // namespace and the `allowed_namespaces` that store may write.
+        description = "Store a long-term memory about the user, a project, or a lesson learned. Stores: profile (user facts), observation (general), procedure (how-to), lesson (corrections and lessons worth keeping). THE DAEMON ADJUDICATES THE store x namespace PAIR: each store writes only some of user | global | project:<name> | agent:<name>, and a pair outside that store's write vocabulary FAILS -- nothing is written, and the refusal names the store, the namespace and the allowed_namespaces that store may write. A write is stored only when THIS call returns a receipt; never report a refused call as remembered. Optionally pass supersedes=<memory id> to replace it. WHEN: the user asks you to remember something, or states a durable preference, decision or correction worth keeping beyond this session. COST: free (zero model tokens)."
     )]
     async fn memory_write(
         &self,
@@ -97,9 +105,19 @@ impl PlatformTools {
             &self.config.daemon_url,
         )
         .await?;
+        // A REFUSED PAIR NEVER REACHES THIS LINE (issue #56, t1): the daemon answers
+        // 409 with a JSON body, and `json_of` turns any non-2xx into an `Err` whose
+        // message IS the daemon's own sentence -- so a refusal is what the caller
+        // sees, never "memory write: RejectedNamespace(...)" dressed as a receipt.
+        //
+        // A 2xx, on the other hand, IS a write, and that envelope always carries
+        // `outcome` (the route's branch table, crates/daemon/src/api.rs). A success
+        // reply WITHOUT it is protocol DRIFT, not an empty reading: `"?"` here would
+        // read as a stored memory, which is the false success this tool must never
+        // produce (the `drift` discipline, t93).
         Ok(format!(
             "memory write: {}",
-            resp["outcome"].as_str().unwrap_or("?")
+            field_str("memory_write", &resp, "outcome")?
         ))
     }
 
@@ -2223,7 +2241,12 @@ pub struct GetParams {
 pub struct WriteParams {
     #[schemars(description = "profile | observation | procedure | lesson")]
     pub store: String,
-    #[schemars(description = "user | global | project:<name> | agent:<name>")]
+    // Not a promise that every store accepts every one of these: the pair is
+    // adjudicated by the daemon, and a refused pair comes back as an error naming
+    // the `allowed_namespaces` for that store (issue #56).
+    #[schemars(
+        description = "user | global | project:<name> | agent:<name> -- but each store writes only some of these; the daemon decides and a refused pair names the allowed set"
+    )]
     pub namespace: String,
     #[schemars(description = "The memory content, one concise fact")]
     pub content: String,
@@ -3491,6 +3514,81 @@ mod tests {
         let plain = refusal_message("memory_search", 500, "database is locked");
         assert!(plain.contains("database is locked"), "{plain}");
         assert!(plain.contains("HTTP 500"), "{plain}");
+    }
+
+    /// issue #56 (t2): the daemon's REFUSED-PAIR body is JSON with
+    /// `error` + `outcome` + `store` + `namespace` + `reason` + `allowed_namespaces`
+    /// (crates/daemon/src/api.rs, `refused_store_namespace`). The bridge must hand
+    /// the caller the daemon's own sentence — not the raw JSON, and not a
+    /// paraphrase that drops which namespaces the store MAY write.
+    #[test]
+    fn a_refused_pair_reaches_the_caller_as_the_daemons_own_sentence() {
+        // The body is the daemon's, byte for byte in shape; `error` is the sentence.
+        let sentence = "namespace governance (design §6.2): store `profile` writes only {user}, \
+                        and `global` is not one of them. NOTHING WAS WRITTEN — the refusal is \
+                        recorded in the write audit as op='reject'";
+        let body = serde_json::json!({
+            "error": sentence,
+            "outcome": "RejectedNamespace (this store does not allow that namespace; write vocabulary \
+                        = ...)",
+            "store": "profile",
+            "namespace": "global",
+            "reason": "namespace governance (design §6.2): store `profile` writes only {user}",
+            "allowed_namespaces": ["user"],
+        })
+        .to_string();
+        let msg = refusal_message("memory_write", 409, &body);
+        assert!(
+            msg.contains(sentence),
+            "the daemon's sentence must survive verbatim: {msg}"
+        );
+        assert!(
+            !msg.contains("{\"error\""),
+            "the JSON wrapper must be gone: {msg}"
+        );
+        assert!(msg.contains("HTTP 409"), "{msg}");
+        // store, namespace and what the store MAY write are all readable.
+        assert!(
+            msg.contains("`profile`") && msg.contains("`global`"),
+            "{msg}"
+        );
+        assert!(msg.contains("only {user}"), "{msg}");
+        assert!(
+            msg.contains("RejectedNamespace") || msg.contains("NOTHING WAS WRITTEN"),
+            "{msg}"
+        );
+        // A refusal is not a receipt, and this stays true of every refusal shape.
+        assert!(!msg.contains("memory write: Inserted"), "{msg}");
+
+        // The OTHER routes still answer plain text (t1: `body: None` by default) --
+        // the JSON probe is a courtesy, not an assumption about all errors.
+        let plain = refusal_message(
+            "memory_write",
+            400,
+            "unknown store `profil` (observation | profile | procedure | lesson)",
+        );
+        assert!(plain.contains("unknown store `profil`"), "{plain}");
+        assert!(plain.contains("HTTP 400"), "{plain}");
+    }
+
+    /// A 2xx WITHOUT `outcome` is drift, not a write: `memory_write` used to print
+    /// "memory write: ?", which reads exactly like a receipt (issue #56 / t93).
+    #[test]
+    fn a_success_envelope_without_outcome_is_drift_not_a_receipt() {
+        let ok = serde_json::json!({ "outcome": "Inserted(7)" });
+        assert_eq!(
+            format!(
+                "memory write: {}",
+                field_str("memory_write", &ok, "outcome").unwrap()
+            ),
+            "memory write: Inserted(7)",
+            "the receipt key and shape are unchanged"
+        );
+        let empty = serde_json::json!({ "note": "ok" });
+        let err = field_str("memory_write", &empty, "outcome")
+            .expect_err("a 2xx without `outcome` is drift");
+        assert!(err.to_string().contains("outcome"), "{err}");
+        assert!(err.to_string().contains("memory_write"), "{err}");
     }
 
     #[test]

@@ -337,6 +337,25 @@ export interface DistillLedgerEntry {
   /** Whether any window lost transcript text. null = not recorded, false = a
    *  measured, lossless pass. */
   truncated: boolean | null;
+  /** WHICH messages this pass read, as indexes into the message list it built
+   *  (that list comes AFTER the user-turn filter, so these are not the
+   *  transcript's own seq field): `from_seq` is the INCLUSIVE start, `to_seq`
+   *  the EXCLUSIVE end (so `from 1 .. to 40` is 39 messages and an empty range
+   *  is `from == to`), and `total_messages` is the denominator -- how many
+   *  messages that list held. The three together are what makes "covered 1..40
+   *  of 120" answerable at all (t3/t4, issue #58).
+   *
+   *  THE THREE ARE ONE MEASUREMENT, so a view has to judge them as a GROUP: the
+   *  writer fills them from a single `Option<TranscriptCoverage>` (all three or
+   *  none -- see 0030_distill_coverage.sql), and a null is "nobody recorded
+   *  it", never 0. A row carrying only SOME of the three (hand-inserted, or
+   *  written by a path that is not the distill writer) is therefore STILL not a
+   *  recorded range: do not complete it with zeros, and do not read the one
+   *  number as if it answered the question. `totals.coverage_not_recorded` is
+   *  the count of exactly those rows. */
+  from_seq: number | null;
+  to_seq: number | null;
+  total_messages: number | null;
   prompt_hash: string | null;
 }
 
@@ -359,6 +378,13 @@ export interface DistillLogPage {
     cost_usd: number | null;
     tokens_used_not_recorded: number;
     cost_usd_not_recorded: number;
+    /** How many rows in this set could NOT answer "how many messages did you
+     *  read" -- i.e. the three coverage columns were not all recorded. A COUNT
+     *  over the same filter as `total`, so a 0 here IS a measured zero (every
+     *  row in the set recorded its coverage). There is deliberately no sum of
+     *  the ranges themselves -- a range is not additive, and a 0-length fake
+     *  range would be a made-up reading (t4, issue #58). */
+    coverage_not_recorded: number;
   };
 }
 
@@ -401,12 +427,19 @@ export interface DistillBatchActual {
   cost_usd_not_recorded: number;
 }
 
+export type DistillTier = "rules" | "acp";
+
 /** `POST /api/v1/sessions/distill/batch` (t7 / issue #47). The SAME shape
  *  answers the plan (`dry_run: true`) and the run, so the panel can put the
  *  estimate and the actual reading side by side without translating between
  *  two vocabularies. */
 export interface DistillBatchOutcome {
   dry_run: boolean;
+  /** The daemon's OWN label for the tier THIS answer is about
+   *  (`ExtractPlan::label()`: `rules` | `acp` | `rules+acp`). It is what makes
+   *  "the estimate and the run used the same tier" CHECKABLE instead of
+   *  promised: the panel compares this echo against the tier it sent, and
+   *  refuses to start a run whose estimate was priced for a different one. */
   extractor: string;
   /** How many sessions this pass would attempt (<= the requested limit). */
   planned: number;
@@ -1565,8 +1598,12 @@ export const api = {
     ).then((r) => r.messages),
 
   // distillation + recall
-  sessionDistill: (key: string) =>
-    post(`/api/v1/sessions/${key}/distill`).then(
+  /** `POST /api/v1/sessions/{key}/distill`, with the tier NAMED (issue #57).
+   *  Same rule as the batch call below: the route reads an empty body as `acp`,
+   *  so the tier is a required ARGUMENT rather than something a caller may
+   *  forget to send. */
+  sessionDistill: (key: string, extractor: DistillTier) =>
+    post(`/api/v1/sessions/${key}/distill`, { extractor }).then(
       (r) =>
         r.json() as Promise<{
           distilled: {
@@ -1596,16 +1633,20 @@ export const api = {
    *  which is what makes it safe to ask before the user commits, and the only
    *  source of the global backlog count. `limit` is clamped by the daemon to its
    *  own [1, 200]. */
-  distillBatch: (opts?: { limit?: number; dryRun?: boolean }) => {
+  distillBatch: (opts: { limit?: number; dryRun?: boolean; extractor: DistillTier }) => {
     const q = new URLSearchParams();
-    if (opts?.limit != null) q.set("limit", String(opts.limit));
-    if (opts?.dryRun) q.set("dry_run", "true");
+    if (opts.limit != null) q.set("limit", String(opts.limit));
+    if (opts.dryRun) q.set("dry_run", "true");
     const qs = q.toString();
-    // An empty JSON body: the route reads the body as raw bytes, so `{}` means
-    // "the defaults", the same thing an absent body means (t4/t7).
-    return post(`/api/v1/sessions/distill/batch${qs ? `?${qs}` : ""}`, {}).then(
-      (r) => r.json() as Promise<DistillBatchOutcome>,
-    );
+    // THE TIER RIDES THE BODY, and it is ALWAYS sent. The route's default for an
+    // absent or empty body is `acp` -- one model call per window -- so an
+    // omitted `extractor` is a paid request made by accident, which is exactly
+    // what the panel used to do with `{}` (issue #57). `?extractor=` is NOT a
+    // query parameter this route reads, and sending it there would be silently
+    // ignored: the shape this repo refuses (t300's "not read" 400).
+    return post(`/api/v1/sessions/distill/batch${qs ? `?${qs}` : ""}`, {
+      extractor: opts.extractor,
+    }).then((r) => r.json() as Promise<DistillBatchOutcome>);
   },
   recall: (q: string, conservative: boolean, topN = 5) =>
     get<RecallResult>(

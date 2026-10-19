@@ -35,6 +35,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0027_entity_aliases_fts.sql"),
     include_str!("migrations/0028_distill_ledger.sql"),
     include_str!("migrations/0029_resolution_dismissed.sql"),
+    include_str!("migrations/0030_distill_coverage.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.
@@ -607,7 +608,15 @@ mod tests {
                 "cost_usd",
                 "retries",
                 "windows",
-                "truncated"
+                "truncated",
+                // 0030 appends the RANGE half of that same measurement (t3 /
+                // issue #58): `windows` and `truncated` say how much and whether
+                // anything was lost, and these three say WHICH MESSAGES the pass
+                // read. Additive to the end like everything before it, so the
+                // pre-0030 order above stays pinned.
+                "from_seq",
+                "to_seq",
+                "total_messages"
             ],
         );
         // 0029 appends the undecided queue's ANSWER (issue #50): every pre-0029
@@ -681,6 +690,13 @@ mod tests {
             ("distill_log", "retries"),
             ("distill_log", "windows"),
             ("distill_log", "truncated"),
+            // 0030: the range of messages the attempt read (t3 / issue #58).
+            // Same rule, third time: NULL = no range was ever measured, and a
+            // `DEFAULT 0` would have stamped "read message 0 to message 0" onto
+            // every historical attempt -- a range nobody observed.
+            ("distill_log", "from_seq"),
+            ("distill_log", "to_seq"),
+            ("distill_log", "total_messages"),
             // 0029: the undecided queue's answer. NULL = not answered yet; a
             // default would have to invent either the decision or its time.
             ("resolution_pending", "dismissed_at"),
@@ -768,7 +784,8 @@ mod tests {
         assert_eq!(
             (v28 + 1, v29 + 1),
             (28, 29),
-            "0028/0029 must be MIGRATIONS[27]/[28]: the two NEWEST scripts, in order"
+            "0028/0029 must be MIGRATIONS[27]/[28], in order (0030 is appended after \
+             them; the indices of these two do not move)"
         );
 
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -961,6 +978,259 @@ mod tests {
         // test having skipped the second application altogether.
         let unguarded =
             conn.execute_batch("ALTER TABLE distill_log ADD COLUMN tokens_used INTEGER;");
+        assert!(
+            unguarded.is_err(),
+            "SQLite has no `ADD COLUMN IF NOT EXISTS`: an unguarded re-ALTER must fail, \
+             which is exactly why the guard has to skip it"
+        );
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "the failed control must leave the schema alone"
+        );
+    }
+
+    /// t3 / issue #58: the ledger learns WHICH MESSAGES an attempt read.
+    ///
+    /// 0028 gave `distill_log` the NUMERIC half of issue #48's coverage
+    /// measurement (`windows`, `truncated`); the RANGE that half belongs to lived
+    /// only in the HTTP response of the pass that produced it, so "which part of
+    /// this session did that attempt read?" died with the response. These three
+    /// columns are that range, and the test asserts the three ways the change
+    /// could be wrong:
+    ///
+    /// 1. **an old database upgrades, and its history stays UNKNOWN.** The
+    ///    fixture is built by the SAME runner (`apply_one` for 1..=29) with a row
+    ///    written the way a pre-0030 daemon wrote one, so the only path exercised
+    ///    is the one a real installation takes. The row's own values must survive
+    ///    untouched, the ROW COUNT must not move, and the three new columns must
+    ///    read NULL in it -- a `DEFAULT 0` would have backfilled a fabricated
+    ///    range ("read message 0 to message 0") onto every historical attempt.
+    /// 2. **re-applying 0030 is a no-op.** A lost `schema_migrations` row for 30
+    ///    means the script runs again against a schema that already has the
+    ///    columns. SQLite has no `ADD COLUMN IF NOT EXISTS`, so this rests
+    ///    entirely on the runner's `pragma_table_info` guard: without it the boot
+    ///    dies with `duplicate column name: from_seq`.
+    /// 3. **the head is 30, and pinned by a TEST rather than by arithmetic.** The
+    ///    contract is `SCHEMA_VERSION == MIGRATIONS.len()` and that length is
+    ///    THIRTY: a migration appended without the head following it, or the array
+    ///    not being extended at all, is what the literal catches.
+    #[test]
+    fn the_coverage_columns_upgrade_an_old_database_and_reapply_cleanly() {
+        const NEW_COVERAGE_COLUMNS: &[&str] = &["from_seq", "to_seq", "total_messages"];
+
+        // Found by CONTENT rather than by a literal, so a migration inserted
+        // anywhere ahead of 0030 cannot leave this test quietly building a fixture
+        // that is not "a database as it was just before 0030".
+        let v30 = MIGRATIONS
+            .iter()
+            .position(|s| s.contains("ADD COLUMN from_seq"))
+            .expect("0030's script must be embedded in MIGRATIONS");
+        assert_eq!(
+            v30 + 1,
+            30,
+            "0030 must be MIGRATIONS[29]: the ALTER-only coverage migration"
+        );
+        assert_eq!(
+            v30 + 1,
+            MIGRATIONS.len(),
+            "0030 must be the NEWEST script; the fixture below is built from \
+             `take(v30)`, so a migration appended after it would be invisible here"
+        );
+        // Criterion 3, as a literal: the head follows the array, and the array is
+        // thirty long.
+        assert_eq!(
+            SCHEMA_VERSION,
+            MIGRATIONS.len() as i64,
+            "SCHEMA_VERSION must be MIGRATIONS.len()"
+        );
+        assert_eq!(SCHEMA_VERSION, 30, "0030 makes the head thirty");
+
+        // ---- 1. a database as it was BEFORE 0030 ----------------------------
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_ledger(&conn).unwrap();
+        for (i, script) in MIGRATIONS.iter().take(v30).enumerate() {
+            apply_one(&mut conn, (i + 1) as i64, script).unwrap();
+        }
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            29,
+            "the fixture must NOT have seen 0030"
+        );
+        for column in NEW_COVERAGE_COLUMNS {
+            assert!(
+                !columns(&conn, "distill_log").iter().any(|c| c == column),
+                "the fixture is wrong: distill_log.{column} already exists before 0030"
+            );
+        }
+        // A pre-0030 daemon's write, spelled with exactly the columns that existed
+        // then -- so the fixture row cannot accidentally carry a new reading.
+        conn.execute(
+            "INSERT INTO distill_log
+             (session_key, distilled_at, memories_written, entities_written, relations_written,
+              agent, status, failure_reason, prompt_hash, retries, windows, truncated)
+             VALUES ('s-pre', '2026-01-01T00:00:00Z', 7, 2, 3, 'agent', 'ok', NULL, 'ph', 0, 3, 0)",
+            [],
+        )
+        .unwrap();
+        let pre_upgrade_rows = count_where(&conn, "SELECT COUNT(*) FROM distill_log");
+        assert_eq!(pre_upgrade_rows, 1, "the fixture needs a historical row");
+
+        // ---- 2. upgrade through the runner's own path -----------------------
+        apply(&mut conn).unwrap();
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION must follow MIGRATIONS.len() onto the new head"
+        );
+        for column in NEW_COVERAGE_COLUMNS {
+            assert!(
+                columns(&conn, "distill_log").iter().any(|c| c == column),
+                "0030 must have added distill_log.{column}"
+            );
+        }
+        // The three are NULLABLE with NO DEFAULT. Asserted here as well as in the
+        // shared census, because THIS is the migration they belong to.
+        for column in NEW_COVERAGE_COLUMNS {
+            let (notnull, dflt) = conn
+                .prepare(
+                    "SELECT name, \"notnull\", dflt_value FROM pragma_table_info('distill_log')",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .find(|(name, _, _)| name == column)
+                .map(|(_, notnull, dflt)| (notnull, dflt))
+                .unwrap_or_else(|| panic!("distill_log.{column} missing"));
+            assert_eq!(
+                notnull, 0,
+                "distill_log.{column} must be NULLABLE: NULL is how a pre-0030 row says \
+                 'nobody recorded a range', and NOT NULL would have backfilled it"
+            );
+            assert!(
+                dflt.is_none(),
+                "distill_log.{column} must have NO default, got {dflt:?}"
+            );
+        }
+
+        // Row count unchanged, the historical row's OWN values untouched, and all
+        // three new columns still saying "not recorded".
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM distill_log"),
+            pre_upgrade_rows,
+            "an ALTER-only migration must neither drop nor duplicate a row"
+        );
+        let (memories, status, unknown): (i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT memories_written, status,
+                        (from_seq IS NULL) + (to_seq IS NULL) + (total_messages IS NULL)
+                 FROM distill_log WHERE session_key = 's-pre'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(memories, 7, "the upgrade must not touch what the row said");
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(
+            unknown,
+            NEW_COVERAGE_COLUMNS.len() as i64,
+            "a pre-0030 row must read 'no range measured' in all three columns; a \
+             DEFAULT would have backfilled a range nobody observed"
+        );
+        // ... and the same statement over the WHOLE table, not just the row read
+        // above: "every historical row" is what the contract says, and a single
+        // row deliberately examined cannot show that.
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM distill_log
+                  WHERE from_seq IS NOT NULL OR to_seq IS NOT NULL
+                     OR total_messages IS NOT NULL"
+            ),
+            0,
+            "no pre-0030 row may carry a range in any of the three columns"
+        );
+
+        // A row written AFTER the migration can STATE the range -- including a
+        // measured `0`, which is how the new columns stay distinguishable from
+        // NULL. The `0` here is a real reading: the pass read ALL of a 120-message
+        // list, windowed, and lost nothing.
+        conn.execute(
+            "INSERT INTO distill_log
+             (session_key, distilled_at, memories_written, entities_written, relations_written,
+              windows, truncated, from_seq, to_seq, total_messages)
+             VALUES ('s-post', '2026-01-02T00:00:00Z', 0, 0, 0, 3, 0, 0, 120, 120)",
+            [],
+        )
+        .unwrap();
+        let stated: (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT from_seq, to_seq, total_messages FROM distill_log \
+                 WHERE session_key = 's-post'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stated,
+            (Some(0), Some(120), Some(120)),
+            "a post-0030 row must be able to STATE a range; a measured 0 is a reading, \
+             NULL is the absence of one, and they must not compare equal"
+        );
+
+        // ---- 3. the SAME script, re-applied ---------------------------------
+        // The lost-ledger-row case, and the one the `pragma_table_info` guard
+        // exists for: the version row is gone while the columns remain.
+        let before = schema_snapshot(&conn);
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version >= ?1",
+            rusqlite::params![(v30 + 1) as i64],
+        )
+        .unwrap();
+        apply(&mut conn).unwrap_or_else(|e| {
+            panic!("re-applying 0030 must be a no-op, not `duplicate column name`: {e}")
+        });
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "the re-applied version row must be recorded again"
+        );
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "a re-applied ADDITIVE migration must leave the schema IDENTICAL; a changed \
+             object here means the guard re-ran an ALTER instead of skipping it"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM distill_log"),
+            2,
+            "the re-apply must not duplicate rows"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM distill_log WHERE session_key = 's-post'
+                   AND from_seq = 0 AND to_seq = 120 AND total_messages = 120"
+            ),
+            1,
+            "the re-apply must not backfill or rewrite the range it already recorded"
+        );
+
+        // NEGATIVE CONTROL for that reading, in-process and without touching any
+        // shared source: the SAME statement, run unguarded, IS an error -- so the
+        // clean re-apply above is the runner's probe doing its job, not SQLite
+        // tolerating a duplicate ADD COLUMN and not a test that skipped the second
+        // application altogether.
+        let unguarded = conn.execute_batch("ALTER TABLE distill_log ADD COLUMN from_seq INTEGER;");
         assert!(
             unguarded.is_err(),
             "SQLite has no `ADD COLUMN IF NOT EXISTS`: an unguarded re-ALTER must fail, \

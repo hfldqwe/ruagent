@@ -350,10 +350,17 @@ impl tower::Service<axum::http::Request<axum::body::Body>> for CacheDir {
     }
 }
 
-/// Error type that renders as (status, message).
+/// Error type that renders as (status, message) — or as (status, JSON) when the
+/// refusal carries a key a caller has to READ rather than a sentence to print
+/// (see [`ApiError::json`]).
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// Set by `json` ONLY. `None` in every other constructor, so the body of
+    /// every route that predates this field is byte-identical to what it was
+    /// (plain text — which is also what `crates/mcp`'s `refusal_message`
+    /// documents as the common case).
+    body: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -361,6 +368,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
+            body: None,
         }
     }
 
@@ -371,6 +379,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            body: None,
         }
     }
 
@@ -380,6 +389,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: msg.into(),
+            body: None,
         }
     }
 
@@ -389,6 +399,27 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: msg.into(),
+            body: None,
+        }
+    }
+
+    /// A REFUSAL WITH STRUCTURE: the same status and the same human sentence,
+    /// plus a JSON body a caller can read machine keys out of.
+    ///
+    /// WHY A SECOND SHAPE EXISTS (issue #56). The memory write route answered
+    /// `200 {"outcome":"RejectedNamespace"}` for a store×namespace pair the
+    /// governance rule forbids. "The row landed" and "nothing was written" were
+    /// therefore BOTH 200, and the only difference was a string no caller
+    /// parsed -- a probe that posted a refused pair read as an empty corpus,
+    /// which is how the silent refusal went unnoticed. The status now carries
+    /// the refusal; the `outcome` string stays in the body under the key it has
+    /// always been read from, beside the facts the sentence would otherwise only
+    /// spell in prose.
+    fn json(status: StatusCode, message: impl Into<String>, body: serde_json::Value) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            body: Some(body),
         }
     }
 
@@ -396,6 +427,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
+            body: None,
         }
     }
 }
@@ -405,6 +437,7 @@ impl From<ruagent_store::DbError> for ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("{e}"),
+            body: None,
         }
     }
 }
@@ -414,6 +447,7 @@ impl From<rusqlite::Error> for ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("{e}"),
+            body: None,
         }
     }
 }
@@ -423,13 +457,19 @@ impl From<anyhow::Error> for ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("{e:#}"),
+            body: None,
         }
     }
 }
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, self.message).into_response()
+        match self.body {
+            // JSON only where the refusal HAS structure to publish; every other
+            // route keeps the plain-text body it has always sent (see `body`).
+            Some(body) => (self.status, Json(body)).into_response(),
+            None => (self.status, self.message).into_response(),
+        }
     }
 }
 
@@ -4291,6 +4331,19 @@ async fn batch_actual(
 /// and "nobody wrote it down" the same reading — the mistake 0028's columns were
 /// added to avoid ("NULL means NOBODY RECORDED THIS, never 0").
 ///
+/// THE COVERAGE RANGE (t4 / #58) JOINED THAT RULE, not a fourth reading of it.
+/// Each row now carries `from_seq` / `to_seq` / `total_messages` -- the range of
+/// messages THIS attempt read (indices into the list the pass read, from
+/// inclusive to exclusive, with the denominator) -- and they follow exactly the
+/// discipline above: `null` for an attempt (or a pre-0030 row) that never recorded
+/// one, never 0. The read end applies no `COALESCE` and no per-column default, and
+/// the sums carry no range at all: a range is not additive, so the only number it
+/// contributes to `totals` is the COUNT of rows that did not record one
+/// (`coverage_not_recorded`). A reader judges the three AS A GROUP -- the writer
+/// feeds all three from one Option -- so "did this attempt record a range?" is
+/// one question about three keys, and the panel renders 未记录 when the group is
+/// absent rather than a 0..0 range nobody measured.
+///
 /// `by_status` counts the rows `total` counts, so its buckets always add up to
 /// `total`; `not_recorded` is a NULL status (the pre-0024 history — 33 of 33 rows
 /// on the live database), NOT a fourth outcome. `status=not_recorded` selects
@@ -4330,10 +4383,15 @@ const DISTILL_LOG_FILTER: &str =
                                        AND (?2 IS NULL OR session_key = ?2)";
 
 /// The ledger's columns, in the order `distill_entry` reads them.
+///
+/// `from_seq`/`to_seq`/`total_messages` are APPENDED (0030, t3) and are the last
+/// three a reader may find, so every pre-0030 position keeps its index: 0028's
+/// columns are read by number, and inserting the new ones anywhere but the end
+/// would silently re-label every field of every row.
 const DISTILL_LOG_COLUMNS: &str = "id, session_key, distilled_at, status, failure_reason, agent, \
      memories_written, entities_written, relations_written, relations_duplicate, \
      relations_refused, tokens_used, context_size, cost_usd, retries, windows, truncated, \
-     prompt_hash";
+     prompt_hash, from_seq, to_seq, total_messages";
 
 /// One read of the ledger, gathered inside ONE closure so the page, the total, the
 /// distribution and the sums all describe the same rows.
@@ -4347,6 +4405,12 @@ struct DistillLedger {
     /// How many rows in the filtered set did NOT record each of them.
     tokens_not_recorded: i64,
     cost_not_recorded: i64,
+    /// How many rows in the filtered set did NOT record a COVERAGE RANGE (t4 /
+    /// #58) -- the attempts that cannot answer "which messages did you read?".
+    /// There is no SUM beside it because a range is not additive, and it is counted
+    /// over the SAME filter as every other number here. A 0 here is a MEASURED
+    /// zero (every row recorded a range), never a fabricated range.
+    coverage_not_recorded: i64,
 }
 
 fn read_distill_ledger(
@@ -4399,21 +4463,31 @@ fn read_distill_ledger(
         }
     }
 
-    let (tokens_used, tokens_recorded, cost_usd, cost_recorded) = conn.query_row(
-        &format!(
-            "SELECT SUM(tokens_used), COUNT(tokens_used), SUM(cost_usd), COUNT(cost_usd) \
+    // The fifth reading is the COVERAGE half (t4 / #58): how many rows carry a
+    // WHOLE range. "Carry all three" is the WRITER's rule (one
+    // `Option<TranscriptCoverage>` feeds all three columns), so the GROUP is
+    // what is counted here -- one column non-null and two null would be a
+    // half-measurement, not a range. COUNT(expr) and never SUM(...): over an empty
+    // filtered set SUM is NULL and this read would fail, while COUNT is 0.
+    let (tokens_used, tokens_recorded, cost_usd, cost_recorded, coverage_recorded) = conn
+        .query_row(
+            &format!(
+                "SELECT SUM(tokens_used), COUNT(tokens_used), SUM(cost_usd), COUNT(cost_usd), \
+                    COUNT(CASE WHEN from_seq IS NOT NULL AND to_seq IS NOT NULL \
+                               AND total_messages IS NOT NULL THEN 1 END) \
                FROM distill_log{DISTILL_LOG_FILTER}"
-        ),
-        rusqlite::params![status, session],
-        |r| {
-            Ok((
-                r.get::<_, Option<i64>>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<f64>>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        },
-    )?;
+            ),
+            rusqlite::params![status, session],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
 
     Ok(DistillLedger {
         entries,
@@ -4423,6 +4497,7 @@ fn read_distill_ledger(
         cost_usd,
         tokens_not_recorded: total - tokens_recorded,
         cost_not_recorded: total - cost_recorded,
+        coverage_not_recorded: total - coverage_recorded,
     })
 }
 
@@ -4452,6 +4527,22 @@ fn distill_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value>
         "windows": row.get::<_, Option<i64>>(15)?,
         "truncated": row.get::<_, Option<i64>>(16)?.map(|measured| measured != 0),
         "prompt_hash": row.get::<_, Option<String>>(17)?,
+        // t4 / issue #58 -- THE RANGE THIS ATTEMPT READ, published exactly as the
+        // writer stored it. THREE separate nullables, and NOT ONE of them is a
+        // `COALESCE(..., 0)`: `null` means NOBODY RECORDED THIS while `0` means "the
+        // range began at the first message", and turning the first into the second
+        // is the mistake 0020/0024/0028/0030 each refused to make.
+        //
+        // A READER JUDGES THE THREE AS ONE MEASUREMENT (t3): the writer takes all
+        // three from a single `Option<TranscriptCoverage>`, so a row either carries a
+        // whole range or none. This end does not enforce that by MASKING -- a
+        // half-measured row (reachable only by hand) is published as it is rather
+        // than silently re-read as "not recorded" -- and `totals.coverage_not_recorded`
+        // is where the count of rows that cannot answer "which messages did you
+        // read?" is stated.
+        "from_seq": row.get::<_, Option<i64>>(18)?,
+        "to_seq": row.get::<_, Option<i64>>(19)?,
+        "total_messages": row.get::<_, Option<i64>>(20)?,
     }))
 }
 
@@ -4496,6 +4587,11 @@ async fn distill_log(
                 // COUNT of rows that did not record one is what makes it usable.
                 "tokens_used_not_recorded": ledger.tokens_not_recorded,
                 "cost_usd_not_recorded": ledger.cost_not_recorded,
+                // t4 / #58: a range is NOT additive, so there is no sum here and
+                // nothing is COALESCEd into a 0-length range -- only the count of
+                // attempts whose three coverage columns are not all recorded, over
+                // the same filter as every other number in this object.
+                "coverage_not_recorded": ledger.coverage_not_recorded,
             }),
         );
     }
@@ -6320,6 +6416,70 @@ struct MemoryWriteRequest {
     supersedes: Option<i64>,
 }
 
+/// The refused-pair answer, in ONE place so the status, the sentence and the
+/// machine keys cannot drift apart (issue #56).
+///
+/// 409 CONFLICT is the status this daemon already uses for "understood,
+/// well-formed, and refused by a RULE rather than by a malformed value" (the
+/// capability gate, `ApiError::conflict`). The pair is not a value error — each
+/// half is valid on its own — and it is not a format error to fix and retry. 422
+/// ("well-formed, semantically unprocessable") is the other defensible choice;
+/// in this daemon 422 currently comes only from axum's OWN `Json` extractor (a
+/// required field the body does not carry), so 409 keeps every refusal this
+/// daemon DECIDES on one status a client can branch on.
+///
+/// `outcome` repeats the EXACT string the 200 body carried (`{:?}` of the
+/// fieldless `WriteOutcome::RejectedNamespace`) — a reader that followed the old
+/// contract finds the value it used to read, now beside the reason.
+///
+/// The sentence names the store, the namespace, the vocabulary that made the
+/// pair illegal and the rule; `allowed_namespaces` publishes the same vocabulary
+/// as data so a caller can correct its request without parsing prose.
+fn refused_store_namespace(
+    store: ruagent_memory::MemoryStore,
+    namespace: &ruagent_memory::Namespace,
+) -> ApiError {
+    let allowed: Vec<&str> = store.allowed_kinds().iter().map(|k| k.as_str()).collect();
+    let reason = format!(
+        "namespace governance (design §6.2): store `{}` writes only {{{}}}, and `{namespace}` is \
+         not one of them",
+        store.as_str(),
+        allowed.join(", ")
+    );
+    let message = format!(
+        "{reason}. NOTHING WAS WRITTEN — the refusal is recorded in the write audit as \
+         op='reject'"
+    );
+    ApiError::json(
+        StatusCode::CONFLICT,
+        message.clone(),
+        serde_json::json!({
+            "error": message,
+            "outcome": format!("{:?}", ruagent_memory::write::WriteOutcome::RejectedNamespace),
+            "store": store.as_str(),
+            "namespace": namespace.to_string(),
+            "reason": reason,
+            "allowed_namespaces": allowed,
+        }),
+    )
+}
+
+/// The route's status contract, branch by branch (issue #56: the refusal used to
+/// be a 200, so a caller could not tell a write from a non-write by status).
+///
+/// | request | status | body |
+/// | --- | --- | --- |
+/// | `store` is not one of the four | 400 | sentence naming the value and the valid set |
+/// | `namespace` is not `user`/`global`/`project:<x>`/`agent:<x>` (or the parameter is empty) | 400 | same |
+/// | the store×namespace pair is not in the store's write vocabulary | **409** | `refused_store_namespace` above: the sentence names BOTH values, the store's vocabulary and the rule, and the JSON body carries `outcome` (the same string the old 200 carried), `store`, `namespace`, `reason`, `allowed_namespaces` |
+/// | pair allowed, content new | 200 | `{"outcome":"Inserted(<id>)"}` |
+/// | pair allowed, identical current content | 200 | `{"outcome":"SkippedDuplicate(<id>)"}` — nothing inserted, and the state is the one the caller asked for; the body names which row it already is |
+/// | pair allowed, `supersedes` names a row that is not a CURRENT row of that store+namespace | 500 | the pipeline's refusal travels as `DbError` (`crates/memory/src/write.rs`), so it arrives as an internal error. A KNOWN GAP, and NOT the class #56 is about: the caller still cannot read it as a write, but the fault is the CALLER's where a 5xx says the daemon broke. Recorded here rather than fixed here: the classification belongs to `ruagent-memory`, and deciding it in this file would mean matching that crate's message text |
+/// | pair allowed, `supersedes` names an id that does not exist | 500 | same shape (the FK violation on `memories.supersedes`) |
+/// | pair allowed, `content` empty | 200 | `{"outcome":"Inserted(<id>)"}`, an empty body row. A data-quality gap, deliberately UNCHANGED: an empty string is not the daemon refusing, and the pair IS allowed — answering 4xx would change what an allowed combination returns |
+/// | `store`/`namespace`/`content` missing, `null` or the wrong type | 422 | axum's `Json` rejection, before this handler runs |
+/// | body is not JSON at all | 400 | axum's `Json` rejection |
+/// | missing/wrong `Content-Type` | 415 | axum's `Json` rejection |
 async fn memory_write(
     State(state): State<AppState>,
     Json(req): Json<MemoryWriteRequest>,
@@ -6357,7 +6517,8 @@ async fn memory_write(
         state.mgr.db(),
         &ruagent_memory::MemoryWrite {
             store,
-            namespace,
+            // Cloned only so the refusal below can still name this namespace.
+            namespace: namespace.clone(),
             content: req.content.clone(),
             confidence: 0.9,
             source_episode: Some(episode),
@@ -6365,8 +6526,16 @@ async fn memory_write(
         },
     )
     .await?;
-    // Semantic leg: embed the row with the shared embedder.
     use ruagent_memory::write::WriteOutcome as W;
+    // A REFUSED PAIR IS NOT A 200 (issue #56). The pipeline returns
+    // `RejectedNamespace` as an `Ok` variant meaning "nothing was written", so the
+    // route used to answer 200 and the caller had to parse the body — or read the
+    // write audit — to find out. The status now says it; `outcome` stays in the
+    // body, unchanged, for the readers that followed the old contract.
+    if matches!(outcome, W::RejectedNamespace) {
+        return Err(refused_store_namespace(store, &namespace));
+    }
+    // Semantic leg: embed the row with the shared embedder.
     let row_id = match &outcome {
         W::Inserted(id) => Some(*id),
         W::Superseded { new, .. } => Some(*new),
@@ -7600,6 +7769,33 @@ mod tests {
         (status, json, text)
     }
 
+    /// POST a RAW body with an optional `Content-Type`, for the branches of a
+    /// route that answer BEFORE its handler body runs: `send_json` can only send
+    /// a value serde already accepts, so it cannot reach axum's own `Json`
+    /// rejections (a non-JSON body, a non-JSON `Content-Type`, a field the shape
+    /// requires and the body does not have).
+    async fn send_raw(
+        app: &Router,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut b = Request::builder().method("POST").uri(uri);
+        if let Some(ct) = content_type {
+            b = b.header("content-type", ct);
+        }
+        let resp = app
+            .clone()
+            .oneshot(b.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// t290: knowledge/search must carry the SAME per-leg evidence as recall's
     /// knowledge hits, hit for hit; and a leg that missed must be `null`, not 0.
     #[tokio::test]
@@ -8302,6 +8498,356 @@ mod tests {
         assert_eq!(st4, StatusCode::NOT_FOUND, "{raw4}");
     }
 
+    /// ISSUE #56 — THE WRITE ROUTE'S STATUS IS THE CONTRACT.
+    ///
+    /// `POST /api/v1/memory/write` used to answer `200
+    /// {"outcome":"RejectedNamespace"}` for a store×namespace pair the governance
+    /// matrix forbids: "the row landed" and "nothing was written" were both 200,
+    /// and the only difference was a string. A probe that posted a refused pair
+    /// therefore read as an EMPTY corpus with no error to notice (that is the
+    /// finding this task closes). The refusal is now 409, whose body still carries
+    /// the `outcome` string the 200 carried — the old readers keep reading, the new
+    /// ones can branch on the status.
+    ///
+    /// Standing of this test against the PRE-CHANGE code, stated plainly: the first
+    /// assertion (`StatusCode::CONFLICT`) fails there. That reading is a CODE
+    /// reading, not a re-measurement — said out loud because the two are easy to
+    /// confuse. The pre-change handler is the current one minus the `matches!`
+    /// branch, and its tail formats the SAME outcome variant into the body, so a
+    /// refused pair answered `200 {"outcome":"RejectedNamespace (…)"}`
+    /// (`git show HEAD:crates/daemon/src/api.rs`, HEAD 6379-6381: the
+    /// `Ok(Json(json!({ "outcome": format!("{outcome:?}") })))` tail of
+    /// `memory_write`, reached by every outcome because no branch looked at one).
+    /// Everything else in this test is the no-harm half: the allowed pairs must
+    /// answer exactly as they answered before.
+    #[tokio::test]
+    async fn a_refused_store_namespace_pair_is_a_409_that_still_names_the_outcome() {
+        let (app, db, _root) = harness().await;
+
+        // (1) THE REFUSAL: `profile` writes only `user`, so `profile` × `global` is
+        // outside its vocabulary and nothing may be written.
+        let (st, body, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/write",
+            Some(serde_json::json!({
+                "store": "profile",
+                "namespace": "global",
+                "content": "the owner prefers tea to coffee",
+            })),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::CONFLICT,
+            "a refused pair must not be a 2xx: {raw}"
+        );
+        // The body names BOTH values and the reason (acceptance: "报文点名 store、
+        // namespace 与原因"), in the JSON keys and in the human sentence alike.
+        assert_eq!(body["store"], "profile", "{raw}");
+        assert_eq!(body["namespace"], "global", "{raw}");
+        assert_eq!(
+            body["allowed_namespaces"],
+            serde_json::json!(["user"]),
+            "the store's own vocabulary, as data: {raw}"
+        );
+        let reason = body["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("`profile`") && reason.contains("`global`") && reason.contains("user"),
+            "the reason names the store, the namespace and what it may write: {raw}"
+        );
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("`profile`")
+                && error.contains("`global`")
+                && error.contains("NOTHING WAS WRITTEN"),
+            "the sentence a human (or MCP's plain-text fallback) reads says nothing was written: \
+             {raw}"
+        );
+        // `outcome` is BYTE-FOR-BYTE the string the 200 body used to carry.
+        let expected_outcome = format!(
+            "{:?}",
+            ruagent_memory::write::WriteOutcome::RejectedNamespace
+        );
+        assert_eq!(
+            body["outcome"],
+            serde_json::json!(expected_outcome),
+            "{raw}"
+        );
+        assert!(
+            expected_outcome.contains("write vocabulary = "),
+            "the wire string still publishes the whole matrix: {expected_outcome}"
+        );
+        // NOTHING was written, and the refusal is still AUDITED (the pipeline's
+        // decision is recorded even though the answer is now a refusal).
+        assert_eq!(memories_written_count(&db).await, 0);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memory_diffs WHERE op = 'reject' \
+                 AND mem_store = 'profile' AND namespace = 'global'"
+            )
+            .await,
+            1
+        );
+
+        // (2) NO HARM: the allowed pairs answer exactly what they answered before —
+        // ONE key (`outcome`), the same variants, the same status.
+        let allowed = serde_json::json!({
+            "store": "observation", "namespace": "agent:t56", "content": "t56 allowed pair",
+        });
+        let (st2, body2, raw2) =
+            send_json(&app, "POST", "/api/v1/memory/write", Some(allowed.clone())).await;
+        assert_eq!(st2, StatusCode::OK, "{raw2}");
+        let keys: Vec<String> = body2
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["outcome".to_string()],
+            "an allowed write's body is still exactly {{outcome}}: {raw2}"
+        );
+        let inserted = body2["outcome"].as_str().unwrap_or_default().to_string();
+        assert!(inserted.starts_with("Inserted("), "{raw2}");
+        assert_eq!(memories_written_count(&db).await, 1);
+
+        // The repeat of the SAME content is still a 200 `SkippedDuplicate`: nothing
+        // was inserted, and the state is the one the caller asked for — the body
+        // names which row it already is.
+        let (st3, body3, raw3) =
+            send_json(&app, "POST", "/api/v1/memory/write", Some(allowed)).await;
+        assert_eq!(st3, StatusCode::OK, "{raw3}");
+        assert_eq!(
+            body3["outcome"],
+            inserted.replace("Inserted(", "SkippedDuplicate("),
+            "{raw3}"
+        );
+
+        // (3) THE OTHER BRANCHES, each by status (acceptance: "其余分支逐条复核并写明
+        // 各自状态码"). The two 4xx value errors and the three extractor rejections
+        // are pinned here so the whole route's contract is one reading, not prose.
+        let (st4, _body4, raw4) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/write",
+            Some(serde_json::json!({
+                "store": "observations", "namespace": "user", "content": "x",
+            })),
+        )
+        .await;
+        assert_eq!(st4, StatusCode::BAD_REQUEST, "{raw4}");
+        assert!(
+            raw4.contains("observations"),
+            "the 400 names the value it refused: {raw4}"
+        );
+        let (st5, _, raw5) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/write",
+            Some(serde_json::json!({
+                "store": "observation", "namespace": "project:", "content": "x",
+            })),
+        )
+        .await;
+        assert_eq!(st5, StatusCode::BAD_REQUEST, "{raw5}");
+        assert!(
+            raw5.contains("project:"),
+            "the 400 names the namespace it refused: {raw5}"
+        );
+
+        // Empty content on an ALLOWED pair: 200 with an empty row. CURRENT, NOT
+        // ENDORSED — it is a data-quality gap, not a refusal (the pair is legal, and
+        // an empty string is not the daemon saying no), so it is deliberately
+        // unchanged by #56 and pinned here only so it cannot move silently. A future
+        // task that refuses empty content must change THIS assertion on purpose.
+        let (st6, body6, raw6) = send_json(
+            &app,
+            "POST",
+            "/api/v1/memory/write",
+            Some(serde_json::json!({
+                "store": "observation", "namespace": "user", "content": "",
+            })),
+        )
+        .await;
+        assert_eq!(st6, StatusCode::OK, "{raw6}");
+        assert!(
+            body6["outcome"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Inserted("),
+            "{raw6}"
+        );
+
+        // The extractor's own rejections, which happen before the handler runs:
+        // a required field the body does not carry, a body that is not JSON, and a
+        // body with no `Content-Type: application/json`.
+        let uri = "/api/v1/memory/write";
+        let (st7, raw7) = send_raw(
+            &app,
+            uri,
+            Some("application/json"),
+            r#"{"store":"observation","namespace":"user"}"#,
+        )
+        .await;
+        assert_eq!(st7, StatusCode::UNPROCESSABLE_ENTITY, "{raw7}");
+        let (st8, raw8) = send_raw(&app, uri, Some("application/json"), "{not json").await;
+        assert_eq!(st8, StatusCode::BAD_REQUEST, "{raw8}");
+        let (st9, raw9) = send_raw(&app, uri, None, r#"{"store":"observation"}"#).await;
+        assert_eq!(st9, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{raw9}");
+
+        println!(
+            "READING #56 memory/write statuses | refused pair(profile×global) -> {} {} | allowed \
+             pair -> {} {} | duplicate -> {} {} | empty content + allowed pair -> {} {} | \
+             unknown store -> {} | empty project: -> {} | missing field -> {} | non-JSON body -> \
+             {} | no content-type -> {} | memories rows at the end = {}",
+            st.as_u16(),
+            raw.trim(),
+            st2.as_u16(),
+            raw2.trim(),
+            st3.as_u16(),
+            raw3.trim(),
+            st6.as_u16(),
+            raw6.trim(),
+            st4.as_u16(),
+            st5.as_u16(),
+            st7.as_u16(),
+            st8.as_u16(),
+            st9.as_u16(),
+            memories_written_count(&db).await
+        );
+    }
+
+    /// THE KNOWN GAP, PINNED AS A READING AND NOT AS A BLESSING (see the route's
+    /// status table in `memory_write`): a `supersedes` id that is not a CURRENT row
+    /// of the caller's own store+namespace is the CALLER's mistake, and the pipeline
+    /// reports it as a `DbError` (crates/memory/src/write.rs: `supersede_refused` for
+    /// a row that exists but is no longer current, the FK violation on
+    /// `memories.supersedes` for an id that never existed). Both render as 500 through
+    /// `From<DbError> for ApiError` — "the daemon broke" for something the caller can
+    /// fix. It is NOT the #56 class (a caller cannot read either as a write), and it is
+    /// deliberately NOT fixed in this file: choosing 4xx there means deciding on
+    /// `ruagent-memory`'s message TEXT from the route, which would make one crate's
+    /// prose a contract in another. Measured, pinned, reported.
+    #[tokio::test]
+    async fn a_supersede_of_a_row_that_is_not_current_still_answers_500() {
+        let (app, db, _root) = harness().await;
+        let uri = "/api/v1/memory/write";
+
+        // (a) an id that never existed: the FK on `memories.supersedes` refuses it.
+        let (st_a, _, raw_a) = send_json(
+            &app,
+            "POST",
+            uri,
+            Some(serde_json::json!({
+                "store": "observation",
+                "namespace": "user",
+                "content": "t56 supersede probe",
+                "supersedes": 999_999,
+            })),
+        )
+        .await;
+        assert_eq!(
+            st_a,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CURRENT reading (not endorsed): the FK violation arrives as a DbError: {raw_a}"
+        );
+
+        // (b) an id that EXISTS but is not a current row of this pair any more: the
+        // pipeline's own `supersede_refused`, which also lands as a 500.
+        let (st_b, body_b, raw_b) = send_json(
+            &app,
+            "POST",
+            uri,
+            Some(serde_json::json!({
+                "store": "observation", "namespace": "user", "content": "t56 probe one",
+            })),
+        )
+        .await;
+        assert_eq!(st_b, StatusCode::OK, "{raw_b}");
+        let first: i64 = body_b["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("Inserted(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap_or_else(|e| panic!("no id in {raw_b}: {e}"));
+        let (st_c, _, raw_c) = send_json(
+            &app,
+            "POST",
+            uri,
+            Some(serde_json::json!({
+                "store": "observation",
+                "namespace": "user",
+                "content": "t56 probe two",
+                "supersedes": first,
+            })),
+        )
+        .await;
+        assert_eq!(st_c, StatusCode::OK, "{raw_c}");
+        assert!(
+            raw_c.contains("Superseded"),
+            "the replacement itself is a normal 200: {raw_c}"
+        );
+        // `first` is superseded now, so naming it again is refused.
+        let (st_d, _, raw_d) = send_json(
+            &app,
+            "POST",
+            uri,
+            Some(serde_json::json!({
+                "store": "observation",
+                "namespace": "user",
+                "content": "t56 probe three",
+                "supersedes": first,
+            })),
+        )
+        .await;
+
+        println!(
+            "READING #56 supersede | nonexistent id -> HTTP {} {} | row where the write landed -> \
+             HTTP {} {} | supersede of a row that is no longer current -> HTTP {} {} | \
+             supersede_refused audit rows = {} | memories rows = {}",
+            st_a.as_u16(),
+            raw_a.trim(),
+            st_c.as_u16(),
+            raw_c.trim(),
+            st_d.as_u16(),
+            raw_d.trim(),
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memory_diffs WHERE op = 'supersede_refused'"
+            )
+            .await,
+            memories_written_count(&db).await
+        );
+        assert_eq!(
+            st_d,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CURRENT reading (not endorsed): the pipeline's supersede_refused arrives as a \
+             DbError: {raw_d}"
+        );
+        assert!(
+            raw_d.contains("supersede refused"),
+            "and the sentence still says what was refused: {raw_d}"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM memory_diffs WHERE op = 'supersede_refused'"
+            )
+            .await,
+            1,
+            "the refusal is audited under its own op, not a supersede that did not happen"
+        );
+        assert_eq!(
+            memories_written_count(&db).await,
+            2,
+            "whatever the status, the refused row must NOT land: {raw_d}"
+        );
+    }
+
     /// t26 / #54: both search routes honour a caller's limit and STATE what their page
     /// left out -- the three boundaries t22/t25 fixed for every other list: REACHED
     /// (a cut, with the real remainder), EXACTLY EQUAL (not a cut), UNTOUCHED (not a
@@ -8333,8 +8879,10 @@ mod tests {
                 Some(serde_json::json!({
                     // The write vocabulary: observation allows user | project:<x> |
                     // agent:<x>; the namespace "global" is NOT one of them, and the
-                    // daemon refuses the pair with 200 + outcome=RejectedNamespace (not
-                    // a 4xx), which would leave this fixture silently empty.
+                    // daemon refuses the pair with 409 + outcome=RejectedNamespace.
+                    // (It used to be a 200, which is what left this fixture silently
+                    // empty — issue #56; the status was the only thing wrong, so the
+                    // values below are unchanged.)
                     "store": "observation",
                     "namespace": "user",
                     "content": format!("t26 probe memory {i}"),
@@ -9242,6 +9790,232 @@ mod tests {
         let (st, _v, raw) = hit(&app, "GET", "/api/v1/distill/log?status=bogus").await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
         assert!(raw.contains("not_recorded"), "{raw}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t4 / #58: THE RANGE AN ATTEMPT READ IS READABLE FROM THE LEDGER, and an attempt
+    /// that never recorded one says `null` -- not 0.
+    ///
+    /// The three columns are 0030's, and the writer fills all three from ONE
+    /// `Option<TranscriptCoverage>` (t3), so a row either carries a whole range or
+    /// none of it. What THIS route owns is the read, and the two ways to get it wrong
+    /// are both attacked here: `COALESCE(from_seq, 0)`, which would report a pre-0030
+    /// row as "this attempt read message 0", and a per-column default, which would
+    /// publish a half-measurement as if it were a range.
+    ///
+    /// The rows are seeded the way 0024+0030 define them rather than through a pass,
+    /// because it is the READ end under test here; the other half of the same link is
+    /// driven through the real route right below in
+    /// `the_range_a_real_rules_pass_measured_is_readable_over_http`.
+    #[tokio::test]
+    async fn the_coverage_range_is_read_from_the_ledger_and_null_stays_null() {
+        let (app, db, root) = harness().await;
+        let seed = |conn: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            // The MEASURED row: issue #58's own question -- "it covered 1..40 of 120".
+            // BOTH ends are non-trivial (from_seq is not 0), so a reader that derives
+            // the range instead of publishing it cannot pass by accident.
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash,
+                     windows, truncated, from_seq, to_seq, total_messages)
+                 VALUES ('ruagent:t4-measured', '2026-02-01T00:00:01Z', 4, 0, 0, 'impl',
+                         'ok', '', 'hash-t4', 3, 0, 1, 40, 120)",
+                [],
+            )?;
+            // The PRE-0030 / refused shape: all three columns absent, which is what the
+            // migration leaves on the history and what a pass that read nothing records.
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash,
+                     windows, truncated)
+                 VALUES ('ruagent:t4-unrecorded', '2026-02-01T00:00:02Z', 0, 0, 0, 'impl',
+                         'failed', 'the harness refused the turn', 'hash-old', NULL, NULL)",
+                [],
+            )?;
+            Ok(())
+        };
+        db.call_flat(seed).await.unwrap();
+
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/distill/log").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t4 [distill/log coverage] {v}");
+        assert_eq!(v["total"], 2, "{v}");
+        let entries = v["entries"].as_array().expect("entries array");
+
+        let measured = entries
+            .iter()
+            .find(|e| e["session_key"] == "ruagent:t4-measured")
+            .expect("the attempt that recorded a range is in the ledger");
+        assert_eq!(measured["from_seq"], 1, "{measured}");
+        assert_eq!(measured["to_seq"], 40, "{measured}");
+        assert_eq!(measured["total_messages"], 120, "{measured}");
+        // The numeric half rides in the same row and is NOT disturbed by them.
+        assert_eq!(measured["windows"], 3, "{measured}");
+        assert_eq!(measured["truncated"], false, "{measured}");
+
+        let unrecorded = entries
+            .iter()
+            .find(|e| e["session_key"] == "ruagent:t4-unrecorded")
+            .expect("the attempt with no recorded range is in the ledger");
+        for key in ["from_seq", "to_seq", "total_messages"] {
+            assert!(
+                unrecorded[key].is_null(),
+                "an attempt that recorded no range answers null for {key}, NOT 0: {unrecorded}"
+            );
+            assert_ne!(
+                unrecorded[key],
+                serde_json::json!(0),
+                "{key} must not be folded into a measured 0: {unrecorded}"
+            );
+        }
+
+        // ADDITIVE (the acceptance's second half): both rows carry every pre-t4 key
+        // AND the three new names -- the only keys this change adds anywhere.
+        let mut expected: Vec<&str> = vec![
+            "id",
+            "session_key",
+            "distilled_at",
+            "status",
+            "failure_reason",
+            "agent",
+            "memories_written",
+            "entities_written",
+            "relations_written",
+            "relations_duplicate",
+            "relations_refused",
+            "tokens_used",
+            "context_size",
+            "cost_usd",
+            "retries",
+            "windows",
+            "truncated",
+            "prompt_hash",
+            "from_seq",
+            "to_seq",
+            "total_messages",
+        ];
+        expected.sort();
+        for row in [measured, unrecorded] {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("a row object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort();
+            assert_eq!(
+                keys, expected,
+                "a row is the pre-t4 key set plus the three coverage names: {row}"
+            );
+        }
+
+        // The TOTALS carry no range and no implicit sum over one: a range is not
+        // additive, so the only number it contributes is the COUNT of rows that could
+        // not answer the question -- and the sums that were already there are untouched.
+        assert_eq!(v["totals"]["coverage_not_recorded"], 1, "{v}");
+        for key in ["from_seq", "to_seq", "total_messages"] {
+            assert!(
+                v["totals"].get(key).is_none(),
+                "totals must not hold a {key}: a range has no sum: {v}"
+            );
+        }
+        assert!(
+            v["totals"]["tokens_used"].is_null(),
+            "no row in this set recorded tokens, so that sum is still null: {v}"
+        );
+        assert_eq!(v["totals"]["tokens_used_not_recorded"], 2, "{v}");
+
+        // The GROUP is counted over the SAME filter as every other number in the
+        // response: a set whose only row recorded a range counts 0 -- a MEASURED zero,
+        // unlike the null in a row that recorded nothing.
+        let (st, one, raw) = hit(
+            &app,
+            "GET",
+            "/api/v1/distill/log?session=ruagent:t4-measured",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(one["total"], 1, "{one}");
+        assert_eq!(one["entries"][0]["from_seq"], 1, "{one}");
+        assert_eq!(one["entries"][0]["total_messages"], 120, "{one}");
+        assert_eq!(one["totals"]["coverage_not_recorded"], 0, "{one}");
+        let (st, none, raw) = hit(
+            &app,
+            "GET",
+            "/api/v1/distill/log?session=ruagent:t4-unrecorded",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(none["totals"]["coverage_not_recorded"], 1, "{none}");
+        assert!(none["entries"][0]["from_seq"].is_null(), "{none}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// t4 / #58, END TO END: the range a REAL pass measured is the range this route
+    /// hands back. This is the only reading here that crosses writer -> SQLite -> HTTP
+    /// instead of seeding the ledger by hand, so it is also the check that the columns
+    /// this route lists by NAME are the columns `distill.rs` writes.
+    ///
+    /// The pass is the FREE tier (`extractor: "rules"`: zero model tokens, no agent
+    /// card needed), so this test spends nothing and calls no model.
+    #[tokio::test]
+    async fn the_range_a_real_rules_pass_measured_is_readable_over_http() {
+        let (app, db, root) = harness().await;
+        let key = "ruagent:t4-coverage";
+        let file = root
+            .join("data")
+            .join("transcripts")
+            .join("run-t4-coverage.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // THREE transcript lines: two user turns -- each with a PREF marker, so the
+        // deterministic tier extracts something -- and one agent chunk between them.
+        // The list the pass reads is built from the USER turns, so 2 is the denominator
+        // this test then requires the ledger to answer with.
+        //
+        // Raw lines joined by a newline: the JSON is full of quotes, and a reader of
+        // this test should not have to un-escape them to see which turn is which.
+        let lines = [
+            r#"{"ts":"2026-02-01T09:00:01Z","seq":1,"event":{"type":"user_message","text":"记住：以后回答都要简洁。"}}"#,
+            r#"{"ts":"2026-02-01T09:00:02Z","seq":2,"event":{"type":"agent_message_chunk","text":"understood"}}"#,
+            r#"{"ts":"2026-02-01T09:00:03Z","seq":3,"event":{"type":"user_message","text":"记住：部署只在周二进行。"}}"#,
+        ];
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        seed_transcript(&db, key, &file).await;
+
+        let (st, _, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/sessions/{key}/distill"),
+            Some(serde_json::json!({ "extractor": "rules" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+
+        let (st, v, raw) = hit(&app, "GET", &format!("/api/v1/distill/log?session={key}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING t4 [distill/log after a real rules pass] {v}");
+        assert_eq!(v["total"], 1, "one attempt, one row: {v}");
+        let row = &v["entries"][0];
+        assert_eq!(
+            row["total_messages"], 2,
+            "the pass read a two-message list, and the denominator says so: {v}"
+        );
+        assert_eq!(
+            row["from_seq"], 0,
+            "the range starts at the first message: {v}"
+        );
+        assert_eq!(
+            row["to_seq"], 2,
+            "the end is EXCLUSIVE, and the pass read the whole list: {v}"
+        );
+        assert_eq!(
+            v["totals"]["coverage_not_recorded"], 0,
+            "this row recorded a range, so the count of attempts that could not is 0: {v}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

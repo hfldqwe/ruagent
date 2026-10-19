@@ -22,6 +22,12 @@ Answer-quality signals — judge BEFORE extracting an agent statement as memory:
 - If the agent hedged ("可能", "I think", "not sure"), lower confidence to 0.5 or skip entirely.
 - An answer the user silently accepted (moved on to a new topic) is normal confidence (0.8).
 
+Attribution rule — every transcript line is labelled with its role (`User:` / `Agent:`):
+- An `Agent:` line is the AGENT's own words. It is NOT evidence of what the user said, asked for, preferred or confirmed. Never turn an `Agent:` line into a `profile`/`user` memory ("durable facts about the user"), and never write a memory whose content asserts a user preference, instruction or confirmation that only an `Agent:` line states — even when the agent phrased it as a promise or a standing instruction ("from now on …", "以后都…").
+- An `Agent:`-only statement may be extracted as a user fact ONLY when a `User:` line in the SAME transcript states that fact; then the memory comes from the `User:` line, and the agent's wording is context at most.
+- Without such a `User:` line, a durable agent-only statement may be recorded as `observation` (never `profile`/`user`), and an agent's own suggestion, plan or offer must be skipped entirely.
+- A transcript with no `User:` line at all can therefore never yield a `profile`/`user` memory.
+
 Extract:
 1. memories: durable facts about the user (profile), observations, procedures (how-to knowledge), and lessons learned. Only things that generalize beyond this single session. Each memory carries a confidence (0.5–1.0) from the signals above.
 2. entities: real-world objects mentioned (people, projects, tools, organizations, products). Entity identity = the real-world object, NOT its category. Merge only explicit aliases of the same object. Also list every OTHER spelling you saw for that same object in `aliases` (an abbreviation, its expansion, a Chinese/English variant) — that list is what lets two mentions of one object resolve to one node later.
@@ -156,10 +162,15 @@ pub struct DistillOutcome {
     /// a session that was WINDOWED is still read end to end, while a message too
     /// large for one window is CUT, and then `truncated` says text was dropped.
     ///
-    /// WHY THE RANGE IS NOT A `distill_log` COLUMN: 0028's column set was fixed by
-    /// the schema task and `crates/store/` is outside this task's scope; the two
-    /// columns that DO exist there (`windows`, `truncated`) are this measurement's
-    /// numeric half, and the range rides the outcome the route returns.
+    /// WHY THE RANGE IS NOW IN `distill_log` (0030; t3 / issue #58): this field
+    /// used to be the ONLY place the range existed, on the grounds that 0028's
+    /// column set was fixed by the schema task and the range could ride the
+    /// response. That left it unreadable the moment the response was gone --
+    /// `windows = 3, truncated = 0` in the ledger cannot be checked against a
+    /// session, and "which part of this session did that attempt read?" had no
+    /// answer anywhere. 0030 adds `from_seq`/`to_seq`/`total_messages` for exactly
+    /// this measurement: the three are written TOGETHER, under this one `Option`,
+    /// when a pass measured a range -- and stay NULL when it did not.
     pub coverage: Option<TranscriptCoverage>,
     /// Tokens the agent reported in context, and the window it reported them
     /// against (`ContextUsage.used`/`.size`). `None` = no agent reported any
@@ -730,16 +741,28 @@ impl Distiller {
         // (`entry_tests::an_assistant_only_session_is_distilled_and_answers_empty` pins
         // exactly that, so the behaviour is deliberate rather than accidental).
         //
-        // The question the code does not answer: SHOULD such a session be refused?
-        // Both sides are real, which is why it is a product decision rather than a
-        // bug fix. For refusing: the t21 concern -- memories attributed to a session
-        // the user never spoke in -- is not closed for the ACP tier, whose prompt
-        // hands the agent's own words to a model that may well return them as a
-        // "memory" (NOT measured here: the test named above uses the rules tier,
-        // which emits nothing for these turns). Against refusing: the pass is cheap and honest
-        // (the ledger's `empty` status already says nothing worth keeping was found),
-        // and a 4xx for a session the user can see and explicitly asked to distil is
-        // a different surprise. Until that is decided, this note describes the code.
+        // THE QUESTION IS ANSWERED, AND THE ANSWER CHANGED THE PROMPT (#59 / t11).
+        // It used to read: "should such a session be refused?" -- and the ACP half
+        // was NOT measured here, so the t21 concern stayed open. MEASURED since
+        // (t8, 2026-10-16, one real ACP distillation of a session holding two
+        // `Agent:` lines and no `User:` line): the concern was REAL and it was an
+        // ATTRIBUTION defect, not an empty pass. The pass wrote
+        // `profile/user 「用户偏好：所有回答使用简体中文，并且先给出结论、再补充细节。」`
+        // at confidence 0.9 out of the agent's own words, and the model's own
+        // reasoning said "this is a user instruction recorded by agent" -- the
+        // prompt asked for "durable facts about the user" and never said which
+        // lines are whose.
+        //
+        // THE RULING (captain, this increment): such a session is NOT refused.
+        // Refusing would add a failure surface for a case that already accounts for
+        // itself honestly (`empty` with zero counts), and what is wrong is the
+        // attribution, not the pass. The fix is the "Attribution rule" in
+        // `EXTRACTION_PROMPT`: an `Agent:` line is not evidence of what the user
+        // said, an agent-only statement may become a user fact ONLY with a
+        // `User:` line in the same transcript stating it, and otherwise it may be
+        // an `observation` or be skipped. The rules tier is untouched by it (it
+        // runs no prompt and emits nothing for these turns), which is why the
+        // `empty` reading above is unchanged.
         let transcript = render_transcript(&messages);
         if transcript.is_empty() {
             return Err(DistillRefusal::no_content(
@@ -1050,6 +1073,22 @@ impl Distiller {
     ///   MEASURED them (`DistillOutcome::windows` is `Some` exactly when an
     ///   extraction loop ran). A refusal or a failure read nothing, so it leaves
     ///   NULL -- "we did not look" -- rather than a 1/0 it never observed.
+    /// * `from_seq`/`to_seq`/`total_messages` are the SAME RULE, one column group
+    ///   further (0030; t3 / issue #58): three readings of ONE measurement
+    ///   (`DistillOutcome::coverage`, `Some` exactly when `windows` is), so they
+    ///   are written together or not at all. A refusal or a failure has
+    ///   `coverage = None` and leaves all three NULL -- never a 0-0 range nobody
+    ///   observed, and never a `total_messages` without the range it measures.
+    ///   The unit is an index into the message list the pass READ (the user-text
+    ///   filter runs first), NOT the transcript's own `seq` field.
+    ///   ⚠ SAID PLAINLY, because "a failure read nothing" is not literally true of
+    ///   every failure: `distill_plan`'s error branch builds its row from
+    ///   `DistillOutcome::default()`, so a pass that MEASURED a range and then
+    ///   failed while WRITING it (a memory or a graph write error) records no range
+    ///   either. That is the reading `windows`/`truncated` already give on that
+    ///   row -- a failed attempt carries NO measurement, taken or not -- and it is
+    ///   deliberate: the row describes an attempt that did not complete, and a
+    ///   half-pass's range is not the range a reader would take it for.
     /// * `tokens_used`/`context_size`/`cost_usd` come from the agent's own
     ///   `UsageUpdate`s; NULL means THE PROVIDER SAID NOTHING, which is not a
     ///   measured 0 (a rules-only pass spends no tokens and reports none).
@@ -1074,8 +1113,10 @@ impl Distiller {
                          (session_key, distilled_at, memories_written, entities_written,
                           relations_written, agent, status, failure_reason, prompt_hash,
                           retries, windows, truncated, tokens_used, context_size, cost_usd,
-                          relations_duplicate, relations_refused)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                          relations_duplicate, relations_refused,
+                          from_seq, to_seq, total_messages)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+                             ?18,?19,?20)",
                     rusqlite::params![
                         log.session_key,
                         chrono::Utc::now().to_rfc3339(),
@@ -1097,6 +1138,14 @@ impl Distiller {
                         log.cost_usd,
                         log.relations_duplicate.map(|d| d as i64),
                         log.relations_refused.map(|r| r as i64),
+                        // The range (0030; t3 / issue #58): three readings of ONE
+                        // measurement, so they share one `Option` and appear
+                        // together or not at all. `Some(0)` for `from_seq` is a
+                        // measured "the range starts at the first message", which
+                        // is why the map cannot be replaced by a `unwrap_or(0)`.
+                        log.coverage.map(|c| c.from_message as i64),
+                        log.coverage.map(|c| c.to_message as i64),
+                        log.coverage.map(|c| c.total_messages as i64),
                     ],
                 )
             })
@@ -1832,6 +1881,77 @@ mod tests {
         assert!(over.starts_with("CUSTOM REGIME"));
         assert!(!over.contains("memory distillation engine"));
         assert!(over.ends_with("TRANSCRIPT:\n"));
+    }
+
+    /// #59 / t11: the ATTRIBUTION RULE is part of the built-in prompt, and this is
+    /// the pin that keeps a later rewrite from dropping it silently.
+    ///
+    /// WHY A PIN IS NEEDED AT ALL. The rule is the ONLY thing standing between an
+    /// ACP distillation of an assistant-only session and a `profile`/`user`
+    /// memory fabricated out of the agent's own words, and that failure is
+    /// measured, not hypothetical (t8): two `Agent:` lines and no `User:` line
+    /// produced `profile/user 「用户偏好：所有回答使用简体中文…」` at confidence 0.9,
+    /// and the model's own reasoning said "this is a user instruction recorded by
+    /// agent". A prompt is PROSE: prose is exactly what a rewrite drops without a
+    /// compiler or a behaviour test noticing, and no other test in this crate
+    /// asserted a single sentence of the built-in prompt's content.
+    ///
+    /// THE NEEDLES ARE WRITTEN OUT HERE INSTEAD OF SHARING A CONSTANT with the
+    /// prompt. A constant used by both sides stays green after someone rewords the
+    /// rule into something the model reads differently -- the pin has to be an
+    /// INDEPENDENT copy of the intent, so that changing the prompt's wording
+    /// forces a change here too.
+    ///
+    /// The rule must also sit BEFORE the transcript tail: everything after
+    /// `TRANSCRIPT:` is the data the rule is supposed to govern.
+    #[test]
+    fn the_attribution_rule_is_in_the_extraction_prompt() {
+        let built_in = extraction_prompt(None, None);
+        for needle in [
+            "Attribution rule",
+            "`Agent:` line is the AGENT's own words",
+            "It is NOT evidence of what the user said",
+            "Never turn an `Agent:` line into a `profile`/`user` memory",
+            "ONLY when a `User:` line in the SAME transcript states that fact",
+            "may be recorded as `observation` (never `profile`/`user`)",
+            "no `User:` line at all can therefore never yield a `profile`/`user` memory",
+        ] {
+            assert!(
+                built_in.contains(needle),
+                "the built-in extraction prompt no longer states the attribution rule \
+                 ({needle:?}); dropping it silently re-opens the t8 defect"
+            );
+        }
+        let rule = built_in
+            .find("Attribution rule")
+            .expect("the rule is in the prompt");
+        let tail = built_in
+            .rfind("TRANSCRIPT:")
+            .expect("the prompt ends with the transcript marker");
+        assert!(
+            rule < tail,
+            "the attribution rule must be an INSTRUCTION (before the transcript \
+             marker), not part of the data it governs"
+        );
+
+        // ... and it reaches the request the ACP tier actually sends: the language
+        // clause (the live policy sets 简体中文) is appended AFTER the rule and
+        // before the transcript, so it cannot displace it.
+        let with_language = extraction_prompt(Some("简体中文"), None);
+        assert!(with_language.contains("Attribution rule"));
+        assert!(with_language.contains("Never turn an `Agent:` line"));
+
+        // A FULL OPERATOR OVERRIDE still replaces the base -- including this rule.
+        // Recorded here rather than discovered later: `prompt_override` is the
+        // operator owning the extraction semantics, and an operator who writes
+        // their own prompt owes the same attribution discipline (the built-in one
+        // is what production runs: policy.toml's `[distill]` sets no `prompt`).
+        let overridden = extraction_prompt(None, Some("CUSTOM REGIME\n"));
+        assert!(
+            !overridden.contains("Attribution rule"),
+            "an override must keep replacing the base; if this ever changes, the \
+             override contract changed and the doc comment on it must say so"
+        );
     }
 
     #[test]
@@ -3036,6 +3156,25 @@ mod entry_tests {
         .unwrap()
     }
 
+    /// The coverage range of the NEWEST attempt for one session, read through
+    /// SENTINELS (`-1`) so a NULL can never pass for a measured 0 -- the same
+    /// shape `newest_attempt` uses for `retries`, and the reason this helper
+    /// exists at all rather than each test writing its own `COALESCE`.
+    async fn newest_coverage(db: &ruagent_store::Db, key: &str) -> (i64, i64, i64) {
+        let key = key.to_string();
+        db.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COALESCE(from_seq,-1), COALESCE(to_seq,-1),
+                        COALESCE(total_messages,-1)
+                 FROM distill_log WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
     async fn attempts_of(db: &ruagent_store::Db, key: &str) -> i64 {
         let key = key.to_string();
         db.call_flat(move |conn| {
@@ -3193,6 +3332,15 @@ mod entry_tests {
         assert_sql_free(&reason);
         assert_eq!(retries, 0, "a terminal refusal is not retried");
         assert_eq!(attempts_of(&d.db, &key).await, 1);
+        // t3 / issue #58: a REFUSAL read nothing, so the coverage columns stay
+        // NULL. The `-1` sentinels are what make that a reading about NULL rather
+        // than about `COALESCE(...,0)` -- a 0 here would be a fabricated range
+        // ("read message 0 to message 0") for a pass that never looked.
+        assert_eq!(
+            newest_coverage(&d.db, &key).await,
+            (-1, -1, -1),
+            "a refused pass must leave all three coverage columns NULL, not 0"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -3235,6 +3383,14 @@ mod entry_tests {
             attempts_of(&d.db, key).await,
             1,
             "retries are attempts INSIDE one pass, not one ledger row each"
+        );
+        // t3 / issue #58: a FAILURE read nothing either, so the three coverage
+        // columns are NULL on its row as well -- `retries = 2` beside them is the
+        // point: the pass tried three times and still never observed a range.
+        assert_eq!(
+            newest_coverage(&d.db, key).await,
+            (-1, -1, -1),
+            "a failed pass must leave all three coverage columns NULL, not 0"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -3372,6 +3528,99 @@ mod entry_tests {
             "an empty pass carries NO failure reason: a refusal would have recorded one              (the two are different rows with the same status)"
         );
         assert_eq!(retries, 0, "nothing failed, so nothing was retried");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ACCEPTANCE (t3 / issue #58): the RANGE the pass read reaches the ledger,
+    /// beside the numeric half of the same measurement — which must not move.
+    ///
+    /// Before 0030 the range existed only in this pass's `DistillOutcome` and died
+    /// with the HTTP response, so the ledger could say `windows = 1,
+    /// truncated = 0` and nothing about WHICH MESSAGES that window held. What is
+    /// asserted here is the pair: the three new columns equal the coverage the
+    /// pass MEASURED (`Some` on both sides — a `None` compared to `None` would
+    /// prove nothing), and `windows`/`truncated` still read exactly what they read
+    /// before the columns existed.
+    ///
+    /// The fixture is three user turns on the free tier: no agent, no model call,
+    /// no spend. `from_message` is INCLUSIVE and `to_message` EXCLUSIVE, so a
+    /// session read end to end has `(0, total, total)`.
+    #[tokio::test]
+    async fn the_coverage_range_reaches_the_ledger_beside_the_numeric_half() {
+        let (home, root) = daemon_layout("coverage-columns");
+        let d = distiller_at(&root);
+        let mut body = String::new();
+        for i in 0..3 {
+            // PREF markers, so the rules tier has something to keep and this is a
+            // pass with a NON-empty result -- the shape a reader meets in
+            // production.
+            body.push_str(&user_turn(
+                i,
+                &format!("记住：约定 {i} — 值班表编号 {i} 用值班人 operator-{i}。"),
+            ));
+        }
+        let path = write_transcript(&root, "run-t3-coverage.jsonl", &body);
+        let key = crate::sessions::session_key_of(&path);
+
+        let out = d
+            .distill_plan(&key, None, rules_plan(), false)
+            .await
+            .expect("a three-turn session must distil");
+        let coverage = out
+            .coverage
+            .expect("an extraction loop ran, so the coverage is a MEASUREMENT");
+        println!("READING coverage pass: status-worthy outcome {out:?} coverage {coverage:?}");
+        assert_eq!(
+            (out.windows, out.truncated),
+            (Some(1), false),
+            "this fixture fits one window and loses nothing: {out:?}"
+        );
+        assert_eq!(
+            coverage.total_messages, 3,
+            "three user turns, and the filter kept all three: {coverage:?}"
+        );
+        assert_eq!(
+            (coverage.from_message, coverage.to_message),
+            (0, 3),
+            "inclusive start, exclusive end, over the whole list: {coverage:?}"
+        );
+
+        let (status, _, _) = newest_attempt(&d.db, &key).await;
+        assert_eq!(status, "ok", "the ledger's own reading of the pass");
+        // THE THREE COLUMNS, read back INDIVIDUALLY and compared to the coverage
+        // the pass reported -- not to a literal, so this cannot pass by both sides
+        // being wrong in the same way.
+        assert_eq!(
+            newest_coverage(&d.db, &key).await,
+            (
+                coverage.from_message as i64,
+                coverage.to_message as i64,
+                coverage.total_messages as i64
+            ),
+            "the ledger's range must be the range the pass MEASURED"
+        );
+        // ... and the numeric half is unchanged. Read from the SAME row, so the
+        // two halves are a reading of one attempt rather than of two.
+        let (w, t): (Option<i64>, Option<i64>) =
+            d.db.call_flat({
+                let key = key.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT windows, truncated FROM distill_log WHERE session_key = ?1 \
+                         ORDER BY id DESC LIMIT 1",
+                        [&key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(w, Some(1), "windows is the count that ran, unchanged");
+        assert_eq!(
+            t,
+            Some(0),
+            "a MEASURED lossless read is 0, not NULL -- unchanged by 0030"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

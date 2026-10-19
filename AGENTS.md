@@ -134,7 +134,7 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   target dir (`D:\rust_cache`) leaves artifacts that contradict the main tree -- and that is how
   this phantom was made, not a theory: the worktree baseline builds of this effort are the likely
   origin. The symptom is a binary build failing on symbols the source plainly declares: `cargo rustc
-  -p ruagent --bin ruagent -o <private path>` failed with **7 bogus errors** --
+  -p ruagent --bin ruagent -- -o <private path>` failed with **7 bogus errors** --
   `cannot find type CapabilityFile in crate ruagent_policy`
   (`crates/daemon/src/capability.rs`), `struct PolicyConfig has no field named capabilities` --
   **immediately after a GREEN `cargo clippy`**, because the stale `libruagent_policy-*.rlib` in the
@@ -282,6 +282,30 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   who else this binds: a captain's follow-up question is one of the things that CAUSES a post-handover
   edit, so the duty to disclose and re-run sits with the author and with the captain who asked — not only
   with the next verifier.
+
+- **A bare hex string in this repo is a `git hash-object` blob id unless the text says md5**
+  (ruagent-issues-56-59; recorded after a real misdiagnosis, not a theory). Two 32-character hex
+  values that differ are **not** evidence that a file moved: they can be the same bytes under two
+  different functions. The captain compared a member's blob id against his own `md5sum` of the same
+  file, concluded the file had changed after the reading, and wrote that claim into a closing brief;
+  recomputing **both** functions on that one file showed a single content. Discipline: before saying
+  "the file changed after that reading", recompute both (`git hash-object f; md5sum f`) and name the
+  one you are quoting -- `docs/design/reviews/issues-45-55-closing.md` SS4 keeps a 10-row blob/md5
+  table for exactly this reason. Related trap on a CRLF checkout: the working copy may be CRLF while
+  the blob is LF, so `md5sum f` and `git show HEAD:f | md5sum` can legitimately differ **while
+  `git status` stays clean** (observed on `scripts/ruagent-daemon.ps1`).
+- **Never delete a probe artifact a report cites -- preserve it, or record that the citation died
+  with it** (ruagent-issues-56-59; this one is not hypothetical, it is what the captain did). Cleaning
+  this effort's probe leftovers out of the user's home removed `~/.dsh/sessions/...t8-acp...`, which a
+  report cited for its per-turn token counts (input 11313 / output 703 / cacheRead 768). The verifier
+  could still confirm the ledger side (`tokens_used=13224`) but had to report those numbers as
+  **unreproducible from their cited source** -- and correctly noted the removal was NOT age-based
+  cleanup, because its own daemon's directories were still there. The rule costs one `cp`; losing it
+  costs a reading nobody can ever re-check. So: before deleting anything under a user home, grep the
+  effort's reports for that path; if one cites it, copy it into the effort's OWN evidence root (a
+  `%TEMP%\<task>\...` directory that is not cleaned mid-round) and leave the original alone until the
+  round closes. The same applies to a task's private daemon roots: a fixture another task verifies
+  against is evidence, not clutter.
 
 ## E2E specs that write the daemon's real config
 

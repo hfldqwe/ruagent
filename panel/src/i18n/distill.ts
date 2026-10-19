@@ -62,6 +62,19 @@ export const zh: Record<string, string> = {
   "distill.ledger.calls": "{n} 次调用",
   "distill.ledger.truncated": "有截断",
   "distill.ledger.complete": "完整",
+  // ---- the coverage of one attempt (t5 / #58, from t3 + t4's read side) ----
+  // Three columns, ONE measurement: from 闭 / to 开, total 是分母. 整组判空 —— a
+  // half-measured row is NOT a range, and a null is never rendered as 0.
+  "distill.ledger.col.coverage": "覆盖范围",
+  "distill.ledger.coverage.range": "覆盖 {from}..{to}",
+  "distill.ledger.coverage.total": "共 {n} 条",
+  "distill.ledger.coverage.hint":
+    "覆盖范围＝那次尝试实际读取的消息列表索引（from 闭、to 开），「共 N 条」是那个列表的分母。三列由写入端一次产出：要么都有，要么都没有。",
+  "distill.ledger.coverage.partial": "未记录 · 半测量：from {from}，to {to}，共 {total}",
+  "distill.ledger.coverageNote":
+    "覆盖范围同样整组记录：{n} 次尝试答不出「读了哪些消息」（三列整组判空，绝不补 0）。",
+  "distill.ledger.coverageNoteUnknown":
+    "这次响应没有报告有多少条答不出「读了哪些消息」（daemon 早于覆盖范围读端）；「未记录」仍是未记录，不当作 0。",
   "distill.ledger.relations": "写入 {w} · 重复 {d} · 被拒 {r}",
   "distill.ledger.status.ok": "成功",
   "distill.ledger.status.empty": "无内容",
@@ -156,6 +169,20 @@ export const en: Record<string, string> = {
   "distill.ledger.calls": "{n} calls",
   "distill.ledger.truncated": "truncated",
   "distill.ledger.complete": "complete",
+  // ---- the coverage of one attempt (t5 / #58, from t3 + t4's read side) ----
+  // Three columns, ONE measurement: `from` inclusive / `to` exclusive, `total`
+  // the denominator. Judged as a group -- a half-measured row is NOT a range,
+  // and a null is never rendered as 0.
+  "distill.ledger.col.coverage": "Coverage",
+  "distill.ledger.coverage.range": "covers {from}..{to}",
+  "distill.ledger.coverage.total": "{n} messages",
+  "distill.ledger.coverage.hint":
+    "Coverage = the indexes of the message list the attempt actually read (`from` inclusive, `to` exclusive); the total is that list's denominator. The writer produces the three together: all of them, or none.",
+  "distill.ledger.coverage.partial": "not recorded · half-measured: from {from}, to {to}, of {total}",
+  "distill.ledger.coverageNote":
+    "Coverage is recorded as a group too: {n} attempts cannot say which messages they read (the three columns are judged together, and a null is never filled with 0).",
+  "distill.ledger.coverageNoteUnknown":
+    "This response did not report how many attempts cannot say which messages they read (the daemon predates the coverage read side); \"not recorded\" still means not recorded, and is not a 0.",
   "distill.ledger.relations": "written {w} · dup {d} · refused {r}",
   "distill.ledger.status.ok": "ok",
   "distill.ledger.status.empty": "empty",

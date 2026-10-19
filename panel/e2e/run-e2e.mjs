@@ -91,7 +91,65 @@ console.log(
   `e2e target: ${target} (writes ${unarmed ? "UNARMED on request: RUAGENT_E2E_ALLOW_WRITES=0" : "armed via RUAGENT_E2E_ALLOW_WRITES=1"})`,
 );
 
+// ---------------------------------------------------------------------------
+// HOW MANY WORKERS -- and why the entry point does not leave it to the host's
+// core count (t7).
+//
+// `panel/playwright.config.ts` sets `workers: process.env.CI ? 2 : undefined`, so
+// CI runs this suite at 2 while a LOCAL run gets Playwright's own default
+// (`cpus/2`) -- on this 16-core machine **8**. That gap is not cosmetic. Measured
+// on this machine (2026-10-16, throwaway root, private daemon on 8899, writes
+// armed through this entry point, 62 tests):
+//
+//   local default (=8 here)   62 passed / 0 failed   29s / 35s / 36s   (3 runs)
+//   --workers=16 (probe)      54 passed / 8 failed   75s
+//
+// and the 8 failures were ALL `page.goto: net::ERR_ABORTED; maybe frame was
+// detached?` or a `waitForResponse` timeout, inside specs no change of this round
+// touched (`agents-health-third-state`, `consumption`, `failure-visibility`). The
+// same bytes at 2 workers were green. Another member measured 57 passed / 3 failed
+// / 2 skipped at the local default on a LOADED machine, every failure the same 30 s
+// `page.goto` abort, and 60/0 at `--workers=2`. So the red is CONCURRENCY, not a
+// spec: N simultaneous chromium instances on one box starve each other, whichever
+// spec is mid-`goto` loses the race, and the failure names a file whose bytes never
+// moved. That is the most expensive kind of red -- it reads as a product bug and
+// pays for a bisect before it is understood.
+//
+// So the entry point pins the concurrency it can defend: 2, the number CI already
+// uses, which also means local and CI exercise the same scheduling. It stays
+// OVERRIDABLE, and neither override is needed to get a green run:
+//   npm run test:e2e -- --workers=8          caller-named value wins (see below)
+//   RUAGENT_E2E_WORKERS=4 npm run test:e2e   for a machine that can take more
+// This is a worker CEILING, not a retry: nothing here re-runs a failed test, so a
+// red at this entry point is still a red on the first attempt.
+const DEFAULT_WORKERS = 2;
+
+function workerCount() {
+  const fromEnv = process.env.RUAGENT_E2E_WORKERS?.trim();
+  if (fromEnv) {
+    if (/^[1-9][0-9]*$/.test(fromEnv)) return { value: fromEnv, why: "RUAGENT_E2E_WORKERS" };
+    console.warn(
+      `e2e workers: ignoring RUAGENT_E2E_WORKERS="${fromEnv}" (want a positive integer) -- using ${DEFAULT_WORKERS}`,
+    );
+  }
+  return { value: String(DEFAULT_WORKERS), why: `the same ${DEFAULT_WORKERS} CI uses` };
+}
+
 const args = process.argv.slice(2);
+// An explicitly named concurrency beats the ceiling above -- and the caller's words
+// have to stay LAST for that to be true: with both present Playwright takes the
+// final occurrence, so appending ours would silently override the caller's.
+// (`-j`, `-j8`, `-j=8` and `--workers[=]N` are all the forms Playwright's own CLI
+// accepts, so all four have to be recognised -- a miss would let ours win.)
+const callerNamesWorkers = args.some((a) => /^(-{1,2}j[0-9]*|--workers)(=|$)/.test(a));
+if (callerNamesWorkers) {
+  console.log("e2e workers: named by the caller (the ceiling in this file is not applied)");
+} else {
+  const { value, why } = workerCount();
+  args.unshift(`--workers=${value}`);
+  console.log(`e2e workers: ${value} (${why})`);
+}
+
 const child = spawn("npx", ["playwright", "test", ...args], {
   stdio: "inherit",
   shell: true,

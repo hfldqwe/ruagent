@@ -7,7 +7,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Dropdown, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
-import { api, type DistillBatchOutcome, type DistillScope, type SessionRecord } from "../api";
+import {
+  api,
+  type DistillBatchOutcome,
+  type DistillScope,
+  type DistillTier,
+  type SessionRecord,
+} from "../api";
 import { dateOf, useI18n } from "../i18n";
 import { Icon } from "../icons";
 import {
@@ -45,6 +51,22 @@ const MSG_CAP = 400;
  *  20, so this asks for exactly one daemon-default page of work instead of
  *  inventing a second default that could drift from the route's. */
 const DISTILL_BATCH_LIMIT = 20;
+
+/** The tier this page's distillation actions START on (issue #57).
+ *
+ *  DEFAULT `rules`, and the reason is the user's money. The batch entry says
+ *  "批量蒸馏未处理 N 条" and one click runs the pass over up to
+ *  DISTILL_BATCH_LIMIT sessions; under the ROUTE's own default (`acp`, because
+ *  the panel used to post an empty body) that click buys N sessions times their
+ *  window counts in model calls, with nothing on screen saying so. `rules` is
+ *  the zero-token tier: the default action costs nothing and cannot surprise
+ *  anyone, and the paid tier is one deliberate click away with its price shown
+ *  before the run (the estimate's window count IS the call count).
+ *
+ *  PAGE state rather than modal state, because ONE choice has to govern three
+ *  requests that must not disagree: the planner (asked on page load and on every
+ *  change), the batch run, and the per-row distill. */
+const DEFAULT_DISTILL_TIER: DistillTier = "rules";
 
 /** The name a session wears on this page (S9.4).
  *
@@ -199,6 +221,9 @@ export function Sessions() {
   const [plan, setPlan] = useState<DistillBatchOutcome | null>(null);
   const [planErr, setPlanErr] = useState<unknown>(null);
   const [batchOpen, setBatchOpen] = useState(false);
+  /** issue #57: the extractor tier this page's distillation actions use. See
+   *  DEFAULT_DISTILL_TIER for why it starts on the free one. */
+  const [tier, setTier] = useState<DistillTier>(DEFAULT_DISTILL_TIER);
   /** Key of the row whose archive/delete request is in flight. */
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState<SessionRecord | null>(null);
@@ -276,10 +301,16 @@ export function Sessions() {
    *  daemon is a PLAN: no extraction, no model call, no write — which is what
    *  makes it safe to ask from a page load, and it is the only source of the
    *  global backlog count (the list holds a window, and its rows carry a
-   *  standing, not a total). */
-  const refreshPlan = useCallback(() => {
+   *  standing, not a total).
+   *
+   *  IT IS ASKED FOR A TIER (issue #57). The estimate's `windows` is the PAID
+   *  tier's model-call count, and the tokens/cost come from the ledger's means
+   *  over historical (ACP) attempts, so an answer priced for one tier is the
+   *  wrong price for the other — the "estimated ACP, ran rules" mismatch this
+   *  issue is about. */
+  const refreshPlan = useCallback((which: DistillTier) => {
     api
-      .distillBatch({ dryRun: true, limit: DISTILL_BATCH_LIMIT })
+      .distillBatch({ extractor: which, dryRun: true, limit: DISTILL_BATCH_LIMIT })
       .then((p) => {
         setPlan(p);
         setPlanErr(null);
@@ -328,12 +359,15 @@ export function Sessions() {
     };
   }, [load]);
 
-  // One plan read on mount; the mutation paths below re-ask it. Deliberately NOT
-  // polled with the list: it is a costing question, and the answer only moves when
-  // something distils — which this page already reacts to.
+  // One plan read on mount, plus one on every TIER change (issue #57); the
+  // mutation paths below re-ask it. Deliberately NOT polled with the list: it is
+  // a costing question, and the answer only moves when something distils — which
+  // this page already reacts to. The tier is a dependency because the same
+  // sessions cost a different number of MODEL CALLS per tier, so a kept estimate
+  // would be a price tag on a pass the user is not about to run.
   useEffect(() => {
-    refreshPlan();
-  }, [refreshPlan]);
+    refreshPlan(tier);
+  }, [refreshPlan, tier]);
 
   // "data may be stale · N seconds ago" has to actually tick.
   useEffect(() => {
@@ -492,23 +526,32 @@ export function Sessions() {
   const distill = async (s: SessionRecord) => {
     setDistilling(s.key);
     try {
-      const r = await api.sessionDistill(s.key);
+      // issue #57: the row action runs the SAME tier as the batch control above
+      // — one page-level choice, so a single distill cannot quietly buy an agent
+      // turn while the page reads "rules（免费）".
+      const r = await api.sessionDistill(s.key, tier);
       const d = r.distilled;
       toast(
         "ok",
+        // The toast IS this action's receipt, so it names the tier and whether
+        // that tier calls the model (issue #57) — without it, "记忆 3 写入" reads
+        // the same whether it cost 0 tokens or three agent turns.
         t("sessions.distilled", {
           m: d.memories_written,
           k: d.memories_skipped,
           e: d.entities_written,
           r: d.relations_written,
           a: d.agent,
-        }),
+        }) +
+          " · " +
+          (tier === "rules" ? t("sessions.tier.note.rules") : t("sessions.tier.note.acp")),
       );
       // This session's standing just changed, and the backlog shrank: re-read
       // both rather than leaving a badge (or a count) describing the previous
       // state. `void` because the toast above is already the user's answer.
       void load();
-      refreshPlan();
+      // Same tier it was priced with: the row action ran THAT one.
+      refreshPlan(tier);
     } catch (e) {
       toast("err", String(e));
     } finally {
@@ -646,6 +689,23 @@ export function Sessions() {
             { value: "created", label: t("sessions.sortCreated") },
           ]}
         />
+        {/* issue #57: the tier stands BESIDE the entry, not only inside the
+            modal, because the planner runs on page load — before any modal
+            exists — and because the same choice governs the row action below.
+            A native `title` carries the explanation: a Tooltip would wrap a
+            controlled control for no gain, and the labels already say which tier
+            costs money. */}
+        <span className="sessions-tier" title={t("sessions.tier.hint")}>
+          <Segmented
+            value={tier}
+            onChange={(v) => setTier(v as DistillTier)}
+            aria-label={t("sessions.tier.label")}
+            options={[
+              { value: "rules", label: t("sessions.tier.rules") },
+              { value: "acp", label: t("sessions.tier.acp") },
+            ]}
+          />
+        </span>
         {/* #47: the backlog pass. The count on the label is the daemon's own
             `undistilled_total` (see refreshPlan), so the button states the size
             of the job BEFORE it is opened — and says nothing rather than 0 when
@@ -773,13 +833,17 @@ export function Sessions() {
         <BatchDistillModal
           plan={plan}
           planErr={planErr}
-          onReloadPlan={refreshPlan}
+          tier={tier}
+          onTierChange={setTier}
+          // `refreshPlan` takes the tier it should price, so it cannot be passed
+          // bare: a bare reference would hand it `undefined` as the tier.
+          onReloadPlan={() => refreshPlan(tier)}
           onClose={() => setBatchOpen(false)}
           onDone={() => {
             // The pass changed standings and the backlog; both readers are
             // re-asked here rather than by a poll that may be 10s away.
             void load();
-            refreshPlan();
+            refreshPlan(tier);
           }}
         />
       )}
@@ -1279,12 +1343,18 @@ function standingHint(
 function BatchDistillModal({
   plan,
   planErr,
+  tier,
+  onTierChange,
   onReloadPlan,
   onClose,
   onDone,
 }: {
   plan: DistillBatchOutcome | null;
   planErr: unknown;
+  /** issue #57: the tier this pass will run, owned by the PAGE (the planner and
+   *  the row action use the same value, so they cannot drift apart). */
+  tier: DistillTier;
+  onTierChange: (next: DistillTier) => void;
   onReloadPlan: () => void;
   onClose: () => void;
   onDone: () => void;
@@ -1293,6 +1363,11 @@ function BatchDistillModal({
   const [busy, setBusy] = useState(false);
   const [outcome, setOutcome] = useState<DistillBatchOutcome | null>(null);
   const [err, setErr] = useState<unknown>(null);
+  /** The tier the RUN was started with, captured at click time: the Segmented
+   *  stays live while the receipt is on screen, so reading `tier` when the
+   *  receipt renders would credit this pass to whatever tier the user moved to
+   *  afterwards. */
+  const [sentTier, setSentTier] = useState<DistillTier | null>(null);
 
   /** A recorded number, or the ledger's own word for "nobody wrote it down". */
   const measured = (v: number | null, render: (n: number) => string) =>
@@ -1305,8 +1380,10 @@ function BatchDistillModal({
   const run = async () => {
     setBusy(true);
     setErr(null);
+    const sent = tier;
     try {
-      const res = await api.distillBatch({ limit: DISTILL_BATCH_LIMIT });
+      const res = await api.distillBatch({ extractor: sent, limit: DISTILL_BATCH_LIMIT });
+      setSentTier(sent);
       setOutcome(res);
       // No success toast: the block below IS the confirmation, and it stays on
       // screen (the page's own rule for a mutation's answer — a 2s notice would
@@ -1322,9 +1399,52 @@ function BatchDistillModal({
 
   const est = plan?.estimated;
   const act = outcome?.actual;
+  /** Whether the tier that RAN calls the model. The daemon's own label decides:
+   *  `rules` is the free one, `acp` and `rules+acp` are not. */
+  const ranFree = outcome != null && outcome.extractor === "rules";
+  /** `rules` is free, so the estimate's windows/tokens/cost — priced from the
+   *  ledger's means over historical attempts, i.e. from ACP runs — describe the
+   *  OTHER tier. The suffix names which numbers those are; the tier note above
+   *  says what THIS pass spends. Without it, "模型调用 12 次" would sit on a pass
+   *  that will make none. */
+  const acpBasis = tier === "rules" ? t("sessions.tier.acpBasis") : "";
+  /** The estimate is only usable for the tier it was priced for. Until the
+   *  planner's answer carries the selected tier, the estimate on screen belongs
+   *  to a different pass and starting is refused (issue #57: one tier may never
+   *  be estimated and another run). */
+  const planTierStale = plan != null && plan.extractor !== tier;
 
   return (
     <Modal title={t("distill.batch.title")} onClose={onClose}>
+      {/* issue #57: the tier, and what it COSTS, before anything else in this
+          modal. The button at the bottom is one click over up to twenty
+          sessions, so "which tier is this, and does it call the model" must not
+          have to be inferred from a label or remembered from the page bar. */}
+      <div className="row wrap" data-tier={tier}>
+        <span className="muted micro">{t("sessions.tier.label")}</span>
+        <Segmented
+          value={tier}
+          onChange={(v) => onTierChange(v as DistillTier)}
+          aria-label={t("sessions.tier.label")}
+          options={[
+            { value: "rules", label: t("sessions.tier.rules") },
+            { value: "acp", label: t("sessions.tier.acp") },
+          ]}
+        />
+        <span className="micro" data-tier-note={tier}>
+          {tier === "rules" ? t("sessions.tier.note.rules") : t("sessions.tier.note.acp")}
+        </span>
+      </div>
+      {plan ? (
+        <p className="muted micro" data-plan-extractor={plan.extractor}>
+          {t("sessions.tier.plan", { x: plan.extractor })}
+        </p>
+      ) : null}
+      {planTierStale ? (
+        <p className="muted micro" data-plan-stale="1">
+          {t("sessions.tier.planStale")}
+        </p>
+      ) : null}
       {planErr && !plan ? (
         <ErrorState
           title={t("distill.batch.err")}
@@ -1347,15 +1467,19 @@ function BatchDistillModal({
             grid
             items={[
               { key: "sessions", label: t("distill.batch.estSessions"), value: est.sessions },
-              { key: "windows", label: t("distill.batch.estWindows"), value: est.windows },
+              {
+                key: "windows",
+                label: t("distill.batch.estWindows") + acpBasis,
+                value: est.windows,
+              },
               {
                 key: "tokens",
-                label: t("distill.batch.estTokens"),
+                label: t("distill.batch.estTokens") + acpBasis,
                 value: measured(est.tokens_used, fmtTokens),
               },
               {
                 key: "cost",
-                label: t("distill.batch.estCost"),
+                label: t("distill.batch.estCost") + acpBasis,
                 value: measured(est.cost_usd, fmtUsd),
               },
             ]}
@@ -1382,6 +1506,36 @@ function BatchDistillModal({
 
       {outcome ? (
         <>
+          {/* issue #57: WHICH TIER RAN, AND WHETHER IT CALLED THE MODEL. Two
+              tiers are named on purpose: `sentTier` is what this request asked
+              for, `outcome.extractor` is what the daemon says it ran. Normally
+              they are the same string; if they ever differ the receipt says so
+              rather than choosing one, because a receipt that quietly credits a
+              pass to the wrong tier is the defect #57 is about. */}
+          <div
+            className="row wrap"
+            data-run-tier={sentTier ?? ""}
+            data-run-extractor={outcome.extractor}
+          >
+            <span className="micro">{t("sessions.tier.run", { x: outcome.extractor })}</span>
+            {sentTier ? (
+              <span className="muted micro">{t("sessions.tier.asked", { x: sentTier })}</span>
+            ) : null}
+          </div>
+          <p className="micro" data-run-calls={ranFree ? "none" : "model"}>
+            {ranFree
+              ? t("sessions.tier.run.calls.rules", {
+                  n: measured(act ? act.windows : null, String),
+                })
+              : t("sessions.tier.run.calls.acp", {
+                  n: measured(act ? act.windows : null, String),
+                })}
+          </p>
+          {sentTier && sentTier !== outcome.extractor ? (
+            <p className="muted micro" data-run-mismatch="1">
+              {t("sessions.tier.run.mismatch", { x: outcome.extractor, y: sentTier })}
+            </p>
+          ) : null}
           <p>
             <strong>
               {t("distill.batch.counted", {
@@ -1403,7 +1557,12 @@ function BatchDistillModal({
                   { key: "rows", label: t("distill.batch.actualRows"), value: act.rows },
                   {
                     key: "windows",
-                    label: t("distill.batch.actualWindows"),
+                    // On the free tier the ledger's `windows` count is the number
+                    // of WINDOWS the pass read, not model calls: the label must not
+                    // turn a free pass into "1 次调用" (issue #57).
+                    label: ranFree
+                      ? t("sessions.tier.windows.rules")
+                      : t("distill.batch.actualWindows"),
                     value: measured(act.windows, (n) => t("distill.ledger.calls", { n })),
                   },
                   {
@@ -1460,7 +1619,7 @@ function BatchDistillModal({
             <Button
               type="primary"
               loading={busy}
-              disabled={busy || !plan || plan.planned === 0}
+              disabled={busy || !plan || plan.planned === 0 || planTierStale}
               onClick={() => void run()}
             >
               {busy ? t("distill.batch.running") : t("distill.batch.start")}

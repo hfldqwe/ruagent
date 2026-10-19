@@ -77,6 +77,33 @@ export const zh: Record<string, string> = {
   "sessions.filter.distillNone": "只看未蒸馏",
   "sessions.filter.distillOk": "只看已蒸馏",
   "sessions.batchFailed": "批量蒸馏失败：{e}",
+
+  // ---- the distillation TIER (ruagent-issues-56-59 t6 / issue #57) ----
+  // These live in THIS view's domain file because the control they label is in
+  // SessionsView.tsx. The batch modal's older copy sits under `distill.batch.*`
+  // in i18n/distill.ts; new strings for this view follow the rule at the top of
+  // i18n/README.md (one file per view domain) rather than that prefix.
+  //
+  // Why the strings are this explicit: the tier is the difference between a
+  // free pass and one model call PER WINDOW over up to twenty sessions, and the
+  // route's own default (an empty body) is the paid one. Every place the tier
+  // is chosen shows what it costs, and every place a pass reports back says
+  // which tier ran and whether it called the model.
+  "sessions.tier.label": "蒸馏档位",
+  "sessions.tier.rules": "rules（免费）",
+  "sessions.tier.acp": "acp（调用模型）",
+  "sessions.tier.hint": "rules＝本地规则抽取，不调用模型（零 token）；acp＝智能体抽取，每个窗口一次模型调用（会计费）。本页的批量蒸馏与单条蒸馏都用这个档位。",
+  "sessions.tier.note.rules": "本档不调用模型：零 token、零成本。",
+  "sessions.tier.note.acp": "本档会调用模型：每个窗口一次模型调用，按用量计费。",
+  "sessions.tier.plan": "这份预估所用档位（daemon 回报）：{x}",
+  "sessions.tier.planStale": "预估还在按所选档位重算——重算回来之前不会开始。",
+  "sessions.tier.acpBasis": "（acp 档对照）",
+  "sessions.tier.windows.rules": "分窗数（非模型调用）",
+  "sessions.tier.run": "本次实跑档位（daemon 回报）：{x}",
+  "sessions.tier.asked": "本次请求的档位：{x}",
+  "sessions.tier.run.calls.rules": "本档不调用模型：0 次模型调用。账本记录的 {n} 个窗口是分窗数（按字节预算切分），不是模型调用。",
+  "sessions.tier.run.calls.acp": "本档会调用模型：账本记录了 {n} 个窗口，即 {n} 次模型调用。",
+  "sessions.tier.run.mismatch": "⚠ 实跑回报的档位是 {x}，而请求的档位是 {y}——以 daemon 的回报为准。",
 };
 
 export const en: Record<string, string> = {
@@ -149,4 +176,25 @@ export const en: Record<string, string> = {
   "sessions.filter.distillNone": "Undistilled only",
   "sessions.filter.distillOk": "Distilled only",
   "sessions.batchFailed": "Batch distillation failed: {e}",
+
+  // ---- the distillation TIER (ruagent-issues-56-59 t6 / issue #57) ----
+  // Keys live in this view's domain file (see the zh block above). The tier is
+  // the difference between a free pass and one model call PER WINDOW over up to
+  // twenty sessions, so the choice states its cost and the receipt states which
+  // tier ran and whether it called the model.
+  "sessions.tier.label": "Distillation tier",
+  "sessions.tier.rules": "rules (free)",
+  "sessions.tier.acp": "acp (calls the model)",
+  "sessions.tier.hint": "rules = local rule extraction, no model call (zero tokens); acp = agent extraction, one model call per window (billed). Both the batch pass and the single-row distill on this page use this tier.",
+  "sessions.tier.note.rules": "This tier calls no model: zero tokens, zero cost.",
+  "sessions.tier.note.acp": "This tier CALLS the model: one call per window, billed by usage.",
+  "sessions.tier.plan": "Tier this estimate was planned with (the daemon's own answer): {x}",
+  "sessions.tier.planStale": "The estimate is being recomputed for the selected tier — starting stays disabled until it arrives.",
+  "sessions.tier.acpBasis": " (acp-tier basis)",
+  "sessions.tier.windows.rules": "windows (not model calls)",
+  "sessions.tier.run": "Tier this run used (the daemon's own answer): {x}",
+  "sessions.tier.asked": "Tier this request asked for: {x}",
+  "sessions.tier.run.calls.rules": "This tier calls no model: 0 model calls. The {n} windows in the ledger are window SPLITS (cut by the byte budget), not model calls.",
+  "sessions.tier.run.calls.acp": "This tier CALLS the model: the ledger recorded {n} windows, i.e. {n} model calls.",
+  "sessions.tier.run.mismatch": "⚠ the run reported tier {x} while the request asked for {y} — the daemon's answer is authoritative.",
 };

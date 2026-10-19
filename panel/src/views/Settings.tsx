@@ -350,6 +350,14 @@ function DistillSettings({ epoch, onReload }: { epoch: number; onReload: () => v
 // never folds it into 0 — "this cost nothing" and "nobody wrote it down" are
 // different readings, and a view that conflates them is the failure the NULL
 // discipline exists to prevent.
+//
+// AND ONE MEASUREMENT THAT IS A GROUP (#58, t5). `from_seq` / `to_seq` /
+// `total_messages` answer "which messages did this attempt read"; the writer
+// produces them from ONE Option (0030), so they exist together or not at all.
+// The card therefore judges the three as a unit (`coverageOf` below): a row
+// that carries only part of the triple is NOT a range, and the missing part is
+// never filled with a 0 to make it look like one. The daemon counts those rows
+// for us in `totals.coverage_not_recorded`.
 // ---------------------------------------------------------------------------
 
 /** How many attempts the card lists. ONE page of the daemon's own envelope (its
@@ -361,6 +369,37 @@ const LEDGER_ROWS = 20;
  *  a NULL status (the pre-0024 rows), NOT a fourth outcome — the buckets are
  *  shown side by side precisely so that distinction stays visible. */
 const LEDGER_BUCKETS = ["ok", "empty", "failed", "not_recorded"] as const;
+
+/** ONE ATTEMPT'S COVERAGE, judged as a GROUP (#58, t5; the read side is t4's).
+ *
+ *  The three columns come from a single `Option<TranscriptCoverage>` on the
+ *  write side, so they are recorded together or not at all. Two consequences
+ *  the card has to honour, and this helper is where they live so that no cell
+ *  can forget them:
+ *
+ *   * `recorded` requires ALL THREE. A row carrying part of the triple is NOT a
+ *     range: rendering "覆盖 0..0" for it would invent a reading out of a null,
+ *     which is exactly what the NULL discipline forbids.
+ *   * the pieces that DO exist are still reported (`parts`) instead of being
+ *     masked into a blank 未记录 — the reader can see that the write was
+ *     incomplete rather than the panel quietly tidying it up. */
+type Coverage =
+  | { recorded: true; from: number; to: number; total: number }
+  | { recorded: false; parts: string[] };
+
+function coverageOf(e: DistillLedgerEntry): Coverage {
+  // The GROUP test, spelled out as one condition: all three, or not recorded.
+  // A union rather than three optional fields, so the `recorded: false` branch
+  // has NO numbers to print even if a caller wanted one.
+  if (e.from_seq != null && e.to_seq != null && e.total_messages != null) {
+    return { recorded: true, from: e.from_seq, to: e.to_seq, total: e.total_messages };
+  }
+  const parts: string[] = [];
+  if (e.from_seq != null) parts.push("from");
+  if (e.to_seq != null) parts.push("to");
+  if (e.total_messages != null) parts.push("total");
+  return { recorded: false, parts };
+}
 
 function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => void }) {
   const { t } = useI18n();
@@ -408,6 +447,15 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
   }
 
   const totals = page.totals;
+  // A daemon that PREDATES t4 (the resident one on 8787 today is one) sends no
+  // `coverage_not_recorded` at all. It is not 0 and it is not a number, and the
+  // card says so instead of letting `t()` leave the literal `{n}` standing in
+  // the sentence -- a placeholder leak reads as a typo, "0" would read as a
+  // measurement, and neither is what happened. The ROW cells need no such
+  // branch: a missing column and a null column are the same non-reading, and
+  // `coverageOf` tests `!= null`, which catches both.
+  const coverageNotRecorded =
+    typeof totals.coverage_not_recorded === "number" ? totals.coverage_not_recorded : null;
   /** A recorded number, or the ledger's own word for "nobody wrote it down". ONE
    *  helper, so no cell of this card can accidentally print a null as 0. */
   const measured = (v: number | null, render: (n: number) => string) =>
@@ -486,6 +534,18 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
               c: totals.cost_usd_not_recorded,
             })}
           </p>
+          {/* #58: the same "counted, never summed" discipline for the coverage
+              reading. The number is how many attempts could not answer what
+              they read; a 0 in it is a MEASURED zero (every row answered), not
+              a missing measurement folded flat. */}
+          <p
+            className="muted micro"
+            data-coverage-not-recorded={coverageNotRecorded ?? "not_recorded"}
+          >
+            {coverageNotRecorded == null
+              ? t("distill.ledger.coverageNoteUnknown")
+              : t("distill.ledger.coverageNote", { n: coverageNotRecorded })}
+          </p>
 
           {/* The four buckets, each a MEASURED count — the daemon counts them
               over the same filter as `total`, so a 0 here is a real zero and
@@ -561,6 +621,56 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
                     {e.truncated === true ? ` · ${t("distill.ledger.truncated")}` : ""}
                   </span>
                 ),
+              },
+              {
+                // Beside the model-call count on purpose: "1 次调用" and "覆盖
+                // 1..40 / 共 120 条" are the two halves of one question — how
+                // much of the session did that call actually see — and a reader
+                // who has one without the other cannot tell a truncated pass
+                // from a small session.
+                title: t("distill.ledger.col.coverage"),
+                key: "coverage",
+                render: (_: unknown, e: DistillLedgerEntry) => {
+                  const cov = coverageOf(e);
+                  const hint = t("distill.ledger.coverage.hint");
+                  // `data-coverage` carries the GROUP VERDICT, so a test asserts
+                  // the judgment itself rather than re-deriving it from rendered
+                  // text; the raw triple rides along for the partial case, where
+                  // the verdict alone would hide which half was missing.
+                  return cov.recorded ? (
+                    <span
+                      className="mono micro"
+                      data-coverage="recorded"
+                      data-coverage-from={cov.from}
+                      data-coverage-to={cov.to}
+                      data-coverage-total={cov.total}
+                      title={hint}
+                    >
+                      {t("distill.ledger.coverage.range", { from: cov.from, to: cov.to })}
+                      {/* " / " inside one reading, " · " between readings: the
+                          usage column next door already separates its three
+                          measurements with " · ", so the range and its
+                          denominator must not blur into that list. */}
+                      {" / "}
+                      {t("distill.ledger.coverage.total", { n: cov.total })}
+                    </span>
+                  ) : (
+                    <span
+                      className="muted micro"
+                      data-coverage="not_recorded"
+                      data-coverage-parts={cov.parts.length ? cov.parts.join(",") : "none"}
+                      title={hint}
+                    >
+                      {cov.parts.length === 0
+                        ? t("distill.notRecorded")
+                        : t("distill.ledger.coverage.partial", {
+                            from: measured(e.from_seq, String),
+                            to: measured(e.to_seq, String),
+                            total: measured(e.total_messages, String),
+                          })}
+                    </span>
+                  );
+                },
               },
               {
                 title: t("distill.ledger.col.relations"),
