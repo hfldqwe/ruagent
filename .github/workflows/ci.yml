@@ -302,7 +302,14 @@ jobs:
             echo ""
             echo "| ignored test | disposition here |"
             echo "| --- | --- |"
-            echo "| \`injection_e2e\`: 8 names + \`roundtrip\`: a_governed_refusal_is_an_error_and_an_empty_pass_is_not | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`; t29 added the second target) |"
+            echo "| \`injection_e2e\`: 8 names | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`; the 8 names are DEMANDED from the log by test-evidence.sh) |"
+            # Its OWN row, not appended to the row above (t29 self-filed finding): the F2 guard
+            # (memory/lifecycle.rs) parses this table and SKIPS any token containing " names",
+            # so a name appended to an 8-name row is never statically checked -- a qualified
+            # `module::fn` resolves to zero functions and is caught only later, at CI runtime,
+            # by test-evidence.sh demanding the name from the log. Standing alone, this name is
+            # checked statically and locally, before CI spends ten minutes discovering it.
+            echo "| \`roundtrip\`: a_governed_refusal_is_an_error_and_an_empty_pass_is_not | RUN (\`--include-ignored\`, a SECOND target with the same mock-binary precondition) |"
             echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` (for live_copy_keeps_history_nullable and live_copy_bigram_backfill_at_scale) and \`RUAGENT_T25_LIVE_COPY\` (for live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, which needs a PRE-0024 copy) = migrated COPYs of a real database. A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. T6 and T25 must point at SEPARATE copies (t36). |"
             echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
             echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"

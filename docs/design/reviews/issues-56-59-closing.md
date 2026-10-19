@@ -278,3 +278,32 @@ demand.
 green after the fix. If CI prints that string again, the next task gets that run's full stdout, not a
 summary of it.
 
+
+## 11. Two self-filed findings the round closed on itself
+
+The most useful report a teammate can file is a defect in its own delivery, and this round produced
+two, one of them the captain's.
+
+**A RUN row the static guard could not see (t29, the mcp member, filed against its own work).** After
+being told its manifest row named a location instead of a function, it did not stop at the fix: it
+re-read the guard's parser and pointed out that its ninth instrument had been APPENDED to the
+eight-name row -- and that the parser skips any token containing ' names'. So the appended name was
+never statically checked at all; the only thing that would have caught a bad one is the CI step's own
+test-evidence.sh, which demands the name from the log (a true catch, ten CI minutes later, instead of a
+local one). Its reading of the mechanism was exact -- it replayed the parser over the final bytes, and
+re-ran the two step bodies in the Linux container. The closure needs no guard redesign, only a shape
+change: the row is SPLIT so the name stands alone. Measured on the final bytes: the parser now yields
+**11** checked tokens (was 10), including that name, and the crate that owns the guard is green
+(82 passed / 0 failed / 1 ignored).
+
+**The manifest row that named a location instead of a function (the captain's, caught by that same
+guard).** The manifest-accounting change was arithmetically right -- 19 ignored = 9 run + 10 declared,
+and its author had re-run the changed step body in the Linux container to prove it -- but the captain's
+row wrote the measurement instrument as 'orphans::tests::measure_attribution_pass_cost'. The guard
+collects bare names by scanning 'fn <ident>' (2228 of them in this tree) and requires each declared
+token to be a substring of exactly ONE of them; a 'module::fn' form therefore resolves to zero, and
+both CI platforms failed on exactly that one test (81 passed / 1 failed each). Reproduced locally in
+one command, fixed by dropping the path prefix, and CI went green on ad09001. The lesson generalises
+beyond this file: a name in a manifest is read by a PARSER, not by a human, and a location belongs in
+the reason column.
+
