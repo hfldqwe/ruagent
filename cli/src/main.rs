@@ -14,7 +14,20 @@ use clap::{ArgGroup, Parser, Subcommand};
 )]
 struct Cli {
     /// Base URL of a running daemon.
-    #[arg(long, env = "RUAGENT_URL", default_value = "http://127.0.0.1:8787")]
+    ///
+    /// GLOBAL ON PURPOSE. Written the way a caller naturally writes it -- a flag
+    /// on the subcommand it belongs to, `ruagent doctor --url <url>` -- this used
+    /// to fail with `error: unexpected argument '--url' found` (exit 2), because
+    /// clap only accepted it in FRONT of the subcommand. That killed the CI
+    /// Doctor step, and Panel serves / Panel e2e were skipped with it. With
+    /// `global = true` the flag parses on either side of the subcommand and the
+    /// value reaches `cli.url` in both orders.
+    #[arg(
+        long,
+        global = true,
+        env = "RUAGENT_URL",
+        default_value = "http://127.0.0.1:8787"
+    )]
     url: String,
 
     #[command(subcommand)]
@@ -1058,6 +1071,60 @@ mod tests {
         });
         let line = distill_reading(&empty);
         assert!(line.contains("no attempts recorded yet"), "{line}");
+    }
+
+    /// t12 / CI: `--url` is GLOBAL, so the flag parses on EITHER side of the
+    /// subcommand. Before this, only `ruagent --url <url> doctor` parsed; the
+    /// natural order -- `ruagent doctor --url <url>`, which is how the CI step
+    /// is written -- died with `error: unexpected argument '--url' found`
+    /// (exit 2), failing the Doctor step and skipping Panel serves and Panel E2E
+    /// with it.
+    ///
+    /// Both orders are asserted HERE, on the parsed struct, because the CI shape is
+    /// a COMMAND LINE, and a command line is only known to work once it has been
+    /// parsed: "the field exists" and "this command line is accepted" are two
+    /// different readings (the gen3-backlog C81 lesson).
+    #[test]
+    fn the_url_flag_parses_on_either_side_of_the_subcommand() {
+        // The natural order: the flag AFTER the subcommand, on the subcommand's
+        // own line, which is how a caller writes it.
+        let after = Cli::try_parse_from(["ruagent", "doctor", "--url", "http://127.0.0.1:8891"])
+            .expect("`doctor --url <url>` must parse: the flag is global");
+        assert_eq!(
+            after.url, "http://127.0.0.1:8891",
+            "the value reaches cli.url"
+        );
+        assert!(
+            matches!(after.cmd, Cmd::Doctor { cleanup: false }),
+            "and the subcommand is still the one that was asked for"
+        );
+
+        // The FRONT-LOADED order: the one that already worked, and must keep
+        // working.
+        let before = Cli::try_parse_from(["ruagent", "--url", "http://127.0.0.1:8891", "doctor"])
+            .expect("`--url <url> doctor` must keep parsing");
+        assert_eq!(before.url, "http://127.0.0.1:8891");
+        assert!(matches!(before.cmd, Cmd::Doctor { cleanup: false }));
+
+        // A subcommand with arguments of its own takes the global too, so the
+        // flag is global rather than merely accepted after `doctor`.
+        let nested = Cli::try_parse_from([
+            "ruagent",
+            "distill",
+            "--session",
+            "sess/key",
+            "--url",
+            "http://127.0.0.1:9",
+        ])
+        .expect("a nested subcommand takes the global as well");
+        assert_eq!(nested.url, "http://127.0.0.1:9");
+
+        // The default is untouched: the local daemon when no flag is given.
+        // (Skipped when RUAGENT_URL is set: the env fallback is deliberate.)
+        if std::env::var("RUAGENT_URL").is_err() {
+            let default = Cli::try_parse_from(["ruagent", "status"]).expect("status parses");
+            assert_eq!(default.url, "http://127.0.0.1:8787");
+        }
     }
 
     /// t9 / #47: the CLI surface itself, without a daemon. Exactly one target is
