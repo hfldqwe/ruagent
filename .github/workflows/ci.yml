@@ -201,7 +201,7 @@ jobs:
       # Each name is DEMANDED in the log: with `--include-ignored` alone, a test
       # could still be skipped by a *new* `#[ignore]` and the summary would not
       # notice it.
-      - name: Ignored instruments CI can satisfy (daemon / mock-agent present)
+      - name: Ignored instruments CI can satisfy (daemon + mcp roundtrip, mock-agent present)
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/t65"
@@ -223,7 +223,30 @@ jobs:
             both_paths_emit_the_contract_truncation_marker \
             a_retried_run_carries_the_shared_retry_prefix \
             chat_event_carries_the_injection_budget_report
-          exit "$rc"
+
+          # A NINTH INSTRUMENT, IN A SECOND TARGET (ruagent-issues-56-59 t29). The mcp
+          # roundtrip's a_governed_refusal_is_an_error_and_an_empty_pass_is_not has the
+          # SAME precondition as the eight above -- the mock binary that
+          # "cargo test --workspace" just built next to the test binaries -- and the same
+          # shape of reading: a real in-process daemon over the real MCP seam, whose ACP
+          # extraction tier is driven by that mock agent, with the refusal arriving as an
+          # ERROR whose text names the refused pair. It lives in another crate, so it is
+          # another target; its name is demanded the same way, and a missing binary is a
+          # FAILURE there too (the test is #[ignore]d with that binary as its
+          # precondition, t37).
+          set +e
+          cargo test -p ruagent-mcp --test roundtrip -- --include-ignored \
+            2>&1 | tee "$RUNNER_TEMP/t65/linux-mcp-ignored.log"
+          rc_mcp=${PIPESTATUS[0]}
+          set -e
+          echo "$rc_mcp" > "$RUNNER_TEMP/t65/linux-mcp-ignored.rc"
+          echo "mcp roundtrip instrumentation exit code: $rc_mcp"
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (ubuntu) -- mcp roundtrip instrumentation (--include-ignored)" \
+            "$RUNNER_TEMP/t65/linux-mcp-ignored.log" "$rc_mcp" \
+            a_governed_refusal_is_an_error_and_an_empty_pass_is_not
+          # BOTH readings fail this step, whichever one is red.
+          exit "$(( rc != 0 || rc_mcp != 0 ))"
 
       # ------------------------------------------- the manifest of the rest
       # Visible skip accounting. `--ignored --list` is the source of truth for
@@ -255,16 +278,19 @@ jobs:
           fi
           found=$(grep -cE ': test$' "$RUNNER_TEMP/t65/ignored-list.txt" || true)
 
-          # RUN by the step above (8). Their names are demanded there.
-          covered=8
-          # DECLARED NOT COVERED here (9). CI has no ~/.ruagent database, no real
+          # RUN by the step above (9). Their names are demanded there: the eight daemon
+          # instruments (one target) and, since t29, the mcp roundtrip's governed-refusal
+          # instrument (a second target, same mock-binary precondition).
+          covered=9
+          # DECLARED NOT COVERED here (10). CI has no ~/.ruagent database, no real
           # ~/.ruagent root and no e5 model; these instruments' subject IS the real
           # history, so a synthetic fixture would not measure them (an empty copy is
           # rejected by their own non-vacuity assertions, t33/t36) -- that is why they
           # are named instead of faked. The ninth is memory's t75 inventory: it reads a
           # NAMED real root, read-only, and is `#[ignore]`d since t165 so that its skip
-          # is counted here instead of passing on nothing.
-          declared_not_covered=9
+          # is counted here instead of passing on nothing. The TENTH (t29) is a measurement
+          # harness with no assertion in it: its row below says why CI does not run it.
+          declared_not_covered=10
           expected=$((covered + declared_not_covered))
 
           {
@@ -276,11 +302,12 @@ jobs:
             echo ""
             echo "| ignored test | disposition here |"
             echo "| --- | --- |"
-            echo "| \`injection_e2e\`: 8 names | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`) |"
+            echo "| \`injection_e2e\`: 8 names + \`roundtrip\`: a_governed_refusal_is_an_error_and_an_empty_pass_is_not | RUN (\`--include-ignored\`, mock binary built by \`cargo test --workspace\`; t29 added the second target) |"
             echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` (for live_copy_keeps_history_nullable and live_copy_bigram_backfill_at_scale) and \`RUAGENT_T25_LIVE_COPY\` (for live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, which needs a PRE-0024 copy) = migrated COPYs of a real database. A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. T6 and T25 must point at SEPARATE copies (t36). |"
             echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
             echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"
             echo "| \`memory\`: the_real_root_inventory_is_read_when_it_is_named | NOT RUN: needs \`RUAGENT_T75_REAL_ROOT\` = a real ruagent root, read-only (it names that machine's backup files). Declared since t165: it used to print SKIPPED and return, which counted as \`passed\` while measuring nothing and which \`--ignored --list\` could not see. |"
+            echo "| \`daemon\`: orphans::tests::measure_attribution_pass_cost | NOT RUN: it is a MEASUREMENT harness with NO assertion in it -- its own doc says why (the number depends on the machine's process table and its load, so an assertion on it would be a flake generator). What it produces is the t24 old-vs-new attribution cost and the per-3-second-window projection, read on a machine whose load the reader knows, and it spawns 12 sleeper processes to do it; a shared runner has no baseline to compare those numbers against, so running it here would print numbers nothing can judge. The BEHAVIOUR it measures is covered by the t24 correctness tests, which run in the default pass. |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ "$found" -ne "$expected" ]; then
@@ -328,7 +355,7 @@ jobs:
             echo "* **Format** (\`cargo fmt --all --check\`): \`rust-linux\` step 7. Not run here."
             echo "* **Clippy** (\`cargo clippy --workspace --all-targets -- -D warnings\`): \`rust-linux\` step 8. Not run here."
             echo "* **Guard against nested-Result misjudgement**: \`rust-linux\` step 9. Not run here."
-            echo "* **The ignored-instrument accounting** -- \`Ignored instruments CI can satisfy\` (step 12) **and** \`Ignored-instrument manifest\` (step 13), which is the one that compares \`--ignored --list\` to the declared sets. Not run here."
+            echo "* **The ignored-instrument accounting** -- \`Ignored instruments CI can satisfy (daemon + mcp roundtrip, mock-agent present)\` (step 12) **and** \`Ignored-instrument manifest\` (step 13), which is the one that compares \`--ignored --list\` to the declared sets. Not run here."
             echo "* **Guard: workflow-referenced paths must be tracked** (\`bash .github/workflows/scripts/check-workflow-refs.sh\`): \`rust-linux\` step 5. Not run here."
             echo ""
             echo "That is not a hypothetical: in run 37139111136 the ubuntu job failed at \`Ignored-instrument manifest\` (\`ignored-test count changed: found 16, this job accounts for 15\`) **while this job was green (10m12s)**. A green here would have looked like \"the skip accounting passed\"; it meant \"the skip accounting did not run\"."
@@ -337,7 +364,7 @@ jobs:
             echo ""
             echo "* **the panel** (its own job) and **the Playwright suite** (its own workflow)."
             echo "* **the 8 live-COPY instruments** (store 3, graph 3, knowledge 2): same reason as the ubuntu job's manifest -- no real \`~/.ruagent\` and no e5 model on a runner."
-            echo "* **the ubuntu job's \`--include-ignored\` instrumentation of the daemon 8**: this job builds them too, but does not demand those 8 names; the ubuntu job is the one that does."
+            echo "* **the ubuntu job's \`--include-ignored\` instrumentation of the 9 satisfiable instruments** (the daemon 8 + the mcp roundtrip refusal instrument, t29): this job builds them too, but does not demand those names; the ubuntu job is the one that does."
             echo "* **the panel job's \`Audit self-test\`** (that job, step 5): a green here says nothing about it either."
             echo "* **anything only a non-main push would catch**: this job runs on main pushes only, so it does not run on pull requests."
           } | tee -a "$GITHUB_STEP_SUMMARY"

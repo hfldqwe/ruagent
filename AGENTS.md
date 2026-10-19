@@ -177,7 +177,11 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   `ruagent-store` reporting `MIGRATIONS=25` while the source declared 26, and a compiled
   `ruagent-mcp` listing 14 tools while the source declared 18. **The shared target dir is the
   leading explanation for all three**, so clean and rebuild before believing a red, a missing symbol
-  or a surprising count.
+  or a surprising count. Measured twice more (ruagent-issues-56-59, in a PRIVATE target dir, so this
+  is not only a shared-dir problem): the compiled `ruagent-memory` rlib lacked a type the source
+  declared (`WriteError`, while the same tree's `cargo check` was green) and `ruagent-store`'s rlib
+  lacked a column (`memories_refused`); `cargo clean -p <package>` turned both green. Same tell, same
+  remedy -- clean first rather than investigating that shape as a source regression.
   * Remedy: `cargo clean -p <package>` (for the policy case above, `ruagent-policy`), or `-p` over
     the workspace packages when several are suspect; measured ~1m24s, after which the same
     `cargo rustc ... -o <private path>` succeeds. `cargo build -p ruagent --bin ruagent` compiles
