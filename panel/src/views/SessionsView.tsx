@@ -6,11 +6,14 @@
 // The page's own notes live at the top of Sessions.tsx.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Dropdown, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
+import { Alert, Button, Checkbox, Dropdown, Input, Popconfirm, Segmented, Select, Tooltip } from "antd";
 import {
   api,
   DistillRefusedError,
+  numOrNull,
+  refusedAny,
   type DistillBatchOutcome,
+  type DistillLedgerEntry,
   type DistillRefusedPayload,
   type DistillScope,
   type DistillTier,
@@ -334,6 +337,22 @@ export function Sessions() {
         // of the default the daemon already has.
         only: distillScope === "all" ? undefined : distillScope,
       });
+      // t23 / issue #66: THE LIST IS THE ONE FIELD THIS PAGE CANNOT LIVE
+      // WITHOUT, and it is unwrapped here rather than in the render -- the same
+      // coupling class the ledger card had. A body without it is a contradictory
+      // response, not an empty page: say so instead of handing undefined to a
+      // virtualised list (which unmounts the whole route).
+      if (!Array.isArray(r.sessions)) {
+        setState({
+          kind: "error",
+          err: new Error(t("sessions.inconsistent.list")),
+          rows: null,
+          // No rows are kept, so this is NOT the stale-rows case: a null "at" is
+          // what makes the failure's OWN message the one the card shows.
+          at: null,
+        });
+        return;
+      }
       setState({ kind: "ready", rows: r.sessions, at: Date.now() });
       // `?? 0` is not defensive noise: an older daemon without the field
       // answered undefined, and the label rendered the literal string
@@ -376,6 +395,44 @@ export function Sessions() {
   useEffect(() => {
     refreshPlan(tier);
   }, [refreshPlan, tier]);
+
+  /** t22 / issues #68 + #67: WHICH SESSIONS WERE REFUSED -- the "these still
+   *  have to be re-run" list. It cannot be answered from this page's window: a
+   *  refused pass WAS recorded (status ok), so the session left the undistilled
+   *  backlog and never comes back on its own. So it is read from the ledger's
+   *  own refusal facet, and the NEWEST attempt of each session decides. */
+  const [refusedSessions, setRefusedSessions] = useState<{
+    supported: boolean;
+    keys: Set<string>;
+  } | null>(null);
+  const [refusedOnly, setRefusedOnly] = useState(false);
+  const loadRefused = useCallback(() => {
+    api
+      .distillLog({ refused: "only", limit: 200 })
+      .then((p) => {
+        // The daemon orders by id DESC, so the FIRST row of a session is its
+        // NEWEST attempt: an older refusal does not survive a newer success.
+        const newest = new Map<string, DistillLedgerEntry>();
+        for (const e of p.entries) if (!newest.has(e.session_key)) newest.set(e.session_key, e);
+        const keys = new Set(
+          [...newest.values()].filter((e) => refusedAny(e)).map((e) => e.session_key),
+        );
+        // totals.refused is what tells a REPORTING daemon from one that predates
+        // the column -- the entries alone cannot (no returned row looks the same
+        // either way), and "no list" must not be shown as "an empty list".
+        setRefusedSessions({
+          supported: typeof p.totals.refused === "number",
+          keys,
+        });
+      })
+      // A failed read must not invent a list: the control stays disabled and no
+      // row is marked.
+      .catch(() => setRefusedSessions({ supported: false, keys: new Set() }));
+  }, []);
+
+  useEffect(() => {
+    loadRefused();
+  }, [loadRefused]);
 
   // "data may be stale · N seconds ago" has to actually tick.
   useEffect(() => {
@@ -441,6 +498,11 @@ export function Sessions() {
       if (filter !== "all" && s.source !== filter) return false;
       if (ws !== "all" && s.project !== ws) return false;
       if (since && s.updated_at < since) return false;
+      // t22 / #67: the "refused last time, waiting for a re-run" list. Applied
+      // only when the daemon reports the counts AND the toggle is on: with no
+      // facet available, an empty list would claim a measurement nobody made.
+      if (refusedOnly && refusedSessions?.supported && !refusedSessions.keys.has(s.key))
+        return false;
       if (needle) {
         const hay = `${s.title ?? ""} ${s.project ?? ""} ${s.preview ?? ""} ${
           s.agent ?? ""
@@ -460,14 +522,16 @@ export function Sessions() {
       out.sort((a, b) => b.started_at - a.started_at || b.updated_at - a.updated_at);
     }
     return out;
-  }, [rows, filter, ws, when, q, systemMode, sort]);
+  }, [rows, filter, ws, when, q, systemMode, sort, refusedOnly, refusedSessions]);
 
-  const anyFilter = filter !== "all" || ws !== "all" || when !== "all" || q.trim() !== "";
+  const anyFilter =
+    filter !== "all" || ws !== "all" || when !== "all" || q.trim() !== "" || refusedOnly;
   const clearFilters = () => {
     setFilter("all");
     setWs("all");
     setWhen("all");
     setQ("");
+    setRefusedOnly(false);
   };
 
   /** Archive = hide from this list. It writes one row in the daemon's own
@@ -720,6 +784,41 @@ export function Sessions() {
             A native `title` carries the explanation: a Tooltip would wrap a
             controlled control for no gain, and the labels already say which tier
             costs money. */}
+        {/* t22 / #67: THE "待重跑" LIST. A refused pass is recorded as ok, so
+            those sessions leave the undistilled backlog and never return to it
+            by themselves; this toggle is the way back to them. Disabled unless
+            the daemon reports the refusal counts, because an empty list would
+            otherwise claim a measurement nobody made. */}
+        {/* The support flag and the count ride on a WRAPPER: antd's Checkbox
+            does not forward unknown data-* props to its root element, so a
+            reader (or a test) would otherwise have no way to tell "this daemon
+            cannot answer" from "nothing matched". */}
+        <span
+          className="sessions-refused-box"
+          data-supported={refusedSessions?.supported ? "true" : "false"}
+          data-refused-sessions={
+            refusedSessions?.supported ? refusedSessions.keys.size : "not_recorded"
+          }
+        >
+          <Tooltip
+            title={
+              refusedSessions?.supported
+                ? t("sessions.refused.onlyHint")
+                : t("sessions.refused.onlyUnsupported")
+            }
+          >
+            <Checkbox
+              className="sessions-refused"
+              checked={refusedOnly}
+              disabled={!refusedSessions?.supported}
+              onChange={(e) => setRefusedOnly(e.target.checked)}
+            >
+              {t("sessions.refused.onlyTag", {
+                n: refusedSessions?.supported ? refusedSessions.keys.size : t("distill.notRecorded"),
+              })}
+            </Checkbox>
+          </Tooltip>
+        </span>
         <span className="sessions-tier" title={t("sessions.tier.hint")}>
           <Segmented
             value={tier}
@@ -816,7 +915,12 @@ export function Sessions() {
           hint={
             state.kind === "error" && state.at
               ? `${t("common.stale")} · ${staleSec}s — ${t("sessions.stale.hint")}`
-              : t("sessions.err.hint")
+              : state.kind === "error"
+                ? // t23 / issue #66: with no rows to keep, the failure's OWN
+                  // message is what the reader needs -- a contradictory response
+                  // has to say WHICH coupling failed, not just that a load did.
+                  `${t("sessions.err.hint")} — ${String(state.err).slice(0, 200)}`
+                : t("sessions.err.hint")
           }
           onRetry={() => void load()}
           retryLabel={t("common.retry")}
@@ -863,6 +967,7 @@ export function Sessions() {
           ) : (
             <RowList
               rows={filtered}
+              refusedKeys={refusedSessions?.supported ? refusedSessions.keys : null}
               distilling={distilling}
               busy={busy}
               narrow={narrow}
@@ -928,12 +1033,18 @@ export function Sessions() {
           // `refreshPlan` takes the tier it should price, so it cannot be passed
           // bare: a bare reference would hand it `undefined` as the tier.
           onReloadPlan={() => refreshPlan(tier)}
+          refusedSessionsCount={
+            refusedSessions?.supported ? refusedSessions.keys.size : null
+          }
           onClose={() => setBatchOpen(false)}
           onDone={() => {
             // The pass changed standings and the backlog; both readers are
             // re-asked here rather than by a poll that may be 10s away.
             void load();
             refreshPlan(tier);
+            // A pass can ADD refusals, so the "waiting for a re-run" list is
+            // re-read here rather than left describing the state before it.
+            loadRefused();
           }}
         />
       )}
@@ -972,6 +1083,7 @@ function RowList({
   onDistill,
   onArchive,
   onDelete,
+  refusedKeys,
 }: {
   rows: SessionRecord[];
   distilling: string | null;
@@ -979,6 +1091,10 @@ function RowList({
   narrow: boolean;
   onOpen: (s: SessionRecord, el: HTMLElement | null) => void;
   onDistill: (s: SessionRecord) => void;
+  /** t22 / #67: the sessions whose NEWEST distillation was refused, or null when
+   *  the daemon does not report the refusal counts -- null and an empty set are
+   *  different states (nothing to mark vs. this daemon cannot say). */
+  refusedKeys: Set<string> | null;
   onArchive: (s: SessionRecord, on: boolean) => void;
   onDelete: (s: SessionRecord) => void;
 }) {
@@ -1131,6 +1247,16 @@ function RowList({
                 data-distilled={s.distilled ? "true" : "false"}
               >
                 {t(s.distilled ? "sessions.distill.state.ok" : "sessions.distill.state.none")}
+              </span>
+            </Tooltip>
+          ) : null}
+          {/* t22 / #67: the row's own mark, read from the LEDGER's refusal
+              column -- not from distill_status, which is the ledger's status
+              word and says ok for a pass that wrote nothing. */}
+          {!narrow && refusedKeys?.has(s.key) ? (
+            <Tooltip title={t("sessions.refused.rowHint")}>
+              <span className="tag err" data-refused-retry="true">
+                {t("sessions.refused.rowTag")}
               </span>
             </Tooltip>
           ) : null}
@@ -1438,6 +1564,7 @@ function BatchDistillModal({
   onReloadPlan,
   onClose,
   onDone,
+  refusedSessionsCount,
 }: {
   plan: DistillBatchOutcome | null;
   planErr: unknown;
@@ -1448,6 +1575,11 @@ function BatchDistillModal({
   onReloadPlan: () => void;
   onClose: () => void;
   onDone: () => void;
+  /** t22 / #67: how many sessions were refused last time, or null when this
+   *  daemon does not report it. The batch's backlog CANNOT contain them (a
+   *  refused pass is recorded as ok), so the modal says where they went rather
+   *  than leaving "why is my refused session not in this batch?" unexplained. */
+  refusedSessionsCount: number | null;
 }) {
   const { t } = useI18n();
   const [busy, setBusy] = useState(false);
@@ -1487,7 +1619,28 @@ function BatchDistillModal({
     }
   };
 
-  const est = plan?.estimated;
+  /** t23 / issue #66: the plan block renders FOUR nested pieces of one response
+   *  (estimated, its basis, the plan counters, the actual). They are unwrapped
+   *  through this check instead of being reached into, so a plan whose
+   *  estimated block is missing says so rather than showing an empty modal. */
+  const est =
+    plan && typeof plan.estimated === "object" && plan.estimated !== null
+      ? plan.estimated
+      : null;
+  /** The receipt's counted block is ONE reading (t22 prints its invariant beside
+   *  it), so it is rendered from numbers or not at all: a sum of NaNs is exactly
+   *  the self-contradictory sentence this page must not print as data. */
+  const counters = (() => {
+    const attempted = numOrNull(outcome?.attempted);
+    const ok = numOrNull(outcome?.ok);
+    const empty = numOrNull(outcome?.empty);
+    const failed = numOrNull(outcome?.failed);
+    return attempted != null && ok != null && empty != null && failed != null
+      ? { attempted, ok, empty, failed, sum: ok + empty + failed }
+      : null;
+  })();
+  /** The per-session results, or null when the response did not carry an array. */
+  const results = outcome && Array.isArray(outcome.results) ? outcome.results : null;
   const act = outcome?.actual;
   /** Whether the tier that RAN calls the model. The daemon's own label decides:
    *  `rules` is the free one, `acp` and `rules+acp` are not. */
@@ -1550,6 +1703,12 @@ function BatchDistillModal({
       ) : null}
       {!plan && !planErr ? <Spinner /> : null}
 
+      {plan && !est && !outcome ? (
+        <p className="muted micro" data-batch-inconsistent="estimated">
+          {t("distill.batch.inconsistent.estimated")}
+        </p>
+      ) : null}
+
       {plan && est && !outcome ? (
         <>
           <p className="muted micro">{t("distill.batch.dryNote")}</p>
@@ -1558,6 +1717,11 @@ function BatchDistillModal({
             {" · "}
             {t("distill.batch.backlog", { n: plan.undistilled_total })}
           </p>
+          {refusedSessionsCount ? (
+            <p className="muted micro" data-batch-refused-retry={refusedSessionsCount}>
+              {t("sessions.refused.batchNote", { n: refusedSessionsCount })}
+            </p>
+          ) : null}
           <ReadoutStrip
             grid
             items={[
@@ -1631,16 +1795,22 @@ function BatchDistillModal({
               {t("sessions.tier.run.mismatch", { x: outcome.extractor, y: sentTier })}
             </p>
           ) : null}
-          <p>
-            <strong>
-              {t("distill.batch.counted", {
-                n: outcome.attempted,
-                ok: outcome.ok,
-                empty: outcome.empty,
-                failed: outcome.failed,
-              })}
-            </strong>
-          </p>
+          {counters == null ? (
+            <p className="muted micro" data-batch-inconsistent="counters">
+              {t("distill.batch.inconsistent.counters")}
+            </p>
+          ) : (
+            <p>
+              <strong>
+                {t("distill.batch.counted", {
+                  n: counters.attempted,
+                  ok: counters.ok,
+                  empty: counters.empty,
+                  failed: counters.failed,
+                })}
+              </strong>
+            </p>
+          )}
           {/* #62: THE REFUSED CLASS, beside the ledger's three words rather than
               as a fourth. "refused" is a subset of "ok" (an attempt that ran,
               was recorded, and wrote nothing because the vocabulary refused every
@@ -1655,20 +1825,20 @@ function BatchDistillModal({
               ? t("sessions.refused.batchNotReported")
               : t("sessions.refused.batch", { n: refusedCount })}
           </p>
-          <p
-            className="muted micro"
-            data-batch-sum={
-              String(outcome.ok + outcome.empty + outcome.failed) + "/" + String(outcome.attempted)
-            }
-          >
-            {t("sessions.refused.batchSum", {
-              ok: outcome.ok,
-              empty: outcome.empty,
-              failed: outcome.failed,
-              sum: outcome.ok + outcome.empty + outcome.failed,
-              attempted: outcome.attempted,
-            })}
-          </p>
+          {counters == null ? null : (
+            <p
+              className="muted micro"
+              data-batch-sum={String(counters.sum) + "/" + String(counters.attempted)}
+            >
+              {t("sessions.refused.batchSum", {
+                ok: counters.ok,
+                empty: counters.empty,
+                failed: counters.failed,
+                sum: counters.sum,
+                attempted: counters.attempted,
+              })}
+            </p>
+          )}
           {act ? (
             <>
               <div className="zone-head">
@@ -1703,12 +1873,18 @@ function BatchDistillModal({
               <p className="muted micro">{t("distill.batch.actualNote")}</p>
             </>
           ) : null}
-          <div className="zone-head">
-            <div className="zone-title">{t("distill.batch.results")}</div>
-            <span className="zone-note">{outcome.results.length}</span>
-          </div>
-          <div className="card">
-            {outcome.results.map((r) => (
+          {results == null ? (
+            <p className="muted micro" data-batch-inconsistent="results">
+              {t("distill.batch.inconsistent.results")}
+            </p>
+          ) : (
+            <>
+              <div className="zone-head">
+                <div className="zone-title">{t("distill.batch.results")}</div>
+                <span className="zone-note">{results.length}</span>
+              </div>
+              <div className="card">
+                {results.map((r) => (
               <div
                 key={r.session_key}
                 className="row tight"
@@ -1751,8 +1927,10 @@ function BatchDistillModal({
                 ) : null}
                 {r.reason ? <span className="muted micro">{r.reason}</span> : null}
               </div>
-            ))}
-          </div>
+                ))}
+              </div>
+            </>
+          )}
         </>
       ) : null}
 

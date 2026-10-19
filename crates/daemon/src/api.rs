@@ -4152,10 +4152,12 @@ async fn sessions_distill_batch(
             .map_err(|e| format!("{e:#}"));
         let written = attempt_written_since(db, key, before).await?;
         let (status, reason) = classify_attempt(&attempt, written);
-        // What the ATTEMPT said about the write vocabulary, taken from the outcome
-        // rather than from the row (the ledger has no refusal column -- see
-        // DistillOutcome::refusal_reason), so the batch reports the same fact the
-        // single route's 409 does.
+        // What the ATTEMPT said about the write vocabulary, taken from the OUTCOME
+        // rather than from the row: the outcome is the same fact the single route's
+        // 409 reports, in the same request, with no read of the ledger in between.
+        // The ledger DOES carry the count now (0031, t21 / issues #68, #67) and the
+        // writer records it from the same field, so the two agree by construction --
+        // the row is for later readers, the outcome is for this response.
         let (mem_written, mem_refused, refusals) = match &attempt {
             Ok(out) => (
                 out.memories_written,
@@ -4506,6 +4508,18 @@ async fn batch_actual(
 /// the envelope's `truncated` (this page left rows out) are DIFFERENT fields, kept
 /// in different namespaces: the row's is inside `entries[]`, the page's is beside
 /// `total`.
+/// THE REFUSAL FACET (t21 / issues #68, #67) is the same shape, one axis over.
+/// Since 0031 each row may carry memories_refused, so
+/// ?refused=only|none|not_recorded selects the attempts whose write path refused
+/// something, the ones with a MEASURED zero, and the ones that recorded no count at
+/// all -- three different answers, with totals.refused and
+/// totals.refused_not_recorded counting them over the same filter as every other
+/// number here. HOW A READER JUDGES A REFUSAL: memories_refused > 0 AND
+/// memories_written == 0 is "the pass was REFUSED EVERYTHING" -- the case that
+/// answers HTTP 409, and the case #68 measured as [ok] + exit 0 in the CLI. status
+/// alone cannot say it: the ledger keeps ok there because the pass DID run and
+/// measure, and the status vocabulary stays closed (the panel counts by its three
+/// words).
 #[derive(Deserialize)]
 struct DistillLogQuery {
     /// ok | empty | failed | not_recorded. Absent = every row.
@@ -4514,6 +4528,14 @@ struct DistillLogQuery {
     /// Exact `distill_log.session_key` match. Absent = every session.
     #[serde(default)]
     session: Option<String>,
+    /// only | none | not_recorded -- THE REFUSAL FACET (t21 / issues #68, #67).
+    /// Absent = every row. `only` selects the attempts whose write path REFUSED
+    /// something, which is the list "which sessions were refused, and have to be
+    /// re-run?" was missing; `none` is a MEASURED refusal count of 0, and
+    /// `not_recorded` the pre-0031 rows that carry no count at all -- three
+    /// different answers, exactly like `status=not_recorded` beside them.
+    #[serde(default)]
+    refused: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
@@ -4533,7 +4555,16 @@ const DISTILL_LOG_STATUSES: [&str; 4] = ["ok", "empty", "failed", "not_recorded"
 /// the clause is not simply `status = ?1`.
 const DISTILL_LOG_FILTER: &str =
     " WHERE (?1 IS NULL OR (?1 = 'not_recorded' AND status IS NULL) OR status = ?1)
-                                       AND (?2 IS NULL OR session_key = ?2)";
+                                       AND (?2 IS NULL OR session_key = ?2)
+                                       AND (?3 IS NULL
+                                            OR (?3 = 'only' AND memories_refused > 0)
+                                            OR (?3 = 'none' AND memories_refused = 0)
+                                            OR (?3 = 'not_recorded' AND memories_refused IS NULL))";
+
+/// The refusal facet's closed vocabulary (t21 / issues #68, #67), the same shape
+/// `DISTILL_LOG_STATUSES` uses one line up: an unknown value is a 400 that names
+/// the accepted ones, never a silently empty page.
+const DISTILL_LOG_REFUSED: [&str; 3] = ["only", "none", "not_recorded"];
 
 /// The ledger's columns, in the order `distill_entry` reads them.
 ///
@@ -4544,7 +4575,7 @@ const DISTILL_LOG_FILTER: &str =
 const DISTILL_LOG_COLUMNS: &str = "id, session_key, distilled_at, status, failure_reason, agent, \
      memories_written, entities_written, relations_written, relations_duplicate, \
      relations_refused, tokens_used, context_size, cost_usd, retries, windows, truncated, \
-     prompt_hash, from_seq, to_seq, total_messages";
+     prompt_hash, from_seq, to_seq, total_messages, memories_refused";
 
 /// One read of the ledger, gathered inside ONE closure so the page, the total, the
 /// distribution and the sums all describe the same rows.
@@ -4564,30 +4595,39 @@ struct DistillLedger {
     /// over the SAME filter as every other number here. A 0 here is a MEASURED
     /// zero (every row recorded a range), never a fabricated range.
     coverage_not_recorded: i64,
+    /// How many rows in the filtered set record a REFUSAL (t21 / issues #68, #67):
+    /// `memories_refused > 0`. Counted, not summed: "how many attempts were
+    /// refused" is the question an operator asks, and the refusal COUNT is already
+    /// per row.
+    refused: i64,
+    /// How many rows in the filtered set did NOT record a refusal count at all
+    /// (pre-0031 rows). A `0` here is a MEASURED zero -- every row answered.
+    refused_not_recorded: i64,
 }
 
 fn read_distill_ledger(
     conn: &rusqlite::Connection,
     status: Option<&str>,
     session: Option<&str>,
+    refused: Option<&str>,
     limit: u32,
     offset: u32,
 ) -> rusqlite::Result<DistillLedger> {
     let sql = format!(
         "SELECT {DISTILL_LOG_COLUMNS} FROM distill_log{DISTILL_LOG_FILTER} ORDER BY id DESC \
-         LIMIT ?3 OFFSET ?4"
+         LIMIT ?4 OFFSET ?5"
     );
     let entries = conn
         .prepare(&sql)?
         .query_map(
-            rusqlite::params![status, session, limit as i64, offset as i64],
+            rusqlite::params![status, session, refused, limit as i64, offset as i64],
             distill_entry,
         )?
         .collect::<Result<Vec<_>, _>>()?;
 
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM distill_log{DISTILL_LOG_FILTER}"),
-        rusqlite::params![status, session],
+        rusqlite::params![status, session, refused],
         |r| r.get(0),
     )?;
 
@@ -4603,7 +4643,7 @@ fn read_distill_ledger(
         let mut stmt = conn.prepare(&format!(
             "SELECT status, COUNT(*) FROM distill_log{DISTILL_LOG_FILTER} GROUP BY status"
         ))?;
-        let rows = stmt.query_map(rusqlite::params![status, session], |r| {
+        let rows = stmt.query_map(rusqlite::params![status, session, refused], |r| {
             Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
         })?;
         for row in rows {
@@ -4622,25 +4662,36 @@ fn read_distill_ledger(
     // what is counted here -- one column non-null and two null would be a
     // half-measurement, not a range. COUNT(expr) and never SUM(...): over an empty
     // filtered set SUM is NULL and this read would fail, while COUNT is 0.
-    let (tokens_used, tokens_recorded, cost_usd, cost_recorded, coverage_recorded) = conn
-        .query_row(
-            &format!(
-                "SELECT SUM(tokens_used), COUNT(tokens_used), SUM(cost_usd), COUNT(cost_usd), \
+    let (
+        tokens_used,
+        tokens_recorded,
+        cost_usd,
+        cost_recorded,
+        coverage_recorded,
+        refused_rows,
+        refused_recorded,
+    ) = conn.query_row(
+        &format!(
+            "SELECT SUM(tokens_used), COUNT(tokens_used), SUM(cost_usd), COUNT(cost_usd), \
                     COUNT(CASE WHEN from_seq IS NOT NULL AND to_seq IS NOT NULL \
-                               AND total_messages IS NOT NULL THEN 1 END) \
+                               AND total_messages IS NOT NULL THEN 1 END), \
+                    COUNT(CASE WHEN memories_refused > 0 THEN 1 END), \
+                    COUNT(memories_refused) \
                FROM distill_log{DISTILL_LOG_FILTER}"
-            ),
-            rusqlite::params![status, session],
-            |r| {
-                Ok((
-                    r.get::<_, Option<i64>>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<f64>>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            },
-        )?;
+        ),
+        rusqlite::params![status, session, refused],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
 
     Ok(DistillLedger {
         entries,
@@ -4651,6 +4702,8 @@ fn read_distill_ledger(
         tokens_not_recorded: total - tokens_recorded,
         cost_not_recorded: total - cost_recorded,
         coverage_not_recorded: total - coverage_recorded,
+        refused: refused_rows,
+        refused_not_recorded: total - refused_recorded,
     })
 }
 
@@ -4696,6 +4749,16 @@ fn distill_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value>
         "from_seq": row.get::<_, Option<i64>>(18)?,
         "to_seq": row.get::<_, Option<i64>>(19)?,
         "total_messages": row.get::<_, Option<i64>>(20)?,
+        // t21 / issues #68, #67 -- HOW MANY MEMORIES THE WRITE VOCABULARY REFUSED
+        // during this attempt (0031). Published as the writer stored it: `null`
+        // means NOBODY RECORDED A COUNT (a pre-0031 row, or an attempt that never
+        // got as far as proposing a memory), while `0` is a MEASURED zero. WITH
+        // `memories_written` it is what makes the judgement machine-readable:
+        // `memories_refused > 0 AND memories_written = 0` is "the pass was REFUSED
+        // EVERYTHING", which `status` alone cannot say -- the ledger keeps
+        // `ok` there because the pass DID run and measure, and the status
+        // vocabulary is closed (the panel counts by its three words).
+        "memories_refused": row.get::<_, Option<i64>>(21)?,
     }))
 }
 
@@ -4713,13 +4776,30 @@ async fn distill_log(
             )));
         }
     };
+    let refused = match q.refused.as_deref() {
+        None => None,
+        Some(r) if DISTILL_LOG_REFUSED.contains(&r) => Some(r.to_string()),
+        Some(r) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown refused `{r}` ({})",
+                DISTILL_LOG_REFUSED.join("|")
+            )));
+        }
+    };
     let session = q.session.clone();
     let (limit, offset) = page_bounds(q.limit, q.offset, 50, 500);
     let ledger = state
         .mgr
         .db()
         .call_flat(move |conn| {
-            read_distill_ledger(conn, status.as_deref(), session.as_deref(), limit, offset)
+            read_distill_ledger(
+                conn,
+                status.as_deref(),
+                session.as_deref(),
+                refused.as_deref(),
+                limit,
+                offset,
+            )
         })
         .await?;
     let mut body = page(
@@ -4745,6 +4825,14 @@ async fn distill_log(
                 // attempts whose three coverage columns are not all recorded, over
                 // the same filter as every other number in this object.
                 "coverage_not_recorded": ledger.coverage_not_recorded,
+                // t21 / issues #68, #67: HOW MANY ATTEMPTS WERE REFUSED, and how
+                // many could not answer the question at all. The first is what an
+                // operator's "which sessions still need a re-run?" question reduces
+                // to (`?refused=only` lists exactly those rows); the second keeps
+                // the reading honest -- a pre-0031 row is NULL, never a 0, so the
+                // two are counted apart rather than folded together.
+                "refused": ledger.refused,
+                "refused_not_recorded": ledger.refused_not_recorded,
             }),
         );
     }
@@ -10197,6 +10285,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// t21 / issues #68, #67: THE LEDGER'S REFUSAL COUNT IS A READING AND A FILTER.
+    ///
+    /// Three rows, three readings of the same question, and they must not compare
+    /// equal: a pass the write vocabulary REFUSED (count > 0, nothing written, and
+    /// the ledger's word still ok), a pass that looked and kept nothing (empty, a
+    /// MEASURED zero), and a pre-0031 row (NO count recorded at all -- never a 0).
+    /// The facet is what turns "which sessions were refused and need a re-run?"
+    /// into a query instead of a sentence search.
+    #[tokio::test]
+    async fn the_ledger_lists_and_filters_the_attempts_the_write_path_refused() {
+        let (app, db, root) = harness().await;
+        let seed = |conn: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash,
+                     windows, truncated, memories_refused)
+                 VALUES ('ruagent:t21-refused', '2026-01-01T00:00:01Z', 0, 0, 0, 'rules', 'ok',
+                         'the write path REFUSED every memory this pass proposed (2 refused, \
+                          none written)', 'hash-refused', 1, 0, 2)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash,
+                     windows, truncated, memories_refused)
+                 VALUES ('ruagent:t21-empty', '2026-01-01T00:00:02Z', 0, 0, 0, 'rules', 'empty',
+                         NULL, 'hash-empty', 1, 0, 0)",
+                [],
+            )?;
+            // The pre-0031 shape: the column did not exist, so the row records none.
+            conn.execute(
+                "INSERT INTO distill_log
+                    (session_key, distilled_at, memories_written, entities_written,
+                     relations_written, agent, status, failure_reason, prompt_hash,
+                     windows, truncated)
+                 VALUES ('ruagent:t21-old', '2026-01-01T00:00:03Z', 1, 0, 0, 'rules', 'ok',
+                         NULL, 'hash-old', 1, 0)",
+                [],
+            )?;
+            Ok(())
+        };
+        db.call_flat(seed).await.unwrap();
+
+        // 1. The whole ledger publishes the column exactly as the writer stored it.
+        let (st, v, raw) = hit(&app, "GET", "/api/v1/distill/log").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!(
+            "READING t21 [distill/log] totals={} refused_row={}",
+            v["totals"],
+            v["entries"]
+                .as_array()
+                .and_then(|e| e.iter().find(|r| r["session_key"] == "ruagent:t21-refused"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        );
+        let entry = |key: &str| -> serde_json::Value {
+            v["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|r| r["session_key"] == key)
+                .unwrap_or_else(|| panic!("{key} missing from {v}"))
+                .clone()
+        };
+        let refused = entry("ruagent:t21-refused");
+        assert_eq!(
+            refused["status"], "ok",
+            "the LEDGER's word is unchanged -- the pass ran and measured: {refused}"
+        );
+        assert_eq!(refused["memories_written"], 0, "{refused}");
+        assert_eq!(
+            refused["memories_refused"], 2,
+            "the refusal count is a column now, not only a sentence: {refused}"
+        );
+        let empty = entry("ruagent:t21-empty");
+        assert_eq!(empty["status"], "empty", "{empty}");
+        assert_eq!(
+            empty["memories_refused"], 0,
+            "a MEASURED zero, and it must not compare equal to a refusal: {empty}"
+        );
+        assert!(empty["failure_reason"].is_null(), "{empty}");
+        let old = entry("ruagent:t21-old");
+        assert!(
+            old["memories_refused"].is_null(),
+            "a pre-0031 row records NO count -- never a 0: {old}"
+        );
+        assert_eq!(v["totals"]["refused"], 1, "{v}");
+        assert_eq!(v["totals"]["refused_not_recorded"], 1, "{v}");
+
+        // 2. THE FACET, which is what #67 asked for: the refused rows are listable.
+        let (st, only, rawo) = hit(&app, "GET", "/api/v1/distill/log?refused=only").await;
+        assert_eq!(st, StatusCode::OK, "{rawo}");
+        assert_eq!(only["total"], 1, "{only}");
+        assert_eq!(
+            only["entries"][0]["session_key"], "ruagent:t21-refused",
+            "{only}"
+        );
+        let (_, none, _) = hit(&app, "GET", "/api/v1/distill/log?refused=none").await;
+        assert_eq!(none["total"], 1, "{none}");
+        assert_eq!(
+            none["entries"][0]["session_key"], "ruagent:t21-empty",
+            "a measured zero is a DIFFERENT set from a refusal: {none}"
+        );
+        let (_, unrecorded, _) = hit(&app, "GET", "/api/v1/distill/log?refused=not_recorded").await;
+        assert_eq!(unrecorded["total"], 1, "{unrecorded}");
+        assert_eq!(
+            unrecorded["entries"][0]["session_key"], "ruagent:t21-old",
+            "{unrecorded}"
+        );
+
+        // 3. It COMPOSES with the filters beside it, and an unknown value is a 400
+        //    that names the vocabulary rather than a silently empty page.
+        let (_, both, _) = hit(
+            &app,
+            "GET",
+            "/api/v1/distill/log?refused=only&session=ruagent:t21-empty",
+        )
+        .await;
+        assert_eq!(both["total"], 0, "the two filters AND together: {both}");
+        let (_, both, _) = hit(
+            &app,
+            "GET",
+            "/api/v1/distill/log?refused=only&session=ruagent:t21-refused",
+        )
+        .await;
+        assert_eq!(both["total"], 1, "{both}");
+        let (st_bad, _, raw_bad) = hit(&app, "GET", "/api/v1/distill/log?refused=maybe").await;
+        assert_eq!(st_bad, StatusCode::BAD_REQUEST, "{raw_bad}");
+        assert!(
+            raw_bad.contains("only|none|not_recorded"),
+            "the 400 names the accepted values: {raw_bad}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// t6 / issues #46, #48, #55: the distillation ledger is READABLE — by status,
     /// with the failure reason, the duplicate/refused relation counts and the cost.
     ///
@@ -10462,7 +10687,9 @@ mod tests {
         }
 
         // ADDITIVE (the acceptance's second half): both rows carry every pre-t4 key
-        // AND the three new names -- the only keys this change adds anywhere.
+        // AND the names the later additive changes add -- and nothing else. t21 /
+        // issues #68, #67 appended ONE more (memories_refused, 0031), which is why
+        // this list is the place a reader finds the row's whole key set.
         let mut expected: Vec<&str> = vec![
             "id",
             "session_key",
@@ -10485,6 +10712,7 @@ mod tests {
             "from_seq",
             "to_seq",
             "total_messages",
+            "memories_refused",
         ];
         expected.sort();
         for row in [measured, unrecorded] {

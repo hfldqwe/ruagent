@@ -36,6 +36,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0028_distill_ledger.sql"),
     include_str!("migrations/0029_resolution_dismissed.sql"),
     include_str!("migrations/0030_distill_coverage.sql"),
+    include_str!("migrations/0031_distill_refused.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.
@@ -616,7 +617,11 @@ mod tests {
                 // pre-0030 order above stays pinned.
                 "from_seq",
                 "to_seq",
-                "total_messages"
+                "total_messages",
+                // 0031 appends the REFUSAL COUNT (t21 / issues #68, #67). Again at
+                // the END: a reader reads these columns by number, so inserting
+                // anywhere else would silently re-label every field of every row.
+                "memories_refused"
             ],
         );
         // 0029 appends the undecided queue's ANSWER (issue #50): every pre-0029
@@ -697,6 +702,11 @@ mod tests {
             ("distill_log", "from_seq"),
             ("distill_log", "to_seq"),
             ("distill_log", "total_messages"),
+            // 0031: how many memories the write vocabulary REFUSED (t21 / issues
+            // #68, #67). Same rule, fourth time: NULL = nobody recorded a refusal
+            // count, and a DEFAULT 0 would have restated "refused 0" for the
+            // historical rows whose own failure_reason says the pass was refused.
+            ("distill_log", "memories_refused"),
             // 0029: the undecided queue's answer. NULL = not answered yet; a
             // default would have to invent either the decision or its time.
             ("resolution_pending", "dismissed_at"),
@@ -990,6 +1000,195 @@ mod tests {
         );
     }
 
+    /// t21 / issues #68, #67: 0031 adds the ledger's REFUSAL COUNT, and this test
+    /// pins the same three properties 0028/0030 are pinned by -- an old database
+    /// upgrades, a historical row's new column reads NULL, and re-applying the
+    /// script is a no-op -- plus the head literal, which moved here because 0031 is
+    /// the newest step.
+    ///
+    /// The fixture row is deliberately a REFUSAL as a pre-0031 daemon wrote one:
+    /// `status = 'ok'`, `memories_written = 0` and the refusal sentence in
+    /// `failure_reason`. That is the exact shape this migration exists to make
+    /// machine-readable, and it is why the new column must read NULL afterwards --
+    /// a `DEFAULT 0` would have restated "refused 0" about the one row whose own
+    /// sentence says the opposite.
+    #[test]
+    fn the_refusal_count_upgrades_an_old_database_and_reapplies_cleanly() {
+        const NEW_COLUMN: &str = "memories_refused";
+
+        let v31 = MIGRATIONS
+            .iter()
+            .position(|s| s.contains("ADD COLUMN memories_refused"))
+            .expect("0031's script must be embedded in MIGRATIONS");
+        assert_eq!(
+            v31 + 1,
+            31,
+            "0031 must be MIGRATIONS[30]: the ALTER-only refusal-count migration"
+        );
+        assert_eq!(
+            v31 + 1,
+            MIGRATIONS.len(),
+            "0031 must be the NEWEST script; THIS test pins the head literal, so a              migration appended after it has to move the literal below"
+        );
+        assert_eq!(
+            SCHEMA_VERSION,
+            MIGRATIONS.len() as i64,
+            "SCHEMA_VERSION must be MIGRATIONS.len()"
+        );
+        assert_eq!(SCHEMA_VERSION, 31, "0031 makes the head thirty-one");
+
+        // ---- 1. a database as it was BEFORE 0031 ----------------------------
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_ledger(&conn).unwrap();
+        for (i, script) in MIGRATIONS.iter().take(v31).enumerate() {
+            apply_one(&mut conn, (i + 1) as i64, script).unwrap();
+        }
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            30,
+            "the fixture must NOT have seen 0031"
+        );
+        assert!(
+            !columns(&conn, "distill_log")
+                .iter()
+                .any(|c| c == NEW_COLUMN),
+            "the fixture is wrong: distill_log.{NEW_COLUMN} already exists before 0031"
+        );
+        conn.execute(
+            "INSERT INTO distill_log
+             (session_key, distilled_at, memories_written, entities_written, relations_written,
+              agent, status, failure_reason, prompt_hash, retries, windows, truncated)
+             VALUES ('s-refused', '2026-01-01T00:00:00Z', 0, 0, 0, 'agent', 'ok',
+                     'the write path REFUSED every memory this pass proposed', 'ph', 0, 1, 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_where(&conn, "SELECT COUNT(*) FROM distill_log"), 1);
+
+        // ---- 2. upgrade through the runner's own path -----------------------
+        apply(&mut conn).unwrap();
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION must follow MIGRATIONS.len() onto the new head"
+        );
+        assert!(
+            columns(&conn, "distill_log")
+                .iter()
+                .any(|c| c == NEW_COLUMN),
+            "0031 must have added distill_log.{NEW_COLUMN}"
+        );
+        let (notnull, dflt) = conn
+            .prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('distill_log')")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|(name, _, _)| name == NEW_COLUMN)
+            .map(|(_, notnull, dflt)| (notnull, dflt))
+            .expect("0031's column must exist after the upgrade");
+        assert_eq!(
+            notnull, 0,
+            "distill_log.{NEW_COLUMN} must be NULLABLE: NULL is how a pre-0031 row              says 'nobody recorded a refusal count', and NOT NULL would have              backfilled it"
+        );
+        assert!(
+            dflt.is_none(),
+            "distill_log.{NEW_COLUMN} must have NO default, got {dflt:?}"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM distill_log WHERE memories_refused IS NULL"
+            ),
+            1,
+            "the pre-0031 row must read 'not recorded', NOT a fabricated 0"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM distill_log"),
+            1,
+            "an ALTER-only migration must neither drop nor duplicate a row"
+        );
+        let (status, written, reason): (Option<String>, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, memories_written, failure_reason FROM distill_log \
+                 WHERE session_key = 's-refused'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some("ok"),
+            "the upgrade touches no value"
+        );
+        assert_eq!(written, 0);
+        assert!(
+            reason.unwrap_or_default().contains("REFUSED"),
+            "the sentence that used to be the only evidence survives"
+        );
+
+        // A row written AFTER the migration can STATE the count -- including a
+        // measured 0, which is how the new column stays distinguishable from NULL.
+        conn.execute(
+            "INSERT INTO distill_log
+             (session_key, distilled_at, memories_written, entities_written, relations_written,
+              windows, truncated, memories_refused)
+             VALUES ('s-post-refusal', '2026-01-02T00:00:00Z', 0, 0, 0, 1, 0, 3)",
+            [],
+        )
+        .unwrap();
+
+        // ---- 3. the SAME script, re-applied ---------------------------------
+        let before = schema_snapshot(&conn);
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version >= ?1",
+            rusqlite::params![(v31 + 1) as i64],
+        )
+        .unwrap();
+        apply(&mut conn).unwrap_or_else(|e| {
+            panic!("re-applying 0031 must be a no-op, not duplicate column name: {e}")
+        });
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "a re-applied ADDITIVE migration must leave the schema IDENTICAL"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM distill_log"),
+            2,
+            "the re-apply must not duplicate rows"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM distill_log WHERE session_key = 's-post-refusal'
+                   AND memories_refused = 3"
+            ),
+            1,
+            "the re-apply must not rewrite the count it already recorded"
+        );
+
+        // NEGATIVE CONTROL for that reading, in-process and without touching any
+        // shared source: the SAME statement, run unguarded, IS an error -- so the
+        // clean re-apply above is the runner's probe doing its job, not SQLite
+        // tolerating a duplicate ADD COLUMN and not a test that skipped the second
+        // application altogether.
+        let unguarded =
+            conn.execute_batch("ALTER TABLE distill_log ADD COLUMN memories_refused INTEGER;");
+        assert!(
+            unguarded.is_err(),
+            "the unguarded ALTER must fail, or the guard is untested"
+        );
+    }
+
     /// t3 / issue #58: the ledger learns WHICH MESSAGES an attempt read.
     ///
     /// 0028 gave `distill_log` the NUMERIC half of issue #48's coverage
@@ -1011,10 +1210,12 @@ mod tests {
     ///    columns. SQLite has no `ADD COLUMN IF NOT EXISTS`, so this rests
     ///    entirely on the runner's `pragma_table_info` guard: without it the boot
     ///    dies with `duplicate column name: from_seq`.
-    /// 3. **the head is 30, and pinned by a TEST rather than by arithmetic.** The
-    ///    contract is `SCHEMA_VERSION == MIGRATIONS.len()` and that length is
-    ///    THIRTY: a migration appended without the head following it, or the array
-    ///    not being extended at all, is what the literal catches.
+    /// 3. **the head follows the array, and the literal moves with each newest
+    ///    step.** The contract is `SCHEMA_VERSION == MIGRATIONS.len()`; the pin on
+    ///    the LITERAL lives in whichever test covers the newest migration, which
+    ///    since 0031 is the_refusal_count_upgrades_an_old_database_and_reapplies_cleanly
+    ///    below. What THIS test pins is that 0030 is MIGRATIONS[29] and that its own
+    ///    step (into 30) works on a database that pre-dates it.
     #[test]
     fn the_coverage_columns_upgrade_an_old_database_and_reapply_cleanly() {
         const NEW_COVERAGE_COLUMNS: &[&str] = &["from_seq", "to_seq", "total_messages"];
@@ -1031,11 +1232,12 @@ mod tests {
             30,
             "0030 must be MIGRATIONS[29]: the ALTER-only coverage migration"
         );
-        assert_eq!(
-            v30 + 1,
-            MIGRATIONS.len(),
-            "0030 must be the NEWEST script; the fixture below is built from \
-             `take(v30)`, so a migration appended after it would be invisible here"
+        // 0031 IS APPENDED AFTER 0030, and this fixture is built from take(v30)
+        // on purpose: what this test covers is the step INTO 0030. The newest step
+        // has its own test, which is where the head literal is pinned.
+        assert!(
+            MIGRATIONS.len() > v30 + 1,
+            "0031 must be appended after 0030, so this fixture is not the newest step"
         );
         // Criterion 3, as a literal: the head follows the array, and the array is
         // thirty long.
@@ -1044,7 +1246,10 @@ mod tests {
             MIGRATIONS.len() as i64,
             "SCHEMA_VERSION must be MIGRATIONS.len()"
         );
-        assert_eq!(SCHEMA_VERSION, 30, "0030 makes the head thirty");
+        assert_eq!(
+            SCHEMA_VERSION, 31,
+            "0031 makes the head thirty-one (0030 made it thirty)"
+        );
 
         // ---- 1. a database as it was BEFORE 0030 ----------------------------
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();

@@ -5,16 +5,23 @@
 // capability plane, so a pipeline is switched here instead of by
 // hand-editing the [capabilities] table of policy.toml.
 
-import { Alert, Button, Input, Select, Switch, Table, Tooltip } from "antd";
+import { Alert, Button, Input, Segmented, Select, Switch, Table, Tooltip } from "antd";
 import { useCallback, useEffect, useState } from "react";
 import {
   api,
+  checkDistillLogPage,
+  ledgerPageDetail,
+  numOrNull,
+  refusedAny,
+  refusedEverything,
+  refusedState,
   type CapabilitiesResponse,
   type CapabilityRow,
   type DistillLedgerEntry,
   type DistillLogPage,
   type DistillPolicy,
   type OptionSchemaEntry,
+  type RefusedFacet,
 } from "../api";
 import {
   capabilitiesBody,
@@ -401,6 +408,22 @@ function coverageOf(e: DistillLedgerEntry): Coverage {
   return { recorded: false, parts };
 }
 
+/** t23 / issue #66: one sentence per way a ledger response can contradict
+ *  itself. The keys are the daemon-side shape names in "api.ts"'s
+ *  LedgerPageDefect, spelled out as literals so the i18n check can see them (a
+ *  key this build has never heard of falls back to the raw id, which is still a
+ *  name someone can grep). */
+const DEFECT_COPY: Record<string, string> = {
+  not_an_object: "distill.ledger.inconsistent.not_an_object",
+  entries_missing: "distill.ledger.inconsistent.entries_missing",
+  total_missing: "distill.ledger.inconsistent.total_missing",
+  by_status_missing: "distill.ledger.inconsistent.by_status_missing",
+  totals_missing: "distill.ledger.inconsistent.totals_missing",
+  bucket_not_a_number: "distill.ledger.inconsistent.bucket_not_a_number",
+  buckets_do_not_add_up: "distill.ledger.inconsistent.buckets_do_not_add_up",
+  page_longer_than_total: "distill.ledger.inconsistent.page_longer_than_total",
+};
+
 function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => void }) {
   const { t } = useI18n();
   // The same two-state shape DistillSettings above uses: `data` is what a
@@ -410,10 +433,19 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
   const [page, setPage] = useState<DistillLogPage | null>(null);
   const [lastFailure, setLastFailure] = useState<DistillLedgerEntry | null>(null);
   const [err, setErr] = useState<unknown>(null);
+  /** t22 / issues #68 + #67: WHICH ROWS THE READER IS LOOKING THROUGH. "all" is
+   *  not a daemon value -- it is "send no facet at all", which is the only
+   *  correct form for a daemon that predates the column: it would IGNORE the
+   *  parameter and answer every row, so a facet it cannot honour must never be
+   *  sent as if it had been honoured. */
+  const [facet, setFacet] = useState<RefusedFacet | "all">("all");
 
   const load = useCallback(() => {
     Promise.all([
-      api.distillLog({ limit: LEDGER_ROWS }),
+      api.distillLog({
+        limit: LEDGER_ROWS,
+        refused: facet === "all" ? undefined : facet,
+      }),
       // The MOST RECENT failure, asked of the whole ledger rather than found
       // inside the page above: "why did the last run fail" must not be answered
       // by "the newest 20 attempts happened to succeed".
@@ -421,11 +453,14 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
     ])
       .then(([p, failures]) => {
         setPage(p);
-        setLastFailure(failures.entries[0] ?? null);
+        // The SECOND read is a response too, and it is unwrapped HERE rather than
+        // in the render: an absent entries array would throw the moment this line
+        // touched it (t23 / issue #66).
+        setLastFailure(checkDistillLogPage(failures).entries[0] ?? null);
         setErr(null);
       })
       .catch((e) => setErr(e));
-  }, []);
+  }, [facet]);
 
   useEffect(() => {
     load();
@@ -446,7 +481,26 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
     );
   }
 
-  const totals = page.totals;
+  /** t23 / issue #66: THE RESPONSE IS CHECKED BEFORE ANY OF IT IS RENDERED.
+   *
+   *  The card renders FOUR parts of ONE response -- the page (entries/total), the
+   *  status buckets, the sums, and the refusal facet inside those sums -- and
+   *  they are supposed to describe the same filtered set. A daemon that failed
+   *  halfway, or a proxy that rewrote one field, can hand the panel a body where
+   *  they do not. The render below reads the CHECKED copy and never touches the
+   *  raw response again, which is what keeps a contradictory body from unmounting
+   *  the whole route (it used to die on "reading ok" of a missing by_status). */
+  const check = checkDistillLogPage(page);
+  const totals = check.totals;
+  const byStatus = check.by_status;
+  const total = check.total;
+  const truncated = page.truncated === true;
+  const defectLabel = check.defect
+    ? DEFECT_COPY[check.defect]
+      ? t(DEFECT_COPY[check.defect])
+      : check.defect
+    : null;
+  const detailLine = ledgerPageDetail(check);
   // A daemon that PREDATES t4 (the resident one on 8787 today is one) sends no
   // `coverage_not_recorded` at all. It is not 0 and it is not a number, and the
   // card says so instead of letting `t()` leave the literal `{n}` standing in
@@ -455,7 +509,19 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
   // branch: a missing column and a null column are the same non-reading, and
   // `coverageOf` tests `!= null`, which catches both.
   const coverageNotRecorded =
-    typeof totals.coverage_not_recorded === "number" ? totals.coverage_not_recorded : null;
+    totals && typeof totals.coverage_not_recorded === "number"
+      ? totals.coverage_not_recorded
+      : null;
+  /** Does this daemon report the refusal counts at all (t21 added them)? The
+   *  facet control is DISABLED rather than sent-and-ignored: a filter the daemon
+   *  cannot honour answers every row, which looks exactly like a filter that
+   *  matched everything. */
+  const facetSupported = totals != null && typeof totals.refused === "number";
+  const refusedTotal = totals != null && typeof totals.refused === "number" ? totals.refused : null;
+  const refusedNotRecorded =
+    totals != null && typeof totals.refused_not_recorded === "number"
+      ? totals.refused_not_recorded
+      : null;
   /** A recorded number, or the ledger's own word for "nobody wrote it down". ONE
    *  helper, so no cell of this card can accidentally print a null as 0. */
   const measured = (v: number | null, render: (n: number) => string) =>
@@ -465,13 +531,82 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
     <div className="card distill-ledger">
       <div className="zone-head">
         <div className="zone-title">{t("distill.ledger")}</div>
-        <span className="zone-note">{t("distill.ledger.rows", { n: page.total })}</span>
+        <span className="zone-note">
+          {total == null
+            ? t("distill.notRecorded")
+            : t("distill.ledger.rows", { n: total })}
+        </span>
         <span className="grow" />
         <span className="muted micro">{t("distill.ledger.windowsNote")}</span>
         <Button size="small" onClick={load}>
           {t("distill.ledger.refresh")}
         </Button>
       </div>
+
+      {/* t23 / issue #66: THE RESPONSE SAYS TWO CONTRADICTORY THINGS, so the
+          card stops pretending its numbers are readings. The notice names the
+          defect, prints the numbers it actually observed (total / entries /
+          bucket sum / what was unusable) and says what that means; whatever part
+          of the body DID pass the check is still rendered below, because a
+          half-rewritten response usually still carries usable rows. */}
+      {!check.ok ? (
+        <Alert
+          className="distill-ledger-inconsistent"
+          type="warning"
+          showIcon
+          data-ledger-inconsistent={check.defect}
+          data-ledger-detail={detailLine}
+          message={t("distill.ledger.inconsistent.title")}
+          description={
+            <div>
+              <p className="micro flush">{defectLabel}</p>
+              <p className="mono micro" data-ledger-detail-line="">
+                {detailLine}
+              </p>
+              <p className="micro flush">{t("distill.ledger.inconsistent.hint")}</p>
+            </div>
+          }
+        />
+      ) : null}
+
+      {/* t22 / #68 + #67: THE REFUSAL FACET. One control, because the ledger's
+          three answers to "was this refused?" are not interchangeable --
+          refused, a MEASURED zero, and no count recorded at all (pre-0031 rows).
+          It is disabled when the daemon does not report the counts, for the same
+          reason the distill scope disables itself: a filter that cannot be
+          honoured must not look like one that was. */}
+      {totals == null ? null : (
+      <div
+        className="row wrap"
+        data-ledger-facet={facet}
+        data-facet-supported={facetSupported ? "true" : "false"}
+      >
+        <span className="muted micro">{t("distill.ledger.refusedFacet")}</span>
+        <Tooltip
+          title={
+            facetSupported
+              ? t("distill.ledger.refusedFacet.hint")
+              : t("distill.ledger.refusedFacet.unsupported")
+          }
+        >
+          <Segmented
+            size="small"
+            value={facet}
+            disabled={!facetSupported}
+            onChange={(v) => setFacet(v as RefusedFacet | "all")}
+            options={[
+              { value: "all", label: t("distill.ledger.refusedFacet.all") },
+              { value: "only", label: t("distill.ledger.refusedFacet.only") },
+              { value: "none", label: t("distill.ledger.refusedFacet.none") },
+              { value: "not_recorded", label: t("distill.ledger.refusedFacet.notRecorded") },
+            ]}
+          />
+        </Tooltip>
+        {facetSupported ? (
+          <span className="muted micro">{t("distill.ledger.refusedRetryNote")}</span>
+        ) : null}
+      </div>
+      )}
 
       {err ? (
         // A refresh failed while rows are on screen: say so, and keep them.
@@ -515,19 +650,21 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
           <ReadoutStrip
             grid
             items={[
-              { key: "rows", label: t("distill.ledger.totalLabel"), value: page.total },
+              { key: "rows", label: t("distill.ledger.totalLabel"), value: total ?? 0 },
               {
                 key: "tokens",
                 label: t("distill.ledger.tokens"),
-                value: measured(totals.tokens_used, fmtTokens),
+                value: measured(numOrNull(totals?.tokens_used), fmtTokens),
               },
               {
                 key: "cost",
                 label: t("distill.ledger.cost"),
-                value: measured(totals.cost_usd, fmtUsd),
+                value: measured(numOrNull(totals?.cost_usd), fmtUsd),
               },
             ]}
           />
+          {totals == null ? null : (
+          <>
           <p className="muted micro">
             {t("distill.ledger.totalsNote", {
               t: totals.tokens_used_not_recorded,
@@ -546,22 +683,44 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
               ? t("distill.ledger.coverageNoteUnknown")
               : t("distill.ledger.coverageNote", { n: coverageNotRecorded })}
           </p>
+          {/* t22 / #68: the refusal reading, counted over the SAME filter as
+              total -- and its second half counts the rows that RECORDED NOTHING,
+              which is not a synonym for zero. A daemon without the column gets
+              the third wording instead of a 0 nobody measured. */}
+          <p
+            className="muted micro"
+            data-ledger-refused={refusedTotal ?? "not_recorded"}
+            data-ledger-refused-unrecorded={refusedNotRecorded ?? "not_recorded"}
+          >
+            {refusedTotal == null
+              ? t("distill.ledger.refusedUnknown")
+              : refusedNotRecorded == null
+                ? t("distill.ledger.refusedNoteNoUnknown", { n: refusedTotal })
+                : t("distill.ledger.refusedNote", {
+                    n: refusedTotal,
+                    u: refusedNotRecorded,
+                  })}
+          </p>
+          </>
+          )}
 
           {/* The four buckets, each a MEASURED count — the daemon counts them
               over the same filter as `total`, so a 0 here is a real zero and
               the four add up to the number above. */}
-          <div className="row wrap">
-            {LEDGER_BUCKETS.map((b) => (
-              <span key={b} className={b === "failed" ? "tag err" : "tag"} data-bucket={b}>
-                {t(`distill.ledger.status.${b}`)} {page.by_status[b] ?? 0}
-              </span>
-            ))}
-          </div>
+          {byStatus == null ? null : (
+            <div className="row wrap">
+              {LEDGER_BUCKETS.map((b) => (
+                <span key={b} className={b === "failed" ? "tag err" : "tag"} data-bucket={b}>
+                  {t(`distill.ledger.status.${b}`)} {byStatus[b] ?? 0}
+                </span>
+              ))}
+            </div>
+          )}
 
           <Table
             className="facts ledger"
             size="small"
-            dataSource={page.entries}
+            dataSource={check.entries}
             rowKey="id"
             pagination={false}
             rowClassName={(e) => (e.status == null ? "row-old" : "")}
@@ -588,13 +747,40 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
                 title: t("distill.ledger.col.status"),
                 dataIndex: "status",
                 render: (v: string | null, e: DistillLedgerEntry) => (
-                  <span className="row tight">
+                  /* data-refused-state is the row's refusal answer in ONE
+                     machine-readable word (t22): refused_all | refused_part |
+                     none | not_recorded. It sits on the cell because the status
+                     word alone cannot say it -- the daemon keeps ok for a
+                     refused pass on purpose (the pass DID run and measure). */
+                  <span className="row tight" data-refused-state={refusedState(e)}>
                     <span
                       className={v === "failed" ? "tag err" : v === "ok" ? "tag ok" : "tag"}
                       data-status={v ?? "not_recorded"}
                     >
                       {t(`distill.ledger.status.${v ?? "not_recorded"}`)}
                     </span>
+                    {/* t22 / #68: THE REFUSAL ITSELF, beside the status word
+                        rather than folded into it. "refused N" says how many
+                        candidates the write vocabulary rejected; with nothing
+                        written the whole pass was refused (the 409 case), and
+                        with something written it is a partial refusal. The two
+                        are told apart from the column and the written count --
+                        never from prose. */}
+                    {refusedAny(e) ? (
+                      <Tooltip
+                        title={
+                          refusedEverything(e)
+                            ? t("distill.ledger.refusedTag.hintAll")
+                            : t("distill.ledger.refusedTag.hintPart", {
+                                n: e.memories_refused ?? 0,
+                              })
+                        }
+                      >
+                        <span className="tag err" data-refused-count={e.memories_refused ?? 0}>
+                          {t("distill.ledger.refusedTag", { n: e.memories_refused ?? 0 })}
+                        </span>
+                      </Tooltip>
+                    ) : null}
                     {/* #62: "ok" AND "0 written" is the shape a governed refusal
                         leaves in the ledger (the pass ran and was recorded; the
                         write vocabulary refused every candidate). Marked here so an
@@ -619,7 +805,10 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
                 dataIndex: "failure_reason",
                 render: (v: string | null, e: DistillLedgerEntry) =>
                   v != null ? (
-                    <span>{v}</span>
+                    /* data-refusal-reason says this text IS the daemon's refusal
+                       sentence -- the one naming the refused store x namespace
+                       pair and the namespaces that store accepts. */
+                    <span data-refusal-reason={refusedAny(e) ? "true" : undefined}>{v}</span>
                   ) : e.status === "failed" ? (
                     <span className="muted micro">{t("distill.ledger.noReason")}</span>
                   ) : (
@@ -710,9 +899,9 @@ function DistillLedger({ epoch, onReload }: { epoch: number; onReload: () => voi
               },
             ]}
           />
-          {page.truncated ? (
+          {truncated && total != null ? (
             <p className="muted micro pad">
-              {t("distill.ledger.rows", { n: page.total })}
+              {t("distill.ledger.rows", { n: total })}
             </p>
           ) : null}
         </>

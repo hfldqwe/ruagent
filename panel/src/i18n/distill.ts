@@ -87,6 +87,44 @@ export const zh: Record<string, string> = {
   "distill.ledger.wroteNothing": "0 写入",
   "distill.ledger.wroteNothingHint": "这一趟跑了、也记了账，但一条记忆都没写。原因看「原因」列：整个 pass 被写入词表拒绝时，daemon 会把被拒的 store × namespace 写在那里。",
 
+  // ---- t22 / #68 + #67: the ledger's REFUSAL FACET ----
+  // Three answers live under one word in the UI, so they are named apart here:
+  // refused (> 0), a MEASURED zero, and no count recorded (pre-0031 rows). The
+  // last one must never be read as zero, which is why it has its own label.
+  "distill.ledger.refusedFacet": "被拒筛选",
+  "distill.ledger.refusedFacet.all": "全部",
+  "distill.ledger.refusedFacet.only": "只看被拒",
+  "distill.ledger.refusedFacet.none": "未被拒（实测 0）",
+  "distill.ledger.refusedFacet.notRecorded": "未记录拒绝数",
+  "distill.ledger.refusedFacet.hint": "按 memories_refused 这一列筛：被拒 = 这趟有候选被写入词表拒绝；未被拒 = 实测 0；未记录拒绝数 = 0031 之前的行（这一列是后来加的）。后两者不是一回事，任何一格都不当 0。",
+  "distill.ledger.refusedFacet.unsupported": "这个 daemon 不报告拒绝计数（字段是后来加的），所以这里不能按它筛选——它会把参数忽略掉并返回每一行，那会假装筛过了。",
+  "distill.ledger.refusedRetryNote": "被拒行的状态仍是「成功」，所以它们不会再进批量蒸馏的未蒸馏队列；要重跑请到会话列表用「只看上次被拒」挑出来单独跑。",
+  "distill.ledger.refusedNote": "本页集合里：被拒 {n} 次（memories_refused > 0）；未记录拒绝计数 {u} 次（0031 之前的历史行）——后者不是 0。",
+  "distill.ledger.refusedNoteNoUnknown": "本页集合里：被拒 {n} 次（memories_refused > 0）。",
+  "distill.ledger.refusedUnknown": "这个 daemon 不报告拒绝计数（字段是后来加的），所以这里不写 0。",
+  "distill.ledger.refusedTag": "被拒 {n}",
+  "distill.ledger.refusedTag.hintAll": "整次被拒：这趟跑了、也记了账，但写入词表把每一条候选都拒了，一条都没落库——单条蒸馏返回 409 就是它。原因列里是 daemon 的原句，含被拒的 store × namespace 与这个 store 可写的词表。",
+  "distill.ledger.refusedTag.hintPart": "部分被拒：写入词表拒了 {n} 条候选，另有记忆落库了；被拒的那几条不会自己回来，重跑一次才有机会。",
+
+  // ---- t23 / #66: a response that contradicts itself ----
+  // The daemon answers FOUR parts of ONE ledger page (the page, the status
+  // buckets, the sums and the refusal facet inside them) and they describe the
+  // same filtered set. When they do not, the panel says so instead of rendering
+  // numbers nobody can reconcile -- or dying on a missing field.
+  "distill.ledger.inconsistent.title": "账本响应自相矛盾——这张卡不再把这些数字当读数",
+  "distill.ledger.inconsistent.hint": "守护进程出错、或中间层改写了响应的一部分时会出现这种情况。上面一行是实测到的原始字段：? 表示拿不到，missing 列出不可用的字段路径。只要还有能用的部分（例如行数据）就照常显示；不可用的部分不再假装有值。",
+  "distill.ledger.inconsistent.not_an_object": "响应不是一个对象。",
+  "distill.ledger.inconsistent.entries_missing": "entries 不是数组——行数据不可用。",
+  "distill.ledger.inconsistent.total_missing": "total 不是数字——总数不可用。",
+  "distill.ledger.inconsistent.by_status_missing": "by_status 不是对象——状态桶不可用。",
+  "distill.ledger.inconsistent.totals_missing": "totals 不是对象——合计与拒绝计数不可用。",
+  "distill.ledger.inconsistent.bucket_not_a_number": "状态桶里有不是数字的值——桶不可用。",
+  "distill.ledger.inconsistent.buckets_do_not_add_up": "状态桶的和与 total 不相等——摘要与行描述的不是同一批行。",
+  "distill.ledger.inconsistent.page_longer_than_total": "entries 比 total 还长——这一页比它自称的总数还多。",
+  "distill.batch.inconsistent.estimated": "响应里没有可用的 estimated 块——这次预估读不出来，所以不显示预估数字。",
+  "distill.batch.inconsistent.counters": "响应里的计数（attempted/ok/empty/failed）不全是数字——本次回执不显示三态读数，也不声称三态和不变。",
+  "distill.batch.inconsistent.results": "响应里没有逐条结果数组——本次不显示逐条结果。",
+
   // ---- batch distillation (t8 / #47) ----
   "distill.batch.open": "批量蒸馏未处理 {n} 条",
   "distill.batch.openPlain": "批量蒸馏…",
@@ -199,6 +237,37 @@ export const en: Record<string, string> = {
   // read as ok/3 -- and never as the "empty" outcome, which is a different fact.
   "distill.ledger.wroteNothing": "0 written",
   "distill.ledger.wroteNothingHint": "The pass ran and was recorded, but not one memory was written. See the Reason column: when the whole pass was refused by the write vocabulary, the daemon writes the refused store x namespace pairs there.",
+
+  // ---- t22 / #68 + #67: the ledger's REFUSAL FACET ----
+  "distill.ledger.refusedFacet": "Refusal filter",
+  "distill.ledger.refusedFacet.all": "All",
+  "distill.ledger.refusedFacet.only": "Refused only",
+  "distill.ledger.refusedFacet.none": "Not refused (measured 0)",
+  "distill.ledger.refusedFacet.notRecorded": "No count recorded",
+  "distill.ledger.refusedFacet.hint": "Filters on memories_refused: refused = this pass had candidates the write vocabulary rejected; not refused = a MEASURED zero; no count recorded = a row written before 0031 (the column was added later). The last two are not the same answer, and no cell here turns either into a 0.",
+  "distill.ledger.refusedFacet.unsupported": "This daemon does not report refusal counts (the column was added later), so this filter is disabled -- it would ignore the parameter and answer every row, which would look like a filter that matched everything.",
+  "distill.ledger.refusedRetryNote": "A refused row still reads ok, so those sessions do not re-enter the batch's undistilled queue; re-run them individually from the sessions list with the refused-last-time filter.",
+  "distill.ledger.refusedNote": "In this set: {n} attempt(s) refused (memories_refused > 0); {u} recorded no refusal count at all (rows written before 0031) -- and that second number is not a zero.",
+  "distill.ledger.refusedNoteNoUnknown": "In this set: {n} attempt(s) refused (memories_refused > 0).",
+  "distill.ledger.refusedUnknown": "This daemon does not report refusal counts (the column was added later), so this line does not claim 0.",
+  "distill.ledger.refusedTag": "refused {n}",
+  "distill.ledger.refusedTag.hintAll": "Refused everything: the pass ran and was recorded, but the write vocabulary rejected every candidate, so nothing landed -- this is the pass that answers 409 on the single-session route. The Reason column carries the daemon's own sentence, refused store x namespace pair and the namespaces that store accepts.",
+  "distill.ledger.refusedTag.hintPart": "Partially refused: the vocabulary rejected {n} candidate(s) while other memories did land. The refused ones do not come back on their own -- only a re-run gives them another chance.",
+
+  // ---- t23 / #66: a response that contradicts itself ----
+  "distill.ledger.inconsistent.title": "The ledger response contradicts itself — this card stops reading its numbers as data",
+  "distill.ledger.inconsistent.hint": "This is what a daemon that failed halfway, or a middle layer that rewrote part of the body, produces. The line above is the raw evidence: ? means the number could not be read, and missing lists the unusable field paths. Whatever did pass is still shown below (the rows usually do); what did not is no longer dressed up as a value.",
+  "distill.ledger.inconsistent.not_an_object": "The response is not an object.",
+  "distill.ledger.inconsistent.entries_missing": "entries is not an array -- the rows are unusable.",
+  "distill.ledger.inconsistent.total_missing": "total is not a number -- the row count is unusable.",
+  "distill.ledger.inconsistent.by_status_missing": "by_status is not an object -- the status buckets are unusable.",
+  "distill.ledger.inconsistent.totals_missing": "totals is not an object -- the sums and the refusal counts are unusable.",
+  "distill.ledger.inconsistent.bucket_not_a_number": "A status bucket is not a number -- the buckets are unusable.",
+  "distill.ledger.inconsistent.buckets_do_not_add_up": "The status buckets do not add up to total -- the summary and the rows describe different sets.",
+  "distill.ledger.inconsistent.page_longer_than_total": "entries is longer than total -- this page holds more rows than it claims to have.",
+  "distill.batch.inconsistent.estimated": "The response carries no usable estimated block -- this plan cannot be read, so no estimate is shown.",
+  "distill.batch.inconsistent.counters": "The response's counters (attempted/ok/empty/failed) are not all numbers -- this receipt shows no three-state reading and does not claim the sum holds.",
+  "distill.batch.inconsistent.results": "The response carries no per-session result array -- no per-session results are shown.",
 
   // ---- batch distillation (t8 / #47) ----
   "distill.batch.open": "Batch-distill {n} unprocessed",

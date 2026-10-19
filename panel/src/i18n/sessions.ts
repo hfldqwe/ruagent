@@ -125,6 +125,19 @@ export const zh: Record<string, string> = {
   "sessions.refused.batchSum": "成功 {ok} + 无内容 {empty} + 失败 {failed} = {sum} = 尝试 {attempted} 条——三态没有变，「被拒」不是第四种状态，而是「成功」里的一个子集标记。",
   "sessions.refused.batchNotReported": "这个 daemon 不报告被拒计数（字段是后来加的），所以这里不写 0。",
   "sessions.refused.result": "被拒 {n}",
+
+  // ---- t22 / #67: the "待重跑" list ----
+  // A refused pass is recorded as ok, so its session leaves the undistilled
+  // backlog and never comes back by itself. This is the only way back to those
+  // sessions, and it is a FILTER over the ledger's refusal column rather than a
+  // guess from the session list's own status word.
+  "sessions.refused.onlyTag": "只看上次被拒（{n}）",
+  "sessions.refused.onlyHint": "筛出「最近一次蒸馏被写入词表拒绝」的会话：它们在账本上仍是「成功」，所以不会自动回到未蒸馏队列——这就是 #67 说的「待重跑」清单。数字是会话数（账本里的被拒「尝试」数可能更多）。",
+  "sessions.refused.onlyUnsupported": "这个 daemon 不报告拒绝计数（字段是后来加的），所以没有这个清单——这里显示的是「没有这个读数」而不是「一条都没有」。",
+  "sessions.refused.rowTag": "上次被拒",
+  "sessions.refused.rowHint": "这个会话最近一次蒸馏被写入词表拒绝，可能什么都没写；用本行的蒸馏按钮按当前档位重跑。",
+  "sessions.refused.batchNote": "{n} 个会话的上次蒸馏被写入词表拒绝：账本上仍是「成功」，所以它们不在本批的未蒸馏队列里，不会自动重跑。",
+  "sessions.inconsistent.list": "会话响应里没有可用的 sessions 数组——这是自相矛盾的响应（守护进程出错或被中间层改写），所以这里显示的是「读数不可用」而不是「没有会话」。",
 };
 
 export const en: Record<string, string> = {
@@ -236,4 +249,13 @@ export const en: Record<string, string> = {
   "sessions.refused.batchSum": "ok {ok} + empty {empty} + failed {failed} = {sum} = {attempted} attempted — the three states are unchanged: ‘refused’ is not a fourth one, it is a subset marker inside ‘ok’.",
   "sessions.refused.batchNotReported": "This daemon does not report a refused count (the field was added later), so this line does not claim 0.",
   "sessions.refused.result": "refused {n}",
+
+  // ---- t22 / #67: the refused-last-time list ----
+  "sessions.refused.onlyTag": "Refused last time only ({n})",
+  "sessions.refused.onlyHint": "Selects the sessions whose MOST RECENT distillation was refused by the write vocabulary: they still read ok in the ledger, so they never return to the undistilled queue -- this is the refused-and-waiting-for-a-re-run list. The number counts SESSIONS (the ledger's refused ATTEMPT count can be higher).",
+  "sessions.refused.onlyUnsupported": "This daemon does not report refusal counts (the column was added later), so there is no such list here -- that is a missing reading, not an empty one.",
+  "sessions.refused.rowTag": "refused last",
+  "sessions.refused.rowHint": "This session's most recent distillation was refused by the write vocabulary and may have written nothing; use the row's distill button to re-run it at the current tier.",
+  "sessions.refused.batchNote": "{n} session(s) were refused by the write vocabulary last time: they still read ok in the ledger, so they are NOT in this batch's undistilled queue and will not be retried automatically.",
+  "sessions.inconsistent.list": "The sessions response carries no usable sessions array -- a self-contradictory response (a daemon that failed halfway, or a middle layer that rewrote it), so this is an unusable reading rather than an empty list.",
 };

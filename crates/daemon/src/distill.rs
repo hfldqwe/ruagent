@@ -1209,13 +1209,26 @@ impl Distiller {
     ///   skipped = the row was already there (a duplicate); refused = the write
     ///   vocabulary forbids this store×namespace pair, so nothing was written and the
     ///   pair is named. A refusal is NEVER recorded as empty and never as a skip: the
-    ///   row stays ok -- the pass ran and measured -- with the refusal sentence in
-    ///   failure_reason, which is what makes the row readable as a refusal without
-    ///   inventing a fourth status word.
+    ///   row stays ok -- the pass ran and measured -- and since 0031 it also carries
+    ///   the COUNT in its own column, so "was this pass refused?" is a comparison
+    ///   rather than a reading of prose. The sentence stays in failure_reason
+    ///   because it names WHICH pair was refused; the count is what makes the
+    ///   judgement machine-readable, and together with memories_written it makes
+    ///   "refused everything" (refused > 0 && written == 0) a shape a script can
+    ///   test. That pair is what issues #68/#67 asked to be distinguishable, and it
+    ///   is why no FOURTH status word was invented: the status vocabulary is closed
+    ///   (the panel counts by its three words) and a new one would be dropped from
+    ///   those counts silently.
     /// * windows/truncated are written together and only when the caller
     ///   MEASURED them (`DistillOutcome::windows` is `Some` exactly when an
     ///   extraction loop ran). A refusal or a failure read nothing, so it leaves
     ///   NULL -- "we did not look" -- rather than a 1/0 it never observed.
+    /// * memories_refused (0031; t21 / issues #68, #67) rides the SAME Option as
+    ///   windows: an extraction loop that ran is what makes a refusal count a
+    ///   reading, so a pass that failed before reading leaves it NULL -- never a 0
+    ///   nobody observed -- while a pass that ran and refused nothing records a
+    ///   MEASURED 0. Its presence is what lets a reader tell a refusal from an
+    ///   empty pass without parsing failure_reason.
     /// * `from_seq`/`to_seq`/`total_messages` are the SAME RULE, one column group
     ///   further (0030; t3 / issue #58): three readings of ONE measurement
     ///   (`DistillOutcome::coverage`, `Some` exactly when `windows` is), so they
@@ -1257,9 +1270,9 @@ impl Distiller {
                           relations_written, agent, status, failure_reason, prompt_hash,
                           retries, windows, truncated, tokens_used, context_size, cost_usd,
                           relations_duplicate, relations_refused,
-                          from_seq, to_seq, total_messages)
+                          from_seq, to_seq, total_messages, memories_refused)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
-                             ?18,?19,?20)",
+                             ?18,?19,?20,?21)",
                     rusqlite::params![
                         log.session_key,
                         chrono::Utc::now().to_rfc3339(),
@@ -1289,6 +1302,15 @@ impl Distiller {
                         log.coverage.map(|c| c.from_message as i64),
                         log.coverage.map(|c| c.to_message as i64),
                         log.coverage.map(|c| c.total_messages as i64),
+                        // The REFUSAL COUNT (0031; t21 / issues #68, #67): the
+                        // number of memories the write vocabulary refused this
+                        // pass, behind the SAME Option as the measurement that
+                        // produced it. windows is Some exactly when an extraction
+                        // loop ran, and that is the only case in which a refusal
+                        // count is a reading rather than a fabricated 0 -- so a
+                        // failed or refused-before-reading pass leaves NULL
+                        // ("nobody recorded a count") instead of claiming zero.
+                        log.windows.map(|_| log.memories_refused as i64),
                     ],
                 )
             })

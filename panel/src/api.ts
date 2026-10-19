@@ -357,6 +357,60 @@ export interface DistillLedgerEntry {
   to_seq: number | null;
   total_messages: number | null;
   prompt_hash: string | null;
+  /** THE REFUSAL COUNT (0031 / t21, issues #68 + #67): how many memory
+   *  candidates this attempt proposed and the WRITE VOCABULARY refused.
+   *
+   *  Three readings that must stay apart, which is why this is a nullable
+   *  number and not a flag: `null` = nobody recorded a count (a row written
+   *  before 0031), a MEASURED `0` = the write path accepted everything it was
+   *  offered, and `> 0` = the vocabulary rejected that many. Beside
+   *  `memories_written === 0` it is the REFUSED-EVERYTHING case -- the pass
+   *  that answers HTTP 409 on the single route and is still `status: "ok"`
+   *  here. A null is NEVER 0. */
+  memories_refused?: number | null;
+}
+
+/** THE REFUSAL FACET (t21 / issues #68 + #67) — the ledger read's fourth axis.
+ *  `?refused=only|none|not_recorded` selects the attempts whose write path
+ *  REFUSED something, the ones with a MEASURED zero, and the pre-0031 rows that
+ *  carry no count at all. Three different answers, and telling the last two
+ *  apart is the whole point of the column. */
+export type RefusedFacet = "only" | "none" | "not_recorded";
+
+/** The daemon's own test for "this pass refused something"
+ *  (`memories_refused > 0`), in ONE place so the ledger card, the sessions
+ *  list and their wording cannot drift apart. An absent count is not a refusal
+ *  and not a zero: it is an unrecorded value, and this returns false without
+ *  claiming a measurement. */
+export function refusedAny(e: { memories_refused?: number | null }): boolean {
+  return typeof e.memories_refused === "number" && e.memories_refused > 0;
+}
+
+/** "The pass was REFUSED EVERYTHING": the vocabulary rejected at least one
+ *  candidate AND nothing was written. This is the 409 case (the daemon's own
+ *  words in `read_distill_ledger`: `memories_refused > 0 AND memories_written
+ *  == 0`), and the case the ledger still records as ok -- the status word
+ *  cannot say it, because the pass DID run and measure. */
+export function refusedEverything(e: {
+  memories_refused?: number | null;
+  memories_written: number;
+}): boolean {
+  return refusedAny(e) && e.memories_written === 0;
+}
+
+/** What ONE ledger row says about refusals, as a value a view (or a test) can
+ *  branch on instead of re-deriving it. Four answers, because the column can
+ *  give four: the whole pass refused, a partial refusal (something landed),
+ *  a measured zero, and no count recorded at all. */
+export type RefusedState = "refused_all" | "refused_part" | "none" | "not_recorded";
+
+export function refusedState(e: {
+  memories_refused?: number | null;
+  memories_written: number;
+}): RefusedState {
+  if (e.memories_refused == null) return "not_recorded";
+  if (e.memories_refused <= 0) return "none";
+  return e.memories_written === 0 ? "refused_all" : "refused_part";
 }
 
 /** `GET /api/v1/distill/log` — one page of the ledger plus the two summaries
@@ -373,19 +427,185 @@ export interface DistillLogPage {
    *  `truncated`, which is about the transcript. */
   truncated: boolean;
   by_status: Record<string, number>;
-  totals: {
-    tokens_used: number | null;
-    cost_usd: number | null;
-    tokens_used_not_recorded: number;
-    cost_usd_not_recorded: number;
-    /** How many rows in this set could NOT answer "how many messages did you
-     *  read" -- i.e. the three coverage columns were not all recorded. A COUNT
-     *  over the same filter as `total`, so a 0 here IS a measured zero (every
-     *  row in the set recorded its coverage). There is deliberately no sum of
-     *  the ranges themselves -- a range is not additive, and a 0-length fake
-     *  range would be a made-up reading (t4, issue #58). */
-    coverage_not_recorded: number;
+  totals: DistillLogTotals;
+}
+
+/** WHICH COUPLING A LEDGER PAGE FAILED (t23 / issue #66), as a word a reader or
+ *  a test can act on rather than a parsed sentence.
+ *
+ *  WHY THIS EXISTS: the ledger card renders FOUR parts of one response -- the
+ *  page (entries/total), the status buckets (by_status), the sums (totals) and
+ *  the refusal facet inside those sums. They are supposed to describe the SAME
+ *  filtered set. A response where they do not is what a daemon that failed
+ *  halfway, or a proxy that rewrote one field, can hand the panel -- and the card
+ *  used to reach straight into by_status, which unmounted the WHOLE route with
+ *  "Cannot read properties of undefined (reading ok)". The check below runs
+ *  before any of that is rendered. */
+export type LedgerPageDefect =
+  | "not_an_object"
+  | "entries_missing"
+  | "total_missing"
+  | "by_status_missing"
+  | "totals_missing"
+  | "bucket_not_a_number"
+  | "buckets_do_not_add_up"
+  | "page_longer_than_total";
+
+/** The defect vocabulary, so a view can render a defect NAME safely (a raw id is
+ *  better than a missing string) and one place owns the set. */
+export const LEDGER_PAGE_DEFECTS: LedgerPageDefect[] = [
+  "not_an_object",
+  "entries_missing",
+  "total_missing",
+  "by_status_missing",
+  "totals_missing",
+  "bucket_not_a_number",
+  "buckets_do_not_add_up",
+  "page_longer_than_total",
+];
+
+/** The verdict on one ledger response, WITH the pieces the view may render.
+ *  Unusable pieces come back as null (or an empty array for the page), so a
+ *  caller never has to re-derive which half passed. */
+export interface DistillLogPageCheck {
+  ok: boolean;
+  defect: LedgerPageDefect | null;
+  /** What was actually observed -- the message shows these numbers, and a test
+   *  reads them off the DOM: never a verdict without evidence. */
+  detail: {
+    total: number | null;
+    entries: number | null;
+    bucketSum: number | null;
+    /** The paths that were unusable: "entries", "total", "by_status",
+     *  "totals", or a named bucket such as "by_status.ok". */
+    missing: string[];
   };
+  entries: DistillLedgerEntry[];
+  by_status: Record<string, number> | null;
+  totals: DistillLogTotals | null;
+  total: number | null;
+}
+
+/** A number, or null. ONE helper for every shape guard in the panel: a JSON body
+ *  is untrusted input, and undefined/NaN/string must never reach an arithmetic
+ *  or cell render. */
+export function numOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** The observed numbers as ONE stable line: shown in the message and carried on
+ *  the notice element, so a test reads the same string a human does. */
+export function ledgerPageDetail(c: DistillLogPageCheck): string {
+  const n = (v: number | null) => (v == null ? "?" : String(v));
+  return (
+    "total=" + n(c.detail.total) +
+    ";entries=" + n(c.detail.entries) +
+    ";bucketSum=" + n(c.detail.bucketSum) +
+    ";missing=" + (c.detail.missing.length ? c.detail.missing.join(",") : "-")
+  );
+}
+
+/** CHECK THE LEDGER RESPONSE BEFORE RENDERING ANY OF IT (t23 / issue #66).
+ *
+ *  Order matters: the pieces the card cannot render at all are reported first
+ *  (entries, then total, then the buckets), the COUPLING between them next (the
+ *  buckets must count the same rows as total; a page cannot be longer than the
+ *  total it belongs to), and the summary block last -- every field in totals is
+ *  read through its own guard, so a missing block is diagnosable but not fatal.
+ *  An object that passes comes back with by_status and totals typed, and the
+ *  card renders the CHECKED copy: it never touches the raw response again. */
+export function checkDistillLogPage(raw: unknown): DistillLogPageCheck {
+  const missing: string[] = [];
+  const asObj = (v: unknown): Record<string, unknown> | null =>
+    typeof v === "object" && v !== null && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : null;
+  const root = asObj(raw);
+  if (!root) {
+    return {
+      ok: false,
+      defect: "not_an_object",
+      detail: { total: null, entries: null, bucketSum: null, missing: ["response"] },
+      entries: [],
+      by_status: null,
+      totals: null,
+      total: null,
+    };
+  }
+  const entries = Array.isArray(root.entries) ? (root.entries as DistillLedgerEntry[]) : null;
+  if (!entries) missing.push("entries");
+  const total = numOrNull(root.total);
+  if (total == null) missing.push("total");
+  const rawBuckets = asObj(root.by_status);
+  if (!rawBuckets) missing.push("by_status");
+  const totals = asObj(root.totals) ? (root.totals as unknown as DistillLogTotals) : null;
+  if (!totals) missing.push("totals");
+  // Every bucket must be a NUMBER: a stringified count renders as "16" beside
+  // numeric ones and silently breaks the sum below.
+  const buckets: Record<string, number> = {};
+  let badBucket: string | null = null;
+  if (rawBuckets) {
+    for (const key of Object.keys(rawBuckets)) {
+      const n = numOrNull(rawBuckets[key]);
+      if (n == null) {
+        badBucket = key;
+        missing.push("by_status." + key);
+        break;
+      }
+      buckets[key] = n;
+    }
+  }
+  const bucketSum =
+    rawBuckets && badBucket == null
+      ? Object.keys(buckets).reduce((a, k) => a + buckets[k], 0)
+      : null;
+  const check: DistillLogPageCheck = {
+    ok: true,
+    defect: null,
+    detail: {
+      total,
+      entries: entries ? entries.length : null,
+      bucketSum,
+      missing,
+    },
+    entries: entries ?? [],
+    by_status: rawBuckets && badBucket == null ? buckets : null,
+    totals,
+    total,
+  };
+  if (!entries) return { ...check, ok: false, defect: "entries_missing" };
+  if (total == null) return { ...check, ok: false, defect: "total_missing" };
+  if (!rawBuckets) return { ...check, ok: false, defect: "by_status_missing" };
+  if (badBucket != null) return { ...check, ok: false, defect: "bucket_not_a_number" };
+  if (bucketSum !== total) return { ...check, ok: false, defect: "buckets_do_not_add_up" };
+  if (entries.length > total) return { ...check, ok: false, defect: "page_longer_than_total" };
+  if (!totals) return { ...check, ok: false, defect: "totals_missing" };
+  return check;
+}
+
+/** The ledger's SUMMARY BLOCK, extracted from the page type so the card can be
+ *  handed a CHECKED copy of it (t23 / issue #66) instead of reaching into a
+ *  response nobody validated. Every field here is optional-by-shape except the
+ *  two that 0008 always wrote. */
+export interface DistillLogTotals {
+  tokens_used: number | null;
+  cost_usd: number | null;
+  tokens_used_not_recorded: number;
+  cost_usd_not_recorded: number;
+  /** How many rows in this set could NOT answer "how many messages did you
+   *  read" -- i.e. the three coverage columns were not all recorded. A COUNT
+   *  over the same filter as total, so a 0 here IS a measured zero (every row in
+   *  the set recorded its coverage). There is deliberately no sum of the ranges
+   *  themselves -- a range is not additive, and a 0-length fake range would be a
+   *  made-up reading (t4, issue #58). */
+  coverage_not_recorded: number;
+  /** THE REFUSAL FACET'S TWO COUNTS (t21), over the SAME filter as total: how
+   *  many rows in this set are refused (memories_refused > 0) and how many
+   *  recorded no count at all (pre-0031 rows). A daemon that predates t21 sends
+   *  NEITHER key -- absent is not 0, and the card says so rather than printing a
+   *  zero it never measured. */
+  refused?: number;
+  refused_not_recorded?: number;
 }
 
 /** What a batch pass WOULD cost, from the same call with `dry_run=true`.
@@ -1721,10 +1941,21 @@ export const api = {
    *  One row per ATTEMPT, newest first, through the same envelope as every
    *  other list route. `status` is the ledger's own vocabulary: ok | empty |
    *  failed | not_recorded. */
-  distillLog: (opts?: { status?: string; session?: string; limit?: number; offset?: number }) => {
+  distillLog: (opts?: {
+    status?: string;
+    session?: string;
+    /** The refusal facet (t21). OMITTED means every row -- and omitted is the
+     *  only correct form for a daemon that predates the column: it would ignore
+     *  the parameter and answer every row, so a facet it cannot honour must not
+     *  be sent as if it had been. */
+    refused?: RefusedFacet;
+    limit?: number;
+    offset?: number;
+  }) => {
     const q = new URLSearchParams();
     if (opts?.status) q.set("status", opts.status);
     if (opts?.session) q.set("session", opts.session);
+    if (opts?.refused) q.set("refused", opts.refused);
     if (opts?.limit != null) q.set("limit", String(opts.limit));
     if (opts?.offset != null) q.set("offset", String(opts.offset));
     const qs = q.toString();

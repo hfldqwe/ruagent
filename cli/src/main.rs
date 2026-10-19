@@ -1205,6 +1205,110 @@ mod tests {
         );
     }
 
+    /// t21 / issues #68, #67: THE EXIT CODE STOPS LYING ABOUT A REFUSAL.
+    ///
+    /// A refused pass wrote NOTHING and used to print [ok] and exit 0: the ledger
+    /// calls it ok (the pass ran and measured) and this client only counted
+    /// failures, so an unattended script could not tell a refusal from a write.
+    /// refused is its own count now, and this test drives BOTH halves -- the refused
+    /// envelope fails, and the envelope of a pass that really wrote still exits 0.
+    #[test]
+    fn a_refused_distillation_is_not_ok_and_not_exit_zero() {
+        // The ledger row the daemon writes for a refusal since 0031.
+        let row = serde_json::json!({
+            "id": 7,
+            "session_key": "s",
+            "distilled_at": "2026-01-01T00:00:00Z",
+            "status": "ok",
+            "failure_reason": "the write path REFUSED every memory this pass proposed (2 refused, none written)",
+            "memories_written": 0,
+            "memories_refused": 2,
+            "windows": 1,
+        });
+        assert_eq!(refusal_of_reading(&row), Refusal::Everything);
+        let (status, _reason) = classify_distill_attempt(Some(&row), None);
+        assert_eq!(
+            status, "ok",
+            "the LEDGER's own word is untouched -- the pass ran and measured"
+        );
+        assert_eq!(
+            Refusal::Everything.word(&status),
+            DISTILL_WORD_REFUSED,
+            "but this client does not print [ok] for a pass that wrote nothing"
+        );
+
+        // The exit code: one refused attempt is not a success.
+        let refused = serde_json::json!({
+            "attempted": 1, "ok": 1, "empty": 0, "failed": 0, "refused": 1
+        });
+        let err = report_distill(&refused, false, vec!["session s: [refused] ...".into()])
+            .expect_err("a refused pass must not exit 0");
+        println!("READING t21 refused exit: {err}");
+        assert!(format!("{err}").contains("REFUSED"), "{err}");
+
+        // THE CONTROL, in the same test because the acceptance is a PAIR: a pass
+        // that really wrote keeps its 0 / [ok].
+        let clean = serde_json::json!({"memories_written": 3, "memories_refused": 0});
+        assert_eq!(refusal_of_reading(&clean), Refusal::None);
+        let ok = serde_json::json!({
+            "attempted": 1, "ok": 1, "empty": 0, "failed": 0, "refused": 0
+        });
+        assert!(
+            report_distill(&ok, false, vec!["session s: [ok] wrote 3 memories".into()]).is_ok(),
+            "a pass that really wrote must stay 0 / [ok]"
+        );
+    }
+
+    /// Three readings, three values: a MEASURED zero, a partial refusal, and a row
+    /// that recorded no count at all (pre-0031). Folding any two of them together is
+    /// the mistake 0031 exists to prevent.
+    #[test]
+    fn the_refusal_projection_keeps_a_measured_zero_apart_from_no_record() {
+        let of = |v: serde_json::Value| refusal_of_reading(&v);
+        assert_eq!(
+            of(serde_json::json!({"memories_written": 0, "memories_refused": 0})),
+            Refusal::None
+        );
+        assert_eq!(
+            of(serde_json::json!({"memories_written": 2, "memories_refused": 1})),
+            Refusal::Partial
+        );
+        assert_eq!(
+            of(serde_json::json!({"memories_written": 0, "memories_refused": 3})),
+            Refusal::Everything
+        );
+        assert_eq!(
+            of(serde_json::json!({"memories_written": 2})),
+            Refusal::NotRecorded
+        );
+        assert_eq!(
+            of(serde_json::json!({"memories_written": 0, "memories_refused": null})),
+            Refusal::NotRecorded,
+            "an explicit null is the same reading as a missing key"
+        );
+        // The words: ONLY the refused-everything case replaces the ledger's own.
+        assert_eq!(Refusal::None.word("ok"), "ok");
+        assert_eq!(
+            Refusal::Partial.word("ok"),
+            "ok",
+            "a partial refusal is reported, not renamed"
+        );
+        assert_eq!(
+            Refusal::NotRecorded.word(DISTILL_STATUS_NOT_RECORDED),
+            DISTILL_STATUS_NOT_RECORDED,
+            "a row that recorded no count cannot be called refused"
+        );
+        assert_eq!(
+            Refusal::Everything.word("failed"),
+            "failed",
+            "a failed attempt keeps its own word: the failure is the stronger fact"
+        );
+        // ... and the line says what the three-state line cannot.
+        let line = refusal_line(1, 2);
+        println!("READING t21 refusal line: {line}");
+        assert!(line.contains("refused EVERYTHING"), "{line}");
+    }
+
     /// t9 / #47: the CLI surface itself, without a daemon. Exactly one target is
     /// required and the two are exclusive -- `--session <key>` and
     /// `--unprocessed <n> --dry-run` are the two calls the contract names.
@@ -1942,6 +2046,83 @@ fn count_status(results: &[serde_json::Value], status: &str) -> u32 {
         .count() as u32
 }
 
+/// The word this client PRINTS for an attempt whose write path was refused
+/// entirely (t21 / issues #68, #67).
+///
+/// It is a DISPLAY word, not a ledger status: the ledger row still says `ok`
+/// (the pass ran and measured), and the daemon's closed status vocabulary is
+/// untouched -- the panel counts by its three words, so inventing a fourth one
+/// there would be silently dropped from those counts. What changed is that
+/// `ok` next to "wrote nothing" is no longer the ONLY thing this client says.
+const DISTILL_WORD_REFUSED: &str = "refused";
+
+/// WHAT THE LEDGER SAYS ABOUT THE WRITE PATH, projected from its own numbers
+/// (t21 / issues #68, #67).
+///
+/// WHY A PROJECTION AND NOT A SECOND CLASSIFIER: `memories_refused` (0031) is a
+/// COUNT, and `memories_written` was already there, so the judgement is a
+/// comparison on the receipt -- no sentence is parsed and no vocabulary is widened.
+/// The three non-refusal variants are kept apart because they are three different
+/// readings: a MEASURED zero, a partial refusal, and "nobody recorded a count"
+/// (a pre-0031 row), which must not be read as either of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// `memories_refused > 0 && memories_written == 0`: the write vocabulary
+    /// refused EVERYTHING this pass proposed, so the attempt wrote NOTHING. This is
+    /// the case that used to print `[ok`] and exit 0 (measured, t18).
+    Everything,
+    /// Some memories landed and some were refused: reported, not a failed attempt.
+    Partial,
+    /// A MEASURED zero -- the count was recorded and nothing was refused.
+    None,
+    /// NO count in the row at all (a pre-0031 row, or an attempt that never got as
+    /// far as proposing a memory). NOT the same as `None`: this is "nobody wrote
+    /// it down", and this client says so rather than assuming the attempt was clean.
+    NotRecorded,
+}
+
+impl Refusal {
+    fn of(written: Option<i64>, refused: Option<i64>) -> Refusal {
+        match refused {
+            None => Refusal::NotRecorded,
+            Some(0) => Refusal::None,
+            Some(_) if written.unwrap_or(0) == 0 => Refusal::Everything,
+            Some(_) => Refusal::Partial,
+        }
+    }
+
+    /// The bracket word for an attempt with this refusal state. Only the
+    /// refused-everything case REPLACES the ledger's word; everything else keeps
+    /// it, so this client never disagrees with the ledger about anything else.
+    fn word(self, ledger_status: &str) -> String {
+        if self == Refusal::Everything && ledger_status == "ok" {
+            DISTILL_WORD_REFUSED.to_string()
+        } else {
+            ledger_status.to_string()
+        }
+    }
+}
+
+/// The refusal judgement of a LEDGER ROW or of a BATCH ENTRY -- the two spell the
+/// same two keys (`memories_written`, `memories_refused`), which is why one
+/// function serves both.
+fn refusal_of_reading(v: &serde_json::Value) -> Refusal {
+    Refusal::of(
+        v["memories_written"].as_i64(),
+        v["memories_refused"].as_i64(),
+    )
+}
+
+/// The write path's own count, ONE line, printed only when it says something: an
+/// attempt refused everything WROTE NOTHING, which the three-state line cannot
+/// express (its word is still the ledger's `ok`).
+fn refusal_line(refused: u32, partial: u32) -> String {
+    format!(
+        "  write path: {refused} attempt(s) refused EVERYTHING (nothing written), \
+         {partial} partly refused"
+    )
+}
+
 /// WHAT ONE ATTEMPT ENDED AS, in the ledger's own vocabulary.
 ///
 /// THE LEDGER DECIDES WHENEVER THERE IS A ROW: its `status` is what happened and
@@ -2140,10 +2321,20 @@ fn batch_report_lines(resp: &serde_json::Value) -> Vec<String> {
     )];
     out.extend(estimate_lines(&resp["estimated"]));
     let results = resp["results"].as_array().cloned().unwrap_or_default();
+    let mut refused_all = 0u32;
+    let mut refused_partial = 0u32;
     for r in &results {
+        // Each ENTRY carries the two counts, so the word and the counts come from
+        // the same projection the single route uses (t21 / issues #68, #67).
+        let refusal = refusal_of_reading(r);
+        match refusal {
+            Refusal::Everything => refused_all += 1,
+            Refusal::Partial => refused_partial += 1,
+            _ => {}
+        }
         out.push(format!(
             "  [{:<12}] {}{}",
-            r["status"].as_str().unwrap_or("?"),
+            refusal.word(r["status"].as_str().unwrap_or("?")),
             r["session_key"].as_str().unwrap_or("?"),
             r["reason"]
                 .as_str()
@@ -2158,6 +2349,9 @@ fn batch_report_lines(resp: &serde_json::Value) -> Vec<String> {
         resp["failed"].as_u64().unwrap_or(0) as u32,
         count_status(&results, DISTILL_STATUS_NOT_RECORDED),
     ));
+    if refused_all > 0 || refused_partial > 0 {
+        out.push(refusal_line(refused_all, refused_partial));
+    }
     if !dry_run {
         out.push(format!("  actual: {}", actual_line(&resp["actual"])));
     }
@@ -2250,9 +2444,19 @@ fn report_distill(resp: &serde_json::Value, json: bool, lines: Vec<String>) -> R
         }
     }
     let failed = resp["failed"].as_u64().unwrap_or(0);
-    if failed > 0 {
+    // A REFUSED attempt is not a success (t21 / issues #68, #67): it wrote NOTHING,
+    // and its ledger word is ok only because the pass ran and measured. Before this,
+    // ruagent distill printed [ok] and exited 0 for it, so an unattended script
+    // could not tell a refusal from a write. The count is the daemon's own on the
+    // batch route (entries with memories_refused > 0 and nothing written) and the
+    // same rule computed from the row on the single route.
+    let refused = resp["refused"].as_u64().unwrap_or(0);
+    if failed > 0 || refused > 0 {
         bail!(
-            "{failed} of {} distillation attempt(s) failed; the reasons are in the report above",
+            "{failed} of {} distillation attempt(s) failed and {refused} wrote NOTHING because \
+             the write vocabulary REFUSED them; the reasons are in the report above (a refused \
+             attempt is not a success: the ledger records it as ok because the pass ran, and the \
+             refusals are listed above)",
             resp["attempted"].as_u64().unwrap_or(0)
         );
     }
@@ -2362,6 +2566,12 @@ fn distill_one(
     let empty = u32::from(status.as_deref() == Some("empty"));
     let failed = u32::from(status.as_deref() == Some("failed"));
     let not_recorded = u32::from(status.as_deref() == Some(DISTILL_STATUS_NOT_RECORDED));
+    // THE WRITE PATH'S OWN READING (t21 / issues #68, #67), from the LEDGER ROW --
+    // the same receipt the three states come from. It is an Option because a dry run
+    // writes no row BY DESIGN, so there is nothing to judge.
+    let refusal = row.as_ref().map(refusal_of_reading);
+    let refused = u32::from(refusal == Some(Refusal::Everything));
+    let refused_partial = u32::from(refusal == Some(Refusal::Partial));
 
     // THE SAME ENVELOPE the batch route returns, so `--json` has ONE shape for
     // both targets and the exit-code rule reads one field in both cases. The
@@ -2377,6 +2587,12 @@ fn distill_one(
         "ok": ok,
         "empty": empty,
         "failed": failed,
+        // The refusal axis, counted BESIDE the ledger's three words (those must keep
+        // adding up to the attempted count): the refused field is the number of
+        // attempts the write vocabulary refused EVERYTHING for, which is what the
+        // exit code turns on. The partial one is the informational half.
+        "refused": refused,
+        "refused_partial": refused_partial,
         "status": status.clone(),
         "reason": reason.clone(),
         "estimated": serde_json::Value::Null,
@@ -2400,7 +2616,12 @@ fn distill_one(
         lines.push(three_state_line(attempted, ok, empty, failed, not_recorded));
         lines
     } else {
-        let word = status.as_deref().unwrap_or(DISTILL_STATUS_NOT_RECORDED);
+        // The DISPLAY word: a ledger ok whose write path was refused entirely is
+        // printed as refused (see Refusal::word). The ledger's vocabulary is
+        // untouched -- this is this client's projection of two of its numbers.
+        let word = refusal
+            .map(|r| r.word(status.as_deref().unwrap_or(DISTILL_STATUS_NOT_RECORDED)))
+            .unwrap_or_else(|| DISTILL_STATUS_NOT_RECORDED.to_string());
         let mut lines = vec![format!(
             "session {key}: [{word}]{}{}",
             reason
@@ -2420,6 +2641,9 @@ fn distill_one(
             None => lines.extend(outcome_lines(&outcome, "the extraction reported")),
         }
         lines.push(three_state_line(attempted, ok, empty, failed, not_recorded));
+        if refused > 0 || refused_partial > 0 {
+            lines.push(refusal_line(refused, refused_partial));
+        }
         lines
     };
     report_distill(&envelope, json, lines)

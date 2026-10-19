@@ -1,0 +1,58 @@
+-- 0031: the distillation ledger learns whether the WRITE PATH REFUSED what the
+-- pass proposed (ruagent-issues-56-59 t21 / issues #68, #67).
+--
+-- THE DEFECT THIS FIXES, stated as the operator's question. #62 made a refused
+-- pass answer HTTP 409 with the refusals as data, but the LEDGER ROW it writes
+-- still said `status = 'ok'` with the refusal sentence in `failure_reason`. So
+-- "was this pass refused?" was answerable only by READING A SENTENCE, and the two
+-- readings a script has to tell apart -- "the vocabulary refused everything this
+-- pass proposed" and "the pass ran, looked and found nothing worth keeping"
+-- (`status = 'empty'`) -- arrived as the same shape to anything that counts
+-- words. Measured (ruagent-issues-56-59 t18): `ruagent distill` printed `[ok`]
+-- and exited 0 for a pass that wrote NOTHING, so an unattended script could not use
+-- the exit code to tell a refusal from a successful write.
+--
+-- WHY A COLUMN AND NOT A FOURTH STATUS WORD. The status vocabulary is
+-- `ok | empty | failed` (0020) and it is a CLOSED list on both sides: the panel
+-- counts rows by those three words, so a fourth word would be silently dropped
+-- from its counts -- a defect that reads as "no data" rather than as an error,
+-- which is why #62 deliberately did not add one. A column is ADDITIVE: no existing
+-- reader changes behaviour, no closed list has to be widened in two places, and a
+-- writer that does not know the column leaves it NULL.
+--
+-- WHAT THE COLUMN MEANS, and what NULL means.
+--   * NULL = NOBODY RECORDED IT: a pre-0031 row, or an attempt that never got as
+--     far as proposing a memory (a refusal before extraction, a planning
+--     failure). Same rule as 0028/0030: NO DEFAULT, so a historical row can never
+--     be read as "refused 0".
+--   * 0 = a MEASURED zero: the pass proposed memories and the write path refused
+--     none of them.
+--   * > 0 = it refused that many. TOGETHER WITH `memories_written`, which is
+--     already here, this makes the judgement machine-readable without parsing a
+--     sentence: `memories_refused > 0 AND memories_written = 0` is "the pass was
+--     REFUSED EVERYTHING" (the 409 case), while `status = 'empty'` is a pass that
+--     looked and found nothing to keep. Those two are the pair #68 asked to be
+--     distinguishable.
+--
+-- WHY IT RIDES `windows`' OWN OPTION at the write end (see distill.rs): the
+-- refusal count is only meaningful when an extraction loop ran, and `windows` is
+-- `Some` exactly then -- so a row carries both readings or neither, the
+-- "readings travel together" rule 0028/0030 already follow.
+--
+-- OUT OF SCOPE, on purpose: this migration does not touch `panel/src/**`. The
+-- read end publishes the column and can FILTER on it
+-- (`?refused=only|none|not_recorded`), so a panel can add the facet without a
+-- schema change, and the closed status vocabulary stays closed.
+--
+-- IDEMPOTENT BY THE RUNNER, not by SQL: SQLite has no `ADD COLUMN IF NOT
+-- EXISTS`, so `migrations::apply_script` probes `pragma_table_info` for every
+-- `ALTER TABLE ... ADD COLUMN` and SKIPS the ones already there. The statement
+-- must keep that exact shape -- one `ALTER TABLE <table> ADD COLUMN <column>
+-- <type>;` per line -- or the probe misses it and a re-apply fails with
+-- `duplicate column name`.
+--
+-- RELATION: ALTER-only and purely additive, like 0030. A pre-0031 database
+-- upgrades in place: no rebuild, no data copy, no `rebuild_already_done`.
+
+-- How many memories the write vocabulary refused during this attempt.
+ALTER TABLE distill_log ADD COLUMN memories_refused INTEGER;
