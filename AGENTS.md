@@ -409,6 +409,26 @@ To run the suite the intended way (private artefacts, write access armed):
 cd panel && npm run test:e2e -- --output=/tmp/pw
 ```
 
+- **An intermittent unix test failure needs a CONCURRENT probe, not another run** (ruagent-issues-56-59 t33,
+  measured). One ubuntu assertion failed in a run and passed in the PREVIOUS run on identical code, with the
+  reading `the snapshot reports the image of a live child: Some("ruagent_daemon-...")` -- the TEST BINARY'S OWN
+  NAME, i.e. the parent's image. It is the fork/exec window: on unix `Command::spawn` returns after the fork and
+  possibly before the exec, so `/proc/<pid>/exe` still names the parent. Hand reproduction failed for two rounds
+  because the window needs CONCURRENCY: measured in the container as uid 1000, six threads spawning `sleep 30`
+  gave **7 hits in 600 rounds (1.2%)**, reading the parent image 12-27 us after spawn with the child's own image
+  appearing 40-189 us later, while **180 sequential rounds gave zero**. So when a Linux-only test fails
+  occasionally: hammer it from several threads and time the first read. A green sequential run is NOT evidence the
+  bug is gone -- the author of that repair said so about its own five green runs, and it was right. Fix the TEST's
+  determinism (a bounded wait for the child to become itself), never the assertion's criteria, and then READ what
+  the product path does inside the window instead of arguing it: here the parent image does not match the
+  program's file name, so `attribute_child` declines, and under-attribution is the safe direction.
+- **A guard test that parses another carrier is blind exactly where its parser is** (ruagent-issues-56-59 t29).
+  The ignored-instrument manifest guard scans CI yml rows for `fn <ident>` names, and one RUN row's token
+  contained the words ` names`, so the parser skipped that token -- the row LOOKED accounted for and was never
+  statically checked. Give such a name its own row so it becomes checkable, and when you add a guard that reads a
+  second carrier (workflow yml, `scripts/*.ps1`, panel TS), first print what the parser extracts and confirm the
+  count is what you expect: this class fails SILENTLY, never with an error.
+
 ## Testing philosophy
 
 The mock ACP agent (`crates/mock-agent`) is the backbone of CI: every orchestration/policy/memory behavior must be testable without real harnesses or API keys. Property tests guard the injection contract (bounded, tagged, visible truncation).
