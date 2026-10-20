@@ -307,3 +307,40 @@ one command, fixed by dropping the path prefix, and CI went green on ad09001. Th
 beyond this file: a name in a manifest is read by a PARSER, not by a human, and a location belongs in
 the reason column.
 
+
+## 12. The intermittent red, and why it took a concurrent probe to catch
+
+One ubuntu assertion failed in a run and passed in the PREVIOUS run on identical code (ad09001 green,
+76731c0 red). It was the very assertion the earlier Linux repair had asked to see again if it ever
+reappeared, and its message is the reading that had been missing:
+
+    the snapshot reports the image of a live child: Some("ruagent_daemon-1295b3a061310cbd")
+
+That value is the TEST BINARY'S OWN NAME -- the parent's image, not the child's. The hypothesis was the
+fork/exec window (on unix, `Command::spawn` returns after the fork and possibly before the exec, so
+`/proc/<pid>/exe` still points at the parent), and it was measured, in the container, as uid 1000: six
+threads spawning `sleep 30` concurrently, 600 rounds -> **7 rounds (1.2%)** read the parent image 12-27 us
+after spawn returned, with the child's own image appearing 40-189 us later. Run SEQUENTIALLY, 180 rounds
+across three spawn flavours -> **zero**. So the window needs concurrency, which is exactly why hand
+reproduction failed for two rounds while CI -- which runs the suite in parallel -- saw it once in a while.
+
+The repair is in the TEST: `sleeper()` waits (bounded at 2 s) for the child's image to become its own
+before asserting, and `image_name` now documents the window. Nothing else moved -- in `git diff -U0`, every
+hit for `assert`/`attribute_child`/`matching_image` comes from ADDED COMMENTS, and a wait that times out
+still fails the same assertion with the reading it found. Control: 6 threads x 60 rounds = 360 calls, the
+window was hit twice, both times `before=parent -> after=sleep`, and 360/360 assertions passed.
+
+The product path is safe in the window, and that was read rather than argued: the pid carries the daemon's
+own image, `matching_image` demands equality with the program's file name, so it does not match and
+`attribute_child` does not claim -- under-attribution, never a stranger's agent. Worst case is one extra
+poll against a tens-of-microseconds window while chat/runs poll at 20-250 ms. The stated boundary: a card
+that named the daemon's own binary as its agent would match the parent image, but the pid that matches is
+the child it just spawned, so the claim is still the right one.
+
+**What this round learned from the two halves of the same lesson.** SS5's interleaved baseline caught a
+regression that a Windows-only gate called green; SS10 and this section record the reverse: a green
+Windows gate says nothing about unix semantics, and a flaky unix assertion says nothing either until the
+window behind it is measured. The author of the repair put it best and it is kept here: on an idle
+machine the window never opens, so the five green container runs do NOT prove the flake is gone -- the
+probe and the control do. A CI run is the final verification, and that is the one that counts.
+
