@@ -527,6 +527,27 @@ fn program_file_name(program: &str) -> String {
 /// ITS program's file name. Attribution therefore uses the narrow tool when the
 /// wide one is ambiguous, and GIVES UP (rather than guessing) when both leave
 /// more than one candidate.
+/// The image (executable file name) of a process, or None when the process table cannot say --
+/// which includes a pid that has already exited (a killed-but-unreaped child is a zombie whose
+/// /proc entry survives with state Z, and the start-time rule treats that as gone).
+///
+/// A FRESHLY SPAWNED CHILD MAY NOT BE ITSELF YET. MEASURED in a linux container, with the
+/// tests own spawn (Stdio::null, no pre_exec): with 6 threads spawning sleep 30 at once, the
+/// first /proc/<pid>/exe read taken 12-27 us after Command::spawn returned reported the PARENTS
+/// image (ruagent_daemon-a90f8dadceb12900 -- the test binary itself) in 7 of 600 rounds, and
+/// the childs own image appeared 40-189 us in; sequentially the window was not observable at
+/// all (0 of 180 rounds across three spawn flavours), and windows -- where this reads a
+/// process-table snapshot -- has no such window. So on unix this can answer "the parent" for a
+/// few tens of microseconds after a spawn, and a caller that reads it ONCE and decides is
+/// racing the kernel.
+///
+/// WHAT THAT MEANS FOR ATTRIBUTION (why the rule is left as it is): an un-exec'd pid still
+/// carries the DAEMONS OWN name, so matching_image -- which requires the programs own file
+/// name -- cannot match it, and attribute_child therefore does not name or claim that pid. The
+/// same probe measured this: while the image was the parents, matching_image(&[pid], "sleep")
+/// came back empty in 4 of the 7 hits and the pid in the other 3, those three having straddled
+/// the window (the rule re-reads the image). The direction is refuse-rather-than-guess: the
+/// worst case is one more poll, never a claim on a process that is not this sessions child.
 pub fn image_name(pid: u32) -> Option<String> {
     #[cfg(windows)]
     return windows_image_name(pid);
@@ -1227,9 +1248,48 @@ mod tests {
             c.arg("30");
             c
         };
-        cmd.stdout(std::process::Stdio::null())
+        let child = cmd
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawning a sleeper child")
+            .expect("spawning a sleeper child");
+        wait_until_the_child_is_itself(child.id());
+        child
+    }
+
+    /// The image the sleeper runs as, per platform -- the same pair the tests compare against.
+    #[cfg(windows)]
+    const SLEEPER_IMAGE: &str = "ping.exe";
+    #[cfg(unix)]
+    const SLEEPER_IMAGE: &str = "sleep";
+
+    /// Wait (BOUNDED) until the child is ITSELF, i.e. until the kernel has finished its exec --
+    /// see the measurement in the doc comment on image_name. This does NOT relax anything: it
+    /// returns either way, so a child that never becomes itself still fails the assertions that
+    /// follow, with the real reading printed here.
+    fn wait_until_the_child_is_itself(pid: u32) {
+        let first = image_name(pid);
+        if first.as_deref() == Some(SLEEPER_IMAGE) {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        while std::time::Instant::now() < deadline {
+            if let Some(name) = image_name(pid)
+                && name.eq_ignore_ascii_case(SLEEPER_IMAGE)
+            {
+                {
+                    println!(
+                        "READING t33 waited for the child's own image: pid={pid} before={first:?}                          after={:?}",
+                        image_name(pid)
+                    );
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        println!(
+            "READING t33 the child {pid} never became {SLEEPER_IMAGE:?} within 2 s: {:?}",
+            image_name(pid)
+        );
     }
 }
