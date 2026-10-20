@@ -22,11 +22,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// The recorded prior daemon: `<pid> <started_at_unix_ms>`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PriorDaemon {
-    pub pid: u32,
-    pub started_at_ms: i64,
-}
+/// F4 (issues-56-59 architecture audit): this used to be a SECOND struct carrying the same
+/// pid+start-time identity as ChildRef, with its own copy of the comparison -- so t28's platform
+/// semantics (a KILLED but not-yet-reaped child is a ZOMBIE on Linux and counts as gone; the
+/// /proc/stat btime is WHOLE SECONDS, hence START_SLACK_MS) reached the two paths only because
+/// someone happened to change the shared primitive they both bottomed out in. It is now the SAME
+/// type, built by the same constructor and answered by the same judgement
+/// (ChildRef::verdict_with), so the two paths cannot disagree about who a pid is.
+pub type PriorDaemon = ChildRef;
 
 /// Where the current daemon's identity lives.
 pub fn record_path(root: &Path) -> PathBuf {
@@ -48,10 +51,7 @@ pub fn read_prior(root: &Path) -> Result<Option<PriorDaemon>> {
     let (Ok(pid), Ok(started)) = (pid.parse::<u32>(), started.parse::<i64>()) else {
         return Ok(None);
     };
-    Ok(Some(PriorDaemon {
-        pid,
-        started_at_ms: started,
-    }))
+    Ok(Some(ChildRef::recorded(pid, started)))
 }
 
 /// Record this daemon for the next boot.
@@ -61,11 +61,23 @@ pub fn write_current(root: &Path) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let pid = std::process::id();
-    let started = process_started_at_ms(pid).unwrap_or(0);
+    // F4: NO SENTINEL. unwrap_or(0) wrote a start time that cannot be told apart from a real one,
+    // so a record could carry an identity nobody can verify -- and the boot sweep must never sweep
+    // on an unverifiable record (a pid that got reused would be swept as if its children were
+    // ours). If this daemon cannot read its own start time, the honest record is NO record: the
+    // next boot treats this root as a first boot, which LEAVES ORPHANS ALIVE rather than killing a
+    // stranger's children.
+    let Some(identity) = ChildRef::of(pid) else {
+        tracing::warn!(
+            pid,
+            "could not read this daemon's own start time -- writing no identity record"
+        );
+        return Ok(());
+    };
     // temp + rename, same discipline as agents.toml: a torn write must
     // never corrupt the record.
     let tmp = path.with_extension("pid.tmp");
-    std::fs::write(&tmp, format!("{pid} {started}"))
+    std::fs::write(&tmp, format!("{pid} {}", identity.started_at_ms))
         .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
@@ -82,33 +94,32 @@ pub fn boot(root: &Path) {
     }
     match read_prior(root) {
         Ok(Some(prior)) if prior.pid != std::process::id() => {
-            if let Some(start) = process_started_at_ms(prior.pid) {
-                if start == prior.started_at_ms {
-                    tracing::warn!(
-                        pid = prior.pid,
-                        "previous daemon still running on this root — skipping orphan sweep"
-                    );
-                } else {
-                    tracing::warn!(
-                        pid = prior.pid,
-                        "recorded pid reused by another process — skipping orphan sweep"
-                    );
-                }
-            } else {
-                let pids = child_pids_of(prior.pid);
-                if !pids.is_empty() {
-                    // The boot sweep is a reclamation like any other, so it
-                    // reports the same reading (issue #60): how many it had to
-                    // kill, how many were already gone, and -- the one that
-                    // matters -- how many SURVIVED.
-                    let out = reclaim(&pids, "boot sweep of the previous daemon orphans");
-                    tracing::info!(
-                        parent = prior.pid,
-                        killed = out.killed,
-                        already_gone = out.already_gone,
-                        failed = out.failed,
-                        "orphaned agent processes from the previous daemon swept"
-                    );
+            // F4: three outcomes, ONE judgement (the same call the child paths make).
+            match prior_action_with(prior, process_started_at_ms) {
+                PriorAction::SkipStillRunning => tracing::warn!(
+                    pid = prior.pid,
+                    "previous daemon still running on this root — skipping orphan sweep"
+                ),
+                PriorAction::SkipReusedPid => tracing::warn!(
+                    pid = prior.pid,
+                    "recorded pid reused by another process — skipping orphan sweep"
+                ),
+                PriorAction::Sweep => {
+                    let pids = child_pids_of(prior.pid);
+                    if !pids.is_empty() {
+                        // The boot sweep is a reclamation like any other, so it
+                        // reports the same reading (issue #60): how many it had to
+                        // kill, how many were already gone, and -- the one that
+                        // matters -- how many SURVIVED.
+                        let out = reclaim(&pids, "boot sweep of the previous daemon orphans");
+                        tracing::info!(
+                            parent = prior.pid,
+                            killed = out.killed,
+                            already_gone = out.already_gone,
+                            failed = out.failed,
+                            "orphaned agent processes from the previous daemon swept"
+                        );
+                    }
                 }
             }
         }
@@ -235,14 +246,83 @@ pub struct ChildRef {
 }
 
 impl ChildRef {
+    /// An identity AS RECORDED: no liveness question is asked yet. This is the boot record's
+    /// constructor, and the one every other path reaches through of().
+    pub fn recorded(pid: u32, started_at_ms: i64) -> Self {
+        Self { pid, started_at_ms }
+    }
+
     /// The identity of the process behind pid RIGHT NOW, or None if it is gone.
     pub fn of(pid: u32) -> Option<Self> {
-        process_started_at_ms(pid).map(|started_at_ms| Self { pid, started_at_ms })
+        process_started_at_ms(pid).map(|started_at_ms| Self::recorded(pid, started_at_ms))
+    }
+
+    /// THE judgement (F4): what does the process table say about this identity?
+    ///
+    /// ONE place, ONE comparison, and BOTH paths ask it -- the boot sweep of a previous daemon's
+    /// orphans (through prior_action_with) and every child reclamation (reclaim_refs_with, which is
+    /// also what the run and session paths call). The reader is passed IN so that a test can drive
+    /// both paths from one input, and so that t28's platform semantics live in the reader
+    /// (process_started_at_ms) instead of being re-derived at each comparison.
+    ///
+    /// THE THREE OUTCOMES MATTER, and collapsing them into a boolean would be a safety bug:
+    /// Reused is a pid that is ALIVE but is somebody else (never kill it, never sweep its
+    /// children), Gone is a pid nobody holds (its children are true orphans), Same is still our
+    /// process.
+    pub fn verdict_with(&self, read: impl Fn(u32) -> Option<i64>) -> IdentityVerdict {
+        match read(self.pid) {
+            Some(started) if started == self.started_at_ms => IdentityVerdict::Same,
+            Some(_) => IdentityVerdict::Reused,
+            None => IdentityVerdict::Gone,
+        }
+    }
+
+    /// The judgement against the real process table.
+    pub fn verdict(&self) -> IdentityVerdict {
+        self.verdict_with(process_started_at_ms)
     }
 
     /// True when the pid still holds the SAME process (not a reused pid).
     pub fn is_still_this_process(&self) -> bool {
-        process_started_at_ms(self.pid) == Some(self.started_at_ms)
+        self.verdict() == IdentityVerdict::Same
+    }
+
+    /// The same question, against a caller-supplied reader.
+    pub fn is_still_this_process_with(&self, read: impl Fn(u32) -> Option<i64>) -> bool {
+        self.verdict_with(read) == IdentityVerdict::Same
+    }
+}
+
+/// What the process table says about a recorded identity (F4: the ONE judgement's result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// The pid still holds the process the identity names.
+    Same,
+    /// The pid is alive and holds a DIFFERENT process: the recorded one is gone and this pid now
+    /// belongs to somebody else.
+    Reused,
+    /// No live process holds this pid.
+    Gone,
+}
+
+/// What the boot sweep does about a prior record (F4: decided by the ONE judgement, never by a
+/// second comparison in the sweep itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorAction {
+    /// The prior daemon is still running on this root: skip the sweep.
+    SkipStillRunning,
+    /// The pid was reused by another process: skip the sweep (its children are not ours).
+    SkipReusedPid,
+    /// Nobody holds the pid: its surviving children are true orphans, sweep them.
+    Sweep,
+}
+
+/// The boot sweep's decision, taken from the SAME judgement every other path uses.
+pub(crate) fn prior_action_with(prior: ChildRef, read: impl Fn(u32) -> Option<i64>) -> PriorAction {
+    match prior.verdict_with(read) {
+        IdentityVerdict::Same => PriorAction::SkipStillRunning,
+        IdentityVerdict::Reused => PriorAction::SkipReusedPid,
+        IdentityVerdict::Gone => PriorAction::Sweep,
     }
 }
 
@@ -297,17 +377,18 @@ fn reclaim_refs_with(
 ) -> Reclaim {
     let mut out = Reclaim::default();
     for child in refs {
-        let ours = |pid: u32| started(pid) == Some(child.started_at_ms);
-        if !ours(child.pid) {
+        // F4: the SAME judgement the boot sweep makes, through the same call -- not a local
+        // comparison of a start time this function re-reads for itself.
+        if !child.is_still_this_process_with(started) {
             out.already_gone += 1;
             continue;
         }
         let _ = kill(child.pid);
         let deadline = std::time::Instant::now() + grace;
-        let mut gone = !ours(child.pid);
+        let mut gone = !child.is_still_this_process_with(started);
         while !gone && std::time::Instant::now() < deadline {
             std::thread::sleep(EXIT_POLL);
-            gone = !ours(child.pid);
+            gone = !child.is_still_this_process_with(started);
         }
         if gone {
             out.killed += 1;
@@ -352,6 +433,11 @@ pub fn reclaim(pids: &[u32], what: &str) -> Reclaim {
 /// 3 s window expired. One pass returns the same evidence for the price of one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildProcess {
+    /// The pid AND its start time ARE the identity (F4), and nothing asks a question of them
+    /// separately: this row is a fresh snapshot, and the moment it is handed to a caller as an
+    /// identity it goes through ChildRef::recorded. (Holding a ChildRef here instead would be
+    /// tidier still, but two call sites outside this file -- chat.rs and runs.rs -- read .pid,
+    /// and both are outside this task's scope.)
     pub pid: u32,
     /// Start time in unix milliseconds -- the child's identity, comparable to the value
     /// now_unix_ms() returns.
@@ -474,10 +560,9 @@ pub fn attribute_child(window: &[u32], window_at_ms: i64, program: &str) -> Opti
     } else {
         None
     };
-    pick.map(|c| ChildRef {
-        pid: c.pid,
-        started_at_ms: c.started_at_ms,
-    })
+    // F4: the identity goes out through the ONE constructor, never as loose fields a later reader
+    // would have to pair up again.
+    pick.map(|c| ChildRef::recorded(c.pid, c.started_at_ms))
 }
 
 /// True when another live child of ours carries the same image name as this one.
@@ -1290,6 +1375,131 @@ mod tests {
         println!(
             "READING t33 the child {pid} never became {SLEEPER_IMAGE:?} within 2 s: {:?}",
             image_name(pid)
+        );
+    }
+
+    /// F4: ONE identity, ONE judgement, TWO paths -- and this is the reading that proves the two
+    /// agree, driven by the SAME reader over the SAME identity.
+    ///
+    /// The two paths are the boot sweep of a previous daemon's orphans (prior_action_with) and a
+    /// child reclamation (reclaim_refs_with, which the run and session paths also call). They take
+    /// the same input type and ask the same method now, so this test drives each of them with one
+    /// injected reader and asserts the three outcomes cannot disagree: the pid still holds OUR
+    /// process, the pid is alive under SOMEBODY ELSE (never kill it, never sweep its children), or
+    /// nobody holds it (its children are true orphans).
+    ///
+    /// The reader is injected, so nothing is spawned and no platform is assumed -- and the platform
+    /// semantics t28 measured (a zombie counts as gone, btime is whole seconds so a fresh start can
+    /// read up to START_SLACK_MS early) live INSIDE the reader the real paths pass, which is the
+    /// whole point of having one judgement.
+    #[test]
+    fn the_boot_sweep_and_a_reclaim_reach_the_same_verdict() {
+        use std::sync::Mutex;
+        let recorded = 1_700_000_000_000i64;
+        let identity = ChildRef::recorded(4242, recorded);
+
+        // The three answers a process table can give about one identity: each case carries the
+        // answer (shared by both paths) and the verdict the ONE judgement must return for it.
+        let cases: [(&str, Option<i64>, IdentityVerdict); 3] = [
+            ("still ours", Some(recorded), IdentityVerdict::Same),
+            (
+                "reused pid",
+                Some(recorded + 999_000),
+                IdentityVerdict::Reused,
+            ),
+            ("gone", None, IdentityVerdict::Gone),
+        ];
+
+        for (name, answer, expected) in cases {
+            let state = Mutex::new(answer);
+            let read = |_pid: u32| *state.lock().expect("reader state");
+            // ONE explicit trait object, so both paths borrow the SAME reader (and no call needs
+            // a borrow of its own for the generic argument).
+            let read: &dyn Fn(u32) -> Option<i64> = &read;
+            let killed: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+            let kill = |pid: u32| {
+                // A killed process leaves the table: the next read stops seeing it, which is how
+                // reclaim_refs_with tells "killed" from "survived its kill".
+                *state.lock().expect("reader state") = None;
+                killed.lock().expect("kill log").push(pid);
+                true
+            };
+
+            let verdict = identity.verdict_with(read);
+            let boot = prior_action_with(identity, read);
+            let out = reclaim_refs_with(
+                std::slice::from_ref(&identity),
+                std::time::Duration::from_millis(50),
+                read,
+                &kill,
+            );
+            let kill_calls = killed.lock().expect("kill log").clone();
+            println!(
+                "READING F4 identity pid={} recorded_start={recorded} reader={name}: verdict={verdict:?} boot={boot:?} reclaim(killed={}, already_gone={}, failed={}) kill_calls={kill_calls:?}",
+                identity.pid, out.killed, out.already_gone, out.failed
+            );
+            assert_eq!(verdict, expected, "{name}: the judgement itself");
+            assert_eq!(
+                verdict == IdentityVerdict::Gone,
+                matches!(boot, PriorAction::Sweep),
+                "{name}: the boot sweep CONSUMES the judgement, it does not re-derive it"
+            );
+            assert_eq!(
+                verdict == IdentityVerdict::Same,
+                kill_calls == vec![identity.pid],
+                "{name}: a reclaim kills EXACTLY when the pid still holds our process"
+            );
+            assert_eq!(
+                out.already_gone,
+                usize::from(verdict != IdentityVerdict::Same),
+                "{name}: anything else is already_gone, never a kill"
+            );
+            assert_eq!(
+                out.killed,
+                usize::from(verdict == IdentityVerdict::Same),
+                "{name}: the same verdict drives what the reclaim reports"
+            );
+        }
+    }
+
+    /// F4, the other half of "one place": the same identity, written as a boot record and read
+    /// back, is answered by the same judgement -- the record round trip cannot invent a second
+    /// identity (this is what PriorDaemon being an alias for ChildRef buys).
+    #[test]
+    fn a_written_record_round_trips_through_the_same_identity_type() {
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-orphans-f4-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        write_current(&root).unwrap();
+        let prior = read_prior(&root)
+            .expect("reading it back")
+            .expect("a record");
+        assert_eq!(prior.pid, std::process::id());
+        assert_eq!(
+            prior,
+            ChildRef::of(std::process::id()).expect("our own identity")
+        );
+        assert_eq!(
+            prior.verdict(),
+            IdentityVerdict::Same,
+            "the record names US"
+        );
+        println!(
+            "READING F4 boot record round trip: pid={} start={} verdict={:?}",
+            prior.pid,
+            prior.started_at_ms,
+            prior.verdict()
+        );
+        // The root is this test's own, and the crate's shared cleanup shape owns the asserting
+        // half (crates/daemon/src/lib.rs, test_cleanup): no handle is held here, so it is the
+        // PANICKING call, not the reporting one.
+        crate::test_cleanup::remove_test_root(
+            &root,
+            "the F4 record round-trip root",
+            std::time::Duration::from_millis(500),
         );
     }
 }
