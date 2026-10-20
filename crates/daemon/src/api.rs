@@ -11,6 +11,7 @@ use axum::{Json, Router};
 use ruagent_acp::chat::ChatCommand;
 use ruagent_core::{Run, RunId, RunStatus, Task, TaskCreator, TaskStatus};
 use ruagent_knowledge::rrf::WeightError;
+use ruagent_store::migrations::DISTILL_LOG_COLUMNS;
 use ruagent_store::{DeleteSession, TranscriptLine, transcript_path};
 use serde::Deserialize;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -4108,10 +4109,13 @@ async fn sessions_distill_batch(
             "planned": planned.len(),
             "undistilled_total": undistilled_total,
             "attempted": 0,
-            "ok": 0,
-            "empty": 0,
+            // THE BUCKET NAMES ARE THE STATUS WORDS (audit F2), not a second
+            // hand-typed copy of the vocabulary: the panel counts on these keys, so
+            // they must stay the words the ledger uses.
+            (DISTILL_LOG_OK): 0,
+            (DISTILL_LOG_EMPTY): 0,
             "refused": 0,
-            "failed": 0,
+            (DISTILL_LOG_FAILED): 0,
             "estimated": estimated,
             "actual": serde_json::Value::Null,
             "results": [],
@@ -4170,9 +4174,9 @@ async fn sessions_distill_batch(
             refused += 1;
         }
         match status.as_str() {
-            "ok" => ok += 1,
-            "empty" => empty += 1,
-            "failed" => failed += 1,
+            DISTILL_LOG_OK => ok += 1,
+            DISTILL_LOG_EMPTY => empty += 1,
+            DISTILL_LOG_FAILED => failed += 1,
             // `not_recorded` is not one of the three outcomes: it is the ledger
             // read's word for "no row recorded this", and it is reported per
             // session rather than folded into a count it does not belong to.
@@ -4194,10 +4198,11 @@ async fn sessions_distill_batch(
         "planned": planned.len(),
         "undistilled_total": undistilled_total,
         "attempted": results.len(),
-        "ok": ok,
-        "empty": empty,
+        // Same words as the dry run above and as the ledger (audit F2).
+        (DISTILL_LOG_OK): ok,
+        (DISTILL_LOG_EMPTY): empty,
         "refused": refused,
-        "failed": failed,
+        (DISTILL_LOG_FAILED): failed,
         "estimated": estimated,
         "actual": actual,
         "results": results,
@@ -4389,7 +4394,7 @@ async fn attempt_written_since(
     Ok(row.map(|(status, reason)| {
         // A row whose status is NULL is the ledger's fourth state; the batch says
         // the same word the ledger read does instead of inventing "ok".
-        let status = status.unwrap_or_else(|| DISTILL_LOG_STATUSES[3].to_string());
+        let status = status.unwrap_or_else(|| DISTILL_LOG_NOT_RECORDED.to_string());
         (status, reason)
     }))
 }
@@ -4419,9 +4424,9 @@ fn classify_attempt(
                 });
             (status, reason)
         }
-        (Err(e), None) => ("failed".to_string(), Some(e.clone())),
+        (Err(e), None) => (DISTILL_LOG_FAILED.to_string(), Some(e.clone())),
         (Ok(_), None) => (
-            "not_recorded".to_string(),
+            DISTILL_LOG_NOT_RECORDED.to_string(),
             Some("the attempt returned without writing a distill_log row".to_string()),
         ),
     }
@@ -4542,8 +4547,30 @@ struct DistillLogQuery {
     offset: Option<u32>,
 }
 
+/// The status vocabulary's WORDS -- one definition each (issues-56-59 audit F2).
+///
+/// WHY NAMES AND NOT INDEXES: this vocabulary used to be reached as
+/// `DISTILL_LOG_STATUSES[3]`, which made the ORDER semantic -- sorting the array
+/// (the most natural refactor there is) would have silently turned "not recorded"
+/// into another word, in a module where nothing would have failed. The word and the
+/// order are now separate facts: `DISTILL_LOG_STATUSES` is the order a reader
+/// iterates, and every USE names the word it means.
+const DISTILL_LOG_OK: &str = "ok";
+const DISTILL_LOG_EMPTY: &str = "empty";
+const DISTILL_LOG_FAILED: &str = "failed";
+/// The ledger's word for "no row recorded an outcome", distinct from the three
+/// outcomes: the same string the refusal facet uses for its own third value, and
+/// deliberately NOT shared with it (the two vocabularies answer different
+/// questions and must be free to change apart).
+const DISTILL_LOG_NOT_RECORDED: &str = "not_recorded";
+
 /// The status vocabulary this route accepts, including the NULL-status selector.
-const DISTILL_LOG_STATUSES: [&str; 4] = ["ok", "empty", "failed", "not_recorded"];
+const DISTILL_LOG_STATUSES: [&str; 4] = [
+    DISTILL_LOG_OK,
+    DISTILL_LOG_EMPTY,
+    DISTILL_LOG_FAILED,
+    DISTILL_LOG_NOT_RECORDED,
+];
 
 /// The ledger's WHERE clause, in ONE place: the page, the count, the distribution
 /// and the sums must all select the same rows, or `total` describes a different
@@ -4561,21 +4588,34 @@ const DISTILL_LOG_FILTER: &str =
                                             OR (?3 = 'none' AND memories_refused = 0)
                                             OR (?3 = 'not_recorded' AND memories_refused IS NULL))";
 
+/// The ledger's projection, generated from the ONE column set: `DISTILL_LOG_COLUMNS`.
+///
+/// WHY A FUNCTION AND NOT AN INLINE `join`: `distill_entry` reads the row BY
+/// NUMBER, so this sequence is a contract between the SELECT and the reader, and the
+/// audit's guard test (`crate::distill`'s `mod tests`) asserts the projected list
+/// parses back to exactly the const. A column edited into the SELECT by hand would
+/// re-label every field the reader takes, silently.
+pub(crate) fn distill_log_select_columns() -> String {
+    DISTILL_LOG_COLUMNS.join(", ")
+}
+
 /// The refusal facet's closed vocabulary (t21 / issues #68, #67), the same shape
 /// `DISTILL_LOG_STATUSES` uses one line up: an unknown value is a 400 that names
 /// the accepted ones, never a silently empty page.
 const DISTILL_LOG_REFUSED: [&str; 3] = ["only", "none", "not_recorded"];
 
-/// The ledger's columns, in the order `distill_entry` reads them.
-///
-/// `from_seq`/`to_seq`/`total_messages` are APPENDED (0030, t3) and are the last
-/// three a reader may find, so every pre-0030 position keeps its index: 0028's
-/// columns are read by number, and inserting the new ones anywhere but the end
-/// would silently re-label every field of every row.
-const DISTILL_LOG_COLUMNS: &str = "id, session_key, distilled_at, status, failure_reason, agent, \
-     memories_written, entities_written, relations_written, relations_duplicate, \
-     relations_refused, tokens_used, context_size, cost_usd, retries, windows, truncated, \
-     prompt_hash, from_seq, to_seq, total_messages, memories_refused";
+// The ledger's columns are defined in ONE place --
+// `ruagent_store::migrations::DISTILL_LOG_COLUMNS`, next to the schema that
+// builds them (issues-56-59 audit F1). This module USES that list; it does not
+// spell it out any more. Two consumers here: the SELECT below, and the INSERT in
+// `crate::distill`, which generates its column names AND its `?N` placeholders
+// from the same sequence.
+//
+// THE ORDER IS THE READER'S, and it is load-bearing: `from_seq`/`to_seq`/
+// `total_messages` were APPENDED (0030, t3) and are the last three a pre-0030
+// reader may find, so every pre-0030 position keeps its index -- `distill_entry`
+// reads the row BY NUMBER, and inserting a column anywhere but the end would
+// silently re-label every field of every row.
 
 /// One read of the ledger, gathered inside ONE closure so the page, the total, the
 /// distribution and the sums all describe the same rows.
@@ -4614,8 +4654,8 @@ fn read_distill_ledger(
     offset: u32,
 ) -> rusqlite::Result<DistillLedger> {
     let sql = format!(
-        "SELECT {DISTILL_LOG_COLUMNS} FROM distill_log{DISTILL_LOG_FILTER} ORDER BY id DESC \
-         LIMIT ?4 OFFSET ?5"
+        "SELECT {} FROM distill_log{DISTILL_LOG_FILTER} ORDER BY id DESC LIMIT ?4 OFFSET ?5",
+        distill_log_select_columns()
     );
     let entries = conn
         .prepare(&sql)?
@@ -4634,11 +4674,10 @@ fn read_distill_ledger(
     // Every bucket starts at a MEASURED zero: this is a count over an explicit
     // filter, not an unrecorded value. A reader can therefore index all four
     // without a null check and still add them up to `total`.
-    let mut by_status: std::collections::BTreeMap<String, i64> =
-        ["ok", "empty", "failed", "not_recorded"]
-            .into_iter()
-            .map(|bucket| (bucket.to_string(), 0i64))
-            .collect();
+    let mut by_status: std::collections::BTreeMap<String, i64> = DISTILL_LOG_STATUSES
+        .into_iter()
+        .map(|bucket| (bucket.to_string(), 0i64))
+        .collect();
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT status, COUNT(*) FROM distill_log{DISTILL_LOG_FILTER} GROUP BY status"
@@ -4651,7 +4690,7 @@ fn read_distill_ledger(
             // A NULL status is the unrecorded bucket; a status the vocabulary does
             // not know keeps its own name rather than being folded into one of the
             // three (the buckets must still add up to `total`).
-            let bucket = raw.unwrap_or_else(|| "not_recorded".to_string());
+            let bucket = raw.unwrap_or_else(|| DISTILL_LOG_NOT_RECORDED.to_string());
             *by_status.entry(bucket).or_insert(0) += n;
         }
     }

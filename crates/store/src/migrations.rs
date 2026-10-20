@@ -62,6 +62,53 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 /// that IS expressible** (0 foreign keys, 0 views, 0 triggers reference
 /// `distill_log` -- measured on the live database before it was written), and it
 /// is the first migration here to replace a table outright.
+/// THE `distill_log` COLUMN SET, DEFINED HERE ONCE (issues-56-59 architecture audit F1).
+///
+/// WHY IT LIVES IN THIS MODULE: the columns of a table are a SCHEMA fact, and this
+/// is the module that builds the schema. The daemon's ledger SELECT and its INSERT
+/// are both generated from this ONE list (audit F1: the set used to be written out
+/// five times, and one of those copies was the `?N` position mirror inside the
+/// INSERT), so a column added here without a migration -- or a migration that adds
+/// one without this list -- fails a test in this file (see
+/// `the_migrations_build_the_documented_column_set`).
+///
+/// THE ORDER IS THE READER'S, NOT THE TABLE'S. `crate::api`'s `distill_entry` reads
+/// a ledger row BY NUMBER (0..=21), so this sequence is what its SELECT must return;
+/// the declaration order the migrations actually built is a DIFFERENT fact (it is
+/// append-only by construction: 0024 rebuilt the table, 0028/0030/0031 each added
+/// columns at the END) and it is pinned in that same test. Two facts, two
+/// assertions -- do not try to make one vector serve both.
+pub const DISTILL_LOG_COLUMNS: [&str; 22] = [
+    "id",
+    "session_key",
+    "distilled_at",
+    "status",
+    "failure_reason",
+    "agent",
+    "memories_written",
+    "entities_written",
+    "relations_written",
+    "relations_duplicate",
+    "relations_refused",
+    "tokens_used",
+    "context_size",
+    "cost_usd",
+    "retries",
+    "windows",
+    "truncated",
+    "prompt_hash",
+    "from_seq",
+    "to_seq",
+    "total_messages",
+    "memories_refused",
+];
+
+/// The ONE column of `DISTILL_LOG_COLUMNS` that an INSERT does not name: it is the
+/// rowid (`INTEGER PRIMARY KEY`), assigned by SQLite at insert time. Named here
+/// instead of left as a string that a filter happens to exclude, so the exception
+/// is one line a reader can check (and the INSERT's guard test asserts exactly it).
+pub const DISTILL_LOG_ROWID: &str = "id";
+
 pub fn apply(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     ensure_ledger(conn)?;
     let versions = ledger_versions(conn)?;
@@ -623,6 +670,21 @@ mod tests {
                 // anywhere else would silently re-label every field of every row.
                 "memories_refused"
             ],
+        );
+        // THE SET IS THE OTHER HALF, AND IT IS NOT HAND-TYPED HERE (audit F1). The
+        // vector above pins the DECLARATION order; the column SET itself is defined
+        // once, as `DISTILL_LOG_COLUMNS` (the reader's order), and this pair of
+        // lines is what ties the real table to it. A column added to the const
+        // without a migration, or a migration that adds one without the const,
+        // fails right here -- which is the mechanical form of "the set has one
+        // definition".
+        let mut declared: Vec<String> = columns(&conn, "distill_log");
+        declared.sort_unstable();
+        let mut one_set: Vec<String> = DISTILL_LOG_COLUMNS.iter().map(|c| c.to_string()).collect();
+        one_set.sort_unstable();
+        assert_eq!(
+            declared, one_set,
+            "the table's column SET and DISTILL_LOG_COLUMNS have drifted apart"
         );
         // 0029 appends the undecided queue's ANSWER (issue #50): every pre-0029
         // row is a pair nobody has ruled on, so `dismissed_at` is the last column

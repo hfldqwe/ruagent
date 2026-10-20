@@ -12,7 +12,35 @@ use ruagent_acp::adapter::HarnessAdapter as _;
 use ruagent_acp::chat::{ChatCommand, ChatOptions, ChatSession};
 use ruagent_core::RunEvent;
 use ruagent_store::Db;
+use ruagent_store::migrations::{DISTILL_LOG_COLUMNS, DISTILL_LOG_ROWID};
 use serde::Deserialize;
+
+/// THE LEDGER INSERT, GENERATED FROM THE ONE COLUMN SET (issues-56-59 audit F1).
+///
+/// The names AND the ?N placeholders come from the same sequence, so the positional
+/// mirror that used to sit beside the column list cannot drift from it: a name that
+/// is not in ruagent_store::migrations::DISTILL_LOG_COLUMNS cannot appear in the
+/// statement, and the number of placeholders IS the number of names by construction.
+/// The guard test in mod tests asserts that, plus that every column of the const is
+/// named exactly once and in its order.
+///
+/// id IS THE ONE EXCEPTION, and it is a NAMED one: it is the rowid, assigned by
+/// SQLite at insert time, so an INSERT that named it would have to invent a value.
+/// DISTILL_LOG_ROWID says which column that is, and the guard asserts it is the only
+/// column of the set left out -- rather than a string a filter happens to exclude.
+fn distill_log_insert_sql() -> String {
+    let cols: Vec<&str> = DISTILL_LOG_COLUMNS
+        .iter()
+        .copied()
+        .filter(|c| *c != DISTILL_LOG_ROWID)
+        .collect();
+    let values: Vec<String> = (1..=cols.len()).map(|n| format!("?{n}")).collect();
+    format!(
+        "INSERT INTO distill_log ({}) VALUES ({})",
+        cols.join(", "),
+        values.join(",")
+    )
+}
 
 const EXTRACTION_PROMPT: &str = r#"You are a memory distillation engine. Analyze the agent session transcript below and extract DURABLE knowledge — things worth remembering weeks from now. Ignore transient details (file paths being edited, one-off commands, small talk).
 
@@ -1265,35 +1293,36 @@ impl Distiller {
         self.db
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO distill_log
-                         (session_key, distilled_at, memories_written, entities_written,
-                          relations_written, agent, status, failure_reason, prompt_hash,
-                          retries, windows, truncated, tokens_used, context_size, cost_usd,
-                          relations_duplicate, relations_refused,
-                          from_seq, to_seq, total_messages, memories_refused)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
-                             ?18,?19,?20,?21)",
+                    // GENERATED from ruagent_store::migrations::DISTILL_LOG_COLUMNS -- see
+                    // distill_log_insert_sql(). The column names and the ?N placeholders
+                    // come from that ONE list, so they cannot mirror apart (audit F1).
+                    &distill_log_insert_sql(),
+                    // THE PARAM ORDER IS THAT GENERATED ORDER, and nothing else: the
+                    // statement lists the columns in DISTILL_LOG_COLUMNS order (minus the
+                    // rowid), so ?1..?21 bind in THAT order. Re-sorting one side without
+                    // the other is exactly the silent re-labelling the audit named; the
+                    // guard test in mod tests pins the correspondence.
                     rusqlite::params![
                         log.session_key,
                         chrono::Utc::now().to_rfc3339(),
+                        status,
+                        failure_reason,
+                        log.agent,
                         log.memories_written,
                         log.entities_written,
                         log.relations_written,
-                        log.agent,
-                        status,
-                        failure_reason,
-                        prompt_hash,
+                        log.relations_duplicate.map(|d| d as i64),
+                        log.relations_refused.map(|r| r as i64),
+                        log.tokens_used,
+                        log.context_size,
+                        log.cost_usd,
                         log.retries,
                         // The two readings travel together: a row that names a
                         // window count also says whether text was dropped, and a
                         // row that read nothing says neither.
                         log.windows.map(|w| w as i64),
                         log.windows.map(|_| if log.truncated { 1i64 } else { 0i64 }),
-                        log.tokens_used,
-                        log.context_size,
-                        log.cost_usd,
-                        log.relations_duplicate.map(|d| d as i64),
-                        log.relations_refused.map(|r| r as i64),
+                        prompt_hash,
                         // The range (0030; t3 / issue #58): three readings of ONE
                         // measurement, so they share one `Option` and appear
                         // together or not at all. `Some(0)` for `from_seq` is a
@@ -4835,5 +4864,82 @@ mod entry_tests {
             "a dry run must not write a distill_log row, not even a failure"
         );
         crate::test_cleanup::report_test_root_left_behind(&home);
+    }
+
+    /// F1'S GUARD (issues-56-59 architecture audit). The ledger's column set is
+    /// defined ONCE, in `ruagent_store::migrations::DISTILL_LOG_COLUMNS`, and this
+    /// is the test that keeps the INSERT from drifting off it.
+    ///
+    /// WHAT IT PINS, and why each half is needed:
+    ///   * every column of the const is NAMED by the generated statement, IN THE
+    ///     CONST'S ORDER, except the rowid -- so "the INSERT covers the column set"
+    ///     is a checked fact, not a coincidence of two hand-typed lists;
+    ///   * the rowid is the ONLY omission (`DISTILL_LOG_ROWID`), because naming it
+    ///     would mean binding a value SQLite assigns itself;
+    ///   * the `?N` placeholders are `?1..?n` in that same order, one each: the
+    ///     position mirror the audit found is now DERIVED from the list, and this is
+    ///     the assertion that says so.
+    ///
+    /// The audit asked for exactly this shape ("a const + one test"); the two
+    /// assertions beside the order check are what make it a guard rather than a
+    /// restatement of the generator.
+    #[test]
+    fn the_ledger_insert_names_every_column_of_the_one_column_set() {
+        let sql = distill_log_insert_sql();
+        let (names, values) = sql
+            .strip_prefix("INSERT INTO distill_log (")
+            .and_then(|rest| rest.split_once(") VALUES ("))
+            .unwrap_or_else(|| panic!("the generated INSERT keeps its shape: {sql}"));
+        let values = values
+            .strip_suffix(')')
+            .unwrap_or_else(|| panic!("the VALUES list closes the statement: {sql}"));
+        let names: Vec<&str> = names.split(", ").collect();
+        let values: Vec<&str> = values.split(',').collect();
+
+        // 1. the column list IS the const, in the const's order, minus the one
+        //    named exception.
+        let expected: Vec<&str> = DISTILL_LOG_COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| *c != DISTILL_LOG_ROWID)
+            .collect();
+        assert_eq!(
+            names, expected,
+            "the INSERT's columns must be DISTILL_LOG_COLUMNS minus {DISTILL_LOG_ROWID}, in that order"
+        );
+
+        // 2. the rowid is left out, and it is the ONLY column left out.
+        assert!(
+            !names.contains(&DISTILL_LOG_ROWID),
+            "an INSERT cannot name {DISTILL_LOG_ROWID}: SQLite assigns the rowid"
+        );
+        assert_eq!(
+            names.len() + 1,
+            DISTILL_LOG_COLUMNS.len(),
+            "exactly one column of the set ({DISTILL_LOG_ROWID}) may be left unnamed"
+        );
+
+        // 3. the positional mirror follows the names -- one placeholder per name,
+        //    numbered by its position, in order.
+        let expected_values: Vec<String> = (1..=names.len()).map(|n| format!("?{n}")).collect();
+        assert_eq!(
+            values, expected_values,
+            "?N must be the positions of the names, or a binding lands in another column"
+        );
+    }
+
+    /// The OTHER consumer of the same const (audit F1): the daemon's ledger
+    /// projection. `api::distill_entry` reads the row BY NUMBER, so a column
+    /// hand-added to (or removed from) the SELECT would re-label every field the
+    /// reader takes -- with no compiler and no type error. This is that check.
+    #[test]
+    fn the_ledger_projection_is_the_same_column_set_in_order() {
+        let projection = crate::api::distill_log_select_columns();
+        let projected: Vec<&str> = projection.split(", ").collect();
+        assert_eq!(
+            projected,
+            DISTILL_LOG_COLUMNS.to_vec(),
+            "the SELECT must project the const, in the const's order"
+        );
     }
 }

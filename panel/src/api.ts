@@ -302,6 +302,15 @@ export interface DistillPolicy {
  *  ATTEMPT, newest first; the ledger keeps the failures too, which is what
  *  makes "why did it fail" answerable at all.
  *
+ *  THE COLUMN SET IS DEFINED ONCE, AND IT IS NOT DEFINED HERE: the authority is
+ *  `ruagent_store::migrations::DISTILL_LOG_COLUMNS`, from which the daemon's
+ *  ledger SELECT and its INSERT are both generated (issues-56-59 audit F1).
+ *  This interface is the panel's PROJECTION of that set -- generating one from the
+ *  other is an explicit non-goal (audit §11.6: no cross-language codegen), so a
+ *  column added there must be added here by hand. WHY THAT MATTERS: a field this
+ *  interface omits is not a type error at the call site, it is `undefined` at
+ *  RUNTIME -- the one failure the compiler cannot show a reader.
+ *
  *  EVERY measurement a writer may not have recorded is NULLABLE, and the three
  *  states stay three: `null` = nobody recorded it (rows written before 0028),
  *  `0` = a measured zero, a number = the reading. A view must not print a null
@@ -311,7 +320,10 @@ export interface DistillLedgerEntry {
   session_key: string;
   distilled_at: string;
   /** "ok" | "empty" | "failed", or null when that row recorded no status —
-   *  the vocabulary's fourth state, NOT a fourth outcome. */
+   *  the vocabulary's fourth state, NOT a fourth outcome. THE WORDS COME FROM THE
+   *  DAEMON (`DISTILL_LOG_OK`/`_EMPTY`/`_FAILED` and `DISTILL_LOG_NOT_RECORDED`
+   *  in `crates/daemon/src/api.rs`, issues-56-59 audit F2): the same strings the
+   *  ledger writes, spelled here because TS has no way to import them. */
   status: string | null;
   /** WHY it failed, or why it wrote nothing, verbatim from the ledger (t4's
    *  actionable messages) — the field this card exists to surface. */
