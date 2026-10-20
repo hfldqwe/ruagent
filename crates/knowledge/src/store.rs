@@ -1670,6 +1670,283 @@ impl Knowledge {
 mod tests {
     use super::*;
 
+    mod cleanup {
+        // t36: the cleanup shape for THIS module's tests (t27's, spread by t30/t31). A unit-test module
+        // cannot see crates/knowledge/tests/cleanup/mod.rs, so the shape is repeated here -- same rule,
+        // same reporting, same 1000..=100_000_000 pid guard.
+
+        /// The temp roots (and root-like files) THIS suite creates.
+        pub(super) const TEST_ROOT_PREFIXES: &[&str] = &["ruagent-kb-"];
+
+        /// Remove a root -- or a root-like FILE -- with a bounded retry, RETURNING the reason (t36).
+        pub(super) fn try_remove_test_entry(
+            path: &std::path::Path,
+            budget: std::time::Duration,
+        ) -> Result<(), String> {
+            let started = std::time::Instant::now();
+            loop {
+                let outcome = if path.is_dir() {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    std::fs::remove_file(path)
+                };
+                match outcome {
+                    Ok(()) => {
+                        if started.elapsed() > std::time::Duration::from_millis(250) {
+                            println!(
+                                "READING t36 cleanup of {} waited {:.1} s for the handles to be released",
+                                path.display(),
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => {
+                        if started.elapsed() >= budget {
+                            return Err(format!(
+                                "{} could NOT be removed within {:.2} s: {e}",
+                                path.display(),
+                                budget.as_secs_f64()
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+            }
+        }
+
+        /// Remove a root test code OWNS, or PANIC naming it (t36): the asserting half of the shape.
+        pub(super) fn remove_test_root(
+            root: &std::path::Path,
+            what: &str,
+            budget: std::time::Duration,
+        ) {
+            if let Err(why) = try_remove_test_entry(root, budget) {
+                panic!("{what}: {why}");
+            }
+        }
+
+        /// Try once, then REPORT -- never silently drop -- a root that is still held (t36).
+        ///
+        /// WHY NOT AN ASSERTION HERE. The holder is this test process (the in-process daemon keeps
+        /// its database open inside the root), so the removal cannot succeed however long it waits and
+        /// a panic would red a test for a fact that is not its own. The failure is made VISIBLE
+        /// instead, and the pile is bounded by the pruner below -- which this call also guarantees has
+        /// run, so a suite that only ever cleans up still prunes.
+        pub(super) fn report_test_root_left_behind(root: &std::path::Path) {
+            prune_stale_test_entries(TEST_ROOT_PREFIXES, "ruagent-knowledge store unit tests");
+            if let Err(why) = try_remove_test_entry(root, std::time::Duration::from_millis(500)) {
+                eprintln!(
+                    "READING t36 cleanup: {why} -- the root is held by THIS test process, so the \
+                     failure is REPORTED rather than swallowed; the next run's pruner removes it"
+                );
+            }
+        }
+
+        /// The same, for a root-like FILE (the scripted replies a test hands to an agent).
+        ///
+        /// Unused in store.rs, which writes no root-like files; kept so this copy of the shape
+        /// stays identical to the mcp crate's.
+        #[allow(dead_code)]
+        pub(super) fn report_test_file_left_behind(file: &std::path::Path) {
+            prune_stale_test_entries(TEST_ROOT_PREFIXES, "ruagent-knowledge store unit tests");
+            if let Err(why) = try_remove_test_entry(file, std::time::Duration::from_millis(500)) {
+                eprintln!(
+                    "READING t36 cleanup: {why} -- the file is reported rather than silently dropped"
+                );
+            }
+        }
+
+        /// Remove the entries a DEAD test process left behind, once per label (t36).
+        ///
+        /// THE SAFETY RULE, deliberately conservative: an entry belongs to a run whose process may
+        /// still be read while it lives, so it is pruned only when it has at least one plausible pid
+        /// in its name (1000..=100_000_000) and NO live number anywhere. A name with no pid at all
+        /// is never pruned -- MEASURED: without that rule the 2 of the word "e2e" made the
+        /// ruagent-e2e-mock-bins directory look prunable and the t31 pruner deleted a live suite's
+        /// agent copies. A number that happens to be a live process keeps the entry, which costs
+        /// disk and never a run.
+        pub(super) fn prune_stale_test_entries(prefixes: &[&str], label: &str) {
+            static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            {
+                let mut done = DONE.lock().expect("prune labels");
+                if done.iter().any(|l| l == label) {
+                    return;
+                }
+                done.push(label.to_string());
+            }
+            // NO ORACLE, NO PRUNE: an empty entry list or an unreadable temp dir means we cannot
+            // tell live from dead, and the only safe answer is to touch nothing.
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            let me = std::process::id();
+            let (mut pruned, mut failed) = (0usize, 0usize);
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !prefixes.iter().any(|p| name.starts_with(p)) {
+                    continue;
+                }
+                if !all_numeric_fields_are_dead(&name, me) {
+                    continue;
+                }
+                let path = e.path();
+                match try_remove_test_entry(&path, std::time::Duration::from_millis(500)) {
+                    Ok(()) => pruned += 1,
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!(
+                            "READING t36 stale entry {} could NOT be removed: {err}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            if pruned > 0 || failed > 0 {
+                eprintln!(
+                    "READING t36 pruned {pruned} stale {label} entr(y/ies) of dead test processes; {failed} could not be removed"
+                );
+            }
+        }
+
+        /// True when every number in a name is safe to prune on, and at least one is a plausible pid.
+        pub(super) fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
+            all_numeric_fields_are_dead_with(name, me, pid_is_alive)
+        }
+
+        /// The rule with the liveness question passed IN, so a test can answer it deterministically
+        /// instead of depending on which pids this machine happens to have live (Windows REUSES pids).
+        pub(super) fn all_numeric_fields_are_dead_with(
+            name: &str,
+            me: u32,
+            alive: impl Fn(u32) -> bool,
+        ) -> bool {
+            let mut seen = false;
+            for field in name.split(|c: char| !c.is_ascii_digit()) {
+                if field.is_empty() {
+                    continue;
+                }
+                let Ok(n) = field.parse::<u32>() else {
+                    continue;
+                };
+                // A number outside this range is NOT evidence about a run: below 1000 it is almost
+                // always part of a NAME (the 2 in ruagent-e2e-mock-bins, the 329 in a tag), and above
+                // 100_000_000 a nanosecond stamp cannot be a pid.
+                if !(1000..=100_000_000).contains(&n) {
+                    continue;
+                }
+                seen = true;
+                if n == me || alive(n) {
+                    return false;
+                }
+            }
+            seen
+        }
+
+        /// Is a process with this pid alive? /proc on unix, one parsed tasklist call on Windows.
+        pub(super) fn pid_is_alive(pid: u32) -> bool {
+            #[cfg(unix)]
+            {
+                std::path::Path::new(&format!("/proc/{pid}")).exists()
+            }
+            #[cfg(windows)]
+            {
+                LIVE_PIDS.get_or_init(live_pids).contains(&pid)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = pid;
+                true
+            }
+        }
+
+        #[cfg(windows)]
+        static LIVE_PIDS: std::sync::OnceLock<std::collections::HashSet<u32>> =
+            std::sync::OnceLock::new();
+
+        /// One tasklist call, parsed. An EMPTY set means the tool could not be read, and an empty oracle
+        /// must never be read as "everything is dead" -- the rule then prunes nothing.
+        #[cfg(windows)]
+        fn live_pids() -> std::collections::HashSet<u32> {
+            use std::collections::HashSet;
+            let mut out = HashSet::new();
+            let Ok(text) = std::process::Command::new("tasklist")
+                .args(["/FO", "CSV", "/NH"])
+                .output()
+            else {
+                return out;
+            };
+            for line in String::from_utf8_lossy(&text.stdout).lines() {
+                let mut fields = line.split(',');
+                let _name = fields.next();
+                if let Some(pid) = fields
+                    .next()
+                    .and_then(|f| f.trim_matches('"').parse::<u32>().ok())
+                {
+                    out.insert(pid);
+                }
+            }
+            out
+        }
+
+        /// t36: the shape's own proof for THIS copy too -- a root held by an open database must come back
+        /// as a REPORTED failure, and the asserting wrapper must PANIC on it.
+        #[test]
+        fn a_cleanup_that_cannot_succeed_is_reported_and_the_asserting_half_panics() {
+            let root = std::env::temp_dir().join(format!(
+                "ruagent-kb-{}-t36proof-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let hold = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&root).unwrap().permissions();
+                perms.set_mode(0o555);
+                std::fs::set_permissions(&root, perms).unwrap();
+            }
+            let why = try_remove_test_entry(&root, std::time::Duration::from_millis(100))
+                .expect_err("a root holding an open database must NOT come back as removed");
+            println!("READING t36 deliberate cleanup failure: {why}");
+            assert!(
+                why.contains(&root.display().to_string()),
+                "the report must name the root: {why}"
+            );
+            let panicked = std::panic::catch_unwind(|| {
+                remove_test_root(
+                    &root,
+                    "the t36 proof root",
+                    std::time::Duration::from_millis(100),
+                )
+            })
+            .is_err();
+            assert!(
+                panicked,
+                "remove_test_root must PANIC on a root it could not remove"
+            );
+            drop(hold);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&root).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&root, perms).unwrap();
+            }
+            remove_test_root(
+                &root,
+                "the t36 proof root, after releasing its handle",
+                std::time::Duration::from_millis(500),
+            );
+            println!("READING t36 after releasing the handle: the proof root was removed");
+        }
+    }
+
     fn test_root(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ruagent-kb-{}-{}-{tag}",
@@ -1733,7 +2010,7 @@ mod tests {
         assert_eq!(docs, 2);
         assert!(chunks >= 2);
         let _ = n2;
-        let _ = std::fs::remove_dir_all(&root);
+        cleanup::report_test_root_left_behind(&root);
     }
 
     /// Constant vectors; a distinct identity per instance — stands in
@@ -1797,7 +2074,7 @@ mod tests {
         Knowledge::with_embedder(&root, db, Arc::new(Tagged("model-b", 16)))
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(&root);
+        cleanup::report_test_root_left_behind(&root);
     }
 
     #[tokio::test]
@@ -1823,7 +2100,7 @@ mod tests {
             "the fallback must not overwrite the real model's identity"
         );
         drop(kb);
-        let _ = std::fs::remove_dir_all(&root);
+        cleanup::report_test_root_left_behind(&root);
     }
 
     // ── t5: the leg configuration ──────────────────────────────────────────
@@ -1887,7 +2164,7 @@ mod tests {
         );
         let all_off = kb.fuse_with(&ann, &fts, &LegConfig::all_off());
         assert!(all_off.is_empty(), "no leg, no ranking: {all_off:?}");
-        let _ = std::fs::remove_dir_all(&root);
+        cleanup::report_test_root_left_behind(&root);
     }
 
     /// The configuration surface: defaults, the resolvers, the weight rule and

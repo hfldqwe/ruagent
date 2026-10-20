@@ -12,6 +12,298 @@ use ruagent_daemon::runs::RunManager;
 use ruagent_mcp::{BridgeConfig, PlatformTools};
 use ruagent_store::Db;
 
+// t36: the cleanup shape t27 fixed and t30/t31 spread. This suite had NO cleanup at all -- only an
+// idempotent pre-clean of a name that never exists yet -- so the ruagent-mcp-e2e-* directory grew
+// by one entry per test per run (measured 1120 -> 1133 over a single cargo test -p ruagent-mcp).
+
+// Three parts, and a suite needs all three: a BOUNDED retry that RETURNS the reason; a REPORTING
+// call site for a root whose holder is this test process (the in-process daemon keeps its store
+// open inside the root, so the removal CANNOT succeed here); and a PRUNER that removes, from the
+// NEXT run, what the previous one could not. The daemon's crate-internal twin is
+// crates/daemon/src/lib.rs's test_cleanup; this copy exists because an integration-test binary
+// sees only the public API of the crate under test.
+
+/// The temp roots (and root-like files) THIS suite creates.
+const TEST_ROOT_PREFIXES: &[&str] = &["ruagent-mcp-e2e-", "ruagent-t18-replies"];
+
+/// Remove a root -- or a root-like FILE -- with a bounded retry, RETURNING the reason (t36).
+fn try_remove_test_entry(
+    path: &std::path::Path,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        let outcome = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match outcome {
+            Ok(()) => {
+                if started.elapsed() > std::time::Duration::from_millis(250) {
+                    println!(
+                        "READING t36 cleanup of {} waited {:.1} s for the handles to be released",
+                        path.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    return Err(format!(
+                        "{} could NOT be removed within {:.2} s: {e}",
+                        path.display(),
+                        budget.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// Remove a root test code OWNS, or PANIC naming it (t36): the asserting half of the shape.
+fn remove_test_root(root: &std::path::Path, what: &str, budget: std::time::Duration) {
+    if let Err(why) = try_remove_test_entry(root, budget) {
+        panic!("{what}: {why}");
+    }
+}
+
+/// Try once, then REPORT -- never silently drop -- a root that is still held (t36).
+///
+/// WHY NOT AN ASSERTION HERE. The holder is this test process (the in-process daemon keeps
+/// its database open inside the root), so the removal cannot succeed however long it waits and
+/// a panic would red a test for a fact that is not its own. The failure is made VISIBLE
+/// instead, and the pile is bounded by the pruner below -- which this call also guarantees has
+/// run, so a suite that only ever cleans up still prunes.
+fn report_test_root_left_behind(root: &std::path::Path) {
+    prune_stale_test_entries(TEST_ROOT_PREFIXES, "ruagent-mcp suite");
+    if let Err(why) = try_remove_test_entry(root, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t36 cleanup: {why} -- the root is held by THIS test process, so the \
+             failure is REPORTED rather than swallowed; the next run's pruner removes it"
+        );
+    }
+}
+
+/// The same, for a root-like FILE (the scripted replies a test hands to an agent).
+fn report_test_file_left_behind(file: &std::path::Path) {
+    prune_stale_test_entries(TEST_ROOT_PREFIXES, "ruagent-mcp suite");
+    if let Err(why) = try_remove_test_entry(file, std::time::Duration::from_millis(500)) {
+        eprintln!(
+            "READING t36 cleanup: {why} -- the file is reported rather than silently dropped"
+        );
+    }
+}
+
+/// Remove the entries a DEAD test process left behind, once per label (t36).
+///
+/// THE SAFETY RULE, deliberately conservative: an entry belongs to a run whose process may
+/// still be read while it lives, so it is pruned only when it has at least one plausible pid
+/// in its name (1000..=100_000_000) and NO live number anywhere. A name with no pid at all
+/// is never pruned -- MEASURED: without that rule the 2 of the word "e2e" made the
+/// ruagent-e2e-mock-bins directory look prunable and the t31 pruner deleted a live suite's
+/// agent copies. A number that happens to be a live process keeps the entry, which costs
+/// disk and never a run.
+fn prune_stale_test_entries(prefixes: &[&str], label: &str) {
+    static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut done = DONE.lock().expect("prune labels");
+        if done.iter().any(|l| l == label) {
+            return;
+        }
+        done.push(label.to_string());
+    }
+    // NO ORACLE, NO PRUNE: an empty entry list or an unreadable temp dir means we cannot
+    // tell live from dead, and the only safe answer is to touch nothing.
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let me = std::process::id();
+    let (mut pruned, mut failed) = (0usize, 0usize);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !prefixes.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        if !all_numeric_fields_are_dead(&name, me) {
+            continue;
+        }
+        let path = e.path();
+        match try_remove_test_entry(&path, std::time::Duration::from_millis(500)) {
+            Ok(()) => pruned += 1,
+            Err(err) => {
+                failed += 1;
+                eprintln!(
+                    "READING t36 stale entry {} could NOT be removed: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if pruned > 0 || failed > 0 {
+        eprintln!(
+            "READING t36 pruned {pruned} stale {label} entr(y/ies) of dead test processes; {failed} could not be removed"
+        );
+    }
+}
+
+/// True when every number in a name is safe to prune on, and at least one is a plausible pid.
+fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
+    all_numeric_fields_are_dead_with(name, me, pid_is_alive)
+}
+
+/// The rule with the liveness question passed IN, so a test can answer it deterministically
+/// instead of depending on which pids this machine happens to have live (Windows REUSES pids).
+fn all_numeric_fields_are_dead_with(name: &str, me: u32, alive: impl Fn(u32) -> bool) -> bool {
+    let mut seen = false;
+    for field in name.split(|c: char| !c.is_ascii_digit()) {
+        if field.is_empty() {
+            continue;
+        }
+        let Ok(n) = field.parse::<u32>() else {
+            continue;
+        };
+        // A number outside this range is NOT evidence about a run: below 1000 it is almost
+        // always part of a NAME (the 2 in ruagent-e2e-mock-bins, the 329 in a tag), and above
+        // 100_000_000 a nanosecond stamp cannot be a pid.
+        if !(1000..=100_000_000).contains(&n) {
+            continue;
+        }
+        seen = true;
+        if n == me || alive(n) {
+            return false;
+        }
+    }
+    seen
+}
+
+/// Is a process with this pid alive? ruagent_daemon::orphans::process_started_at_ms(pid).is_some()
+fn pid_is_alive(pid: u32) -> bool {
+    ruagent_daemon::orphans::process_started_at_ms(pid).is_some()
+}
+
+/// t36: the shape's own proof, so a cleanup that cannot happen cannot go quiet again.
+///
+/// The root is held (an open database inside it) exactly as a live test holds it: the bounded
+/// retry must RETURN a reason that NAMES the path, and the asserting wrapper must PANIC on it.
+///
+/// THE CONTROL IS ENV-GATED AND DELIBERATE: with RUAGENT_T36_CONTROL_NO_HOLD=1 the root is NOT
+/// held, the removal therefore SUCCEEDS, and this test MUST fail -- which is what proves the
+/// assertion below is about the failure and not vacuous, and makes that red reading reproducible
+/// without ever reddening the default run.
+#[test]
+fn a_cleanup_that_cannot_succeed_is_reported_and_the_asserting_half_panics() {
+    let root = std::env::temp_dir().join(format!(
+        "ruagent-mcp-e2e-{}-t36proof-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let hold = std::env::var_os("RUAGENT_T36_CONTROL_NO_HOLD")
+        .is_none()
+        .then(|| ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap());
+    // An open file does NOT block rmdir on unix, so the failure is made deterministic there the
+    // only other way it can be: a read-only directory. This machine is Windows, so the unix branch
+    // is reasoned rather than measured here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&root, perms).unwrap();
+    }
+
+    let why = try_remove_test_entry(&root, std::time::Duration::from_millis(100))
+        .expect_err("a root holding an open database must NOT come back as removed");
+    println!("READING t36 deliberate cleanup failure: {why}");
+    assert!(
+        why.contains(&root.display().to_string()),
+        "the report must name the root it could not remove: {why}"
+    );
+    let panicked = std::panic::catch_unwind(|| {
+        remove_test_root(
+            &root,
+            "the t36 proof root",
+            std::time::Duration::from_millis(100),
+        )
+    })
+    .is_err();
+    assert!(
+        panicked,
+        "remove_test_root must PANIC on a root it could not remove, or the pile is back in the dark"
+    );
+
+    drop(hold);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&root, perms).unwrap();
+    }
+    remove_test_root(
+        &root,
+        "the t36 proof root, after releasing its handle",
+        std::time::Duration::from_millis(500),
+    );
+    println!("READING t36 after releasing the handle: the proof root was removed");
+}
+
+/// The pruner's rule, with the liveness question answered deterministically -- no dependence on
+/// which pids this machine happens to have live, and no child process to spawn.
+#[test]
+fn only_names_with_a_plausible_dead_pid_are_prunable() {
+    let me = std::process::id();
+    let never = |_pid: u32| false;
+    let pid_4242 = |pid: u32| pid == 4242;
+    // NO pid in the name: never pruned, however many digits it carries.
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-e2e-mock-bins",
+        me,
+        never
+    ));
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-mcp-e2e-help",
+        me,
+        never
+    ));
+    // A number too large to be a pid is not evidence either way.
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-mcp-e2e-4294967280",
+        me,
+        never
+    ));
+    // A plausible pid that is GONE: prunable, which is the reading the pruner acts on ...
+    assert!(all_numeric_fields_are_dead_with(
+        "ruagent-mcp-e2e-4242-1",
+        me,
+        never
+    ));
+    // ... and the same pid ALIVE keeps the entry -- in a directory name or a file name.
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-mcp-e2e-4242-1",
+        me,
+        pid_4242
+    ));
+    assert!(!all_numeric_fields_are_dead_with(
+        "ruagent-t18-replies-4242.json",
+        me,
+        pid_4242
+    ));
+    // Our OWN pid is live by definition, so this run is never pruned out from under itself.
+    assert!(!all_numeric_fields_are_dead_with(
+        &format!("ruagent-mcp-e2e-{me}-1"),
+        me,
+        never
+    ));
+}
+
 struct TestClient;
 
 impl ClientHandler for TestClient {
@@ -62,7 +354,7 @@ async fn start_test_daemon_with(
     static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!("ruagent-mcp-e2e-{}-{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    report_test_root_left_behind(&root);
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("agents.toml"), agents_toml).unwrap();
@@ -795,6 +1087,9 @@ async fn a_governed_refusal_is_an_error_and_an_empty_pass_is_not() {
     );
 
     shutdown_pair(client, server_task).await;
+
+    // t36: the replies file this test wrote is a leftover too; reported, not dropped.
+    report_test_file_left_behind(&replies);
 }
 
 /// t13's COMPATIBILITY clause, at the seam: an OLD daemon's 200 envelope — a success
