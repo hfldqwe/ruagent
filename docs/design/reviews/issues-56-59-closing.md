@@ -344,3 +344,11 @@ window behind it is measured. The author of the repair put it best and it is kep
 machine the window never opens, so the five green container runs do NOT prove the flake is gone -- the
 probe and the control do. A CI run is the final verification, and that is the one that counts.
 
+  **Verdict (recorded after the fact).** The CI run on `4bcfc12` -- which carries this repair plus everything else
+  this round landed -- is **green on all three jobs** (`Rust (windows)`, `Rust (ubuntu)`, `Panel (node)`). Two
+  intermediate runs (`1f6dabf`, `f29a514`) were cancelled by the repository concurrency policy when a newer push
+  arrived, so this is the first run that carried this bytes to completion; the flake had already been proven
+  dead by the probe before any of them, which is the order that matters -- a green run alone would have been
+  consistent with the bug still being there and simply not firing.
+
+
