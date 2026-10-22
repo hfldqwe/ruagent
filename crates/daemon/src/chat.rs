@@ -442,13 +442,19 @@ pub struct ChatManager {
 /// BACKGROUND task -- chat start never waits on it.
 const ATTRIBUTION_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How long the attribution pass waits before its next poll, and the ceiling that delay
-/// doubles up to (t24). A flat 25 ms over the whole 3 s window was up to 120 passes, each
-/// a machine-wide process snapshot (45-190 ms under e2e load) taken ON the async runtime;
-/// the first few milliseconds decide a healthy session, so a doubling delay keeps that
-/// resolution where it matters and spends almost nothing on the tail.
-const ATTRIBUTION_FIRST_POLL_MS: u64 = 20;
-const ATTRIBUTION_MAX_POLL_MS: u64 = 250;
+/// How long the attribution pass waits before its next poll, and the ceiling that delay doubles up
+/// to (t24). A flat 25 ms over the whole 3 s window was up to 120 passes, each a machine-wide
+/// process snapshot (45-190 ms under e2e load) taken ON the async runtime; the first few
+/// milliseconds decide a healthy session, so a doubling delay keeps that resolution where it
+/// matters and spends almost nothing on the tail.
+///
+/// F7: these are the SAME pair the run path doubles with -- one definition, in
+/// crates/daemon/src/runs.rs, imported here under this module's own names. The EXIT CONDITIONS stay
+/// separate on purpose: this loop returns when the child is ATTRIBUTED, the run path's when its
+/// child is, so the cadence is shared and the loops are not.
+pub(crate) use crate::runs::{
+    CHILD_POLL_FIRST_MS as ATTRIBUTION_FIRST_POLL_MS, CHILD_POLL_MAX_MS as ATTRIBUTION_MAX_POLL_MS,
+};
 
 /// How long a close waits for the session's own teardown (the supervisor task
 /// returning, which is when the SDK's ChildGuard runs) before reclaiming its
@@ -2135,7 +2141,27 @@ async fn apply_role_defaults(chat: &Chat, defaults: &std::collections::BTreeMap<
     }
 }
 
-/// Persist one runtime's option catalog (fire-and-forget upsert).
+/// Persist one runtime's option catalog -- **write-behind, by contract** (t41).
+///
+/// THE CONTRACT, in three sentences:
+///   1. the in-memory catalog is AUTHORITATIVE for this process. Every reader
+///      inside the daemon (`agent_options`) is served from the cache the caller
+///      fills BEFORE reaching this function, so nothing waits on this write;
+///   2. the table is the copy that SURVIVES A RESTART, and it is written from a
+///      spawned task. The row may therefore be absent for a moment after the HTTP
+///      response returns, and a reader on another connection (a test, a second
+///      process, `sqlite3`) can legitimately see the previous state. That is why
+///      the write is spawned rather than awaited: a picker must not be held open
+///      by a disk write;
+///   3. a FAILURE here is REPORTED and never swallowed. The cache stays correct
+///      for this process while the restart copy silently rots, so the reason has
+///      to reach the log. It still does not block or fail the response: there is
+///      nothing synchronous the caller could do about it.
+///
+/// The `let _ = ...` this replaces was the third leg's defect (a write that
+/// failed left no trace anywhere), and the mid-flight window in leg 2 is why the
+/// mock-agent test that reads the table from ANOTHER connection polls instead of
+/// reading once.
 fn persist_options(
     db: &ruagent_store::Db,
     runtime: &str,
@@ -2143,12 +2169,17 @@ fn persist_options(
     updated_at: i64,
 ) {
     let Ok(json) = serde_json::to_string(options) else {
+        tracing::warn!(
+            runtime,
+            "agent_options write-behind skipped: the catalog did not serialise"
+        );
         return;
     };
     let runtime = runtime.to_string();
     let db = db.clone();
     tokio::spawn(async move {
-        let _ = db
+        let logged = runtime.clone();
+        match db
             .call(move |conn| {
                 conn.execute(
                     "INSERT INTO agent_options (runtime, options, updated_at)
@@ -2158,7 +2189,26 @@ fn persist_options(
                     rusqlite::params![runtime, json, updated_at],
                 )
             })
-            .await;
+            .await
+        {
+            Ok(Ok(rows)) => tracing::debug!(
+                runtime = %logged,
+                rows,
+                "agent_options persisted (write-behind; the row lands after the response)"
+            ),
+            Ok(Err(err)) => tracing::warn!(
+                runtime = %logged,
+                error = %err,
+                "agent_options write-behind FAILED: this process's cache is still correct, but a \
+                 restart will not see this catalog"
+            ),
+            Err(err) => tracing::warn!(
+                runtime = %logged,
+                error = ?err,
+                "agent_options write-behind did NOT complete (the write task was cancelled or \
+                 panicked): a restart will not see this catalog"
+            ),
+        }
     });
 }
 

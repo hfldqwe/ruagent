@@ -118,6 +118,48 @@ where
     panic!("timed out waiting for: {what}");
 }
 
+/// Poll (bounded) until THIS connection sees `want` rows for the `rt` runtime.
+///
+/// WHY A POLL AND NOT A READ: the daemon persists the catalog from a SPAWNED
+/// write-behind task (`persist_options`), so the HTTP response above is answered
+/// BEFORE the row lands -- the in-memory cache, not the table, is what the read
+/// path is promised. Reading once therefore races the write, and on a loaded
+/// ubuntu runner the window was wide enough to lose it:
+/// `assertion left == right failed: left: 0, right: 1` (CI run 39439959774,
+/// commit 095cb14).
+///
+/// Bounded, like `poll_json` above: 100 tries, 100 ms apart, and it returns the
+/// LAST reading either way -- so a write that never lands still FAILS the
+/// unchanged assertion below, and the failure prints the count actually read
+/// rather than a value nobody observed. No fixed sleep is added anywhere.
+async fn poll_agent_options_rows(db: &Db, want: i64) -> i64 {
+    let mut n = agent_options_rows(db).await;
+    for _ in 0..100 {
+        if n == want {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        n = agent_options_rows(db).await;
+    }
+    n
+}
+
+/// One read of the persisted-catalog row count, from this connection.
+async fn agent_options_rows(db: &Db) -> i64 {
+    let n: Result<Result<i64, ruagent_store::DbError>, ruagent_store::DbError> = db
+        .call(|conn| -> Result<i64, ruagent_store::DbError> {
+            conn.query_row(
+                "SELECT COUNT(*) FROM agent_options WHERE runtime = 'rt'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(ruagent_store::DbError::from)
+        })
+        .await;
+    n.expect("the row-count read did not complete")
+        .expect("the row-count read failed")
+}
+
 /// The mock runtime's option catalog is probed once, then served from
 /// cache; the persisted copy survives a daemon restart (fresh
 /// ChatManager seeds its memory cache from `agent_options`).
@@ -156,8 +198,14 @@ async fn option_catalog_probes_once_then_persists() {
         .unwrap();
     assert_eq!(v["cached"], true);
 
-    // The persisted row exists.
+    // The persisted row exists -- asked with a BOUNDED POLL, because the daemon
+    // writes it from a spawned task (see `poll_agent_options_rows` for the
+    // measured failure this closes). The read and the assertion below are
+    // untouched: a row that never lands still fails, with the count in the
+    // message.
     let db = Db::open(root.join("data").join("ruagent.db")).unwrap();
+    let polled = poll_agent_options_rows(&db, 1).await;
+    eprintln!("READING write-behind persist: rows seen by the poll = {polled} (want 1)");
     let n: Result<Result<i64, ruagent_store::DbError>, _> = db
         .call(|conn| -> Result<i64, ruagent_store::DbError> {
             conn.query_row(
