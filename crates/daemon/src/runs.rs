@@ -1349,11 +1349,23 @@ fn routed_naming_what_ran(
 /// (issue #60). It only delays a BACKGROUND task; the run never waits on it.
 const RUN_CHILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The attribution pass's poll delays (t24), doubling up to a ceiling: the pass costs a
-/// machine-wide process snapshot, and a flat 25 ms over the whole window paid for up to
-/// 120 of them per run on the async runtime.
-const RUN_CHILD_FIRST_POLL_MS: u64 = 20;
-const RUN_CHILD_MAX_POLL_MS: u64 = 250;
+/// The poll cadence the wait-for-a-just-spawned-child loops share (t24, F7): start at
+/// CHILD_POLL_FIRST_MS and double up to CHILD_POLL_MAX_MS.
+///
+/// WHY ONE PAIR, IN ONE PLACE. Each attribution pass costs a machine-wide process snapshot, and a
+/// flat 25 ms over the whole 3 s window paid for up to 120 of them per pass ON the async runtime --
+/// hence the doubling. The chat path (crates/daemon/src/chat.rs) and the run path (here) carried
+/// the SAME two numbers, TO THE DIGIT, which is the strongest evidence that they are one fact and
+/// not two independent choices: t24 measured that they must move together, and a single path
+/// changed alone fails NO test -- it only shows up as an occasional timeout on a loaded machine.
+/// So the numbers live here, once, and chat.rs imports them under its own names.
+///
+/// WHY THE LOOPS ARE NOT EXTRACTED. The three wait-until loops in this crate exit on three
+/// different conditions (return when the child is ATTRIBUTED, return when it is GONE, return at the
+/// DEADLINE), so sharing the loop would mean passing a closure: six lines traded for a layer of
+/// indirection (F7's own advice). What IS shared is the cadence -- these two numbers.
+pub(crate) const CHILD_POLL_FIRST_MS: u64 = 20;
+pub(crate) const CHILD_POLL_MAX_MS: u64 = 250;
 
 /// Reclaim a run's agent child, with the reading the chat path reports too
 /// (issue #60): how many it had to kill, how many were already gone, and how
@@ -1528,7 +1540,7 @@ async fn supervise(
         let slot = run_child.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + RUN_CHILD_WINDOW;
-            let mut wait_ms = RUN_CHILD_FIRST_POLL_MS;
+            let mut wait_ms = CHILD_POLL_FIRST_MS;
             loop {
                 let window = child_window.clone();
                 let program = child_program.clone();
@@ -1548,7 +1560,7 @@ async fn supervise(
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                wait_ms = (wait_ms * 2).min(RUN_CHILD_MAX_POLL_MS);
+                wait_ms = (wait_ms * 2).min(CHILD_POLL_MAX_MS);
             }
         });
     }
@@ -2530,5 +2542,57 @@ mod tests {
         assert!(parse_judge_verdict("RUN: 11111111", &same_prefix).is_none());
         // No RUN: line at all.
         assert!(parse_judge_verdict("I liked the second one", &ids).is_none());
+    }
+
+    /// F7: ONE pair of numbers, TWO loops, and the cadence both of them produce -- the reading that
+    /// says the merge changed no behaviour.
+    ///
+    /// The expected vector is the sequence MEASURED BEFORE the merge, printed separately by each
+    /// path from its OWN constants (both said [20, 40, 80, 160, 250, 250, 250, 250]). The test now
+    /// derives that sequence three ways -- from the shared pair, and from each path's own names for
+    /// it -- so a changed number, a changed cap rule or a path that stopped sharing fails HERE
+    /// rather than as an occasional timeout on a loaded machine.
+    #[test]
+    fn the_two_attribution_loops_share_one_poll_cadence() {
+        let cadence = |first: u64, max: u64, steps: usize| -> Vec<u64> {
+            let mut out = Vec::new();
+            let mut wait_ms = first;
+            for _ in 0..steps {
+                out.push(wait_ms);
+                wait_ms = (wait_ms * 2).min(max);
+            }
+            out
+        };
+        let shared = cadence(CHILD_POLL_FIRST_MS, CHILD_POLL_MAX_MS, 8);
+        let chat_path = cadence(
+            crate::chat::ATTRIBUTION_FIRST_POLL_MS,
+            crate::chat::ATTRIBUTION_MAX_POLL_MS,
+            8,
+        );
+        let run_path = cadence(CHILD_POLL_FIRST_MS, CHILD_POLL_MAX_MS, 8);
+        println!(
+            "READING F7 poll cadence: shared={shared:?} chat_path={chat_path:?} run_path={run_path:?}"
+        );
+        assert_eq!(
+            shared,
+            vec![20, 40, 80, 160, 250, 250, 250, 250],
+            "the cadence measured before the merge"
+        );
+        assert_eq!(
+            chat_path, shared,
+            "the chat path doubles with the shared pair"
+        );
+        assert_eq!(
+            run_path, shared,
+            "the run path doubles with the shared pair"
+        );
+        assert_eq!(
+            (CHILD_POLL_FIRST_MS, CHILD_POLL_MAX_MS),
+            (
+                crate::chat::ATTRIBUTION_FIRST_POLL_MS,
+                crate::chat::ATTRIBUTION_MAX_POLL_MS
+            ),
+            "one definition: both names are the same two values"
+        );
     }
 }
