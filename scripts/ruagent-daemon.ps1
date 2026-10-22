@@ -36,10 +36,17 @@
 #   outside, "a job object killed it" and "it exited cleanly" looked IDENTICAL, because
 #   neither wrote anything. Now every daemon writes <root>/data/daemon.exit at boot
 #   ("running pid=... since=...") and rewrites it with a reason on every path that knows
-#   why it is leaving ("exit reason=stop-request|signal:console|panic|error ..."). A
-#   KILLED daemon is the case that cannot rewrite it -- so the trace it leaves is its
-#   boot line, and "status" reads that line WITH the liveness of its pid and reports
-#   "DIED WITHOUT A TRACE". The next boot also logs a WARN about it.
+#   why it is leaving ("exit reason=<token> pid=... at=...", plus " detail=..." when the
+#   caller has free text). A KILLED daemon is the case that cannot rewrite it -- so the
+#   trace it leaves is its boot line, and "status" reads that line WITH the liveness of
+#   its pid and reports "DIED WITHOUT A TRACE". The next boot also logs a WARN about it.
+#
+#   THE REASON TOKENS ARE NOT LISTED HERE (issues-56-59 audit F5). They are defined ONCE,
+#   in crates/daemon/src/lib.rs (exit_trace::EXIT_REASONS), and a Rust guard test PARSES
+#   THIS FILE and fails if it names a token that set does not contain -- so a list here
+#   would be a second copy the guard would then have to tolerate. This script does not
+#   need the vocabulary anyway: it asks whether an "exit reason=" line EXISTS at all
+#   (that is the entire "shut down vs was killed" judgement) and prints it verbatim.
 #
 # START METHOD, MEASURED (2026-10-19, this machine). "start" uses WMI
 # (Win32_Process.Create) because the child is owned by the WMI service rather than by

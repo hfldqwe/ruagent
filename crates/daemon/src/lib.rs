@@ -189,6 +189,47 @@ pub mod exit_trace {
         Ok(())
     }
 
+    /// THE EXIT-REASON VOCABULARY -- defined ONCE, here (issues-56-59 audit F5).
+    ///
+    /// THE TOKENS ARE A CONTRACT, so they must not change; only where they are WRITTEN may.
+    /// `data/daemon.exit` is read by `scripts/ruagent-daemon.ps1 status` and by a human after
+    /// an incident: the line is `exit reason=<token> pid=... at=...` (plus ` detail=...` when a
+    /// caller has free text), and the "was it killed or did it leave" judgement rests on whether
+    /// an `exit reason=` line exists AT ALL -- a killed daemon cannot write one, so the line it
+    /// leaves is its boot line. The script prints that line and does NOT branch on the token,
+    /// which is why the vocabulary is interpreted in exactly one place: here.
+    ///
+    /// WHY A SET AND NOT ONLY THE WRITE SITES: `graceful` is a word the vocabulary has always
+    /// declared (`lib.rs:202` before this change) while NOTHING writes it -- the audit measured
+    /// that gap, and a reader may still meet any of the six in a trace written by another
+    /// revision. The set is the whole vocabulary; the four constants below the ones used by a
+    /// write site are the same strings.
+    pub const EXIT_REASONS: [&str; 6] = [
+        EXIT_REASON_GRACEFUL,
+        EXIT_REASON_STOP_REQUEST,
+        EXIT_REASON_SIGNAL_CONSOLE,
+        EXIT_REASON_PANIC,
+        EXIT_REASON_ERROR,
+        EXIT_REASON_SERVER_RETURNED,
+    ];
+
+    /// The launcher asked, through `data/daemon.stop`: the ONLY reason `stop` calls GRACEFUL.
+    pub const EXIT_REASON_STOP_REQUEST: &str = "stop-request";
+    /// A console event -- Ctrl-C, Ctrl-Break, or (through the same handler) console close,
+    /// logoff and shutdown. The path a FOREGROUND daemon takes.
+    pub const EXIT_REASON_SIGNAL_CONSOLE: &str = "signal:console";
+    /// A panic, through the hook installed by `install_panic_hook` (or `record_panic`).
+    pub const EXIT_REASON_PANIC: &str = "panic";
+    /// `serve_with_remote` returned an error.
+    pub const EXIT_REASON_ERROR: &str = "error";
+    /// `serve` returned without a recorded reason: the server gave up its loop and nothing
+    /// asked it to stop.
+    pub const EXIT_REASON_SERVER_RETURNED: &str = "server-returned";
+    /// Declared by the vocabulary and written by NO path today: kept because it names the
+    /// planned/observed shape (a daemon that left through its own shutdown path without a
+    /// specific trigger) and because a trace written by another revision may carry it.
+    pub const EXIT_REASON_GRACEFUL: &str = "graceful";
+
     /// This daemon is up: the line a silent death leaves behind.
     pub fn record_running(root: &Path) -> Result<()> {
         write(
@@ -199,9 +240,11 @@ pub mod exit_trace {
 
     /// This daemon is leaving, and here is why.
     ///
-    /// The reason is a SHORT token (graceful, stop-request, signal:console,
-    /// panic, error, server-returned); the detail is the free text that has to
-    /// survive (a panic message, an error, a launcher's note).
+    /// The reason is a SHORT token from `EXIT_REASONS` above (the ONE definition of that
+    /// vocabulary); the detail is the free text that has to survive (a panic message, an
+    /// error, a launcher's note). This doc does NOT repeat the tokens: the list that used to
+    /// sit here was the second copy the audit found, and it had already drifted -- it named
+    /// `graceful`, which nothing writes.
     pub fn record_exit(root: &Path, reason: &str, detail: Option<&str>) -> Result<()> {
         let mut line = format!(
             "exit reason={} pid={} at={}",
@@ -223,6 +266,36 @@ pub mod exit_trace {
     /// Parse one trace line. Tolerant by design: this file is read to EXPLAIN an
     /// unexplained death, so an unreadable line comes back as None (and the caller
     /// says so) rather than panicking in the reader.
+    /// The exit-reason tokens a DAEMON SCRIPT names, for the cross-carrier guard in
+    /// @@exit_trace_tests@@ (issues-56-59 audit F5).
+    ///
+    /// RECOGNISED SHAPE, and only it: @@exit reason=<token>@@ and an enumeration after it
+    /// (@@exit reason=a|b,c@@) -- the shape the audit found duplicated in
+    /// @@scripts/ruagent-daemon.ps1@@. The script's OTHER @@reason=@@ sites (the stop-notice line
+    /// and the stop-request file) carry the operator's free text from @@-Reason@@ and are
+    /// deliberately NOT parsed: they are not the vocabulary.
+    ///
+    /// WHY THE PARSER IS A FUNCTION: the guard's own red proof needs to feed it text (a
+    /// fabricated token), and that proof must not mutate the shared script.
+    #[cfg(test)]
+    pub(crate) fn exit_reason_tokens_in(script: &str) -> Vec<String> {
+        const MARKER: &str = "exit reason=";
+        let mut out: Vec<String> = Vec::new();
+        for (at, _) in script.match_indices(MARKER) {
+            let rest = &script[at + MARKER.len()..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '|' | ',')))
+                .unwrap_or(rest.len());
+            for token in rest[..end].split(['|', ',']) {
+                let token = token.trim();
+                if !token.is_empty() && !out.iter().any(|t| t == token) {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        out
+    }
+
     pub fn parse(text: &str) -> Option<Trace> {
         let text = text.trim();
         let mut it = text.split_whitespace();
@@ -312,7 +385,11 @@ pub mod exit_trace {
                         .map(|s| s.to_string())
                         .or_else(|| info.payload().downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "panic".into());
-                    let _ = record_exit(root, "panic", Some(&format!("{what} at {where_}")));
+                    let _ = record_exit(
+                        root,
+                        EXIT_REASON_PANIC,
+                        Some(&format!("{what} at {where_}")),
+                    );
                 }
                 previous(info);
             }));
@@ -322,7 +399,11 @@ pub mod exit_trace {
     /// Record a panic WITHOUT the hook, for a caller that has one to hand (the
     /// tests, and any future path that catches an unwind itself).
     pub fn record_panic(root: &Path, message: &str, location: &str) -> Result<()> {
-        record_exit(root, "panic", Some(&format!("{message} at {location}")))
+        record_exit(
+            root,
+            EXIT_REASON_PANIC,
+            Some(&format!("{message} at {location}")),
+        )
     }
 }
 
@@ -708,7 +789,7 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
                 .lock()
                 .expect("exit reason lock")
                 .clone()
-                .unwrap_or_else(|| "server-returned".to_string());
+                .unwrap_or_else(|| exit_trace::EXIT_REASON_SERVER_RETURNED.to_string());
             if let Err(e) = exit_trace::record_exit(&root, &reason, None) {
                 tracing::warn!(error = %e, "writing the exit trace failed");
             }
@@ -716,7 +797,9 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
             Ok(())
         }
         Err(e) => {
-            if let Err(werr) = exit_trace::record_exit(&root, "error", Some(&e.to_string())) {
+            if let Err(werr) =
+                exit_trace::record_exit(&root, exit_trace::EXIT_REASON_ERROR, Some(&e.to_string()))
+            {
                 tracing::warn!(error = %werr, "writing the exit trace failed");
             }
             tracing::error!(error = %e, "the server stopped with an error");
@@ -755,12 +838,14 @@ fn shutdown_signal(
                 // handler) console close / logoff / shutdown. This is the path a
                 // FOREGROUND daemon takes, and the one a machine shutdown leaves.
                 _ = tokio::signal::ctrl_c() => {
-                    *why.lock().expect("exit reason lock") = Some("signal:console".into());
+                    *why.lock().expect("exit reason lock") =
+                        Some(exit_trace::EXIT_REASON_SIGNAL_CONSOLE.into());
                     break;
                 }
                 _ = tick.tick() => {
                     if stop_request.is_file() {
-                        *why.lock().expect("exit reason lock") = Some("stop-request".into());
+                        *why.lock().expect("exit reason lock") =
+                            Some(exit_trace::EXIT_REASON_STOP_REQUEST.into());
                         break;
                     }
                 }
@@ -847,7 +932,12 @@ mod exit_trace_tests {
     fn a_clean_exit_reads_as_an_exit_not_as_a_silent_death() {
         let root = unique_root("clean");
         exit_trace::record_running(&root).unwrap();
-        exit_trace::record_exit(&root, "stop-request", Some("the launcher asked")).unwrap();
+        exit_trace::record_exit(
+            &root,
+            exit_trace::EXIT_REASON_STOP_REQUEST,
+            Some("the launcher asked"),
+        )
+        .unwrap();
         let raw = std::fs::read_to_string(exit_trace::path(&root)).unwrap();
         println!("READING t20 clean record: {}", raw.trim());
         match exit_trace::read(&root).expect("a record") {
@@ -943,7 +1033,12 @@ mod exit_trace_tests {
     #[test]
     fn a_multiline_detail_stays_one_record() {
         let root = unique_root("multiline");
-        exit_trace::record_exit(&root, "panic", Some("first\nsecond\tthird")).unwrap();
+        exit_trace::record_exit(
+            &root,
+            exit_trace::EXIT_REASON_PANIC,
+            Some("first\nsecond\tthird"),
+        )
+        .unwrap();
         let raw = std::fs::read_to_string(exit_trace::path(&root)).unwrap();
         println!("READING t20 flattened record: {}", raw.trim());
         assert_eq!(raw.lines().count(), 1, "one line, whatever the detail held");
@@ -954,6 +1049,104 @@ mod exit_trace_tests {
             other => panic!("expected an Exit record, got {other:?}"),
         }
         crate::test_cleanup::report_test_root_left_behind(&root);
+    }
+
+    /// THE VOCABULARY'S INDEPENDENT PIN (issues-56-59 audit F5): the six tokens, written out
+    /// HERE by value, so a change to any of them is a red test and not a silent format change.
+    ///
+    /// WHY BY VALUE AND NOT BY REFERENCING THE CONSTANTS: an assertion that read the const
+    /// could not detect a changed TOKEN -- it would compare the const with itself. The tokens
+    /// are a contract with @@data/daemon.exit@@, with @@scripts/ruagent-daemon.ps1@@ and with
+    /// AGENTS.md's readings (@@exit reason=stop-request pid=... at=...@@, @@reason=panic ...
+    /// detail=...@@, and the @@DIED WITHOUT A TRACE@@ judgement), so they get one hand-typed
+    /// copy -- in a test, where changing it is an argument rather than an edit.
+    #[test]
+    fn the_exit_reason_vocabulary_is_exactly_these_six_tokens() {
+        assert_eq!(
+            exit_trace::EXIT_REASONS,
+            [
+                "graceful",
+                "stop-request",
+                "signal:console",
+                "panic",
+                "error",
+                "server-returned",
+            ],
+            "the exit-reason tokens are a contract: changing one changes what every trace and              every status reading means"
+        );
+    }
+
+    /// THE CROSS-CARRIER GUARD (issues-56-59 audit F5): the vocabulary lives in RUST, and the
+    /// PowerShell script must not carry a second copy of it.
+    ///
+    /// WHAT IT PARSES -- and it PRINTS what it parsed, because a guard that reads a second
+    /// carrier is blind exactly where its parser is and that failure is SILENT (the lesson the
+    /// CI manifest guard paid for): every @@exit reason=<token|token|...>@@ occurrence in the
+    /// script, split on @@|@@ and @@,@@, deduplicated in order. Each token must be a member of
+    /// @@EXIT_REASONS@@. The script's OTHER @@reason=@@ sites (the stop-notice line and the
+    /// stop-request file) are deliberately NOT parsed: those carry the operator's free text
+    /// from @@-Reason@@, which is not the vocabulary.
+    ///
+    /// WHY THIS SHAPE: the copy the audit found was an ENUMERATION in a comment -- the shape a
+    /// reader trusts and a rename forgets. The script's real judgement does not need the tokens
+    /// at all (it asks whether an @@exit reason=@@ line EXISTS and reports it verbatim), so the
+    /// guard's positive reading is "the script names only tokens the daemon knows" and its red
+    /// reading is a fabricated token.
+    #[test]
+    fn the_daemon_script_only_names_exit_reasons_the_daemon_knows() {
+        // THE PATH IS OVERRIDABLE, and only for the NEGATIVE CONTROL: point the guard at a
+        // COPY of the script that carries a fabricated token and it must fail -- WITHOUT
+        // mutating the shared file (the mutation-control rule). Unset in every normal run.
+        let path = std::env::var_os("RUAGENT_T38_SCRIPT").map_or_else(
+            || {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("scripts")
+                    .join("ruagent-daemon.ps1")
+            },
+            std::path::PathBuf::from,
+        );
+        let script = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let found = exit_trace::exit_reason_tokens_in(&script);
+        println!(
+            "READING t38 {} names {} exit-reason token(s): {found:?}",
+            path.display(),
+            found.len()
+        );
+        assert!(
+            !found.is_empty(),
+            "the parser extracted NO token from the script -- the guard is blind (the script              must name at least the stop-request path it implements)"
+        );
+        let unknown: Vec<&String> = found
+            .iter()
+            .filter(|t| !exit_trace::EXIT_REASONS.contains(&t.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "the script names exit reason(s) the daemon does not know: {unknown:?}. The              vocabulary is defined ONCE, in exit_trace::EXIT_REASONS -- either the script is              out of date or the new token has to be added there (and to its pin above)"
+        );
+
+        // PLANTED CONTROL: the same shape with a token the daemon does not know must be
+        // reported, so the assertions above are about the parser and not about the script
+        // happening to be clean. Synthetic text -- the shared script is never mutated.
+        let planted = "  # writes an exit reason=stop-request|quiesced trace into data/daemon.exit";
+        assert_eq!(
+            exit_trace::exit_reason_tokens_in(planted),
+            vec!["stop-request".to_string(), "quiesced".to_string()],
+            "the parser must report every token of an enumeration, known or not"
+        );
+        let unknown_planted: Vec<String> = exit_trace::exit_reason_tokens_in(planted)
+            .iter()
+            .filter(|t| !exit_trace::EXIT_REASONS.contains(&t.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            unknown_planted,
+            vec!["quiesced".to_string()],
+            "a fabricated token must be reported as unknown, or this guard cannot fail"
+        );
     }
 }
 
