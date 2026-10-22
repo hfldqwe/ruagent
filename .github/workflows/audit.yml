@@ -109,7 +109,19 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats)
+      # PINNED TOOLCHAIN (t40, audit F6): the AUTHORITY is rust-toolchain.toml
+      # (channel = "1.95.0") -- that file is what every cargo/rustc invocation in this
+      # repository RUNS. This input is what the runner INSTALLS: the action does not read
+      # the toml file, so omitting the input installs the action default (stable) and
+      # leaves this job floating -- which is what the guard below now fails on.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head (2026-09-03), SHA-pinned like every other action here
+        with:
+          toolchain: "1.95.0"
+      # F6 GUARD: the toolchain pin has ONE authority (rust-toolchain.toml). This fails when
+      # a workflow toolchain input disagrees with it, and REPORTS the carriers that are still
+      # unpinned (e2e.yml:69, release.yml:132) rather than hiding them.
+      - name: "Guard: the toolchain pin must match rust-toolchain.toml"
+        run: bash .github/scripts/check-toolchain-pin.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

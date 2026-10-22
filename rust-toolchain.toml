@@ -11,10 +11,20 @@
 # (`rustup check`: "update available: 1.95.0 (59807616e …) -> 1.99.0 (b940084d7 …)"),
 # so a new clippy lint could turn a zero-diff commit red under `-D warnings`.
 #
-# TO RAISE THE PIN (two carriers, keep them EQUAL):
-#   1. this file: channel = "x.y.z"
-#   2. .github/workflows/ci.yml: the `with: toolchain:` input of BOTH
-#      `dtolnay/rust-toolchain` steps (rust-linux and rust-windows)
+# TO RAISE THE PIN. The CARRIERS, and the ONE authority among them (t40):
+#   1. THIS FILE is the authority: its channel = x.y.z is what every cargo/rustc
+#      invocation in this repository RUNS (rustup prints the override above).
+#   2. .github/workflows/ci.yml: the with: toolchain: input of BOTH
+#      dtolnay/rust-toolchain steps (rust-linux and rust-windows) -- what the runner
+#      INSTALLS, which the action takes from this input, never from this file.
+#   3. .github/workflows/audit.yml: the same input (t40; that job used to omit it and
+#      floated on the action default, i.e. on whatever stable was that day).
+#   NOT YET PINNED: e2e.yml:69 and release.yml:132 still omit the input. The guard below
+#   reports them as WARN on every run, and enforcing them needs only pinning them.
+#
+# THE GUARD: bash .github/scripts/check-toolchain-pin.sh FAILS when a carrier disagrees
+# with this file, or drops its input, so the carriers cannot drift apart silently. It runs
+# as a step in ci.yml and audit.yml.
 # ...AND INSTALL IT FIRST ON EVERY MACHINE THAT BUILDS THIS TREE:
 #   rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
 # Pinning a version that is not installed here does NOT fall back: rustup selects

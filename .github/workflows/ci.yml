@@ -59,6 +59,8 @@ jobs:
           # file governs cargo/rustc here regardless of what the runner installed.
           # Raise both carriers together (rust-toolchain.toml + this input, here and
           # in rust-windows).
+          # The F6 guard below FAILS when this input and rust-toolchain.toml disagree, so
+          # the carriers can no longer drift apart silently.
           toolchain: "1.95.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
@@ -77,6 +79,13 @@ jobs:
       # script's header.
       - name: "Guard: workflow-referenced paths must be tracked"
         run: bash .github/workflows/scripts/check-workflow-refs.sh
+
+      # F6 GUARD (t40): the toolchain pin has ONE authority -- rust-toolchain.toml. This
+      # fails when a workflow toolchain input disagrees with it (or is missing, which floats
+      # on the action default), and REPORTS the carriers that are still unpinned
+      # (e2e.yml:69, release.yml:132) instead of hiding them.
+      - name: "Guard: the toolchain pin must match rust-toolchain.toml"
+        run: bash .github/scripts/check-toolchain-pin.sh
 
       # ---------------------------------------------------------------- coverage
       # Declared BEFORE the greens on purpose: a reader must know what a green
