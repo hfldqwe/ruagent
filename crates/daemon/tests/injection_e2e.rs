@@ -190,42 +190,66 @@ const WIKI_DOC: &str = r#"# Deploy notes
 t292-wiki-generated-summary-of-the-release-process, to be verified against the deploy guide.
 "#;
 
-/// The mock binary, derived from THIS test binary's own location:
+// ---- mock-agent-locator: begin (t42 -- keep this block BYTE-IDENTICAL in every copy;
+//      crates/mock-agent/tests/mock_locator_drift.rs fails when two copies differ) ----
+
+/// The mock binary, derived from THIS test binarys own location:
 /// target/profile/deps/test.exe -> target/profile/ruagent-mock-agent[.exe].
-/// CARGO_BIN_EXE_ruagent-mock-agent is only defined for the mock-agent package's
-/// own tests, so an in-scope daemon test cannot use it.
-fn mock_bin() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    let profile_dir = exe.parent()?.parent()?;
-    let name = if cfg!(windows) {
-        "ruagent-mock-agent.exe"
-    } else {
-        "ruagent-mock-agent"
-    };
-    let path = profile_dir.join(name);
-    path.is_file().then(|| {
-        path.display()
-            .to_string()
-            .replace(std::path::MAIN_SEPARATOR, "/")
-    })
+/// CARGO_BIN_EXE_ruagent-mock-agent is only defined for the mock-agent packages own
+/// tests, so a cross-package suite has to do this arithmetic itself. There is more than
+/// one such suite, so this block is copied VERBATIM and the drift guard named above is
+/// what keeps the copies honest: a fix applied to one copy alone turns it red.
+const NEEDS_MOCK: &str = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`";
+
+/// Every path the locator will accept, in the order it tries them -- BOTH names, because
+/// Windows needs the .exe and unix does not, and the missing-binary message has to name
+/// them (t42: a bare absent tells the reader nothing about which of the two candidates
+/// was wrong).
+fn mock_bin_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(profile_dir) = exe.parent().and_then(|d| d.parent())
+    {
+        for name in ["ruagent-mock-agent.exe", "ruagent-mock-agent"] {
+            out.push(profile_dir.join(name));
+        }
+    }
+    out
 }
 
-/// WHAT A MISSING PRECONDITION MUST SAY (t37).
-///
-/// The seven tests below carry `#[ignore = "needs ruagent-mock-agent …"]`, so:
-///   * the DEFAULT run reports them as `ignored` -- the harness accounts for
-///     "not run" separately from "passed", which is the whole point;
-///   * an explicit `-- --ignored` run PANICS with this message when the binary is
-///     absent, i.e. a missing precondition is a FAILURE, not a silent pass.
-///
-/// WHY THE SHAPE CHANGED: an early `return` on a missing precondition is a PASS
-/// in cargo's summary -- a run that measured nothing prints "test result: ok"
-/// exactly like a real one. The old answer to the same problem was the
-/// `RUAGENT_REQUIRE_MOCK` opt-in, but nothing in the repo ever set it (t37 grep:
-/// three occurrences, all inside this file, plus two docs describing it), so the
-/// default gate kept counting these seven as passed. A switch nobody throws is
-/// not a guard; `#[ignore]` + a body-head `expect` needs no opt-in.
-const NEEDS_MOCK: &str = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent` (or `cargo test --workspace`), then run this test with `-- --ignored`";
+/// The located binary as a slash-separated path, or None after SAYING WHAT WAS TRIED.
+/// The paths are printed even though the caller goes on to panic with NEEDS_MOCK: the panic
+/// names the precondition, this names the paths and the command that satisfies them, so a
+/// reader never has to reproduce t28s manual `cargo build -p ruagent-mock-agent --bins` to
+/// find out what the locator was looking for.
+fn mock_bin() -> Option<String> {
+    let candidates = mock_bin_candidates();
+    if let Some(path) = candidates.iter().find(|p| p.is_file()) {
+        return Some(path.display().to_string().replace(char::from(92), "/"));
+    }
+    eprintln!("mock binary MISSING (t42) -- {NEEDS_MOCK}");
+    for path in &candidates {
+        eprintln!("  looked for: {}", path.display());
+    }
+    None
+}
+// ---- mock-agent-locator: end ----
+
+// WHAT A MISSING PRECONDITION MUST SAY (t37).
+//
+// The seven tests below carry `#[ignore = "needs ruagent-mock-agent …"]`, so:
+//   * the DEFAULT run reports them as `ignored` -- the harness accounts for
+//     "not run" separately from "passed", which is the whole point;
+//   * an explicit `-- --ignored` run PANICS with this message when the binary is
+//     absent, i.e. a missing precondition is a FAILURE, not a silent pass.
+//
+// WHY THE SHAPE CHANGED: an early `return` on a missing precondition is a PASS
+// in cargo's summary -- a run that measured nothing prints "test result: ok"
+// exactly like a real one. The old answer to the same problem was the
+// `RUAGENT_REQUIRE_MOCK` opt-in, but nothing in the repo ever set it (t37 grep:
+// three occurrences, all inside this file, plus two docs describing it), so the
+// default gate kept counting these seven as passed. A switch nobody throws is
+// not a guard; `#[ignore]` + a body-head `expect` needs no opt-in.
 
 struct TestDaemon {
     url: String,
@@ -458,7 +482,7 @@ async fn drive_run(d: &TestDaemon, prompt: &str) -> (String, String) {
 /// DIRECTION 1: with a source document and a wiki page, a real run's injected
 /// context carries memory AND knowledge AND wiki -- and the agent received them.
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn run_injects_memory_knowledge_and_wiki() {
     let d = boot("withkb", true).await.expect(NEEDS_MOCK);
     let (render, echoed) = drive_run(&d, PROMPT).await;
@@ -506,7 +530,7 @@ async fn run_injects_memory_knowledge_and_wiki() {
 /// Without this direction, direction 1 could pass on a renderer that emits the
 /// tags unconditionally and the test would never notice.
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn run_without_knowledge_documents_has_no_knowledge_block() {
     let d = boot("nokb", false).await.expect(NEEDS_MOCK);
     let (render, echoed) = drive_run(&d, PROMPT).await;
@@ -620,7 +644,7 @@ fn headers_of(render: &str) -> Vec<String> {
 /// now it had no test touching its injection at all (injection_context had two
 /// references: its definition and its one call site).
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn chat_injects_memory_knowledge_and_wiki() {
     let d = boot("chatwithkb", true).await.expect(NEEDS_MOCK);
     let (render, echoed) = drive_chat(&d, PROMPT).await;
@@ -658,7 +682,7 @@ async fn chat_injects_memory_knowledge_and_wiki() {
 /// must be ABSENT, and the memory block must still be there -- otherwise this
 /// test cannot tell "correctly empty" from "never wired up".
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn chat_without_knowledge_documents_has_no_knowledge_block() {
     let d = boot("chatnokb", false).await.expect(NEEDS_MOCK);
     let (render, echoed) = drive_chat(&d, PROMPT).await;
@@ -687,7 +711,7 @@ async fn chat_without_knowledge_documents_has_no_knowledge_block() {
 /// their block headers must be IDENTICAL -- and the old chat-only header must be
 /// gone from both.
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn chat_and_run_use_the_same_block_wording() {
     let d = boot("wording", true).await.expect(NEEDS_MOCK);
     let (chat_render, _) = drive_chat(&d, PROMPT).await;
@@ -770,7 +794,7 @@ async fn seed_long_observation(d: &TestDaemon, content: &str) {
 /// the contract's exact bytes -- compared against the contract's own
 /// constructor, not against a shape that a lookalike could also satisfy.
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn both_paths_emit_the_contract_truncation_marker() {
     let d = boot("markers", true).await.expect(NEEDS_MOCK);
     seed_long_observation(&d, &"t309-long-memory ".repeat(90)).await;
@@ -810,7 +834,7 @@ async fn both_paths_emit_the_contract_truncation_marker() {
 /// (ContextInjected), so the retried run's own render must open with the SHARED
 /// retry prefix -- byte-equal to chat.rs's retry_head(), which runs.rs calls.
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn a_retried_run_carries_the_shared_retry_prefix() {
     let d = boot("retry", false).await.expect(NEEDS_MOCK);
     let http = reqwest::Client::new();
@@ -924,7 +948,7 @@ async fn a_retried_run_carries_the_shared_retry_prefix() {
 /// different sources in the file, so agreeing is evidence, not tautology;
 /// (3) the agent received that render (the mock echoes its prompt).
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to the test binary; run with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn chat_event_carries_the_injection_budget_report() {
     let d = boot("chatbudget", true).await.expect(NEEDS_MOCK);
     // Overflow the render budget ON PURPOSE. The knobs that actually move it on

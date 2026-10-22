@@ -885,25 +885,50 @@ async fn an_empty_distillation_pass_is_a_success_not_a_refusal() {
     shutdown_pair(client, server_task).await;
 }
 
-/// The mock binary, derived from THIS test binary's own location:
-/// target/profile/deps/test.exe -> target/profile/ruagent-mock-agent[.exe]. This crate
-/// cannot use CARGO_BIN_EXE_ruagent-mock-agent (that is defined only for the mock-agent
-/// package's own tests), which is why the precondition is a located path plus an honest
-/// `#[ignore]` rather than a hard dependency.
-fn mock_bin() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    let profile_dir = exe.parent()?.parent()?;
-    let name = if cfg!(windows) {
-        "ruagent-mock-agent.exe"
-    } else {
-        "ruagent-mock-agent"
-    };
-    let path = profile_dir.join(name);
-    path.is_file()
-        .then(|| path.display().to_string().replace('\\', "/"))
+// ---- mock-agent-locator: begin (t42 -- keep this block BYTE-IDENTICAL in every copy;
+//      crates/mock-agent/tests/mock_locator_drift.rs fails when two copies differ) ----
+
+/// The mock binary, derived from THIS test binarys own location:
+/// target/profile/deps/test.exe -> target/profile/ruagent-mock-agent[.exe].
+/// CARGO_BIN_EXE_ruagent-mock-agent is only defined for the mock-agent packages own
+/// tests, so a cross-package suite has to do this arithmetic itself. There is more than
+/// one such suite, so this block is copied VERBATIM and the drift guard named above is
+/// what keeps the copies honest: a fix applied to one copy alone turns it red.
+const NEEDS_MOCK: &str = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`";
+
+/// Every path the locator will accept, in the order it tries them -- BOTH names, because
+/// Windows needs the .exe and unix does not, and the missing-binary message has to name
+/// them (t42: a bare absent tells the reader nothing about which of the two candidates
+/// was wrong).
+fn mock_bin_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(profile_dir) = exe.parent().and_then(|d| d.parent())
+    {
+        for name in ["ruagent-mock-agent.exe", "ruagent-mock-agent"] {
+            out.push(profile_dir.join(name));
+        }
+    }
+    out
 }
 
-const NEEDS_MOCK: &str = "needs ruagent-mock-agent next to this test binary: build it with cargo build -p ruagent-mock-agent (or cargo test --workspace), then run this test with -- --ignored";
+/// The located binary as a slash-separated path, or None after SAYING WHAT WAS TRIED.
+/// The paths are printed even though the caller goes on to panic with NEEDS_MOCK: the panic
+/// names the precondition, this names the paths and the command that satisfies them, so a
+/// reader never has to reproduce t28s manual `cargo build -p ruagent-mock-agent --bins` to
+/// find out what the locator was looking for.
+fn mock_bin() -> Option<String> {
+    let candidates = mock_bin_candidates();
+    if let Some(path) = candidates.iter().find(|p| p.is_file()) {
+        return Some(path.display().to_string().replace(char::from(92), "/"));
+    }
+    eprintln!("mock binary MISSING (t42) -- {NEEDS_MOCK}");
+    for path in &candidates {
+        eprintln!("  looked for: {}", path.display());
+    }
+    None
+}
+// ---- mock-agent-locator: end ----
 
 /// t13 / #56 + #62: a GOVERNED REFUSAL reaches the MCP caller as an ERROR naming the
 /// pair the store refused — and it is NOT the reply an empty pass gets.
@@ -920,7 +945,7 @@ const NEEDS_MOCK: &str = "needs ruagent-mock-agent next to this test binary: bui
 /// a PASS in cargo's summary (t37). This test is reported as ignored, and an explicit
 /// `-- --ignored` run PANICS with the reason when the binary is absent.
 #[tokio::test]
-#[ignore = "needs ruagent-mock-agent next to this test binary: build it with cargo build -p ruagent-mock-agent (or cargo test --workspace), then run this test with -- --ignored"]
+#[ignore = "needs ruagent-mock-agent next to this test binary: build it with `cargo build -p ruagent-mock-agent --bins` (or `cargo test --workspace`), then run this test with `-- --ignored`"]
 async fn a_governed_refusal_is_an_error_and_an_empty_pass_is_not() {
     let mock = mock_bin().expect(NEEDS_MOCK);
     let replies =
