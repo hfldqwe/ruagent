@@ -143,6 +143,16 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
 - High-volume run events are append-only JSONL under `transcripts/`; SQLite holds queryable state only.
 - New adapters must come with mock-driven tests; real-harness smoke tests are feature-gated (`--features smoke`).
 - Windows is a first-class platform: no Unix-only assumptions (paths, process groups, signals).
+- **Reach for the existing helper before hand-rolling a new one** (ruagent-issues-56-59, from the audit's F3/F10).
+  Two mechanisms already exist here and are still being re-invented: `pub fn now_unix_ms()` while
+  `SystemTime::now()` is hand-rolled in 25 places, and `tempfile` -- already in `Cargo.lock` through the
+  dependency graph, not declared anywhere -- while 112 test sites build temporary roots by hand out of
+  `std::env::temp_dir()` + process id + a counter, which is the same mechanism with the cleanup left to the
+  author. The audit REFUSED a bulk replacement of those 112 (a 112-file diff for no behavioural gain) and
+  asked for the cheap half instead: new code uses `now_unix_ms`, and a new test that needs a temporary root
+  declares `tempfile` as a dev-dependency of the crate it lives in. The general rule: when you are about to
+  write the THIRD copy of a mechanism, that is the moment to look for the existing one -- and when you are
+  writing the FIRST, check that it is not already here.
 - **Format before you submit** (t66). CI's first gate is `cargo fmt --all --check`; a task that
   leaves unformatted Rust does not fail *itself* — it fails the **next push** (observed: **177
   diff sites** accumulated across the tree, concentrated in files no gate ever reformatted:
