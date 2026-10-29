@@ -20,8 +20,13 @@ name: Release
 #      actions are now pinned to a commit SHA, with the human-readable ref in a
 #      comment. Upgrading one is a deliberate edit:
 #        gh api repos/<owner>/<repo>/commits/<ref> --jq .sha   # then update both
-#      (Pinning the action does NOT pin the Rust toolchain itself: `stable` still
-#      floats at run time. That is a separate decision -- see the report §19.)
+#      (Pinning the action does NOT pin the Rust toolchain itself: the INSTALL still
+#      floats unless the step passes `with: toolchain:`. Every build step below now does,
+#      with the value .github/scripts/check-toolchain-pin.sh holds equal to
+#      rust-toolchain.toml -- t40 audit F6. Two reasons it is not merely tidy: the action
+#      does not read the toml (its README says the toolchain comes from the action ref), and
+#      its master revision has since made that input REQUIRED with no default, so an
+#      unpinned step would eventually fail the job outright rather than float quietly.)
 #
 #   3. The release path ran NO gate: a red commit that got a tag was published as
 #      a release. The `gate` job now demands that CI has already reached a green
@@ -131,6 +136,11 @@ jobs:
           persist-credentials: false # nothing here pushes; do not leave a token in .git/config
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03)
         with:
+          # t40 audit F6: WITHOUT this the step installs the action default (stable) and the
+          # release build floats -- a zero-diff tag could compile under a new compiler. The
+          # value is checked against rust-toolchain.toml by .github/scripts/check-toolchain-pin.sh
+          # (release.yml is in its ENFORCED list), so it cannot drift silently.
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc
@@ -148,29 +158,106 @@ jobs:
           npm ci
           npm run build
         working-directory: panel
+      # WHAT DOES THE ONNX RUNTIME COST A DOWNLOADER? Nothing -- and it is MEASURED, because
+      # this is the question that gets re-litigated every time someone looks into a cache
+      # directory, sees no `onnxruntime.dll` and cannot tell "static" from "lazy"
+      # (ruagent-issues-56-59 t43). Four readings, none of them inference:
+      #
+      #   * `cargo tree -e features -i ort -p ruagent` lists ort's `download-binaries` and NOT
+      #     `load-dynamic`: ort-sys links the prebuilt ONNX Runtime IN at build time instead of
+      #     dlopen()ing it at run time, so there is no shared object for an archive to carry.
+      #   * the import table of the produced binary names 35 DLLs and NO onnx* entry (a scan of
+      #     the PE import directory; KERNEL32, MSVCP140, VCRUNTIME140, ws2_32, ...). An
+      #     import-lib-linked or load-dynamic build would show up exactly there.
+      #   * it DOES import directml.dll / d3d12.dll / dxgi.dll -- the DirectML execution
+      #     provider, which is how the statically linked runtime reaches a GPU on Windows.
+      #     DirectML ships with Windows 10 1903+ (C:/Windows/System32/DirectML.dll), i.e. the
+      #     operating system provides it, not the archive.
+      #   * at run time the PACKAGED daemon boots, serves the panel, and reports the embedder it
+      #     ended up with through /api/v1/stats -- the smoke step below prints that line. ort's
+      #     ONNX SESSION is created lazily by FastEmbedder (which also downloads a model from
+      #     HuggingFace), so a missing library would surface as an embedder fallback, on a
+      #     machine with no extra files installed.
+      # CONCLUSION: no onnxruntime.dll/.so goes into the archive. If an ort bump ever turns
+      # `load-dynamic` on, this block is wrong -- and the smoke step's embedder line is where
+      # that shows up first.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $staging = "staging"
-          New-Item -ItemType Directory -Force $staging | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $staging = 'staging'
+          New-Item -ItemType Directory -Force "$staging/panel/dist" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/ruagent.exe" $staging
-          Copy-Item -Recurse "panel/dist" "$staging/panel-dist"
+          # THE ARCHIVE-SIDE PATH IS A CONTRACT (t43). The daemon resolves the panel as
+          # RUAGENT_PANEL_DIST, <exe dir>/panel/dist, <build tree>/panel/dist, then
+          # <cwd>/panel/dist (crates/daemon/src/api.rs) -- so the archive must carry
+          # panel/dist/... . The previous shape copied the directory to panel-dist/, which
+          # matches NONE of the four: the user unpacked the release, the API answered, and /
+          # returned 404 (the t188 shape, shipped as a release).
+          Copy-Item -Path "panel/dist/*" -Destination "$staging/panel/dist" -Recurse -Force
           Copy-Item "README.md" $staging
-          Compress-Archive -Path $staging -DestinationPath "${{ matrix.archive }}" -Force
+          Get-ChildItem "LICENSE*" -File | ForEach-Object { Copy-Item $_.FullName $staging }
+          # CHECKSUMS OF THE FILES THE ARCHIVE CARRIES; the archive's own checksum goes BESIDE
+          # the archive, so a downloader can verify what it downloaded.
+          Push-Location $staging
+          $stageLen = (Get-Location).Path.Length
+          $entries = @(Get-ChildItem -Recurse -File | Where-Object { $_.Name -ne 'SHA256SUMS' } |
+              ForEach-Object { $_.FullName.Substring($stageLen + 1).Replace([char]92, '/') } |
+              Sort-Object)
+          $lines = @(foreach ($f in $entries) {
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower() + '  ' + $f })
+          Set-Content -Path 'SHA256SUMS' -Value $lines -Encoding ascii
+          Write-Output 'SHA256SUMS:'
+          $lines | ForEach-Object { Write-Output ('  ' + $_) }
+          Pop-Location
+          # CONTENTS AT THE ARCHIVE ROOT. `-Path $staging` (the directory itself) nests
+          # everything under staging/ inside the zip -- an off-by-one-level that the smoke step
+          # below catches, and that nobody was reading for before it existed.
+          Compress-Archive -Path "$staging/*" -DestinationPath "${{ matrix.archive }}" -Force
+          $sum = ((Get-FileHash -Algorithm SHA256 -LiteralPath "${{ matrix.archive }}").Hash.ToLower() + '  /' + "${{ matrix.archive }}")
+          Set-Content -Path "${{ matrix.archive }}.sha256" -Value $sum -Encoding ascii
+          Write-Output ("archive checksum: " + $sum)
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p staging
+          set -euo pipefail
+          mkdir -p staging/panel/dist
           cp target/${{ matrix.target }}/release/ruagent staging/
-          cp -r panel/dist staging/panel-dist
+          # THE ARCHIVE-SIDE PATH IS A CONTRACT (t43, see the Windows leg): <exe dir>/panel/dist
+          # is the candidate the daemon actually finds in a package, so the panel goes THERE.
+          cp -r panel/dist/. staging/panel/dist/
           cp README.md staging/
+          cp LICENSE* staging/ 2>/dev/null || true
+          # SHA256SUMS over the files the archive carries; the archive's own sum goes beside it.
+          ( cd staging && find . -type f ! -name SHA256SUMS | sed 's|^[.]/||' | LC_ALL=C sort |
+              xargs -r sha256sum > SHA256SUMS )
+          echo 'SHA256SUMS:'; sed 's/^/  /' staging/SHA256SUMS
           tar czf ${{ matrix.archive }} -C staging .
+          sha256sum "${{ matrix.archive }}" | sed 's|^|/|' > "${{ matrix.archive }}.sha256"
+          echo "archive checksum: $(cat "${{ matrix.archive }}.sha256")"
+          echo 'archive contents (first 5):'; tar tzf "${{ matrix.archive }}" | head -5
+      # SMOKE: THE ARCHIVE MUST RUN FROM ITS OWN CONTENTS (ruagent-issues-56-59 t43).
+      # The release job used to publish whatever it had just zipped and nobody ever unpacked
+      # it -- which is how panel-dist/ shipped as a 404. This step unpacks the archive into a
+      # temp dir, runs it (--version), starts a real daemon on a free loopback port with a
+      # private root, demands /api/v1/health 200 AND / 200 with the PANEL body, then stops it
+      # cleanly. It compiles nothing, so a failure here is the archive's fault -- which is the
+      # only failure a download-and-run user experiences. Exit 1 = publish nothing.
+      - name: Smoke the archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/scripts/smoke-archive.ps1 -Archive "${{ matrix.archive }}" -Exe ruagent.exe
+      - name: Smoke the archive (Linux)
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/smoke-archive.sh "${{ matrix.archive }}" --exe ruagent
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (2025-03-19)
         with:
           name: ${{ matrix.target }}
-          path: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
 
   release:
     name: Create release
