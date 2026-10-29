@@ -127,7 +127,10 @@ echo "GET / -> 200 with the panel marker (<title>ruagent</title>), $(wc -c <"$st
 #    the offline hash embedder (crates/daemon/src/lib.rs); /api/v1/stats reports the outcome,
 #    so this is a live reading on a machine with no shipped onnxruntime library.
 stats="$(curl -s --max-time 10 "$base/api/v1/stats" 2>/dev/null)"
-embedder="$(printf '%s' "$stats" | tr ',' '\n' | grep '"embedder"' | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')"
+# `| head -1` closed the pipe on grep, and under `set -o pipefail` a SIGPIPE from that side becomes the
+# step's exit code -- the same class as the `tar | head` that failed the first real release packaging.
+# `grep -m1` stops itself rather than being killed.
+embedder="$(printf '%s' "$stats" | tr ',' '\n' | grep -m1 '"embedder"' | sed 's/.*: *"\([^"]*\)".*/\1/')"
 echo "embedder in use: ${embedder:-<unreadable>}"
 
 # 5. CLEAN STOP through the daemon's own channel, forced kill only as a reported fallback.

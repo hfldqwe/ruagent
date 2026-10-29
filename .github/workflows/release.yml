@@ -236,7 +236,10 @@ jobs:
           tar czf ${{ matrix.archive }} -C staging .
           sha256sum "${{ matrix.archive }}" | sed 's|^|/|' > "${{ matrix.archive }}.sha256"
           echo "archive checksum: $(cat "${{ matrix.archive }}.sha256")"
-          echo 'archive contents (first 5):'; tar tzf "${{ matrix.archive }}" | head -5
+          # `| head -5` closed the pipe while tar was still writing, and pipefail turned tar's
+          # `stdout: write error` (exit 2) into a failed PACKAGE step on the first real release
+          # run -- a race that a small local archive hides. sed reads every line instead.
+          echo 'archive contents (first 5):'; tar tzf "${{ matrix.archive }}" | sed -n '1,5p'
       # SMOKE: THE ARCHIVE MUST RUN FROM ITS OWN CONTENTS (ruagent-issues-56-59 t43).
       # The release job used to publish whatever it had just zipped and nobody ever unpacked
       # it -- which is how panel-dist/ shipped as a 404. This step unpacks the archive into a
