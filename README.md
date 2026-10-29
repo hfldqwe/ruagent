@@ -30,7 +30,37 @@ crash, kill or clean exit. On every platform the next boot sweeps the
 surviving children of a previously recorded daemon that is verifiably
 gone.
 
-## Quick start
+## Install a prebuilt release
+
+Every tagged release publishes ready-to-run archives — no Rust toolchain, no
+`protoc`, no `npm ci`:
+
+| platform | archive |
+| --- | --- |
+| Windows (x86_64) | `ruagent-vX.Y.Z-x86_64-windows.zip` |
+| Linux (x86_64) | `ruagent-vX.Y.Z-x86_64-linux.tar.gz` |
+
+Download the one for your platform from
+[Releases](https://github.com/hfldqwe/ruagent/releases), check it against the
+published `SHA256SUMS`, unpack it **as a whole**, and run:
+
+```bash
+./ruagent serve      # daemon + web panel on 127.0.0.1:8787
+./ruagent doctor     # 7-check end-to-end self-test
+```
+
+Then open **http://127.0.0.1:8787**.
+
+> The archive ships the web panel beside the binary (`panel/dist`), because
+> `ruagent` resolves it relative to its own executable. Moving the binary out
+> of the unpacked directory leaves you with the API and a 404 on `/` — that
+> exact failure is what the release pipeline's smoke test guards against: each
+> archive is unpacked and started by CI, and nothing is published unless `/`
+> serves the panel and `/api/v1/health` answers.
+
+macOS targets are not published yet; build from source below instead.
+
+## Build from source
 
 ```bash
 # Prerequisites: protoc on PATH (lancedb needs it at build time)

@@ -27,7 +27,34 @@
 立刻终止它拉起过的所有智能体、包装进程和 MCP 服务器；所有平台上，
 下一次启动都会清扫上一个已确认消失的 daemon 遗留的子进程。
 
-## 快速开始
+## 安装（预编译版）
+
+每个打 tag 的版本都会发布**开箱即用**的归档——不需要 Rust 工具链、不需要
+`protoc`、不需要 `npm ci`：
+
+| 平台 | 归档 |
+| --- | --- |
+| Windows (x86_64) | `ruagent-vX.Y.Z-x86_64-windows.zip` |
+| Linux (x86_64) | `ruagent-vX.Y.Z-x86_64-linux.tar.gz` |
+
+到 [Releases](https://github.com/hfldqwe/ruagent/releases) 下载对应平台那一个，
+用同页的 `SHA256SUMS` 校验，**整包解压**后运行：
+
+```bash
+./ruagent serve      # 守护进程 + Web 面板，127.0.0.1:8787
+./ruagent doctor     # 7 项端到端自检
+```
+
+然后打开 **http://127.0.0.1:8787**。
+
+> 归档把 Web 面板放在可执行文件旁边（`panel/dist`），因为 `ruagent` 是按**自身
+> 所在目录**解析面板的。把可执行文件单独挪走，就只剩 API、`/` 会 404——发布
+> 流水线的冒烟测试正是拦这个：CI 会解压自己产出的归档并真的启动一次，只有
+> `/` 能出面板且 `/api/v1/health` 有应答才允许发布。
+
+macOS 目标暂不发布，请用下面的源码构建。
+
+## 从源码构建
 
 ```bash
 # 前置：protoc 在 PATH 上（lancedb 构建期需要）
