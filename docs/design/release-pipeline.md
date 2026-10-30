@@ -80,12 +80,30 @@ unzip -q ruagent-vX.Y.Z-x86_64-windows.zip -d unpacked && cd unpacked
 `GET /` must be 200 with the panel markup -- not merely a live API. `doctor` runs the platform's own
 seven-check self-test and is the fastest way to tell a broken download from a broken machine.
 
+## Version and tags
+
+`[workspace.package] version` in the root `Cargo.toml` is the single authority: every crate inherits it, so
+`ruagent --version` reports it. The release tag must be `v` + that version, and the gate job now enforces
+it with `check-release-version.sh` before anything is built.
+
+That guard exists because of a real miss. `v0.1.1` was cut from a commit whose version had not been bumped,
+so its archives self-report `ruagent 0.1.0`. Nothing caught it: the CI gate was green (it was), and the
+smoke test proved the archive runs and serves its panel (it does). Neither of those looks at the version
+string, and the disagreement only surfaces when a user asks which build they have -- so it is cheaper to
+refuse the tag than to explain the release. The three readings that prove the guard works: the published
+`v0.1.1` manifest fails it (`tag 'v0.1.1' does not match the workspace version '0.1.0'`), a manifest with
+no readable version fails it (`the guard is blind, which is a failure, not a pass`), and the current tree
+against `v0.1.1` passes.
+
 ## Known gaps
 
 * **macOS is not published.** The matrix covers `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`; the
   macOS entries are deliberately absent rather than untested-and-hoped-for.
-* **`e2e.yml` and `release.yml`... `release.yml` is pinned now; `e2e.yml` still takes the action's default
-  toolchain**, which `check-toolchain-pin.sh` reports as a WARN on every run rather than failing silently.
+* **`v0.1.1` archives report `ruagent 0.1.0`** in `--version`, per the miss described above; the version was
+  bumped to `0.1.1` afterwards, so every release from now on matches its tag.
+* **`e2e.yml` still takes the action's default toolchain.** `ci.yml`, `audit.yml` and `release.yml` pin
+  `1.95.0` and `check-toolchain-pin.sh` fails on a mismatch; `e2e.yml` is outside that list and is reported
+  as a WARN on every run rather than failing silently.
 * **The download itself can be truncated on this network.** A `gh release download` of the 97 MB `v0.1.0`
   asset produced a 3.2 MB file that was not a zip, while the API reported the full 97,274,294 bytes -- a
   transport truncation, NOT a corrupt asset. Check `sha256sum` against `SHA256SUMS` before concluding that a

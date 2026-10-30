@@ -6296,7 +6296,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -6313,7 +6313,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-acp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "ruagent-core",
@@ -6326,7 +6326,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -6336,7 +6336,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -6374,14 +6374,14 @@ dependencies = [
 
 [[package]]
 name = "ruagent-extract"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "ruagent-graph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "ruagent-store",
@@ -6394,7 +6394,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-knowledge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow-array 55.2.0",
  "arrow-schema 55.2.0",
@@ -6414,7 +6414,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
  "reqwest 0.12.28",
@@ -6431,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "proptest",
@@ -6448,7 +6448,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-mock-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "axum 0.8.9",
@@ -6466,7 +6466,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-orchestrator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ruagent-core",
  "serde",
@@ -6475,7 +6475,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -6484,7 +6484,7 @@ dependencies = [
 
 [[package]]
 name = "ruagent-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "ruagent-core",

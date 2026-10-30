@@ -63,6 +63,16 @@ jobs:
     permissions:
       actions: read # REQUIRED: reading this commit's runs IS the gate
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
+        with:
+          persist-credentials: false # this job reads a manifest and nothing else
+      # THE TAG MUST BE THE VERSION THE BINARY REPORTS (ruagent-issues-56-59 t43).
+      # v0.1.1 shipped archives whose `--version` said 0.1.0: the tag was cut from a commit whose
+      # [workspace.package] version had never been bumped, and nothing downstream looked at it -- the
+      # CI gate was green and the smoke test proved the archive runs, both of which were true. The
+      # mismatch only surfaces when a user is asked which version they have. Fail here instead.
+      - name: Require the tag to match the workspace version
+        run: bash .github/scripts/check-release-version.sh "${{ github.ref_name }}"
       - name: Require a green CI verdict for this commit
         env:
           GH_TOKEN: ${{ github.token }}
