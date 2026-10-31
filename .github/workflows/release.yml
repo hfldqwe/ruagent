@@ -37,6 +37,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A VALIDATION PATH THAT CANNOT PUBLISH (ruagent-issues-56-59 t44). Issue #74 asks for macOS
+  # archives; the answer is not "add a matrix row and hope the first tag proves it". A dispatch
+  # runs the same gate + build + package + smoke + artifact upload on a BRANCH ref, and the
+  # `release` job below is conditioned on the EVENT, so a dispatch can never create a release
+  # (see its comment: the input is NOT a publish switch). Green here is the evidence a new
+  # target needs before it joins the tag-driven matrix.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build, package, smoke and upload artifacts. A dispatch NEVER publishes; this records intent.'
+        type: boolean
+        default: true
 
 # Least privilege by DEFAULT (see note 1 above).
 permissions:
@@ -72,14 +84,31 @@ jobs:
       # CI gate was green and the smoke test proved the archive runs, both of which were true. The
       # mismatch only surfaces when a user is asked which version they have. Fail here instead.
       - name: Require the tag to match the workspace version
+        # TAG-ONLY, and not as a relaxation: a dispatch runs on a BRANCH ref, where
+        # github.ref_name is 'main' -- comparing it with the workspace version would fail on a
+        # string that is not a tag, and "skip the check" is the wrong fix (the tag path is the
+        # one that publishes). The condition keeps the check exactly as strict where it means
+        # something, and the tag path cannot reach the build jobs without it.
+        if: github.event_name == 'push'
         run: bash .github/scripts/check-release-version.sh "${{ github.ref_name }}"
       - name: Require a green CI verdict for this commit
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
+          # t44: the SAME check applies to a dispatch (it is about this COMMIT, not about a
+          # tag), so the messages below name the event and the ref -- "re-push the tag" would
+          # send a dispatcher looking for a tag that does not exist.
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # What this run is: a tag push (publishing path) or a dispatch on a branch (validation
+          # path). Only the wording differs -- the demand is identical: THIS commit must be green.
+          where="tag $REF (event: $EVENT)"
+          if [ "$EVENT" != "push" ]; then
+            where="branch $REF via $EVENT"
+          fi
           deadline=$(( $(date +%s) + 900 ))
           while :; do
             line=$(gh run list --repo "$REPO" --workflow=ci.yml --commit "$SHA" --limit 1 \
@@ -94,16 +123,16 @@ jobs:
                   echo "gate: green CI verdict for ${SHA}"
                   exit 0
                 fi
-                echo "::error::the newest CI run for ${SHA} concluded '${conclusion:-unknown}'. A red commit must not be published. See https://github.com/${REPO}/actions/runs?query=head_sha%3A${SHA}"
+                echo "::error::the newest CI run for ${SHA} concluded '${conclusion:-unknown}' (${where}). A red commit must not be published, and must not be used as evidence that a new target builds. See https://github.com/${REPO}/actions/runs?query=head_sha%3A${SHA}"
                 exit 1
                 ;;
               none)
-                echo "::error::no CI run found for ${SHA}. Push this commit to main (or open a PR) and let CI report a verdict, then re-push the tag. A tag with no verdict is not a release candidate."
+                echo "::error::no CI run found for ${SHA} (${where}). Push this commit to main (or open a PR) and let CI report a verdict. A commit with no verdict is not a release candidate -- and for a dispatch that means: dispatch only a commit CI has already judged."
                 exit 1
                 ;;
             esac
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::CI for ${SHA} is still '${status}' after 15 minutes; not publishing on an unfinished verdict. Re-push the tag once CI is green."
+              echo "::error::CI for ${SHA} is still '${status}' after 15 minutes; not publishing on an unfinished verdict (${where}). Wait for CI to finish, then re-run."
               exit 1
             fi
             sleep 30
@@ -140,6 +169,14 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: ruagent-${{ github.ref_name }}-x86_64-linux.tar.gz
+          # macOS, arm64 (ruagent-issues-56-59 t44; issue #74's first item). IT ENTERS THE MATRIX
+          # ONLY WITH ITS PACKAGING AND SMOKE STEPS -- a matrix row without them would publish a
+          # target nobody ever ran. macos-latest is arm64 (macos-14 and later are Apple silicon),
+          # which is what aarch64-apple-darwin needs; if that pointer ever moved back to x86_64,
+          # the cross-built arm64 binary could not RUN, and the smoke step is what says so.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: ruagent-${{ github.ref_name }}-aarch64-macos.tar.gz
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
         with:
@@ -159,6 +196,11 @@ jobs:
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         run: choco install -y protoc
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        # lancedb's build script needs protoc on PATH (the build prerequisite in AGENTS.md); the
+        # macOS images do not guarantee it, and brew is a no-op when it is already installed.
+        run: brew install protobuf
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p ruagent
         env:
@@ -250,6 +292,26 @@ jobs:
           # `stdout: write error` (exit 2) into a failed PACKAGE step on the first real release
           # run -- a race that a small local archive hides. sed reads every line instead.
           echo 'archive contents (first 5):'; tar tzf "${{ matrix.archive }}" | sed -n '1,5p'
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        # SAME SHAPE AS THE LINUX LEG, DIFFERENT TOOL NAMES (t44): macOS has no GNU coreutils, so
+        # `sha256sum` is `shasum -a 256`, and `xargs -r` does not exist (BSD xargs has no -r and would
+        # pass an empty list to sha256sum). A `while read` loop over the sorted list keeps the
+        # output byte-compatible with the Linux SHA256SUMS format: "<hex>  <path>".
+        run: |
+          set -euo pipefail
+          mkdir -p staging/panel/dist
+          cp "target/${{ matrix.target }}/release/ruagent" staging/
+          cp -R panel/dist/. staging/panel/dist/
+          cp README.md staging/
+          cp LICENSE* staging/ 2>/dev/null || true
+          ( cd staging && find . -type f ! -name SHA256SUMS | sed 's|^[.]/||' | LC_ALL=C sort |
+              while IFS= read -r f; do shasum -a 256 "$f"; done > SHA256SUMS )
+          echo 'SHA256SUMS:'; sed 's/^/  /' staging/SHA256SUMS
+          tar czf "${{ matrix.archive }}" -C staging .
+          shasum -a 256 "${{ matrix.archive }}" | sed 's|^|/|' > "${{ matrix.archive }}.sha256"
+          echo "archive checksum: $(cat "${{ matrix.archive }}.sha256")"
+          echo 'archive contents (first 5):'; tar tzf "${{ matrix.archive }}" | sed -n '1,5p'
       # SMOKE: THE ARCHIVE MUST RUN FROM ITS OWN CONTENTS (ruagent-issues-56-59 t43).
       # The release job used to publish whatever it had just zipped and nobody ever unpacked
       # it -- which is how panel-dist/ shipped as a 404. This step unpacks the archive into a
@@ -264,6 +326,14 @@ jobs:
       - name: Smoke the archive (Linux)
         if: runner.os == 'Linux'
         run: bash .github/scripts/smoke-archive.sh "${{ matrix.archive }}" --exe ruagent
+      - name: Smoke the archive (macOS)
+        if: runner.os == 'macOS'
+        # The SAME script, and it is cross-platform by construction (see its header): no
+        # sha256sum/timeout/stat/seq dependency that macOS lacks, a port helper that says what
+        # is missing instead of guessing, and an sha256 tool that is detected and FAILS LOUDLY
+        # when neither exists. macOS is why those were removed, so this step is the proof they
+        # are gone rather than a second copy of the script.
+        run: bash .github/scripts/smoke-archive.sh "${{ matrix.archive }}" --exe ruagent
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (2025-03-19)
         with:
@@ -275,6 +345,13 @@ jobs:
   release:
     name: Create release
     needs: build
+    # TAG-ONLY, BY EVENT (ruagent-issues-56-59 t44). A dispatch must be able to prove a new
+    # target builds WITHOUT the ability to publish, so the condition is the event and NOT the
+    # `dry_run` input: passing false on a dispatch still publishes nothing. Publishing stays
+    # reachable only from a tag push, where check-release-version.sh has already made the tag
+    # agree with the binary. (fail-fast is false, so a red build leg leaves "needs: build"
+    # unsatisfied and this job does not run either.)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # 30 min (t114). This job is `gh`/API only: on the green run (34849294052) the whole
     # job was 21s and `Create GitHub release` itself was 8s; the longest this leg has ever
