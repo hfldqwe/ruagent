@@ -1,0 +1,23 @@
+# Supply chain, kept fresh by a machine instead of by memory (ruagent-issues-56-59 t44).
+#
+# Every `uses:` in this repository is pinned to a commit SHA, not to a tag or a branch -- so a tag push
+# cannot execute different code than the one reviewed. That decision has a running cost: a pinned SHA
+# never moves on its own, and there are ~20 of them, so "is this still the version we think it is?"
+# silently rots. Dependabot understands SHA pins: it rewrites the SHA AND the `# vN` comment beside it,
+# so the pin stays readable and checkable.
+#
+# Scope is deliberately `github-actions` only. Cargo updates would open PRs against a workspace whose
+# toolchain is pinned to 1.95.0 and whose lockfile is verified by three gates; that is a deliberate,
+# reviewed decision each time, not something to automate into a queue. Anyone who wants a dependency
+# moved runs `cargo update -p <crate>` by hand and lets CI speak.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
