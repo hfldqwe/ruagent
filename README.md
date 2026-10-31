@@ -39,6 +39,7 @@ Every tagged release publishes ready-to-run archives — no Rust toolchain, no
 | --- | --- |
 | Windows (x86_64) | `ruagent-vX.Y.Z-x86_64-windows.zip` |
 | Linux (x86_64) | `ruagent-vX.Y.Z-x86_64-linux.tar.gz` |
+| macOS (Apple silicon) | `ruagent-vX.Y.Z-aarch64-macos.tar.gz` |
 
 Download the one for your platform from
 [Releases](https://github.com/hfldqwe/ruagent/releases), check it against the
@@ -58,7 +59,7 @@ Then open **http://127.0.0.1:8787**.
 > archive is unpacked and started by CI, and nothing is published unless `/`
 > serves the panel and `/api/v1/health` answers.
 
-macOS targets are not published yet; build from source below instead.
+Intel Macs are not published; build from source below instead.
 
 ## Build from source
 

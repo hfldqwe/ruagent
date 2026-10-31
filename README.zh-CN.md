@@ -36,6 +36,7 @@
 | --- | --- |
 | Windows (x86_64) | `ruagent-vX.Y.Z-x86_64-windows.zip` |
 | Linux (x86_64) | `ruagent-vX.Y.Z-x86_64-linux.tar.gz` |
+| macOS（Apple 芯片） | `ruagent-vX.Y.Z-aarch64-macos.tar.gz` |
 
 到 [Releases](https://github.com/hfldqwe/ruagent/releases) 下载对应平台那一个，
 用同页的 `SHA256SUMS` 校验，**整包解压**后运行：
@@ -52,7 +53,7 @@
 > 流水线的冒烟测试正是拦这个：CI 会解压自己产出的归档并真的启动一次，只有
 > `/` 能出面板且 `/api/v1/health` 有应答才允许发布。
 
-macOS 目标暂不发布，请用下面的源码构建。
+Intel 芯片的 Mac 暂不发布，请用下面的源码构建。
 
 ## 从源码构建
 

@@ -16,10 +16,25 @@ git push git@github.com:<owner>/ruagent.git vX.Y.Z    # HTTPS may be blocked; SS
 1. **Gate** -- asks the Actions API for the CI verdict of the tagged commit and refuses to build unless the
    newest completed run for it succeeded. No CI run at all, a red one, or one still running past the wait
    is `fail`. A tag is a promise; this job is what makes the promise checkable.
-2. **Build** (matrix: `windows-latest` / `ubuntu-latest`) -- builds `ruagent` in release, builds the panel,
-   packages the archive, **smoke-tests that archive**, and only then uploads the artifact.
+2. **Build** (matrix: `windows-latest` / `ubuntu-latest` / `macos-latest`) -- builds `ruagent` in release,
+   builds the panel, packages the archive, **smoke-tests that archive**, and only then uploads the artifact.
 3. **Release** -- downloads the artifacts and creates the GitHub release (`contents: write` is granted to
    THIS job only; the workflow default is `contents: read`).
+
+### Proving a new target WITHOUT publishing it
+
+`workflow_dispatch` takes a `dry_run` input (boolean, default `true`) and runs the same gate + build +
+package + smoke + artifact upload. Two guards keep it from publishing, and both are keyed to the EVENT
+rather than to the input: the tag/version step is `if: github.event_name == 'push'`, and so is the release
+job. A dispatch that passes `dry_run=false` therefore still publishes nothing -- the input exists to make
+the intent readable, not to be a switch a typo can flip. The green CI-verdict gate still applies on a
+dispatch, because it asks about the COMMIT, which a branch push also has.
+
+This is how macOS arrived. `aarch64-apple-darwin` was not added to the matrix and left for the next tag to
+discover: a tag publishes, so the first evidence for a new target would have been a broken download. The
+dry-run dispatch built, packaged and started the macOS archive on a real macOS runner --
+`SMOKE OK: ruagent-main-aarch64-macos.tar.gz runs from its own contents and serves the panel` -- and only
+then did macOS join the matrix, shipping from `v0.1.2`.
 
 ## What an archive must contain, and why the paths are a contract
 
@@ -49,6 +64,18 @@ It refuses on the failure that matters, and it says which one it found: with onl
 the script prints all four candidates -- marking the one a package can satisfy -- lists where `index.html`
 actually sits, and ends `every candidate above misses and / would answer 404 (the t188 shape)`. A test that
 cannot fail is not a check, so that red reading was produced on purpose before the script was trusted.
+
+It also verifies the archive's own `SHA256SUMS` before trusting anything inside it. That check did not exist
+in the first version: the smoke test unpacked the archive and ran whatever was in it, which would have
+passed a tampered or half-written file just as happily. Writing one wrong digest into the manifest turns
+the run into `panel/dist/index.html: FAILED` + `SMOKE FAILED: the archive SHA256SUMS does not match the
+files it shipped`, exit 1.
+
+`smoke-archive.sh` runs on both Linux and macOS, which is not free: `sha256sum` is GNU (macOS has
+`shasum -a 256`), `xargs -r` is GNU (BSD xargs does not have it), `timeout` is absent on macOS, `seq` is not
+guaranteed, and bash there is 3.2 (no arrays, no `${x,,}`, no `mapfile`). Each is either probed with a
+working alternative or **fails loudly naming what is missing** -- a checksum step that silently skips is
+worse than no checksum step, because the run still says OK.
 
 ## The ONNX question, answered with evidence
 
@@ -97,8 +124,10 @@ against `v0.1.1` passes.
 
 ## Known gaps
 
-* **macOS is not published.** The matrix covers `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`; the
-  macOS entries are deliberately absent rather than untested-and-hoped-for.
+* **Intel Macs are not published.** macOS ships as `aarch64-apple-darwin` (Apple silicon) from `v0.1.2`; the
+  x86_64 macOS target is absent because no run has produced one, and an untested target is not a download to
+  offer. Adding it means a matrix entry plus its packaging and smoke steps, proven first through the dry-run
+  dispatch above.
 * **`v0.1.1` archives report `ruagent 0.1.0`** in `--version`, per the miss described above; the version was
   bumped to `0.1.1` afterwards, so every release from now on matches its tag.
 * **`e2e.yml` still takes the action's default toolchain.** `ci.yml`, `audit.yml` and `release.yml` pin
