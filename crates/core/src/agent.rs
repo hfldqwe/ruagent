@@ -95,6 +95,15 @@ pub struct AgentCard {
     /// Lightweight tags consumed by routing rules.
     pub tags: Vec<String>,
     pub enabled: bool,
+    /// THE PRIMARY AGENT (docs/design/primary-agent.md): the role the user talks to by
+    /// default. At most ONE card carries it, and it is a flag on a REGISTRY card -- the id a
+    /// routing decision records is always the registry's, never a config-file id minted per
+    /// load (the t43 lesson that deleted `default_agent()`).
+    ///
+    /// `serde(default)` is what keeps this additive: the `agents` table stores each card as
+    /// JSON, so every card written before this field existed deserializes with `primary = false`.
+    #[serde(default)]
+    pub primary: bool,
 }
 
 impl AgentCard {
@@ -118,5 +127,42 @@ mod tests {
             "npx @agentclientprotocol/claude-agent-acp"
         );
         assert_eq!(HarnessKind::Dsh.default_command(), "dsh --profile acp");
+    }
+}
+
+#[cfg(test)]
+mod primary_flag_tests {
+    use super::*;
+
+    fn json_without_primary() -> serde_json::Value {
+        serde_json::json!({
+            "id": "01a0b915-8273-73c4-8fe9-0e35a34d4ded",
+            "name": "claude",
+            "harness": "claude_code",
+            "description": "d",
+            "models": [],
+            "tags": [],
+            "enabled": true
+        })
+    }
+
+    /// Additivity, measured: a card persisted BEFORE this field existed (the `agents` table
+    /// stores the card as JSON) must still deserialize, and it must not become primary by
+    /// accident -- an absent flag is `false`, never a default the platform chose (t45).
+    #[test]
+    fn an_absent_primary_field_deserializes_as_false() {
+        let card: AgentCard = serde_json::from_value(json_without_primary()).expect("legacy card");
+        assert!(!card.primary, "absent means not primary");
+        let round: AgentCard =
+            serde_json::from_value(serde_json::to_value(&card).unwrap()).expect("round trip");
+        assert!(!round.primary, "and it stays false through a round trip");
+    }
+
+    #[test]
+    fn a_present_true_flag_round_trips() {
+        let mut v = json_without_primary();
+        v["primary"] = serde_json::json!(true);
+        let card: AgentCard = serde_json::from_value(v).expect("explicit primary");
+        assert!(card.primary);
     }
 }

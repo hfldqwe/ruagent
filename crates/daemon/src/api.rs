@@ -7405,6 +7405,7 @@ mod tests {
             options: std::collections::BTreeMap::new(),
             tags: Vec::new(),
             enabled,
+            primary: false,
         }
     }
 

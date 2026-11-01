@@ -1286,6 +1286,7 @@ mod tests {
             options: Default::default(),
             tags: Vec::new(),
             enabled: true,
+            primary: false,
         };
         (distiller, card)
     }

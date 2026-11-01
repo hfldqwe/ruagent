@@ -937,6 +937,7 @@ mod tests {
             tags: vec![],
             models: vec![],
             enabled: true,
+            primary: false,
         };
         db.upsert_agent(&card).await.unwrap();
         let task = Task::new("t", "i", TaskCreator::Human);
@@ -980,6 +981,7 @@ mod tests {
             tags: vec![],
             models: vec![],
             enabled: true,
+            primary: false,
         };
         db.upsert_agent(&card).await.unwrap();
 

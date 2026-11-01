@@ -182,6 +182,7 @@ mod tests {
             tags: vec![],
             models: vec![],
             enabled: true,
+            primary: false,
         };
         let spec = adapter_for(HarnessKind::Dsh)
             .spawn_spec(&card)

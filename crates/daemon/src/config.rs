@@ -165,6 +165,9 @@ struct AgentEntry {
     #[serde(default)]
     tags: Vec<String>,
     enabled: Option<bool>,
+    /// `primary = true` marks the role the user talks to by default (docs/design/primary-agent.md).
+    /// Exactly one entry may carry it; a TIE is a load error (see `enforce_single_primary`).
+    primary: Option<bool>,
 }
 
 pub(crate) fn harness_of(name: &str, spec: Option<&str>) -> Result<HarnessKind> {
@@ -187,7 +190,41 @@ fn parse_effort(s: Option<&str>) -> Option<ReasoningEffort> {
     })
 }
 
+/// Parse `agents.toml` and enforce the one-primary rule. EVERY caller goes through here, so a
+/// tie cannot slip in through a second entry point (t45).
 pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
+    let cards = parse_agents_unchecked(text)?;
+    enforce_single_primary(&cards)?;
+    Ok(cards)
+}
+
+/// AT MOST ONE AGENT MAY BE PRIMARY (docs/design/primary-agent.md).
+///
+/// WHY A LOAD ERROR AND NOT FILE ORDER: resolving a tie by picking the first entry would repeat
+/// the t43 mistake in a new place -- the platform would record an agent nobody chose. A tie is a
+/// configuration error, and it has to name BOTH entries or the reader cannot tell which two to
+/// fix. A primary that is DISABLED is not an error (it is a deliberate off-switch): it is
+/// reported here, and the routing falls through to the next level with a rationale that says so.
+fn enforce_single_primary(cards: &[AgentCard]) -> Result<()> {
+    let marked: Vec<&AgentCard> = cards.iter().filter(|c| c.primary).collect();
+    if marked.len() > 1 {
+        let names: Vec<String> = marked.iter().map(|c| format!("`{}`", c.name)).collect();
+        anyhow::bail!(
+            "agents.toml marks {} agents primary ({}): at most ONE may be primary. A tie is a              configuration error, not something to resolve by file order -- keep one of them              (docs/design/primary-agent.md)",
+            marked.len(),
+            names.join(", ")
+        );
+    }
+    if let Some(only) = marked.first().filter(|c| !c.enabled) {
+        tracing::warn!(
+            "agent `{}` is marked primary but DISABLED: routing falls through to the next level              (the first enabled card). Enable it (`enabled = true`) or set another primary.",
+            only.name
+        );
+    }
+    Ok(())
+}
+
+fn parse_agents_unchecked(text: &str) -> Result<Vec<AgentCard>> {
     let file: AgentsFile = toml::from_str(text)?;
     let mut out = Vec::new();
 
@@ -215,6 +252,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                     options: BTreeMap::new(),
                     tags: Vec::new(),
                     enabled: entry.enabled.unwrap_or(true),
+                    primary: false, // a raw [runtime.X] is not a role: only roles can be primary
                 },
             );
         }
@@ -240,6 +278,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                     options: entry.options.clone(),
                     tags: entry.tags.clone(),
                     enabled: entry.enabled.unwrap_or(true),
+                    primary: entry.primary.unwrap_or(false),
                 });
                 continue;
             }
@@ -283,6 +322,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
                 options: entry.options.clone(),
                 tags: entry.tags.clone(),
                 enabled: entry.enabled.unwrap_or(true),
+                primary: entry.primary.unwrap_or(false),
             });
         }
         // Runtime cards that no role claimed: still listed (direct-run
@@ -322,6 +362,7 @@ pub(crate) fn parse_agents(text: &str) -> Result<Vec<AgentCard>> {
             options: entry.options,
             tags: entry.tags,
             enabled: entry.enabled.unwrap_or(true),
+            primary: entry.primary.unwrap_or(false),
         });
     }
     Ok(out)
@@ -987,14 +1028,14 @@ servers = ["fs", "all"]
 // ---------------------------------------------------------------------------
 
 /// `routing.toml` as written by users: agents by NAME.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct RoutingFile {
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
     pub default: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct RouteEntry {
     pub project: Option<String>,
     pub title_contains: Option<String>,
@@ -1186,6 +1227,151 @@ default = "claude"
 # project = "ruagent"
 # agent = "claude"
 "#;
+
+/// Re-read `routing.toml` on demand.
+///
+/// `PUT /api/v1/routing` must take effect on the NEXT run, and `DaemonConfig` is loaded once at
+/// boot -- so the run path asks the FILE, not the boot snapshot (t45). A missing or broken file
+/// falls back to `fallback` with a WARN: routing damage must not stop the platform from answering.
+pub fn load_routing_file(config_dir: &std::path::Path, fallback: &RoutingFile) -> RoutingFile {
+    let path = config_dir.join("routing.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match parse_routing(&text) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    "parsing {} failed ({e:#}): using the routing loaded at boot",
+                    path.display()
+                );
+                fallback.clone()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "reading {} failed ({e}): using the routing loaded at boot",
+                path.display()
+            );
+            fallback.clone()
+        }
+    }
+}
+
+/// Round-trip editor for the PRIMARY FLAG in `agents.toml` (t45).
+///
+/// WHY IT WRITES THE FILE ITSELF: the flag is a property of a `agent.X` entry, and the registry
+/// editor's `AgentPatch` does not carry it -- so this uses the same discipline as `DistillEditor`
+/// (toml_edit keeps comments and ordering, temp+rename is atomic, a mutex serialises interleaved
+/// writers) instead of teaching a wider patch type a narrower concern.
+pub struct PrimaryEditor {
+    path: PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+impl PrimaryEditor {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Mark ONE entry primary and clear the flag from EVERY other entry IN THE SAME WRITE.
+    /// `None` clears it everywhere (the platform then has no primary).
+    pub fn set(&self, name: Option<&str>) -> Result<()> {
+        let _g = self.lock.lock().expect("primary editor lock");
+        let text = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parsing {}", self.path.display()))?;
+        let agents = doc
+            .get_mut("agent")
+            .and_then(|i| i.as_table_mut())
+            .context("agents.toml has no [agent.*] tables")?;
+        let mut found = false;
+        let names: Vec<String> = agents.iter().map(|(k, _)| k.to_string()).collect();
+        for entry in names {
+            let Some(t) = agents.get_mut(&entry).and_then(|i| i.as_table_mut()) else {
+                continue;
+            };
+            if name == Some(entry.as_str()) {
+                t.insert("primary", toml_edit::value(true));
+                found = true;
+            } else {
+                t.remove("primary");
+            }
+        }
+        if let Some(wanted) = name.filter(|_| !found) {
+            anyhow::bail!("agent `{wanted}` not found in {}", self.path.display());
+        }
+        let tmp = self.path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("renaming into {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+/// Round-trip editor for `routing.toml` (t45): the parsed `RoutingFile` in, the FILE out,
+/// with its header comments and every other line kept.
+///
+/// ORDER MATTERS, and the file says so itself: top-level keys must come BEFORE any `routes`
+/// section, or TOML folds them into the last rule. The body therefore (1) drops the rules,
+/// (2) writes `default`, (3) re-adds the rules -- so an inserted `default` can never land after
+/// the array-of-tables.
+pub struct RoutingEditor {
+    path: PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+impl RoutingEditor {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn write(&self, cfg: &RoutingFile) -> Result<()> {
+        let _g = self.lock.lock().expect("routing editor lock");
+        let text = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parsing {}", self.path.display()))?;
+        doc.remove("routes");
+        match &cfg.default {
+            Some(name) => {
+                doc.insert("default", toml_edit::value(name.as_str()));
+            }
+            None => {
+                doc.remove("default");
+            }
+        }
+        if !cfg.routes.is_empty() {
+            let mut tables = toml_edit::ArrayOfTables::new();
+            for r in &cfg.routes {
+                let mut t = toml_edit::Table::new();
+                if let Some(p) = &r.project {
+                    t.insert("project", toml_edit::value(p.as_str()));
+                }
+                if let Some(tc) = &r.title_contains {
+                    t.insert("title_contains", toml_edit::value(tc.as_str()));
+                }
+                t.insert("agent", toml_edit::value(r.agent.as_str()));
+                tables.push(t);
+            }
+            doc.insert("routes", toml_edit::Item::ArrayOfTables(tables));
+        }
+        let tmp = self.path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("renaming into {}", self.path.display()))?;
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod routing_tests {
