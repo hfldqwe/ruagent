@@ -130,3 +130,39 @@ the user's tokens or changes who answers them states that out loud before the wr
 Creating agents, editing prompts and setting models per agent from a tool; a natural-language router tier;
 multi-agent conversations. The four tools above are the foundation those need -- each of them is a thin
 wrapper over an endpoint that already exists or is created here.
+## Measurements (what was actually observed, not designed)
+
+Run on 2026-11-01 against a private root and a privately built binary, so the resident daemon's own config was
+never touched.
+
+**A fresh install already has a front door.** `GET /api/v1/primary` before any edit:
+
+```
+{"name":"claude","id":"01a19668-...","source":"routing-default",
+ "why":"routing.toml's `default` and the `primary = true` flag name the SAME agent (`claude`), so both
+  carriers agree and level 3 decides"}
+```
+
+**One write moves both carriers.** `PUT /api/v1/primary {"name":"opencode"}` returned the opencode card with
+the same shape, and on disk `agents.toml` carried `primary = true` while `routing.toml` carried
+`default = "opencode"`. An unknown name answered `400` and left both files unchanged.
+
+**Level 4 routes real runs, and it is provably level 4.** With `routing.toml` given no `default` and two
+enabled agents -- `aaa-first-enabled` (which the level-5 fallback would have taken, alphabetically first) and
+`mock` (marked primary) -- a run started with **no agent named** got:
+
+```
+params.agent = 01a19669-c1b5-74ba-b0f8-90268460f249     # the id /api/v1/primary reported for `mock`
+rationale     = PRIMARY agent `mock` (agents.toml marks it `primary = true`)
+source.level  = default
+```
+
+The id in the run is the registry's own (the t43 rule), so a run and the API cannot disagree about which
+agent answered. `aaa-first-enabled` appears nowhere in the transcript, which is what makes this level 4 rather
+than level 5 -- a unit test on the pure function could not have told the two apart.
+
+**A defect found this way, not by review:** `RoutingEditor` replaced the `default` item together with its
+decor, so the first `PUT` dropped `routing.toml`'s header comment block (the file began with
+`default = "opencode"` instead of `# ruagent routing rules ...`). Filed as its own repair rather than fixed on
+the way past, because the design says the comments survive and a green suite would otherwise have implied they
+did.

@@ -104,6 +104,42 @@ the runtime behind it. The panel has separate pages for the two layers:
 **Agents** (#agents, roles with live stats) and **Runtimes** (#runtimes,
 execution backends). Legacy single-layer configs keep working.
 
+## The primary agent (who answers you)
+
+One agent is the **front door**: new conversations start there, and every
+run that no rule, no pin and no `routing.toml` default picked goes to it.
+Mark it in `agents.toml`:
+
+```toml
+[agent.ruagent]
+primary = true                    # at most one agent may carry this
+prompt = "You are ruagent, the user's single point of contact. …"
+runtimes = ["claude-code", "dsh", "opencode"]
+```
+
+A fresh install already has one — the seed marks `claude`, which is the
+agent its `routing.toml` already named — so nothing changes until you
+choose otherwise. Three ways to choose:
+
+```bash
+curl -X PUT localhost:8787/api/v1/primary -d '{"name":"architect"}'   # sets both carriers
+curl localhost:8787/api/v1/primary                                    # who answers, and why
+```
+
+…or the **Agents** page in the panel, or ask the agent itself (it has
+`agents_list` / `agent_set_primary` / `routing_show` / `routing_set_default`).
+
+`GET /api/v1/primary` always answers **the agent that will actually
+answer**, and says where that decision came from. That distinction is
+load-bearing: `routing.toml`'s `default` outranks the `primary` flag, so
+if the two disagreed and the API only reported the flag, you would set a
+primary and see nothing change. Writes go the other way — one call, both
+carriers — for the same reason.
+
+Two agents marked `primary` is a **load error** naming both, not a tie
+broken by file order. A marked but disabled primary declines out loud: the
+routing rationale says which agent was skipped and why.
+
 ## Orchestration
 
 - **Direct** — one run on one agent.

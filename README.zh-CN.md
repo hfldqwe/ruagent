@@ -96,6 +96,38 @@ claude-code——同一个角色、同一份记忆。角色提示词也同样上
 **智能体**（#agents，角色 + 实时表现）和**运行时**（#runtimes，
 执行后端）。旧的单层配置继续兼容。
 
+## 主智能体（谁来回答你）
+
+有一个智能体是**正门**：新对话从它开始，凡是没被 pin、没被规则、也没被
+`routing.toml` 的 `default` 选中的运行，都落到它身上。在 `agents.toml` 里标出：
+
+```toml
+[agent.ruagent]
+primary = true                    # 最多只有一个智能体能带这个标记
+prompt = "你是 ruagent，用户唯一的对接人。…"
+runtimes = ["claude-code", "dsh", "opencode"]
+```
+
+全新安装本来就有——seed 把 `claude` 标成了主智能体，而它正是 `routing.toml`
+早就点名的那个——所以在你主动更改之前，行为一点没变。三种改法：
+
+```bash
+curl -X PUT localhost:8787/api/v1/primary -d '{"name":"architect"}'   # 一处调用写两处
+curl localhost:8787/api/v1/primary                                    # 谁回答你，以及为什么
+```
+
+……或者用面板的**智能体**页，或者直接让智能体自己改（它有 `agents_list` /
+`agent_set_primary` / `routing_show` / `routing_set_default`）。
+
+`GET /api/v1/primary` 给出的永远是**实际会回答你的那个智能体**，并说明这个
+结论来自哪里。这条区分是承重的：`routing.toml` 的 `default` 优先于 `primary`
+标记，若两者不一致而接口只报标记，你会设了主智能体却看不到任何变化。写入同理
+——一次调用写两处——理由是一样的。
+
+两个智能体同时标 `primary` 是**加载错误**并点名两者，而不是按文件顺序决出
+胜负。标了但被禁用的主智能体会**明确声明退出**：路由的 rationale 会写明跳过了
+谁、为什么。
+
 ## 编排
 
 - **直连** —— 一个智能体一次运行。
