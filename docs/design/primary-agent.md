@@ -65,6 +65,10 @@ routing.toml default `claude` overrides the primary flag `builder` -- edit routi
 agent_set_primary, which writes both
 ```
 
+When the two agree, `source` names the cascade step that actually produced the answer (`routing-default`)
+and `why` says the flag names the same agent -- agreement is worth stating, because it is what a fresh
+install has.
+
 Anything that sets the front door writes BOTH places, so they cannot drift by accident: `agent_set_primary`
 (the tool) marks the flag and sets `routing.toml`'s `default` in the same operation, and its reply reports
 both writes. A deliberate hand edit of `routing.toml` remains the operator's override -- it just cannot be
