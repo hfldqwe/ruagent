@@ -600,11 +600,25 @@ const DEFAULT_AGENTS_TOML: &str = r#"# ruagent agent registry. See design §4.1.
 #   description    : free text, cold-start hint for the (future) LLM router
 #   statistics     : accumulated by the daemon from run history
 
+# THE PRIMARY AGENT (docs/design/primary-agent.md): the role a fresh install talks to by default.
+#
+# Why `claude`, and why nothing was added: DEFAULT_ROUTING_TOML below already seeds
+# `default = "claude"`, and level 3 of the routing cascade (the configured default) outranks the
+# primary flag (level 4). Naming the SAME agent in both places is what makes a fresh install have
+# one front door stated twice instead of two answers that disagree -- the answer does not change,
+# the concept simply becomes visible. Do NOT point this at an agent the routing seed does not also
+# name (a primary the cascade outranks reads as a setting that does nothing), and do not invent a
+# role here: at seed time nobody knows which runtime the user installed, and a guess that misses is
+# a broken first run.
+#
+# This file is written ONLY when agents.toml is MISSING (DaemonConfig::load), so an existing
+# installation keeps its own file byte for byte: this seed changes nothing for anyone already set up.
 [agent.claude]
 harness = "claude-code"
 command = "npx @agentclientprotocol/claude-agent-acp"
 description = "Claude Code via the official ACP adapter"
 mcp_profile = "default"
+primary = true
 
 [agent.opencode]
 harness = "opencode"
@@ -1535,5 +1549,133 @@ mod mcp_preflight_tests {
         );
         assert!(cfg.expand_profile_preflighted(None, "dsh").is_ok());
         assert!(cfg.expand_profile_preflighted(Some("nope"), "dsh").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod primary_seed_tests {
+    use super::*;
+
+    /// The seed states the front door in TWO files, so both are checked together: this is the test
+    /// that stops a future edit from pointing them at different agents (t49).
+    #[test]
+    fn the_agents_seed_marks_exactly_one_primary_and_it_is_claude() {
+        let cards = parse_agents(DEFAULT_AGENTS_TOML).expect("the shipped agents seed parses");
+        let marked: Vec<&str> = cards
+            .iter()
+            .filter(|c| c.primary)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["claude"],
+            "exactly one card is primary, and it is the role the routing seed also names: {marked:?}"
+        );
+        let claude = cards
+            .iter()
+            .find(|c| c.name == "claude")
+            .expect("claude is seeded");
+        assert!(
+            claude.enabled,
+            "the seeded primary must be ENABLED, or level 4 declines and the flag looks dead"
+        );
+    }
+
+    /// ... and the routing seed must still name that same agent: a default pointing elsewhere would
+    /// OVERRIDE the flag (level 3 beats level 4), which is the drift this design warns about.
+    #[test]
+    fn the_routing_seed_still_names_the_same_agent() {
+        let routing = parse_routing(DEFAULT_ROUTING_TOML).expect("the shipped routing seed parses");
+        assert_eq!(
+            routing.default.as_deref(),
+            Some("claude"),
+            "the two seeds must not disagree"
+        );
+        let cards = parse_agents(DEFAULT_AGENTS_TOML).expect("the shipped agents seed parses");
+        assert!(
+            cards.iter().any(|c| c.name == "claude" && c.enabled),
+            "the routing default must name a card the agents seed registers AND enables"
+        );
+    }
+
+    /// A FRESH INSTALL through the real router: GET /api/v1/primary answers claude and says the two
+    /// carriers agree. `source` is routing-default because that is the level the cascade reaches --
+    /// which is exactly why the seeded pair has to be consistent (t49).
+    #[tokio::test]
+    async fn a_fresh_install_reports_claude_as_the_effective_front_door() {
+        use tower::ServiceExt as _;
+
+        let root = std::env::temp_dir().join(format!("ruagent-cfg-primary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a private root");
+        crate::test_cleanup::report_test_root_left_behind(&root);
+
+        let cfg = DaemonConfig::load(&root).expect("the first boot seeds the config");
+        let seeded =
+            std::fs::read_to_string(root.join("config").join("agents.toml")).expect("seeded file");
+        assert!(
+            seeded.contains("primary = true"),
+            "the SEEDED FILE carries the flag, not just the parsed view: {seeded}"
+        );
+
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).expect("db");
+        let knowledge = ruagent_knowledge::Knowledge::open(&root, db.clone())
+            .await
+            .expect("knowledge");
+        let chats = crate::chat::ChatManager::new(
+            db.clone(),
+            root.clone(),
+            std::sync::Arc::new(|_, _| {}),
+            cfg.mcp.clone(),
+            crate::distill::AutoDistill::default(),
+            None,
+            crate::distill::AgentRegistry::default(),
+        );
+        let mgr = std::sync::Arc::new(crate::runs::RunManager::new(
+            db.clone(),
+            root.clone(),
+            cfg.agents.clone(),
+            cfg.policy.to_policy(),
+            cfg.mcp.clone(),
+        ));
+        let state = crate::api::AppState {
+            mgr,
+            config: std::sync::Arc::new(cfg),
+            knowledge: std::sync::Arc::new(knowledge),
+            chats,
+            sessions: std::sync::Arc::new(crate::sessions::SessionIndexer::new(
+                db,
+                std::env::temp_dir(),
+            )),
+        };
+
+        let resp = crate::api::router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/primary")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(
+            json["name"], "claude",
+            "a fresh install answers with claude: {json}"
+        );
+        assert_eq!(json["source"], "routing-default", "{json}");
+        let why = json["why"].as_str().unwrap_or_default().to_string();
+        assert!(
+            why.contains("SAME"),
+            "the why must say the two carriers agree: {why}"
+        );
+        assert!(why.contains("claude"), "{why}");
+        assert!(json["id"].as_str().is_some_and(|s| !s.is_empty()), "{json}");
     }
 }
