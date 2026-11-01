@@ -1491,6 +1491,18 @@ export const api = {
    *  two readers of one fact is how the sider badge and the dashboard start
    *  disagreeing. A failure REJECTS; it is never an empty answer. */
   primary: () => get<unknown>("/api/v1/primary").then(primaryShape),
+  /** Set or clear the front door — THE operation clients should call
+   *  (docs/design/primary-agent.md § API contract). ONE request writes BOTH
+   *  places: the `primary` flag in agents.toml and routing.toml's `default`.
+   *  That rule lives in the daemon on purpose — a client that wrote only the flag
+   *  would produce "I set the primary and nothing changed", the exact shape this
+   *  endpoint exists to make impossible. `null` clears both (sent as "none").
+   *  The reply is the resulting effective front door, the shape GET answers with,
+   *  so the caller updates its state from the WRITE instead of re-reading. */
+  setPrimary: (name: string | null) =>
+    put("/api/v1/primary", { name: name ?? "none" })
+      .then((r) => r.json() as Promise<unknown>)
+      .then(primaryShape),
   agentOptions: (name: string, refresh?: boolean, runtime?: string) =>
     get<AgentOptions>(
       `/api/v1/agents/${name}/options` +

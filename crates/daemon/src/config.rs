@@ -1334,6 +1334,32 @@ impl PrimaryEditor {
 /// section, or TOML folds them into the last rule. The body therefore (1) drops the rules,
 /// (2) writes `default`, (3) re-adds the rules -- so an inserted `default` can never land after
 /// the array-of-tables.
+/// The comment block that sits above a file's FIRST item -- in TOML that decor prefix is the only
+/// place a file-level comment can live, which is why replacing the first item deletes it (t52).
+fn leading_prefix(doc: &toml_edit::DocumentMut) -> Option<toml_edit::RawString> {
+    // MEASURED (t52): the header block is the FIRST KEY's leaf decor, not the item's value decor --
+    // printing both showed the value prefix as a single space while the key's was
+    // "# h1\n# h2\n\n". `doc.insert` replaces the key along with the value, which is exactly why the
+    // comments went with it.
+    let first = doc.iter().next().map(|(k, _)| k.to_string())?;
+    let (key, _) = doc.get_key_value(&first)?;
+    Some(key.leaf_decor().prefix()?.clone())
+}
+
+/// Put the lifted prefix back on the first item -- unless that item already carries a comment
+/// prefix, in which case the file documents it itself and prepending would duplicate the text.
+fn put_leading_prefix(doc: &mut toml_edit::DocumentMut, prefix: toml_edit::RawString) {
+    let Some(first) = doc.iter().next().map(|(k, _)| k.to_string()) else {
+        return;
+    };
+    let Some((mut key, _)) = doc.get_key_value_mut(&first) else {
+        return;
+    };
+    let mut decor = key.leaf_decor().clone();
+    decor.set_prefix(prefix);
+    *key.leaf_decor_mut() = decor;
+}
+
 pub struct RoutingEditor {
     path: PathBuf,
     lock: std::sync::Mutex<()>,
@@ -1354,6 +1380,13 @@ impl RoutingEditor {
         let mut doc: toml_edit::DocumentMut = text
             .parse()
             .with_context(|| format!("parsing {}", self.path.display()))?;
+        // t52: the file's own HEADER COMMENT BLOCK lives in the decor of its FIRST item, and
+        // writing `default` replaces that item wholesale -- so the documentation went with it.
+        // Measured before this fix: after one write the file began at `default = "beta"` and every
+        // "# ruagent routing rules ..." line was gone. The prefix is therefore lifted off the old
+        // first item and put back on whatever ends up first. Comments INSIDE the rules array are not
+        // carried: rewriting the rules is exactly what a PUT of routes asks for.
+        let leading = leading_prefix(&doc);
         doc.remove("routes");
         match &cfg.default {
             Some(name) => {
@@ -1377,6 +1410,9 @@ impl RoutingEditor {
                 tables.push(t);
             }
             doc.insert("routes", toml_edit::Item::ArrayOfTables(tables));
+        }
+        if let Some(prefix) = leading {
+            put_leading_prefix(&mut doc, prefix);
         }
         let tmp = self.path.with_extension("toml.tmp");
         std::fs::write(&tmp, doc.to_string())
@@ -1677,5 +1713,110 @@ mod primary_seed_tests {
         );
         assert!(why.contains("claude"), "{why}");
         assert!(json["id"].as_str().is_some_and(|s| !s.is_empty()), "{json}");
+    }
+}
+
+#[cfg(test)]
+mod routing_editor_tests {
+    use super::*;
+
+    /// The seeded file, byte for byte in shape: header comments, then `default`, then a commented
+    /// rule block. The comments are the point of these tests (t52).
+    const SEEDED: &str = r#"# ruagent routing rules (design §5.4/§9.1).
+# Cascade: explicit --agent > first matching route > default.
+#
+# NOTE: top-level keys (default) must come BEFORE any [[routes]] section.
+
+default = "claude"
+
+# A rule comment that also has to survive.
+[[routes]]
+project = "ruagent"
+agent = "claude"
+"#;
+
+    fn private_root(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ruagent-cfg-routing-{tag}-{}", std::process::id()));
+        // Order matters: the cleanup helper REMOVES a stale root of the same name, so it has to run
+        // BEFORE the directory is created (measured: creating first made the seed write fail with
+        // NotFound -- "the system cannot find the path").
+        crate::test_cleanup::report_test_root_left_behind(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a private root");
+        dir
+    }
+
+    /// Scenario 1 -- a file with NO rules: changing `default` must not delete the header block.
+    /// These comments live in the `default` item's decor, so replacing the item wholesale (the bug
+    /// t51 measured) takes them with it.
+    #[test]
+    fn a_default_only_file_keeps_its_header_comments() {
+        let dir = private_root("default-only");
+        let path = dir.join("routing.toml");
+        let original = "# ruagent routing rules (design §5.4/§9.1).\n# Cascade: explicit --agent > first matching route > default.\n#\n# NOTE: top-level keys (default) must come BEFORE any [[routes]] section.\n\ndefault = \"claude\"\n";
+        std::fs::write(&path, original).expect("seed the file");
+
+        RoutingEditor::new(&path)
+            .write(&RoutingFile {
+                default: Some("dsh".to_string()),
+                routes: Vec::new(),
+            })
+            .expect("write");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            text.contains("# ruagent routing rules"),
+            "the header block must survive a default write: {text}"
+        );
+        assert!(
+            text.contains("# NOTE: top-level keys"),
+            "every header line matters, not just the first: {text}"
+        );
+        assert!(text.contains("default = \"dsh\""), "{text}");
+        assert_eq!(
+            parse_routing(&text)
+                .expect("still parses")
+                .default
+                .as_deref(),
+            Some("dsh")
+        );
+    }
+
+    /// Scenario 2 -- a file WITH rules: the header survives AND `default` stays before the first
+    /// `[[routes]]` header (the file's own warning: in TOML a key after a table header belongs to
+    /// that table, so an insert that lands after it changes the meaning of the file).
+    #[test]
+    fn changing_the_default_keeps_the_header_and_the_key_order() {
+        let dir = private_root("with-routes");
+        let path = dir.join("routing.toml");
+        std::fs::write(&path, SEEDED).expect("seed the file");
+
+        let mut cfg = parse_routing(SEEDED).expect("the seed parses");
+        cfg.default = Some("dsh".to_string());
+        cfg.routes.push(RouteEntry {
+            project: None,
+            title_contains: Some("review".to_string()),
+            agent: "dsh".to_string(),
+        });
+        RoutingEditor::new(&path).write(&cfg).expect("write");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            text.contains("# ruagent routing rules"),
+            "the header block must survive: {text}"
+        );
+        assert!(text.contains("# Cascade:"), "{text}");
+        // LINE-START searches: the header comment itself mentions `[[routes]]` ("top-level keys
+        // must come BEFORE any [[routes]] section"), so a plain find would match the prose (t52).
+        let key = text.find("\ndefault = ").expect("a default key line") + 1;
+        let rules = text.find("\n[[routes]]").expect("a rules header line") + 1;
+        assert!(
+            key < rules,
+            "default must stay BEFORE the first [[routes]]: {text}"
+        );
+        let back = parse_routing(&text).expect("still parses");
+        assert_eq!(back.default.as_deref(), Some("dsh"));
+        assert_eq!(back.routes.len(), 2, "{text}");
     }
 }

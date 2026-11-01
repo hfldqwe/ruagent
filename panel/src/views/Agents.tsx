@@ -19,6 +19,7 @@ import {
   type AgentStats,
   type McpRegistry,
   type PendingPermission,
+  type PrimaryInfo,
   type SessionOptionInfo,
   isRoleAgent,
 } from "../api";
@@ -29,9 +30,14 @@ import {
   ReadoutStrip,
   RelTime,
   Spinner,
+  StaleNotice,
   Zone,
   fmtUsd,
+  readFailed,
+  readLoading,
+  readReady,
   useToast,
+  type LoadState,
 } from "../ui";
 import { useI18n } from "../i18n";
 import { Icon } from "../icons";
@@ -72,10 +78,24 @@ export function Agents() {
   const [editing, setEditing] = useState<AgentInfo | null>(null);
   /** The agent whose prompt is open in the dialog (null = closed). */
   const [promptOf, setPromptOf] = useState<AgentInfo | null>(null);
+  /** WHO ANSWERS A NEW CHAT (docs/design/primary-agent.md, GET /api/v1/primary).
+   *  A `LoadState`, not `PrimaryInfo | null`: this file's own rule is that a
+   *  failed read is never rendered as an empty one (行 20), and here the empty
+   *  reading would be "there is no primary" — a fact this view would be making
+   *  up. `data` survives a later failure, so a blip does not blank the badges. */
+  const [frontDoor, setFrontDoor] = useState<LoadState<PrimaryInfo>>(readLoading<PrimaryInfo>());
+  /** The last primary WRITE that failed, kept on screen with the op it tried:
+   *  a toast disappears, and a refusal that disappears leaves the row looking
+   *  like the user's click simply did nothing. */
+  const [primaryErr, setPrimaryErr] = useState<{ err: unknown; name: string | null } | null>(null);
+  const [primaryBusy, setPrimaryBusy] = useState(false);
   const toast = useToast();
 
-  // One request window for agents + stats + mcp instead of two staggered
-  // 5s timers (A10). Each leg keeps the last good value on failure.
+  // One request window for agents + stats + mcp + primary instead of staggered
+  // timers (A10). Each leg keeps the last good value on failure. The front door
+  // joins THIS window rather than getting its own timer: one cadence per page
+  // (行 28), and it is the same fact — a registry edit can move the answer, so a
+  // separate schedule would let the rows and the answer disagree.
   const load = () => {
     api
       .agents()
@@ -98,12 +118,19 @@ export function Agents() {
         setMcpErr(null);
       })
       .catch((e) => setMcpErr(e));
+    api
+      .primary()
+      .then((fd) => setFrontDoor(readReady(fd)))
+      // A failure keeps the previous answer (and flags itself); it is NEVER
+      // turned into "there is no primary" — see `frontDoor`'s declaration.
+      .catch((e) => setFrontDoor((prev) => readFailed(prev, e)));
   };
-  // 行 39: agents + stats + mcp are three endpoints, so the window's budget
-  // is `2K + 2 = 8`. A 5s timer spends 3 per endpoint (mount + 2 ticks) = 9
-  // — measured 262 / 5276 / 10275, evenly spaced: cadence, not duplicate
-  // fetches. 10s leaves mount + one tick = 6. Registry edits still refresh
-  // immediately (the create/edit paths call load() themselves).
+  // 行 39: the window's budget is `2K + 2` per endpoint, so it is 8 for the
+  // three it had and 10 for the four it has now. A 5s timer spends 3 per
+  // endpoint (mount + 2 ticks) = 9 — measured 262 / 5276 / 10275, evenly spaced:
+  // cadence, not duplicate fetches. 10s leaves mount + one tick = 6 ≤ 10, and
+  // that per-endpoint count did not grow when the front door joined the window.
+  // Registry edits still refresh immediately (create/edit call load() themselves).
   usePoll(load, 10000);
 
   const roles = useMemo(
@@ -134,6 +161,97 @@ export function Agents() {
     } catch (e) {
       toast("err", String(e));
     }
+  };
+
+  /** The front door as far as this view KNOWS it. `data` outlives a later
+   *  failure on purpose (that is what LoadState is for): a 10s blip must not
+   *  blank the badges and thereby claim the platform lost its primary. */
+  const fdv = frontDoor.data;
+  const fvName = fdv?.name ?? null;
+  const fvWhy = (fdv?.why ?? "").trim();
+  const fvSource = fdv?.source ?? null;
+  /** The read failed and nothing was ever read: the band says so, and NO row is
+   *  allowed to claim it is (or is not) the primary. */
+  const fvUnknown = frontDoor.kind === "error" && !fdv;
+  /** Read failed, but an earlier answer is on screen: show it and say it may be
+   *  out of date (StaleNotice), rather than treating the blip as an answer. */
+  const fvStale = frontDoor.kind === "error" && !!fdv;
+  /** The daemon's answer names something that is NOT a role card (a runtime card,
+   *  or an agent gone from the registry). Every badge below lives on a role card,
+   *  so the band has to say why none of them carries one — naming a front door
+   *  with no visible row reads as a broken page. (A DISABLED role is still a role
+   *  card here, filtered by nothing, and is badged like any other.) */
+  const fvNotARole = !!fvName && !roles.some((a) => a.name === fvName);
+
+  /** SET or CLEAR the front door — the ONE operation clients should call.
+   *  `PUT /api/v1/primary` writes both places (the `primary` flag in agents.toml
+   *  and routing.toml's `default`) in one step; this view must not try to do it
+   *  in two requests, because the failure mode of a half-write ("I set the
+   *  primary and nothing changed") is the one thing the endpoint exists to
+   *  prevent. The reply IS the resulting answer, so the state is updated from the
+   *  write instead of refetching the page. */
+  const applyPrimary = async (name: string | null) => {
+    setPrimaryErr(null);
+    setPrimaryBusy(true);
+    try {
+      const fd = await api.setPrimary(name);
+      setFrontDoor(readReady(fd));
+      // The rows' `primary` flags follow the same single write (exactly one flag,
+      // or none), so they are updated locally instead of by a refetch. The 10s
+      // poll re-reads the registry anyway — that is what would correct this line
+      // if a daemon ever answered with something other than what it just wrote.
+      setAgents((rows) =>
+        rows ? rows.map((a) => ({ ...a, primary: a.name === (name ?? "") })) : rows,
+      );
+      toast("ok", name ? t("agents.primary.done", { name }) : t("agents.primary.cleared"));
+    } catch (e) {
+      // Rows are NOT touched here. A refused write is not a cancel: flipping a
+      // row to "no longer primary" on a 4xx would be inventing a success.
+      setPrimaryErr({ err: e, name });
+      toast("err", String(e));
+    } finally {
+      setPrimaryBusy(false);
+    }
+  };
+
+  /** The row badge — WHICH agent answers a new chat, and why. Three different
+   *  facts, deliberately not collapsed into one label:
+   *   · it answers, because it carries the `primary` flag (the user's own pick);
+   *   · it answers, because routing.toml's `default` outranks the flag (someone
+   *     who marked a DIFFERENT agent must be able to see this, not just the
+   *     winner's name);
+   *   · it carries the flag and does NOT answer — or we cannot say, because the
+   *     front-door read failed (then only what the row itself claims is shown). */
+  const primaryBadge = (a: AgentInfo): { text: string; cls: string; title?: string } | null => {
+    if (fvName && fvName === a.name) {
+      const routing = fvSource === "routing-default";
+      return {
+        text: routing
+          ? t("agents.primary.effectiveRouting")
+          : fvSource === "primary-flag"
+            ? t("agents.primary.effectiveFlag")
+            : t("agents.primary.effective"),
+        cls: routing ? "tag" : "tag ok",
+        title: fvWhy || undefined,
+      };
+    }
+    if (a.primary) {
+      if (fvName) {
+        return {
+          text: t("agents.primary.overridden"),
+          cls: "tag warn",
+          title: t("agents.primary.overriddenHint", { name: fvName }),
+        };
+      }
+      // The answer is unknown (the read failed), so the row says only the one
+      // thing it knows: this card is flagged in agents.toml.
+      return {
+        text: t("agents.primary.flagged"),
+        cls: "tag",
+        title: t("agents.primary.flaggedHint"),
+      };
+    }
+    return null;
   };
 
   if (agents === null) {
@@ -185,6 +303,95 @@ export function Agents() {
           retryLabel={t("common.retry")}
         />
       ) : null}
+
+      {/* WHO ANSWERS A NEW CHAT (docs/design/primary-agent.md). The band states
+          the ONE answer and its SOURCE, because the two sources can disagree and
+          the difference is invisible from the picker: routing.toml's `default`
+          outranks the `primary` flag, so a user who marked one agent can be
+          answered by another. The rows carry the same information as badges; this
+          band is where the reason is readable in words. */}
+      <Zone title={t("agents.primary.title")} note={t("agents.primary.subtitle")}>
+        {fvUnknown ? (
+          /* A FAILED READ IS NOT "no primary" (行 20). Say what happened, offer
+             the retry, and leave every row without a badge: not knowing is the
+             state, and faking either answer is the bug this avoids. */
+          <ErrorState
+            title={t("agents.primary.readErr")}
+            hint={`${t("agents.primary.readErr.hint")}${
+              String(frontDoor.err ?? "").trim()
+                ? ` — ${String(frontDoor.err).trim().slice(0, 200)}`
+                : ""
+            }`}
+            onRetry={load}
+            retryLabel={t("common.retry")}
+          />
+        ) : (
+          <>
+            {fvStale ? (
+              <StaleNotice
+                err={frontDoor.err}
+                hint={t("agents.primary.stale.hint")}
+                onRetry={load}
+              />
+            ) : null}
+            {/* The last failed WRITE, with the operation that failed, so a
+                refusal is readable instead of a toast that already vanished. */}
+            {primaryErr ? (
+              <ErrorState
+                title={
+                  primaryErr.name
+                    ? t("agents.primary.writeErr", { name: primaryErr.name })
+                    : t("agents.primary.writeErrClear")
+                }
+                hint={`${String(primaryErr.err ?? "").trim().slice(0, 300) || t(
+                  "agents.primary.writeErr.hint",
+                )}`}
+                onRetry={() => {
+                  void applyPrimary(primaryErr.name);
+                }}
+                retryLabel={t("common.retry")}
+              />
+            ) : null}
+            <div className="card">
+              {frontDoor.kind === "loading" && !fdv ? (
+                <p className="muted pad">{t("agents.primary.loading")}</p>
+              ) : fvName ? (
+                <div className="row">
+                  <span className="doc-icon">
+                    <Icon name="bot" size={15} />
+                  </span>
+                  <strong>{fvName}</strong>
+                  <span
+                    className={fvSource === "routing-default" ? "tag" : "tag ok"}
+                    title={fvWhy || undefined}
+                  >
+                    {fvSource === "routing-default"
+                      ? t("agents.primary.srcRouting")
+                      : fvSource === "primary-flag"
+                        ? t("agents.primary.srcFlag")
+                        : t("agents.primary.srcUnknown")}
+                  </span>
+                  <span className="grow" />
+                  {fvNotARole ? (
+                    <span
+                      className="tag warn"
+                      title={t("agents.primary.notARole.hint", { name: fvName ?? "" })}
+                    >
+                      {t("agents.primary.notARole")}
+                    </span>
+                  ) : null}
+                </div>
+              ) : (
+                /* A DEFINITE answer: the daemon has no front door. Say what to do
+                   about it — the picker step on the chat page is the thing this
+                   removes. */
+                <p className="muted pad">{t("agents.primary.none")}</p>
+              )}
+              {fvWhy ? <p className="muted pad">{t("agents.primary.why", { why: fvWhy })}</p> : null}
+            </div>
+          </>
+        )}
+      </Zone>
 
       {roles.length === 0 ? (
         <Empty icon="bot" title={t("agents.empty.title")} hint={t("agents.empty.hint")} />
@@ -238,6 +445,17 @@ export function Agents() {
                   ) : (
                     <span className="tag">{t("agents.disabled")}</span>
                   )}
+                  {/* Appended LAST on purpose: the band's existing order is
+                      information and e2e/registry.spec.ts:46 asserts a role
+                      card's first .tag is the runtime name. */}
+                  {(() => {
+                    const b = primaryBadge(a);
+                    return b ? (
+                      <span className={b.cls} title={b.title}>
+                        {b.text}
+                      </span>
+                    ) : null;
+                  })()}
                 </div>
                 <p className="muted" style={{ margin: "10px 0 6px" }}>
                   {a.description}
@@ -305,6 +523,39 @@ export function Agents() {
                   </div>
                 )}
                 <div className="row end">
+                  {/* Set / clear the front door. The consequence is stated in the
+                      popconfirm BEFORE the click does anything — both places it
+                      writes, in one sentence — because this changes who answers
+                      the user, and that is not a thing to discover afterwards.
+                      A disabled role gets a disabled button: it cannot answer, so
+                      "make it the primary" would be a promise the cascade breaks
+                      (it skips disabled cards). */}
+                  {!a.enabled ? (
+                    <Button disabled title={t("agents.primary.setDisabled")}>
+                      {t("agents.primary.set")}
+                    </Button>
+                  ) : fvName === a.name ? (
+                    <Popconfirm
+                      title={t("agents.primary.confirmClear.title")}
+                      description={t("agents.primary.confirmClear.body")}
+                      okText={t("agents.primary.clear")}
+                      cancelText={t("common.keep")}
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => applyPrimary(null)}
+                    >
+                      <Button loading={primaryBusy}>{t("agents.primary.clear")}</Button>
+                    </Popconfirm>
+                  ) : (
+                    <Popconfirm
+                      title={t("agents.primary.confirmSet.title", { name: a.name })}
+                      description={t("agents.primary.confirmSet.body", { name: a.name })}
+                      okText={t("agents.primary.set")}
+                      cancelText={t("common.keep")}
+                      onConfirm={() => applyPrimary(a.name)}
+                    >
+                      <Button loading={primaryBusy}>{t("agents.primary.set")}</Button>
+                    </Popconfirm>
+                  )}
                   {/* A12: a disabled role used to be a dead end — .5 opacity
                       and no way back. The card can re-enable itself. */}
                   {!a.enabled ? (
