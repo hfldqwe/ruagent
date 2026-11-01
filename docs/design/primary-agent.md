@@ -87,8 +87,14 @@ mistaken for the flag.
   source holds a different agent.
   The `why` is not decoration: it is what the panel shows when there is no primary, and what an agent tool
   reads back after setting one.
-* `PUT /api/v1/agents/{name}` accepts `primary: true`. Setting it clears the flag from every other agent in
-  the same write, and clearing it from the current primary is allowed (the platform then has none).
+* `PUT /api/v1/primary` `{"name": "<agent>" | "none"}` -- **the operation clients should call.** It writes
+  BOTH places in one step (the flag and `routing.toml`'s `default`) and answers with the resulting effective
+  front door. Keeping the two-write rule inside the daemon is the point: if each client had to remember it,
+  one of them would eventually write only the flag, and the symptom -- "I set the primary and nothing
+  changed" -- is the hardest kind to diagnose.
+* `PUT /api/v1/agents/{name}` accepts `primary: true` as the low-level primitive (flag only). Setting it
+  clears the flag from every other agent in the same write, and clearing it from the current primary is
+  allowed (the platform then has none).
 * `GET/PUT /api/v1/routing` -> the parsed `{default, routes}` view; `PUT` writes `routing.toml` and takes
   effect on the next run.
 
