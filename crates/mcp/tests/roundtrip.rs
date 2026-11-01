@@ -468,11 +468,22 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
         "graph_fact_add",
         "distill_status",
         "graph_resolution_pending",
+        // t46 (docs/design/primary-agent.md): the front door -- two reads and two writes,
+        // all zero-token config calls.
+        "agents_list",
+        "agent_set_primary",
+        "routing_show",
+        "routing_set_default",
+        // t53 (v2): handing work to another agent -- two free calls and the ONE that starts a
+        // real run.
+        "task_create",
+        "task_dispatch",
+        "run_get",
     ];
     assert_eq!(
         expected.len(),
-        21,
-        "the declared consumption surface is 21 tools"
+        28,
+        "the declared consumption surface is 28 tools"
     );
     let mut got = names.clone();
     got.sort();
@@ -2504,6 +2515,426 @@ async fn capability_set_refuses_a_field_it_cannot_send() {
         vec!["enabled", "min_score", "weight"],
         "the control write adds exactly what the caller set: {after}"
     );
+
+    shutdown_pair(client, server_task).await;
+}
+
+// ---------------------------------------------------------------------------
+// The front door (docs/design/primary-agent.md, t46)
+// ---------------------------------------------------------------------------
+
+/// Two ENABLED cards, one of them marked primary: enough to prove a swap moves the marker and
+/// leaves the other row false, which is the whole point of `agent_set_primary`.
+const FRONT_DOOR_AGENTS: &str = r#"[agent.alpha]
+harness = "mock"
+command = "mock-agent"
+description = "the first card"
+enabled = true
+model = "model-alpha"
+
+[agent.beta]
+harness = "mock"
+command = "mock-agent"
+description = "the second card"
+enabled = true
+model = "model-beta"
+primary = true
+"#;
+
+type FdClient = rmcp::service::RunningService<rmcp::service::RoleClient, TestClient>;
+type FdServer = tokio::task::JoinHandle<
+    rmcp::service::RunningService<rmcp::service::RoleServer, PlatformTools>,
+>;
+
+/// A REAL daemon (the same in-process router the rest of this file uses) plus an MCP client
+/// wired to a served `PlatformTools`. The daemon is real on purpose: the four front-door tools
+/// are thin, so what they must be tested against is the daemon's own write -- one PUT that
+/// sets BOTH carriers -- and not a mock that would agree with whatever the tool sent.
+async fn front_door_pair(agents_toml: &str) -> (FdClient, FdServer, std::path::PathBuf) {
+    let (daemon_url, root) = start_test_daemon_with(agents_toml, DEFAULT_POLICY).await;
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move {
+        PlatformTools::new(BridgeConfig { daemon_url })
+            .serve(server_transport)
+            .await
+            .expect("mcp server starts")
+    });
+    let client = TestClient.serve(client_transport).await.unwrap();
+    (client, server_task, root)
+}
+
+/// The row line of `agents_list` for one agent (the text is one row per card, two lines each).
+fn row_of<'a>(text: &'a str, agent: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.starts_with(&format!("- {agent} ")))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row for {agent} in:
+{text}"
+            )
+        })
+}
+
+#[tokio::test]
+async fn agents_list_reports_the_marker_and_agent_set_primary_moves_it() {
+    let (client, server_task, root) = front_door_pair(FRONT_DOOR_AGENTS).await;
+
+    // BEFORE: the marker is on beta and off alpha, and every row carries the fields a caller
+    // decides with.
+    let before = text_of(
+        &client
+            .call_tool(call("agents_list", serde_json::json!({})))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 agents_list BEFORE:
+{before}"
+    );
+    assert!(
+        row_of(&before, "beta").contains("primary=true"),
+        "the marked card must say so: {before}"
+    );
+    assert!(
+        row_of(&before, "alpha").contains("primary=false"),
+        "an unmarked card must say false, not omit the column: {before}"
+    );
+    for column in ["id=", "kind=", "enabled=true", "model=model-"] {
+        assert!(
+            row_of(&before, "alpha").contains(column),
+            "the row must carry {column}: {before}"
+        );
+    }
+
+    // THE WRITE: one tool call, which the description says must be announced first.
+    let wrote = text_of(
+        &client
+            .call_tool(call(
+                "agent_set_primary",
+                serde_json::json!({ "name": "alpha" }),
+            ))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 agent_set_primary:
+{wrote}"
+    );
+    assert!(
+        wrote.contains("THE FRONT DOOR IS NOW") && wrote.contains("alpha"),
+        "the reply must name the post-change front door: {wrote}"
+    );
+    assert!(
+        wrote.contains("source:"),
+        "the reply must name WHICH level decided: {wrote}"
+    );
+
+    // AFTER: the old primary is FALSE and the new one is TRUE -- read through agents_list, the
+    // tool a caller would use, not the raw daemon payload.
+    let after = text_of(
+        &client
+            .call_tool(call("agents_list", serde_json::json!({})))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 agents_list AFTER:
+{after}"
+    );
+    assert!(
+        row_of(&after, "alpha").contains("primary=true"),
+        "the chosen card must be the marker: {after}"
+    );
+    assert!(
+        row_of(&after, "beta").contains("primary=false"),
+        "the replaced card must be false: {after}"
+    );
+
+    // THE INVARIANT THIS TASK EXISTS FOR: after the write, routing_show's default and
+    // agents_list's primary must name the SAME agent -- the daemon writes both carriers, and a
+    // tool that wrote only one would leave this green-looking pair disagreeing.
+    let routing = text_of(
+        &client
+            .call_tool(call("routing_show", serde_json::json!({})))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 routing_show after the write:
+{routing}"
+    );
+    assert!(
+        routing.contains("default = ") && routing.contains("alpha"),
+        "routing_show must agree with agents_list: {routing}"
+    );
+    // The FILE is the second witness: the marker alone would be invisible to the cascade.
+    let routing_toml = std::fs::read_to_string(root.join("config").join("routing.toml")).unwrap();
+    assert!(
+        routing_toml
+            .lines()
+            .any(|l| l.trim_start().starts_with("default") && l.contains("alpha")),
+        "routing.toml's default must move with the marker: {routing_toml}"
+    );
+    let agents_toml = std::fs::read_to_string(root.join("config").join("agents.toml")).unwrap();
+    assert!(
+        agents_toml.contains("primary = true"),
+        "the marker write must land in agents.toml: {agents_toml}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+#[tokio::test]
+async fn routing_set_default_round_trips_and_keeps_the_rules() {
+    let (client, server_task, root) = front_door_pair(FRONT_DOOR_AGENTS).await;
+
+    // A routing file with a RULE in it, written behind the tool's back: the daemon's PUT
+    // replaces the whole file, so a default-only body would take this rule with it.
+    let routing_toml = [
+        r#"default = "beta""#,
+        "",
+        "[[routes]]",
+        r#"project = "ruagent""#,
+        r#"title_contains = "release""#,
+        r#"agent = "beta""#,
+        "",
+    ]
+    .join("\n");
+    std::fs::write(root.join("config").join("routing.toml"), routing_toml).unwrap();
+
+    let shown = text_of(
+        &client
+            .call_tool(call("routing_show", serde_json::json!({})))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 routing_show BEFORE:
+{shown}"
+    );
+    assert!(shown.contains("default = `beta`"), "{shown}");
+    assert!(shown.contains("rules: 1"), "{shown}");
+    assert!(
+        shown.contains("agent beta"),
+        "the rule must be listed: {shown}"
+    );
+
+    let wrote = text_of(
+        &client
+            .call_tool(call(
+                "routing_set_default",
+                serde_json::json!({ "name": "alpha" }),
+            ))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 routing_set_default:
+{wrote}"
+    );
+    assert!(wrote.contains("default = `alpha`"), "{wrote}");
+    assert!(
+        wrote.contains("rules: 1") && wrote.contains("agent beta"),
+        "the rule must SURVIVE the write: {wrote}"
+    );
+    assert!(
+        wrote.contains("THE FRONT DOOR IS NOW") && wrote.contains("alpha"),
+        "the reply must also resolve who answers: {wrote}"
+    );
+
+    // READ BACK through the read tool AND the file.
+    let shown_after = text_of(
+        &client
+            .call_tool(call("routing_show", serde_json::json!({})))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 routing_show AFTER:
+{shown_after}"
+    );
+    assert!(shown_after.contains("default = `alpha`"), "{shown_after}");
+    assert!(shown_after.contains("rules: 1"), "{shown_after}");
+    let file = std::fs::read_to_string(root.join("config").join("routing.toml")).unwrap();
+    assert!(
+        file.lines()
+            .any(|l| l.trim_start().starts_with("default") && l.contains("alpha")),
+        "{file}"
+    );
+    assert!(
+        file.lines()
+            .any(|l| l.contains("title_contains") && l.contains("release")),
+        "the rule must still be in the file: {file}"
+    );
+
+    // CLEARING IT: routing_set_default(name = none) leaves no default, and the reply says so.
+    let cleared = text_of(
+        &client
+            .call_tool(call(
+                "routing_set_default",
+                serde_json::json!({ "name": "none" }),
+            ))
+            .await
+            .unwrap(),
+    );
+    println!(
+        "READING t46 routing_set_default(none):
+{cleared}"
+    );
+    assert!(cleared.contains("<none>"), "{cleared}");
+    let file_after = std::fs::read_to_string(root.join("config").join("routing.toml")).unwrap();
+    assert!(file_after.contains("title_contains"), "{file_after}");
+
+    shutdown_pair(client, server_task).await;
+}
+
+#[tokio::test]
+async fn an_unknown_agent_is_refused_with_the_daemons_own_reason_and_changes_nothing() {
+    let (client, server_task, _root) = front_door_pair(FRONT_DOOR_AGENTS).await;
+
+    // agent_set_primary: the daemon refuses BEFORE writing, and its sentence names the known
+    // cards -- that is what makes the refusal actionable instead of a status code.
+    let refused = failure(
+        client
+            .call_tool(call(
+                "agent_set_primary",
+                serde_json::json!({ "name": "nope" }),
+            ))
+            .await,
+    );
+    println!(
+        "READING t46 agent_set_primary(unknown):
+{refused}"
+    );
+    assert!(refused.contains("unknown agent"), "{refused}");
+    assert!(
+        refused.contains("known agents") && refused.contains("alpha") && refused.contains("beta"),
+        "the refusal must name the agents that DO exist: {refused}"
+    );
+
+    // Nothing moved: beta is still the marker.
+    let after = text_of(
+        &client
+            .call_tool(call("agents_list", serde_json::json!({})))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        row_of(&after, "beta").contains("primary=true"),
+        "a refusal must not be a half-written change: {after}"
+    );
+
+    // routing_set_default: same discipline on the other write.
+    let refused_route = failure(
+        client
+            .call_tool(call(
+                "routing_set_default",
+                serde_json::json!({ "name": "nope" }),
+            ))
+            .await,
+    );
+    println!(
+        "READING t46 routing_set_default(unknown):
+{refused_route}"
+    );
+    assert!(refused_route.contains("routing default"), "{refused_route}");
+    assert!(
+        refused_route.contains("not a registered agent"),
+        "{refused_route}"
+    );
+
+    shutdown_pair(client, server_task).await;
+}
+
+#[tokio::test]
+async fn an_unreachable_daemon_is_reported_as_unreachable_not_as_a_change() {
+    // A dead address, the same one tool_surface.rs uses: no daemon is started here.
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn(async move {
+        PlatformTools::new(BridgeConfig {
+            daemon_url: "http://127.0.0.1:1".to_string(),
+        })
+        .serve(server_transport)
+        .await
+        .expect("mcp server starts")
+    });
+    let client = TestClient.serve(client_transport).await.unwrap();
+
+    for (tool, args) in [
+        ("agents_list", serde_json::json!({})),
+        ("routing_show", serde_json::json!({})),
+        ("agent_set_primary", serde_json::json!({ "name": "alpha" })),
+        (
+            "routing_set_default",
+            serde_json::json!({ "name": "alpha" }),
+        ),
+    ] {
+        let msg = failure(client.call_tool(call(tool, args)).await);
+        println!("READING t46 {tool} against a dead daemon: {msg}");
+        assert!(
+            msg.contains("cannot reach the ruagent daemon"),
+            "{tool} must report the transport failure in words a caller can act on: {msg}"
+        );
+    }
+
+    shutdown_pair(client, server_task).await;
+}
+
+#[tokio::test]
+async fn the_front_door_tools_advertise_what_a_caller_has_to_know() {
+    let (client, server_task, _root) = front_door_pair(FRONT_DOOR_AGENTS).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let by_name = |n: &str| {
+        tools
+            .iter()
+            .find(|t| t.name.as_ref() == n)
+            .unwrap_or_else(|| panic!("{n} is not served"))
+            .description
+            .clone()
+            .unwrap_or_default()
+    };
+
+    // The four tools exist AS TOOLS (the surface list in roundtrip's first test pins the names;
+    // this pins what a model reading them is told).
+    let list = by_name("agents_list");
+    assert!(
+        list.contains("primary"),
+        "agents_list must name the marker: {list}"
+    );
+    let set = by_name("agent_set_primary");
+    assert!(set.contains("primary"), "{set}");
+    assert!(
+        set.to_lowercase().contains("say it out loud"),
+        "changing who answers must be announced first: {set}"
+    );
+    assert!(set.contains("zero model tokens"), "{set}");
+    let show = by_name("routing_show");
+    assert!(
+        show.contains("default") && show.contains("zero model tokens"),
+        "{show}"
+    );
+    let rset = by_name("routing_set_default");
+    assert!(
+        rset.contains("default") && rset.contains("zero model tokens"),
+        "{rset}"
+    );
+    assert!(
+        rset.to_lowercase().contains("say it out loud"),
+        "the routing default changes who answers: {rset}"
+    );
+    // The four are FREE, and each description says so -- the reason a model hesitates to use a
+    // config tool is the fear of spending tokens.
+    for name in [
+        "agents_list",
+        "agent_set_primary",
+        "routing_show",
+        "routing_set_default",
+    ] {
+        assert!(
+            by_name(name).contains("zero model tokens"),
+            "{name} must state that it costs no model tokens"
+        );
+    }
 
     shutdown_pair(client, server_task).await;
 }

@@ -433,11 +433,13 @@ async fn every_tool_refuses_fields_it_does_not_declare() {
 
     // Non-vacuity: an empty list (a broken walker, an unserved tool set) would "pass".
     // t12 (issues #51, #54) added three tools -- graph_fact_add, distill_status and
-    // graph_resolution_pending -- and this count is the non-vacuity guard: it moves
-    // with the surface and names the whole list when it does not match.
+    // graph_resolution_pending -- and t46 (the front door) added four more (agents_list,
+    // agent_set_primary, routing_show, routing_set_default) and t53 (handing work over)
+    // three more (task_create, task_dispatch, run_get). This count is the non-vacuity
+    // guard: it moves with the surface and names the whole list when it does not match.
     assert_eq!(
         tools.len(),
-        21,
+        28,
         "the walker ran over the wrong surface: {:?}",
         tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>()
     );

@@ -434,6 +434,219 @@ impl PlatformTools {
         capability_set_to_text(&resp, &params)
     }
 
+    // -- handing work to another agent (v2, t53) -------------------------
+
+    #[tool(
+        description = "Create a durable TASK (a work item: title + intent, optional project) WITHOUT running anything. WHEN: the user asks for work that should outlive this conversation, or you are about to hand work to a specialist agent -- create it here, then task_dispatch it. One task can be dispatched several times (several agents, several attempts), and the dispatch is what spends tokens, not this call. COST: free (zero model tokens) -- it writes one row and starts no agent. The reply is the new task's id and status; KEEP THE ID, because task_dispatch takes it."
+    )]
+    async fn task_create(
+        &self,
+        Parameters(params): Parameters<TaskCreateParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "task_create";
+        let url = format!("{}/api/v1/tasks", self.config.daemon_url);
+        let mut body = serde_json::json!({
+            "title": params.title,
+            "intent": params.intent,
+        });
+        if let Some(project) = params.project.as_deref() {
+            body["project"] = serde_json::json!(project);
+        }
+        let resp = json_of(
+            self.http.post(&url).json(&body),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        task_created_to_text(&resp)
+    }
+
+    #[tool(
+        description = "Dispatch a task: start ONE run of <task_id> at an agent. WHEN: the user wants work PERFORMED now by an agent (the task exists -- task_create made it), or you are handing a piece of your own plan to a specialist instead of doing it yourself. agent is the agent's NAME; OMIT IT to let the daemon's routing cascade choose (project/title rules -> routing.toml's default -> the primary agent -> the first enabled card). COST: THIS SPENDS THE USER'S MODEL TOKENS -- it starts a real run with a real agent, and there is no dry-run flag. Say it out loud first (which task, and which agent if you are naming one) and only then dispatch. IT DOES NOT WAIT FOR THE WORK: the reply is the run id, its current status and the agent the daemon RESOLVED -- reported by NAME, because you and the user know agents by name while the run stores a registry id. Read progress with run_get. WHO RUNS IT IS THE DAEMON'S DECISION: when you omit agent this tool sends no agent field at all and does not guess a default here -- a guess would silently replace the user's routing."
+    )]
+    async fn task_dispatch(
+        &self,
+        Parameters(params): Parameters<TaskDispatchParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "task_dispatch";
+        let url = format!(
+            "{}/api/v1/tasks/{}/runs",
+            self.config.daemon_url, params.task_id
+        );
+        // NO INVENTED DEFAULT (t53). Omitting agent is a REQUEST for the daemon's cascade, and
+        // filling a name in here would replace the user's routing with this tool's idea of it --
+        // silently, and in the one place the cascade exists to be applied. The body is built by
+        // inserting ONLY what the caller sent, so an absent agent is absent on the wire.
+        let mut body = serde_json::Map::new();
+        if let Some(agent) = params.agent.as_deref() {
+            body.insert("agent".to_string(), serde_json::json!(agent));
+        }
+        if let Some(prompt) = params.prompt.as_deref() {
+            body.insert("prompt".to_string(), serde_json::json!(prompt));
+        }
+        let resp = json_of(
+            self.http.post(&url).json(&serde_json::Value::Object(body)),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        // ID -> NAME. The run stores params.agent (a registry id); the caller was told to pass a
+        // NAME. A failed translation must not fail the dispatch -- the run already exists -- so it
+        // is reported in the reply instead of being swallowed or escalated.
+        let agent = self
+            .describe_agent(resp.get("params").and_then(|p| p.get("agent")))
+            .await;
+        dispatched_to_text(what, &resp, &agent)
+    }
+
+    #[tool(
+        description = "Read ONE run: its status, whether it has ENDED, the agent's final text (bounded) and the failure cause if it failed. WHEN: after task_dispatch, to see how the work is going -- a run is asynchronous, so the first reading is usually queued/spawning/running and the right move is to read again rather than to assume failure. COST: free (zero model tokens) -- it reads rows and never calls a model. THIS TOOL DOES NOT WAIT: it is a single GET with no polling loop and no sleep, so status=running with finished=false is the normal answer for work that is still going; call it again later instead of holding one call open."
+    )]
+    async fn run_get(
+        &self,
+        Parameters(params): Parameters<RunGetParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "run_get";
+        let url = format!("{}/api/v1/runs/{}", self.config.daemon_url, params.run_id);
+        // ONE request, no loop (t53): the description promises this call does not block, and the
+        // only way to keep that promise is to never wait inside it.
+        let resp = json_of(self.http.get(&url), what, &self.config.daemon_url).await?;
+        let agent = self
+            .describe_agent(resp.get("params").and_then(|p| p.get("agent")))
+            .await;
+        run_to_text(what, &resp, &agent)
+    }
+
+    /// The agent NAME a run's registry id belongs to, as a phrase the caller can read (t53).
+    ///
+    /// A run records its agent as an id, and every caller here speaks names -- so the mapping has
+    /// to come from the daemon, which owns it (GET /api/v1/agents). A failure to translate is
+    /// reported IN the phrase rather than propagated: for task_dispatch the run already exists, so
+    /// turning a successful dispatch into an error because a second read failed would be a lie
+    /// about what happened.
+    async fn describe_agent(&self, raw: Option<&serde_json::Value>) -> String {
+        let Some(id) = raw.and_then(|v| v.as_str()) else {
+            return "<the daemon's reply carries no params.agent>".to_string();
+        };
+        let url = format!("{}/api/v1/agents", self.config.daemon_url);
+        let resolved = async {
+            let resp = json_of(self.http.get(&url), "agents", &self.config.daemon_url).await?;
+            let rows = resp
+                .get("agents")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| drift("agents", "agents", &resp))?;
+            Ok::<Option<String>, rmcp::ErrorData>(
+                rows.iter()
+                    .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
+                    .and_then(|r| r.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            )
+        }
+        .await;
+        match resolved {
+            Ok(Some(name)) => name,
+            Ok(None) => format!("{id} (no card with this id is in the registry any more)"),
+            Err(_) => format!("{id} (the agent list could not be read to translate this id)"),
+        }
+    }
+
+    // -- the front door (docs/design/primary-agent.md) -------------------
+
+    #[tool(
+        description = "List every agent card the platform knows, one row each: name, id, kind (role or runtime), enabled, primary (the front-door MARKER in agents.toml), model and description. WHEN: before you name an agent to the user, before agent_set_primary (the name you pass must be one of these), or when you need to know which card carries the primary marker. COST: free (zero model tokens) -- a config read, so read it instead of guessing. THE MARKER IS NOT THE ANSWER: routing.toml's default is consulted BEFORE the marker (level 3 outranks level 4), so when the two name different agents the DEFAULT is who answers -- routing_show shows the default, and the daemon's /api/v1/primary reports the resolved front door. A runtime card (kind=runtime) can never be primary."
+    )]
+    async fn agents_list(
+        &self,
+        Parameters(_params): Parameters<NoParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/agents", self.config.daemon_url);
+        let resp = json_of(self.http.get(&url), "agents_list", &self.config.daemon_url).await?;
+        agents_to_text(&resp)
+    }
+
+    #[tool(
+        description = "Make ONE agent the platform's front door: the agent a user's next message reaches when no routing rule matches. WHEN: the user says make X my main agent or I want to talk to Y from now on, or asks which agent is primary and wants to change it. COST: free (zero model tokens) -- a configuration write; no model is called and no run is started. THIS CHANGES WHO ANSWERS THE USER: say it out loud first -- name the agent you are choosing AND the one it replaces (agents_list shows the current primary) -- and only then call this. WRITES BOTH CARRIERS IN ONE STEP: the daemon's PUT /api/v1/primary sets the primary = true marker in agents.toml AND routing.toml's default, because the default outranks the marker and a marker-only write would change nothing a user can observe. Nothing is half-written: an unknown or disabled agent is refused (400, with the known names) and NEITHER file is touched, so a refusal is never reported as a change. Pass name=none to clear the front door instead of choosing an agent. The reply is the post-change front door with its source and the cascade's own explanation; it takes effect on the NEXT run/message -- a run already in flight keeps the agent it started with."
+    )]
+    async fn agent_set_primary(
+        &self,
+        Parameters(params): Parameters<AgentSetPrimaryParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "agent_set_primary";
+        let url = format!("{}/api/v1/primary", self.config.daemon_url);
+        // ONE ENDPOINT, ONE WRITE (t46). The daemon owns "who answers" and writes both carriers
+        // (the agents.toml marker and routing.toml's default) inside this single PUT, refusing
+        // before it writes anything. Doing those two writes HERE -- a card PATCH then a routing
+        // PUT -- would be a second copy of that rule, and the copy is what ships "I set a primary
+        // and nothing happened" the day one of the two writes is forgotten.
+        let resp = json_of(
+            self.http
+                .put(&url)
+                .json(&serde_json::json!({ "name": params.name })),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        front_door_to_text(what, &resp, &params.name)
+    }
+
+    #[tool(
+        description = "Show the routing cascade's CONFIGURED default and its rules: the default agent (level 3 -- what answers when no rule matches) and every rule (project / title_contains -> agent). WHEN: the user asks who answers them, or why a task went to a particular agent; before routing_set_default; or to see the rules that are consulted BEFORE the front-door marker. COST: free (zero model tokens) -- a config read. THE DEFAULT OUTRANKS THE PRIMARY MARKER: routing.toml's default is level 3 and the primary = true flag is level 4, so when the two name DIFFERENT agents the default is what answers -- agents_list shows the marker, this tool shows the default, and the daemon's /api/v1/primary reports which one won."
+    )]
+    async fn routing_show(
+        &self,
+        Parameters(_params): Parameters<NoParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let url = format!("{}/api/v1/routing", self.config.daemon_url);
+        let resp = json_of(self.http.get(&url), "routing_show", &self.config.daemon_url).await?;
+        routing_to_text("routing_show", &resp)
+    }
+
+    #[tool(
+        description = "Set or clear routing.toml's default -- the agent that answers when no rule matches (level 3 of the cascade, ABOVE the primary marker). WHEN: the user wants a specific agent to answer by default and there are project/title rules they want to KEEP; or when the rule and the marker disagree and they want the rule to name someone. COST: free (zero model tokens) -- a configuration write; no model is called. THIS CHANGES WHO ANSWERS THE USER: say it out loud first -- which agent, and that this level outranks the primary marker -- and only then call this. THE RULES SURVIVE: the daemon's PUT replaces the WHOLE routing file, so this tool reads the current routing first and re-sends its rules with the new default (a default-only write would silently delete every rule). An unknown agent is refused (400, with the known names) and the file is left alone. Pass name=none (or an empty string) to clear the default, which lets the primary marker decide again. The reply is the post-change default, the rules that survived, and the effective front door; it takes effect on the NEXT run."
+    )]
+    async fn routing_set_default(
+        &self,
+        Parameters(params): Parameters<RoutingSetDefaultParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "routing_set_default";
+        let url = format!("{}/api/v1/routing", self.config.daemon_url);
+        // READ-MODIFY-WRITE, for the reason capability_set states: the daemon's PUT REPLACES the
+        // whole file, so a body carrying only default would take the rules with it (they
+        // deserialize to an empty list) and the user would find their routing silently dropped.
+        let current = json_of(self.http.get(&url), what, &self.config.daemon_url).await?;
+        let clear = params.name.eq_ignore_ascii_case("none") || params.name.is_empty();
+        let default = if clear {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(params.name.as_str())
+        };
+        let routes = current
+            .get("routes")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        let resp = json_of(
+            self.http.put(&url).json(&serde_json::json!({
+                "default": default,
+                "routes": routes,
+            })),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        // THEN THE FRONT DOOR. The write above is level 3; whether it is what ANSWERS also depends
+        // on level 4 (the marker), so the reply reads the daemon's resolved answer instead of
+        // repeating the request back as if it were the outcome.
+        let door = json_of(
+            self.http
+                .get(format!("{}/api/v1/primary", self.config.daemon_url)),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        routing_written_to_text(what, &resp, &door, &params.name)
+    }
+
     // -- the two trigger surfaces (§14.3) --------------------------------
 
     #[tool(
@@ -1285,6 +1498,140 @@ fn capability_set_to_text(
     Ok(out)
 }
 
+/// One line per card, with the front-door MARKER on every row (t46).
+///
+/// `model` and `description` are printed as `<none>` / empty rather than drifted on: a card
+/// legitimately may have neither, so demanding them would turn a valid registry into an error.
+/// The columns a caller decides with -- name, id, kind, enabled, primary -- are read WITH drift,
+/// because a daemon that stopped sending `primary` would otherwise print `false` on every row and
+/// the tool would look like an answer.
+fn agents_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "agents_list";
+    let rows = resp
+        .get("agents")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| drift(WHAT, "agents", resp))?;
+    if rows.is_empty() {
+        return Ok(
+            "agents_list: the registry has NO agent cards, so nothing can answer. Add one in agents.toml (or through the panel) before setting a primary.\n"
+                .to_string(),
+        );
+    }
+    let mut out = format!(
+        "agents_list: {} card(s). A `primary=true` row is the front-door MARKER in agents.toml; routing.toml's default (routing_show) is consulted BEFORE it, so the default wins when the two disagree.\n",
+        rows.len()
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "- {}  id={}  kind={}  enabled={}  primary={}  model={}\n    {}\n",
+            field_str(WHAT, row, "name")?,
+            field_str(WHAT, row, "id")?,
+            field_str(WHAT, row, "kind")?,
+            field_bool(WHAT, row, "enabled")?,
+            field_bool(WHAT, row, "primary")?,
+            row.get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<none>"),
+            row.get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        ));
+    }
+    Ok(out)
+}
+
+/// What the front door IS now, in the daemon's own words (t46).
+///
+/// A `null` name is a REAL answer -- no agent is the front door and the cascade falls through to
+/// the first enabled card -- so it is reported as such instead of being skipped as if the
+/// response were empty. `source` is printed whenever it is there and its absence is stated rather
+/// than hidden: a caller deciding "did my write work" needs to know which level won.
+fn front_door_to_text(
+    what: &str,
+    resp: &serde_json::Value,
+    requested: &str,
+) -> Result<String, rmcp::ErrorData> {
+    let name = resp.get("name").and_then(|v| v.as_str());
+    let source = resp.get("source").and_then(|v| v.as_str());
+    let why = resp
+        .get("why")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<the daemon sent no why>");
+    let mut out = match (name, source) {
+        (Some(n), Some(s)) => {
+            format!("{what}: wrote `{requested}`. THE FRONT DOOR IS NOW `{n}` (source: `{s}`).\n")
+        }
+        (Some(n), None) => format!(
+            "{what}: wrote `{requested}`. The daemon reports front door `{n}` but NO source level -- read the payload before telling the user which level decided.\n"
+        ),
+        (None, _) => format!(
+            "{what}: wrote `{requested}`. NO AGENT IS THE FRONT DOOR NOW -- the cascade falls through to the first enabled card.\n"
+        ),
+    };
+    if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
+        out.push_str(&format!("  id: {id}\n"));
+    }
+    out.push_str(&format!("  why: {why}\n"));
+    out.push_str(
+        "Takes effect on the NEXT run/message; a run already in flight keeps the agent it started with.\n",
+    );
+    Ok(out)
+}
+
+/// The routing file as the cascade sees it: the default, then every rule (t46).
+fn routing_to_text(what: &str, resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    let routes = resp
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| drift(what, "routes", resp))?;
+    let default = resp.get("default").and_then(|v| v.as_str());
+    let mut out = match default {
+        Some(d) => format!("{what}: default = `{d}` (level 3 -- answers when no rule matches).\n"),
+        None => format!(
+            "{what}: default = <none> (level 3 is unset, so the primary marker decides, and after that the first enabled card).\n"
+        ),
+    };
+    out.push_str(&format!(
+        "rules: {} (level 2 -- consulted before the default).\n",
+        routes.len()
+    ));
+    for rule in routes {
+        let project = rule
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<any>");
+        let title = rule
+            .get("title_contains")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<any>");
+        out.push_str(&format!(
+            "- project={project} title_contains={title} -> agent {}\n",
+            field_str(what, rule, "agent")?
+        ));
+    }
+    out.push_str(
+        "NOTE: agents_list shows the primary MARKER; when this default and that marker name different agents, THIS default is who answers.\n",
+    );
+    Ok(out)
+}
+
+/// The post-write routing, then the RESOLVED front door (t46).
+fn routing_written_to_text(
+    what: &str,
+    written: &serde_json::Value,
+    door: &serde_json::Value,
+    requested: &str,
+) -> Result<String, rmcp::ErrorData> {
+    let mut out = format!("{what}: wrote default = `{requested}`.\n");
+    out.push_str(&routing_to_text(what, written)?);
+    if let Some(ta) = written.get("takes_effect").and_then(|v| v.as_str()) {
+        out.push_str(&format!("takes_effect: {ta}\n"));
+    }
+    out.push('\n');
+    out.push_str(&front_door_to_text(what, door, requested)?);
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // The two trigger surfaces
 // ---------------------------------------------------------------------------
@@ -2004,6 +2351,111 @@ fn dismiss_result_to_text(resp: &serde_json::Value) -> Result<String, rmcp::Erro
 /// shown them". The page size is now NAMED and sent, the envelope's
 /// total/limit/offset are read from the daemon, and the reply ends with how many
 /// rows are not shown.
+/// The new task, led by its id (t53): the id is what task_dispatch takes, so it is printed first
+/// and a reply WITHOUT one is drift, not an empty success.
+fn task_created_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
+    const WHAT: &str = "task_create";
+    let id = field_str(WHAT, resp, "id")?;
+    let title = resp.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+    let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut out = format!(
+        "task_create: created `{title}` -- id: {id}, status: {status}.\n Nothing ran: creating a task spends no tokens and starts no agent. Next: task_dispatch(task_id: \"{id}\") starts a run -- THAT is the call that spends the user's model tokens.\n"
+    );
+    if let Some(project) = resp.get("project").and_then(|v| v.as_str()) {
+        out.push_str(&format!("  project: {project}\n"));
+    }
+    Ok(out)
+}
+
+/// A dispatched run, with the agent named rather than identified (t53).
+fn dispatched_to_text(
+    what: &str,
+    resp: &serde_json::Value,
+    agent: &str,
+) -> Result<String, rmcp::ErrorData> {
+    let run_id = field_str(what, resp, "id")?;
+    let task_id = resp.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut out = format!(
+        "{what}: started run {run_id} of task {task_id}.\n  agent: {agent}\n  status: {status} ({})\n",
+        finished_phrase(status)
+    );
+    if let Some(prompt) = resp
+        .get("params")
+        .and_then(|p| p.get("prompt"))
+        .and_then(|v| v.as_str())
+    {
+        out.push_str(&format!("  prompt: {}\n", clip(prompt, 120)));
+    }
+    out.push_str(
+        "The run is ASYNCHRONOUS: this call returned as soon as the daemon accepted it, and the work is still going. Read it with run_get(run_id) -- a first reading of queued, spawning or running is normal, not a failure.\n",
+    );
+    Ok(out)
+}
+
+/// The run states that mean the run has ENDED (t53).
+///
+/// A COPY, and the only one this crate can have: the MCP server speaks HTTP and deliberately does
+/// not depend on `ruagent-core` (whose `RunStatus::is_terminal`, crates/core/src/run.rs, is the
+/// authority). The spellings are the wire's (`#[serde(rename_all = "snake_case")]`). An
+/// UNRECOGNISED status is reported as unknown instead of guessing "still running", so a status
+/// added upstream shows up as a visible gap rather than as a run that looks stuck forever.
+const TERMINAL_RUN_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "interrupted"];
+
+/// The states that mean the run is still moving -- named so an unknown status can be told apart
+/// from both answers above.
+const ACTIVE_RUN_STATUSES: [&str; 4] = ["queued", "spawning", "running", "waiting_permission"];
+
+/// Whether the run has ended, as a phrase the caller can act on.
+fn finished_phrase(status: &str) -> String {
+    if TERMINAL_RUN_STATUSES.contains(&status) {
+        "finished".to_string()
+    } else if ACTIVE_RUN_STATUSES.contains(&status) {
+        "NOT finished yet".to_string()
+    } else {
+        format!(
+            "unknown status `{status}`: this tool does not know whether the run has finished -- read it again later"
+        )
+    }
+}
+
+/// One run as the caller needs it: state, whether it ended, the result summary and the error (t53).
+fn run_to_text(
+    what: &str,
+    resp: &serde_json::Value,
+    agent: &str,
+) -> Result<String, rmcp::ErrorData> {
+    let run_id = field_str(what, resp, "id")?;
+    let task_id = resp.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut out = format!(
+        "{what}: run {run_id} of task {task_id}\n  status: {status} ({})\n  agent: {agent}\n",
+        finished_phrase(status)
+    );
+    if let Some(cost) = resp.get("cost_usd").and_then(|v| v.as_f64()) {
+        out.push_str(&format!("  cost so far: {cost:.4} USD\n"));
+    }
+    if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+        out.push_str(&format!("  ERROR: {error}\n"));
+    }
+    match resp.get("result").and_then(|v| v.as_str()) {
+        Some(result) => out.push_str(&format!(
+            "  result ({} chars, shown up to 600):\n{}\n",
+            result.chars().count(),
+            clip(result, 600)
+        )),
+        None => out.push_str("  result: <none yet -- the agent has not produced a final text>\n"),
+    }
+    if TERMINAL_RUN_STATUSES.contains(&status) {
+        out.push_str("The run has ENDED: this reading is final.\n");
+    } else {
+        out.push_str(
+            "NOT finished: call run_get again later instead of assuming it failed. This tool never waits.\n",
+        );
+    }
+    Ok(out)
+}
+
 fn tasks_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
     const WHAT: &str = "list_tasks";
     let tasks = field_array(WHAT, resp, "tasks")?;
@@ -2272,6 +2724,62 @@ impl ServerHandler for PlatformTools {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoParams {}
+
+/// The parameters of agent_set_primary (docs/design/primary-agent.md).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSetPrimaryParams {
+    #[schemars(
+        description = "The agent name to make the front door, or none to CLEAR it (both carriers: the agents.toml marker and routing.toml's default). The name must be a card agents_list shows as enabled; an unknown or disabled name is refused and nothing is written."
+    )]
+    pub name: String,
+}
+
+/// The parameters of `task_create` (v2: handing work to another agent).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreateParams {
+    #[schemars(description = "Short human-readable title of the work item.")]
+    pub title: String,
+    #[schemars(
+        description = "The full intent: what should be done, not how. This is what the agent a run is dispatched to will read."
+    )]
+    pub intent: String,
+    #[schemars(description = "Optional project the task belongs to; omitted = unattributed.")]
+    pub project: Option<String>,
+}
+
+/// The parameters of `task_dispatch`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchParams {
+    #[schemars(description = "The task to start a run of (the id task_create returned).")]
+    pub task_id: String,
+    #[schemars(
+        description = "Agent NAME to run this attempt. OMIT IT to let the daemon's routing cascade decide (rules -> routing.toml default -> the primary agent -> the first enabled card); this tool then sends no agent field at all rather than choosing one."
+    )]
+    pub agent: Option<String>,
+    #[schemars(description = "Prompt override for this attempt; omitted = the task's own intent.")]
+    pub prompt: Option<String>,
+}
+
+/// The parameters of `run_get`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunGetParams {
+    #[schemars(description = "The run to read (the id task_dispatch returned).")]
+    pub run_id: String,
+}
+
+/// The parameters of routing_set_default.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingSetDefaultParams {
+    #[schemars(
+        description = "The agent name to put in routing.toml's default (level 3 of the cascade, ABOVE the primary marker), or none / an empty string to CLEAR it and let the primary marker decide again. The rules already in the file are preserved."
+    )]
+    pub name: String,
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
