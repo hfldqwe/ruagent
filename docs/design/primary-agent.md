@@ -48,6 +48,28 @@ explicit, resolvable by NAME, and always sayable: every decision that reaches it
 Steps 1-3 and 5 are unchanged. Step 4 is new and sits directly above the old fallback, so a config that
 predates this document behaves exactly as before.
 
+### One answer to "who will answer me"
+
+Steps 3 and 4 can disagree, and a shipped install already has step 3 set: `DEFAULT_ROUTING_TOML`
+(`crates/daemon/src/config.rs:1173`) seeds `default = "claude"`. So a user who marks a different agent
+primary would see nothing change, because the routing default still wins. That is the shape of feature that
+looks broken while working as designed.
+
+Therefore the platform exposes exactly ONE answer, and everything the user can see reads that answer: the
+**effective front door** = step 3 if `routing.toml` names an enabled agent, else step 4, else nothing.
+`GET /api/v1/primary` returns the effective front door plus a `why` that names its source, and when both
+exist and differ it says so in as many words:
+
+```
+routing.toml default `claude` overrides the primary flag `builder` -- edit routing.toml, or use
+agent_set_primary, which writes both
+```
+
+Anything that sets the front door writes BOTH places, so they cannot drift by accident: `agent_set_primary`
+(the tool) marks the flag and sets `routing.toml`'s `default` in the same operation, and its reply reports
+both writes. A deliberate hand edit of `routing.toml` remains the operator's override -- it just cannot be
+mistaken for the flag.
+
 ## Failure modes (each must be sayable, not silent)
 
 * **Two agents marked primary** -- `agents.toml` load fails, naming both. A tie is a configuration error;
@@ -60,7 +82,9 @@ predates this document behaves exactly as before.
 ## API contract
 
 * `GET /api/v1/agents` rows gain `primary: bool`.
-* `GET /api/v1/primary` -> `{"name": ..., "id": ..., "why": ...}` or `{"name": null, "why": "..."}`.
+* `GET /api/v1/primary` -> the EFFECTIVE front door: `{"name": ..., "id": ..., "source": "routing-default"|"primary-flag", "why": ...}`
+  or `{"name": null, "why": "..."}`. `why` names the source, and names the disagreement when the other
+  source holds a different agent.
   The `why` is not decoration: it is what the panel shows when there is no primary, and what an agent tool
   reads back after setting one.
 * `PUT /api/v1/agents/{name}` accepts `primary: true`. Setting it clears the flag from every other agent in
