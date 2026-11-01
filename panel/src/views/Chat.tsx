@@ -1,9 +1,12 @@
-// Chat: terminal-like conversations — pick agent, pick model, talk
-// multi-turn on one persistent session. Models / permission modes /
-// thinking levels come from the daemon's cached catalog (instant, with
-// a manual sync); the model defaults to the agent's configured one so
-// nobody is asked to choose every time. The history drawer reopens
-// past conversations (live ones reattach and stream).
+// Chat: terminal-like conversations — talk, multi-turn on one persistent
+// session. You do NOT pick an agent first: a new chat lands on the daemon's
+// effective front door (`GET /api/v1/primary`, docs/design/primary-agent.md),
+// so opening the panel and typing is the whole flow. The picker stays, for
+// switching, and `?agent=` still overrides. Models / permission modes /
+// thinking levels come from the daemon's cached catalog (instant, with a
+// manual sync); the model defaults to the agent's configured one so nobody is
+// asked to choose every time. The history drawer reopens past conversations
+// (live ones reattach and stream).
 
 import {
   Fragment,
@@ -24,6 +27,7 @@ import {
   type OptionChoice,
   type SessionOptionInfo,
   type SessionRecord,
+  type PrimaryInfo,
   HttpError,
 } from "../api";
 import { BrandMark } from "../brand";
@@ -255,9 +259,23 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   /** A failed agent load is an ERROR, not an empty list (MASTER §12 row 20). */
   const [agentsError, setAgentsError] = useState<unknown>(null);
+  /** The name the registry marks `primary = true`, read from the UNFILTERED
+   *  registry (see `loadAgents`). `null` = the flag was not reported at all,
+   *  which is not the same as "no agent is primary" and must never be used to
+   *  claim a disagreement. */
+  const [flaggedPrimary, setFlaggedPrimary] = useState<string | null>(null);
   /** A failed send: shown persistently above the composer, with a retry. */
   const [sendError, setSendError] = useState<unknown>(null);
   const [agent, setAgent] = useState(initialAgent ?? "");
+  /** `?agent=` AS THE VIEW WAS ENTERED — captured once, on purpose.
+   *
+   *  The hash effect just below writes the current pick back into the URL
+   *  (t331), so after the first default is applied `?agent=` no longer tells
+   *  "the user asked for this agent" apart from "the panel picked one for
+   *  them". `initialAgent` is the only reading that predates that write, and
+   *  it is what makes `?agent=` outrank the front door (criterion: an explicit
+   *  request wins) instead of being overwritten by it on the next render. */
+  const explicitAgent = useRef((initialAgent ?? "").trim()).current;
   // t331 (MASTER row 58): WHICH agent you are talking to is a view state, so it
   // belongs in the URL. App.tsx already reads ?agent= into initialAgent; the
   // WRITE side was missing, so switching agents left the hash at #chat and the
@@ -473,9 +491,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       .then((a) => {
         const enabled = a.filter((x) => x.enabled);
         setAgents(enabled);
-        setAgent((cur) =>
-          cur && enabled.some((a) => a.name === cur) ? cur : (enabled[0]?.name ?? ""),
-        );
+        // From the FULL list on purpose: a `primary` on a DISABLED agent is the
+        // exact case where the user set a front door and someone else answers,
+        // and filtering first would hide the mark that explains it.
+        setFlaggedPrimary(a.find((x) => x.primary)?.name ?? null);
+        // A pick that is no longer in the registry is dropped here; WHICH agent
+        // replaces it is no longer decided here. That choice is the landing rule
+        // below (`Where a NEW chat lands`): picking `enabled[0]` here and then
+        // overriding it a frame later would show the user two different agents
+        // before they typed a character.
+        setAgent((cur) => (cur && enabled.some((a) => a.name === cur) ? cur : ""));
       })
       .catch((e) => {
         // Swallowing this into `[]` used to render a picker with no options
@@ -487,6 +512,70 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   useEffect(() => {
     loadAgents();
   }, [loadAgents]);
+
+  // The effective front door (docs/design/primary-agent.md, `GET /api/v1/primary`).
+  // ONE read for this view, through the shared client: the panel used to have no
+  // notion of a default at all, so a new chat landed on whichever enabled card
+  // came first in the registry.
+  const [frontDoor, setFrontDoor] = useState<LoadState<PrimaryInfo>>(readLoading<PrimaryInfo>());
+  const loadFrontDoor = useCallback(() => {
+    api
+      .primary()
+      .then((fd) => setFrontDoor(readReady(fd)))
+      // A failed read is NOT "there is no primary" (Home.tsx's rule: a failed
+      // read is not a zero). `readFailed` keeps the last good answer, and
+      // `frontDoorNote` below reports the failure instead of letting the picker
+      // pass for the answer.
+      .catch((e) => setFrontDoor((prev) => readFailed(prev, e)));
+  }, []);
+  useEffect(() => {
+    loadFrontDoor();
+  }, [loadFrontDoor]);
+
+  /** What this view chose by itself, and whether that pick was a FALLBACK
+   *  (step 4 below). Remembered for one reason: a front-door read that failed
+   *  and is then retried successfully may re-decide — but only while the chat is
+   *  still untouched. Once a conversation exists, the agent under it is not the
+   *  panel's to change. */
+  const autoPickRef = useRef<{ name: string; fallback: boolean } | null>(null);
+  /** Set when the USER picks an agent. From then on the front door decides the
+   *  next NEW chat and never the one they just chose. */
+  const userPickedRef = useRef(false);
+
+  /** Where a NEW chat lands (docs/design/primary-agent.md § Panel):
+   *
+   *    1. `?agent=` — the user named an agent. Nothing outranks it.
+   *    2. an OPEN conversation — it keeps the agent it was created with. The
+   *       front door is a default for the NEXT chat; switching the one being
+   *       read would rewrite history under the user (`openPast` sets `agent`
+   *       from the entry it opens, and that decision must survive this effect).
+   *    3. the EFFECTIVE front door — who actually answers, which is what makes
+   *       the picker step disappear.
+   *    4. the first enabled card — today's behaviour, kept as the last resort so
+   *       an install with no front door can still be used.
+   *
+   *  A FAILED front-door read takes step 4 and SAYS SO (`frontDoorNote`): the
+   *  fallback is honest about being one, instead of reading as "this platform has
+   *  no primary" — the shape Home.tsx refuses for every gauge on the dashboard. */
+  useEffect(() => {
+    if (!agents) return; // the registry is still loading
+    if (explicitAgent && agents.some((a) => a.name === explicitAgent)) return; // 1
+    if (userPickedRef.current) return;
+    if (chatIdRef.current) return; // 2 — a conversation is open
+    // Step 3 waits for the read to SETTLE. Defaulting now and overriding a
+    // frame later would show two different agents in the picker before the user
+    // has typed a character.
+    if (frontDoor.kind === "loading") return;
+    const prev = autoPickRef.current;
+    const mayRedecide = !!prev?.fallback && messages.length === 0 && agent === prev.name;
+    if (prev && !mayRedecide) return;
+    const named = frontDoor.kind === "ready" ? frontDoor.data.name : null;
+    const hit = named ? agents.find((a) => a.name === named) : undefined;
+    const pick = hit?.name ?? agents[0]?.name ?? "";
+    if (!pick) return;
+    autoPickRef.current = { name: pick, fallback: !hit };
+    setAgent(pick);
+  }, [agents, agent, explicitAgent, frontDoor, messages]);
 
   // Session options for the selected agent: the daemon's cached catalog
   // (instant after restart), read for the CURRENT engine — model
@@ -975,6 +1064,9 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
    * conversation continues across engines (claude-code ↔ dsh ↔ …).
    * Without a live chat it is just a different default pick. */
   const switchAgent = async (name: string) => {
+    // The user is in charge of this view from now on: the front door decides
+    // the NEXT new chat, never the pick they just made.
+    userPickedRef.current = true;
     if (chatId && !streaming) {
       try {
         const r = await api.chatHandoff(chatId, name);
@@ -1537,11 +1629,119 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
   const windowOffset = showAll ? 0 : Math.max(0, messages.length - MSG_CAP);
   const shownMessages = showAll ? messages : messages.slice(-MSG_CAP);
 
+  // ── Who will answer me ────────────────────────────────────────────────────
+  // ONE answer, read from `GET /api/v1/primary`, and every sentence below is
+  // about THAT answer — never about the flag alone. The two sources can
+  // disagree (routing.toml's `default` outranks the `primary` flag in the
+  // cascade), and the disagreement is the thing the user cannot work out by
+  // looking at the picker: they marked an agent primary and someone else
+  // answers. Naming only one of the two sources is what makes that look broken.
+  const fd = frontDoor.kind === "ready" ? frontDoor.data : null;
+  /** Every reason the daemon gave for its answer, verbatim. It is data (the
+   *  daemon's own sentence), not a string this view owns — the framing around it
+   *  is what goes through i18n. */
+  const fdWhy = (fd?.why ?? "").trim();
+  const fdName = fd?.name ?? null;
+  const fdUsable = !!fdName && agents.some((a) => a.name === fdName);
+  /** BOTH sources are named when they disagree — that is the sentence the user
+   *  needs after marking a primary and still being answered by someone else, and
+   *  naming only the winner is what makes it look like the flag did nothing.
+   *  `flaggedPrimary` comes from the unfiltered registry, so a flag on a disabled
+   *  agent counts as a disagreement too (the daemon's `why` says which). */
+  const conflict = !!fdName && !!flaggedPrimary && flaggedPrimary !== fdName;
+  /** `?agent=` named something this registry cannot run (disabled or gone). The
+   *  request is not silently dropped: it is reported, and the picker shows what
+   *  actually got chosen instead. */
+  const explicitUnusable =
+    !!explicitAgent && !agents.some((a) => a.name === explicitAgent);
+
+  const noteBox = (line: string, detail?: string) => (
+    <div className="chat-primary-note">
+      <span className="micro muted">{line}</span>
+      {detail ? <span className="micro muted"> — {detail}</span> : null}
+    </div>
+  );
+
+  /** The note above the composer. Ordered by what the user must know FIRST:
+   *  a failed read outranks everything (it invalidates the rest), then an
+   *  unusable `?agent=`, then the reason there is no front door, then the two
+   *  sources disagreeing, then — with a conversation open — that this
+   *  conversation keeps ITS agent while new ones land elsewhere. */
+  const frontDoorNote = (() => {
+    if (frontDoor.kind === "error") {
+      // A failed read is NOT "no primary" (Home.tsx: a failed read is not a
+      // zero). The picker below is showing a FALLBACK, and this says so.
+      return (
+        <ErrorState
+          title={t("chat.primary.err")}
+          hint={`${t("chat.primary.err.hint")}${
+            String(frontDoor.err ?? "").trim()
+              ? ` — ${String(frontDoor.err).trim().slice(0, 200)}`
+              : ""
+          }`}
+          onRetry={loadFrontDoor}
+          retryLabel={t("common.retry")}
+        />
+      );
+    }
+    // `agent` empty = the landing rule has not run yet, so the note waits for a
+    // fallback that exists instead of naming one it would have to guess.
+    if (explicitUnusable && agent) {
+      return noteBox(
+        t("chat.primary.explicitMissing", { name: explicitAgent, fallback: agent }),
+      );
+    }
+    if (fd && fdName === null) {
+      return noteBox(
+        t("chat.primary.none"),
+        fdWhy ? t("chat.primary.why", { why: fdWhy }) : undefined,
+      );
+    }
+    if (fd && fdName && !fdUsable) {
+      return noteBox(
+        t("chat.primary.unusable", { name: fdName }),
+        fdWhy ? t("chat.primary.why", { why: fdWhy }) : undefined,
+      );
+    }
+    if (conflict) {
+      return noteBox(
+        t("chat.primary.conflict", { flag: flaggedPrimary ?? "", name: fdName ?? "" }),
+        fdWhy ? t("chat.primary.why", { why: fdWhy }) : undefined,
+      );
+    }
+    if (fdName && chatId && agent && agent !== fdName) {
+      return noteBox(t("chat.primary.held", { agent, name: fdName }));
+    }
+    return null;
+  })();
+
+  /** One row of the agent picker. The front door is MARKED (docs/design/
+   *  primary-agent.md § Panel: the primary must be identifiable in the UI), and
+   *  the mark follows the agent that ANSWERS rather than the flag: when the two
+   *  sources disagree, marking the flag would point at an agent that will not
+   *  answer. The tooltip carries the daemon's own sentence, so the mark is
+   *  explainable without leaving the picker. */
+  const agentOption = (a: AgentInfo) => ({
+    value: a.name,
+    label: (
+      <span className="sel-opt">
+        <BrandMark harness={a.harness} size={13} mono fallback="bot" />
+        {a.name}
+        {a.name === fdName ? (
+          <span className="micro muted" title={fdWhy || t("chat.primary.tag.title")}>
+            · {t("chat.primary.tag")}
+          </span>
+        ) : null}
+      </span>
+    ),
+  });
+
   /** The composer unit: input row + hairline-divided controls row (agent,
    * model, mode/effort, project). Rendered centered when the conversation
    * is empty, sticky at the bottom once it has messages. */
   const composerBlock = (
     <div className="chat-bottom">
+      {frontDoorNote}
       {sendError ? (
         <ErrorState
           title={t("common.offline")}
@@ -1624,30 +1824,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             }}
             disabled={streaming}
             options={[
-              ...agents
-                .filter((a) => isRoleAgent(a))
-                .map((a) => ({
-                  value: a.name,
-                  label: (
-                    <span className="sel-opt">
-                      <BrandMark harness={a.harness} size={13} mono fallback="bot" />
-                      {a.name}
-                    </span>
-                  ),
-                })),
+              ...agents.filter((a) => isRoleAgent(a)).map(agentOption),
               {
                 label: t("chat.runtimeGroup"),
-                options: agents
-                  .filter((a) => !isRoleAgent(a))
-                  .map((a) => ({
-                    value: a.name,
-                    label: (
-                      <span className="sel-opt">
-                        <BrandMark harness={a.harness} size={13} mono fallback="bot" />
-                        {a.name}
-                      </span>
-                    ),
-                  })),
+                options: agents.filter((a) => !isRoleAgent(a)).map(agentOption),
               },
             ]}
           />

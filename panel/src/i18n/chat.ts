@@ -83,6 +83,20 @@ export const zh: Record<string, string> = {
   "chat.historyEmpty": "还没有和它聊过——开始第一段对话吧。在线的会话点开即恢复，已结束的只读查看。",
   "chat.sync": "同步模型目录",
   "chat.syncedAt": "目录同步于",
+
+  // 主智能体（docs/design/primary-agent.md § Panel）：谁默认回答你。
+  // 「主」标在实际会回答你的那个 agent 上（effective front door），不是只标
+  // primary 标记——两者不一致时，标标记会指向一个不会回答你的人。
+  "chat.primary.tag": "主智能体",
+  "chat.primary.tag.title": "新会话默认落在它上面：这台 daemon 现在实际会回答你的智能体",
+  "chat.primary.why": "原因：{why}",
+  "chat.primary.none": "没有可用的主智能体——先选一个开始对话。把一个角色标成 primary = true（或用 agent_set_primary），这一步以后就不必再选。",
+  "chat.primary.unusable": "主智能体是 {name}，但它已被禁用或不在注册表里，只能先选一个开始。",
+  "chat.primary.conflict": "primary 标记是 `{flag}`，但实际回答你的是 `{name}`——routing.toml 的默认排在 primary 标记之前。",
+  "chat.primary.held": "本会话保持创建时的 {agent}；新会话会落在 {name}。",
+  "chat.primary.explicitMissing": "链接里指定的 ?agent={name} 不可用（已禁用或不存在），已回落到 {fallback}。",
+  "chat.primary.err": "读不到主智能体（/api/v1/primary 失败）",
+  "chat.primary.err.hint": "选择器里显示的是回落项——这不等于「没有主智能体」，只是这次没读到。",
 };
 
 export const en: Record<string, string> = {
@@ -163,4 +177,19 @@ export const en: Record<string, string> = {
   "chat.historyEmpty": "Nothing yet — start the first conversation. Live chats reattach and stream; closed ones open read-only.",
   "chat.sync": "Sync model catalog",
   "chat.syncedAt": "Catalog synced",
+
+  // The primary agent (docs/design/primary-agent.md § Panel): who answers you
+  // by default. The mark follows the agent that ACTUALLY answers (the effective
+  // front door), not the flag alone — when the two disagree, marking the flag
+  // would point at an agent that will not answer.
+  "chat.primary.tag": "primary",
+  "chat.primary.tag.title": "New chats land on this agent: it is the one that actually answers you on this daemon",
+  "chat.primary.why": "Reason: {why}",
+  "chat.primary.none": "No usable primary agent — pick one to start. Mark a role `primary = true` (or use agent_set_primary) and this step goes away.",
+  "chat.primary.unusable": "The primary agent is {name}, but it is disabled or not in the registry, so pick one to start for now.",
+  "chat.primary.conflict": "The primary flag is `{flag}`, but `{name}` is the one that actually answers you — routing.toml's default ranks above the flag.",
+  "chat.primary.held": "This conversation keeps {agent} from when it was created; new chats will land on {name}.",
+  "chat.primary.explicitMissing": "The link asked for ?agent={name}, which is unavailable (disabled or missing); fell back to {fallback}.",
+  "chat.primary.err": "Cannot read the primary agent (/api/v1/primary failed)",
+  "chat.primary.err.hint": "The picker is showing a fallback — that is not the same as \"there is no primary\"; this read simply failed.",
 };

@@ -24,6 +24,38 @@ export interface AgentInfo {
    *  "runtime" — claude-code/dsh/opencode, the execution backends. */
   kind?: "role" | "runtime";
   command?: string | null;
+  /** The agent `agents.toml` marks `primary = true` (docs/design/primary-agent.md).
+   *  OPTIONAL on purpose: a daemon older than the field omits it, and "the flag
+   *  was not reported" must never be read as "this agent is primary" nor as
+   *  "some other agent is". The flag also does not say who ANSWERS — routing.toml's
+   *  `default` outranks it, and `/api/v1/primary` is the one answer to that. */
+  primary?: boolean;
+}
+
+/** `GET /api/v1/primary` — the EFFECTIVE front door, not merely the flag.
+ *
+ *  Everything the panel shows about "who will answer me" reads this, because the
+ *  cascade puts routing.toml's `default` ABOVE the `primary` flag: a config whose
+ *  two sources disagree answers with the routing default while the flag names
+ *  someone else. `why` states the source, and states the disagreement in as many
+ *  words when there is one — exactly the sentence the user needs after setting a
+ *  primary and seeing nothing change.
+ *
+ *  `name: null` is a definite answer ("there is no front door") and NOT a
+ *  failure: a failed read rejects, like every other wrapper in this file, so a
+ *  caller cannot render "the daemon is down" as "there is no primary". */
+export interface PrimaryInfo {
+  name: string | null;
+  /** The front-door card's id, when the daemon resolved one. */
+  id?: string | null;
+  /** `"routing-default"` | `"primary-flag"` — the cascade step that actually
+   *  produced `name`. Optional: the view branches on `name` and `why`, and a
+   *  daemon that does not send it must not break the page. */
+  source?: string | null;
+  /** The daemon's own sentence: which source answered and, when they disagree,
+   *  which other source it overrode. The panel's only explanation when `name`
+   *  is null. */
+  why?: string | null;
 }
 
 /** Two-layer model (user ruling 2026-09-17): a card with a role prompt or
@@ -1355,6 +1387,26 @@ async function getChecked<T>(
   return expectShape<T>(path, await get<unknown>(path), spec, element);
 }
 
+/** `/api/v1/primary` checks its OWN contract, and it cannot use `expectShape`:
+ *  its `name` is LEGALLY null (that is the "no front door" answer), while every
+ *  `Shape` in that helper treats null as a missing field. So: an object, `name`
+ *  a string or null, `why` a string when present. A malformed 200 must reach the
+ *  view's error state rather than being rendered as "no primary" — the whole
+ *  point of this endpoint is that its answer is a fact. */
+const primaryShape = (data: unknown): PrimaryInfo => {
+  const bad: string[] = [];
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    bad.push("body is not an object");
+  } else {
+    const o = data as Record<string, unknown>;
+    if (o.name !== null && typeof o.name !== "string") bad.push('"name" is not a string or null');
+    if (o.why != null && typeof o.why !== "string") bad.push('"why" is not a string');
+    if (o.source != null && typeof o.source !== "string") bad.push('"source" is not a string');
+  }
+  if (bad.length) throw new Error(`/api/v1/primary: malformed response, ${bad.join("; ")}`);
+  return data as PrimaryInfo;
+};
+
 /** `/api/v1/capabilities` answers the SAME payload to GET and PUT (design
  *  §14.1/§14.2), so both wrappers assert one shape. Every field the settings
  *  card reads is asserted: `tier`/`configured` are the strings it branches on,
@@ -1434,6 +1486,11 @@ async function getText(path: string): Promise<string> {
 export const api = {
   // agents + stats
   agents: () => get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents),
+  /** The one answer to "who will answer me" (docs/design/primary-agent.md).
+   *  ONE read for the whole shell: the chat view asks, and nothing else does —
+   *  two readers of one fact is how the sider badge and the dashboard start
+   *  disagreeing. A failure REJECTS; it is never an empty answer. */
+  primary: () => get<unknown>("/api/v1/primary").then(primaryShape),
   agentOptions: (name: string, refresh?: boolean, runtime?: string) =>
     get<AgentOptions>(
       `/api/v1/agents/${name}/options` +
