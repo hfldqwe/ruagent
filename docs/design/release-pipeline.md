@@ -71,6 +71,17 @@ passed a tampered or half-written file just as happily. Writing one wrong digest
 the run into `panel/dist/index.html: FAILED` + `SMOKE FAILED: the archive SHA256SUMS does not match the
 files it shipped`, exit 1.
 
+
+**A model download must not read as a broken archive** (v0.1.3's Windows leg). The daemon's boot path tries
+the ONNX-backed FastEmbedder, which downloads its model on first use (`crates/daemon/src/lib.rs`), so a cold
+runner whose model host is slow can spend the whole health budget downloading. On v0.1.3 that produced
+`no 200 from .../api/v1/health within 120 s` on Windows while the SAME bytes passed on Linux and macOS in the
+same run, with the daemon log stopping right after `agent registry loaded` -- i.e. a red that named a network
+fact, in the one script whose job is to judge the archive. Re-running the failed job on the same tree passed,
+which is what makes this a transient rather than a defect. The budget is now 240 s, and a timeout retries once
+with `RUAGENT_EMBEDDER=hash`, printing a WARN that names exactly which reading was lost; only a daemon that
+cannot boot either way fails the gate.
+
 `smoke-archive.sh` runs on both Linux and macOS, which is not free: `sha256sum` is GNU (macOS has
 `shasum -a 256`), `xargs -r` is GNU (BSD xargs does not have it), `timeout` is absent on macOS, `seq` is not
 guaranteed, and bash there is 3.2 (no arrays, no `${x,,}`, no `mapfile`). Each is either probed with a
