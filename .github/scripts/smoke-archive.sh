@@ -48,7 +48,7 @@ set -uo pipefail
 
 archive=""
 exe_name="ruagent"
-boot_timeout=120
+boot_timeout=240
 while [ $# -gt 0 ]; do
   case "$1" in
     --archive) archive="${2:-}"; shift 2 ;;
@@ -159,26 +159,43 @@ case "$port" in
   ''|*[!0-9]*) fail "cannot obtain a free loopback port: neither python3 nor perl is on PATH. This script refuses to guess a port, because a collision would turn a packaging bug into a flaky red." ;;
 esac
 base="http://127.0.0.1:$port"
-echo "starting: $exe_name serve --addr 127.0.0.1:$port --root $root"
-"$stage/$exe_name" serve --addr "127.0.0.1:$port" --root "$root" >"$stage/daemon.out.log" 2>"$stage/daemon.err.log" &
-daemon_pid=$!
+# Boot the daemon and wait up to $1 seconds for /api/v1/health. Returns 0 when it answered.
+boot_and_wait() {
+  "$stage/$exe_name" serve --addr "127.0.0.1:$port" --root "$root" >"$stage/daemon.out.log" 2>"$stage/daemon.err.log" &
+  daemon_pid=$!
+  code=""
+  deadline=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+      echo 'daemon stdout:'; tail -20 "$stage/daemon.out.log"
+      echo 'daemon stderr:'; tail -20 "$stage/daemon.err.log"
+      fail "the daemon exited before answering /api/v1/health"
+    fi
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$base/api/v1/health" 2>/dev/null)"
+    [ "$code" = "200" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
 
-code=""
-deadline=$(( $(date +%s) + boot_timeout ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+echo "starting: $exe_name serve --addr 127.0.0.1:$port --root $root"
+if ! boot_and_wait "$boot_timeout"; then
+  # The boot path tries the ONNX-backed FastEmbedder, which DOWNLOADS its model on first use
+  # (crates/daemon/src/lib.rs). A cold runner whose model host is slow or blocked can spend the
+  # whole budget downloading -- a fact about the network, not about the archive this script is
+  # here to vet. So: say the reading was lost, retry with the offline embedder, and fail only if
+  # the daemon still cannot boot.
+  echo "WARN: no 200 from $base/api/v1/health within ${boot_timeout}s (last: ${code:-<none>})."
+  echo "WARN: retrying with RUAGENT_EMBEDDER=hash -- a model download is not part of what this archive promises."
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  export RUAGENT_EMBEDDER=hash
+  boot_and_wait 120 || {
     echo 'daemon stdout:'; tail -20 "$stage/daemon.out.log"
     echo 'daemon stderr:'; tail -20 "$stage/daemon.err.log"
-    fail "the daemon exited before answering /api/v1/health"
-  fi
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$base/api/v1/health" 2>/dev/null)"
-  [ "$code" = "200" ] && break
-  sleep 0.5
-done
-if [ "$code" != "200" ]; then
-  echo 'daemon stdout:'; tail -20 "$stage/daemon.out.log"
-  echo 'daemon stderr:'; tail -20 "$stage/daemon.err.log"
-  fail "no 200 from $base/api/v1/health within ${boot_timeout}s (last: ${code:-<none>})"
+    fail "no 200 from $base/api/v1/health within ${boot_timeout}s, nor within 120s with RUAGENT_EMBEDDER=hash: the archive does not boot"
+  }
+  echo "WARN: it booted with the offline hash embedder; the fastembed reading was lost to this attempt, not to the archive."
 fi
 echo "GET /api/v1/health -> 200 $(curl -s --max-time 5 "$base/api/v1/health" | tr -d '\n')"
 

@@ -29,7 +29,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Archive,
     [string]$Exe = 'ruagent.exe',
-    [int]$BootTimeoutSeconds = 120
+    [int]$BootTimeoutSeconds = 240
 )
 
 $ErrorActionPreference = 'Stop'
@@ -106,25 +106,41 @@ try {
     $base = "http://127.0.0.1:$port"
     $outLog = Join-Path $stage 'daemon.out.log'
     $errLog = Join-Path $stage 'daemon.err.log'
-    Write-Output "starting: $Exe serve --addr 127.0.0.1:$port --root $root"
-    $daemon = Start-Process -FilePath $exePath -ArgumentList @('serve', '--addr', "127.0.0.1:$port", '--root', $root) -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    # Boot the daemon and wait up to $Seconds for /api/v1/health. $true when it answered.
+    function Start-AndWait([int]$Seconds) {
+        $script:daemon = Start-Process -FilePath $exePath -ArgumentList @('serve', '--addr', "127.0.0.1:$port", '--root', $root) -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+        $script:health = $null
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            if ($script:daemon.HasExited) {
+                if (Test-Path $outLog) { Write-Output 'daemon stdout:'; Get-Content $outLog -Tail 20 }
+                if (Test-Path $errLog) { Write-Output 'daemon stderr:'; Get-Content $errLog -Tail 20 }
+                Stop-With "the daemon exited (code $($script:daemon.ExitCode)) before answering /api/v1/health"
+            }
+            try { $script:health = Invoke-WebRequest -Uri "$base/api/v1/health" -UseBasicParsing -TimeoutSec 5 } catch { $script:health = $null }
+            if ($script:health -and ($script:health.StatusCode -eq 200)) { return $true }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
+    }
 
-    $health = $null
-    $deadline = (Get-Date).AddSeconds($BootTimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if ($daemon.HasExited) {
+    Write-Output "starting: $Exe serve --addr 127.0.0.1:$port --root $root"
+    if (-not (Start-AndWait $BootTimeoutSeconds)) {
+        # The boot path tries the ONNX-backed FastEmbedder, which DOWNLOADS its model on first use
+        # (crates/daemon/src/lib.rs). A cold runner whose model host is slow or blocked can spend the
+        # whole budget downloading -- a fact about the network, not about the archive this script is
+        # here to vet. So: say the reading was lost, retry with the offline embedder, and fail only if
+        # the daemon still cannot boot.
+        Write-Output "WARN: no 200 from $base/api/v1/health within $BootTimeoutSeconds s -- retrying with RUAGENT_EMBEDDER=hash"
+        Write-Output 'WARN: a model download is not part of what this archive promises.'
+        if (-not $script:daemon.HasExited) { Stop-Process -Id $script:daemon.Id -Force -ErrorAction SilentlyContinue }
+        $env:RUAGENT_EMBEDDER = 'hash'
+        if (-not (Start-AndWait 120)) {
             if (Test-Path $outLog) { Write-Output 'daemon stdout:'; Get-Content $outLog -Tail 20 }
             if (Test-Path $errLog) { Write-Output 'daemon stderr:'; Get-Content $errLog -Tail 20 }
-            Stop-With "the daemon exited (code $($daemon.ExitCode)) before answering /api/v1/health"
+            Stop-With "no 200 from $base/api/v1/health within $BootTimeoutSeconds s, nor within 120 s with RUAGENT_EMBEDDER=hash: the archive does not boot"
         }
-        try { $health = Invoke-WebRequest -Uri "$base/api/v1/health" -UseBasicParsing -TimeoutSec 5 } catch { $health = $null }
-        if ($health -and ($health.StatusCode -eq 200)) { break }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not ($health -and ($health.StatusCode -eq 200))) {
-        if (Test-Path $outLog) { Write-Output 'daemon stdout:'; Get-Content $outLog -Tail 20 }
-        if (Test-Path $errLog) { Write-Output 'daemon stderr:'; Get-Content $errLog -Tail 20 }
-        Stop-With "no 200 from $base/api/v1/health within $BootTimeoutSeconds s"
+        Write-Output 'WARN: it booted with the offline hash embedder; the fastembed reading was lost to this attempt, not to the archive.'
     }
     Write-Output ("GET /api/v1/health -> 200 " + $health.Content)
 
