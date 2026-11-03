@@ -111,16 +111,34 @@ mistaken for the flag.
   An unknown key is a 400 (a typo must not look like a successful write). The reply is the resulting
   `{default, routes}` view plus `takes_effect`, and it applies to the next run.
 
-## MCP tools (v1)
+## MCP tools
 
-The primary can only operate the platform if it has hands. Four tools, deliberately few:
+The primary can only operate the platform if it has hands. Seven tools, in two groups -- deliberately few,
+because every tool is a surface the model has to read before it can act, and a long catalogue of near-durable
+operations is how an agent ends up paraphrasing instead of reading.
+
+**The front door and the agents it can point at:**
 
 | tool | kind | what it does |
 | --- | --- | --- |
 | `agents_list` | read | every agent: name, id, kind, enabled, `primary`, model, description |
-| `agent_set_primary` | write | mark one agent primary (atomic swap), or clear with `none` |
+| `agent_set_primary` | write | mark one agent primary -- ONE call to `PUT /api/v1/primary`, which writes both carriers |
 | `routing_show` | read | the `default` and the rules, as the cascade sees them |
-| `routing_set_default` | write | set/clear `routing.toml`'s `default` |
+| `routing_set_default` | write | patch `routing.toml`'s `default` (the patch keeps the rules) |
+| `agent_create` | write | create a role; a role without a prompt is refused by the daemon, so the tool says so |
+| `agent_update` | write | change only the fields given -- an unspecified field is not sent as null |
+| `agent_delete` | write | refuses to delete the current front door, or a runtime another role depends on |
+
+**Handing work to another agent** (this is what makes the front door a front door rather than a chat window):
+
+| tool | kind | what it does |
+| --- | --- | --- |
+| `task_create` | write | create a task; costs no tokens |
+| `task_dispatch` | write | start a run, optionally naming an agent; answers with the resolved agent's NAME, not its ULID |
+| `run_get` | read | a run's status and result -- never blocks waiting for it to finish |
+
+An omitted agent on `task_dispatch` is passed through untouched, so the cascade (and level 4) decides. The
+tool must not guess a default: that would be a second router, disagreeing with the first.
 
 Rules these tools follow, matching `capability_set`'s precedent: the reply is the full post-change state
 (so the caller reads one answer instead of calling again), a refusal explains WHY, and anything that spends
