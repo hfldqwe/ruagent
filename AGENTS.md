@@ -485,3 +485,18 @@ run Playwright through the repo entry point (`node e2e/run-e2e.mjs`) rather than
 `npx playwright test` (which goes through a `cmd.exe` shim), have a probe close its own
 browser, and at the start of the next call look for orphans **by command line matching
 your own temporary path** -- never by process name or by port.
+
+- **The front door has three invariants; breaking any of them is silent** (`docs/design/primary-agent.md`,
+  ruagent / primary-agent work). (a) The primary is **explicit and resolvable by name**: the `primary = true`
+  flag lives in `agents.toml`, resolves to a REGISTRY card, and every recorded decision carries that card's own
+  id -- this is the t43 lesson, whose deleted `default_agent()` is documented at `crates/daemon/src/config.rs`.
+  (b) There is **one answer to "who will answer me"**: `routing.toml`'s `default` outranks the flag, so
+  `GET /api/v1/primary` reports the EFFECTIVE front door and says which carrier produced it; an API that only
+  reported the flag would let a user set a primary and see nothing change. (c) There is **one write**
+  (`PUT /api/v1/primary`), because a two-write rule duplicated into every client is a rule that will one day be
+  half-applied. Two agents marked primary is a LOAD ERROR naming both -- a tie broken by file order is (a)
+  happening again. A marked-but-disabled primary declines out loud, and only the last-resort fallback still
+  consults the permission approver (`api.rs::default_route_agent`), because a `routing.toml` default is the
+  operator's deliberate choice. Measured, not designed: the seed marks `claude` and `routing.toml` already names
+  it, so a fresh install HAS a front door without changing who answers; a run started with no agent named lands
+  on the flag at level 4 with `rationale = PRIMARY agent ...` and the registry id in `params.agent`.
