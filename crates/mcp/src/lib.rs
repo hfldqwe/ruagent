@@ -785,7 +785,7 @@ impl PlatformTools {
     }
 
     #[tool(
-        description = "Set or clear routing.toml's default -- the agent that answers when no rule matches (level 3 of the cascade, ABOVE the primary marker). WHEN: the user wants a specific agent to answer by default and there are project/title rules they want to KEEP; or when the rule and the marker disagree and they want the rule to name someone. COST: free (zero model tokens) -- a configuration write; no model is called. THIS CHANGES WHO ANSWERS THE USER: say it out loud first -- which agent, and that this level outranks the primary marker -- and only then call this. THE RULES SURVIVE: the daemon's PUT replaces the WHOLE routing file, so this tool reads the current routing first and re-sends its rules with the new default (a default-only write would silently delete every rule). An unknown agent is refused (400, with the known names) and the file is left alone. Pass name=none (or an empty string) to clear the default, which lets the primary marker decide again. The reply is the post-change default, the rules that survived, and the effective front door; it takes effect on the NEXT run."
+        description = "Set or clear routing.toml's default -- the agent that answers when no rule matches (level 3 of the cascade, ABOVE the primary marker). WHEN: the user wants a specific agent to answer by default and there are project/title rules they want to KEEP; or when the rule and the marker disagree and they want the rule to name someone. COST: free (zero model tokens) -- a configuration write; no model is called. THIS CHANGES WHO ANSWERS THE USER: say it out loud first -- which agent, and that this level outranks the primary marker -- and only then call this. THE RULES SURVIVE ON THEIR OWN: the daemon's PUT is a PATCH -- an omitted key keeps its current value and only an explicit `routes: []` clears the rules -- so this tool sends `default` and NOTHING else, and never re-sends the user's rules, which are not its to rewrite. An unknown agent is refused (400, with the known names) and the file is left alone. Pass name=none (or an empty string) to clear the default, which lets the primary marker decide again; the clear travels as an EXPLICIT empty value, because an omitted key would mean leave the default alone. The reply is the post-change default, the rules as the daemon now holds them (unchanged unless you asked otherwise), and the effective front door; it takes effect on the NEXT run."
     )]
     async fn routing_set_default(
         &self,
@@ -793,25 +793,19 @@ impl PlatformTools {
     ) -> Result<String, rmcp::ErrorData> {
         let what = "routing_set_default";
         let url = format!("{}/api/v1/routing", self.config.daemon_url);
-        // READ-MODIFY-WRITE, for the reason capability_set states: the daemon's PUT REPLACES the
-        // whole file, so a body carrying only default would take the rules with it (they
-        // deserialize to an empty list) and the user would find their routing silently dropped.
-        let current = json_of(self.http.get(&url), what, &self.config.daemon_url).await?;
+        // ONE KEY, PATCH SEMANTICS (t62). This used to GET the current view and re-send its rules
+        // because the daemon's PUT replaced the whole file; PUT is a patch now (an omitted key is
+        // kept, `routes: []` clears the rules), so all that detour did was write the user's rules
+        // back on their behalf -- a rewrite nobody asked for.
         let clear = params.name.eq_ignore_ascii_case("none") || params.name.is_empty();
-        let default = if clear {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!(params.name.as_str())
-        };
-        let routes = current
-            .get("routes")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
+        // AN EXPLICIT EMPTY VALUE, NEVER AN OMITTED KEY: to this endpoint an omitted `default`
+        // means "leave it alone", so dropping the key for `none` would be a silent no-op that
+        // looks like a successful clear.
+        let default = if clear { "" } else { params.name.as_str() };
         let resp = json_of(
-            self.http.put(&url).json(&serde_json::json!({
-                "default": default,
-                "routes": routes,
-            })),
+            self.http
+                .put(&url)
+                .json(&serde_json::json!({ "default": default })),
             what,
             &self.config.daemon_url,
         )
