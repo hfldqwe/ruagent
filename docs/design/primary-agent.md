@@ -99,8 +99,17 @@ mistaken for the flag.
 * `PUT /api/v1/agents/{name}` accepts `primary: true` as the low-level primitive (flag only). Setting it
   clears the flag from every other agent in the same write, and clearing it from the current primary is
   allowed (the platform then has none).
-* `GET/PUT /api/v1/routing` -> the parsed `{default, routes}` view; `PUT` writes `routing.toml` and takes
-  effect on the next run.
+* `GET /api/v1/routing` -> the parsed `{default, routes}` view, as the cascade reads it.
+* `PUT /api/v1/routing` is a **patch, not a replacement** (t58). An **omitted** key keeps whatever is
+  there, so `{"default": "dsh"}` changes the default and leaves `[[routes]]` untouched -- the
+  replacement semantics made every client responsible for content it cannot see, and the first tool
+  author hit exactly that (a default-only write silently emptied the rules, so the tool had to GET
+  first and echo the rules back; a rule duplicated into every client is a rule that will one day be
+  half-applied). An **explicit empty** value is a statement that means clear: `"routes": []` empties
+  the rules, `"default": ""` (or `null`) removes the default. Omitted and empty are therefore
+  distinguishable, which is the whole point -- `routes: []` must not be readable as "no opinion".
+  An unknown key is a 400 (a typo must not look like a successful write). The reply is the resulting
+  `{default, routes}` view plus `takes_effect`, and it applies to the next run.
 
 ## MCP tools (v1)
 

@@ -566,7 +566,20 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
     // frame later would show two different agents in the picker before the user
     // has typed a character.
     if (frontDoor.kind === "loading") return;
-    const prev = autoPickRef.current;
+    // An EMPTY pick is never a decision. `loadAgents` drops a pick that left the
+    // registry, and a ref that still claims "I already decided <name>" would then
+    // be guarding a name that no longer exists — the early return below would
+    // leave the picker empty with nothing explaining it (front-door audit F7). The
+    // claim is about a NAME, so when the name is gone the claim goes with it and
+    // the rule decides again. Measured while writing this (see the t60 probe): a
+    // plain navigation round-trip ALREADY re-landed, because App unmounts this
+    // view and the ref dies with the mount — this keeps the rule true for the day
+    // that changes, and for any other path that clears the pick.
+    let prev = autoPickRef.current;
+    if (prev && !agent) {
+      autoPickRef.current = null;
+      prev = null;
+    }
     const mayRedecide = !!prev?.fallback && messages.length === 0 && agent === prev.name;
     if (prev && !mayRedecide) return;
     const named = frontDoor.kind === "ready" ? frontDoor.data.name : null;
@@ -1684,6 +1697,18 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
         />
       );
     }
+    // AN EMPTY PICKER IS NEVER SILENT (front-door audit F7). The Select looks the
+    // same in all three states below and they mean three different things, so the
+    // sentence is the only thing that tells them apart — and the last one is why
+    // this branch exists at all: measured before it, with every card disabled, the
+    // note read "只能先选一个开始" next to a picker that had nothing to pick.
+    if (!agent) {
+      if (frontDoor.kind === "loading") return noteBox(t("chat.primary.landing"));
+      if (agents.length === 0) {
+        return noteBox(t("chat.primary.noAgents"), t("chat.primary.noAgents.hint"));
+      }
+      return noteBox(t("chat.primary.noPick"), t("chat.primary.noPick.hint", { n: agents.length }));
+    }
     // `agent` empty = the landing rule has not run yet, so the note waits for a
     // fallback that exists instead of naming one it would have to guess.
     if (explicitUnusable && agent) {
@@ -1698,8 +1723,11 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
       );
     }
     if (fd && fdName && !fdUsable) {
+      // Names WHO answers, not just who does not: "pick one to start" was the old
+      // sentence, and it is untrue the moment the landing rule already picked one
+      // (the audit's F7 case) — `agent` is that pick.
       return noteBox(
-        t("chat.primary.unusable", { name: fdName }),
+        t("chat.primary.unusable", { name: fdName, agent }),
         fdWhy ? t("chat.primary.why", { why: fdWhy }) : undefined,
       );
     }
@@ -1801,7 +1829,13 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
             <Button
               type="primary"
               className="send-btn"
-              disabled={streaming || starting || !input.trim() || !!archivedOpen}
+              /* t178's ruling, applied to the picker: a control that cannot act
+                 is disabled next to the note that explains it, not left looking
+                 pressable. `send()` already refuses without an agent, so
+                 without this the button pressed fine and nothing happened —
+                 the silent no-op an empty picker otherwise ends in (front-door
+                 audit F7). */
+              disabled={streaming || starting || !input.trim() || !!archivedOpen || !agent}
               onClick={() => {
                 void send();
               }}
