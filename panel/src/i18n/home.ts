@@ -48,6 +48,19 @@ export const zh: Record<string, string> = {
   "home.guide.inbox": "等待你批准的权限请求（配置审批智能体可无人值守）",
   "home.err": "无法加载平台数据",
   "home.err.hint": "daemon 不可达。读数显示「—」而不是 0：取不到与真的是 0 不是一回事。",
+  // 主智能体：打开面板最该先知道的一件事——现在是谁在回答你。
+  // 说的永远是「实际会回答你的那个」：routing.toml 的 default 排在 primary 标记
+  // 前面，所以只写「主智能体」而不写来源，会在两者不一致时指错人。
+  "home.panel.frontDoor": "主智能体",
+  "home.frontDoor.change": "去换",
+  "home.frontDoor.why": "原因：{why}",
+  "home.frontDoor.source.routing": "来自 routing 默认",
+  "home.frontDoor.source.flag": "来自 primary 标记",
+  "home.frontDoor.source.unknown": "来源未告知",
+  "home.frontDoor.none": "还没有主智能体，新对话会落到第一个启用的智能体。",
+  "home.frontDoor.noneCta": "去 Agents 页设一个",
+  "home.frontDoor.err": "读不到主智能体",
+  "home.frontDoor.err.hint": "这不等于「没有主智能体」——只是这次没读到，所以这里不作任何判断。",
 };
 
 export const en: Record<string, string> = {
@@ -93,4 +106,18 @@ export const en: Record<string, string> = {
   "home.guide.inbox": "Permission requests awaiting you (configure an approver agent for unattended runs)",
   "home.err": "Cannot load platform data",
   "home.err.hint": "The daemon is unreachable. Gauges read “—” rather than 0: “unavailable” and “genuinely zero” are different facts.",
+  // The primary agent: the first thing this page should answer — who replies
+  // when you start typing. Always the agent that ACTUALLY answers:
+  // routing.toml's default outranks the primary flag, so a label without a
+  // source would point at the wrong agent the moment the two disagree.
+  "home.panel.frontDoor": "Primary agent",
+  "home.frontDoor.change": "Change",
+  "home.frontDoor.why": "Reason: {why}",
+  "home.frontDoor.source.routing": "from routing's default",
+  "home.frontDoor.source.flag": "from the primary flag",
+  "home.frontDoor.source.unknown": "source not reported",
+  "home.frontDoor.none": "No primary agent yet — a new chat falls through to the first enabled agent.",
+  "home.frontDoor.noneCta": "Pick one on the Agents page",
+  "home.frontDoor.err": "Cannot read the primary agent",
+  "home.frontDoor.err.hint": "That is not the same as \"there is no primary\" — this read failed, so no claim is made here.",
 };

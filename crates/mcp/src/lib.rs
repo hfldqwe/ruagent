@@ -434,6 +434,188 @@ impl PlatformTools {
         capability_set_to_text(&resp, &params)
     }
 
+    // -- making and changing agents (v3, t54) ---------------------------
+
+    #[tool(
+        description = "Create an AGENT: a role the platform can dispatch work to. WHEN: the user wants a new specialist (a reviewer, a release manager) rather than an existing one, or asks to add an agent with its own prompt. COST: free (zero model tokens) -- it writes a card and starts nothing. A ROLE NEEDS BOTH A PROMPT AND AT LEAST ONE RUNTIME, and the daemon refuses it otherwise: pass prompt (what the role is for) and runtimes (or runtime for the default one); if the platform has no runtime at all, create one first (POST /api/v1/runtimes) -- this tool cannot invent one. CREATING AN AGENT DOES NOT MAKE IT THE FRONT DOOR: the user's next message still reaches whoever answers today, and moving the front door is agent_set_primary, a separate and announced decision. The reply is the new card with its registry id."
+    )]
+    async fn agent_create(
+        &self,
+        Parameters(params): Parameters<AgentCreateParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "agent_create";
+        let url = format!("{}/api/v1/agents", self.config.daemon_url);
+        let mut body = serde_json::Map::new();
+        body.insert("name".to_string(), serde_json::json!(params.name));
+        if let Some(prompt) = params.prompt.as_deref() {
+            body.insert("prompt".to_string(), serde_json::json!(prompt));
+        }
+        if let Some(description) = params.description.as_deref() {
+            body.insert("description".to_string(), serde_json::json!(description));
+        }
+        if let Some(runtimes) = params.runtimes.as_ref() {
+            body.insert("runtimes".to_string(), serde_json::json!(runtimes));
+        }
+        if let Some(runtime) = params.runtime.as_deref() {
+            body.insert("runtime".to_string(), serde_json::json!(runtime));
+        }
+        if let Some(model) = params.model.as_deref() {
+            body.insert("model".to_string(), serde_json::json!(model));
+        }
+        let resp = json_of(
+            self.http.post(&url).json(&serde_json::Value::Object(body)),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        agent_card_to_text(what, "created", &resp)
+    }
+
+    #[tool(
+        description = "Change an EXISTING agent: prompt, description, model, mcp profile, runtimes, default runtime, enabled. WHEN: the user says a role should be sharper, cheaper, use another model, or stop being offered. COST: free (zero model tokens) -- a config write, no run and no model call. THIS CAN CHANGE HOW THE USER IS ANSWERED: the prompt and the model are what an agent's answers are made of, and enabled=false can take it out of the routing cascade entirely -- say what you are changing out loud before you write, especially when the agent you are editing is the front door (GET /api/v1/primary names it). ONLY THE FIELDS YOU PASS ARE SENT: everything else keeps its current value, so a one-field change cannot blank the rest of the card. The front-door MARKER is not settable here on purpose -- agent_set_primary is the one write that changes who answers, because it writes the marker and routing.toml together. The reply is the full post-change card."
+    )]
+    async fn agent_update(
+        &self,
+        Parameters(params): Parameters<AgentUpdateParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "agent_update";
+        let url = format!("{}/api/v1/agents/{}", self.config.daemon_url, params.name);
+        // ONLY WHAT THE CALLER SET (t54). The daemon's PUT is a patch, and the difference matters:
+        // serialising this struct wholesale would send null for every unmentioned field and clear
+        // the card instead of editing one thing.
+        let mut body = serde_json::Map::new();
+        if let Some(prompt) = params.prompt.as_deref() {
+            body.insert("prompt".to_string(), serde_json::json!(prompt));
+        }
+        if let Some(description) = params.description.as_deref() {
+            body.insert("description".to_string(), serde_json::json!(description));
+        }
+        if let Some(model) = params.model.as_deref() {
+            body.insert("model".to_string(), serde_json::json!(model));
+        }
+        if let Some(profile) = params.mcp_profile.as_deref() {
+            body.insert("mcp_profile".to_string(), serde_json::json!(profile));
+        }
+        if let Some(runtimes) = params.runtimes.as_ref() {
+            body.insert("runtimes".to_string(), serde_json::json!(runtimes));
+        }
+        if let Some(runtime) = params.runtime.as_deref() {
+            body.insert("runtime".to_string(), serde_json::json!(runtime));
+        }
+        if let Some(enabled) = params.enabled {
+            body.insert("enabled".to_string(), serde_json::json!(enabled));
+        }
+        if body.is_empty() {
+            return Err(rmcp::ErrorData::internal_error(
+                format!(
+                    "{what}: nothing to change -- pass at least one of prompt, description, model, mcp_profile, runtimes, runtime, enabled. (An empty write would still rewrite the card, so it is refused rather than sent.)"
+                ),
+                None,
+            ));
+        }
+        let sent: Vec<String> = body.keys().cloned().collect();
+        let resp = json_of(
+            self.http.put(&url).json(&serde_json::Value::Object(body)),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        let mut out = agent_card_to_text(what, "updated", &resp)?;
+        out.push_str(&format!("  fields sent: {}\n", sent.join(", ")));
+        out.push_str("  every other field kept its previous value.\n");
+        Ok(out)
+    }
+
+    #[tool(
+        description = "Delete an agent (a role, or a runtime) by name, for good. WHEN: the user wants an agent GONE -- not merely disabled (agent_update(enabled=false) keeps it selectable and reversible; this does not). COST: free (zero model tokens). THIS IS DESTRUCTIVE AND IT CAN REMOVE THE AGENT THAT IS ANSWERING THE USER, so say it out loud first. TWO REFUSALS COME FROM THIS TOOL, before anything is deleted: (a) the agent is the CURRENT FRONT DOOR -- give the front door to someone else first (agent_set_primary), otherwise you delete the agent the user is talking to; (b) the agent is a RUNTIME that roles still list -- fix those roles first (agent_update with their runtimes), otherwise they would point at nothing. If the daemon refuses anyway, its own sentence is passed through verbatim. The reply names what was deleted and what is left."
+    )]
+    async fn agent_delete(
+        &self,
+        Parameters(params): Parameters<AgentDeleteParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "agent_delete";
+        let target = params.name.as_str();
+        let agents_url = format!("{}/api/v1/agents", self.config.daemon_url);
+        // PRE-CHECK 1: THE FRONT DOOR. The registry's delete has no such guard (measured:
+        // crates/daemon/src/registry.rs::delete_agent removes the table entry outright), so
+        // deleting the current front door would succeed and leave the user talking to a card that
+        // no longer exists.
+        let door = json_of(
+            self.http
+                .get(format!("{}/api/v1/primary", self.config.daemon_url)),
+            what,
+            &self.config.daemon_url,
+        )
+        .await?;
+        if door.get("name").and_then(|v| v.as_str()) == Some(target) {
+            return Err(rmcp::ErrorData::internal_error(
+                format!(
+                    "{what}: `{target}` is the CURRENT FRONT DOOR (the agent the user's next message reaches), so deleting it would remove the agent that is answering them. Next step: give the front door to another agent first -- agent_set_primary(name: `<another enabled agent>`) -- or clear it with agent_set_primary(name: `none`), then delete `{target}`."
+                ),
+                None,
+            ));
+        }
+        // PRE-CHECK 2: A RUNTIME THAT ROLES STILL LIST. The daemon has this guard on the RUNTIME
+        // route (registry.rs::delete_runtime, whose sentence names the users), but this tool
+        // deletes through the AGENT route, so the check is made here -- from the daemon's own
+        // registry, read now, not from a copy of it.
+        let cards = json_of(self.http.get(&agents_url), what, &self.config.daemon_url).await?;
+        let users = agent_names_referencing(&cards, target);
+        if let Some(first) = users.first() {
+            return Err(rmcp::ErrorData::internal_error(
+                format!(
+                    "{what}: `{target}` is a RUNTIME that these agent(s) still reference in their runtimes: {}. Deleting it would leave them pointing at nothing. Next step: edit those roles first -- agent_update(name: `{first}`, runtimes: [<their runtimes without this one>]) -- or delete them, then delete `{target}`.",
+                    users.join(", ")
+                ),
+                None,
+            ));
+        }
+        // THE DELETE. A 204 carries no body to decode, so this does not go through json_of.
+        let resp = self
+            .http
+            .delete(format!(
+                "{}/api/v1/agents/{}",
+                self.config.daemon_url, target
+            ))
+            .send()
+            .await
+            .map_err(|e| {
+                rmcp::ErrorData::internal_error(
+                    transport_message(what, &self.config.daemon_url, &e),
+                    None,
+                )
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(rmcp::ErrorData::internal_error(
+                refusal_message(what, status.as_u16(), &body),
+                None,
+            ));
+        }
+        // POST-STATE: what is left, read from the daemon rather than assumed.
+        let after = json_of(self.http.get(&agents_url), what, &self.config.daemon_url).await?;
+        let remaining: Vec<String> = after
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("name").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(format!(
+            "{what}: deleted `{target}`.\n  still registered ({}): {}\n  The front door was not it, so who answers the user is unchanged -- GET /api/v1/primary still reports the same agent.\n",
+            remaining.len(),
+            if remaining.is_empty() {
+                "<none>".to_string()
+            } else {
+                remaining.join(", ")
+            }
+        ))
+    }
+
     // -- handing work to another agent (v2, t53) -------------------------
 
     #[tool(
@@ -2456,6 +2638,81 @@ fn run_to_text(
     Ok(out)
 }
 
+/// A created or updated agent card, as the caller has to read it (v3, t54).
+fn agent_card_to_text(
+    what: &str,
+    verb: &str,
+    resp: &serde_json::Value,
+) -> Result<String, rmcp::ErrorData> {
+    let name = field_str(what, resp, "name")?;
+    let id = field_str(what, resp, "id")?;
+    let flag = |key: &str| {
+        resp.get(key)
+            .and_then(|v| v.as_bool())
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let mut out = format!(
+        "{what}: {verb} `{name}` -- id: {id}, kind: {}, enabled: {}, primary: {}\n",
+        resp.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
+        flag("enabled"),
+        flag("primary"),
+    );
+    if let Some(model) = resp.get("model").and_then(|v| v.as_str()) {
+        out.push_str(&format!("  model: {model}\n"));
+    }
+    let runtimes: Vec<&str> = resp
+        .get("runtimes")
+        .and_then(|v| v.as_array())
+        .map(|rows| rows.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "  runtimes: {}\n",
+        if runtimes.is_empty() {
+            "<none>".to_string()
+        } else {
+            runtimes.join(", ")
+        }
+    ));
+    if let Some(runtime) = resp.get("runtime").and_then(|v| v.as_str()) {
+        out.push_str(&format!("  default runtime: {runtime}\n"));
+    }
+    if let Some(prompt) = resp.get("prompt").and_then(|v| v.as_str()) {
+        out.push_str(&format!("  prompt: {}...\n", clip(prompt, 120)));
+    }
+    // The marker is not the answer to who replies (routing.toml's default outranks it), and a
+    // reader who sees primary=true on the card should not conclude otherwise.
+    if resp.get("primary").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str(
+            "NOTE: the card carries the primary marker, but routing.toml's default outranks it -- GET /api/v1/primary (or routing_show) is the answer to who actually replies.\n",
+        );
+    }
+    Ok(out)
+}
+
+/// The names of agents whose runtimes list mentions `target` (t54's delete pre-check).
+///
+/// The agent itself is EXCLUDED: a role that names its own runtime is not a DEPENDENT, and
+/// refusing its deletion because of its own list would be a check nothing can ever pass.
+fn agent_names_referencing(cards: &serde_json::Value, target: &str) -> Vec<String> {
+    cards
+        .get("agents")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.get("name").and_then(|v| v.as_str()) != Some(target))
+                .filter(|row| {
+                    row.get("runtimes")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(target)))
+                })
+                .filter_map(|row| row.get("name").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn tasks_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
     const WHAT: &str = "list_tasks";
     let tasks = field_array(WHAT, resp, "tasks")?;
@@ -2732,6 +2989,65 @@ pub struct AgentSetPrimaryParams {
     #[schemars(
         description = "The agent name to make the front door, or none to CLEAR it (both carriers: the agents.toml marker and routing.toml's default). The name must be a card agents_list shows as enabled; an unknown or disabled name is refused and nothing is written."
     )]
+    pub name: String,
+}
+
+/// The parameters of `agent_create` (v3: making an agent, not just choosing one).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCreateParams {
+    #[schemars(description = "Name of the new role (a TOML key and a URL segment: no spaces).")]
+    pub name: String,
+    #[schemars(
+        description = "REQUIRED IN PRACTICE: the role is the prompt -- what this agent is FOR. The daemon refuses a role without one (a role needs a prompt -- that is what makes it a role), so pass it here instead of retrying."
+    )]
+    pub prompt: Option<String>,
+    #[schemars(description = "One-line description shown in the registry and in agents_list.")]
+    pub description: Option<String>,
+    #[schemars(
+        description = "The runtimes this role may run on, by name. A role needs at least one: give runtimes, or runtime for the default single one, or the daemon refuses (create a runtime first if the platform has none)."
+    )]
+    pub runtimes: Option<Vec<String>>,
+    #[schemars(
+        description = "The single default runtime; merged into runtimes when both are given."
+    )]
+    pub runtime: Option<String>,
+    #[schemars(description = "Model override this role asks its runtime for.")]
+    pub model: Option<String>,
+}
+
+/// The parameters of `agent_update`. EVERY field is optional and ONLY the ones a caller sets
+/// are sent: the daemon's PUT is a patch, so a field nobody mentioned must not arrive as null.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUpdateParams {
+    #[schemars(description = "The role to change (must already exist).")]
+    pub name: String,
+    #[schemars(description = "New prompt. Omit to leave the current one untouched.")]
+    pub prompt: Option<String>,
+    #[schemars(description = "New description. Omit to leave it untouched.")]
+    pub description: Option<String>,
+    #[schemars(description = "New model override. Omit to leave it untouched.")]
+    pub model: Option<String>,
+    #[schemars(description = "New MCP profile. Omit to leave it untouched.")]
+    pub mcp_profile: Option<String>,
+    #[schemars(
+        description = "New runtimes list (replaces the old one). Omit to leave it untouched."
+    )]
+    pub runtimes: Option<Vec<String>>,
+    #[schemars(description = "New default runtime. Omit to leave it untouched.")]
+    pub runtime: Option<String>,
+    #[schemars(
+        description = "Enable or disable the role. Omit to leave it untouched. NOTE: the front-door MARKER is not settable here on purpose -- agent_set_primary writes the marker and routing.toml together, and that one write is what changes who answers."
+    )]
+    pub enabled: Option<bool>,
+}
+
+/// The parameters of `agent_delete`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDeleteParams {
+    #[schemars(description = "The agent (role or runtime) to delete, by name.")]
     pub name: String,
 }
 

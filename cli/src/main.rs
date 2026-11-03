@@ -72,6 +72,14 @@ enum Cmd {
         #[arg(long)]
         cleanup: bool,
     },
+    /// Show or change the primary agent -- the front door this daemon actually answers with.
+    ///
+    /// WHY THIS EXISTS: the other two entry points (the panel and curl) both require remembering a
+    /// URL, and this is the setting a user changes without opening either.
+    Primary {
+        #[command(subcommand)]
+        action: Option<PrimaryCmd>,
+    },
     /// Run a prompt as a one-off task and stream the result.
     Run {
         prompt: String,
@@ -165,6 +173,20 @@ enum WikiCmd {
 }
 
 #[derive(Subcommand)]
+enum PrimaryCmd {
+    /// Make <name> the primary agent. Writes BOTH carriers: agents.toml's `primary` flag and
+    /// routing.toml's `default` (the routing default outranks the flag, so writing one alone
+    /// changes nothing a user can observe).
+    Set {
+        /// Agent name, as printed by `ruagent agents`.
+        name: String,
+    },
+    /// Clear the primary agent (writes both carriers).
+    #[command(name = "none")]
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum KnowledgeCmd {
     /// Ingest every `.md` under DIR as a searchable document (nested names
     /// are preserved), printing bytes and chunk counts per file plus a
@@ -204,6 +226,7 @@ fn main() -> Result<()> {
                 .context("building tokio runtime")?;
             runtime.block_on(ruagent_daemon::serve_with_remote(root, addr, allow_remote))
         }
+        Cmd::Primary { action } => primary_cmd(&cli.url, action),
         Cmd::Agents => list_agents(&cli.url),
         Cmd::Doctor { cleanup } => doctor(&cli.url, cleanup),
         Cmd::Status => status(&cli.url),
@@ -1893,6 +1916,123 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// primary: the front door, from a terminal (t55)
+// ---------------------------------------------------------------------------
+
+/// Print the EFFECTIVE front door -- the agent this daemon actually answers with -- or change it.
+///
+/// A missing front door is a STATEMENT, not a failure: a daemon with nothing configured still
+/// answers, and a non-zero exit would make a shell script treat a valid state as an error. Only a
+/// transport or HTTP failure is an error here. `--url` (global, `cli.url`) is the only address
+/// source: this command deliberately does not parse one of its own.
+fn primary_cmd(url: &str, action: Option<PrimaryCmd>) -> Result<()> {
+    match action {
+        None => {
+            let v = fetch_primary(url)?;
+            print!("{}", format_front_door(&v));
+            Ok(())
+        }
+        Some(PrimaryCmd::Set { name }) => put_primary(url, &name),
+        Some(PrimaryCmd::Clear) => put_primary(url, "none"),
+    }
+}
+
+fn fetch_primary(url: &str) -> Result<serde_json::Value> {
+    client()
+        .get(format!("{url}/api/v1/primary"))
+        .send()
+        .with_context(|| unreachable_hint(url))?
+        .error_for_status()
+        .with_context(|| format!("{url}/api/v1/primary answered with an error status"))?
+        .json()
+        .context("parsing the /api/v1/primary response")
+}
+
+/// One error string for "the daemon did not answer", naming the ADDRESS and the command to run:
+/// "connection refused" with neither is the least actionable failure this CLI can print.
+fn unreachable_hint(url: &str) -> String {
+    format!(
+        "daemon unreachable at {url} -- is `ruagent serve` running? (or point this at it with \
+         --url / RUAGENT_URL)"
+    )
+}
+
+fn put_primary(url: &str, name: &str) -> Result<()> {
+    let resp = client()
+        .put(format!("{url}/api/v1/primary"))
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .with_context(|| unreachable_hint(url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("{}", format_rejection(status.as_u16(), &body));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .context("parsing the /api/v1/primary response")?;
+    print!("{}", format_set_result(name, &v));
+    Ok(())
+}
+
+/// The front door as a human reads it: the name, then WHERE that answer comes from, then the
+/// daemon's own reason. `source` is the cascade level that produced it, so printing it is what makes
+/// a surprising answer explainable instead of mysterious (that is the whole point of the field).
+fn format_front_door(v: &serde_json::Value) -> String {
+    let Some(name) = v["name"].as_str() else {
+        return format!(
+            "no primary agent -- nothing is configured as the front door\n  \
+             why: {}\n  \
+             set one with: ruagent primary set <name>\n",
+            v["why"].as_str().unwrap_or("(the daemon gave no reason)")
+        );
+    };
+    format!(
+        "{name}\n  \
+         id:     {}\n  \
+         source: {}\n  \
+         why:    {}\n",
+        v["id"].as_str().unwrap_or("(none)"),
+        v["source"].as_str().unwrap_or("(unknown)"),
+        v["why"].as_str().unwrap_or("(the daemon gave no reason)")
+    )
+}
+
+/// Say what was written, in full: this one command rewrites TWO files, and a user who is not told
+/// that will one day edit routing.toml, see nothing change, and conclude the feature is broken.
+fn format_set_result(name: &str, v: &serde_json::Value) -> String {
+    let headline = if name.eq_ignore_ascii_case("none") {
+        "cleared the primary agent".to_string()
+    } else {
+        format!("set `{name}` as the primary agent")
+    };
+    format!(
+        "{headline}\n  \
+         wrote BOTH carriers, on purpose:\n    \
+         agents.toml  -- the `primary = true` flag\n    \
+         routing.toml -- the `default`\n  \
+         (level 3 of the routing cascade is the routing default, so writing only the flag would \
+         change nothing you can observe)\n\n  \
+         effective front door now:\n  {}",
+        format_front_door(v).replace('\n', "\n  ")
+    )
+}
+
+/// `PUT` refusals must reach the user in the daemon's own words: its 400 names the unknown agent
+/// and lists the ones it knows, and "failed" alone would throw that away.
+fn format_rejection(status: u16, body: &str) -> String {
+    let msg = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["error"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    format!("the daemon refused the change (HTTP {status}): {msg}")
+}
 fn list_agents(url: &str) -> Result<()> {
     let resp: serde_json::Value = client()
         .get(format!("{url}/api/v1/agents"))
@@ -2780,4 +2920,114 @@ fn skills_cmd(url: &str, do_sync: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod primary_cli_tests {
+    use super::*;
+
+    fn a_front_door() -> serde_json::Value {
+        serde_json::json!({
+            "name": "claude",
+            "id": "01a0b915-8273-73c4-8fe9-0e35a34d4ded",
+            "source": "routing-default",
+            "why": "routing.toml's `default` and the `primary = true` flag name the SAME agent (`claude`)"
+        })
+    }
+
+    /// The line a user reads: who answers, where that answer comes from, and the daemon's reason.
+    #[test]
+    fn the_front_door_names_the_source_and_the_why() {
+        let text = format_front_door(&a_front_door());
+        assert!(text.contains("claude"), "{text}");
+        assert!(text.contains("01a0b915"), "{text}");
+        assert!(text.contains("source: routing-default"), "{text}");
+        assert!(text.contains("SAME agent"), "{text}");
+    }
+
+    /// "no front door" is a valid state, and the text has to say what to run instead.
+    #[test]
+    fn no_front_door_is_a_statement_not_a_failure() {
+        let v = serde_json::json!({
+            "name": serde_json::Value::Null,
+            "why": "no routing.toml `default` and no agent marked primary: the next run falls through"
+        });
+        let text = format_front_door(&v);
+        assert!(text.starts_with("no primary agent"), "{text}");
+        assert!(text.contains("no routing.toml"), "{text}");
+        assert!(text.contains("ruagent primary set"), "{text}");
+    }
+
+    /// A stub daemon answering ONE canned `GET /api/v1/primary`: this asserts the real code path
+    /// (and therefore the exit status) for the no-front-door case without needing a live daemon.
+    #[test]
+    fn a_daemon_without_a_front_door_is_reported_and_succeeds() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stub daemon");
+        let addr = listener.local_addr().expect("an address");
+        let body =
+            serde_json::json!({ "name": serde_json::Value::Null, "why": "nothing is configured yet" })
+                .to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        let result = primary_cmd(&format!("http://{addr}"), None);
+        assert!(result.is_ok(), "no front door must exit 0: {result:?}");
+    }
+
+    /// The one command that rewrites two files must say so, or the next person edits routing.toml
+    /// only and concludes the feature does nothing.
+    #[test]
+    fn setting_names_both_files_that_were_written() {
+        let text = format_set_result("opencode", &a_front_door());
+        assert!(
+            text.contains("set `opencode` as the primary agent"),
+            "{text}"
+        );
+        assert!(text.contains("agents.toml"), "{text}");
+        assert!(text.contains("routing.toml"), "{text}");
+        assert!(text.contains("BOTH carriers"), "{text}");
+        assert!(text.contains("level 3 of the routing cascade"), "{text}");
+
+        let cleared = format_set_result(
+            "none",
+            &serde_json::json!({ "name": serde_json::Value::Null, "why": "w" }),
+        );
+        assert!(cleared.contains("cleared the primary agent"), "{cleared}");
+        assert!(cleared.contains("routing.toml"), "{cleared}");
+    }
+
+    /// A refusal keeps the daemon's words: its 400 names the unknown agent and lists what it knows.
+    #[test]
+    fn a_refusal_keeps_the_daemons_own_words() {
+        let body = "{\"error\":\"unknown agent `ghost` -- known agents: claude, dsh\"}";
+        let text = format_rejection(400, body);
+        assert!(text.contains("HTTP 400"), "{text}");
+        assert!(text.contains("unknown agent"), "{text}");
+        assert!(text.contains("claude, dsh"), "{text}");
+    }
+
+    /// An unreachable daemon must produce a non-zero path whose message says what to run.
+    #[test]
+    fn an_unreachable_daemon_says_what_to_run() {
+        let hint = unreachable_hint("http://127.0.0.1:8787");
+        assert!(hint.contains("http://127.0.0.1:8787"), "{hint}");
+        assert!(hint.contains("ruagent serve"), "{hint}");
+        assert!(hint.contains("--url"), "{hint}");
+
+        // Nothing listens on port 1: this must be an Err (exit 1 through main), not a panic.
+        let err = primary_cmd("http://127.0.0.1:1", None).expect_err("unreachable daemon");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("daemon unreachable"), "{msg}");
+        assert!(msg.contains("ruagent serve"), "{msg}");
+    }
 }

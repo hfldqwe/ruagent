@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Button, Card } from "antd";
-import { api, isRoleAgent, type MemoryRow, type SessionRecord } from "../api";
+import { api, isRoleAgent, type MemoryRow, type PrimaryInfo, type SessionRecord } from "../api";
 import { useI18n } from "../i18n";
 import { ErrorState, ReadoutStrip, RelTime, Spinner } from "../ui";
 import { Icon, type IconName } from "../icons";
@@ -30,6 +30,20 @@ interface Dash {
   memories: Maybe<MemoryRow[]>;
   storeCounts: Record<string, number>;
   embedder: Maybe<string>;
+  /** WHO ANSWERS A NEW CHAT — `GET /api/v1/primary`
+   *  (docs/design/primary-agent.md). `null` means the read has not answered
+   *  yet; "answered: the daemon has no front door" is `{ name: null, why }`,
+   *  i.e. a real object, because those are two different facts and 行 20 exists
+   *  precisely to keep them apart. */
+  frontDoor: Maybe<PrimaryInfo>;
+  /** The last front-door read that FAILED (`null` = the last one landed).
+   *  Separate from `frontDoor`, which cannot say "failed" on its own — this
+   *  pair is what makes a failure render as a failure instead of as the empty
+   *  answer. Deliberately NOT a member of `failed`: that list drives the
+   *  platform dot and the "cannot read platform data" banner, so a daemon that
+   *  answers the other six endpoints but not this one would be reported
+   *  OFFLINE while it is plainly online — the same class of lie as "0 agents". */
+  frontDoorErr: unknown;
   /** endpoints that did not answer; their gauges read em dash, never 0. */
   failed: string[];
 }
@@ -45,6 +59,8 @@ const BLANK: Dash = {
   memories: null,
   storeCounts: {},
   embedder: null,
+  frontDoor: null,
+  frontDoorErr: null,
   failed: [],
 };
 
@@ -152,6 +168,25 @@ export function Home({
         .knowledgeDocs()
         .then((d) => patch({ docs: d.documents.length, embedder: d.embedder }, "knowledge"))
         .catch(() => markFailed("knowledge")),
+      // The front door rides the SAME window as the six above (one cadence per
+      // page) but settles itself: it has its own failure text and must not move
+      // the platform dot, so it does not go through patch/markFailed — see
+      // `frontDoorErr` in `Dash`.
+      api
+        .primary()
+        .then((fd) =>
+          setDash((prev) => ({ ...(prev ?? BLANK), frontDoor: fd, frontDoorErr: null })),
+        )
+        // A FAILED READ IS NOT "THERE IS NO PRIMARY" (行 20). The answer is
+        // blanked and the error is kept, so the card can only render the
+        // failure — the empty state's text would be a fact nobody read.
+        .catch((e) =>
+          setDash((prev) => ({
+            ...(prev ?? BLANK),
+            frontDoor: null,
+            frontDoorErr: e ?? new Error("GET /api/v1/primary failed"),
+          })),
+        ),
     ]);
     setSettled(true);
   }, [patch, markFailed]);
@@ -201,6 +236,20 @@ export function Home({
         : "var(--status-warn)";
   const recent = (dash.sessions ?? []).slice(0, RECENT_CAP);
   const memories = dash.memories ?? [];
+
+  // ── who answers a new chat ──────────────────────────────────────────────
+  // The source is spelled out, not inferred: routing.toml's `default` OUTRANKS
+  // the `primary = true` flag, so "it is called the primary" and "it is what
+  // answers" are two different claims and this page must make the second one.
+  const fd = dash.frontDoor;
+  const fdWhy = (fd?.why ?? "").trim();
+  const fdErrText = dash.frontDoorErr ? String(dash.frontDoorErr).trim().slice(0, 200) : "";
+  const fdSource =
+    fd?.source === "primary-flag"
+      ? t("home.frontDoor.source.flag")
+      : fd?.source === "routing-default"
+        ? t("home.frontDoor.source.routing")
+        : t("home.frontDoor.source.unknown");
 
   return (
     <div className="home dash">
@@ -295,6 +344,80 @@ export function Home({
         </Card>
 
         <div className="dash-side">
+          {/* The landing page's most important answer: who will reply if I start
+              typing right now. A READOUT, not a switch — the choice is one write
+              against two config files and it lives on #agents, so the only
+              action here is the jump. The source chip is not decoration:
+              routing.toml outranks the primary flag, so a user who marked an
+              agent must be able to see that a different one answers. */}
+          <Card size="small">
+            <section className="zone" data-readout="front-door">
+              <DashHead
+                title={t("home.panel.frontDoor")}
+                actions={
+                  <Button type="text" size="small" onClick={() => onNav("agents")}>
+                    {t("home.frontDoor.change")}
+                  </Button>
+                }
+              />
+              {dash.frontDoorErr ? (
+                /* FAILED, not empty: the daemon's own reason stands in for the
+                   answer, with a retry. This branch is why `frontDoorErr`
+                   exists — see `Dash`. */
+                <ErrorState
+                  title={t("home.frontDoor.err")}
+                  hint={`${t("home.frontDoor.err.hint")}${fdErrText ? ` — ${fdErrText}` : ""}`}
+                  onRetry={() => void load()}
+                  retryLabel={t("common.retry")}
+                />
+              ) : fd === null ? (
+                /* Not answered yet. An em dash, the same placeholder the gauges
+                   use — never the empty state. */
+                <div className="status-row">
+                  <span className="dot" style={{ background: "var(--status-idle)" }} />
+                  <span className="muted">{NA}</span>
+                </div>
+              ) : fd.name === null ? (
+                /* A DEFINITE answer: there is no front door. Say why and what
+                   to do — the fallback is silent otherwise (the next run takes
+                   the first enabled card). */
+                <>
+                  <div className="status-row">
+                    <span className="dot" style={{ background: "var(--status-warn)" }} />
+                    <span>{t("home.frontDoor.none")}</span>
+                  </div>
+                  {fdWhy ? (
+                    <p className="muted micro truncated" title={fdWhy}>
+                      {t("home.frontDoor.why", { why: fdWhy })}
+                    </p>
+                  ) : null}
+                  <button className="row-btn" onClick={() => onNav("agents")}>
+                    <Icon name="bot" size={15} />
+                    <span className="grow">{t("home.frontDoor.noneCta")}</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="status-row" title={fdWhy || undefined}>
+                    <span className="dot" style={{ background: "var(--status-ok)" }} />
+                    <strong className="truncated">{fd.name}</strong>
+                    <span className={fd.source === "primary-flag" ? "tag ok" : "tag"}>
+                      {fdSource}
+                    </span>
+                  </div>
+                  {/* The daemon's why, elided by CSS and complete on hover: the
+                      short forms above do not explain a conflict, and a conflict
+                      is exactly when the reader needs the sentence. */}
+                  {fdWhy ? (
+                    <p className="muted micro truncated" title={fdWhy}>
+                      {t("home.frontDoor.why", { why: fdWhy })}
+                    </p>
+                  ) : null}
+                </>
+              )}
+            </section>
+          </Card>
+
           <Card size="small">
             <section className="zone">
               <DashHead title={t("home.panel.platform")} />

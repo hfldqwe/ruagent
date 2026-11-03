@@ -479,11 +479,15 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
         "task_create",
         "task_dispatch",
         "run_get",
+        // t54 (v3): making and changing the agents themselves.
+        "agent_create",
+        "agent_update",
+        "agent_delete",
     ];
     assert_eq!(
         expected.len(),
-        28,
-        "the declared consumption surface is 28 tools"
+        31,
+        "the declared consumption surface is 31 tools"
     );
     let mut got = names.clone();
     got.sort();
