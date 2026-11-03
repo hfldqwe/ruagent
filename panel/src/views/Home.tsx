@@ -97,6 +97,118 @@ function DashHead({
   );
 }
 
+/**
+ * WHO ANSWERS YOU -- one readout, rendered on BOTH landing branches.
+ *
+ * It is a component because the same answer is needed twice: the dashboard shows it
+ * beside the day's work, and the FIRST-RUN guide shows it because a brand-new install
+ * is exactly when "who will reply if I type right now" matters most -- and, before
+ * this, that page did not answer it at all (the guide renders when
+ * agents === 0 or sessions.length === 0, so a user who had not run anything yet never
+ * saw the card; measured in e2e/front-door.spec.ts, where three readings had to skip
+ * on a fresh daemon). Two copies would drift; one component cannot.
+ *
+ * IT IS A READOUT, NOT A SWITCH: the choice is one write against two config files and
+ * it lives on #agents, so the only actions here are the jump and -- when the read
+ * failed -- the retry.
+ *
+ * THE THREE STATES ARE NOT INTERCHANGEABLE, and the e2e spec pins each one:
+ *   failed    -> home.frontDoor.err: "we could not read it". NOT "there is none"; the
+ *                daemon's own reason stands in for the answer and a retry is offered.
+ *   no answer -> home.frontDoor.none: a DEFINITE answer, with the reason and the next
+ *                step (routing.toml's default names nobody usable, so the next run
+ *                silently takes the first enabled card).
+ *   named     -> the name plus WHICH carrier produced it: routing.toml's default
+ *                outranks the primary flag, so "it is marked primary" and "it answers
+ *                you" are two different claims and this page makes the second one.
+ * frontDoor === null (the endpoint has not answered yet) is a fourth, transient state:
+ * an em dash, the same placeholder the gauges use -- never the empty state.
+ */
+function FrontDoorReadout({
+  dash,
+  onNav,
+  onRetry,
+}: {
+  dash: Dash;
+  onNav: (hash: string) => void;
+  onRetry: () => void;
+}) {
+  const { t } = useI18n();
+  const fd = dash.frontDoor;
+  const fdWhy = (fd?.why ?? "").trim();
+  const fdErrText = dash.frontDoorErr ? String(dash.frontDoorErr).trim().slice(0, 200) : "";
+  const fdSource =
+    fd?.source === "primary-flag"
+      ? t("home.frontDoor.source.flag")
+      : fd?.source === "routing-default"
+        ? t("home.frontDoor.source.routing")
+        : t("home.frontDoor.source.unknown");
+
+  return (
+    <section className="zone" data-readout="front-door">
+      <DashHead
+        title={t("home.panel.frontDoor")}
+        actions={
+          <Button type="text" size="small" onClick={() => onNav("agents")}>
+            {t("home.frontDoor.change")}
+          </Button>
+        }
+      />
+      {dash.frontDoorErr ? (
+        /* FAILED, not empty: the daemon's own reason stands in for the answer, with a
+           retry. This branch is why frontDoorErr exists -- see Dash. */
+        <ErrorState
+          title={t("home.frontDoor.err")}
+          hint={t("home.frontDoor.err.hint") + (fdErrText ? " — " + fdErrText : "")}
+          onRetry={onRetry}
+          retryLabel={t("common.retry")}
+        />
+      ) : fd === null ? (
+        /* Not answered yet. An em dash, the same placeholder the gauges use -- never
+           the empty state. */
+        <div className="status-row">
+          <span className="dot" style={{ background: "var(--status-idle)" }} />
+          <span className="muted">{NA}</span>
+        </div>
+      ) : fd.name === null ? (
+        /* A DEFINITE answer: there is no front door. Say why and what to do -- the
+           fallback is silent otherwise (the next run takes the first enabled card). */
+        <>
+          <div className="status-row">
+            <span className="dot" style={{ background: "var(--status-warn)" }} />
+            <span>{t("home.frontDoor.none")}</span>
+          </div>
+          {fdWhy ? (
+            <p className="muted micro truncated" title={fdWhy}>
+              {t("home.frontDoor.why", { why: fdWhy })}
+            </p>
+          ) : null}
+          <button className="row-btn" onClick={() => onNav("agents")}>
+            <Icon name="bot" size={15} />
+            <span className="grow">{t("home.frontDoor.noneCta")}</span>
+          </button>
+        </>
+      ) : (
+        <>
+          <div className="status-row" title={fdWhy || undefined}>
+            <span className="dot" style={{ background: "var(--status-ok)" }} />
+            <strong className="truncated">{fd.name}</strong>
+            <span className={fd.source === "primary-flag" ? "tag ok" : "tag"}>{fdSource}</span>
+          </div>
+          {/* The daemon's why, elided by CSS and complete on hover: the short forms
+              above do not explain a conflict, and a conflict is exactly when the
+              reader needs the sentence. */}
+          {fdWhy ? (
+            <p className="muted micro truncated" title={fdWhy}>
+              {t("home.frontDoor.why", { why: fdWhy })}
+            </p>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
 export function Home({
   inbox,
   onOpenTask,
@@ -214,6 +326,7 @@ export function Home({
         setCreating={setCreating}
         onOpenTask={onOpenTask}
         onNav={onNav}
+        onRetry={() => void load()}
       />
     );
   }
@@ -236,20 +349,6 @@ export function Home({
         : "var(--status-warn)";
   const recent = (dash.sessions ?? []).slice(0, RECENT_CAP);
   const memories = dash.memories ?? [];
-
-  // ── who answers a new chat ──────────────────────────────────────────────
-  // The source is spelled out, not inferred: routing.toml's `default` OUTRANKS
-  // the `primary = true` flag, so "it is called the primary" and "it is what
-  // answers" are two different claims and this page must make the second one.
-  const fd = dash.frontDoor;
-  const fdWhy = (fd?.why ?? "").trim();
-  const fdErrText = dash.frontDoorErr ? String(dash.frontDoorErr).trim().slice(0, 200) : "";
-  const fdSource =
-    fd?.source === "primary-flag"
-      ? t("home.frontDoor.source.flag")
-      : fd?.source === "routing-default"
-        ? t("home.frontDoor.source.routing")
-        : t("home.frontDoor.source.unknown");
 
   return (
     <div className="home dash">
@@ -344,78 +443,12 @@ export function Home({
         </Card>
 
         <div className="dash-side">
-          {/* The landing page's most important answer: who will reply if I start
-              typing right now. A READOUT, not a switch — the choice is one write
-              against two config files and it lives on #agents, so the only
-              action here is the jump. The source chip is not decoration:
-              routing.toml outranks the primary flag, so a user who marked an
-              agent must be able to see that a different one answers. */}
+          {/* The landing page's most important answer, in the dashboard's side
+              column. The card itself is FrontDoorReadout -- the FIRST-RUN guide
+              renders the same component, so a brand-new install answers the same
+              question with the same sentences and the same three states. */}
           <Card size="small">
-            <section className="zone" data-readout="front-door">
-              <DashHead
-                title={t("home.panel.frontDoor")}
-                actions={
-                  <Button type="text" size="small" onClick={() => onNav("agents")}>
-                    {t("home.frontDoor.change")}
-                  </Button>
-                }
-              />
-              {dash.frontDoorErr ? (
-                /* FAILED, not empty: the daemon's own reason stands in for the
-                   answer, with a retry. This branch is why `frontDoorErr`
-                   exists — see `Dash`. */
-                <ErrorState
-                  title={t("home.frontDoor.err")}
-                  hint={`${t("home.frontDoor.err.hint")}${fdErrText ? ` — ${fdErrText}` : ""}`}
-                  onRetry={() => void load()}
-                  retryLabel={t("common.retry")}
-                />
-              ) : fd === null ? (
-                /* Not answered yet. An em dash, the same placeholder the gauges
-                   use — never the empty state. */
-                <div className="status-row">
-                  <span className="dot" style={{ background: "var(--status-idle)" }} />
-                  <span className="muted">{NA}</span>
-                </div>
-              ) : fd.name === null ? (
-                /* A DEFINITE answer: there is no front door. Say why and what
-                   to do — the fallback is silent otherwise (the next run takes
-                   the first enabled card). */
-                <>
-                  <div className="status-row">
-                    <span className="dot" style={{ background: "var(--status-warn)" }} />
-                    <span>{t("home.frontDoor.none")}</span>
-                  </div>
-                  {fdWhy ? (
-                    <p className="muted micro truncated" title={fdWhy}>
-                      {t("home.frontDoor.why", { why: fdWhy })}
-                    </p>
-                  ) : null}
-                  <button className="row-btn" onClick={() => onNav("agents")}>
-                    <Icon name="bot" size={15} />
-                    <span className="grow">{t("home.frontDoor.noneCta")}</span>
-                  </button>
-                </>
-              ) : (
-                <>
-                  <div className="status-row" title={fdWhy || undefined}>
-                    <span className="dot" style={{ background: "var(--status-ok)" }} />
-                    <strong className="truncated">{fd.name}</strong>
-                    <span className={fd.source === "primary-flag" ? "tag ok" : "tag"}>
-                      {fdSource}
-                    </span>
-                  </div>
-                  {/* The daemon's why, elided by CSS and complete on hover: the
-                      short forms above do not explain a conflict, and a conflict
-                      is exactly when the reader needs the sentence. */}
-                  {fdWhy ? (
-                    <p className="muted micro truncated" title={fdWhy}>
-                      {t("home.frontDoor.why", { why: fdWhy })}
-                    </p>
-                  ) : null}
-                </>
-              )}
-            </section>
+            <FrontDoorReadout dash={dash} onNav={onNav} onRetry={() => void load()} />
           </Card>
 
           <Card size="small">
@@ -518,12 +551,17 @@ function FirstRun({
   setCreating,
   onOpenTask,
   onNav,
+  onRetry,
 }: {
   dash: Dash;
   creating: boolean;
   setCreating: (v: boolean) => void;
   onOpenTask: (id: string) => void;
   onNav: (hash: string) => void;
+  /** Re-read the dashboard (the readout's retry). Passed down rather than
+   *  re-implemented: a guide that asked the daemon on its own would be a second
+   *  reader of the same answer -- exactly the drift this extraction prevents. */
+  onRetry: () => void;
 }) {
   const { t } = useI18n();
   const memoriesTotal = Object.values(dash.storeCounts).reduce((s, n) => s + n, 0);
@@ -554,6 +592,15 @@ function FirstRun({
         <h1>{t("home.greeting")}</h1>
         <p className="muted">{t("home.subtitle")}</p>
       </div>
+
+      {/* WHO ANSWERS YOU, on the page a brand-new install lands on. Same component as
+          the dashboard's card, same three states, same i18n keys: this is the one
+          question a first-run user has, and until now this page did not answer it.
+          Placement follows the existing rhythm -- a small card above the "start here"
+          steps, like the dashboard's own small cards; no new visual grade. */}
+      <Card size="small">
+        <FrontDoorReadout dash={dash} onNav={onNav} onRetry={onRetry} />
+      </Card>
 
       <div className="stat-strip">
         {stats.map((s) => (
