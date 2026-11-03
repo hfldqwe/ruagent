@@ -122,12 +122,19 @@ agent its `routing.toml` already named — so nothing changes until you
 choose otherwise. Three ways to choose:
 
 ```bash
-curl -X PUT localhost:8787/api/v1/primary -d '{"name":"architect"}'   # sets both carriers
-curl localhost:8787/api/v1/primary                                    # who answers, and why
+ruagent primary                     # who answers you here, and why
+ruagent primary set architect       # change it (writes BOTH carriers)
+ruagent primary none                # leave no front door
 ```
 
-…or the **Agents** page in the panel, or ask the agent itself (it has
-`agents_list` / `agent_set_primary` / `routing_show` / `routing_set_default`).
+…or the **Agents** page in the panel (the landing page shows the
+current front door too), or ask the agent itself. It has ten tools for
+this: `agents_list` / `agent_set_primary` / `agent_create` /
+`agent_update` / `agent_delete` to shape who exists and who answers,
+`routing_show` / `routing_set_default` for the cascade, and
+`task_create` / `task_dispatch` / `run_get` to hand work to another
+agent and follow it without blocking. Delegation is the point: you talk
+to one agent, and it operates the rest.
 
 `GET /api/v1/primary` always answers **the agent that will actually
 answer**, and says where that decision came from. That distinction is

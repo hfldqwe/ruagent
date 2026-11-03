@@ -112,12 +112,17 @@ runtimes = ["claude-code", "dsh", "opencode"]
 早就点名的那个——所以在你主动更改之前，行为一点没变。三种改法：
 
 ```bash
-curl -X PUT localhost:8787/api/v1/primary -d '{"name":"architect"}'   # 一处调用写两处
-curl localhost:8787/api/v1/primary                                    # 谁回答你，以及为什么
+ruagent primary                     # 这里谁在回答你，以及为什么
+ruagent primary set architect       # 换人（一处调用写两处）
+ruagent primary none                # 干脆不设主智能体
 ```
 
-……或者用面板的**智能体**页，或者直接让智能体自己改（它有 `agents_list` /
-`agent_set_primary` / `routing_show` / `routing_set_default`）。
+……或者用面板的**智能体**页（首页也会显示当前主智能体），或者直接让智能体
+自己改。它有十个工具做这件事：`agents_list` / `agent_set_primary` /
+`agent_create` / `agent_update` / `agent_delete` 决定「有谁」和「谁回答你」，
+`routing_show` / `routing_set_default` 管路由级联，
+`task_create` / `task_dispatch` / `run_get` 把活派给别的智能体并在不阻塞的
+前提下跟进。派活才是重点：你只跟一个智能体说话，由它去操作其余的。
 
 `GET /api/v1/primary` 给出的永远是**实际会回答你的那个智能体**，并说明这个
 结论来自哪里。这条区分是承重的：`routing.toml` 的 `default` 优先于 `primary`
