@@ -1063,24 +1063,53 @@ pub struct RouteEntry {
 /// Round-trip editor for the `[distill]` table of `policy.toml` — the
 /// registry::Editor discipline (toml_edit keeps comments/ordering/other
 /// sections, temp+rename is atomic, a mutex stops interleaved writes)
+/// The ONE lock every config write takes (front-door-audit F2).
+///
+/// Each editor used to carry its own `Mutex`, which protected nothing across requests: the API
+/// builds a FRESH editor per request, so two concurrent writes to the same file never met. These
+/// files are small and the writes take milliseconds, so one process-wide lock costs nothing and
+/// turns "interleaved writes" into "last writer wins".
+fn config_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    // A panic while holding this must not brick every later config write: the file is written by
+    // temp+rename, so a poisoned guard carries no half-written state to protect against.
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A UNIQUE temp path per write (front-door-audit F2).
+///
+/// Every editor used to write `<file>.toml.tmp` and rename it into place, so two concurrent writes
+/// could truncate each other's temp file and rename a TORN result in: a routing.toml that does not
+/// parse makes every later read fall back to the boot snapshot and every later write fail. The lock
+/// above makes the outcome last-writer-wins; this makes a torn temp impossible even if a lock is
+/// ever bypassed.
+fn unique_tmp_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let file = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("config.toml");
+    path.with_file_name(format!("{file}.{}.{n}.tmp", std::process::id()))
+}
+
 /// applied to the distillation policy.
 pub struct DistillEditor {
     path: PathBuf,
-    lock: std::sync::Mutex<()>,
 }
 
 impl DistillEditor {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            lock: std::sync::Mutex::new(()),
-        }
+        Self { path: path.into() }
     }
 
     /// Write the whole `[distill]` table: `auto` always, the optional
     /// keys only when present (None removes the key from the file).
     pub fn update(&self, cfg: &ruagent_policy::DistillConfig) -> Result<()> {
-        let _guard = self.lock.lock().expect("distill editor lock");
+        let _guard = config_write_lock();
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
         let mut doc: toml_edit::DocumentMut = text
@@ -1097,7 +1126,7 @@ impl DistillEditor {
         set_or_remove(tbl, "language", &cfg.language);
         set_or_remove(tbl, "prompt", &cfg.prompt);
         set_or_remove_bool(tbl, "graph", cfg.graph);
-        let tmp = self.path.with_extension("toml.tmp");
+        let tmp = unique_tmp_path(&self.path);
         std::fs::write(&tmp, doc.to_string())
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
@@ -1116,15 +1145,11 @@ impl DistillEditor {
 /// write, so a refused update leaves the file untouched (design §5.3).
 pub struct CapabilitiesEditor {
     path: PathBuf,
-    lock: std::sync::Mutex<()>,
 }
 
 impl CapabilitiesEditor {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            lock: std::sync::Mutex::new(()),
-        }
+        Self { path: path.into() }
     }
 
     /// REPLACE the whole `[capabilities]` table with `entries`.
@@ -1136,7 +1161,7 @@ impl CapabilitiesEditor {
     /// * an EMPTY map REMOVES the `[capabilities]` table entirely, which is
     ///   what returns the daemon to legacy mode (L1).
     pub fn update(&self, entries: &BTreeMap<String, ruagent_policy::CapabilityFile>) -> Result<()> {
-        let _guard = self.lock.lock().expect("capabilities editor lock");
+        let _guard = config_write_lock();
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
         let mut doc: toml_edit::DocumentMut = text
@@ -1164,7 +1189,7 @@ impl CapabilitiesEditor {
                 set_or_remove_u32(tbl, "max_docs_per_pass", file.max_docs_per_pass);
             }
         }
-        let tmp = self.path.with_extension("toml.tmp");
+        let tmp = unique_tmp_path(&self.path);
         std::fs::write(&tmp, doc.to_string())
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
@@ -1278,21 +1303,17 @@ pub fn load_routing_file(config_dir: &std::path::Path, fallback: &RoutingFile) -
 /// writers) instead of teaching a wider patch type a narrower concern.
 pub struct PrimaryEditor {
     path: PathBuf,
-    lock: std::sync::Mutex<()>,
 }
 
 impl PrimaryEditor {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            lock: std::sync::Mutex::new(()),
-        }
+        Self { path: path.into() }
     }
 
     /// Mark ONE entry primary and clear the flag from EVERY other entry IN THE SAME WRITE.
     /// `None` clears it everywhere (the platform then has no primary).
     pub fn set(&self, name: Option<&str>) -> Result<()> {
-        let _g = self.lock.lock().expect("primary editor lock");
+        let _guard = config_write_lock();
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
         let mut doc: toml_edit::DocumentMut = text
@@ -1318,7 +1339,7 @@ impl PrimaryEditor {
         if let Some(wanted) = name.filter(|_| !found) {
             anyhow::bail!("agent `{wanted}` not found in {}", self.path.display());
         }
-        let tmp = self.path.with_extension("toml.tmp");
+        let tmp = unique_tmp_path(&self.path);
         std::fs::write(&tmp, doc.to_string())
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
@@ -1348,33 +1369,49 @@ fn leading_prefix(doc: &toml_edit::DocumentMut) -> Option<toml_edit::RawString> 
 
 /// Put the lifted prefix back on the first item -- unless that item already carries a comment
 /// prefix, in which case the file documents it itself and prepending would duplicate the text.
-fn put_leading_prefix(doc: &mut toml_edit::DocumentMut, prefix: toml_edit::RawString) {
+/// Returns the prefix BACK when the document is empty and therefore has no key to hang it on: the
+/// caller prepends it to the serialized text. Returning early instead is what silently emptied the
+/// file -- a clear write (`remove("routes")` then `remove("default")`) lost the whole
+/// `# ruagent routing rules ...` header, leaving a zero-byte routing.toml (front-door-audit F3).
+fn put_leading_prefix(
+    doc: &mut toml_edit::DocumentMut,
+    prefix: toml_edit::RawString,
+) -> Option<toml_edit::RawString> {
     let Some(first) = doc.iter().next().map(|(k, _)| k.to_string()) else {
-        return;
+        return Some(prefix);
     };
-    let Some((mut key, _)) = doc.get_key_value_mut(&first) else {
-        return;
+    let Some((mut key, item)) = doc.get_key_value_mut(&first) else {
+        return Some(prefix);
     };
+    // An ARRAY-OF-TABLES stores the `[[` itself in the KEY's decor prefix, so writing the comments
+    // there turns `[[routes]]` into `routes]]` and the file stops parsing (measured when a PATCH
+    // cleared `default` while rules remained: `TOML parse error at line 4, column 7`). The comments
+    // go on the first table's own decor instead, which prints in the same place.
+    if let toml_edit::Item::ArrayOfTables(tables) = item {
+        if let Some(table) = tables.iter_mut().next() {
+            let mut decor = table.decor().clone();
+            decor.set_prefix(prefix);
+            *table.decor_mut() = decor;
+        }
+        return None;
+    }
     let mut decor = key.leaf_decor().clone();
     decor.set_prefix(prefix);
     *key.leaf_decor_mut() = decor;
+    None
 }
 
 pub struct RoutingEditor {
     path: PathBuf,
-    lock: std::sync::Mutex<()>,
 }
 
 impl RoutingEditor {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            lock: std::sync::Mutex::new(()),
-        }
+        Self { path: path.into() }
     }
 
     pub fn write(&self, cfg: &RoutingFile) -> Result<()> {
-        let _g = self.lock.lock().expect("routing editor lock");
+        let _guard = config_write_lock();
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
         let mut doc: toml_edit::DocumentMut = text
@@ -1411,12 +1448,13 @@ impl RoutingEditor {
             }
             doc.insert("routes", toml_edit::Item::ArrayOfTables(tables));
         }
-        if let Some(prefix) = leading {
-            put_leading_prefix(&mut doc, prefix);
-        }
-        let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, doc.to_string())
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        let text = match leading.and_then(|prefix| put_leading_prefix(&mut doc, prefix)) {
+            // the document ended up EMPTY (a clear write): keep the header as a comment-only file
+            Some(head) => format!("{}{doc}", head.as_str().unwrap_or_default()),
+            None => doc.to_string(),
+        };
+        let tmp = unique_tmp_path(&self.path);
+        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming into {}", self.path.display()))?;
         Ok(())
@@ -1818,5 +1856,157 @@ agent = "claude"
         let back = parse_routing(&text).expect("still parses");
         assert_eq!(back.default.as_deref(), Some("dsh"));
         assert_eq!(back.routes.len(), 2, "{text}");
+    }
+}
+
+#[cfg(test)]
+mod config_writer_tests {
+    use super::*;
+
+    fn private_root(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ruagent-cfg-writer-{tag}-{}", std::process::id()));
+        crate::test_cleanup::report_test_root_left_behind(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a private root");
+        dir
+    }
+
+    const SEEDED: &str = "# ruagent routing rules (design §5.4/§9.1).\n# Cascade: explicit --agent > first matching route > default.\n\ndefault = \"claude\"\n\n# a rule\n[[routes]]\nproject = \"ruagent\"\nagent = \"claude\"\n";
+
+    /// F3 (front-door-audit): a CLEAR write -- no default, no rules -- used to fall through
+    /// `put_leading_prefix`'s early return, so the whole header block went with the keys and the
+    /// file ended up EMPTY. The header is the only documentation routing.toml has.
+    #[test]
+    fn clearing_the_routing_file_keeps_its_header() {
+        let dir = private_root("clear");
+        let path = dir.join("routing.toml");
+        std::fs::write(&path, SEEDED).expect("seed");
+
+        RoutingEditor::new(&path)
+            .write(&RoutingFile {
+                default: None,
+                routes: Vec::new(),
+            })
+            .expect("clear write");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            text.contains("# ruagent routing rules"),
+            "a clear write must not eat the header block: {text:?}"
+        );
+        assert!(text.contains("# Cascade:"), "{text:?}");
+        assert!(!text.contains("default ="), "the default is gone: {text:?}");
+    }
+
+    /// Also F3/F2-adjacent (found while writing the PATCH): clearing the default while rules remain
+    /// left `[[routes]]` as the first key, and the prefix carry overwrote the key decor that HOLDS
+    /// the `[[` -- the file came out as `routes]]` and stopped parsing.
+    #[test]
+    fn clearing_the_default_with_rules_left_still_parses() {
+        let dir = private_root("clear-with-rules");
+        let path = dir.join("routing.toml");
+        std::fs::write(&path, SEEDED).expect("seed");
+
+        let mut cfg = parse_routing(SEEDED).expect("the seed parses");
+        cfg.default = None;
+        RoutingEditor::new(&path)
+            .write(&cfg)
+            .expect("clear the default");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let back = parse_routing(&text)
+            .unwrap_or_else(|e| panic!("the file must still parse ({e}): {text:?}"));
+        assert_eq!(back.default, None, "{text:?}");
+        assert_eq!(back.routes.len(), 1, "{text:?}");
+        assert!(text.contains("# ruagent routing rules"), "{text:?}");
+    }
+    /// F2: the temp path is UNIQUE per write, so two writers cannot truncate each other's temp file
+    /// and rename a torn result in. It used to be a fixed `<file>.toml.tmp` shared by every editor
+    /// and every request.
+    #[test]
+    fn every_write_gets_its_own_temp_path() {
+        let path = std::path::Path::new("C:/tmp/ruagent/routing.toml");
+        let a = unique_tmp_path(path);
+        let b = unique_tmp_path(path);
+        assert_ne!(a, b, "two writes must not share one temp file");
+        let name = a
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("routing.toml."), "{name}");
+        assert!(name.ends_with(".tmp"), "{name}");
+        assert!(name.contains(&std::process::id().to_string()), "{name}");
+        assert_eq!(
+            a.parent(),
+            path.parent(),
+            "the temp file stays beside its target"
+        );
+    }
+
+    /// F2: the lock is PROCESS-WIDE. Each editor used to own a `Mutex`, and the API builds a fresh
+    /// editor per request, so the two writes never met; this asserts the identity of the lock every
+    /// editor takes (sequentially -- holding two guards would deadlock, which is itself the proof).
+    #[test]
+    fn the_write_lock_is_one_object_for_the_whole_process() {
+        let first = {
+            let guard = config_write_lock();
+            &*guard as *const ()
+        };
+        let second = {
+            let guard = config_write_lock();
+            &*guard as *const ()
+        };
+        assert_eq!(first, second, "every editor must take the SAME lock");
+    }
+
+    /// F2 end to end: two threads write the same file with DIFFERENT content, 100 times each.
+    /// Whatever the interleaving, the result must parse and carry exactly one winner -- never a mix
+    /// of the two, and never an unparseable file (which would make every later read fall back to the
+    /// boot snapshot and every later write fail).
+    #[test]
+    fn concurrent_writers_never_leave_a_torn_file() {
+        use std::sync::Arc;
+
+        let dir = private_root("concurrent");
+        let path = Arc::new(dir.join("agents.toml"));
+        std::fs::write(
+            &*path,
+            "[agent.alpha]\nharness = \"mock\"\ncommand = \"cargo\"\ndescription = \"a\"\n\n[agent.beta]\nharness = \"mock\"\ncommand = \"cargo\"\ndescription = \"b\"\n",
+        )
+        .expect("seed");
+
+        let mut handles = Vec::new();
+        for target in ["alpha", "beta"] {
+            let path = Arc::clone(&path);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    PrimaryEditor::new(&*path).set(Some(target)).expect("write");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+
+        let text = std::fs::read_to_string(&*path).expect("read back");
+        let cards = parse_agents(&text).unwrap_or_else(|e| {
+            panic!("concurrent writes left an unparseable agents.toml ({e}): {text:?}")
+        });
+        let flagged: Vec<&str> = cards
+            .iter()
+            .filter(|c| c.primary)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "exactly one winner, never two concatenated states: {text:?}"
+        );
+        assert!(
+            flagged[0] == "alpha" || flagged[0] == "beta",
+            "the winner is one of the two writers: {text:?}"
+        );
     }
 }

@@ -2516,10 +2516,19 @@ fn front_door_json(
                  so `{}` is what answers -- PUT /api/v1/primary sets both in one write",
                 default.name, primary.name, default.name
             ),
-            None => format!(
-                "routing.toml's `default` names `{}` and no agent is marked primary",
-                default.name
-            ),
+            // F4 (front-door-audit): the flag may sit on a DISABLED card, and then "no agent is
+            // marked primary" contradicts both agents.toml and what the panel renders. Say which
+            // card carries it and why it does not answer.
+            None => match cards.iter().find(|c| c.primary) {
+                Some(disabled) => format!(
+                    "routing.toml's `default` names `{}`; agents.toml also marks `{}` primary, but                      that agent is DISABLED, so the default is what answers (enable `{}` for its                      marker to take effect)",
+                    default.name, disabled.name, disabled.name
+                ),
+                None => format!(
+                    "routing.toml's `default` names `{}` and no agent is marked primary",
+                    default.name
+                ),
+            },
         };
         return serde_json::json!({
             "name": default.name.clone(),
@@ -2529,13 +2538,22 @@ fn front_door_json(
         });
     }
     if let Some(primary) = marked {
+        // F5/F4 (front-door-audit): if routing.toml DOES name something, say WHICH and why it is not
+        // answering. "names no usable default" without the name is the same denial F4 is about -- the
+        // file plainly carries a name, and a reader who opens it must not be told otherwise.
+        let because = match routing.default.as_deref() {
+            Some(named) => format!(
+                "routing.toml's `default` names `{named}`, which is not an enabled registered \
+                 agent, so it cannot answer"
+            ),
+            None => "routing.toml names no `default`".to_string(),
+        };
         return serde_json::json!({
             "name": primary.name.clone(),
             "id": primary.id.to_string(),
             "source": "primary-flag",
             "why": format!(
-                "routing.toml names no usable `default`, and agents.toml marks `{}` primary, \
-                 so level 4 of the cascade answers",
+                "{because}; agents.toml marks `{}` primary, so level 4 of the cascade answers",
                 primary.name
             ),
         });
@@ -2605,14 +2623,47 @@ async fn put_primary(
         }
         Some(req.name.clone())
     };
-    crate::config::PrimaryEditor::new(config_dir.join("agents.toml"))
-        .set(target.as_deref())
-        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    // F1 (front-door-audit): ROUTING FIRST, then the flag.
+    //
+    // This endpoint exists to make the two carriers agree, so a failure in the SECOND write must not
+    // leave the first one landed. The old order wrote the flag and then the routing default: a
+    // routing failure (unparseable file, read-only file, a scanner holding it) answered 500 while the
+    // disk said "flag = X, default = old" -- exactly the drift this endpoint is supposed to end. A
+    // routing preflight that only READS would not be enough (it can parse and still refuse to write),
+    // so the routing write IS the preflight.
     let mut routing = crate::config::load_routing_file(&config_dir, &state.config.routing);
+    let previous_default = routing.default.clone();
     routing.default = target.clone();
     crate::config::RoutingEditor::new(config_dir.join("routing.toml"))
         .write(&routing)
-        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "writing routing.toml failed ({e:#}); the primary flag was NOT touched, so the two                  carriers still agree on the old value"
+            ))
+        })?;
+    if let Err(e) =
+        crate::config::PrimaryEditor::new(config_dir.join("agents.toml")).set(target.as_deref())
+    {
+        // The flag write failed AFTER routing moved: put routing back, and say in the error which of
+        // the two states the disk is actually in. A silent half-write is the one thing this endpoint
+        // may not produce.
+        let mut back = crate::config::load_routing_file(&config_dir, &state.config.routing);
+        back.default = previous_default.clone();
+        let rolled_back = crate::config::RoutingEditor::new(config_dir.join("routing.toml"))
+            .write(&back)
+            .is_ok();
+        return Err(ApiError::internal(if rolled_back {
+            format!(
+                "writing the primary flag failed ({e:#}); routing.toml's default was rolled back to                  `{}`, so the two carriers still agree",
+                previous_default.as_deref().unwrap_or("(none)")
+            )
+        } else {
+            format!(
+                "writing the primary flag failed ({e:#}) AND routing.toml could not be rolled back: it                  now names `{}` while agents.toml carries no matching flag -- fix both files by hand,                  or retry this request",
+                target.as_deref().unwrap_or("(none)")
+            )
+        }));
+    }
     reload_registry(&state).await?;
     Ok(Json(effective_front_door(&state)))
 }
@@ -7685,8 +7736,18 @@ fn routing_decision_with(
     routing: &crate::config::RoutingFile,
     task: &Task,
 ) -> Option<ruagent_core::RoutingDecision> {
-    let by_name: std::collections::HashMap<&str, ruagent_core::AgentId> =
-        cards.iter().map(|c| (c.name.as_str(), c.id)).collect();
+    // F5 (front-door-audit): ONLY ENABLED CARDS RESOLVE. The report side (`front_door_json`) already
+    // refuses a routing default that names a disabled agent, while this path used to resolve it
+    // anyway -- so the API said "the answer comes from the primary flag" and the run then started on
+    // a disabled agent. Chosen direction: the RUN path gives up the name as well, because starting a
+    // run on an agent that cannot run is a failure the user never asked for; falling through to the
+    // next level (primary, then the first enabled card) is the same rule the report side applies, and
+    // it is what makes the two answers identical.
+    let by_name: std::collections::HashMap<&str, ruagent_core::AgentId> = cards
+        .iter()
+        .filter(|c| c.enabled)
+        .map(|c| (c.name.as_str(), c.id))
+        .collect();
     let resolve = |name: &str| by_name.get(name).map(|id| id.to_string());
     let config = ruagent_orchestrator::RoutingConfig {
         routes: routing
@@ -12710,10 +12771,16 @@ mod primary_api_tests {
         assert!(beta.contains("primary = true"), "beta carries it: {agents}");
         let routing = read(&root, "routing.toml");
         assert!(routing.contains("default = \"beta\""), "{routing}");
-        // NOT asserted here: whether the HEADER comments survive this write. Measured in t51:
-        // RoutingEditor (config.rs, outside this task's scope) replaces the "default" item together
-        // with its decor, so "# ruagent routing rules" is lost on the first write. Filed as a
-        // finding instead of being papered over -- what this test owns is that BOTH carriers changed.
+        // The header block now survives this write, and this test asserts it (t61). History, so the
+        // next reader does not have to rediscover it: t51 measured that writing `default` replaced
+        // the item AND its decor, dropping "# ruagent routing rules"; t52 fixed the ORDINARY write
+        // (the prefix is carried onto whichever key ends up first); the CLEAR write (no default, no
+        // rules) still emptied the file, and clearing the default while rules remained produced
+        // `routes]]` -- both fixed in t59.
+        assert!(
+            routing.contains("# ruagent routing rules"),
+            "the header block survives a two-carrier write: {routing}"
+        );
 
         // clearing with "none" empties both again.
         let (st, json, raw) = send_json(
@@ -12916,15 +12983,11 @@ mod routing_patch_tests {
 
     /// `""` and `null` both clear the default -- and only then; an omission keeps it.
     ///
-    /// IGNORED, WITH THE REASON (t58): this path is BROKEN today, and the fix is not in this task's
-    /// scope. Clearing the default leaves `[[routes]]` as the file's first key, and
-    /// `config::put_leading_prefix` overwrites that KEY's prefix decor -- which is where toml_edit
-    /// stores the `[[` -- so the file comes out as `routes]]` and stops parsing (`TOML parse error at
-    /// line 11, column 7`, measured). The repair belongs to crates/daemon/src/config.rs (`put_leading
-    /// _prefix` must put the comments on the first TABLE's decor for an array-of-tables and return).
-    /// Keeping the test here, ignored rather than deleted, so the defect stays visible and the fix
-    /// has its regression test ready.
-    #[ignore = "blocked: clearing `default` corrupts routing.toml (RoutingEditor AoT decor bug, fix lives in config.rs)"]
+    /// This test was `#[ignore]`d under t58, because clearing the default left `[[routes]]` as the
+    /// file's first key and `config::put_leading_prefix` overwrote the key decor that HOLDS the `[[`
+    /// -- the file came out as `routes]]` and stopped parsing. t59 fixed that helper (array-of-tables
+    /// comments go on the first TABLE's decor; an empty document keeps its header), so the ignore is
+    /// gone and this runs for real.
     #[tokio::test]
     async fn an_explicit_empty_default_clears_it() {
         let (app, _db, _root) = harness_with_agents(Some(AGENTS)).await;
@@ -12999,5 +13062,130 @@ mod routing_patch_tests {
             before,
             "a refused patch writes nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_consistency_tests {
+    use super::tests::{harness_with_agents, send_json};
+    use super::*;
+    use axum::http::StatusCode;
+
+    const AGENTS: &str = "[agent.alpha]\nharness = \"mock\"\ncommand = \"cargo\"\ndescription = \"alpha\"\nprompt = \"alpha\"\nprimary = true\n\n[agent.beta]\nharness = \"mock\"\ncommand = \"cargo\"\ndescription = \"beta\"\nprompt = \"beta\"\n";
+
+    fn card(name: &str, primary: bool, enabled: bool) -> ruagent_core::AgentCard {
+        ruagent_core::AgentCard {
+            id: ruagent_core::AgentId::generate(),
+            name: name.to_string(),
+            harness: ruagent_core::HarnessKind::Dsh,
+            command: None,
+            description: String::new(),
+            model: None,
+            reasoning_effort: None,
+            context_window: None,
+            mcp_profile: None,
+            models: Vec::new(),
+            prompt: None,
+            runtime: None,
+            runtimes: Vec::new(),
+            options: std::collections::BTreeMap::new(),
+            tags: Vec::new(),
+            enabled,
+            primary,
+        }
+    }
+
+    /// F1 (front-door-audit): the two carriers are written routing-first, so a REFUSED routing write
+    /// leaves the flag alone. The old order wrote the flag first and answered 500 with the disk in
+    /// the drifted state this endpoint exists to prevent.
+    #[tokio::test]
+    async fn a_failed_routing_write_leaves_the_primary_flag_alone() {
+        let (app, _db, root) = harness_with_agents(Some(AGENTS)).await;
+        // a routing.toml the editor cannot parse: the write fails before the flag is touched
+        let routing_path = root.join("config").join("routing.toml");
+        std::fs::write(&routing_path, "this is not = valid = toml\n").expect("corrupt it");
+        let agents_before =
+            std::fs::read_to_string(root.join("config").join("agents.toml")).unwrap();
+
+        let (st, _json, raw) = send_json(
+            &app,
+            "PUT",
+            "/api/v1/primary",
+            Some(serde_json::json!({ "name": "beta" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{raw}");
+        assert!(raw.contains("primary flag was NOT touched"), "{raw}");
+
+        let agents_after =
+            std::fs::read_to_string(root.join("config").join("agents.toml")).unwrap();
+        assert_eq!(
+            agents_after, agents_before,
+            "a refused routing write must not move the flag: {agents_after}"
+        );
+        let alpha = agents_after
+            .split("[agent.beta]")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            alpha.contains("primary = true"),
+            "alpha still carries the flag: {agents_after}"
+        );
+    }
+
+    /// F5 (front-door-audit): a routing default that names a DISABLED agent is ignored by BOTH
+    /// sides -- the report and the run must never answer with different agents.
+    #[test]
+    fn a_disabled_routing_default_is_ignored_by_both_the_report_and_the_run() {
+        let cards = vec![card("alpha", true, true), card("beta", false, false)];
+        let routing = crate::config::RoutingFile {
+            default: Some("beta".to_string()),
+            routes: Vec::new(),
+        };
+        let task = Task::new("t", "i", ruagent_core::TaskCreator::Human);
+
+        // the run side gives the name up entirely, so the cascade falls through to level 4
+        assert!(
+            routing_decision_with(&cards, &routing, &task).is_none(),
+            "a disabled default must not resolve on the run path"
+        );
+        let (run_side, _) = primary_decision(&cards, None).expect("level 4 answers instead");
+        assert_eq!(run_side, "alpha");
+
+        // and the report says the same agent, from the same level
+        let report = front_door_json(&cards, &routing);
+        assert_eq!(report["name"], "alpha", "{report}");
+        assert_eq!(report["source"], "primary-flag", "{report}");
+        let why = report["why"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("beta"),
+            "the why names the default it refused: {why}"
+        );
+    }
+
+    /// F4 (front-door-audit): when the flag sits on a DISABLED card, the why must name it instead of
+    /// claiming nothing is marked primary -- the panel renders the marker at the same time.
+    #[test]
+    fn the_why_names_a_disabled_primary_instead_of_denying_it() {
+        let cards = vec![card("alpha", true, false), card("beta", false, true)];
+        let routing = crate::config::RoutingFile {
+            default: Some("beta".to_string()),
+            routes: Vec::new(),
+        };
+        let report = front_door_json(&cards, &routing);
+        assert_eq!(report["name"], "beta", "{report}");
+        let why = report["why"].as_str().unwrap_or_default();
+        assert!(
+            !why.contains("no agent is marked primary"),
+            "the flag IS set (on a disabled card) -- denying it is the contradiction: {why}"
+        );
+        assert!(why.contains("alpha"), "{why}");
+        assert!(why.contains("DISABLED"), "{why}");
+
+        // ... and with NO flag anywhere the sentence is still the right one
+        let plain = vec![card("beta", false, true)];
+        let report = front_door_json(&plain, &routing);
+        let why = report["why"].as_str().unwrap_or_default();
+        assert!(why.contains("no agent is marked primary"), "{why}");
     }
 }
