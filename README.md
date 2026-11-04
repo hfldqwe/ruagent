@@ -147,6 +147,47 @@ Two agents marked `primary` is a **load error** naming both, not a tie
 broken by file order. A marked but disabled primary declines out loud: the
 routing rationale says which agent was skipped and why.
 
+### Connecting a runtime (and what to do when it won't)
+
+A *runtime* is a spawnable engine: the platform talks to it over ACP by running
+a command. The seed registers three, and **each one needs something installed on
+the machine you are using** — a fresh install on a different computer will show
+them and then fail to start them, which is the expected state, not a broken build:
+
+| runtime | command | what has to exist |
+| --- | --- | --- |
+| `claude` | `npx @agentclientprotocol/claude-agent-acp` | Node.js (`npx`), network on first run, and the `claude` CLI the adapter drives |
+| `opencode` | `opencode acp` | the `opencode` CLI on `PATH` |
+| `dsh` | `dsh --profile acp` | the `dsh` CLI on `PATH` |
+
+Check them where the daemon runs (the daemon's `PATH`, not your shell's, if they
+differ):
+
+```bash
+command -v npx opencode dsh      # or: where npx opencode dsh   (Windows)
+```
+
+Then verify the one you intend to use end to end — a runtime that is merely
+*registered* has not been proven to start:
+
+```bash
+curl -s -X POST localhost:8787/api/v1/runtimes/dsh/probe   # 0.1.6+: stage + detail
+curl -s localhost:8787/api/v1/agents/dsh/options           # spawns it, 400 = it did not start
+```
+
+The `400` from `options` carries the reason verbatim — `program \`x\` for agent
+\`dsh\` not found on PATH` is the most common one. To point a runtime at a command
+that *is* installed, edit it in the panel (Runtimes → edit) or:
+
+```bash
+curl -s -X PATCH localhost:8787/api/v1/runtimes/dsh \
+  -H 'content-type: application/json' -d '{"command":"my-cli --acp"}'
+```
+
+A runtime also needs a **known harness** (`claude-code`, `opencode`, `dsh`,
+`mock`) — that is what decides which ACP adapter lands on it. The name does not
+have to be the harness: give `harness` explicitly when you name it something else.
+
 ## Orchestration
 
 - **Direct** — one run on one agent.

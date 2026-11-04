@@ -133,6 +133,42 @@ ruagent primary none                # 干脆不设主智能体
 胜负。标了但被禁用的主智能体会**明确声明退出**：路由的 rationale 会写明跳过了
 谁、为什么。
 
+### 接入运行时（以及接不通时看哪里）
+
+*运行时*是可被拉起的引擎：平台通过 ACP 跑一条命令跟它说话。种子注册了三个，
+而**每一个都要求你正用的这台机器上装了对应的东西**——换一台电脑全新安装，会看到
+它们、然后启动失败，这是预期状态，不是装坏了：
+
+| 运行时 | 命令 | 需要什么 |
+| --- | --- | --- |
+| `claude` | `npx @agentclientprotocol/claude-agent-acp` | Node.js（`npx`）、首次运行要联网、以及适配器要驱动的 `claude` CLI |
+| `opencode` | `opencode acp` | `PATH` 上的 `opencode` |
+| `dsh` | `dsh --profile acp` | `PATH` 上的 `dsh` |
+
+要在 **daemon 的 `PATH`** 里查（不一定是你的 shell 的）：
+
+```bash
+command -v npx opencode dsh      # Windows: where npx opencode dsh
+```
+
+然后把你打算用的那个**端到端验一遍**——「注册了」不等于「起得来」：
+
+```bash
+curl -s -X POST localhost:8787/api/v1/runtimes/dsh/probe   # 0.1.6 起：stage + detail
+curl -s localhost:8787/api/v1/agents/dsh/options           # 真去起一次；400 = 没起来
+```
+
+`options` 的 `400` 会原样带出原因——`program \`x\` for agent \`dsh\` not found on
+PATH` 是最常见的那条。若这台机器上装的是别的命令，在面板 Runtimes 页编辑它，或：
+
+```bash
+curl -s -X PATCH localhost:8787/api/v1/runtimes/dsh \
+  -H 'content-type: application/json' -d '{"command":"my-cli --acp"}'
+```
+
+运行时还需要一个**已知 harness**（`claude-code`、`opencode`、`dsh`、`mock`），它决定
+挂哪个 ACP 适配器。名字不必等于 harness：名字自定义时请显式给 `harness`。
+
 ## 编排
 
 - **直连** —— 一个智能体一次运行。
