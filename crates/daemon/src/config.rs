@@ -170,14 +170,40 @@ struct AgentEntry {
     primary: Option<bool>,
 }
 
+/// Every harness spelling the platform understands, in ONE table: the error that lists what IS
+/// supported must not be a second hand-written copy of this match (it drifted -- a wrong or empty
+/// `harness` answered `unknown harness ``` ``` with no hint, and a user on a fresh machine cannot
+/// guess `dsh`/`mock` from `codex`).
+const HARNESS_NAMES: &[(&str, HarnessKind)] = &[
+    ("claude-code", HarnessKind::ClaudeCode),
+    ("claude", HarnessKind::ClaudeCode),
+    ("opencode", HarnessKind::OpenCode),
+    ("dsh", HarnessKind::Dsh),
+    ("deepseek", HarnessKind::Dsh),
+    ("mock", HarnessKind::Mock),
+];
+
+/// The CANONICAL spellings, for error text and for anyone asking what is supported.
+pub const CANONICAL_HARNESSES: &[&str] = &["claude-code", "opencode", "dsh", "mock"];
+
 pub(crate) fn harness_of(name: &str, spec: Option<&str>) -> Result<HarnessKind> {
-    match spec.unwrap_or(name).trim() {
-        "claude-code" | "claude" => Ok(HarnessKind::ClaudeCode),
-        "opencode" => Ok(HarnessKind::OpenCode),
-        "dsh" | "deepseek" => Ok(HarnessKind::Dsh),
-        "mock" => Ok(HarnessKind::Mock),
-        other => anyhow::bail!("unknown harness `{other}` (runtime `{name}`)"),
+    let wanted = spec.unwrap_or(name).trim();
+    if wanted.is_empty() {
+        anyhow::bail!(
+            "no harness chosen for runtime `{name}`: pick one of {} -- for the built-in test agent use \"mock\"",
+            CANONICAL_HARNESSES.join(", ")
+        );
     }
+    HARNESS_NAMES
+        .iter()
+        .find(|(spelling, _)| *spelling == wanted)
+        .map(|(_, kind)| *kind)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown harness `{wanted}` (runtime `{name}`) -- supported: {}",
+                CANONICAL_HARNESSES.join(", ")
+            )
+        })
 }
 
 fn parse_effort(s: Option<&str>) -> Option<ReasoningEffort> {
@@ -445,6 +471,103 @@ fn parse_mcp(text: &str) -> Result<McpConfig> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// THE PLATFORM'S OWN MCP SERVER (t69)
+// ---------------------------------------------------------------------------
+
+/// Does a bare command resolve on PATH? Asked of `ruagent_mcp::health::resolve_command`, i.e. the
+/// SAME rule the pre-flight applies, so the daemon never holds a second opinion about where a
+/// binary lives.
+fn command_resolves(command: &str) -> bool {
+    ruagent_mcp::health::resolve_command(command).is_ok()
+}
+
+/// This process's own executable: what the platform's own MCP server is started from when the
+/// distribution put nothing on PATH.
+fn this_executable() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()
+}
+
+/// The two questions the substitution needs, injected so a test can answer them WITHOUT mutating the
+/// process's PATH (which would race every parallel test in this binary).
+#[derive(Clone, Copy)]
+struct CommandResolution {
+    resolves: fn(&str) -> bool,
+    own_exe: fn() -> Option<std::path::PathBuf>,
+}
+
+impl CommandResolution {
+    fn real() -> Self {
+        Self {
+            resolves: command_resolves,
+            own_exe: this_executable,
+        }
+    }
+}
+
+/// Is this entry the PLATFORM's own MCP server -- the only command the daemon may replace (t69)?
+///
+/// Deliberately narrow: a BARE name (no separator, so it can only be a PATH lookup; a configured
+/// path is the user's own statement and is never second-guessed) that is `ruagent` or `ruagent.exe`,
+/// AND the `mcp-serve` subcommand among the args. A user's own server is never rewritten: guessing
+/// what somebody else's command meant is worse than refusing it.
+fn is_platform_own_server(entry: &McpEntry) -> bool {
+    let Some(command) = entry.command.as_deref().map(str::trim) else {
+        return false;
+    };
+    if command.is_empty() || command.contains('/') || command.contains('\\') {
+        return false;
+    }
+    let lowered = command.to_ascii_lowercase();
+    let stem = lowered.strip_suffix(".exe").unwrap_or(lowered.as_str());
+    if stem != "ruagent" {
+        return false;
+    }
+    entry.args.iter().any(|a| a.trim() == "mcp-serve")
+}
+
+/// What this entry will ACTUALLY be spawned with, and whether the daemon substituted its own
+/// executable for the bare `ruagent` name.
+fn resolved_command(entry: &McpEntry, how: CommandResolution) -> (Option<String>, bool) {
+    let Some(configured) = entry
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+    else {
+        return (None, false);
+    };
+    if !is_platform_own_server(entry) || (how.resolves)(&configured) {
+        return (Some(configured), false);
+    }
+    match (how.own_exe)() {
+        Some(exe) => (Some(exe.to_string_lossy().into_owned()), true),
+        // No own executable either: keep the configured name, so the pre-flight's ordinary
+        // message ("PATH 上找不到") is what the user reads.
+        None => (Some(configured), false),
+    }
+}
+
+/// Say ONCE per process which executable stands in for `ruagent`: the pre-flight and the expansion
+/// both ask, and one session start must not print it twice.
+fn note_own_executable_fallback(server: &str, exe: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = format!("{server}\u{1f}{exe}");
+    let first = said.lock().map(|mut s| s.insert(key)).unwrap_or(true);
+    if first {
+        tracing::warn!(
+            server,
+            exe,
+            "ruagent is not on PATH -- starting the platform's own MCP server from THIS executable instead (an unzipped install has nothing on PATH)"
+        );
+    }
+}
+
 impl McpConfig {
     /// Expand a profile into ACP MCP servers for one agent (design §7.1:
     /// injection is an overlay, `inject_for` filters membership).
@@ -453,10 +576,36 @@ impl McpConfig {
         profile: Option<&str>,
         agent_name: &str,
     ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+        self.expand_profile_with(profile, agent_name, CommandResolution::real())
+    }
+
+    /// [Self::expand_profile] with the command resolution injected (t69): the platform's own MCP
+    /// server falls back to THIS process's executable when `ruagent` is not on PATH.
+    fn expand_profile_with(
+        &self,
+        profile: Option<&str>,
+        agent_name: &str,
+        how: CommandResolution,
+    ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
         self.profile_entries(profile, agent_name)
             .into_iter()
-            .map(|(n, e)| mcp_entry_to_acp(n, e))
+            .map(|(n, e)| mcp_entry_to_acp(n, e, self.spawn_command(n, e, how)))
             .collect()
+    }
+
+    /// The command a profile entry is actually spawned with (t69), with the one-line notice when the
+    /// daemon substitutes its own executable.
+    fn spawn_command(
+        &self,
+        name: &str,
+        entry: &McpEntry,
+        how: CommandResolution,
+    ) -> Option<String> {
+        let (command, substituted) = resolved_command(entry, how);
+        if substituted && let Some(exe) = command.as_deref() {
+            note_own_executable_fallback(name, exe);
+        }
+        command
     }
 
     /// The registry entries a profile would inject, in injection order.
@@ -509,11 +658,23 @@ impl McpConfig {
         profile: Option<&str>,
         agent_name: &str,
     ) -> Vec<McpPreflightFailure> {
+        self.preflight_profile_with(profile, agent_name, CommandResolution::real())
+    }
+
+    /// [Self::preflight_profile] with the command resolution injected (t69). The target carries the
+    /// SAME command the expansion would inject, so the pre-flight can never pass a command the
+    /// harness would then fail to start (or fail one it would have started).
+    fn preflight_profile_with(
+        &self,
+        profile: Option<&str>,
+        agent_name: &str,
+        how: CommandResolution,
+    ) -> Vec<McpPreflightFailure> {
         self.profile_entries(profile, agent_name)
             .into_iter()
             .filter_map(|(name, entry)| {
                 let target = ruagent_mcp::health::PingTarget {
-                    command: entry.command.clone(),
+                    command: self.spawn_command(name, entry, how),
                     args: entry.args.clone(),
                     url: entry.url.clone(),
                 };
@@ -542,7 +703,22 @@ impl McpConfig {
         profile: Option<&str>,
         agent_name: &str,
     ) -> Result<Vec<agent_client_protocol::schema::v1::McpServer>, String> {
-        let failures = self.preflight_profile(profile, agent_name);
+        self.expand_profile_preflighted_with(profile, agent_name, CommandResolution::real())
+    }
+
+    /// [Self::expand_profile_preflighted] with the command resolution injected (t69).
+    ///
+    /// The error text names the failures AND the two next steps that actually exist, because in the
+    /// shipped (unzipped) shape the user should not have to edit a file at all: the platform's own
+    /// server is started from the daemon's own executable, so a failure here means that executable
+    /// itself is unusable -- which is a different fix from "fix your command".
+    fn expand_profile_preflighted_with(
+        &self,
+        profile: Option<&str>,
+        agent_name: &str,
+        how: CommandResolution,
+    ) -> Result<Vec<agent_client_protocol::schema::v1::McpServer>, String> {
+        let failures = self.preflight_profile_with(profile, agent_name, how);
         if !failures.is_empty() {
             let detail = failures
                 .iter()
@@ -554,13 +730,20 @@ impl McpConfig {
                 })
                 .collect::<Vec<_>>()
                 .join("；");
+            let own = this_executable()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(无法读取自身路径)".to_string());
             return Err(format!(
                 "{detail}。请修正 ~/.ruagent/config/mcp.toml 里该 server 的 command/url，\
-                 或把它从 profile [{}] 中移除后重试。",
+                 或把它从 profile [{}] 中移除后重试。\
+                 注意：若失败的是平台自己的那个 server（command 为 ruagent、args 含 mcp-serve），\
+                 它在 PATH 上解析不到时 daemon 会自动改用自身可执行文件 {own} 启动它；\
+                 这条仍然失败说明 {own} 也用不了——确认该文件存在、可执行，\
+                 或把 daemon 放进 PATH / 在 mcp.toml 里写绝对路径。",
                 profile.unwrap_or("(none)")
             ));
         }
-        Ok(self.expand_profile(profile, agent_name))
+        Ok(self.expand_profile_with(profile, agent_name, how))
     }
 }
 
@@ -573,14 +756,18 @@ pub struct McpPreflightFailure {
     pub reason: String,
 }
 
-fn mcp_entry_to_acp(name: &str, e: &McpEntry) -> agent_client_protocol::schema::v1::McpServer {
+fn mcp_entry_to_acp(
+    name: &str,
+    e: &McpEntry,
+    command: Option<String>,
+) -> agent_client_protocol::schema::v1::McpServer {
     use agent_client_protocol::schema::v1::{McpServer, McpServerHttp, McpServerStdio};
     if let Some(url) = &e.url {
         // http vs sse is indistinguishable from config alone; http is the
         // modern default and agents that only support sse will say so.
         return McpServer::Http(McpServerHttp::new(name, url.clone()));
     }
-    let command = e.command.clone().unwrap_or_default();
+    let command = command.unwrap_or_default();
     // The registry name travels: agents label servers by it (a
     // hardcoded "mcp" made every injection indistinguishable).
     let mut stdio = McpServerStdio::new(name, command);
@@ -663,8 +850,10 @@ const DEFAULT_MCP_TOML: &str = r#"# ruagent MCP registry. See design §7.1.
 # url = "https://mcp.example.com/sse"
 
 # The platform's own MCP server: memory, knowledge and task tools for
-# every agent (design SS6.5). Requires the ruagent binary reachable as
-# `ruagent` on PATH and a running daemon (`ruagent serve`).
+# every agent (design SS6.5). It needs a running daemon (`ruagent serve`); it does
+# NOT need `ruagent` on PATH -- when that bare name does not resolve, the
+# daemon starts this server from its OWN executable and says so in the log,
+# because the shipped install is "unzip and run" and has nothing on PATH.
 [mcp.ruagent]
 command = "ruagent"
 args = ["mcp-serve"]
@@ -1627,6 +1816,274 @@ mod mcp_preflight_tests {
 }
 
 #[cfg(test)]
+mod platform_mcp_tests {
+    use super::*;
+
+    fn mcp_config(entries: &[(&str, Option<&str>, &[&str])], profile: &[&str]) -> McpConfig {
+        let mut servers = BTreeMap::new();
+        for (name, command, args) in entries {
+            servers.insert(
+                (*name).to_string(),
+                McpEntry {
+                    command: command.map(|c| c.to_string()),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    url: None,
+                    inject_for: None,
+                },
+            );
+        }
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "default".to_string(),
+            profile.iter().map(|s| s.to_string()).collect(),
+        );
+        McpConfig {
+            servers,
+            profiles,
+            health: std::sync::Arc::new(crate::mcphealth::McpHealth::default()),
+        }
+    }
+
+    fn entry(command: Option<&str>, args: &[&str]) -> McpEntry {
+        McpEntry {
+            command: command.map(|c| c.to_string()),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            url: None,
+            inject_for: None,
+        }
+    }
+
+    /// What the harness is actually handed: (server name, stdio command path).
+    fn injected(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Vec<(String, String)> {
+        use agent_client_protocol::schema::v1::McpServer;
+        servers
+            .iter()
+            .map(|s| match s {
+                McpServer::Stdio(stdio) => {
+                    (stdio.name.clone(), stdio.command.display().to_string())
+                }
+                other => (format!("{other:?}"), "(not stdio)".to_string()),
+            })
+            .collect()
+    }
+
+    const FAKE_OWN_EXE: &str = "/abs/ruagent-own-executable-9f3a";
+
+    fn no_path_own_exe() -> CommandResolution {
+        CommandResolution {
+            resolves: |_| false,
+            own_exe: || Some(std::path::PathBuf::from(FAKE_OWN_EXE)),
+        }
+    }
+
+    /// THE SHIPPED SHAPE MEETS THE SHIPPED DISTRIBUTION (t69). The seed writes
+    /// `[mcp.ruagent] command = "ruagent"`, and an unzipped install has nothing on PATH --
+    /// after which EVERY runtime answered 400 on session/options because the pre-flight refused the
+    /// whole profile. The daemon must hand the harness its own executable instead.
+    #[test]
+    fn the_platform_own_server_falls_back_to_this_executable() {
+        // A REAL file, because the pre-flight afterwards checks that the substituted command EXISTS
+        // -- an invented path would make this test assert the wrong thing (measured: a fake
+        // /abs/... made the pre-flight fail with "不存在或不可读", which is the pre-flight doing its
+        // job, not the fallback failing).
+        let own_exe = std::env::current_exe().expect("this test binary has a path");
+        let own_exe_display = own_exe.display().to_string();
+        for command in ["ruagent", "ruagent.exe"] {
+            let cfg = mcp_config(&[("ruagent", Some(command), &["mcp-serve"])], &["ruagent"]);
+            let how = CommandResolution {
+                resolves: |_| false,
+                own_exe: || std::env::current_exe().ok(),
+            };
+            let servers = cfg
+                .expand_profile_preflighted_with(Some("default"), "dsh", how)
+                .unwrap_or_else(|e| {
+                    panic!("`{command}` off PATH must not fail the whole profile: {e}")
+                });
+            assert_eq!(
+                injected(&servers),
+                vec![("ruagent".to_string(), own_exe_display.clone())],
+                "the fallback is THIS process's own executable, as an absolute path (the ACP field \
+                 is a PathBuf for that reason)"
+            );
+            assert!(
+                own_exe.is_absolute(),
+                "and it really is absolute: {own_exe_display}"
+            );
+            // The pre-flight must ask about the SAME command the expansion injects: a passing
+            // pre-flight on the bare name and a failing spawn on the path (or the reverse) is
+            // exactly the disagreement that makes this class silent.
+            assert!(
+                cfg.preflight_profile_with(Some("default"), "dsh", how)
+                    .is_empty(),
+                "the pre-flight checks the substituted command"
+            );
+            // ...and with the real PATH answer the command is left alone.
+            let present = CommandResolution {
+                resolves: |_| true,
+                own_exe: || Some(std::path::PathBuf::from(FAKE_OWN_EXE)),
+            };
+            // NOTE: the expansion only, not the preflighted pair -- the pre-flight's own check is
+            // the REAL PATH one, so on a machine where the bare name does not resolve it fails no
+            // matter what this seam says. What is under test here is the substitution decision.
+            let servers = cfg.expand_profile_with(Some("default"), "dsh", present);
+            assert_eq!(
+                injected(&servers),
+                vec![("ruagent".to_string(), command.to_string())],
+                "when the bare name DOES resolve, nothing is substituted"
+            );
+        }
+    }
+
+    /// NOTHING ELSE MAY BE REWRITTEN (t69). A user's own server keeps its command and keeps its
+    /// failure: substituting the daemon's executable for somebody else's command would be guessing,
+    /// and guessing a command is worse than refusing it.
+    #[test]
+    fn a_users_own_server_fails_exactly_as_configured() {
+        let how = no_path_own_exe();
+        // (label, configured command, args) -- the last three are near-misses that must NOT be
+        // mistaken for the platform's own server.
+        // `ruagent` WITHOUT `mcp-serve` is not the platform's own server, and that is a fact about
+        // the DECISION, not about the machine: asserted here directly because the loop below must
+        // fail for reasons the host cannot change. (`ruagent` resolves on a host that has the
+        // binary on PATH, so asserting "it fails" in the loop made this test say different things
+        // on different machines -- measured: it was red on a host with `ruagent` on PATH and green
+        // without it, which is the very coupling t69 exists to remove.)
+        assert!(
+            !is_platform_own_server(&McpEntry {
+                command: Some("ruagent".into()),
+                args: vec!["serve".into()],
+                url: None,
+                inject_for: None,
+            }),
+            "bare `ruagent` with other args is a user's server, not the platform's own"
+        );
+        let cases: [(&str, &str, &[&str]); 3] = [
+            ("another tool", "some-user-mcp-binary-9f3a", &["--stdio"]),
+            ("a lookalike name", "ruagent-other-9f3a", &["mcp-serve"]),
+            ("an absolute path", "/opt/nope-9f3a/ruagent", &["mcp-serve"]),
+        ];
+        for (label, command, args) in cases {
+            let cfg = mcp_config(&[("mine", Some(command), args)], &["mine"]);
+            let err = cfg
+                .expand_profile_preflighted_with(Some("default"), "dsh", how)
+                .expect_err(label);
+            assert!(
+                err.contains(command),
+                "{label}: the failure names the CONFIGURED command: {err}"
+            );
+            assert!(
+                !err.contains(FAKE_OWN_EXE),
+                "{label}: the daemon must never substitute its own executable for a user's server: {err}"
+            );
+            // and the reason is the resolver's own, not something invented
+            assert!(
+                err.contains("PATH 上找不到") || err.contains("不存在或不可读"),
+                "{label}: the reason comes from resolve_command: {err}"
+            );
+        }
+    }
+
+    /// The identification itself, so a future edit cannot widen it: bare name plus the mcp-serve
+    /// subcommand, and nothing else.
+    #[test]
+    fn the_platform_server_is_identified_narrowly() {
+        assert!(is_platform_own_server(&entry(
+            Some("ruagent"),
+            &["mcp-serve"]
+        )));
+        assert!(is_platform_own_server(&entry(
+            Some("ruagent.exe"),
+            &["mcp-serve"]
+        )));
+        assert!(is_platform_own_server(&entry(
+            Some("RuaGent.EXE"),
+            &["mcp-serve"]
+        )));
+        assert!(is_platform_own_server(&entry(
+            Some("ruagent"),
+            &["--log", "mcp-serve"]
+        )));
+        assert!(!is_platform_own_server(&entry(Some("ruagent"), &["serve"])));
+        assert!(!is_platform_own_server(&entry(
+            Some("ruagent-other"),
+            &["mcp-serve"]
+        )));
+        assert!(!is_platform_own_server(&entry(
+            Some("./ruagent"),
+            &["mcp-serve"]
+        )));
+        assert!(!is_platform_own_server(&entry(
+            Some(r"C:\tools\ruagent.exe"),
+            &["mcp-serve"]
+        )));
+        assert!(!is_platform_own_server(&entry(None, &["mcp-serve"])));
+        assert_eq!(
+            resolved_command(&entry(Some("ruagent"), &["mcp-serve"]), no_path_own_exe()),
+            (Some(FAKE_OWN_EXE.to_string()), true),
+            "the substitution reports itself"
+        );
+        assert_eq!(
+            resolved_command(&entry(Some("ruagent"), &["serve"]), no_path_own_exe()),
+            (Some("ruagent".to_string()), false),
+            "and does not claim a substitution it did not do"
+        );
+    }
+
+    /// The seed must describe what the code DOES (t69). It used to say the binary has to be reachable
+    /// as ruagent on PATH -- the exact state the shipped (unzipped) install is not in, which is how
+    /// every runtime ended up answering 400 on a machine where the daemon was never installed.
+    #[test]
+    fn the_mcp_seed_describes_the_fallback_instead_of_requiring_path() {
+        assert!(
+            !DEFAULT_MCP_TOML.contains("Requires the ruagent binary reachable as"),
+            "the old claim is gone: {DEFAULT_MCP_TOML}"
+        );
+        assert!(!DEFAULT_MCP_TOML.contains("on PATH and a running daemon"));
+        assert!(
+            DEFAULT_MCP_TOML.contains("from its OWN executable"),
+            "the seed states the fallback: {DEFAULT_MCP_TOML}"
+        );
+        assert!(
+            DEFAULT_MCP_TOML.contains("unzip and run"),
+            "and WHY it exists"
+        );
+        // the entry itself is still the platform's own, so the fallback actually applies to the seed
+        assert!(DEFAULT_MCP_TOML.contains("command = \"ruagent\""));
+        assert!(DEFAULT_MCP_TOML.contains("args = [\"mcp-serve\"]"));
+    }
+
+    /// THE REAL RESOLVERS on whatever machine runs this (t69): either the bare name is on PATH -- and
+    /// then the command is left exactly as configured -- or it is not, and the command becomes THIS
+    /// executable. Never "not on PATH and still the bare name", which is the 400 the user reported.
+    #[test]
+    fn the_real_resolver_never_hands_out_an_unstartable_platform_command() {
+        let (command, substituted) = resolved_command(
+            &entry(Some("ruagent"), &["mcp-serve"]),
+            CommandResolution::real(),
+        );
+        let command = command.expect("the seed configures a command");
+        let startable = ruagent_mcp::health::resolve_command(&command);
+        let on_path = command_resolves("ruagent");
+        let own = this_executable().map(|p| p.display().to_string());
+        println!(
+            "READING t69 platform MCP server with the REAL resolvers: bare name resolves on PATH = {on_path}, substituted = {substituted}, command = {command}, startable = {}",
+            startable.is_ok()
+        );
+        assert!(
+            startable.is_ok(),
+            "the daemon would hand the harness an unstartable command: {command} ({startable:?})"
+        );
+        assert_eq!(
+            substituted, !on_path,
+            "the substitution must track the PATH answer exactly"
+        );
+        if !on_path {
+            assert_eq!(Some(command.clone()), own, "the substitute is this process");
+        }
+    }
+}
+
+#[cfg(test)]
 mod primary_seed_tests {
     use super::*;
 
@@ -2008,5 +2465,39 @@ mod config_writer_tests {
             flagged[0] == "alpha" || flagged[0] == "beta",
             "the winner is one of the two writers: {text:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_text_tests {
+    use super::*;
+
+    /// t65: an unknown harness used to answer `unknown harness `codex` (runtime `x`)` with no hint,
+    /// and an EMPTY one answered `unknown harness `` ` -- two empty backticks, which reads like a bug.
+    #[test]
+    fn the_harness_error_names_what_is_supported() {
+        let unknown = format!("{}", harness_of("x", Some("codex")).unwrap_err());
+        for name in ["claude-code", "opencode", "dsh", "mock"] {
+            assert!(
+                unknown.contains(name),
+                "the error must list `{name}`: {unknown}"
+            );
+        }
+        assert!(unknown.contains("codex"), "{unknown}");
+
+        let empty = format!("{}", harness_of("x2", Some("")).unwrap_err());
+        assert!(empty.contains("no harness chosen"), "{empty}");
+        assert!(
+            empty.contains("claude-code") && empty.contains("mock"),
+            "{empty}"
+        );
+        assert!(!empty.contains("``"), "no empty backticks: {empty}");
+    }
+
+    #[test]
+    fn every_canonical_harness_resolves() {
+        for name in CANONICAL_HARNESSES {
+            assert!(harness_of("x", Some(name)).is_ok(), "{name}");
+        }
     }
 }
