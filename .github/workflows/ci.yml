@@ -254,8 +254,25 @@ jobs:
             "Rust (ubuntu) -- mcp roundtrip instrumentation (--include-ignored)" \
             "$RUNNER_TEMP/t65/linux-mcp-ignored.log" "$rc_mcp" \
             a_governed_refusal_is_an_error_and_an_empty_pass_is_not
-          # BOTH readings fail this step, whichever one is red.
-          exit "$(( rc != 0 || rc_mcp != 0 ))"
+          # THE ELEVENTH AND TWELFTH INSTRUMENTS, IN A THIRD TARGET (ruagent-issues-56-59 t68).
+          # The runtime probe's two #[ignore]d tests sat in the daemon LIB, and this job never runs
+          # daemon-lib ignored tests -- so they produced NO reading while still counting towards
+          # `found`, which is a skip-accounting mismatch by construction. They now live in a target
+          # of their own, with the same mock-binary precondition and the same demanded names.
+          set +e
+          cargo test -p ruagent-daemon --test runtime_probe -- --include-ignored \
+            2>&1 | tee "$RUNNER_TEMP/t65/linux-probe-ignored.log"
+          rc_probe=${PIPESTATUS[0]}
+          set -e
+          echo "$rc_probe" > "$RUNNER_TEMP/t65/linux-probe-ignored.rc"
+          echo "daemon runtime-probe instrumentation exit code: $rc_probe"
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (ubuntu) -- daemon runtime-probe instrumentation (--include-ignored)" \
+            "$RUNNER_TEMP/t65/linux-probe-ignored.log" "$rc_probe" \
+            probing_the_mock_agent_reports_ok_and_the_command_path \
+            a_program_that_exits_immediately_is_reported_with_its_code_and_stderr
+          # EVERY reading fails this step, whichever one is red.
+          exit "$(( rc != 0 || rc_mcp != 0 || rc_probe != 0 ))"
 
       # ------------------------------------------- the manifest of the rest
       # Visible skip accounting. `--ignored --list` is the source of truth for
@@ -287,10 +304,12 @@ jobs:
           fi
           found=$(grep -cE ': test$' "$RUNNER_TEMP/t65/ignored-list.txt" || true)
 
-          # RUN by the step above (9). Their names are demanded there: the eight daemon
-          # instruments (one target) and, since t29, the mcp roundtrip's governed-refusal
-          # instrument (a second target, same mock-binary precondition).
-          covered=9
+          # RUN by the step above (11). Their names are demanded there: the eight daemon
+          # instruments (one target), since t29 the mcp roundtrip's governed-refusal
+          # instrument (a second target, same mock-binary precondition), and since t68 the
+          # runtime probe's two instruments (a third target -- they used to sit in the daemon
+          # LIB, whose ignored tests this job never runs, so they produced no reading at all).
+          covered=11
           # DECLARED NOT COVERED here (10). CI has no ~/.ruagent database, no real
           # ~/.ruagent root and no e5 model; these instruments' subject IS the real
           # history, so a synthetic fixture would not measure them (an empty copy is
@@ -319,6 +338,10 @@ jobs:
             # by test-evidence.sh demanding the name from the log. Standing alone, this name is
             # checked statically and locally, before CI spends ten minutes discovering it.
             echo "| \`roundtrip\`: a_governed_refusal_is_an_error_and_an_empty_pass_is_not | RUN (\`--include-ignored\`, a SECOND target with the same mock-binary precondition) |"
+            # ITS OWN ROW (t68): the two names must each be a token of their own so the F2 guard
+            # can check them statically -- appending them to the 8-name row above would put them
+            # behind the " names" token the guard skips.
+            echo "| \`runtime_probe\`: probing_the_mock_agent_reports_ok_and_the_command_path, a_program_that_exits_immediately_is_reported_with_its_code_and_stderr | RUN (\`--include-ignored\`, a THIRD target with the same mock-binary precondition; t68 moved them out of the daemon lib, whose ignored tests this job never runs) |"
             echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` (for live_copy_keeps_history_nullable and live_copy_bigram_backfill_at_scale) and \`RUAGENT_T25_LIVE_COPY\` (for live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, which needs a PRE-0024 copy) = migrated COPYs of a real database. A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. T6 and T25 must point at SEPARATE copies (t36). |"
             echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
             echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"

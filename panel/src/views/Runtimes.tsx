@@ -7,7 +7,14 @@
 
 import { useEffect, useState } from "react";
 import { Button, Card, Input, Popconfirm, Select } from "antd";
-import { api, isRoleAgent, type AgentInfo, type SessionOptionInfo } from "../api";
+import {
+  api,
+  HttpError,
+  isRoleAgent,
+  type AgentInfo,
+  type RuntimeProbeResult,
+  type SessionOptionInfo,
+} from "../api";
 import { brandClass, BrandMark } from "../brand";
 import { Empty, ErrorState, Modal, ReadoutStrip, Spinner, useToast } from "../ui";
 import { useI18n } from "../i18n";
@@ -62,6 +69,43 @@ export function modelsReadout(
   return Object.keys(probeFailed).some((n) => probeFailed[n]) ? label.failed : label.notProbed;
 }
 
+
+/** What a runtime card may say about whether its command can START.
+ *
+ *  THREE states, never two. The daemon reports command_resolved as true / false /
+ *  absent, and ABSENT IS NOT TRUE: a daemon older than the field simply does not
+ *  answer, and rendering that as "available" is precisely the report this exists for
+ *  -- a runtime created on another machine looked healthy here (saved, listed, no
+ *  warning) and only failed when a chat started. "unknown" is a reading of its own
+ *  and is written on screen as such; the probe button next to it is how a user gets
+ *  a real answer instead.
+ *
+ *  Kept as a pure function, like modelChipState above, so the rule is reviewable
+ *  without a browser: only true may look healthy. */
+export type CommandState =
+  | { kind: "resolved"; path: string | null }
+  | { kind: "notFound" }
+  | { kind: "unknown" };
+
+export function commandState(
+  resolved: boolean | null | undefined,
+  path?: string | null,
+): CommandState {
+  if (resolved === true) return { kind: "resolved", path: path ?? null };
+  if (resolved === false) return { kind: "notFound" };
+  return { kind: "unknown" };
+}
+
+/** One card's probe reading.
+ *
+ *  "error" is the REQUEST failing -- an older daemon answers 404 for a route it does
+ *  not have -- which is a different fact from an answer whose ok is false (the daemon
+ *  telling us, in its own words, that the runtime cannot start). Both mean "not
+ *  reachable", and neither may be shown as the other. */
+type ProbeState =
+  | { kind: "running" }
+  | { kind: "answer"; result: RuntimeProbeResult }
+  | { kind: "error"; message: string; status: number | null };
 /** Model-count chip state for the card grid. */
 function useModelCounts(names: string[]) {
   const [counts, setCounts] = useState<Record<string, number>>({});
@@ -180,6 +224,10 @@ export function Runtimes() {
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [err, setErr] = useState<unknown>(null);
   const [probeErr, setProbeErr] = useState<Record<string, boolean>>({});
+  /** The "can it really start" reading per runtime, cleared by a NEW probe and never
+   *  cached: PATH contents and a binary's handshake change without agents.toml
+   *  changing, so a remembered answer would be the same lie as no answer. */
+  const [probes, setProbes] = useState<Record<string, ProbeState>>({});
   const [editing, setEditing] = useState<AgentInfo | null>(null);
   const [creating, setCreating] = useState(false);
   const toast = useToast();
@@ -259,6 +307,34 @@ export function Runtimes() {
   const probe = async (name: string) => {
     const ok = await sync(name);
     setProbeErr((m) => ({ ...m, [name]: !ok }));
+  };
+
+  /** Ask the daemon to really START this backend: POST
+   *  /api/v1/runtimes/{name}/probe.
+   *
+   *  Deliberately NOT the same function as probe() above -- that one syncs the
+   *  model catalogue through the options route. Two questions ("which models does it
+   *  claim" vs "does it start") sharing one button and one piece of state is how the
+   *  first would end up answering the second.
+   *
+   *  Re-probing is the point: every click replaces the previous reading, including a
+   *  failed request, so a user who fixed the PATH or installed the binary can ask
+   *  again without reloading the page. */
+  const testConnection = async (name: string) => {
+    setProbes((m) => ({ ...m, [name]: { kind: "running" } }));
+    try {
+      const result = await api.probeRuntime(name);
+      setProbes((m) => ({ ...m, [name]: { kind: "answer", result } }));
+    } catch (e) {
+      setProbes((m) => ({
+        ...m,
+        [name]: {
+          kind: "error",
+          message: String(e instanceof Error ? e.message : e),
+          status: e instanceof HttpError ? e.status : null,
+        },
+      }));
+    }
   };
 
   return (
@@ -341,6 +417,11 @@ export function Runtimes() {
               !!notKnown[r.name],
               counts[r.name],
             );
+            // Whether this machine can actually start it, and the last probe of it.
+            // Both are per-card readings, never defaults: `commandState` is the only
+            // place that decides which of the three states is on screen.
+            const cmd = commandState(r.command_resolved, r.command_path);
+            const ps = probes[r.name];
             return (
               <Card key={r.name} className="agent-card" size="small">
                 <div className="row">
@@ -394,6 +475,100 @@ export function Runtimes() {
                       {r.command}
                     </span>
                   </div>
+                ) : null}
+                {/* CAN THIS COMMAND ACTUALLY START -- the reading the user report
+                    was missing. A runtime created on another machine looked healthy
+                    here and only failed when a chat started. Three states, never
+                    two: true resolves, false does not, and ABSENT (a daemon older
+                    than the field) is UNKNOWN -- written as neither "available"
+                    nor "missing", because guessing either way is how this card
+                    lied before. A connection failure is also NOT "disabled":
+                    disabled is the operator's intent, this is the machine's
+                    reality, and the two must not share a badge. */}
+                <div className="row wrap" data-command-state={cmd.kind}>
+                  {cmd.kind === "resolved" ? (
+                    <span
+                      className="tag ok"
+                      title={cmd.path ? t("runtimes.cmd.path", { path: cmd.path }) : undefined}
+                    >
+                      {t("runtimes.cmd.resolved")}
+                    </span>
+                  ) : cmd.kind === "notFound" ? (
+                    <span className="tag err">{t("runtimes.cmd.notFound")}</span>
+                  ) : (
+                    <span className="muted" title={t("runtimes.cmd.unknown.hint")}>
+                      {t("runtimes.cmd.unknown")}
+                    </span>
+                  )}
+                  <span className="grow" />
+                  {/* The probe asks the DAEMON (real spawn + handshake), not this
+                      browser: the failure the user hit belongs to the machine that
+                      runs the agent, which is not necessarily the one showing this
+                      page. */}
+                  <Button
+                    loading={ps?.kind === "running"}
+                    onClick={() => testConnection(r.name)}
+                    title={t("runtimes.test")}
+                    data-test={r.name}
+                  >
+                    {ps?.kind === "running" ? t("runtimes.testing") : t("runtimes.test")}
+                  </Button>
+                </div>
+                {cmd.kind === "notFound" ? (
+                  <p className="muted micro">{t("runtimes.cmd.notFound.hint")}</p>
+                ) : cmd.kind === "unknown" ? (
+                  <p className="muted micro">{t("runtimes.cmd.unknown.hint")}</p>
+                ) : null}
+                {ps ? (
+                  <div className="row wrap" data-probe-state={ps.kind}>
+                    {ps.kind === "running" ? (
+                      <span className="muted">{t("runtimes.testing")}</span>
+                    ) : ps.kind === "error" ? (
+                      // The REQUEST failed (a daemon that has no such route): its own
+                      // status and message are shown, and it is never dressed up as an
+                      // answer about the runtime. 404 AND 405 both mean "this daemon
+                      // does not serve a probe here" -- measured: a tree without the
+                      // route answered POST /api/v1/runtimes/ghost/probe with 405 on
+                      // this daemon (the /{name} routes exist for PATCH/DELETE), so
+                      // keying the message on 404 alone would have shown a bare
+                      // "Method Not Allowed" to the user.
+                      <span className="tag err">
+                        {ps.status === 404 || ps.status === 405
+                          ? t("runtimes.probe.noRoute", { status: ps.status })
+                          : t("runtimes.probe.requestFailed", { err: ps.message })}
+                      </span>
+                    ) : (
+                      <>
+                        <span
+                          className={ps.result.ok ? "tag ok" : "tag err"}
+                          data-probe-ok={String(ps.result.ok)}
+                        >
+                          {ps.result.ok ? t("runtimes.probe.ok") : t("runtimes.probe.bad")}
+                        </span>
+                        <span className="muted">{t("runtimes.probe.stage")}</span>
+                        {/* VERBATIM: the daemon's own token, not a friendlier
+                            word. detail (below) is the only part that says why,
+                            and both are shown untranslated and untruncated. */}
+                        <span className="mono" data-probe-stage={String(ps.result.stage)}>
+                          {String(ps.result.stage)}
+                        </span>
+                        {ps.result.command_path ? (
+                          <span
+                            className="muted mono truncated"
+                            title={ps.result.command_path}
+                          >
+                            {ps.result.command_path}
+                          </span>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                ) : null}
+                {ps && ps.kind === "answer" ? (
+                  <p className="muted micro" data-probe-detail>
+                    <span>{t("runtimes.probe.detail")}</span>
+                    <span>{ps.result.detail || t("runtimes.probe.noDetail")}</span>
+                  </p>
                 ) : null}
                 <div className="row">
                   {chipState.kind === "failed" ? (
@@ -553,12 +728,33 @@ function RuntimeModal({
         mcp_profile: form.mcp_profile.trim() || undefined,
         models: models.length ? models : undefined,
       };
+      const name = editing ? editing.name : form.name.trim();
       if (editing) {
         await api.updateRuntime(editing.name, body);
-        toast("ok", t("runtimes.updated", { name: editing.name }));
       } else {
-        await api.createRuntime({ name: form.name.trim(), ...body });
-        toast("ok", t("runtimes.created", { name: form.name.trim() }));
+        await api.createRuntime({ name, ...body });
+      }
+      // SAVED IS NOT REACHABLE -- and the user report behind this task is exactly
+      // that gap: the save returned, the card looked fine, and the first chat
+      // failed. So the toast is decided by the daemon's own post-write answer, not
+      // by the fact that the write returned 2xx: one extra GET, on a rare path,
+      // reading the config that was just written. When the daemon does not report
+      // command_resolved at all, the toast says THAT rather than claiming either.
+      const written = await api
+        .agents()
+        .then((list) => list.find((a) => a.name === name))
+        .catch(() => undefined);
+      if (written && written.command_resolved === false) {
+        // An ERROR toast, not a success one: green would say "you are done", and
+        // that sentence is the defect this ticket answers.
+        toast(
+          "err",
+          `${t("runtimes.saved.butNotFound")} ${t("runtimes.saved.butNotFound.hint")}`,
+        );
+      } else if (written && written.command_resolved === undefined) {
+        toast("ok", t("runtimes.saved.unknownResolve"));
+      } else {
+        toast("ok", editing ? t("runtimes.updated", { name }) : t("runtimes.created", { name }));
       }
       onSaved();
     } catch (e) {

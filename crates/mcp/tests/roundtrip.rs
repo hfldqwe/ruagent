@@ -483,11 +483,13 @@ async fn mcp_tools_reach_the_daemon_memory_and_knowledge() {
         "agent_create",
         "agent_update",
         "agent_delete",
+        // t67: why a runtime will not connect.
+        "runtime_probe",
     ];
     assert_eq!(
         expected.len(),
-        31,
-        "the declared consumption surface is 31 tools"
+        32,
+        "the declared consumption surface is 32 tools"
     );
     let mut got = names.clone();
     got.sort();

@@ -44,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/primary", get(get_primary).put(put_primary))
         .route("/api/v1/routing", get(get_routing).put(put_routing))
         .route("/api/v1/agents/{name}/options", get(agent_options))
+        // (B) t65: POST because it starts a process; a failed probe is still 200 (see the handler).
+        .route("/api/v1/runtimes/{name}/probe", post(probe_runtime))
         .route("/api/v1/runtimes", post(create_runtime_card))
         .route(
             "/api/v1/runtimes/{name}",
@@ -2777,6 +2779,212 @@ async fn put_routing(
     })))
 }
 
+/// (B) t65: a REAL probe -- can this runtime work on THIS machine? Answered in four stages.
+///
+/// `POST` because it starts a process; a GET that spawns is a lie a prefetcher can tell on your
+/// behalf.
+///
+/// **A FAILED PROBE IS STILL HTTP 200.** The probe COMPLETED; the answer is `ok: false` plus `stage`
+/// and `detail`. Turning that into a 4xx/5xx would claim the REQUEST was wrong and throw away the
+/// structured reason -- do not "fix" this into an error status.
+#[derive(Debug, serde::Serialize)]
+struct ProbeReport {
+    ok: bool,
+    command_path: Option<String>,
+    /// `not-found` | `spawn-failed` | `handshake-failed` | `ok`
+    stage: &'static str,
+    detail: String,
+}
+
+/// The ACP handshake routinely takes seconds (a CLI boots, loads its harness, answers `initialize`
+/// and `session/new`), so 20 s is generous but bounded. A probe that can hang forever is a probe
+/// nobody runs twice.
+const PROBE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The handshake ceiling, with an override so a slow machine can raise it and a test can lower it.
+/// (`RUAGENT_PROBE_TIMEOUT_MS`, in milliseconds.) The default is the 20 s above: a test that had to
+/// wait the real ceiling would be a test nobody runs, and a reported TIMEOUT that was never measured
+/// is the kind of claim this effort keeps refusing to make.
+fn handshake_timeout() -> std::time::Duration {
+    std::env::var("RUAGENT_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(PROBE_HANDSHAKE_TIMEOUT)
+}
+
+/// How long a freshly spawned program gets to die before we call it alive. A missing shared library or
+/// a wrong interpreter fails in milliseconds, so this stays short -- and it is the only reason the
+/// `spawn-failed` stage can report an exit code and a stderr tail at all (the ACP client owns the
+/// pipes afterwards and would only say "the session ended").
+const PROBE_LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(700);
+
+async fn probe_runtime(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let card = state
+        .mgr
+        .agent(&name)
+        .ok_or_else(|| ApiError::not_found(format!("no agent or runtime named `{name}`")))?;
+    let report = probe_command(&card).await;
+    serde_json::to_value(&report)
+        .map(Json)
+        .map_err(|e| ApiError::internal(format!("serialising the probe report: {e}")))
+}
+
+async fn probe_command(card: &ruagent_core::AgentCard) -> ProbeReport {
+    let (program, extra_args) = ruagent_acp::split_command_line(card.spawn_command());
+    let Some(spec) = ruagent_acp::resolve_program(&program) else {
+        return ProbeReport {
+            ok: false,
+            command_path: None,
+            stage: "not-found",
+            detail: format!(
+                "`{program}` is not on PATH. Install it, or set this runtime's `command` to the \
+                 binary's full path (the PATH this daemon sees is the one it was started with)."
+            ),
+        };
+    };
+    let mut args = spec.args.clone();
+    args.extend(extra_args);
+    let shell_note = match shell_and_shim(&spec) {
+        Some((shell, shim)) => format!(" (resolved to {shim}, launched through {shell})"),
+        None => String::new(),
+    };
+    let mut report = ProbeReport {
+        ok: false,
+        command_path: Some(reported_command_path(&spec)),
+        stage: "spawn-failed",
+        detail: String::new(),
+    };
+
+    // 1. liveness: an early exit is a SPAWN failure and the only stage we can report a code + stderr
+    //    tail for, so it is measured here rather than inferred from the handshake.
+    if let Some(detail) = early_exit(&spec, &args, &shell_note) {
+        report.detail = detail;
+        return report;
+    }
+
+    // 2. the handshake, bounded. `StateChanged` is the first thing the supervisor emits once
+    //    `initialize` + `session/new` are done; `Error` carries the reason they were not.
+    report.stage = "handshake-failed";
+    let cwd = std::env::temp_dir().join(format!("ruagent-probe-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
+        report.detail = format!("could not create a probe working directory: {e}");
+        return report;
+    }
+    let opts = ruagent_acp::ChatOptions {
+        program: spec.program.clone(),
+        args,
+        cwd,
+        mcp_servers: Vec::new(),
+        model: None,
+    };
+    let (ask_tx, _ask_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = match ruagent_acp::start_chat(opts, ask_tx) {
+        Ok(session) => session,
+        Err(e) => {
+            report.detail = format!("could not start the ACP client: {e}");
+            return report;
+        }
+    };
+    let mut events = session.subscribe();
+    let waited = tokio::time::timeout(handshake_timeout(), async {
+        loop {
+            match events.recv().await {
+                Ok(ruagent_core::RunEvent::StateChanged { .. }) => return Ok(()),
+                Ok(ruagent_core::RunEvent::Error { message }) => return Err(message),
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    return Err(format!("the probe fell {n} events behind while waiting"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err("the session closed before the handshake finished".to_string());
+                }
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(Ok(())) => {
+            report.ok = true;
+            report.stage = "ok";
+            report.detail =
+                format!("the ACP handshake completed (initialize + session/new){shell_note}");
+        }
+        Ok(Err(message)) => {
+            report.detail = format!("the ACP handshake failed: {message}");
+        }
+        Err(_) => {
+            report.detail = format!(
+                "the ACP handshake did not finish within {}s (TIMEOUT) -- the program started but \
+                 never answered initialize/session/new; a runtime that hangs is usually waiting for \
+                 input, so run the command by hand to see what it wants",
+                handshake_timeout().as_secs_f32()
+            );
+        }
+    }
+    report
+}
+
+/// Spawn the program ourselves, wait one short window, and report an early exit WITH its code and the
+/// tail of its stderr. `None` means it was still alive when the window closed (so the caller's probe
+/// may continue to the handshake); the child is killed either way.
+fn early_exit(spec: &ruagent_acp::SpawnSpec, args: &[String], shell_note: &str) -> Option<String> {
+    let program = reported_command_path(spec);
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(&spec.program)
+        .args(args)
+        // STDIN MUST STAY OPEN: an ACP agent reads its protocol frames from stdin, so a null stdin
+        // means EOF and every healthy agent exits at once -- the first version of this probe called
+        // the mock agent `spawn-failed (exit code: 0)` for exactly that reason (t65, measured).
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Some(format!("could not spawn `{program}`: {e}")))
+        .ok()?;
+    let deadline = std::time::Instant::now() + PROBE_LIVENESS_WINDOW;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                let tail: String = {
+                    let trimmed = stderr.trim_end();
+                    let take = trimmed.len().saturating_sub(600);
+                    trimmed[take..].to_string()
+                };
+                return Some(format!(
+                    "`{program}` exited immediately ({status}){shell_note}{}{}",
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        ": ".to_string()
+                    },
+                    tail
+                ));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Some(format!("could not watch `{program}`: {e}"));
+            }
+        }
+    }
+}
+
 async fn delete_agent_card(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -2809,6 +3017,45 @@ async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 /// The agent-card JSON shape (list + registry create/update replies).
+/// The path a user can ACT ON (t68). On Windows a `.cmd`/`.bat` shim resolves to a launch through
+/// `cmd /c <shim>` (acp::resolve_program), and reporting `cmd` as "the command we found" is useless:
+/// the user cannot search for it and it is not what they installed. So the SHIM is the path, and the
+/// fact that it is launched through a shell goes in the detail text.
+fn reported_command_path(spec: &ruagent_acp::SpawnSpec) -> String {
+    match shell_and_shim(spec) {
+        Some((_, shim)) => shim,
+        None => spec.program.clone(),
+    }
+}
+
+/// `Some((shell, shim))` when this spec is a shell launch of a batch shim.
+fn shell_and_shim(spec: &ruagent_acp::SpawnSpec) -> Option<(String, String)> {
+    let shell = std::path::Path::new(&spec.program)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(shell.as_str(), "cmd" | "cmd.exe") {
+        return None;
+    }
+    let mut args = spec.args.iter();
+    let switch = args.next()?;
+    if !switch.eq_ignore_ascii_case("/c") {
+        return None;
+    }
+    Some((spec.program.clone(), args.next()?.clone()))
+}
+
+/// The program this card would spawn, resolved through PATH only (t65). `None` means: this machine
+/// cannot run it -- as opposed to "it would fail", which only a probe can say.
+fn resolved_command(card: &ruagent_core::AgentCard) -> Option<ruagent_acp::SpawnSpec> {
+    let (program, _) = ruagent_acp::split_command_line(card.spawn_command());
+    ruagent_acp::resolve_program(&program).map(|mut spec| {
+        spec.program = reported_command_path(&spec);
+        spec
+    })
+}
+
 fn card_json(a: &ruagent_core::AgentCard) -> serde_json::Value {
     serde_json::json!({
         "id": a.id.to_string(),
@@ -2839,6 +3086,12 @@ fn card_json(a: &ruagent_core::AgentCard) -> serde_json::Value {
             "runtime"
         },
         "command": a.command,
+        // (A) t65: a CHEAP resolution reading -- a PATH lookup, no spawn and no network -- so the list
+        // can say which runtimes cannot possibly work on THIS machine without starting any of them.
+        // The user report that produced this: a runtime created with a command that is not installed
+        // was accepted with 201 and looked ready until the first chat.
+        "command_resolved": resolved_command(a).is_some(),
+        "command_path": resolved_command(a).map(|spec| spec.program),
     })
 }
 
@@ -13187,5 +13440,114 @@ mod routing_consistency_tests {
         let report = front_door_json(&plain, &routing);
         let why = report["why"].as_str().unwrap_or_default();
         assert!(why.contains("no agent is marked primary"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod runtime_probe_tests {
+    use super::tests::{harness_with_agents, hit, send_json};
+    use axum::http::StatusCode;
+
+    const AGENTS: &str = "[agent.alpha]\nharness = \"mock\"\ncommand = \"cargo\"\ndescription = \"alpha\"\nprompt = \"alpha\"\n";
+
+    fn json_name(v: &serde_json::Value) -> Vec<String> {
+        v["agents"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// (A) + probe stage `not-found`: a command that is not installed is visible in the LIST (no
+    /// spawn, no network) and the probe says exactly which stage failed.
+    #[tokio::test]
+    async fn a_command_that_is_not_installed_is_flagged_in_the_list_and_probed_as_not_found() {
+        let (app, _db, _root) = harness_with_agents(Some(AGENTS)).await;
+        let (st, _, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/runtimes",
+            Some(serde_json::json!({
+                "name": "ghost",
+                "harness": "mock",
+                "command": "definitely-not-installed-xyz"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{raw}");
+
+        let (_, list, raw) = hit(&app, "GET", "/api/v1/agents").await;
+        assert!(json_name(&list).contains(&"ghost".to_string()), "{raw}");
+        let ghost = list["agents"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["name"] == "ghost"))
+            .cloned()
+            .expect("the ghost runtime is listed");
+        assert_eq!(ghost["command_resolved"], false, "{ghost}");
+        assert!(ghost["command_path"].is_null(), "{ghost}");
+
+        // POST, because it starts a process; a failed probe is still 200 with a structured reason
+        let (st, probe, raw) = send_json(&app, "POST", "/api/v1/runtimes/ghost/probe", None).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a completed probe is 200 even when it fails: {raw}"
+        );
+        assert_eq!(probe["ok"], false, "{raw}");
+        assert_eq!(probe["stage"], "not-found", "{raw}");
+        assert!(probe["command_path"].is_null(), "{raw}");
+        assert!(
+            probe["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("definitely-not-installed-xyz"),
+            "the detail names the program: {raw}"
+        );
+    }
+
+    /// (B) the timeout branch, MEASURED: a program that starts and then says nothing must be reported
+    /// as a TIMEOUT (not as "spawn-failed", not as ok). `cmd /c pause` and `sleep 30` both stay alive
+    /// and silent, and the ceiling is lowered for the test through the documented override.
+    #[tokio::test]
+    async fn a_runtime_that_never_answers_is_reported_as_a_timeout() {
+        let (app, _db, _root) = harness_with_agents(Some(AGENTS)).await;
+        // Silent AND alive: `pause` under a piped stdin returns EOF at once (measured: it produced
+        // "Incoming transport closed", not a timeout), so a sleeping process is what the branch
+        // actually needs.
+        let command = if cfg!(windows) {
+            "powershell -NoProfile -Command Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let (st, _, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/runtimes",
+            Some(serde_json::json!({
+                "name": "silent",
+                "harness": "mock",
+                "command": command
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{raw}");
+
+        // SAFETY: a test-local override, set before the probe runs and removed right after.
+        unsafe { std::env::set_var("RUAGENT_PROBE_TIMEOUT_MS", "3000") };
+        let (st, probe, raw) = send_json(&app, "POST", "/api/v1/runtimes/silent/probe", None).await;
+        unsafe { std::env::remove_var("RUAGENT_PROBE_TIMEOUT_MS") };
+
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(probe["ok"], false, "{raw}");
+        assert_eq!(probe["stage"], "handshake-failed", "{raw}");
+        let detail = probe["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("TIMEOUT"),
+            "a timeout must say so: {detail}"
+        );
+        assert!(detail.contains("did not finish within"), "{detail}");
     }
 }

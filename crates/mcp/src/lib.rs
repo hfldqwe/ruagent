@@ -434,6 +434,27 @@ impl PlatformTools {
         capability_set_to_text(&resp, &params)
     }
 
+    #[tool(
+        description = "Probe ONE runtime: does its command exist on this machine, does it stay alive, and does it finish an ACP handshake? WHEN: the user says a runtime will not connect / does not work / cannot be selected, or you are about to dispatch work to an agent and want to know whether its runtime can run here at all -- this turns `it failed` into a STAGE and a next step instead of a log line to guess at. COST: free in model tokens (no model is called), BUT IT STARTS A PROCESS: the probe resolves the command, spawns it, waits a liveness window and then does a real handshake up to a timeout, so call it once per runtime per question -- never in a loop. A FAILED PROBE IS A RESULT, NOT AN ERROR: the daemon answers HTTP 200 with ok=false plus stage (not-found | spawn-failed | handshake-failed | ok) and detail, and this tool reports them verbatim -- only a genuinely failed request (unknown name, daemon down) is an error. agents_list already shows command_resolved for every card, so read that first to see WHICH runtime is worth probing."
+    )]
+    async fn runtime_probe(
+        &self,
+        Parameters(params): Parameters<RuntimeProbeParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let what = "runtime_probe";
+        let url = format!(
+            "{}/api/v1/runtimes/{}/probe",
+            self.config.daemon_url, params.name
+        );
+        // THE 200-vs-ERROR LINE IS HERE (t67). This endpoint answers a COMPLETED probe with HTTP 200
+        // and ok:false, so the body always comes back through json_of; treating ok:false as an error
+        // would throw away the stage and detail -- the only two things the user can act on. What
+        // json_of does fail on is a request that genuinely did not work (404 unknown name, daemon
+        // down), and those keep the daemon's own sentence.
+        let resp = json_of(self.http.post(&url), what, &self.config.daemon_url).await?;
+        probe_to_text(what, &resp, &params.name)
+    }
+
     // -- making and changing agents (v3, t54) ---------------------------
 
     #[tool(
@@ -1712,8 +1733,76 @@ fn agents_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorData> {
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
         ));
+        // t67: WHICH RUNTIME CANNOT WORK is the first thing a user with "it will not connect" needs,
+        // and the daemon answers it without spawning anything (a PATH lookup at card-build time).
+        // Printed when present; an older daemon without the field prints nothing rather than
+        // claiming false.
+        if let Some(resolved) = row.get("command_resolved").and_then(|v| v.as_bool()) {
+            match (resolved, row.get("command_path").and_then(|v| v.as_str())) {
+                (true, Some(path)) => {
+                    out.push_str(&format!("    command_resolved=true  path={path}\n"))
+                }
+                (true, None) => out.push_str("    command_resolved=true\n"),
+                (false, _) => out.push_str(
+                    "    command_resolved=FALSE -- its command is not on PATH on this machine, so it cannot start here. runtime_probe(name) reports which stage fails and the next step.\n",
+                ),
+            }
+        }
     }
     Ok(out)
+}
+
+/// A probe report as a diagnosis plus a next step (t67).
+///
+/// THE STAGE IS PRINTED VERBATIM, never normalised into "failed": `not-found`,
+/// `spawn-failed` and `handshake-failed` send the reader to three different places (install it /
+/// fix the binary / fix the harness or its login), and collapsing them into one word is exactly
+/// what makes an error message useless. The daemon's own `detail` follows unchanged -- it carries
+/// the path, the exit code, the stderr tail or the timeout, and it is the sentence a user can
+/// search for.
+fn probe_to_text(
+    what: &str,
+    resp: &serde_json::Value,
+    requested: &str,
+) -> Result<String, rmcp::ErrorData> {
+    let stage = field_str(what, resp, "stage")?;
+    let ok = field_bool(what, resp, "ok")?;
+    let detail = resp.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+    let path = resp.get("command_path").and_then(|v| v.as_str());
+    if ok && stage == "ok" {
+        let mut out = format!(
+            "{what}: `{requested}` RUNS -- it resolved, stayed alive and finished the ACP handshake.\n"
+        );
+        match path {
+            Some(p) => out.push_str(&format!("  resolved to: {p}\n")),
+            None => out.push_str("  resolved to: <the daemon reported no path>\n"),
+        }
+        out.push_str("Nothing to fix: work sent to this runtime should start.\n");
+        return Ok(out);
+    }
+    let next = match stage {
+        "not-found" => {
+            "install the program, or point this runtime at it by name or full path (PUT /api/v1/runtimes/<name> with the command field), then probe again"
+        }
+        "spawn-failed" => {
+            "the program exists but died on start -- the exit code and the stderr tail are in the detail above; fix the binary, its interpreter or its configuration, then probe again"
+        }
+        "handshake-failed" => {
+            "the process started but did not finish an ACP handshake -- a harness that needs a login, a wrong harness value, or a machine too slow for the ceiling are the usual causes (RUAGENT_PROBE_TIMEOUT_MS raises it), then probe again"
+        }
+        other => {
+            // An unknown stage is a GAP, not a failure to report as one: say the tool does not know
+            // it instead of guessing what it means.
+            return Ok(format!(
+                "{what}: `{requested}` answered with a stage this tool does not know: `{other}`.\n  command path: {}\n  detail: {detail}\nA stage this tool does not know is a gap HERE, not a diagnosis.\n",
+                path.unwrap_or("<not resolved>")
+            ));
+        }
+    };
+    Ok(format!(
+        "{what}: `{requested}` CANNOT RUN -- stage: {stage}.\n  command path: {}\n  detail: {detail}\nNext: {next}.\n",
+        path.unwrap_or("<not resolved>")
+    ))
 }
 
 /// What the front door IS now, in the daemon's own words (t46).
@@ -2982,6 +3071,16 @@ pub struct NoParams {}
 pub struct AgentSetPrimaryParams {
     #[schemars(
         description = "The agent name to make the front door, or none to CLEAR it (both carriers: the agents.toml marker and routing.toml's default). The name must be a card agents_list shows as enabled; an unknown or disabled name is refused and nothing is written."
+    )]
+    pub name: String,
+}
+
+/// The parameters of `runtime_probe`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProbeParams {
+    #[schemars(
+        description = "Name of the runtime (or any agent card whose command should be probed)."
     )]
     pub name: String,
 }

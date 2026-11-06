@@ -24,12 +24,46 @@ export interface AgentInfo {
    *  "runtime" — claude-code/dsh/opencode, the execution backends. */
   kind?: "role" | "runtime";
   command?: string | null;
+  /** Whether the daemon could RESOLVE this runtime's spawn command on ITS OWN
+   *  machine (the first token of `command`, looked up on PATH).
+   *
+   *  OPTIONAL on purpose, exactly like `primary` below: a daemon older than the
+   *  field omits it, and "was not reported" must never be read as "resolves". So
+   *  there are THREE states -- `true`, `false` and `undefined` -- and the Runtimes
+   *  view renders a different, non-interchangeable reading for each one (see
+   *  `commandState` there); `undefined` says "unknown", never "available".
+   *
+   *  This field exists for one user report: runtimes created on another machine
+   *  looked healthy in the panel -- saved, listed, no warning -- and only failed
+   *  when a chat actually started. "Saved" and "can be started" are two facts. */
+  command_resolved?: boolean;
+  /** What the command resolved to (absolute path) when
+   *  `command_resolved === true`; null otherwise. Shown on hover, never invented. */
+  command_path?: string | null;
   /** The agent `agents.toml` marks `primary = true` (docs/design/primary-agent.md).
    *  OPTIONAL on purpose: a daemon older than the field omits it, and "the flag
    *  was not reported" must never be read as "this agent is primary" nor as
    *  "some other agent is". The flag also does not say who ANSWERS — routing.toml's
    *  `default` outranks it, and `/api/v1/primary` is the one answer to that. */
   primary?: boolean;
+}
+
+/** What a runtime probe got to before it stopped (POST
+ *  /api/v1/runtimes/{name}/probe): resolvable on PATH, spawnable, able to speak
+ *  ACP, or fine. A closed set on the daemon's side; the panel renders the token it
+ *  received VERBATIM instead of mapping it to a friendlier word, because the word
+ *  alone never explains a platform — `detail` does. */
+export type RuntimeProbeStage = "not-found" | "spawn-failed" | "handshake-failed" | "ok";
+
+/** One probe's result. `ok === false` arrives with HTTP **200**: the request
+ *  succeeded, the runtime did not, so a caller must read `ok` and never the status
+ *  code. `detail` is the daemon's own sentence (PATH searched, exit code, timeout)
+ *  and is displayed as-is: it is the only part that answers "why". */
+export interface RuntimeProbeResult {
+  ok: boolean;
+  command_path: string | null;
+  stage: RuntimeProbeStage;
+  detail: string;
 }
 
 /** `GET /api/v1/primary` — the EFFECTIVE front door, not merely the flag.
@@ -1561,6 +1595,18 @@ export const api = {
   updateRuntime: (name: string, body: Partial<AgentInfo>) =>
     send("PATCH", `/api/v1/runtimes/${encodeURIComponent(name)}`, body),
   deleteRuntime: (name: string) => send("DELETE", `/api/v1/runtimes/${encodeURIComponent(name)}`),
+  /** Can this backend REALLY start on this machine?
+   *
+   *  ONE probe, no cache: the answer depends on this machine's PATH and on the
+   *  binary answering a handshake, both of which change without the config
+   *  changing, so a cached "ok" would be the same lie as no reading at all.
+   *  `ok:false` comes back with HTTP 200 (see RuntimeProbeResult); a REJECT means
+   *  the request itself failed -- an older daemon without the route answers 404,
+   *  and that is a fact about the daemon, not about the runtime. */
+  probeRuntime: (name: string) =>
+    post(`/api/v1/runtimes/${encodeURIComponent(name)}/probe`).then(
+      (r) => r.json() as Promise<RuntimeProbeResult>,
+    ),
   createAgent: (body: {
     name: string;
     prompt: string;

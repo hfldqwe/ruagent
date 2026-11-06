@@ -440,7 +440,7 @@ async fn every_tool_refuses_fields_it_does_not_declare() {
     // guard: it moves with the surface and names the whole list when it does not match.
     assert_eq!(
         tools.len(),
-        31,
+        32,
         "the walker ran over the wrong surface: {:?}",
         tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>()
     );
