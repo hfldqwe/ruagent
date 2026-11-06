@@ -271,8 +271,24 @@ jobs:
             "$RUNNER_TEMP/t65/linux-probe-ignored.log" "$rc_probe" \
             probing_the_mock_agent_reports_ok_and_the_command_path \
             a_program_that_exits_immediately_is_reported_with_its_code_and_stderr
+          # THE THIRTEENTH (ruagent / unzipped-install fix). `t69` guards the one shape the release
+          # exists for -- a fresh root whose mcp.toml still says `command = "ruagent"` while the
+          # binary is NOT on PATH -- and it needs the same mock binary to build a runtime to ask
+          # about. It is its own target, so it needs its own run and its own demanded name; leaving
+          # it merely #[ignore]d would count it in `found` while never producing a reading (t65).
+          set +e
+          cargo test -p ruagent-daemon --test platform_mcp_path -- --include-ignored \
+            2>&1 | tee "$RUNNER_TEMP/t65/linux-platform-mcp.log"
+          rc_platform=${PIPESTATUS[0]}
+          set -e
+          echo "$rc_platform" > "$RUNNER_TEMP/t65/linux-platform-mcp.rc"
+          echo "daemon platform-mcp instrumentation exit code: $rc_platform"
+          bash .github/workflows/scripts/test-evidence.sh \
+            "Rust (ubuntu) -- platform MCP path instrumentation (--include-ignored)" \
+            "$RUNNER_TEMP/t65/linux-platform-mcp.log" "$rc_platform" \
+            options_are_not_400_when_ruagent_is_not_on_path
           # EVERY reading fails this step, whichever one is red.
-          exit "$(( rc != 0 || rc_mcp != 0 || rc_probe != 0 ))"
+          exit "$(( rc != 0 || rc_mcp != 0 || rc_probe != 0 || rc_platform != 0 ))"
 
       # ------------------------------------------- the manifest of the rest
       # Visible skip accounting. `--ignored --list` is the source of truth for
@@ -309,7 +325,7 @@ jobs:
           # instrument (a second target, same mock-binary precondition), and since t68 the
           # runtime probe's two instruments (a third target -- they used to sit in the daemon
           # LIB, whose ignored tests this job never runs, so they produced no reading at all).
-          covered=11
+          covered=12
           # DECLARED NOT COVERED here (10). CI has no ~/.ruagent database, no real
           # ~/.ruagent root and no e5 model; these instruments' subject IS the real
           # history, so a synthetic fixture would not measure them (an empty copy is
@@ -342,6 +358,7 @@ jobs:
             # can check them statically -- appending them to the 8-name row above would put them
             # behind the " names" token the guard skips.
             echo "| \`runtime_probe\`: probing_the_mock_agent_reports_ok_and_the_command_path, a_program_that_exits_immediately_is_reported_with_its_code_and_stderr | RUN (\`--include-ignored\`, a THIRD target with the same mock-binary precondition; t68 moved them out of the daemon lib, whose ignored tests this job never runs) |"
+            echo "| \`platform_mcp_path\`: options_are_not_400_when_ruagent_is_not_on_path | RUN (\`--include-ignored\`, a FOURTH target: the unzipped-install shape, where the binary is not on PATH and the seed mcp.toml still says \`command = \"ruagent\"\`) |"
             echo "| \`store\`: live_copy_keeps_history_nullable, live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, live_copy_bigram_backfill_at_scale | NOT RUN: needs \`RUAGENT_T6_LIVE_COPY\` (for live_copy_keeps_history_nullable and live_copy_bigram_backfill_at_scale) and \`RUAGENT_T25_LIVE_COPY\` (for live_copy_upgrades_without_losing_distill_rows_and_then_holds_each_attempt, which needs a PRE-0024 copy) = migrated COPYs of a real database. A fresh DB cannot show the history-NULL clause at all -- that is the clause under test. Satisfiable only on a machine with a real \`~/.ruagent\`. T6 and T25 must point at SEPARATE copies (t36). |"
             echo "| \`graph\`: community_coverage_and_multihop_on_the_real_graph, redundant_pairs_on_the_real_graph_go_to_zero, the_real_query_frame_through_the_new_legs | NOT RUN: needs \`RUAGENT_GRAPH_LIVE_COPY\` = a COPY of the real graph DB; the instrument refuses any path containing \`.ruagent\` and asserts the source's object set, so a synthetic DB does not measure it. |"
             echo "| \`knowledge\`: live_copy_gold_set, live_copy_evidence_and_run_record | NOT RUN: needs \`RUAGENT_IA_LIVE_COPY\` = a COPY of a live root WITH the corpus (934 docs) and the e5 model; the C1/C2/C9 readings are properties of that corpus. |"
