@@ -1,5 +1,6 @@
 //! ruagent CLI: thin client over the daemon's local API (design §3).
 
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::time::Duration;
 
@@ -1572,6 +1573,348 @@ mod tests {
         assert!(joined.contains("tokens 1200"), "{joined}");
         assert!(joined.contains("$0.0030"), "{joined}");
     }
+
+    // ------------------------------------------------------------------
+    // t70: the runtimes section -- decided from constructed JSON, no daemon
+    // ------------------------------------------------------------------
+
+    /// An `/api/v1/agents` runtime card, in the shape api.rs emits (the two
+    /// command_* fields are OPTIONAL there, so the tests can leave them out).
+    fn runtime_card(
+        name: &str,
+        harness: &str,
+        resolved: Option<bool>,
+        path: Option<&str>,
+    ) -> serde_json::Value {
+        let mut card = serde_json::json!({
+            "id": "c-1",
+            "name": name,
+            "harness": harness,
+            "kind": "runtime",
+            "enabled": true,
+            "command": format!("{name} --acp"),
+        });
+        if let Some(r) = resolved {
+            card["command_resolved"] = serde_json::json!(r);
+        }
+        if let Some(p) = path {
+            card["command_path"] = serde_json::json!(p);
+        }
+        card
+    }
+
+    fn agents_of(cards: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "agents": cards })
+    }
+
+    fn probes(pairs: Vec<(&str, ProbeCall)>) -> BTreeMap<String, ProbeCall> {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    fn answered(ok: bool, stage: &str, detail: &str) -> ProbeCall {
+        ProbeCall::Answer(serde_json::json!({
+            "ok": ok,
+            "command_path": serde_json::Value::Null,
+            "stage": stage,
+            "detail": detail,
+        }))
+    }
+
+    /// Every runtime starts: PASS, one row per runtime, and the front door is marked
+    /// by the endpoint that answers "who will reply" rather than by a flag.
+    #[test]
+    fn doctor_runtimes_all_ok_passes_and_marks_the_front_door() {
+        let agents = agents_of(vec![
+            runtime_card("claude", "claude-code", Some(true), Some("/usr/bin/claude")),
+            runtime_card("mock", "mock", Some(true), Some("/opt/build/mock")),
+        ]);
+        let primary = serde_json::json!({ "name": "claude", "source": "routing-default" });
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&primary),
+            &probes(vec![
+                ("claude", answered(true, "ok", "")),
+                ("mock", answered(true, "ok", "")),
+            ]),
+        );
+        assert!(c.ok, "two working backends must pass: {}", c.detail);
+        assert_eq!(c.name, "runtimes");
+        assert!(c.detail.contains("2/2 runtime(s) start"), "{}", c.detail);
+        assert!(
+            c.detail.contains("/usr/bin/claude"),
+            "the resolved path is the daemon's answer and must be printed: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("stage: ok"), "{}", c.detail);
+        assert!(
+            c.detail.contains("claude") && c.detail.contains("← primary"),
+            "the effective front door must be marked: {}",
+            c.detail
+        );
+        assert!(!c.detail.contains("NONE"), "{}", c.detail);
+        // One summary line plus exactly one line per runtime. That is the shape the
+        // reader asked for (`doctor` must not fold four backends into a sentence).
+        assert_eq!(c.detail.lines().count(), 3, "{}", c.detail);
+    }
+
+    /// Nothing starts (the fresh-machine case): NOT a pass, and the text has to say
+    /// what to install or where to change the command -- "check your config" is the
+    /// sentence this section exists to replace.
+    #[test]
+    fn doctor_runtimes_all_not_found_fails_with_a_next_step() {
+        let agents = agents_of(vec![
+            runtime_card("claude", "claude-code", Some(false), None),
+            runtime_card("opencode", "opencode", Some(false), None),
+        ]);
+        let primary = serde_json::json!({ "name": serde_json::Value::Null });
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&primary),
+            &probes(vec![
+                (
+                    "claude",
+                    answered(
+                        false,
+                        "not-found",
+                        "`claude` is not on PATH. Install it, or set this runtime's `command` to the \
+                         binary's full path (the PATH this daemon sees is the one it was started \
+                         with).",
+                    ),
+                ),
+                (
+                    "opencode",
+                    answered(false, "not-found", "`opencode` is not on PATH."),
+                ),
+            ]),
+        );
+        assert!(
+            !c.ok,
+            "a machine on which no runtime starts must NOT report all checks passed: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("0/2 runtime(s) start"), "{}", c.detail);
+        assert!(c.detail.contains("NONE could start"), "{}", c.detail);
+        // The daemon's own detail reaches the reader, and so does the next step.
+        assert!(c.detail.contains("Install it"), "{}", c.detail);
+        assert!(c.detail.contains("full path"), "{}", c.detail);
+        // Three facts per row: resolution, stage, and (here) no front door at all.
+        assert!(
+            c.detail.contains("command NOT found on PATH"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("stage: not-found"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("← primary"),
+            "nobody is the front door, so nothing may be marked: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("no front door"), "{}", c.detail);
+    }
+
+    /// Mixed, including a probe whose REQUEST failed: one working backend is enough
+    /// for the install to be usable, but the broken rows still name their stage.
+    #[test]
+    fn doctor_runtimes_mixed_reports_each_stage_and_still_passes() {
+        let agents = agents_of(vec![
+            runtime_card("claude", "claude-code", Some(true), Some("/usr/bin/claude")),
+            runtime_card(
+                "opencode",
+                "opencode",
+                Some(true),
+                Some("/usr/bin/opencode"),
+            ),
+            runtime_card("dsh", "dsh", None, None),
+        ]);
+        let primary = serde_json::json!({ "name": "claude" });
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&primary),
+            &probes(vec![
+                ("claude", answered(true, "ok", "")),
+                (
+                    "opencode",
+                    answered(
+                        false,
+                        "spawn-failed",
+                        "`/usr/bin/opencode` exited immediately (exit code: 3): boom",
+                    ),
+                ),
+                (
+                    "dsh",
+                    ProbeCall::Failed("HTTP 500: {\"error\":\"probe exploded\"}".into()),
+                ),
+            ]),
+        );
+        assert!(
+            c.ok,
+            "one usable backend keeps the install usable: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("1/3 runtime(s) start"), "{}", c.detail);
+        assert!(c.detail.contains("stage: spawn-failed"), "{}", c.detail);
+        assert!(
+            c.detail.contains("exit code: 3"),
+            "the exit code is the whole diagnosis for a spawn failure: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("probe failed: HTTP 500"),
+            "a failed REQUEST is not a stage and must say so: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("command: not reported by this daemon"),
+            "a daemon without the field is neither resolved nor missing: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("1/3"), "{}", c.detail);
+    }
+
+    /// Every probe request fails (a daemon that does not serve the route, or a 500):
+    /// that is NOT a pass, and every row must name the request's own status.
+    #[test]
+    fn doctor_runtimes_all_probe_requests_failing_fails() {
+        let agents = agents_of(vec![
+            runtime_card("claude", "claude-code", Some(true), Some("/usr/bin/claude")),
+            runtime_card("mock", "mock", Some(true), Some("/opt/mock")),
+        ]);
+        let c = runtimes_check(
+            Ok(&agents),
+            Err("HTTP 404: not found".into()),
+            &probes(vec![
+                (
+                    "claude",
+                    ProbeCall::Failed("HTTP 500: probe exploded".into()),
+                ),
+                (
+                    "mock",
+                    ProbeCall::Failed("HTTP 405: Method Not Allowed".into()),
+                ),
+            ]),
+        );
+        assert!(
+            !c.ok,
+            "cannot probe anything is a red section: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("0/2 runtime(s) start"), "{}", c.detail);
+        assert!(c.detail.contains("probe failed: HTTP 500"), "{}", c.detail);
+        assert!(c.detail.contains("probe failed: HTTP 405"), "{}", c.detail);
+        assert!(c.detail.contains("NONE could start"), "{}", c.detail);
+        // ...and a /primary that did not answer is "unknown", not "nobody".
+        assert!(c.detail.contains("front door unknown"), "{}", c.detail);
+        assert!(!c.detail.contains("no front door"), "{}", c.detail);
+    }
+
+    /// The front door's three answers are three different sentences. A daemon that
+    /// omits `name` (older than the field) must not be read as "there is none".
+    #[test]
+    fn doctor_runtimes_front_door_missing_field_is_not_no_front_door() {
+        let agents = agents_of(vec![runtime_card(
+            "claude",
+            "claude-code",
+            Some(true),
+            Some("/usr/bin/claude"),
+        )]);
+        let ok_probes = probes(vec![("claude", answered(true, "ok", ""))]);
+        // (a) the field is ABSENT
+        let absent = serde_json::json!({ "why": "routing.toml decides" });
+        let c = runtimes_check(Ok(&agents), Ok(&absent), &ok_probes);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("front door not reported"), "{}", c.detail);
+        assert!(!c.detail.contains("no front door"), "{}", c.detail);
+        assert!(!c.detail.contains("← primary"), "{}", c.detail);
+        // (b) the field is there and names NOBODY
+        let nobody = serde_json::json!({ "name": serde_json::Value::Null });
+        let c = runtimes_check(Ok(&agents), Ok(&nobody), &ok_probes);
+        assert!(c.detail.contains("no front door"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("front door not reported"),
+            "{}",
+            c.detail
+        );
+        // (c) a front door that is not an enabled runtime card is named as such
+        let elsewhere = serde_json::json!({ "name": "alpha" });
+        let c = runtimes_check(Ok(&agents), Ok(&elsewhere), &ok_probes);
+        assert!(
+            c.detail
+                .contains("front door `alpha` is not an enabled runtime card"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// Not being able to ask is not a pass (the same rule `distill_check` follows).
+    #[test]
+    fn doctor_runtimes_unreadable_agents_is_not_checked_and_fails() {
+        let c = runtimes_check(
+            Err("connect refused".into()),
+            Err("connect refused".into()),
+            &BTreeMap::new(),
+        );
+        assert!(
+            !c.ok,
+            "an unanswered section must not read as PASS: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("未检查"), "{}", c.detail);
+        assert!(c.detail.contains("connect refused"), "{}", c.detail);
+        assert!(
+            c.detail.contains("GET /api/v1/agents"),
+            "the cause names which read failed: {}",
+            c.detail
+        );
+    }
+
+    /// A config with no enabled runtime card: nothing to diagnose, and no chat can
+    /// start -- a failure whose text says what to add.
+    #[test]
+    fn doctor_runtimes_no_enabled_cards_fails_and_says_what_to_add() {
+        let agents = agents_of(vec![
+            runtime_card("mock", "mock", Some(true), None),
+            serde_json::json!({ "id": "r", "name": "alpha", "harness": "mock",
+                "kind": "role", "enabled": true, "prompt": "hi" }),
+        ]);
+        // the runtime card above is disabled: the operator's intent, not a breakage
+        let mut cards = agents.clone();
+        cards["agents"][0]["enabled"] = serde_json::json!(false);
+        let c = runtimes_check(
+            Ok(&cards),
+            Ok(&serde_json::json!({ "name": "alpha" })),
+            &BTreeMap::new(),
+        );
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no enabled runtime card"), "{}", c.detail);
+        assert!(c.detail.contains("[runtime.*]"), "{}", c.detail);
+    }
+
+    /// The probe's own report is what the row prints: a 200 whose body says ok:false is
+    /// a FAILURE, and the same daemon's `detail` is carried through verbatim.
+    #[test]
+    fn doctor_runtimes_reads_ok_from_the_body_not_the_status() {
+        let agents = agents_of(vec![runtime_card(
+            "claude",
+            "claude-code",
+            Some(false),
+            None,
+        )]);
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&serde_json::json!({ "name": "claude" })),
+            &probes(vec![(
+                "claude",
+                answered(false, "not-found", "`claude` is not on PATH."),
+            )]),
+        );
+        assert!(!c.ok, "HTTP 200 with ok:false is a failure: {}", c.detail);
+        assert!(
+            c.detail.contains("`claude` is not on PATH."),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("← primary"), "{}", c.detail);
+    }
 }
 
 fn client() -> reqwest::blocking::Client {
@@ -1685,6 +2028,242 @@ fn distill_reading(v: &serde_json::Value) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// doctor: the runtimes section (t70) -- "which backend is broken, and where"
+// ---------------------------------------------------------------------------
+
+/// One probe call's outcome, as the CLI obtained it.
+///
+/// TWO variants on purpose, and a MISSING entry (nothing in the map) is the third
+/// reading: no call was made, because the daemon never told us the runtime exists.
+/// `Answer` is the daemon's report -- a failed probe is still HTTP 200 there (the
+/// request succeeded, the runtime did not: see api.rs). `Failed` is the REQUEST
+/// failing; an older daemon has no such route and answers 405 (measured), which is a
+/// fact about the daemon and must not be dressed up as a stage the runtime reached.
+#[derive(Clone, Debug)]
+enum ProbeCall {
+    Answer(serde_json::Value),
+    Failed(String),
+}
+
+/// Doctor's runtimes section (t70), decided from JSON the CLI already fetched.
+///
+/// WHY THIS IS A PURE FUNCTION: the user report is "the panel was the only place
+/// that could tell me a runtime cannot start", and the reading that fixes it is a
+/// decision over three documents (the agents card, the front door, one probe per
+/// runtime). Keeping that decision out of the network code is what lets the tests
+/// below drive every branch with constructed JSON instead of a daemon.
+///
+/// WHAT IT REFUSES TO DO: look up PATH itself. `command_resolved` / `command_path`
+/// come from the daemon, which is the process that will actually spawn the command
+/// and therefore the only holder of that truth -- a second lookup here would be a
+/// second answer that can disagree with the one that matters.
+///
+/// WHEN IT FAILS: only when NO runtime starts. A partially broken install is not a
+/// doctor failure (one usable backend still answers chats), but every broken row is
+/// printed with the stage the daemon stopped at, so the section is never silently
+/// green. "Not checked" is a FAILURE, the same rule `distill_check` follows.
+fn runtimes_check(
+    agents: Result<&serde_json::Value, String>,
+    primary: Result<&serde_json::Value, String>,
+    probes: &BTreeMap<String, ProbeCall>,
+) -> Check {
+    const NAME: &str = "runtimes";
+    let cards = match agents {
+        Ok(v) => v["agents"].as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            return Check {
+                name: NAME.into(),
+                ok: false,
+                detail: format!(
+                    "未检查（GET /api/v1/agents failed: {e}）— the daemon's own card is the only \
+                     holder of command_resolved, so nothing can be said about a runtime \
+                     without it"
+                ),
+            };
+        }
+    };
+
+    // WHICH runtimes: enabled runtime CARDS. A role is not a backend, and a disabled
+    // runtime is the operator's intent rather than a broken machine -- reporting it
+    // as a failure would blame the machine for a decision (the panel makes the same
+    // distinction).
+    let runtimes: Vec<&serde_json::Value> = cards
+        .iter()
+        .filter(|c| {
+            c["kind"].as_str().unwrap_or("runtime") == "runtime"
+                && c["enabled"].as_bool().unwrap_or(true)
+        })
+        .collect();
+
+    // The front door is a SEPARATE endpoint because marking an agent primary is not
+    // the same as being answered by it (routing.toml's `default` outranks the flag).
+    // Three answers, three sentences: a name, a definite nobody, and "not reported".
+    let (front, front_note) = match &primary {
+        Ok(v) => match v["name"].as_str() {
+            Some(n) => (Some(n.to_string()), String::new()),
+            None if v.get("name").is_some() => (
+                None,
+                " · no front door: the next run takes the first enabled card".to_string(),
+            ),
+            None => (
+                None,
+                " · front door not reported by this daemon".to_string(),
+            ),
+        },
+        Err(e) => (
+            None,
+            format!(" · front door unknown (GET /api/v1/primary failed: {e})"),
+        ),
+    };
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut started = 0usize;
+    for r in &runtimes {
+        let name = r["name"].as_str().unwrap_or("?").to_string();
+        let harness = r["harness"].as_str().unwrap_or("?");
+        // 1. can the daemon resolve the command? `command_resolved` is OPTIONAL, so
+        //    "absent" gets its own wording: neither "resolves" nor "missing".
+        let command = match r["command_resolved"].as_bool() {
+            Some(true) => match r["command_path"].as_str() {
+                Some(p) if !p.trim().is_empty() => format!("command resolves ({p})"),
+                _ => "command resolves".to_string(),
+            },
+            Some(false) => "command NOT found on PATH".to_string(),
+            None => "command: not reported by this daemon".to_string(),
+        };
+        // 2. can it actually start? The stage is printed VERBATIM (it is the daemon's
+        //    vocabulary, not ours) and the detail only when the probe failed -- a
+        //    successful handshake has nothing to explain.
+        let (probe_text, ok) = match probes.get(&name) {
+            Some(ProbeCall::Answer(v)) => {
+                let ok = v["ok"].as_bool().unwrap_or(false);
+                let stage = v["stage"].as_str().unwrap_or("<the daemon sent no stage>");
+                let detail = v["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .replace(['\n', '\r'], " ");
+                let text = if ok {
+                    format!("starts (stage: {stage})")
+                } else if detail.trim().is_empty() {
+                    format!("does NOT start (stage: {stage})")
+                } else {
+                    format!(
+                        "does NOT start (stage: {stage}) — {}",
+                        truncate_chars(detail.trim(), 200)
+                    )
+                };
+                (text, ok)
+            }
+            Some(ProbeCall::Failed(e)) => (format!("probe failed: {e}"), false),
+            None => ("probe not run".to_string(), false),
+        };
+        if ok {
+            started += 1;
+        }
+        let mark = if ok { "OK  " } else { "FAIL" };
+        let star = if front.as_deref() == Some(name.as_str()) {
+            "  ← primary"
+        } else {
+            ""
+        };
+        rows.push(format!(
+            "{mark} {:<16} [{harness}] {command} · {probe_text}{star}",
+            name
+        ));
+    }
+
+    let total = runtimes.len();
+    let (ok, summary) = if total == 0 {
+        (
+            false,
+            "no enabled runtime card in agents.toml — add a [runtime.*] section (or enable one), \
+             otherwise no chat can start and there is nothing here to diagnose"
+                .to_string(),
+        )
+    } else if started == 0 {
+        (
+            false,
+            format!(
+                "0/{total} runtime(s) start — NONE could start: install the binary each FAIL row \
+                 names, or set that runtime's `command` to the binary's full path in \
+                 ~/.ruagent/config/agents.toml, then re-run `ruagent doctor`"
+            ),
+        )
+    } else if started < total {
+        (
+            true,
+            format!(
+                "{started}/{total} runtime(s) start; the FAIL row(s) below name the stage the \
+                 daemon stopped at"
+            ),
+        )
+    } else {
+        (true, format!("{started}/{total} runtime(s) start"))
+    };
+
+    let mut detail = format!("{summary}{front_note}");
+    if let Some(f) = &front
+        && !runtimes
+            .iter()
+            .any(|r| r["name"].as_str() == Some(f.as_str()))
+    {
+        detail.push_str(&format!(
+            " · front door `{f}` is not an enabled runtime card here"
+        ));
+    }
+    for row in rows {
+        detail.push('\n');
+        detail.push_str(&row);
+    }
+    Check {
+        name: NAME.into(),
+        ok,
+        detail,
+    }
+}
+
+/// One `POST /api/v1/runtimes/{name}/probe`, as a `ProbeCall`.
+///
+/// A FAILED PROBE IS STILL HTTP 200 (the request completed; the runtime did not),
+/// so the answer is read from the BODY and the status only distinguishes "the
+/// request itself failed". Measured on a tree without the route: this path answers
+/// **405** (the `/{name}` PATCH and DELETE exist), which must read as "this daemon
+/// has no probe", never as a stage the runtime reached.
+fn probe_runtime(url: &str, name: &str) -> ProbeCall {
+    let client = match reqwest::blocking::Client::builder()
+        // Bounded well past the daemon's own handshake window (it gives up in ~20 s),
+        // so a slow probe is reported as the daemon's own stage rather than as a
+        // transport timeout on our side.
+        .timeout(Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return ProbeCall::Failed(format!("client: {e}")),
+    };
+    let resp = match client
+        .post(format!("{url}/api/v1/runtimes/{name}/probe"))
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => return ProbeCall::Failed(format!("transport: {e}")),
+    };
+    let status = resp.status().as_u16();
+    let body = match resp.text() {
+        Ok(t) => t,
+        Err(e) => return ProbeCall::Failed(format!("HTTP {status}: body unreadable ({e})")),
+    };
+    if !(200..300).contains(&status) {
+        return ProbeCall::Failed(format!(
+            "HTTP {status}: {}",
+            truncate_chars(body.trim(), 120)
+        ));
+    }
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => ProbeCall::Answer(v),
+        Err(e) => ProbeCall::Failed(format!("HTTP {status}: unparsable body ({e})")),
+    }
+}
 fn doctor(url: &str, cleanup: bool) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -1880,6 +2459,38 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         get_json(url, "/api/v1/distill/log?limit=1"),
     ));
 
+    // 7. runtimes (t70): WHICH backend cannot be used, and WHERE it stopped. Three
+    // facts per row, all of them the daemon's: can it resolve the command, did a real
+    // probe get through, and which one is the front door. The probe SPAWNS the binary
+    // (bounded, ~20 s worst case per runtime), so this is the slowest section -- and
+    // the only one that answers "why did the chat fail" without opening the panel.
+    {
+        let agents = get_json(url, "/api/v1/agents");
+        let primary = get_json(url, "/api/v1/primary");
+        let mut probes: BTreeMap<String, ProbeCall> = BTreeMap::new();
+        let cards = agents
+            .as_ref()
+            .ok()
+            .and_then(|v| v["agents"].as_array().cloned())
+            .unwrap_or_default();
+        for card in cards {
+            if card["kind"].as_str().unwrap_or("runtime") != "runtime"
+                || !card["enabled"].as_bool().unwrap_or(true)
+            {
+                continue;
+            }
+            let Some(name) = card["name"].as_str() else {
+                continue;
+            };
+            probes.insert(name.to_string(), probe_runtime(url, name));
+        }
+        checks.push(runtimes_check(
+            agents.as_ref().map_err(|e| e.clone()),
+            primary.as_ref().map_err(|e| e.clone()),
+            &probes,
+        ));
+    }
+
     // Probe hygiene (t252): the removable probe document is deleted
     // BEFORE the report, so cleanup is part of running the command and not
     // something a human has to remember.
@@ -1904,7 +2515,20 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         if !c.ok {
             failed += 1;
         }
-        println!("  [{mark}] {:<26} {}", c.name, c.detail);
+        // A check may carry a TABLE under its summary line: the runtimes section is one
+        // line per backend by design (which backend, which stage), and folding those
+        // rows into one sentence is exactly the unreadable thing this section replaces.
+        // Continuation lines are indented under the detail column instead of restarting
+        // at column 0, so the rows are visibly part of their check.
+        let mut detail_lines = c.detail.split('\n');
+        println!(
+            "  [{mark}] {:<26} {}",
+            c.name,
+            detail_lines.next().unwrap_or("")
+        );
+        for extra in detail_lines {
+            println!("         {extra}");
+        }
     }
     println!();
     if failed == 0 {
