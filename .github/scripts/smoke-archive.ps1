@@ -170,6 +170,40 @@ try {
         Write-Output ('embedder reading unavailable: ' + $_.Exception.Message)
     }
 
+    # 4b. THE UNZIPPED-INSTALL SHAPE (v0.1.6). A zip is unpacked, not installed: the daemon runs
+    #     from $stage and nothing named `ruagent` needs to be on PATH. Until 0.1.6 the seeded
+    #     mcp.toml said `command = "ruagent"`, and when that name did not resolve the platform's
+    #     OWN MCP server failed its pre-flight -- FATAL for the profile -- so EVERY runtime answered
+    #     400 with an MCP message and no runtime ever started. /api/v1/health was 200 throughout,
+    #     which is why a health check cannot see this. So ask each seeded runtime from here, and
+    #     require that the platform's own server is never the thing that fails. A runtime whose
+    #     command is genuinely absent may still fail -- that failure names the RUNTIME, which is
+    #     the honest reading and what the probe exists to say.
+    $onPath = if (Get-Command ruagent -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }
+    Write-Output ("shape: ruagent on PATH = $onPath (this daemon runs from $stage, like an unzipped download)")
+    foreach ($rt in @('claude', 'opencode', 'dsh')) {
+        try {
+            $opts = Invoke-WebRequest -Uri "$base/api/v1/agents/$rt/options" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            $optsBody = $opts.Content
+        } catch {
+            if ($_.Exception.Response) {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $optsBody = $reader.ReadToEnd()
+            } else { $optsBody = $_.Exception.Message }
+        }
+        if ($optsBody -match '\[ruagent\]') {
+            Stop-With "GET /api/v1/agents/$rt/options blames the platform's OWN MCP server, so no runtime can start: $($optsBody.Substring(0, [Math]::Min(300, $optsBody.Length)))"
+        }
+        try {
+            $probeResp = Invoke-WebRequest -Uri "$base/api/v1/runtimes/$rt/probe" -Method Post -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            $probeBody = $probeResp.Content
+        } catch { $probeBody = $_.Exception.Message }
+        if ($probeBody -notmatch '"stage"') {
+            Stop-With "POST /api/v1/runtimes/$rt/probe gave no stage reading: $($probeBody.Substring(0, [Math]::Min(300, $probeBody.Length)))"
+        }
+        Write-Output ("runtime $rt : probe -> " + $probeBody.Substring(0, [Math]::Min(140, $probeBody.Length)))
+    }
+
     # 5. CLEAN STOP: the request file is the daemon's own channel (a console-less process has
     #    no Ctrl-C). A forced stop is the fallback and is reported, never silent.
     $stopFile = Join-Path $root 'data/daemon.stop'

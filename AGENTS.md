@@ -439,6 +439,18 @@ cd panel && npm run test:e2e -- --output=/tmp/pw
   second carrier (workflow yml, `scripts/*.ps1`, panel TS), first print what the parser extracts and confirm the
   count is what you expect: this class fails SILENTLY, never with an error.
 
+- **A change nobody can install is not a fix: every landed change ships a version** (user directive, 2026-11-08).
+  The user runs the product from a downloaded archive on another machine, so a fix that exists only on `main` is
+  a fix they cannot use. After landing user-visible work: bump the patch version in `Cargo.toml`, regenerate
+  `Cargo.lock` (`cargo check` does it), commit, `git tag -a vX.Y.Z`, push the commit and the tag, and then
+  CONFIRM the release run is green and the three assets + `.sha256` files exist -- "pushed" is not "released".
+  Detail worth keeping: the release gate job requires CI green on the exact tagged commit, so push `main`
+  first and wait for green; and because `github.com` was unreachable while `api.github.com` worked (see the
+  proxy entries above), the tag push goes over SSH (`git push git@github.com:<owner>/<repo>.git vX.Y.Z`). A
+  tag that was never released may be re-pointed rather than skipped: v0.1.6 moved because the first attempt's
+  commit failed the ignored-instrument manifest, and shipping the same version number twice under one tag is
+  how a downloader ends up with bytes nobody verified.
+
 ## Testing philosophy
 
 The mock ACP agent (`crates/mock-agent`) is the backbone of CI: every orchestration/policy/memory behavior must be testable without real harnesses or API keys. Property tests guard the injection contract (bounded, tagged, visible truncation).

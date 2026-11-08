@@ -218,6 +218,32 @@ stats="$(curl -s --max-time 10 "$base/api/v1/stats" 2>/dev/null)"
 embedder="$(printf '%s' "$stats" | tr ',' '\n' | grep -m1 '"embedder"' | sed 's/.*: *"\([^"]*\)".*/\1/')"
 echo "embedder in use: ${embedder:-<unreadable>}"
 
+# 5b. THE UNZIPPED-INSTALL SHAPE (v0.1.6). A zip is unpacked, not installed: the daemon runs from
+#     $stage and nothing named `ruagent` needs to be on PATH. Until 0.1.6 the seeded mcp.toml said
+#     `command = "ruagent"`, and when that name did not resolve the platform's OWN MCP server failed
+#     its pre-flight -- which is FATAL for the profile -- so EVERY runtime answered 400 with an MCP
+#     message and every runtime simply never started. That is the reported failure this release
+#     exists for, and it is invisible to a health check: /api/v1/health was 200 the whole time.
+#     So ask, from here, and require that the platform's own server is never the thing that fails.
+#     A runtime whose command is genuinely absent MAY still fail -- on a CI runner `dsh`, `opencode`
+#     and `claude` are not installed -- and that failure names the RUNTIME, which is the honest
+#     reading and exactly what the probe exists to say.
+on_path=no; command -v ruagent >/dev/null 2>&1 && on_path=yes
+echo "shape: ruagent on PATH = $on_path (this daemon runs from $stage, like an unzipped download)"
+for rt in claude opencode dsh; do
+  body="$(curl -s --max-time 60 "$base/api/v1/agents/$rt/options" 2>/dev/null)"
+  case "$body" in
+    *"[ruagent]"*) fail "GET /api/v1/agents/$rt/options blames the platform's OWN MCP server, so no runtime can start: $(printf "%s" "$body" | cut -c1-300)" ;;
+  esac
+  probe="$(curl -s --max-time 60 -X POST "$base/api/v1/runtimes/$rt/probe" 2>/dev/null)"
+  case "$probe" in
+    *'"stage"'*) : ;;
+    *) fail "POST /api/v1/runtimes/$rt/probe gave no stage reading: $(printf "%s" "$probe" | cut -c1-300)" ;;
+  esac
+  echo "runtime $rt: probe -> $(printf "%s" "$probe" | cut -c1-140)"
+  echo "runtime $rt: options -> $(printf "%s" "$body" | cut -c1-140)"
+done
+
 # 6. CLEAN STOP through the daemon's own channel, forced kill only as a reported fallback.
 #    A POSIX counter loop, not seq: BSD/macOS seq is not universal.
 mkdir -p "$root/data"
