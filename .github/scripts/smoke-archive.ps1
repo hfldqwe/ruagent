@@ -182,22 +182,29 @@ try {
     $onPath = if (Get-Command ruagent -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }
     Write-Output ("shape: ruagent on PATH = $onPath (this daemon runs from $stage, like an unzipped download)")
     foreach ($rt in @('claude', 'opencode', 'dsh')) {
+        # A 4xx here is the NORMAL answer on a runner without these CLIs, and its body is the
+        # whole reading -- so it must be captured, not thrown. Two traps, both measured on a real
+        # release run: pwsh 7's Invoke-WebRequest throws HttpResponseException whose Response is an
+        # HttpResponseMessage (NO GetResponseStream, which is the 5.1 shape), and a bare
+        # $_.Exception.Message is the status line, not the body. ErrorDetails.Message carries the
+        # body under every PowerShell version this repo runs on.
+        $optsBody = ''
         try {
-            $opts = Invoke-WebRequest -Uri "$base/api/v1/agents/$rt/options" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
-            $optsBody = $opts.Content
+            $optsBody = (Invoke-WebRequest -Uri "$base/api/v1/agents/$rt/options" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop).Content
         } catch {
-            if ($_.Exception.Response) {
-                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                $optsBody = $reader.ReadToEnd()
-            } else { $optsBody = $_.Exception.Message }
+            $optsBody = $_.ErrorDetails.Message
+            if (-not $optsBody) { $optsBody = $_.Exception.Message }
         }
         if ($optsBody -match '\[ruagent\]') {
             Stop-With "GET /api/v1/agents/$rt/options blames the platform's OWN MCP server, so no runtime can start: $($optsBody.Substring(0, [Math]::Min(300, $optsBody.Length)))"
         }
+        $probeBody = ''
         try {
-            $probeResp = Invoke-WebRequest -Uri "$base/api/v1/runtimes/$rt/probe" -Method Post -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
-            $probeBody = $probeResp.Content
-        } catch { $probeBody = $_.Exception.Message }
+            $probeBody = (Invoke-WebRequest -Uri "$base/api/v1/runtimes/$rt/probe" -Method Post -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop).Content
+        } catch {
+            $probeBody = $_.ErrorDetails.Message
+            if (-not $probeBody) { $probeBody = $_.Exception.Message }
+        }
         if ($probeBody -notmatch '"stage"') {
             Stop-With "POST /api/v1/runtimes/$rt/probe gave no stage reading: $($probeBody.Substring(0, [Math]::Min(300, $probeBody.Length)))"
         }
