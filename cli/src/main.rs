@@ -1603,6 +1603,31 @@ mod tests {
         card
     }
 
+    /// An AGENT card: a role, which answers THROUGH a runtime rather than being one.
+    /// The captain's real install is exactly this shape -- `[agent.ruagent]` enabled and
+    /// `primary = true` next to the `[runtime.*]` cards it uses.
+    fn role_card(
+        name: &str,
+        harness: &str,
+        runtime: Option<&str>,
+        enabled: bool,
+        primary: bool,
+    ) -> serde_json::Value {
+        let mut card = serde_json::json!({
+            "id": "r-1",
+            "name": name,
+            "harness": harness,
+            "kind": "role",
+            "enabled": enabled,
+            "primary": primary,
+            "prompt": "you are the front door",
+        });
+        if let Some(r) = runtime {
+            card["runtime"] = serde_json::json!(r);
+        }
+        card
+    }
+
     fn agents_of(cards: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "agents": cards })
     }
@@ -1638,6 +1663,8 @@ mod tests {
             ]),
         );
         assert!(c.ok, "two working backends must pass: {}", c.detail);
+        assert!(!c.partial, "nothing is broken here: {}", c.detail);
+        assert_eq!(check_mark(&c), "PASS", "{}", c.detail);
         assert_eq!(c.name, "runtimes");
         assert!(c.detail.contains("2/2 runtime(s) start"), "{}", c.detail);
         assert!(
@@ -1751,6 +1778,12 @@ mod tests {
             "one usable backend keeps the install usable: {}",
             c.detail
         );
+        assert!(
+            c.partial,
+            "one of three is broken, so this is not a plain PASS: {}",
+            c.detail
+        );
+        assert_eq!(check_mark(&c), "WARN", "{}", c.detail);
         assert!(c.detail.contains("1/3 runtime(s) start"), "{}", c.detail);
         assert!(c.detail.contains("stage: spawn-failed"), "{}", c.detail);
         assert!(
@@ -1834,13 +1867,171 @@ mod tests {
             "{}",
             c.detail
         );
-        // (c) a front door that is not an enabled runtime card is named as such
+        // (c) a front door that matches NO card at all is a FAILURE, not a note: with
+        // this agents document there is no `alpha` anywhere, so the front door points at
+        // nothing and the section must go red (t73 -- this used to be a neutral sentence
+        // on a PASS line).
         let elsewhere = serde_json::json!({ "name": "alpha" });
         let c = runtimes_check(Ok(&agents), Ok(&elsewhere), &ok_probes);
         assert!(
+            !c.ok,
+            "a front door that resolves to nothing is a silent fault: {}",
             c.detail
-                .contains("front door `alpha` is not an enabled runtime card"),
+        );
+        assert!(
+            c.detail.contains("front door `alpha` matches NO card"),
             "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("ruagent primary --set"),
+            "the failing case must say how to fix it: {}",
+            c.detail
+        );
+    }
+
+    /// The captain's real reading: the front door is an ENABLED agent card that answers
+    /// through a runtime. That is normal configuration and must read as normal -- this
+    /// test exists because the section used to print "front door `ruagent` is not an
+    /// enabled runtime card here" for exactly this install.
+    #[test]
+    fn doctor_runtimes_front_door_is_an_agent_card_is_not_a_problem() {
+        let agents = agents_of(vec![
+            runtime_card(
+                "claude-code",
+                "claude-code",
+                Some(true),
+                Some("/usr/bin/claude"),
+            ),
+            role_card("ruagent", "claude-code", Some("claude-code"), true, true),
+        ]);
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&serde_json::json!({ "name": "ruagent", "source": "routing-default" })),
+            &probes(vec![("claude-code", answered(true, "ok", ""))]),
+        );
+        assert!(c.ok, "a healthy front door is not a finding: {}", c.detail);
+        assert!(!c.partial, "{}", c.detail);
+        assert_eq!(check_mark(&c), "PASS", "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("front door is agent `ruagent` via runtime `claude-code`"),
+            "the note must say WHAT the front door is, and through which runtime: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("expected"),
+            "the wording must not sound like a defect: {}",
+            c.detail
+        );
+        for alarm in [
+            "matches NO card",
+            "DISABLED",
+            "not an enabled runtime card",
+            "front door unknown",
+        ] {
+            assert!(
+                !c.detail.contains(alarm),
+                "a healthy agent front door must not be accused of {alarm}: {}",
+                c.detail
+            );
+        }
+        assert!(
+            !c.detail.contains("← primary"),
+            "the marker belongs on a runtime ROW, and no row here is the front door: {}",
+            c.detail
+        );
+    }
+
+    /// The same name, but the card is DISABLED: that IS a problem, and the sentence says
+    /// which lever to pull.
+    #[test]
+    fn doctor_runtimes_front_door_disabled_card_fails() {
+        let agents = agents_of(vec![
+            runtime_card(
+                "claude-code",
+                "claude-code",
+                Some(true),
+                Some("/usr/bin/claude"),
+            ),
+            role_card("ruagent", "claude-code", Some("claude-code"), false, false),
+        ]);
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&serde_json::json!({ "name": "ruagent" })),
+            &probes(vec![("claude-code", answered(true, "ok", ""))]),
+        );
+        assert!(
+            !c.ok,
+            "a front door pointing at a disabled card answers nothing: {}",
+            c.detail
+        );
+        assert_eq!(check_mark(&c), "FAIL", "{}", c.detail);
+        assert!(
+            c.detail.contains("front door `ruagent` is DISABLED"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("enable it"), "{}", c.detail);
+    }
+
+    /// A partially broken install: still not a doctor failure (t70's contract), but no
+    /// longer a plain PASS either -- its own bracket word, and the count said out loud.
+    #[test]
+    fn doctor_runtimes_partial_failure_is_not_a_plain_pass() {
+        let agents = agents_of(vec![
+            runtime_card(
+                "claude-code",
+                "claude-code",
+                Some(true),
+                Some("/usr/bin/claude"),
+            ),
+            runtime_card("dsh", "dsh", Some(true), Some("/usr/bin/dsh")),
+            runtime_card(
+                "opencode",
+                "opencode",
+                Some(true),
+                Some("/usr/bin/opencode"),
+            ),
+        ]);
+        let c = runtimes_check(
+            Ok(&agents),
+            Ok(&serde_json::json!({ "name": "claude-code" })),
+            &probes(vec![
+                ("claude-code", answered(true, "ok", "")),
+                ("dsh", answered(true, "ok", "")),
+                (
+                    "opencode",
+                    answered(
+                        false,
+                        "handshake-failed",
+                        "the ACP handshake did not complete: timed out",
+                    ),
+                ),
+            ]),
+        );
+        assert!(c.ok, "two of three still answer chats: {}", c.detail);
+        assert!(c.partial, "but this is not a clean pass: {}", c.detail);
+        assert_eq!(
+            check_mark(&c),
+            "WARN",
+            "a PASS on top of FAIL rows is the reading a user skims past: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("2/3 runtime(s) start; 1 does NOT start"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail
+                .contains("does NOT start (stage: handshake-failed)"),
+            "the stage stays the daemon's word, verbatim: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("the ACP handshake did not complete"),
+            "the daemon's detail must survive: {}",
             c.detail
         );
     }
@@ -1931,7 +2122,34 @@ fn client() -> reqwest::blocking::Client {
 struct Check {
     name: String,
     ok: bool,
+    /// A PASS with a caveat: the section did its job and one of its ROWS did not.
+    ///
+    /// WHY IT EXISTS (measured on a real install, not theorised): the runtimes section
+    /// printed `[PASS] runtimes 2/3 runtime(s) start; the FAIL row(s) below …` — and the
+    /// captain reported reading exactly that and moving on, because a reader who sees
+    /// `[PASS]` does not read the lines under it. The marker is now a DIFFERENT WORD for
+    /// this state, while the exit code keeps following `ok` alone (the t70 contract: no
+    /// runtime starting is the failure, one of three failing is not). Invariant, asserted
+    /// in `check_mark`: `partial` is only ever set on an `ok` check.
+    partial: bool,
     detail: String,
+}
+
+/// The word in the bracket. One function so the marker and the exit code cannot drift:
+/// `ok` decides pass/fail, `partial` only decides WHICH WORD a pass gets.
+fn check_mark(c: &Check) -> &'static str {
+    debug_assert!(
+        c.ok || !c.partial,
+        "a FAIL cannot also be a caveat-pass: {}",
+        c.name
+    );
+    if !c.ok {
+        "FAIL"
+    } else if c.partial {
+        "WARN"
+    } else {
+        "PASS"
+    }
 }
 
 /// Any CLI session store present on this machine?
@@ -1962,12 +2180,14 @@ fn distill_check(daemon_up: bool, reading: Result<serde_json::Value, String>) ->
         (_, Ok(v)) => Check {
             name: "distillation pipeline".into(),
             ok: true,
+            partial: false,
             detail: distill_reading(&v),
         },
         // NO DAEMON AT ALL: the cause is the daemon, and the line says so.
         (false, Err(_)) => Check {
             name: "distillation pipeline".into(),
             ok: false,
+            partial: false,
             detail: "未检查（daemon 不可达）— start it with `ruagent serve`".into(),
         },
         // A DAEMON THAT DOES NOT SERVE THIS ENDPOINT: NOT the same finding as an
@@ -1977,6 +2197,7 @@ fn distill_check(daemon_up: bool, reading: Result<serde_json::Value, String>) ->
         (true, Err(e)) => Check {
             name: "distillation pipeline".into(),
             ok: false,
+            partial: false,
             detail: format!("未检查（endpoint failed: {e}）"),
         },
     }
@@ -2059,10 +2280,13 @@ enum ProbeCall {
 /// and therefore the only holder of that truth -- a second lookup here would be a
 /// second answer that can disagree with the one that matters.
 ///
-/// WHEN IT FAILS: only when NO runtime starts. A partially broken install is not a
-/// doctor failure (one usable backend still answers chats), but every broken row is
-/// printed with the stage the daemon stopped at, so the section is never silently
-/// green. "Not checked" is a FAILURE, the same rule `distill_check` follows.
+/// WHEN IT FAILS: when NO runtime starts, and when the front door resolves to nothing
+/// (a name that matches no card, or a disabled one — an unreachable front door answers
+/// nothing, and a green section would hide that until the first chat). A PARTIALLY broken
+/// install is not a doctor failure (one usable backend still answers chats) but it is not
+/// a plain PASS either: `partial` gives it its own bracket word and the summary counts the
+/// rows that do not start, because a `[PASS]` on top of FAIL rows is what a reader skims
+/// past. "Not checked" is a FAILURE, the same rule `distill_check` follows.
 fn runtimes_check(
     agents: Result<&serde_json::Value, String>,
     primary: Result<&serde_json::Value, String>,
@@ -2075,6 +2299,7 @@ fn runtimes_check(
             return Check {
                 name: NAME.into(),
                 ok: false,
+                partial: false,
                 detail: format!(
                     "未检查（GET /api/v1/agents failed: {e}）— the daemon's own card is the only \
                      holder of command_resolved, so nothing can be said about a runtime \
@@ -2098,24 +2323,67 @@ fn runtimes_check(
 
     // The front door is a SEPARATE endpoint because marking an agent primary is not
     // the same as being answered by it (routing.toml's `default` outranks the flag).
-    // Three answers, three sentences: a name, a definite nobody, and "not reported".
-    let (front, front_note) = match &primary {
+    //
+    // THREE CASES, and treating them as one is what made this section accuse a healthy
+    // install: on a real machine it printed `· front door `ruagent` is not an enabled
+    // runtime card here` for an agent that is ENABLED, marked primary, and reported by
+    // both carriers -- normal configuration described as a defect. So:
+    //   (a) the front door IS one of the runtime cards -> its row carries `← primary`;
+    //   (b) it is an enabled card that is not a runtime (a ROLE answers THROUGH a
+    //       runtime) -> say what it is, neutrally, and do not fail;
+    //   (c) the name matches NOTHING, or matches a DISABLED card -> a silent fault
+    //       (AGENTS.md's front-door invariants: explicit, and resolvable by name), so
+    //       this one FAILS the section and names the name.
+    let mut front: Option<String> = None;
+    let mut front_note = String::new();
+    let mut front_broken = false;
+    match &primary {
         Ok(v) => match v["name"].as_str() {
-            Some(n) => (Some(n.to_string()), String::new()),
-            None if v.get("name").is_some() => (
-                None,
-                " · no front door: the next run takes the first enabled card".to_string(),
-            ),
-            None => (
-                None,
-                " · front door not reported by this daemon".to_string(),
-            ),
+            Some(n) => {
+                front = Some(n.to_string());
+                if !runtimes.iter().any(|r| r["name"].as_str() == Some(n)) {
+                    match cards.iter().find(|c| c["name"].as_str() == Some(n)) {
+                        Some(card) if card["enabled"].as_bool().unwrap_or(true) => {
+                            front_note = format!(
+                                " · front door is agent `{n}` {} (a role, not a [runtime.*] card \
+                                 — expected)",
+                                front_door_via(card)
+                            );
+                        }
+                        Some(_) => {
+                            front_broken = true;
+                            front_note = format!(
+                                " · front door `{n}` is DISABLED in agents.toml — an enabled \
+                                 front door that resolves by name is a load-bearing invariant \
+                                 here; enable it, or point the front door at another card"
+                            );
+                        }
+                        None => {
+                            front_broken = true;
+                            front_note = format!(
+                                " · front door `{n}` matches NO card in agents.toml (no agent, no \
+                                 runtime) — a front door that resolves to nothing fails silently \
+                                 the first time somebody asks a question; run \
+                                 `ruagent primary --set <name>`"
+                            );
+                        }
+                    }
+                }
+            }
+            None if v.get("name").is_some() => {
+                front_note =
+                    " · no front door: the next run takes the first enabled card".to_string();
+            }
+            None => {
+                front_note = " · front door not reported by this daemon".to_string();
+            }
         },
-        Err(e) => (
-            None,
-            format!(" · front door unknown (GET /api/v1/primary failed: {e})"),
-        ),
-    };
+        // NOT case (c): we never learned a name, so there is nothing to call a broken
+        // pointer. It still must not read as "all good" -- the note says what failed.
+        Err(e) => {
+            front_note = format!(" · front door unknown (GET /api/v1/primary failed: {e})");
+        }
+    }
 
     let mut rows: Vec<String> = Vec::new();
     let mut started = 0usize;
@@ -2174,8 +2442,10 @@ fn runtimes_check(
     }
 
     let total = runtimes.len();
-    let (ok, summary) = if total == 0 {
+    let not_starting = total.saturating_sub(started);
+    let (ok, partial, summary) = if total == 0 {
         (
+            false,
             false,
             "no enabled runtime card in agents.toml — add a [runtime.*] section (or enable one), \
              otherwise no chat can start and there is nothing here to diagnose"
@@ -2184,34 +2454,35 @@ fn runtimes_check(
     } else if started == 0 {
         (
             false,
+            false,
             format!(
                 "0/{total} runtime(s) start — NONE could start: install the binary each FAIL row \
                  names, or set that runtime's `command` to the binary's full path in \
                  ~/.ruagent/config/agents.toml, then re-run `ruagent doctor`"
             ),
         )
-    } else if started < total {
+    } else if not_starting > 0 {
+        // PARTIAL: the section did its job and one row did not. `partial` changes the
+        // bracket word (check_mark) and the summary says the count out loud, so the
+        // section cannot be skimmed as a clean pass.
         (
             true,
+            true,
             format!(
-                "{started}/{total} runtime(s) start; the FAIL row(s) below name the stage the \
-                 daemon stopped at"
+                "{started}/{total} runtime(s) start; {not_starting} does NOT start — the FAIL \
+                 row(s) below name the stage the daemon stopped at"
             ),
         )
     } else {
-        (true, format!("{started}/{total} runtime(s) start"))
+        (true, false, format!("{started}/{total} runtime(s) start"))
     };
+    // A front door that resolves to nothing is a FAILURE even when a backend starts
+    // (case (c) above): it is the one reading here that a green section would hide
+    // until the first chat.
+    let ok = ok && !front_broken;
+    let partial = partial && ok;
 
     let mut detail = format!("{summary}{front_note}");
-    if let Some(f) = &front
-        && !runtimes
-            .iter()
-            .any(|r| r["name"].as_str() == Some(f.as_str()))
-    {
-        detail.push_str(&format!(
-            " · front door `{f}` is not an enabled runtime card here"
-        ));
-    }
     for row in rows {
         detail.push('\n');
         detail.push_str(&row);
@@ -2219,10 +2490,32 @@ fn runtimes_check(
     Check {
         name: NAME.into(),
         ok,
+        partial,
         detail,
     }
 }
 
+/// How the front door reaches a backend, in the daemon's own terms: a role names a
+/// `runtime`/`runtimes` entry, and a card with neither runs its own harness. Read from
+/// the agents card, so this section never invents a second answer.
+fn front_door_via(card: &serde_json::Value) -> String {
+    let runtime = card["runtime"]
+        .as_str()
+        .filter(|r| !r.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            card["runtimes"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    match (runtime, card["harness"].as_str()) {
+        (Some(r), _) => format!("via runtime `{r}`"),
+        (None, Some(h)) if !h.trim().is_empty() => format!("via its own `{h}` command"),
+        _ => "without naming a runtime".to_string(),
+    }
+}
 /// One `POST /api/v1/runtimes/{name}/probe`, as a `ProbeCall`.
 ///
 /// A FAILED PROBE IS STILL HTTP 200 (the request completed; the runtime did not),
@@ -2304,6 +2597,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
             checks.push(Check {
                 name: "daemon + knowledge".into(),
                 ok: true,
+                partial: false,
                 detail: format!("embedder = {embedder}"),
             });
             let semantic = embedder != "hash-embedder";
@@ -2313,6 +2607,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
             checks.push(Check {
                 name: "semantic embeddings".into(),
                 ok: semantic || pinned,
+                partial: false,
                 detail: if semantic {
                     "real model active".into()
                 } else if pinned {
@@ -2326,6 +2621,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         None => checks.push(Check {
             name: "daemon + knowledge".into(),
             ok: false,
+            partial: false,
             detail: format!("daemon unreachable at {url} (ruagent serve)"),
         }),
     }
@@ -2346,6 +2642,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         checks.push(Check {
             name: "semantic recall".into(),
             ok: hit,
+            partial: false,
             detail: if hit {
                 "sunrise→dawn probe hit".into()
             } else {
@@ -2356,6 +2653,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         checks.push(Check {
             name: "semantic recall".into(),
             ok: false,
+            partial: false,
             detail: "ingest failed".into(),
         });
     }
@@ -2370,6 +2668,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     checks.push(Check {
         name: "memory write".into(),
         ok: mem.is_some(),
+        partial: false,
         detail: mem
             .map(|m| m["outcome"].as_str().unwrap_or("?").to_string())
             .unwrap_or_else(|| "failed".into()),
@@ -2385,6 +2684,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     checks.push(Check {
         name: "memory recall (semantic+fts)".into(),
         ok: mem_hit,
+        partial: false,
         detail: if mem_hit {
             "kettle probe recalled".into()
         } else {
@@ -2402,12 +2702,14 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         checks.push(Check {
             name: "graph entity".into(),
             ok: facts.is_some(),
+            partial: false,
             detail: format!("entity #{id} readable"),
         });
     } else {
         checks.push(Check {
             name: "graph entity".into(),
             ok: false,
+            partial: false,
             detail: "create failed".into(),
         });
     }
@@ -2440,6 +2742,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         checks.push(Check {
             name: "session sync".into(),
             ok: !sessions.is_empty() || no_histories,
+            partial: false,
             detail: if sessions.is_empty() && no_histories {
                 "no CLI histories on this machine (advisory)".into()
             } else {
@@ -2499,6 +2802,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         checks.push(Check {
             name: "probe hygiene".into(),
             ok: clean,
+            partial: false,
             detail: lines.join("; "),
         });
     }
@@ -2511,7 +2815,7 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
     );
     let mut failed = 0;
     for c in &checks {
-        let mark = if c.ok { "PASS" } else { "FAIL" };
+        let mark = check_mark(c);
         if !c.ok {
             failed += 1;
         }
