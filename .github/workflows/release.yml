@@ -344,7 +344,11 @@ jobs:
 
   release:
     name: Create release
-    needs: build
+    # `gate` MUST be in `needs` BECAUSE the `if` below reads `needs.gate.result`: a reference to a
+    # job that is not a dependency makes the WHOLE FILE invalid, and GitHub then creates a run with
+    # NO JOBS and the message 'This run likely failed because of a workflow file issue' -- measured
+    # exactly that way on 1e71986, after the same file parsed fine locally as YAML.
+    needs: [gate, build]
     # A LEG THAT NEVER GOT A RUNNER MUST NOT WITHHOLD THE ARTIFACTS USERS CAN RUN (2026-11-10).
     # Measured three times on two tags: `Build aarch64-apple-darwin` finished with
     # `conclusion: cancelled` after ~15 minutes and **zero steps** -- GitHub never assigned a macos
@@ -356,13 +360,10 @@ jobs:
     # `!cancelled()` keeps the DISPATCH no-publish rule intact (a dispatch never reaches here at all)
     # and `needs.gate.result == 'success'` keeps "a red commit must not be published" exactly as strict.
     if: github.event_name == 'push' && !cancelled() && needs.gate.result == 'success'
-    # TAG-ONLY, BY EVENT (ruagent-issues-56-59 t44). A dispatch must be able to prove a new
-    # target builds WITHOUT the ability to publish, so the condition is the event and NOT the
-    # `dry_run` input: passing false on a dispatch still publishes nothing. Publishing stays
-    # reachable only from a tag push, where check-release-version.sh has already made the tag
-    # agree with the binary. (fail-fast is false, so a red build leg leaves "needs: build"
-    # unsatisfied and this job does not run either.)
-    if: github.event_name == 'push'
+    # STILL TAG-ONLY, BY EVENT (ruagent-issues-56-59 t44): a dispatch must be able to prove a new
+    # target builds WITHOUT the ability to publish (the condition is the event, not the `dry_run`
+    # input), and check-release-version.sh has already made the tag agree with the binary. What
+    # changed above is only what happens when a leg could not build AT ALL.
     runs-on: ubuntu-latest
     # 30 min (t114). This job is `gh`/API only: on the green run (34849294052) the whole
     # job was 21s and `Create GitHub release` itself was 8s; the longest this leg has ever
