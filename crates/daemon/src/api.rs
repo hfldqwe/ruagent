@@ -2797,12 +2797,17 @@ struct ProbeReport {
 }
 
 /// The ACP handshake routinely takes seconds (a CLI boots, loads its harness, answers `initialize`
-/// and `session/new`), so 20 s is generous but bounded. A probe that can hang forever is a probe
-/// nobody runs twice.
-const PROBE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// and `session/new`).
+///
+/// 45 s, MEASURED, not guessed: at 20 s the same `opencode acp` on one machine oscillated between
+/// `ok` and `handshake-failed (TIMEOUT)` across consecutive probes, and an `npx`-based runtime (the
+/// seed's `claude` is `npx @agentclientprotocol/claude-agent-acp`) downloads its package on the
+/// FIRST run. A diagnosis that says "your runtime is broken" about a runtime that is merely cold is
+/// worse than no diagnosis: it sends the user to repair something that is not broken.
+const PROBE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The handshake ceiling, with an override so a slow machine can raise it and a test can lower it.
-/// (`RUAGENT_PROBE_TIMEOUT_MS`, in milliseconds.) The default is the 20 s above: a test that had to
+/// (`RUAGENT_PROBE_TIMEOUT_MS`, in milliseconds.) The default is the 45 s above: a test that had to
 /// wait the real ceiling would be a test nobody runs, and a reported TIMEOUT that was never measured
 /// is the kind of claim this effort keeps refusing to make.
 fn handshake_timeout() -> std::time::Duration {
@@ -2906,26 +2911,75 @@ async fn probe_command(card: &ruagent_core::AgentCard) -> ProbeReport {
         }
     })
     .await;
-    match waited {
-        Ok(Ok(())) => {
-            report.ok = true;
-            report.stage = "ok";
-            report.detail =
-                format!("the ACP handshake completed (initialize + session/new){shell_note}");
-        }
-        Ok(Err(message)) => {
-            report.detail = format!("the ACP handshake failed: {message}");
-        }
-        Err(_) => {
-            report.detail = format!(
-                "the ACP handshake did not finish within {}s (TIMEOUT) -- the program started but \
-                 never answered initialize/session/new; a runtime that hangs is usually waiting for \
-                 input, so run the command by hand to see what it wants",
-                handshake_timeout().as_secs_f32()
-            );
-        }
-    }
+    let ceiling = handshake_timeout();
+    let outcome = match waited {
+        Ok(Ok(())) => ProbeWait::Ready,
+        // `None` on the outer Result means the WAIT was cut by the ceiling; a `Some(reason)` is a
+        // session that ended (or an error the client reported) before the handshake completed.
+        Ok(Err(reason)) => ProbeWait::Ended(reason),
+        Err(_) => ProbeWait::TimedOut,
+    };
+    let display = if shell_note.is_empty() {
+        program.clone()
+    } else {
+        format!("{program}{shell_note}")
+    };
+    let (ok, stage, detail) = classify_handshake(outcome, ceiling, &display);
+    report.ok = ok;
+    report.stage = stage;
+    report.detail = detail;
     report
+}
+
+/// What the bounded wait for a handshake ended with.
+#[derive(Debug)]
+enum ProbeWait {
+    /// `initialize` + `session/new` completed.
+    Ready,
+    /// The session ended (or the client reported an error) BEFORE the ceiling was reached: the
+    /// process started and then gave up. That is a STARTUP failure, not a slow start.
+    Ended(String),
+    /// The ceiling was reached while the process was still running and had answered nothing.
+    TimedOut,
+}
+
+/// Turn a finished wait into the report's `(ok, stage, detail)`.
+///
+/// THE TWO FAILURES STAY DISTINGUISHABLE, on purpose:
+///   * `Ended` -- the process started and then went away (or the client reported an error) before
+///     answering. Stage `spawn-failed`: this is "it never got to the protocol", and retrying will
+///     not help.
+///   * `TimedOut` -- the process was STILL RUNNING and had answered nothing when the ceiling hit.
+///     Stage `handshake-failed`, and the text has to say that a FIRST run may be downloading its
+///     package (the seed's `claude` runs through `npx`), because that is the difference between
+///     "try again in a minute" and "your configuration is wrong".
+fn classify_handshake(
+    outcome: ProbeWait,
+    ceiling: std::time::Duration,
+    command_display: &str,
+) -> (bool, &'static str, String) {
+    match outcome {
+        ProbeWait::Ready => (
+            true,
+            "ok",
+            "the ACP handshake completed (initialize + session/new)".to_string(),
+        ),
+        ProbeWait::Ended(reason) => (
+            false,
+            "spawn-failed",
+            format!(
+                "the process started but exited before it answered initialize ({reason}) -- that is not a slow start, so retrying will not help: run `{command_display}` by hand and read what it prints"
+            ),
+        ),
+        ProbeWait::TimedOut => (
+            false,
+            "handshake-failed",
+            format!(
+                "no answer within {}s (TIMEOUT) while the process was still running. A FIRST run can spend this long downloading its package (an `npx`-based runtime does), so: test the connection once more; if it keeps timing out, run `{command_display}` by hand to see what it waits for. This is NOT yet evidence that the runtime is broken.",
+                ceiling.as_secs_f32()
+            ),
+        ),
+    }
 }
 
 /// Spawn the program ourselves, wait one short window, and report an early exit WITH its code and the
@@ -13548,6 +13602,82 @@ mod runtime_probe_tests {
             detail.contains("TIMEOUT"),
             "a timeout must say so: {detail}"
         );
-        assert!(detail.contains("did not finish within"), "{detail}");
+        assert!(
+            detail.contains("no answer within") && detail.contains("still running"),
+            "the timeout says the process was still running: {detail}"
+        );
+        assert!(
+            detail.contains("downloading its package") && detail.contains("NOT yet evidence"),
+            "t72: a cold start must not be reported as a broken runtime: {detail}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_ceiling_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// t72: 20 s was MEASURED to misjudge a cold runtime (`opencode acp` oscillated ok/TIMEOUT on one
+    /// machine, and an `npx` runtime downloads on first run). The default must accommodate a cold
+    /// start, so this pins the number the product ships with.
+    #[test]
+    fn the_default_ceiling_accommodates_a_cold_start() {
+        assert!(
+            PROBE_HANDSHAKE_TIMEOUT >= Duration::from_secs(45),
+            "a cold start (npx downloads on first run) needs more than the 20 s that misjudged it: {PROBE_HANDSHAKE_TIMEOUT:?}"
+        );
+    }
+
+    /// The TWO failures stay distinguishable, and the timeout text has to give the user something to
+    /// DO instead of telling them their runtime is broken.
+    #[test]
+    fn a_timeout_says_it_may_be_a_first_run_and_offers_a_next_step() {
+        let (ok, stage, detail) =
+            classify_handshake(ProbeWait::TimedOut, Duration::from_secs(45), "opencode acp");
+        assert!(!ok, "{detail}");
+        assert_eq!(stage, "handshake-failed", "{detail}");
+        assert!(detail.contains("TIMEOUT"), "{detail}");
+        assert!(detail.contains("45s"), "the ceiling is named: {detail}");
+        assert!(
+            detail.contains("downloading its package"),
+            "a first run may be downloading: {detail}"
+        );
+        assert!(
+            detail.contains("test the connection once more")
+                && detail.contains("run `opencode acp` by hand"),
+            "a next step, with the command in it: {detail}"
+        );
+        assert!(
+            !detail.contains("broken.") || detail.contains("NOT yet evidence"),
+            "{detail}"
+        );
+    }
+
+    /// A process that STARTED and then went away is a different failure from one that is still
+    /// running and silent: `spawn-failed` vs `handshake-failed`.
+    #[test]
+    fn a_session_that_ends_before_initialize_is_not_a_timeout() {
+        let (ok, stage, detail) = classify_handshake(
+            ProbeWait::Ended("Incoming transport closed".to_string()),
+            Duration::from_secs(45),
+            "some-agent acp",
+        );
+        assert!(!ok, "{detail}");
+        assert_eq!(stage, "spawn-failed", "{detail}");
+        assert!(detail.contains("not a slow start"), "{detail}");
+        assert!(detail.contains("Incoming transport closed"), "{detail}");
+        assert!(
+            !detail.contains("TIMEOUT"),
+            "this is not a timeout: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_completed_handshake_is_ok() {
+        let (ok, stage, detail) =
+            classify_handshake(ProbeWait::Ready, Duration::from_secs(45), "x");
+        assert!(ok, "{detail}");
+        assert_eq!(stage, "ok", "{detail}");
     }
 }

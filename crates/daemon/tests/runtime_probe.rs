@@ -212,3 +212,72 @@ async fn a_cmd_shim_is_reported_by_its_own_path_not_as_the_shell() {
         "a shell launch must be stated, not hidden: {body}"
     );
 }
+
+/// t72: a SLOW but eventually answering agent. Below its own latency the probe must report a timeout
+/// (that is the 20 s misjudgment in miniature), above it the same agent must report `ok` -- the ceiling
+/// is what decided, not the runtime.
+///
+/// NOT `#[ignore]`d on purpose: a third skip in this target would change CI's ignored-instrument
+/// count, whose manifest lives in `.github/` (outside this task). The mock binary it needs is built by
+/// the same `cargo test --workspace` / `cargo build -p ruagent-mock-agent --bins` step the other two
+/// already document, so the body-head `expect(NEEDS_MOCK)` refuses to pass silently.
+#[tokio::test]
+async fn a_slow_but_answering_agent_is_a_timeout_below_its_latency_and_ok_above_it() {
+    let _turn = turn().await;
+    let mock = mock_bin().expect(NEEDS_MOCK);
+    let (base, root) = boot("slow").await;
+
+    // A wrapper that sleeps ~4 s and THEN becomes the ACP agent. A script (not a command line) because
+    // the command is split on whitespace with no quoting.
+    let dir = root.join("slow");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = if cfg!(windows) {
+        let path = dir.join("slow-agent.cmd");
+        std::fs::write(
+            &path,
+            format!("@echo off\r\nping -n 5 127.0.0.1 >nul\r\n\"{mock}\" --behavior echo\r\n"),
+        )
+        .unwrap();
+        path
+    } else {
+        let path = dir.join("slow-agent.sh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nsleep 4\nexec \"{mock}\" --behavior echo\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    };
+    make_runtime(&base, "slowpoke", &script.display().to_string()).await;
+
+    // 1) a ceiling BELOW the agent's own latency: the old 20 s mistake, scaled to a test
+    unsafe { std::env::set_var("RUAGENT_PROBE_TIMEOUT_MS", "800") };
+    let (status, early) = probe(&base, "slowpoke").await;
+    unsafe { std::env::remove_var("RUAGENT_PROBE_TIMEOUT_MS") };
+    println!("READING t72 short ceiling: {early}");
+    assert_eq!(status, 200, "{early}");
+    assert_eq!(early["ok"], false, "{early}");
+    assert_eq!(early["stage"], "handshake-failed", "{early}");
+    let detail = early["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("TIMEOUT"), "{detail}");
+    assert!(detail.contains("downloading its package"), "{detail}");
+
+    // 2) the SAME agent, same machine, ceiling above its latency: ok
+    unsafe { std::env::set_var("RUAGENT_PROBE_TIMEOUT_MS", "30000") };
+    let (status, late) = probe(&base, "slowpoke").await;
+    unsafe { std::env::remove_var("RUAGENT_PROBE_TIMEOUT_MS") };
+    println!("READING t72 generous ceiling: {late}");
+    assert_eq!(status, 200, "{late}");
+    assert_eq!(
+        late["ok"], true,
+        "the same agent, only the ceiling moved: {late}"
+    );
+    assert_eq!(late["stage"], "ok", "{late}");
+}
