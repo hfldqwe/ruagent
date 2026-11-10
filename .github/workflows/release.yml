@@ -345,6 +345,17 @@ jobs:
   release:
     name: Create release
     needs: build
+    # A LEG THAT NEVER GOT A RUNNER MUST NOT WITHHOLD THE ARTIFACTS USERS CAN RUN (2026-11-10).
+    # Measured three times on two tags: `Build aarch64-apple-darwin` finished with
+    # `conclusion: cancelled` after ~15 minutes and **zero steps** -- GitHub never assigned a macos
+    # runner. With `needs: build` and fail-fast false, that one leg left this job SKIPPED, so v0.1.7
+    # and v0.1.8 published nothing at all while their windows and linux archives were built, packaged
+    # and smoke-tested green. A flaky runner is not a reason to withhold a working download; the
+    # `require every target` part of the contract is enforced AFTER publishing, by the
+    # `Release completeness` job below, which goes red and names the missing platform.
+    # `!cancelled()` keeps the DISPATCH no-publish rule intact (a dispatch never reaches here at all)
+    # and `needs.gate.result == 'success'` keeps "a red commit must not be published" exactly as strict.
+    if: github.event_name == 'push' && !cancelled() && needs.gate.result == 'success'
     # TAG-ONLY, BY EVENT (ruagent-issues-56-59 t44). A dispatch must be able to prove a new
     # target builds WITHOUT the ability to publish, so the condition is the event and NOT the
     # `dry_run` input: passing false on a dispatch still publishes nothing. Publishing stays
@@ -371,8 +382,61 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      # Publishing what EXISTS is allowed only if something exists: with every leg failed there is
+      # nothing to attach, and a release with no assets is worse than no release -- a downloader
+      # would find the tag and nothing to fetch. This stops loudly rather than skipping silently.
+      - name: Say what will be published, and refuse to publish nothing
+        run: |
+          set -eu
+          count=$(find artifacts -maxdepth 1 -type f | wc -l)
+          echo "artifacts to publish: $count"
+          find artifacts -maxdepth 1 -type f -printf '  %f\n' | sort || true
+          if [ "$count" -eq 0 ]; then
+            echo '::error::no artifacts were produced, so there is nothing to publish: every build leg failed or was cancelled'
+            exit 1
+          fi
+          missing=''
+          for p in x86_64-windows x86_64-linux aarch64-macos; do
+            ls artifacts/*"$p"* >/dev/null 2>&1 || missing="$missing $p"
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::publishing WITHOUT:$missing -- that build leg produced no archive. The run ends red via 'Release completeness'."
+          fi
       - name: Create GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2 (2026-04-12)
         with:
           generate_release_notes: true
           files: artifacts/*
+
+  completeness:
+    name: Release completeness
+    needs: [build, release]
+    # THE STRICT HALF, AFTER PUBLISHING (2026-11-10). Every target must have produced an archive.
+    # If one did not, the release still went out -- because the other platforms were built, packaged
+    # and smoke-tested, and a downloader should not be told 'nothing for you' because a macos runner
+    # was never assigned -- and this job goes RED naming the gap, so it cannot go unnoticed.
+    # A dispatch publishes nothing and therefore has nothing to be complete about.
+    if: always() && github.event_name == 'push' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Every platform archive must be attached to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          assets=$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name' | sort)
+          echo "attached to $TAG:"; echo "$assets"
+          missing=''
+          for p in x86_64-windows.zip x86_64-linux.tar.gz aarch64-macos.tar.gz; do
+            echo "$assets" | grep -q -- "$p" || missing="$missing $p"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the release is MISSING:$missing. What IS published works -- download it. Then re-run the failed leg (gh run rerun --failed <run-id>) and publish the gap; do not move the tag."
+            exit 1
+          fi
+          echo 'all three platform archives and their checksums are attached'
