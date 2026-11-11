@@ -41,6 +41,27 @@ pub struct AgentPatch {
     pub enabled: Option<bool>,
 }
 
+/// Which card a `/api/v1/runtimes/{name}` write actually edited (t79).
+///
+/// Two layers define runtimes in `agents.toml`: the `[runtime.<name>]` layer and the older
+/// `[agent.<name>]` shape that a fresh install's SEED still ships. The read paths present both as
+/// runtimes, so the write path has to reach both -- and say which one it reached, because silently
+/// editing a card the caller believes is a runtime is its own small lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditedCard {
+    Runtime,
+    Agent,
+}
+
+impl EditedCard {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 /// Round-trip editor over one `agents.toml`.
 pub struct Editor {
     path: PathBuf,
@@ -176,14 +197,7 @@ impl Editor {
         let Some(t) = find_table(doc.as_table_mut(), "runtime", name) else {
             bail!("runtime `{name}` not found");
         };
-        Self::set_str(t, "harness", &patch.harness);
-        Self::set_str(t, "command", &patch.command);
-        Self::set_str(t, "description", &patch.description);
-        Self::set_str(t, "mcp_profile", &patch.mcp_profile);
-        Self::set_string_list(t, "models", &patch.models);
-        if let Some(e) = patch.enabled {
-            t.insert("enabled", value(e));
-        }
+        Self::apply_runtime_fields(t, patch);
         self.save(&doc)
     }
 
@@ -208,6 +222,112 @@ impl Editor {
         self.save(&doc)
     }
 
+    /// Apply the runtime-shaped field set to one table (shared by the `[runtime.*]` path and the
+    /// `[agent.*]` fallback so the two can never drift apart, t79).
+    fn apply_runtime_fields(t: &mut dyn TableLike, patch: &RuntimePatch) {
+        Self::set_str(t, "harness", &patch.harness);
+        Self::set_str(t, "command", &patch.command);
+        Self::set_str(t, "description", &patch.description);
+        Self::set_str(t, "mcp_profile", &patch.mcp_profile);
+        Self::set_string_list(t, "models", &patch.models);
+        if let Some(e) = patch.enabled {
+            t.insert("enabled", value(e));
+        }
+    }
+
+    /// Every name this file defines, whichever layer it lives in (t79): a fresh install's seed
+    /// defines its runtimes as `[agent.<name>]`, so a message that listed only `[runtime.*]` would be
+    /// empty on exactly the machine the user is asking about.
+    fn known_names(&self, doc: &DocumentMut) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for layer in ["runtime", "agent"] {
+            let Some(t) = doc.as_table().get(layer).and_then(|x| x.as_table_like()) else {
+                continue;
+            };
+            for (name, _) in t.iter() {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    fn unknown_name(&self, doc: &DocumentMut, name: &str) -> anyhow::Error {
+        let known = self.known_names(doc);
+        let list = if known.is_empty() {
+            "this root defines no runtimes at all".to_string()
+        } else {
+            format!("this root defines {}", known.join(", "))
+        };
+        anyhow::anyhow!(
+            "runtime `{name}` not found: {list}. Runtimes live in config/agents.toml as `[runtime.<name>]` \
+             or `[agent.<name>]` -- GET /api/v1/agents lists the names this daemon actually serves."
+        )
+    }
+
+    /// Update a runtime card, ACCEPTING BOTH layers (t79).
+    ///
+    /// `[runtime.<name>]` wins and behaves exactly as [Self::update_runtime] always did. When only
+    /// `[agent.<name>]` exists -- which is what a fresh install's seed ships -- that card IS the
+    /// runtime the read paths (`GET /api/v1/agents`, `ruagent doctor`, the panel's Runtimes page and
+    /// `POST /api/v1/runtimes/{name}/probe`) present, so the write goes there and the caller is told
+    /// which card it edited. Before this, the panel's Edit button and the README's `curl -X PATCH`
+    /// recipe both answered 404 on a new machine: the only documented repair did not work where it
+    /// was most needed.
+    pub fn update_runtime_or_agent(&self, name: &str, patch: &RuntimePatch) -> Result<EditedCard> {
+        let _g = self.lock.lock().expect("registry edit lock");
+        let mut doc = self.load()?;
+        let card = if find_table(doc.as_table_mut(), "runtime", name).is_some() {
+            EditedCard::Runtime
+        } else if find_table(doc.as_table_mut(), "agent", name).is_some() {
+            EditedCard::Agent
+        } else {
+            return Err(self.unknown_name(&doc, name));
+        };
+        let layer = match card {
+            EditedCard::Runtime => "runtime",
+            EditedCard::Agent => "agent",
+        };
+        let table =
+            find_table(doc.as_table_mut(), layer, name).expect("the card was found a line above");
+        Self::apply_runtime_fields(table, patch);
+        self.save(&doc)?;
+        Ok(card)
+    }
+
+    /// Delete a runtime card, ACCEPTING BOTH layers (t79). The "used by an agent" invariant is the
+    /// same one [Self::delete_runtime] enforces, and it is checked against the file BEFORE anything is
+    /// removed -- for the `[agent.*]` case too, where the role that references the runtime is a
+    /// DIFFERENT entry, so the card being deleted is not its own user.
+    pub fn delete_runtime_or_agent(&self, name: &str) -> Result<EditedCard> {
+        let _g = self.lock.lock().expect("registry edit lock");
+        let mut doc = self.load()?;
+        let card = if find_table(doc.as_table_mut(), "runtime", name).is_some() {
+            EditedCard::Runtime
+        } else if find_table(doc.as_table_mut(), "agent", name).is_some() {
+            EditedCard::Agent
+        } else {
+            return Err(self.unknown_name(&doc, name));
+        };
+        if let Some(users) = runtime_users(doc.as_table(), name) {
+            bail!(
+                "runtime `{name}` is used by agent(s) {} — remove them first or edit their runtimes",
+                users.join(", ")
+            );
+        }
+        let layer = match card {
+            EditedCard::Runtime => "runtime",
+            EditedCard::Agent => "agent",
+        };
+        doc.as_table_mut()
+            .get_mut(layer)
+            .and_then(|r| r.as_table_mut())
+            .expect("the layer exists")
+            .remove(name);
+        self.save(&doc)?;
+        Ok(card)
+    }
     // -- agents (roles) --------------------------------------------------
 
     /// Create `[agent.<name>]`. Fails if it already exists.

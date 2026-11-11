@@ -96,6 +96,20 @@ mistaken for the flag.
   front door. Keeping the two-write rule inside the daemon is the point: if each client had to remember it,
   one of them would eventually write only the flag, and the symptom -- "I set the primary and nothing
   changed" -- is the hardest kind to diagnose.
+* `POST /api/v1/chat` **without `agent`** starts the conversation on the FRONT DOOR (t74). The same
+  invariant that makes `GET /api/v1/primary` the one answer to "who will answer me" applies here: a
+  `/chat` that demanded a name would push the cascade back to every client. Omitted (or empty) => the
+  cascade the run path walks -- `routing.toml`'s default, then the `primary = true` flag, then the first
+  enabled card -- and the reply's `agent` field names the runtime that actually answered, so the caller
+  never has to guess. An **explicit** `agent` means exactly what it meant before: that card, or a 400
+  `unknown agent ...`. A front door whose runtime cannot start answers **400** (a configuration and
+  environment fault, not a server fault) with one readable sentence: which runtime cannot start, which
+  command is missing from `PATH`, **which runtimes this machine CAN start right now** (`command_resolved`,
+  the same cheap reading the card list carries -- no spawn), and the two edits that fix it (`PUT
+  /api/v1/primary` to switch the front door, or the runtime's `command` set to the binary's full path).
+  When nothing on the machine can start, it says so plainly and points at the installation step instead
+  of blaming a field name; the raw client error (which names the program twice, in nested backticks) goes
+  to the daemon log, not to the user.
 * `PUT /api/v1/agents/{name}` accepts `primary: true` as the low-level primitive (flag only). Setting it
   clears the flag from every other agent in the same write, and clearing it from the current primary is
   allowed (the platform then has none).

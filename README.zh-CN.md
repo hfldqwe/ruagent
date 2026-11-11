@@ -166,6 +166,25 @@ curl -s -X PATCH localhost:8787/api/v1/runtimes/dsh \
   -H 'content-type: application/json' -d '{"command":"my-cli --acp"}'
 ```
 
+### 一台什么都没装的机器：`0/3` 就是起点，不是坏掉
+
+全新电脑上 `ruagent doctor` 会直接这样报（0.1.8 实测，PATH 里没有 `npx`/`dsh`/`opencode`）：
+
+```
+  [FAIL] runtimes   0/3 runtime(s) start — NONE could start: install the binary each FAIL row
+                    names, or set that runtime's `command` to the binary's full path in
+                    ~/.ruagent/config/agents.toml, then re-run `ruagent doctor`
+         FAIL claude   [ClaudeCode] command NOT found on PATH · does NOT start (stage: not-found)
+                       — `npx` is not on PATH. Install it, or set this runtime's `command` …  ← primary
+         FAIL dsh      [Dsh]        command NOT found on PATH · … `dsh` is not on PATH. …
+         FAIL opencode [OpenCode]   command NOT found on PATH · … `opencode` is not on PATH. …
+```
+
+`← primary` 标出前门（谁来应答你）。**只要装上任一个**——例如装 Node 让 `claude` 的
+`npx` 可用——再跑一次 `ruagent doctor`，那一行就会变成 `starts (stage: ok)`，面板同名的
+卡片也会从「找不到命令」变成「命令可解析」。你不需要三个都装，也不需要它们都在 PATH 上：
+把某个运行时的 `command` 改成二进制全路径同样成立。
+
 运行时还需要一个**已知 harness**（`claude-code`、`opencode`、`dsh`、`mock`），它决定
 挂哪个 ACP 适配器。名字不必等于 harness：名字自定义时请显式给 `harness`。
 

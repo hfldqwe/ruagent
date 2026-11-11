@@ -2204,6 +2204,36 @@ async fn sync_skills(State(state): State<AppState>) -> Result<Json<serde_json::V
 
 /// The MCP registry as configured (design SS7.1). Live health pinging
 /// arrives with the M3 platform MCP server.
+/// What this server will ACTUALLY be spawned with (t77) -- the platform's own substitution included.
+///
+/// The configured `command` stays as configured: clients and the panel read it, and it is the value a
+/// user edits. This field is the FACT, and it exists because a checker that judged the configured value
+/// alone failed on the HEALTHIEST possible machine: when the bare name `ruagent` is not on PATH, the
+/// daemon starts its own MCP server from its OWN executable (the 0.1.6 fix), so `health ok / tools 21`
+/// and `command = "ruagent"` are both true at once. A diagnosis that goes red on a healthy machine is
+/// worse than no diagnosis.
+///
+/// The substitution itself lives in `config::McpConfig::expand_profile` and is NOT re-implemented here
+/// (it is correct): this asks it about ONE server at a time through a scoped clone, so a sibling that
+/// cannot start cannot hide this server's answer. `None` means there is no spawn command to report --
+/// an http/sse server, or one this expansion excludes via `inject_for`.
+///
+/// The HEALTH GATE IS DELIBERATELY BYPASSED here: `expand_profile` drops servers whose last check
+/// failed, and those are exactly the servers a diagnosis is asked about. Measured on a root with no
+/// `ruagent` on PATH: the health loop marked BOTH servers `down`, and a health-gated report answered
+/// `command_effective: null` for the very runtime being diagnosed -- the field would have been useless
+/// precisely where it matters. A fresh registry inside a scoped clone makes the substitution leg run
+/// unchanged while the live health of the daemon is untouched.
+fn effective_mcp_command(state: &AppState, name: &str) -> Option<String> {
+    // ONE RESOLUTION, THE SAME ONE EVERY SPAWNER ASKS (t80). This used to build a scoped clone of
+    // the whole config, synthesise a profile and expand it -- a SECOND resolution that could drift
+    // from the one injection and the health check use, and did: it reported a substituted absolute
+    // path while the health check pinged the configured bare name, marked the server down, and the
+    // health gate then dropped it from injection. `McpConfig::ping_target` IS that one place.
+    let entry = state.config.mcp.servers.get(name)?;
+    state.config.mcp.ping_target(name, entry).command
+}
+
 async fn mcp_registry(State(state): State<AppState>) -> Json<serde_json::Value> {
     // Live health per server (issue #24); null = never checked.
     let health = state.config.mcp.health.snapshot();
@@ -2215,7 +2245,10 @@ async fn mcp_registry(State(state): State<AppState>) -> Json<serde_json::Value> 
         .map(|(name, e)| {
             serde_json::json!({
                 "name": name,
+                // the CONFIGURED value: unchanged semantics, still the field clients read
                 "command": e.command,
+                // the FACT: what will actually be spawned (t77)
+                "command_effective": effective_mcp_command(&state, name),
                 "url": e.url,
                 "inject_for": e.inject_for,
                 "health": health.get(name),
@@ -2326,31 +2359,57 @@ async fn update_runtime_card(
         crate::config::harness_of(&name, Some(h))
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
-    state
+    // t79: the write accepts BOTH layers (`[runtime.<name>]` first, then the `[agent.<name>]` shape a
+    // fresh install's seed ships) and reports which card it edited -- the read paths present both as
+    // runtimes, so a 404 here made the panel's Edit button and the README's `curl -X PATCH` recipe
+    // dead on exactly the machine that needed them.
+    let edited = state
         .mgr
         .registry()
-        .update_runtime(&name, &req.patch())
+        .update_runtime_or_agent(&name, &req.patch())
         .map_err(registry_error)?;
     let cards = reload_registry(&state).await?;
     let card = cards
         .iter()
         .find(|c| c.name == name)
         .ok_or_else(|| ApiError::internal("runtime vanished after update"))?;
-    Ok(Json(card_json(card)))
+    let mut body = card_json(card);
+    body["edited"] = serde_json::json!(edited.as_str());
+    if edited == crate::registry::EditedCard::Agent {
+        body["note"] = serde_json::json!(
+            "this root defines runtimes as `[agent.<name>]`, so the AGENT card was edited -- the runtime view and the agent view are the same card, and GET /api/v1/agents shows the new value"
+        );
+    }
+    Ok(Json(body))
 }
 
 async fn delete_runtime_card(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    // A runtime in use by any role is a conflict, not a bad request.
-    state
+) -> Result<axum::response::Response, ApiError> {
+    // A runtime in use by any role is a conflict, not a bad request (t79 keeps this invariant for the
+    // `[agent.<name>]` fallback too: the role that references the runtime is a different entry).
+    let edited = state
         .mgr
         .registry()
-        .delete_runtime(&name)
+        .delete_runtime_or_agent(&name)
         .map_err(registry_error)?;
     reload_registry(&state).await?;
-    Ok(StatusCode::NO_CONTENT)
+    match edited {
+        // the documented shape for a `[runtime.<name>]` delete is unchanged
+        crate::registry::EditedCard::Runtime => Ok(StatusCode::NO_CONTENT.into_response()),
+        // a fresh install has no `[runtime.*]`: say that the AGENT card went, instead of answering a
+        // silent 204 about a card the caller believed was a runtime
+        crate::registry::EditedCard::Agent => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted": name,
+                "edited": "agent",
+                "note": "this root defines runtimes as `[agent.<name>]`, so the AGENT card was deleted"
+            })),
+        )
+            .into_response()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -6880,7 +6939,12 @@ async fn resolve_permission(
 
 #[derive(Deserialize)]
 struct ChatStartRequest {
-    agent: String,
+    /// (t74) OPTIONAL. Omitted = the FRONT DOOR answers. There is one answer to "who will answer me"
+    /// (`GET /api/v1/primary`), and /chat must not push that question back to the caller: a client
+    /// that has to name an agent to start a conversation is a client that has to duplicate the
+    /// cascade. An EXPLICIT name still means exactly what it meant before.
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(default)]
     model: Option<String>,
     /// Project directory the session works in; empty/absent = the
@@ -6889,14 +6953,83 @@ struct ChatStartRequest {
     cwd: Option<String>,
 }
 
+/// The card a chat with NO explicit `agent` runs on (t74): the SAME answer `GET /api/v1/primary`
+/// reports (level 3 `routing.toml` default, then level 4 the `primary = true` flag), and level 5 (the
+/// first enabled card) only when neither is usable -- the order `routing_decision_with` walks for a
+/// run that pinned no agent.
+fn chat_default_card(state: &AppState) -> Option<ruagent_core::AgentCard> {
+    let cards = state.mgr.agents();
+    let front = effective_front_door(state);
+    if let Some(name) = front["name"].as_str()
+        && let Some(card) = cards.iter().find(|c| c.name == name && c.enabled)
+    {
+        return Some(card.clone());
+    }
+    // level 5: the first enabled card. A chat cannot consult the permission approver the way a run
+    // does, so this is the same last resort `default_route_agent` uses, without the approver leg.
+    cards.iter().find(|c| c.enabled).cloned()
+}
+
+/// The runtimes this machine can actually start right now, by name (t74). `command_resolved` is the
+/// same cheap PATH reading the card list carries, so this costs no spawn.
+fn usable_runtime_names(cards: &[ruagent_core::AgentCard]) -> Vec<String> {
+    cards
+        .iter()
+        .filter(|c| c.enabled && resolved_command(c).is_some())
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// What to tell a user whose runtime cannot start (t74).
+///
+/// The old text was `resolving spawn command for `claude`: invalid agent command `program `npx` for
+/// agent `claude` not found on PATH`: NESTED backticks, two languages in one sentence, and NO next
+/// step. This one names the runtime, the program that is missing, the runtimes this machine CAN start,
+/// and the two edits that would fix it -- or says plainly that nothing on this machine can start.
+fn unusable_runtime_message(state: &AppState, card: &ruagent_core::AgentCard) -> String {
+    let (program, _) = ruagent_acp::split_command_line(card.spawn_command());
+    let usable = usable_runtime_names(&state.mgr.agents());
+    // ONE readable sentence, one language, no nested backticks -- the raw client error goes to the
+    // LOG (it names the same program twice and reads like a stack trace), not to the user.
+    let head = format!(
+        "运行时 {} 在这台机器上起不来：它的命令 {} 不在 PATH 上。",
+        card.name, program
+    );
+    if usable.is_empty() {
+        return format!(
+            "{head} 这台机器上没有任何运行时能启动，所以也没有别的运行时可以代它应答 —— 先装一个（例如 npm i -g @agentclientprotocol/claude-agent-acp，或你的 harness 对应的安装命令），或在 ~/.ruagent/config/agents.toml 里把它的 command 改成二进制的完整路径。`ruagent doctor` 会逐条列出每个运行时缺什么。"
+        );
+    }
+    let usable_list = usable.join("、");
+    let first = usable.first().cloned().unwrap_or_default();
+    format!(
+        "{head} 此刻能启动的运行时：{usable_list}。改法二选一：用 PUT /api/v1/primary 把前门换成其中一个（例如 {{\"name\": \"{first}\"}}），或在 ~/.ruagent/config/agents.toml 里把 {} 的 command 改成二进制的完整路径。`ruagent doctor` 会逐条列出每个运行时缺什么。",
+        card.name
+    )
+}
+
 async fn chat_start(
     State(state): State<AppState>,
     Json(req): Json<ChatStartRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let card = state
-        .mgr
-        .agent(&req.agent)
-        .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{}`", req.agent)))?;
+    let named = req
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let card = match named {
+        // an EXPLICIT name means exactly what it meant before this change
+        Some(name) => state
+            .mgr
+            .agent(name)
+            .ok_or_else(|| ApiError::bad_request(format!("unknown agent `{name}`")))?,
+        // no name: the front door answers (t74)
+        None => chat_default_card(&state).ok_or_else(|| {
+            ApiError::bad_request(
+                "这台机器上没有任何运行时能启动，所以没有 agent 可以应答 —— 先在 config/agents.toml 里配一个运行时，`ruagent doctor` 会逐条列出每个运行时缺什么。"
+            )
+        })?,
+    };
     // The user's pick wins; otherwise the card's configured default
     // model ([agent.X].model / [runtime.X].model) — nobody should be
     // asked to choose a model on every chat.
@@ -6908,11 +7041,13 @@ async fn chat_start(
         .cwd
         .filter(|c| !c.trim().is_empty())
         .map(std::path::PathBuf::from);
-    let chat = state
-        .chats
-        .start(&card, model, cwd)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let chat = state.chats.start(&card, model, cwd).await.map_err(|e| {
+        // (t74) a runtime that cannot START is a configuration/environment problem, not a server
+        // fault: 400 with an actionable sentence, never a 500, and never a bare field name. The raw
+        // client error keeps its nested backticks -- in the LOG, where a human debugging may want it.
+        tracing::warn!(target: "ruagent::api", agent = %card.name, "chat could not start the runtime: {e:#}");
+        ApiError::bad_request(unusable_runtime_message(&state, &card))
+    })?;
     Ok(Json(serde_json::json!({
         "id": chat.id.to_string(),
         "agent": chat.agent,

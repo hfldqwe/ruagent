@@ -38,6 +38,8 @@
 //   [data-command-state=resolved|notFound|unknown]   the card's command reading
 //   [data-probe-state=running|answer|error]          what the probe is doing
 //   [data-probe-ok=true|false] [data-probe-stage=…] [data-probe-detail]
+//   [data-fleet-verdict=none|partial|unknown|ok]     the PAGE-level verdict banner
+//   [data-fleet-total=N] [data-fleet-unresolved=N]   the counts it was computed from
 // The stage token is rendered VERBATIM (untranslated, untruncated) -- the property
 // the second test protects: the front end must not soften the daemon's word.
 
@@ -72,7 +74,10 @@ function runtime(over: Record<string, unknown>): Record<string, unknown> {
 /** Serve a SYNTHETIC agents list: the real response is fetched first (so every
  *  other field and every other route stays the daemon's), then the array is
  *  replaced. Pathname-checked, because the page also talks to /agents/... */
-async function serveAgents(page: Page, agents: Record<string, unknown>[]): Promise<void> {
+async function serveAgents(
+  page: Page,
+  agents: Record<string, unknown>[] | (() => Record<string, unknown>[]),
+): Promise<void> {
   await page.route(AGENTS, async (route) => {
     const req = route.request();
     if (req.method() !== "GET" || new URL(req.url()).pathname !== "/api/v1/agents") {
@@ -81,7 +86,11 @@ async function serveAgents(page: Page, agents: Record<string, unknown>[]): Promi
     }
     const res = await route.fetch();
     const body = (await res.json()) as Record<string, unknown>;
-    await route.fulfill({ response: res, json: { ...body, agents } });
+    // A thunk lets one test serve a DIFFERENT grid to each load (reload) without
+    // re-registering the route -- which is how the three page-level verdicts are
+    // driven from the same page.
+    const list = typeof agents === "function" ? agents() : agents;
+    await route.fulfill({ response: res, json: { ...body, agents: list } });
   });
 }
 
@@ -217,6 +226,69 @@ test("a resolvable runtime is NOT marked as a missing command", async ({ page })
     "data-command-state",
     "notFound",
   );
+});
+
+test("the page-level verdict tells all-unavailable, partial and all-clear apart", async ({
+  page,
+}) => {
+  // SYNTHETIC, and the point is the DIFFERENCE between the three states: several red
+  // badges and no summary was the report this banner answers, so the banner must say
+  // "none of them" differently from "some of them" -- computed, not guessed.
+  const unresolved = (name: string) =>
+    runtime({ name, command: "definitely-not-installed-xyz --acp", command_resolved: false });
+  const ok = (name: string) =>
+    runtime({
+      name,
+      command: "npx some-agent --acp",
+      command_resolved: true,
+      command_path: "C:/tools/npx.cmd",
+    });
+  let list: Record<string, unknown>[] = [unresolved("e2e-f1"), unresolved("e2e-f2")];
+  await serveAgents(page, () => list);
+  await openRuntimes(page);
+  const banner = page.locator("[data-fleet-verdict]");
+
+  // (1) NOTHING can start -- error tone, and it says what to DO next.
+  await expect(banner).toHaveAttribute("data-fleet-verdict", "none");
+  await expect(banner).toHaveAttribute("data-fleet-total", "2");
+  await expect(banner).toHaveAttribute("data-fleet-unresolved", "2");
+  await expect(banner).toContainText("没有任何运行时能启动");
+  await expect(banner).toContainText("安装对应的命令行工具");
+  await expect(banner).toContainText("command 改成二进制全路径");
+
+  // (2) SOME can start -- warning tone, and the count is the daemon's.
+  list = [unresolved("e2e-f1"), ok("e2e-f2"), ok("e2e-f3")];
+  await page.reload();
+  await expect(banner).toHaveAttribute("data-fleet-verdict", "partial");
+  await expect(banner).toHaveAttribute("data-fleet-total", "3");
+  await expect(banner).toHaveAttribute("data-fleet-unresolved", "1");
+  await expect(banner).toContainText("找不到命令");
+
+  // (3) ALL can start -- and the banner says so instead of staying silent (a silent
+  // page cannot be told apart from one whose check did not run).
+  list = [ok("e2e-f1"), ok("e2e-f2"), ok("e2e-f3")];
+  await page.reload();
+  await expect(banner).toHaveAttribute("data-fleet-verdict", "ok");
+  await expect(banner).toHaveAttribute("data-fleet-unresolved", "0");
+  await expect(banner).toContainText("全部可启动");
+});
+
+test("an empty grid is guidance, not a blank page", async ({ page }) => {
+  // SYNTHETIC empty registry: what a brand-new install looks like before anything is
+  // configured. The card grid is gone here, so this test navigates on its own rather
+  // than through openRuntimes (which waits for the grid).
+  await serveAgents(page, []);
+  await page.goto("/#runtimes");
+
+  const empty = page.locator(".empty-state");
+  await expect(empty).toBeVisible();
+  await expect(empty.locator(".empty-title")).toHaveText("没有注册的运行时");
+  // ... with the "where do I define one" guidance and a way to act on it.
+  await expect(empty.locator(".empty-hint")).toContainText("agents.toml");
+  await expect(empty).toContainText("新建运行时");
+  // ... and NO verdict banner: there is nothing to judge, and two overlapping
+  // "you have nothing" messages would be worse than one.
+  await expect(page.locator("[data-fleet-verdict]")).toHaveCount(0);
 });
 
 test("LIVE daemon: the real probe on an unresolvable runtime stops at not-found", async ({

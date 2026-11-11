@@ -608,6 +608,45 @@ impl McpConfig {
         command
     }
 
+    /// THE ONE PLACE that turns a registry entry into the command a spawner would be handed
+    /// (t80). The expansion, the pre-flight and the HEALTH CHECK all ask here, so they cannot
+    /// disagree about what a server would be.
+    ///
+    /// Why this function exists: `McpHealth::refresh` used to build its ping target from
+    /// `entry.command` -- the CONFIGURED value -- while injection went through
+    /// [Self::spawn_command]. On a machine without `ruagent` on PATH the platform's own server was
+    /// therefore pinged as an unresolvable bare name, marked `down`, and then EXCLUDED from
+    /// injection by the health gate: every agent lost the platform's tools, which is the 0.1.6
+    /// failure arriving through the diagnostic path instead of the injection path.
+    pub fn ping_target(&self, name: &str, entry: &McpEntry) -> ruagent_mcp::health::PingTarget {
+        self.ping_target_with(name, entry, CommandResolution::real())
+    }
+
+    /// [Self::ping_target] with the command resolution injected, for tests that must not depend
+    /// on what this machine happens to have on PATH.
+    fn ping_target_with(
+        &self,
+        name: &str,
+        entry: &McpEntry,
+        how: CommandResolution,
+    ) -> ruagent_mcp::health::PingTarget {
+        ruagent_mcp::health::PingTarget {
+            command: self.spawn_command(name, entry, how),
+            args: entry.args.clone(),
+            url: entry.url.clone(),
+        }
+    }
+
+    /// Every registered server's ping target, in registry order -- what the health loop checks.
+    /// The loop takes THIS rather than reading `servers` itself, so a second resolution cannot
+    /// grow back there.
+    pub fn ping_targets(&self) -> Vec<(String, ruagent_mcp::health::PingTarget)> {
+        self.servers
+            .iter()
+            .map(|(name, entry)| (name.clone(), self.ping_target(name, entry)))
+            .collect()
+    }
+
     /// The registry entries a profile would inject, in injection order.
     ///
     /// Split out of [Self::expand_profile] so the pre-flight below can inspect
@@ -673,11 +712,9 @@ impl McpConfig {
         self.profile_entries(profile, agent_name)
             .into_iter()
             .filter_map(|(name, entry)| {
-                let target = ruagent_mcp::health::PingTarget {
-                    command: self.spawn_command(name, entry, how),
-                    args: entry.args.clone(),
-                    url: entry.url.clone(),
-                };
+                // ONE construction (t80): the pre-flight must judge the same command the
+                // expansion will hand the harness -- both go through `ping_target_with`.
+                let target = self.ping_target_with(name, entry, how);
                 match ruagent_mcp::health::preflight(&target) {
                     Ok(()) => None,
                     Err(reason) => Some(McpPreflightFailure {
@@ -1876,6 +1913,152 @@ mod platform_mcp_tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // t80: the health check must judge THE COMMAND INJECTION WOULD SPAWN
+    // ------------------------------------------------------------------
+
+    /// The defect: on a machine without `ruagent` on PATH the platform's own server was pinged
+    /// as an unresolvable BARE NAME (the configured value), recorded as `down`, and then
+    /// dropped from injection by the health gate -- every agent lost the platform's tools.
+    /// The target must be the substituted, absolute, existing executable instead.
+    #[test]
+    fn the_health_target_is_the_command_the_harness_would_get() {
+        let cfg = mcp_config(
+            &[("ruagent", Some("ruagent"), &["mcp-serve"])],
+            &["ruagent"],
+        );
+        let own = std::env::current_exe().expect("this test binary has a path");
+        let how = CommandResolution {
+            resolves: |_| false,
+            own_exe: || std::env::current_exe().ok(),
+        };
+        let target = cfg.ping_target_with("ruagent", &cfg.servers["ruagent"], how);
+        let command = target
+            .command
+            .clone()
+            .expect("a stdio target carries a command");
+        assert_eq!(
+            command,
+            own.display().to_string(),
+            "the health check must ping the executable the daemon actually starts"
+        );
+        assert!(
+            std::path::Path::new(&command).is_absolute(),
+            "an absolute path, never a PATH lookup: {command}"
+        );
+        assert_ne!(
+            command, "ruagent",
+            "the configured name is not a spawnable path"
+        );
+        assert_eq!(
+            target.args,
+            vec!["mcp-serve".to_string()],
+            "args travel with it"
+        );
+        assert!(target.url.is_none());
+
+        // ...and the harness is handed the SAME command, so a health failure can no longer mean
+        // 'this server works' while the report says otherwise.
+        let injected = injected(&cfg.expand_profile_with(Some("default"), "dsh", how));
+        assert_eq!(
+            injected,
+            vec![("ruagent".to_string(), command.clone())],
+            "health and injection must name one program"
+        );
+        assert!(
+            cfg.health.down_set().is_empty(),
+            "nothing was judged down by asking"
+        );
+    }
+
+    /// The other half of the rule: only the PLATFORM's own server is ever rewritten. A user's
+    /// command stays exactly as configured, health check included.
+    #[test]
+    fn the_health_target_never_rewrites_a_users_own_server() {
+        let cfg = mcp_config(
+            &[
+                ("mine", Some("some-user-mcp-binary-9f3a"), &["--stdio"]),
+                ("ruagent", Some("ruagent"), &["mcp-serve"]),
+            ],
+            &["mine", "ruagent"],
+        );
+        let how = no_path_own_exe();
+        let mine = cfg.ping_target_with("mine", &cfg.servers["mine"], how);
+        assert_eq!(
+            mine.command.as_deref(),
+            Some("some-user-mcp-binary-9f3a"),
+            "a user's command is never second-guessed"
+        );
+        assert_eq!(mine.args, vec!["--stdio".to_string()]);
+        let platform = cfg.ping_target_with("ruagent", &cfg.servers["ruagent"], how);
+        assert_eq!(platform.command.as_deref(), Some(FAKE_OWN_EXE));
+    }
+
+    /// ONE resolution, three consumers (t80 item 4). The pre-flight used to build its target by
+    /// hand next to the expansion; both must judge the same thing, or a server the harness would
+    /// start can be refused before it ever is.
+    #[test]
+    fn preflight_health_and_expansion_judge_the_same_target() {
+        let cfg = mcp_config(
+            &[("ruagent", Some("ruagent"), &["mcp-serve"])],
+            &["ruagent"],
+        );
+        let how = CommandResolution {
+            resolves: |_| false,
+            own_exe: || std::env::current_exe().ok(),
+        };
+        let target = cfg.ping_target_with("ruagent", &cfg.servers["ruagent"], how);
+        let failures = cfg.preflight_profile_with(Some("default"), "dsh", how);
+        assert!(
+            failures.is_empty(),
+            "the pre-flight must accept the substituted command, not the bare name: {failures:?}"
+        );
+        assert!(
+            cfg.expand_profile_preflighted_with(Some("default"), "dsh", how)
+                .is_ok(),
+            "and the whole profile must survive"
+        );
+        let injected = injected(&cfg.expand_profile_with(Some("default"), "dsh", how));
+        assert_eq!(
+            injected.first().map(|(_, c)| c.clone()),
+            target.command.clone(),
+            "pre-flight, health and expansion must name one command"
+        );
+    }
+
+    /// The same invariant under the REAL resolver, whatever this machine's PATH says: for every
+    /// registered server the health target equals the injected command. This is the property the
+    /// bug broke, and it holds whether or not `ruagent` resolves here -- which is what makes it
+    /// safe to run in CI (where the platform binary may well be on PATH).
+    #[test]
+    fn the_health_target_matches_injection_with_the_real_resolver() {
+        let cfg = mcp_config(
+            &[
+                ("ruagent", Some("ruagent"), &["mcp-serve"]),
+                ("mine", Some("some-user-mcp-binary-9f3a"), &[]),
+            ],
+            &["ruagent", "mine"],
+        );
+        let injected = injected(&cfg.expand_profile(Some("default"), "dsh"));
+        assert_eq!(
+            injected.len(),
+            2,
+            "neither server is excluded: {injected:?}"
+        );
+        let targets = cfg.ping_targets();
+        assert_eq!(targets.len(), 2, "every registered server is checked");
+        for (name, target) in targets {
+            let expected = injected
+                .iter()
+                .find(|(n, _)| n == &name)
+                .map(|(_, command)| command.clone());
+            assert_eq!(
+                target.command.clone(),
+                expected,
+                "health and injection disagree about `{name}`"
+            );
+        }
+    }
     /// THE SHIPPED SHAPE MEETS THE SHIPPED DISTRIBUTION (t69). The seed writes
     /// `[mcp.ruagent] command = "ruagent"`, and an unzipped install has nothing on PATH --
     /// after which EVERY runtime answered 400 on session/options because the pre-flight refused the

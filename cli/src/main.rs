@@ -2106,6 +2106,397 @@ mod tests {
         );
         assert!(c.detail.contains("← primary"), "{}", c.detail);
     }
+
+    // ------------------------------------------------------------------
+    // t75: the MCP section -- decided from constructed JSON, no daemon
+    // ------------------------------------------------------------------
+
+    /// A server entry in the shape `GET /api/v1/mcp` emits (health can be null).
+    fn mcp_server(
+        name: &str,
+        command: Option<&str>,
+        health: Option<(bool, i64, Option<&str>)>,
+    ) -> serde_json::Value {
+        let mut s = serde_json::json!({
+            "name": name,
+            "url": serde_json::Value::Null,
+            "inject_for": serde_json::Value::Null,
+        });
+        s["command"] = match command {
+            Some(c) => serde_json::json!(c),
+            None => serde_json::Value::Null,
+        };
+        s["health"] = match health {
+            None => serde_json::Value::Null,
+            Some((ok, tools, error)) => serde_json::json!({
+                "state": if ok { "ok" } else { "failed" },
+                "tools": tools,
+                "latency_ms": 51,
+                "error": match error {
+                    Some(e) => serde_json::json!(e),
+                    None => serde_json::Value::Null,
+                },
+                "checked_at": 1_794_406_768_475_i64,
+            }),
+        };
+        s
+    }
+
+    fn mcp_catalogue(
+        servers: Vec<serde_json::Value>,
+        profiles: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({ "servers": servers, "profiles": profiles })
+    }
+
+    fn default_profile(names: &[&str]) -> serde_json::Value {
+        serde_json::json!([{ "name": "default", "servers": names }])
+    }
+
+    /// A path that really exists on this machine, so the platform-server check is driven
+    /// by a real file rather than by a hard-coded path that may not exist.
+    /// An absolute path that is NOT a file here, built from the platform's own temp
+    /// directory so it is absolute on Windows AND on unix.
+    fn a_path_that_is_not_a_file() -> String {
+        let mut p = std::env::temp_dir();
+        p.push("ruagent-t75-no-such-binary.exe");
+        let _ = std::fs::remove_file(&p);
+        p.display().to_string()
+    }
+
+    fn a_file_that_exists() -> String {
+        std::env::current_exe()
+            .expect("the test binary has a path")
+            .display()
+            .to_string()
+    }
+
+    /// Everything healthy: PASS, one row per server, and the platform row shows the
+    /// command it would start (the fix for 0.1.6, visible).
+    #[test]
+    fn doctor_mcp_all_ok_passes_and_shows_the_absolute_command() {
+        let exe = a_file_that_exists();
+        let v = mcp_catalogue(
+            vec![mcp_server("ruagent", Some(&exe), Some((true, 32, None)))],
+            default_profile(&["ruagent"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(c.ok, "a healthy catalogue must pass: {}", c.detail);
+        assert!(!c.partial, "{}", c.detail);
+        assert_eq!(check_mark(&c), "PASS", "{}", c.detail);
+        assert_eq!(c.name, "mcp");
+        assert!(c.detail.contains("1/1 server(s)"), "{}", c.detail);
+        assert!(
+            c.detail.contains("tools 32"),
+            "the tool count is a fact the reader needs: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("an existing file"),
+            "the platform command must be shown as a file: {}",
+            c.detail
+        );
+        assert!(!c.detail.contains("0 tools"), "{}", c.detail);
+    }
+
+    /// `health: null` means NOBODY has checked yet: not a failure, and emphatically not
+    /// `ok` -- the section goes to WARN and says which server has not been checked.
+    #[test]
+    fn doctor_mcp_health_null_is_not_ok_but_not_a_failure() {
+        let exe = a_file_that_exists();
+        let v = mcp_catalogue(
+            vec![mcp_server("ruagent", Some(&exe), None)],
+            default_profile(&["ruagent"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(c.ok, "nobody having looked is not a failure: {}", c.detail);
+        assert!(c.partial, "but it is not a clean pass either: {}", c.detail);
+        assert_eq!(check_mark(&c), "WARN", "{}", c.detail);
+        assert!(c.detail.contains("health NOT checked yet"), "{}", c.detail);
+        assert!(
+            c.detail.contains("NOT ok"),
+            "it must not read as ok: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("not been health-checked yet"),
+            "{}",
+            c.detail
+        );
+        assert!(!c.detail.contains("health ok"), "{}", c.detail);
+    }
+
+    /// A server the profile uses whose health is not ok: FAIL, and the row carries the
+    /// daemon's own error text plus where the server would be started from.
+    #[test]
+    fn doctor_mcp_health_error_fails_and_names_the_error() {
+        let exe = a_file_that_exists();
+        let v = mcp_catalogue(
+            vec![mcp_server(
+                "ruagent",
+                Some(&exe),
+                Some((false, 0, Some("spawn went nowhere: ENOENT"))),
+            )],
+            default_profile(&["ruagent"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(
+            !c.ok,
+            "a failing MCP server must fail the section: {}",
+            c.detail
+        );
+        assert_eq!(check_mark(&c), "FAIL", "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("health is failed: spawn went nowhere: ENOENT"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains(&exe),
+            "the command belongs in the finding: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("1 problem(s)"), "{}", c.detail);
+    }
+
+    /// A server that answers but exposes no tools is named on its own line -- it reads
+    /// like a healthy row otherwise, and behaves like no server at all.
+    #[test]
+    fn doctor_mcp_zero_tools_is_named_and_fails() {
+        let exe = a_file_that_exists();
+        let v = mcp_catalogue(
+            vec![mcp_server("ruagent", Some(&exe), Some((true, 0, None)))],
+            default_profile(&["ruagent"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(
+            !c.ok,
+            "answering with no tools is not a working server: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("exposes 0 tools"), "{}", c.detail);
+        assert!(c.detail.contains("harder to notice"), "{}", c.detail);
+        assert!(
+            c.detail.contains("and it exposes 0 tools"),
+            "the ROW must say it too: {}",
+            c.detail
+        );
+    }
+
+    /// THE OLD-DAEMON SHAPE (pre-t77): no `command_effective` on the wire, a BARE configured
+    /// command, and nothing proving the daemon would substitute its own executable. That is
+    /// exactly the 0.1.6 defect and it must stay a failure.
+    #[test]
+    fn doctor_mcp_platform_server_with_a_bare_command_and_no_effective_fails() {
+        let v = mcp_catalogue(
+            vec![mcp_server(
+                "ruagent",
+                Some("ruagent"),
+                Some((true, 32, None)),
+            )],
+            default_profile(&["ruagent"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(!c.ok, "a bare command is the 0.1.6 defect: {}", c.detail);
+        assert!(c.detail.contains("NOT an absolute path"), "{}", c.detail);
+        assert!(
+            c.detail.contains("0.1.6"),
+            "the sentence names the defect it prevents: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("reports no `command_effective`"),
+            "with no effective command reported, the finding says which value it judged: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("resolved through PATH"),
+            "and says what the fix is: {}",
+            c.detail
+        );
+    }
+
+    /// Absolute but stale: a path is not enough, the file has to be there.
+    #[test]
+    fn doctor_mcp_platform_server_path_that_is_not_a_file_fails() {
+        let stale = a_path_that_is_not_a_file();
+        let v = mcp_catalogue(
+            vec![mcp_server("ruagent", Some(&stale), Some((true, 32, None)))],
+            default_profile(&["ruagent"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(
+            !c.ok,
+            "a stale absolute path is still a broken self-attachment: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("not a file on this machine"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// No `default` profile: every agent runs without tools and nothing says so.
+    #[test]
+    fn doctor_mcp_missing_default_profile_fails() {
+        let exe = a_file_that_exists();
+        let v = mcp_catalogue(
+            vec![mcp_server("ruagent", Some(&exe), Some((true, 32, None)))],
+            serde_json::json!([]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("no `default` MCP profile"),
+            "{}",
+            c.detail
+        );
+        let empty = mcp_catalogue(Vec::new(), default_profile(&[]));
+        let c = mcp_check(Ok(&empty));
+        assert!(
+            !c.ok,
+            "an empty profile is the same end state: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("carries no servers"), "{}", c.detail);
+    }
+
+    /// Attach `command_effective` (the value the daemon would ACTUALLY spawn). `None`
+    /// leaves the field ABSENT, which is what an older daemon sends.
+    fn with_effective(mut server: serde_json::Value, effective: Option<&str>) -> serde_json::Value {
+        if let Some(e) = effective {
+            server["command_effective"] = serde_json::json!(e);
+        }
+        server
+    }
+
+    /// THE HEALTHY POST-0.1.6 SHAPE, which t75 judged as a failure on a real machine:
+    /// the platform ships a BARE configured command and the daemon substitutes its own
+    /// executable. Bare `command` + absolute `command_effective` + tools > 0 = PASS, and
+    /// the fact is printed so nobody re-reads it as the old defect.
+    #[test]
+    fn doctor_mcp_bare_command_with_an_absolute_effective_passes() {
+        let exe = a_file_that_exists();
+        let server = with_effective(
+            mcp_server("ruagent", Some("ruagent"), Some((true, 21, None))),
+            Some(&exe),
+        );
+        let v = mcp_catalogue(vec![server], default_profile(&["ruagent"]));
+        let c = mcp_check(Ok(&v));
+        assert!(
+            c.ok,
+            "a bare CONFIGURED command is the fix, not the defect: {}",
+            c.detail
+        );
+        assert!(!c.partial, "{}", c.detail);
+        assert_eq!(check_mark(&c), "PASS", "{}", c.detail);
+        assert!(
+            c.detail
+                .contains(&format!("starts `{exe}` (an existing file)")),
+            "the row must name the command that would actually start: {}",
+            c.detail
+        );
+        assert!(
+            c.detail
+                .contains("is a bare name and the daemon starts it with its own"),
+            "the fact belongs in the output: {}",
+            c.detail
+        );
+        assert!(
+            !c.detail.contains("NOT an absolute path"),
+            "nothing may be called non-absolute here: {}",
+            c.detail
+        );
+        assert!(!c.detail.contains("0.1.6 defect"), "{}", c.detail);
+    }
+
+    /// The defect, measured through the EFFECTIVE command: the daemon itself would try
+    /// the bare name.
+    #[test]
+    fn doctor_mcp_bare_effective_command_fails() {
+        let server = with_effective(
+            mcp_server("ruagent", Some("ruagent"), Some((true, 21, None))),
+            Some("ruagent"),
+        );
+        let v = mcp_catalogue(vec![server], default_profile(&["ruagent"]));
+        let c = mcp_check(Ok(&v));
+        assert!(!c.ok, "{}", c.detail);
+        assert_eq!(check_mark(&c), "FAIL", "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("would be started as `ruagent`, which is NOT an absolute path"),
+            "the finding names the effective command: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("the command it would actually start"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// A daemon that ships the field but cannot say (null) is treated as one that does
+    /// not ship it: fall back to the configured value and SAY SO.
+    #[test]
+    fn doctor_mcp_null_effective_falls_back_to_the_configured_command() {
+        let mut server = mcp_server("ruagent", Some("ruagent"), Some((true, 21, None)));
+        server["command_effective"] = serde_json::Value::Null;
+        let v = mcp_catalogue(vec![server], default_profile(&["ruagent"]));
+        let c = mcp_check(Ok(&v));
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("this daemon reports no `command_effective`"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("configured value"),
+            "the row must say which value it judged: {}",
+            c.detail
+        );
+    }
+    /// A profile that lists a server nobody defines, and a server nobody uses.
+    #[test]
+    fn doctor_mcp_profile_listing_a_missing_server_fails() {
+        let exe = a_file_that_exists();
+        let v = mcp_catalogue(
+            vec![
+                mcp_server("ruagent", Some(&exe), Some((true, 32, None))),
+                mcp_server("ghost", Some("/opt/ghost"), Some((true, 4, None))),
+            ],
+            default_profile(&["ruagent", "nowhere"]),
+        );
+        let c = mcp_check(Ok(&v));
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no such server exists"), "{}", c.detail);
+        assert!(
+            c.detail.contains("absent from the catalogue"),
+            "the row must show it: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("ghost") && c.detail.contains("not used by any profile"),
+            "an unused server is still a fact: {}",
+            c.detail
+        );
+    }
+
+    /// Not being able to ask is not a pass (the rule `distill_check` set).
+    #[test]
+    fn doctor_mcp_unreadable_reading_is_not_checked_and_fails() {
+        let c = mcp_check(Err("connect refused".into()));
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("未检查"), "{}", c.detail);
+        assert!(c.detail.contains("connect refused"), "{}", c.detail);
+        assert!(
+            c.detail.contains("GET /api/v1/mcp"),
+            "the cause names which read failed: {}",
+            c.detail
+        );
+    }
 }
 
 fn client() -> reqwest::blocking::Client {
@@ -2516,6 +2907,380 @@ fn front_door_via(card: &serde_json::Value) -> String {
         _ => "without naming a runtime".to_string(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// doctor: the MCP section (t75) -- the failure class doctor could not see
+// ---------------------------------------------------------------------------
+
+/// One MCP server's row, plus the reasons it is a problem.
+struct McpRow {
+    text: String,
+    /// Empty when this server is fine; otherwise a sentence for the summary.
+    fatal: String,
+    /// A pass with a caveat (not health-checked yet) -- never a clean pass.
+    caveat: bool,
+    /// True things worth printing that are NOT problems (e.g. a bare configured command
+    /// that the daemon replaces with its own executable).
+    facts: Vec<String>,
+}
+
+/// Doctor's MCP section (t75), decided from `GET /api/v1/mcp`.
+///
+/// WHY THIS EXISTS: 0.1.6's root cause was the platform's own MCP self-attachment -- it
+/// launched `ruagent` BY NAME, so on any machine where that name was not on PATH every
+/// runtime answered 400 -- and `doctor` had no MCP line at all, so that class of failure was
+/// invisible in exactly the report people are told to run first. The data was already
+/// there (servers + per-server health + profiles); this reads it and asks the daemon for
+/// nothing new.
+///
+/// WHAT COUNTS AS A FAILURE, and why the quiet states count too:
+///   * a server the used profile lists whose health is not `ok`;
+///   * a server that answers but exposes 0 tools -- an MCP server with no tools is the
+///     same thing as no MCP server, only harder to notice;
+///   * the platform's own server (`ruagent`) whose `command` is not an ABSOLUTE path to an
+///     existing file -- a bare name is the 0.1.6 defect itself, coming back;
+///   * no `default` profile, or one carrying no servers: every agent then runs WITHOUT
+///     tools and nothing says so.
+///
+/// `health: null` is NOT a failure -- nobody has checked yet -- but it is not `ok` either: it
+/// gets its own sentence and downgrades the section to a caveat-pass (WARN).
+///
+/// THE FILE CHECK IS THE LOCAL VIEW. This CLI is a loopback tool for one machine; an
+/// absolute path that is not a file HERE is reported as exactly that, so a remote
+/// `--url` cannot be turned into a false accusation about somebody else's disk.
+fn mcp_check(reading: Result<&serde_json::Value, String>) -> Check {
+    const NAME: &str = "mcp";
+    let v = match reading {
+        Ok(v) => v,
+        Err(e) => {
+            return Check {
+                name: NAME.into(),
+                ok: false,
+                partial: false,
+                detail: format!(
+                    "未检查（GET /api/v1/mcp failed: {e}）— without this read nothing can be \
+                     said about the servers every agent is supposed to be given: a silent \
+                     MCP failure is exactly what 0.1.6 looked like from the outside"
+                ),
+            };
+        }
+    };
+    let servers = v["servers"].as_array().cloned().unwrap_or_default();
+    let profiles = v["profiles"].as_array().cloned().unwrap_or_default();
+
+    // WHICH servers matter: the ones the profile agents actually use. `default` is that
+    // profile -- it is what a role inherits when it names none.
+    let default_profile = profiles
+        .iter()
+        .find(|p| p["name"].as_str() == Some("default"));
+    let used: Vec<String> = default_profile
+        .and_then(|p| p["servers"].as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut usable = 0usize;
+    let mut never_checked = 0usize;
+    let mut caveat = false;
+
+    for name in &used {
+        let Some(server) = servers
+            .iter()
+            .find(|s| s["name"].as_str() == Some(name.as_str()))
+        else {
+            problems.push(format!(
+                "profile `default` lists `{name}`, but no such server exists in the \
+                 catalogue -- the profile promises a server that is not there"
+            ));
+            rows.push(format!(
+                "FAIL {:<16} listed in profile `default`, absent from the catalogue",
+                name
+            ));
+            continue;
+        };
+        let row = mcp_server_row(name, server);
+        caveat |= row.caveat;
+        notes.extend(row.facts.iter().cloned());
+        if row.caveat {
+            never_checked += 1;
+        }
+        if row.fatal.is_empty() {
+            usable += 1;
+        } else {
+            problems.push(row.fatal.clone());
+        }
+        rows.push(row.text);
+    }
+
+    // Servers no profile uses are not a failure, but they are facts worth printing: a
+    // stale entry is how an old command survives an upgrade.
+    for s in &servers {
+        let Some(name) = s["name"].as_str() else {
+            continue;
+        };
+        if !used.iter().any(|u| u == name) {
+            rows.push(format!(
+                "--   {name:<16} not used by any profile (informational)"
+            ));
+        }
+    }
+
+    let total = used.len();
+    let (mut ok, mut partial, summary) = if default_profile.is_none() {
+        (
+            false,
+            false,
+            "no `default` MCP profile in this catalogue -- every agent then runs WITHOUT \
+             tools and nothing says so; the daemon seeds one at first boot (start it once \
+             against this root, then re-read GET /api/v1/mcp)"
+                .to_string(),
+        )
+    } else if total == 0 {
+        (
+            false,
+            false,
+            "profile `default` carries no servers -- an empty profile is the same end state \
+             as none: every agent gets no tools"
+                .to_string(),
+        )
+    } else if !problems.is_empty() {
+        (
+            false,
+            false,
+            format!(
+                "{usable}/{total} server(s) of profile `default` are usable, and {} \
+                 problem(s) are named below: check that each FAIL row's command exists and \
+                 is executable (or drop the server from the profile), then re-run \
+                 `ruagent doctor`",
+                problems.len()
+            ),
+        )
+    } else if caveat {
+        (
+            true,
+            true,
+            format!(
+                "{usable}/{total} server(s) in profile `default` answered; {never_checked} has \
+                 not been health-checked yet -- the daemon checks MCP servers periodically, \
+                 and 'not checked' is not the same as 'ok'"
+            ),
+        )
+    } else {
+        (
+            true,
+            false,
+            format!("{usable}/{total} server(s) in profile `default` answer with tools"),
+        )
+    };
+    ok = ok && problems.is_empty();
+    partial = partial && ok;
+
+    let mut detail = summary;
+    for row in rows {
+        detail.push_str(&format!("\n{row}"));
+    }
+    // True facts that are not problems go first (the healthy post-0.1.6 shape belongs in
+    // the report: without it, a reader who knows the old defect reads a bare command as
+    // one). Then THE ACTIONABLE SENTENCES -- a row names the fact, the line under it says
+    // what to do about it (the difference between "1 problem(s) below" and something a
+    // user can act on).
+    for note in &notes {
+        detail.push_str(&format!("\n  · {note}"));
+    }
+    for problem in &problems {
+        detail.push_str(&format!("\n  → {problem}"));
+    }
+    Check {
+        name: NAME.into(),
+        ok,
+        partial,
+        detail,
+    }
+}
+
+/// One server's row: health, tool count, and -- for the platform's own server -- whether
+/// the command the daemon would start is an absolute path to a file.
+///
+/// THE PLATFORM ROW IS THE POINT OF THE SECTION: 0.1.6 shipped a self-attachment that
+/// launched `ruagent` by name, and its only symptom was every runtime answering 400.
+fn mcp_server_row(name: &str, server: &serde_json::Value) -> McpRow {
+    let health = &server["health"];
+    let command = server["command"].as_str().unwrap_or("").trim().to_string();
+    let url = server["url"].as_str().unwrap_or("").trim().to_string();
+    // THE COMMAND THE DAEMON WOULD ACTUALLY START, not the configured value: after the
+    // 0.1.6 repair the platform deliberately ships a BARE `command` and substitutes its own
+    // executable at spawn time, so judging `command` flags a healthy machine (measured on
+    // 2026-11-11: `command = ruagent` with `tools 21` was reported as a failure).
+    // Old daemons do not send the field at all; falling back to `command` keeps them
+    // diagnosable, and the row SAYS which value it judged.
+    let reported_effective = server["command_effective"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let launch = reported_effective
+        .clone()
+        .unwrap_or_else(|| command.clone());
+    let mut problems: Vec<String> = Vec::new();
+    let mut caveat = false;
+    let mut facts: Vec<String> = Vec::new();
+
+    // 1. health. `null` means nobody has looked yet: not a failure, and not ok.
+    let mut status = if health.is_null() {
+        caveat = true;
+        "health NOT checked yet (the daemon checks MCP servers periodically -- this is \
+         NOT ok)"
+            .to_string()
+    } else {
+        let state = health["state"]
+            .as_str()
+            .unwrap_or("<the daemon sent no state>");
+        if state == "ok" {
+            let tools = health["tools"].as_i64().unwrap_or(0);
+            let latency = match health["latency_ms"].as_i64() {
+                Some(ms) => format!("{ms} ms"),
+                None => "latency not recorded".to_string(),
+            };
+            format!("health ok (tools {tools}, {latency})")
+        } else {
+            let err = health["error"]
+                .as_str()
+                .unwrap_or("the daemon recorded no error text");
+            problems.push(format!(
+                "`{name}` health is {state}: {err}{}",
+                mcp_launch_hint(&launch, &url)
+            ));
+            format!("health {state}: {err}")
+        }
+    };
+
+    // 2. a server that answers with NO tools is not a tool server. Named separately,
+    //    because 'ok, 0 tools' reads like a healthy line and behaves like an empty one.
+    if health["state"].as_str() == Some("ok") && health["tools"].as_i64() == Some(0) {
+        problems.push(format!(
+            "`{name}` answers but exposes 0 tools{} -- an MCP server with no tools is \
+             the same thing as no MCP server, and harder to notice",
+            mcp_launch_hint(&launch, &url)
+        ));
+        status.push_str(" -- and it exposes 0 tools");
+    }
+
+    // 3. the platform's own server. The criterion is THE COMMAND THE DAEMON WOULD ACTUALLY
+    //    START: absolute, and an existing file. A bare CONFIGURED value is the healthy
+    //    post-0.1.6 shape (the daemon substitutes its own executable), so it is reported as
+    //    a fact, never as a failure. A bare EFFECTIVE value, or a daemon too old to report
+    //    one while the configured value is bare, is the defect.
+    if name == "ruagent" {
+        if launch.is_empty() {
+            if url.is_empty() {
+                problems.push(
+                    "`ruagent` (the platform's own server) has neither a command nor a url \
+                     -- nothing can start it, so every agent that expects the platform's \
+                     tools runs without them"
+                        .to_string(),
+                );
+                status.push_str(" · no command and no url");
+            } else {
+                status.push_str(&format!(" · served over url `{url}`"));
+            }
+        } else {
+            let path = std::path::Path::new(&launch);
+            let configured_absolute = std::path::Path::new(&command).is_absolute();
+            if !path.is_absolute() {
+                if reported_effective.is_some() {
+                    problems.push(format!(
+                        "`ruagent` (the platform's own server) would be started as `{launch}`, \
+                         which is NOT an absolute path -- the self-attachment must be started \
+                         by the daemon with its OWN executable; a bare name resolves through \
+                         PATH, and that is exactly the 0.1.6 defect (every runtime then \
+                         answered 400)"
+                    ));
+                    status.push_str(&format!(
+                        " · the command it would actually start, `{launch}`, is NOT an absolute path"
+                    ));
+                } else {
+                    problems.push(format!(
+                        "`ruagent` (the platform's own server) is configured with `{launch}` and \
+                         this daemon reports no `command_effective`, so that bare name is what \
+                         would be resolved through PATH -- that is exactly the 0.1.6 defect \
+                         (every runtime then answered 400). A daemon that starts its own \
+                         executable reports `command_effective` as that absolute path"
+                    ));
+                    status.push_str(&format!(
+                        " · command `{launch}` (configured value; this daemon reports no \
+                         `command_effective`) is NOT an absolute path"
+                    ));
+                }
+            } else if !path.is_file() {
+                problems.push(format!(
+                    "`ruagent` (the platform's own server) would be started from `{launch}`, an \
+                     absolute path that is not a file on this machine -- the daemon must \
+                     start its own executable, so this command is stale or points at a \
+                     build that is gone"
+                ));
+                status.push_str(&format!(" · starts `{launch}` (not a file here)"));
+            } else {
+                status.push_str(&format!(" · starts `{launch}` (an existing file)"));
+                if reported_effective.is_none() {
+                    status.push_str(&format!(
+                        " (the configured value `{command}`; this daemon reports no \
+                         `command_effective`)"
+                    ));
+                } else if !configured_absolute && !command.is_empty() {
+                    facts.push(format!(
+                        "`{name}`: the configured value `{command}` is a bare name and the daemon \
+                         starts it with its own executable (`{launch}`) -- that is the 0.1.6 \
+                         fix working, not a problem"
+                    ));
+                }
+            }
+        }
+    } else if !launch.is_empty() {
+        if reported_effective.is_some() && !command.is_empty() && command != launch {
+            status.push_str(&format!(" · command `{command}` → starts `{launch}`"));
+        } else {
+            status.push_str(&format!(" · command `{launch}`"));
+        }
+    } else if !url.is_empty() {
+        status.push_str(&format!(" · url `{url}`"));
+    }
+
+    let mark = if !problems.is_empty() {
+        "FAIL"
+    } else if caveat {
+        "WARN"
+    } else {
+        "OK  "
+    };
+    McpRow {
+        text: format!("{mark} {name:<16} {status}"),
+        fatal: if problems.is_empty() {
+            String::new()
+        } else {
+            problems.join("; ")
+        },
+        caveat,
+        facts,
+    }
+}
+
+/// Where a server would be started from, for a failure sentence: the reader needs the
+/// command or the url in the same breath as the error, not two sections away.
+fn mcp_launch_hint(command: &str, url: &str) -> String {
+    if !command.is_empty() {
+        format!(" · command `{command}`")
+    } else if !url.is_empty() {
+        format!(" · url `{url}`")
+    } else {
+        " · no command and no url".to_string()
+    }
+}
+
 /// One `POST /api/v1/runtimes/{name}/probe`, as a `ProbeCall`.
 ///
 /// A FAILED PROBE IS STILL HTTP 200 (the request completed; the runtime did not),
@@ -2794,6 +3559,15 @@ fn doctor(url: &str, cleanup: bool) -> Result<()> {
         ));
     }
 
+    // 8. mcp (t75): the platform's own MCP self-attachment, which is the one thing whose
+    // failure is INVISIBLE from the outside -- 0.1.6 launched `ruagent` by name, every
+    // runtime answered 400, and this report had no MCP line to say so. `GET /api/v1/mcp`
+    // already carries the state (health per server, profiles, tools); nothing new is asked.
+    checks.push(mcp_check(
+        get_json(url, "/api/v1/mcp").as_ref().map_err(|e| e.clone()),
+    ));
+
+    // Probe hygiene (t252): the removable probe document is deleted
     // Probe hygiene (t252): the removable probe document is deleted
     // BEFORE the report, so cleanup is part of running the command and not
     // something a human has to remember.

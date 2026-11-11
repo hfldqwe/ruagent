@@ -66,12 +66,13 @@ impl McpHealth {
     /// ping timeout) and store the results.
     pub async fn refresh(&self, cfg: &McpConfig) {
         let mut checks = Vec::new();
-        for (name, entry) in &cfg.servers {
-            let target = ruagent_mcp::health::PingTarget {
-                command: entry.command.clone(),
-                args: entry.args.clone(),
-                url: entry.url.clone(),
-            };
+        // THE COMMAND INJECTION WOULD ACTUALLY SPAWN, not the configured one (t80). Building this
+        // target from `entry.command` meant the platform's own server -- configured as a bare
+        // `ruagent` -- was pinged as an unresolvable name on any machine without it on PATH,
+        // recorded as `down`, and then dropped from injection by the health gate: agents got no
+        // platform tools at all. `McpConfig::ping_targets` is the single resolution; the
+        // expansion, the pre-flight and this loop all ask it.
+        for (name, target) in cfg.ping_targets() {
             let name = name.clone();
             checks.push(async move {
                 let outcome = ruagent_mcp::health::ping(&target).await;

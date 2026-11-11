@@ -6,7 +6,7 @@
 // agents.toml (comments preserved) and hot-reloads the registry.
 
 import { useEffect, useState } from "react";
-import { Button, Card, Input, Popconfirm, Select } from "antd";
+import { Alert, Button, Card, Input, Popconfirm, Select } from "antd";
 import {
   api,
   HttpError,
@@ -94,6 +94,41 @@ export function commandState(
   if (resolved === true) return { kind: "resolved", path: path ?? null };
   if (resolved === false) return { kind: "notFound" };
   return { kind: "unknown" };
+}
+
+/** What the page as a WHOLE can say about starting anything (t76).
+ *
+ *  A user on a fresh machine saw several red "找不到命令" badges and no answer to
+ *  "is it all of them, or just some?" -- the question `ruagent doctor` already
+ *  answers with "0/3 runtime(s) start -- NONE could start". So the verdict is
+ *  COMPUTED from the same field the cards read (`command_resolved`), never
+ *  guessed, and an ABSENT flag stays a state of its own: a daemon older than the
+ *  field must not be reported as "everything is fine" -- that is the report this
+ *  whole surface exists for.
+ *
+ *  Counted over the runtimes the grid actually renders (enabled, non-role), because
+ *  a disabled backend is not a candidate to start at all. Pure, like
+ *  `commandState` and `modelsReadout`, so the rule is reviewable without a browser. */
+export type FleetVerdict =
+  | { kind: "empty"; total: 0; unresolved: 0; unknown: 0 }
+  | { kind: "none"; total: number; unresolved: number; unknown: number }
+  | { kind: "partial"; total: number; unresolved: number; unknown: number }
+  | { kind: "unknown"; total: number; unresolved: number; unknown: number }
+  | { kind: "ok"; total: number; unresolved: number; unknown: number };
+
+export function fleetVerdict(
+  runtimes: ReadonlyArray<Pick<AgentInfo, "command_resolved">>,
+): FleetVerdict {
+  const total = runtimes.length;
+  const unresolved = runtimes.filter((r) => r.command_resolved === false).length;
+  const unknown = runtimes.filter(
+    (r) => r.command_resolved !== true && r.command_resolved !== false,
+  ).length;
+  if (total === 0) return { kind: "empty", total: 0, unresolved: 0, unknown: 0 };
+  if (unresolved === total) return { kind: "none", total, unresolved, unknown };
+  if (unresolved > 0) return { kind: "partial", total, unresolved, unknown };
+  if (unknown > 0) return { kind: "unknown", total, unresolved, unknown };
+  return { kind: "ok", total, unresolved, unknown };
 }
 
 /** One card's probe reading.
@@ -288,6 +323,9 @@ export function Runtimes() {
         (a.harness ?? "").localeCompare(b.harness ?? "") || a.name.localeCompare(b.name),
     );
 
+  // t76: the page's own judgement over that grid -- computed, not felt.
+  const verdict = fleetVerdict(runtimes);
+
   // t182/C4: the runtimes the daemon actually ANSWERED for. A failed probe and a
   // "never told" answer (`known === false`) are both no-readings, so neither may
   // contribute a number to the strip -- that is how an unknown runtime used to be
@@ -355,6 +393,41 @@ export function Runtimes() {
           hint={t("runtimes.stale.hint")}
           onRetry={load}
           retryLabel={t("common.retry")}
+        />
+      ) : null}
+
+      {/* The page's own judgement (t76), above everything else: three states
+          computed by `fleetVerdict` from the same field the cards read, plus a
+          fourth ("unknown") for a daemon that does not report the field at all.
+          `empty` renders NOTHING here on purpose -- the Empty block below IS that
+          state's guidance, and two overlapping "you have nothing" messages would be
+          worse than one. */}
+      {verdict.kind !== "empty" ? (
+        <Alert
+          className="fleet-verdict"
+          type={
+            verdict.kind === "none"
+              ? "error"
+              : verdict.kind === "ok"
+                ? "success"
+                : "warning"
+          }
+          showIcon
+          data-fleet-verdict={verdict.kind}
+          data-fleet-total={verdict.total}
+          data-fleet-unresolved={verdict.unresolved}
+          message={t(`runtimes.fleet.${verdict.kind}.title`, {
+            total: verdict.total,
+            unresolved: verdict.unresolved,
+            unknown: verdict.unknown,
+            ok: verdict.total - verdict.unresolved - verdict.unknown,
+          })}
+          description={t(`runtimes.fleet.${verdict.kind}.detail`, {
+            total: verdict.total,
+            unresolved: verdict.unresolved,
+            unknown: verdict.unknown,
+            ok: verdict.total - verdict.unresolved - verdict.unknown,
+          })}
         />
       ) : null}
 

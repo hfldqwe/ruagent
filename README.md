@@ -184,6 +184,25 @@ curl -s -X PATCH localhost:8787/api/v1/runtimes/dsh \
   -H 'content-type: application/json' -d '{"command":"my-cli --acp"}'
 ```
 
+### A machine with none of them installed: `0/3` is the starting state, not a broken install
+
+On a fresh computer `ruagent doctor` says what is missing (measured on 0.1.8, with no
+`npx`/`dsh`/`opencode` on `PATH`):
+
+```
+  [FAIL] runtimes   0/3 runtime(s) start — NONE could start: install the binary each FAIL row
+                    names, or set that runtime's `command` to the binary's full path in
+                    ~/.ruagent/config/agents.toml, then re-run `ruagent doctor`
+         FAIL claude   [ClaudeCode] command NOT found on PATH · … `npx` is not on PATH …  ← primary
+         FAIL dsh      [Dsh]        command NOT found on PATH · … `dsh` is not on PATH …
+         FAIL opencode [OpenCode]   command NOT found on PATH · … `opencode` is not on PATH …
+```
+
+`← primary` marks the front door (who answers you). Install **any one** of them — Node alone
+makes `claude`'s `npx` resolvable — and the same line becomes `starts (stage: ok)`; that runtime's
+card in the panel stops saying “command not found”. You do not need all three, and they do not
+have to be on `PATH`: pointing a runtime's `command` at the binary's full path counts too.
+
 A runtime also needs a **known harness** (`claude-code`, `opencode`, `dsh`,
 `mock`) — that is what decides which ACP adapter lands on it. The name does not
 have to be the harness: give `harness` explicitly when you name it something else.

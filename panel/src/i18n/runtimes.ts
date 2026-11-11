@@ -28,6 +28,20 @@ export const zh: Record<string, string> = {
   "runtimes.stale.hint": "显示的是上一次成功读取的结果，5 秒轮询正在重试。",
   "runtimes.notProbed": "未探测",
   "runtimes.probeFailed": "探测失败 · 重试",
+  // t76: the page-level verdict -- the answer a fresh machine needs. Every state
+  // names what to DO next, because "3 red badges and no summary" was the report.
+  "runtimes.fleet.ok.title": "{total} 个运行时全部可启动",
+  "runtimes.fleet.ok.detail":
+    "每个运行时的命令都能在这台机器上解析到。要让 daemon 真正启动一次做端到端确认，点卡片上的「测试连接」。",
+  "runtimes.fleet.partial.title": "{total} 个运行时里有 {unresolved} 个找不到命令",
+  "runtimes.fleet.partial.detail":
+    "其余 {ok} 个可以启动。红标签卡片上的命令在这台机器上解析不到：装上对应的命令行工具，或到「编辑」里把 command 改成二进制全路径。",
+  "runtimes.fleet.none.title": "这台机器上没有任何运行时能启动（0/{total}）",
+  "runtimes.fleet.none.detail":
+    "全部 {total} 个运行时的 command 都解析不到。下一步：按卡片上的提示安装对应的命令行工具，或到「编辑」里把该运行时的 command 改成二进制全路径（用 npx 装的要给完整路径）。装好后点卡片上的「测试连接」确认。",
+  "runtimes.fleet.unknown.title": "{total} 个运行时有 {unknown} 个未报告命令是否可解析",
+  "runtimes.fleet.unknown.detail":
+    "这个 daemon 不报告 command_resolved，所以这里既不写「可用」也不写「找不到」。点卡片上的「测试连接」可以直接问它。",
   "runtimes.cmd.resolved": "命令可解析",
   "runtimes.cmd.path": "解析到：{path}",
   "runtimes.cmd.notFound": "找不到命令",
@@ -72,6 +86,19 @@ export const en: Record<string, string> = {
   "runtimes.stale.hint": "Showing the last successful read; the 5s poll is retrying.",
   "runtimes.notProbed": "not probed",
   "runtimes.probeFailed": "probe failed · retry",
+  // t76: the page-level verdict -- what a fresh machine needs to be told.
+  "runtimes.fleet.ok.title": "all {total} runtimes can start",
+  "runtimes.fleet.ok.detail":
+    "Every runtime's command resolves on this machine. To have the daemon really start one end to end, press \"Test connection\" on its card.",
+  "runtimes.fleet.partial.title": "{unresolved} of {total} runtimes cannot find their command",
+  "runtimes.fleet.partial.detail":
+    "The other {ok} can start. On the red cards the command does not resolve on this machine: install the matching command-line tool, or edit the runtime and give the full path of the binary.",
+  "runtimes.fleet.none.title": "no runtime can start on this machine (0/{total})",
+  "runtimes.fleet.none.detail":
+    "None of the {total} runtimes' commands resolve. Next step: install the command-line tool each card names, or edit the runtime and give the full path of the binary (an npx install needs its full path). Then press \"Test connection\" on the card to confirm.",
+  "runtimes.fleet.unknown.title": "{unknown} of {total} runtimes did not report whether their command resolves",
+  "runtimes.fleet.unknown.detail":
+    "This daemon does not report command_resolved, so neither \"available\" nor \"not found\" is written here. \"Test connection\" on a card asks it directly.",
   "runtimes.cmd.resolved": "command resolves",
   "runtimes.cmd.path": "resolves to: {path}",
   "runtimes.cmd.notFound": "command not found",
