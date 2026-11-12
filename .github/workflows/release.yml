@@ -34,6 +34,18 @@ name: Release
 #      consumes ci.yml's verdict rather than duplicating a 30-minute suite -- that
 #      is what "publish only what the pipeline has passed" means here.
 
+#   4. INTEL MACS HAD NO DOWNLOAD (ruagent-issues-56-59 t82). The matrix carried only
+#      `aarch64-apple-darwin`, so a user on an x86_64 Mac found nothing they could run on the
+#      release page -- the same class as the panel/README gaps this effort keeps closing: a
+#      product nobody can install. `x86_64-apple-darwin` now has its own matrix row, built on
+#      `macos-15-intel`: GitHub's own runner table lists only `macos-15-intel`/`macos-26-intel`
+#      for Intel macOS (`macos-13`, the obvious answer, is not in it any more; macOS 14 images
+#      were retired 2026-11-02). The archive list the checks use is DERIVED from the matrix
+#      instead of being written a second time (see the `targets` job).
+#
+#      VALIDATION, NOT A TAG: a new target is proven by `workflow_dispatch` on a branch, which
+#      never publishes (the `release` job is conditioned on the EVENT), and only then by a tag.
+
 on:
   push:
     tags: ["v*"]
@@ -138,9 +150,78 @@ jobs:
             sleep 30
           done
 
+  # THE ONE LIST EVERYTHING ELSE DERIVES FROM (ruagent-issues-56-59 t82).
+  #
+  # Two facts used to be written twice in this file -- the build matrix, and the archive names
+  # that `release` warns about and `completeness` demands. Adding a platform to the matrix and
+  # forgetting the list is a silent half-failure in BOTH directions: a release that is missing a
+  # platform, or a completeness job that demands an asset nobody builds and so goes red forever.
+  # Here there is exactly one place to add a platform; the matrix, the publish pre-check and the
+  # completeness check all read THIS job's output. (`strategy.matrix.include` accepts an
+  # expression, which is what makes a derived matrix possible at all.)
+  #
+  # The archive names are built here, with the ref, because every packaging and smoke step below
+  # takes `matrix.archive` as given -- keeping that name in the matrix and the naming rule in one
+  # place at the same time.
+  targets:
+    name: Targets (the list the matrix and the checks derive from)
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      include: ${{ steps.list.outputs.include }}
+      assets: ${{ steps.list.outputs.assets }}
+    steps:
+      # THE RUNNER LABELS ARE THE PART THAT GOES STALE (t82). Measured today, from GitHub's own
+      # runner table (docs.github.com/actions/reference/runners/github-hosted-runners): the Intel
+      # macOS labels are `macos-15-intel` and `macos-26-intel`; `macos-13`, the obvious Intel
+      # answer, is no longer in that table, and the macOS 14 images were retired 2026-11-02
+      # (actions/runner-images). A retired label does not fail fast -- it QUEUES (measured on
+      # this very file: three macos legs came back `cancelled` with zero steps). `macos-15-intel`
+      # is the OLDEST still-supported Intel image, which is the safest choice for a build that
+      # must keep working.
+      # An arm64 runner cannot produce an x86_64 binary that RUNS there, so the smoke step below
+      # is what proves the pairing: it executes the archive's own binary.
+      - name: Emit the target list
+        id: list
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - "$REF" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+
+          ref = sys.argv[1]
+          # (runner label, rust target triple, archive suffix, archive extension) -- ADD A
+          # PLATFORM HERE AND NOWHERE ELSE.
+          rows = [
+              ("windows-latest", "x86_64-pc-windows-msvc", "x86_64-windows", "zip"),
+              ("ubuntu-latest", "x86_64-unknown-linux-gnu", "x86_64-linux", "tar.gz"),
+              # macos-latest is arm64 (macos-14 and later are Apple silicon).
+              ("macos-latest", "aarch64-apple-darwin", "aarch64-macos", "tar.gz"),
+              # Intel Macs: without this row a downloader on x86_64 macOS finds nothing to run.
+              ("macos-15-intel", "x86_64-apple-darwin", "x86_64-macos", "tar.gz"),
+          ]
+          include = [
+              {
+                  "os": runner,
+                  "target": triple,
+                  "archive": f"ruagent-{ref}-{suffix}.{ext}",
+              }
+              for runner, triple, suffix, ext in rows
+          ]
+          print("include=" + json.dumps(include, separators=(",", ":")))
+          # `release` warns about a missing leg by SUFFIX (it greps the artifact names) and
+          # `completeness` demands the ASSET name, which is the suffix plus the extension.
+          print("assets=" + " ".join(f"{suffix}.{ext}" for _, _, suffix, ext in rows))
+          print("targets:", ", ".join(t for _, t, _, _ in rows), file=sys.stderr)
+          PY
+
   build:
     name: Build ${{ matrix.target }}
-    needs: gate
+    needs: [gate, targets]
     runs-on: ${{ matrix.os }}
     # 180 min PER MATRIX ENTRY (t114; report: docs/design/reviews/gen3-ci-timeouts.md §8).
     # The bound comes from the only GREEN release run (34849294052, 2026-09-14): the
@@ -161,22 +242,14 @@ jobs:
       actions: write
     strategy:
       fail-fast: false
+      # THE MATRIX IS NOT WRITTEN HERE (t82): `targets` emits it, so adding a platform is one row
+      # in one job and every consumer -- this matrix, the publish pre-check, `completeness` --
+      # follows. The entries still carry `os`/`target`/`archive`, which is why every packaging and
+      # smoke step below keeps working unchanged. A row without packaging+smoke steps would
+      # publish a target nobody ever ran, which is why the steps are keyed on `runner.os`, not on
+      # the target name.
       matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: ruagent-${{ github.ref_name }}-x86_64-windows.zip
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: ruagent-${{ github.ref_name }}-x86_64-linux.tar.gz
-          # macOS, arm64 (ruagent-issues-56-59 t44; issue #74's first item). IT ENTERS THE MATRIX
-          # ONLY WITH ITS PACKAGING AND SMOKE STEPS -- a matrix row without them would publish a
-          # target nobody ever ran. macos-latest is arm64 (macos-14 and later are Apple silicon),
-          # which is what aarch64-apple-darwin needs; if that pointer ever moved back to x86_64,
-          # the cross-built arm64 binary could not RUN, and the smoke step is what says so.
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: ruagent-${{ github.ref_name }}-aarch64-macos.tar.gz
+        include: ${{ fromJSON(needs.targets.outputs.include) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
         with:
@@ -348,7 +421,7 @@ jobs:
     # job that is not a dependency makes the WHOLE FILE invalid, and GitHub then creates a run with
     # NO JOBS and the message 'This run likely failed because of a workflow file issue' -- measured
     # exactly that way on 1e71986, after the same file parsed fine locally as YAML.
-    needs: [gate, build]
+    needs: [gate, build, targets]
     # A LEG THAT NEVER GOT A RUNNER MUST NOT WITHHOLD THE ARTIFACTS USERS CAN RUN (2026-11-10).
     # Measured three times on two tags: `Build aarch64-apple-darwin` finished with
     # `conclusion: cancelled` after ~15 minutes and **zero steps** -- GitHub never assigned a macos
@@ -387,6 +460,9 @@ jobs:
       # nothing to attach, and a release with no assets is worse than no release -- a downloader
       # would find the tag and nothing to fetch. This stops loudly rather than skipping silently.
       - name: Say what will be published, and refuse to publish nothing
+        env:
+          # THE PLATFORM LIST IS DERIVED (t82), not a second hand-kept copy.
+          ASSETS: ${{ needs.targets.outputs.assets }}
         run: |
           set -eu
           count=$(find artifacts -maxdepth 1 -type f | wc -l)
@@ -397,7 +473,10 @@ jobs:
             exit 1
           fi
           missing=''
-          for p in x86_64-windows x86_64-linux aarch64-macos; do
+          # THE PLATFORM LIST COMES FROM `targets` (t82), not from a second hand-kept copy:
+          # `x86_64-linux.tar.gz` -> `x86_64-linux`, which is what the artifact names carry.
+          for a in $ASSETS; do
+            p="${a%%.*}"
             ls artifacts/*"$p"* >/dev/null 2>&1 || missing="$missing $p"
           done
           if [ -n "$missing" ]; then
@@ -411,7 +490,7 @@ jobs:
 
   completeness:
     name: Release completeness
-    needs: [build, release]
+    needs: [build, release, targets]
     # THE STRICT HALF, AFTER PUBLISHING (2026-11-10). Every target must have produced an archive.
     # If one did not, the release still went out -- because the other platforms were built, packaged
     # and smoke-tested, and a downloader should not be told 'nothing for you' because a macos runner
@@ -428,16 +507,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
+          ASSETS: ${{ needs.targets.outputs.assets }}
         run: |
           set -eu
           assets=$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name' | sort)
           echo "attached to $TAG:"; echo "$assets"
           missing=''
-          for p in x86_64-windows.zip x86_64-linux.tar.gz aarch64-macos.tar.gz; do
+          # THE SAME ONE LIST (t82): the asset names come from `targets`, so a platform added to
+          # the matrix can never leave this check demanding an archive nobody builds (red forever)
+          # or accepting a release that is missing one (silently incomplete).
+          for p in $ASSETS; do
             echo "$assets" | grep -q -- "$p" || missing="$missing $p"
           done
           if [ -n "$missing" ]; then
             echo "::error::the release is MISSING:$missing. What IS published works -- download it. Then re-run the failed leg (gh run rerun --failed <run-id>) and publish the gap; do not move the tag."
             exit 1
           fi
-          echo 'all three platform archives and their checksums are attached'
+          echo 'every platform archive in the target list, and its checksum, is attached'
