@@ -34,17 +34,47 @@ name: Release
 #      consumes ci.yml's verdict rather than duplicating a 30-minute suite -- that
 #      is what "publish only what the pipeline has passed" means here.
 
-#   4. INTEL MACS HAD NO DOWNLOAD (ruagent-issues-56-59 t82). The matrix carried only
-#      `aarch64-apple-darwin`, so a user on an x86_64 Mac found nothing they could run on the
-#      release page -- the same class as the panel/README gaps this effort keeps closing: a
-#      product nobody can install. `x86_64-apple-darwin` now has its own matrix row, built on
-#      `macos-15-intel`: GitHub's own runner table lists only `macos-15-intel`/`macos-26-intel`
-#      for Intel macOS (`macos-13`, the obvious answer, is not in it any more; macOS 14 images
-#      were retired 2026-11-02). The archive list the checks use is DERIVED from the matrix
-#      instead of being written a second time (see the `targets` job).
+#   4. INTEL MACS HAVE NO DOWNLOAD -- AND NOW WE KNOW WHY (ruagent-issues-56-59 t82). The
+#      matrix carries only `aarch64-apple-darwin`, so a user on an x86_64 Mac finds nothing to
+#      run: the same class as the panel/README gaps this effort keeps closing, a product nobody
+#      can install. A row for `x86_64-apple-darwin` (runner `macos-15-intel`) WAS written, and
+#      DISPATCHED BEFORE ANY TAG, exactly as this file's validation path demands. It builds as
+#      far as the release binary and then dies INSIDE A DEPENDENCY:
 #
-#      VALIDATION, NOT A TAG: a new target is proven by `workflow_dispatch` on a branch, which
-#      never publishes (the `release` job is conditioned on the EVENT), and only then by a tag.
+#          ort-sys@2.0.0-rc.13: [WARN] can't do xcframework linking for target 'x86_64-apple-darwin'
+#          ort-sys@2.0.0-rc.13: no prebuilt binaries available for target x86_64-apple-darwin
+#          error: build script logged errors
+#          ##[error]Process completed with exit code 101
+#
+#      MEASURED TWICE, independently: dispatch run 43238636506 and run 43239220529 both failed
+#      `Build x86_64-apple-darwin` at `Build release binary`, while the other three targets in the
+#      SAME run went green (and `Targets` emitted the four-leg matrix correctly). ort-sys
+#      DOWNLOADS a prebuilt ONNX Runtime at build time (see the note above the packaging steps: no
+#      shared object is carried in the archive, so the library must exist AT BUILD), and it
+#      publishes no x86_64 macOS artefact -- so this is neither a matrix typo nor a runner-label
+#      problem, and no `macos-*` image fixes it.
+#
+#      SUPPORTING INTEL macOS NEEDS ONE OF THESE FIRST:
+#        * an `ort` version (or a vendored/build-from-source ONNX Runtime) that ships an
+#          x86_64-apple-darwin artefact;
+#        * building ONNX Runtime from source for that target inside this workflow (a long job of
+#          its own, not a matrix row);
+#        * an Intel archive with the ONNX-backed embedder COMPILED OUT -- which changes what the
+#          product does, so it is a capability decision, not a build tweak.
+#      UNTIL ONE OF THOSE LANDS: do not add the row back, and do not publish a partial release for
+#      Intel Macs. A platform that is honestly missing is a gap the user can see; a release page
+#      that offers a download that cannot be built is a promise that fails at the download button.
+#      The row is not left commented out on purpose: a commented matrix row is how the next reader
+#      concludes it was never tried. THIS NOTE IS THE TRIAL.
+#
+#      WHAT SURVIVED THAT ATTEMPT: the archive list the checks use is DERIVED from one `targets`
+#      job instead of being written a second time (see it below), so re-adding a platform later is
+#      one row in one place -- and when that row is added to a file whose platform list is
+#      duplicated, the failure modes were 'release silently missing a platform' and 'completeness
+#      demands an asset nobody builds', both caught by nobody.
+#
+#      VALIDATION, NOT A TAG: a new target is proven by `workflow_dispatch` (which never publishes
+#      -- the `release` job is conditioned on the EVENT), and only then by a tag.
 
 on:
   push:
@@ -174,16 +204,13 @@ jobs:
       include: ${{ steps.list.outputs.include }}
       assets: ${{ steps.list.outputs.assets }}
     steps:
-      # THE RUNNER LABELS ARE THE PART THAT GOES STALE (t82). Measured today, from GitHub's own
+      # THE RUNNER LABELS ARE THE PART THAT GOES STALE (t82). Measured today from GitHub's own
       # runner table (docs.github.com/actions/reference/runners/github-hosted-runners): the Intel
       # macOS labels are `macos-15-intel` and `macos-26-intel`; `macos-13`, the obvious Intel
-      # answer, is no longer in that table, and the macOS 14 images were retired 2026-11-02
-      # (actions/runner-images). A retired label does not fail fast -- it QUEUES (measured on
-      # this very file: three macos legs came back `cancelled` with zero steps). `macos-15-intel`
-      # is the OLDEST still-supported Intel image, which is the safest choice for a build that
-      # must keep working.
-      # An arm64 runner cannot produce an x86_64 binary that RUNS there, so the smoke step below
-      # is what proves the pairing: it executes the archive's own binary.
+      # answer, is no longer in that table, and the macOS 14 images were retired 2026-11-02. That
+      # matters for the NEXT Intel attempt, not for the current one: the row is absent because its
+      # build is red in a dependency (top of this file), not because a runner was hard to find --
+      # `macos-15-intel` DID assign runners and DID run the build in both dispatch runs.
       - name: Emit the target list
         id: list
         env:
@@ -201,8 +228,9 @@ jobs:
               ("ubuntu-latest", "x86_64-unknown-linux-gnu", "x86_64-linux", "tar.gz"),
               # macos-latest is arm64 (macos-14 and later are Apple silicon).
               ("macos-latest", "aarch64-apple-darwin", "aarch64-macos", "tar.gz"),
-              # Intel Macs: without this row a downloader on x86_64 macOS finds nothing to run.
-              ("macos-15-intel", "x86_64-apple-darwin", "x86_64-macos", "tar.gz"),
+              # NO INTEL MACOS ROW, DELIBERATELY: `x86_64-apple-darwin` is built by nothing
+              # because ort-sys ships no ONNX Runtime for it and the build dies there. Re-adding
+              # it is ONE line here -- read the measured reason at the top of this file first.
           ]
           include = [
               {

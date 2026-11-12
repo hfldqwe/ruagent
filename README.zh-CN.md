@@ -38,6 +38,13 @@
 | Linux (x86_64) | `ruagent-vX.Y.Z-x86_64-linux.tar.gz` |
 | macOS（Apple 芯片） | `ruagent-vX.Y.Z-aarch64-macos.tar.gz` |
 
+**Intel Mac 暂不提供，这是依赖的限制，不是漏做。** 嵌入模型通过 `ort-sys` 链接 ONNX Runtime，
+而它没有 `x86_64-apple-darwin` 的预编译库；把这个 target 加进矩阵，构建会死在 build script 里
+（`no prebuilt binaries available for target x86_64-apple-darwin`，实测于 release dispatch
+run 43238636506），而不是产出一个归档。要支持它需要做产品决策——该 target 关掉嵌入能力、换一个
+提供该平台预编译产物的 `ort` 版本、或在那边从源码构建 ONNX。已记录为 issue #78；在那之前，
+tag 触发的发布会变成「声称三个平台、实际只发两个」，比在这里写清限制更糟。
+
 到 [Releases](https://github.com/hfldqwe/ruagent/releases) 下载对应平台那一个，
 用同页的 `SHA256SUMS` 校验，**整包解压**后运行：
 

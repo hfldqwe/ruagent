@@ -41,6 +41,15 @@ Every tagged release publishes ready-to-run archives — no Rust toolchain, no
 | Linux (x86_64) | `ruagent-vX.Y.Z-x86_64-linux.tar.gz` |
 | macOS (Apple silicon) | `ruagent-vX.Y.Z-aarch64-macos.tar.gz` |
 
+**Intel Macs are not offered, and that is a dependency limit rather than an omission.** The
+embedder links ONNX Runtime through `ort-sys`, which publishes no prebuilt library for
+`x86_64-apple-darwin`; adding the target makes the build die in its build script
+(`no prebuilt binaries available for target x86_64-apple-darwin`, measured in release dispatch
+run 43238636506) instead of producing an archive. Enabling it needs a product decision — build
+that target without the embedder, move to an `ort` release that ships it, or build ONNX from
+source there. Tracked as issue #78; until then a tag-driven release would publish two platforms
+while claiming three, which is worse than naming the limit here.
+
 Download the one for your platform from
 [Releases](https://github.com/hfldqwe/ruagent/releases), check it against the
 published `SHA256SUMS`, unpack it **as a whole**, and run:
