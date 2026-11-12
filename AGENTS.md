@@ -317,6 +317,24 @@ The CLI package is named `ruagent` (it lives in `cli/`), not `ruagent-cli`.
   own entries above cite bare ids from earlier generations (t66, t93/t81, t76, t45/t54, t188), so this
   is an improvement on current practice rather than a description of it; apply it to new comments and
   do not rewrite the old ones as a drive-by.
+- **One question, one resolution -- or the two answers will disagree about a healthy machine** (0.1.9).
+  The platform's own MCP server had **two** answers to "what command do we start": injection asked
+  `McpConfig::spawn_command` (which substitutes the daemon's own executable when `ruagent` is not on
+  PATH, the 0.1.6 fix) while `McpHealth::refresh` asked `entry.command` -- the CONFIGURED bare name.
+  So on an unzipped install the server was pinged as an unresolvable name, marked `down`, and the health
+  gate then dropped it from injection: **every agent lost the platform's tools while the runtimes
+  connected fine**, i.e. 0.1.6's failure arriving through the diagnostic path instead of the injection
+  path. Nothing red said so; the only trace was `WARN mcp health check failed — server excluded from
+  injection`. The fix is `McpConfig::ping_target` as THE one place expansion, pre-flight, health and the
+  API report all ask; a second implementation is now a review finding, not a convenience.
+  **And the measurement trap that hid it, which cost two wrong readings in one round:** on Windows,
+  `CreateProcess` searches the **directory of the executable being launched** as well as `PATH`, so a
+  daemon binary sitting in `%TEMP%\pa\` -- a directory that happens to contain an older `ruagent.exe`
+  -- resolves the bare name `ruagent` to it and reports a HEALTHY platform server. `command -v ruagent`
+  cannot show this (it only reads PATH). **To test the unzipped shape, put the binary in a directory that
+  contains nothing else of that name**; that is when `down / spawn failed: program not found` appears.
+  The same reading also means a green smoke on a runner is worth more than a green reading on a
+  developer machine here: the runner's temp directory is clean by construction.
 - **A green gate certifies the BYTES it ran on, so a post-handover edit must be disclosed and the gates
   re-run** (ruagent-tunable-capabilities t20, from the increment-5 handover). The increment-5
   implementer added two COMMENT-ONLY clarifications to `crates/daemon/src/capability.rs` AFTER handing

@@ -244,7 +244,46 @@ for rt in claude opencode dsh; do
   echo "runtime $rt: options -> $(printf "%s" "$body" | cut -c1-140)"
 done
 
-# 6. CLEAN STOP through the daemon's own channel, forced kill only as a reported fallback.
+# 6. THE PLATFORM'S OWN MCP SERVER MUST BE HEALTHY, AND ITS COMMAND MUST BE A REAL PATH (t81).
+#    This is the one place in the repo that runs the SHIPPED shape -- unzipped, `ruagent` not on
+#    PATH -- and the 0.1.9 bug lived exactly here while this script was green: the health loop
+#    pinged the platform's server by its CONFIGURED bare name, marked it down, and the health gate
+#    then dropped every platform tool from injection. Every agent lost the platform's tools, the
+#    runtimes still connected, and nothing red said so -- the only trace was a WARN.
+#    It was also invisible on a Windows runner for a reason worth keeping: CreateProcess searches
+#    the directory of the executable being launched as well as PATH, so a stale `ruagent.exe`
+#    beside the binary resolves the bare name. Alone in a clean directory it says `down`.
+mcp="$(curl -s --max-time 60 "$base/api/v1/mcp" 2>/dev/null)"
+case "$mcp" in
+  *'"name":"ruagent"'*) : ;;
+  *) fail "GET /api/v1/mcp does not list the platform's own MCP server (name ruagent), so no agent can be given the platform's tools: $(printf '%s' "$mcp" | cut -c1-300)" ;;
+esac
+# The fragment after the server's own name starts with ITS fields, so `head -1` scopes every reading
+# to that server without a JSON parser (this script has no jq and does not grow one here; the handler
+# emits the keys in a fixed order: name, command, command_effective, url, inject_for, health).
+mcp_frag="$(printf '%s' "$mcp" | sed -n 's/.*{"name":"ruagent"\(.*\)/\1/p')"
+mcp_state="$(printf '%s' "$mcp_frag" | grep -o '"state":"[a-z]*"' | head -1 | cut -d'"' -f4)"
+mcp_tools="$(printf '%s' "$mcp_frag" | grep -o '"tools":[0-9]*' | head -1 | cut -d: -f2)"
+mcp_error="$(printf '%s' "$mcp_frag" | grep -o '"error":"[^"]*"' | head -1 | cut -d'"' -f4)"
+mcp_effective="$(printf '%s' "$mcp_frag" | grep -o '"command_effective":"[^"]*"' | head -1 | cut -d'"' -f4)"
+if [ "$mcp_state" != "ok" ]; then
+  echo 'injection-gate lines from the daemon log (this is the path that drops the platform tools):'
+  grep -i 'excluded from injection' "$stage/daemon.out.log" 2>/dev/null | tail -5 || true
+  echo 'daemon log tail:'
+  tail -12 "$stage/daemon.out.log" 2>/dev/null || true
+  fail "the platform's OWN MCP server is not healthy (health.state=${mcp_state:-<missing>}, error=${mcp_error:-<none>}): the health gate drops it from injection and EVERY agent loses the platform's tools. That is the 0.1.9 shape -- the server must be pinged through the same command resolution injection uses, never by its configured bare name."
+fi
+case "${mcp_tools:-}" in
+  ''|*[!0-9]*) fail "GET /api/v1/mcp reports no tool COUNT for the platform's own server (tools=${mcp_tools:-<missing>}), so a healthy state proves nothing: $(printf '%s' "$mcp" | cut -c1-300)" ;;
+  0) fail "the platform's own MCP server answers but exposes 0 tools, so agents get nothing usable: $(printf '%s' "$mcp" | cut -c1-300)" ;;
+esac
+case "${mcp_effective:-}" in
+  /*) : ;;
+  [A-Za-z]:[\\/]*) : ;;
+  *) fail "command_effective for the platform's own server is not an absolute path (${mcp_effective:-<missing>}): the report must name the command that will ACTUALLY be spawned (the daemon's own executable), not the configured bare name -- that field is what makes this whole class of bug visible, so it may not be dropped." ;;
+esac
+echo "mcp: ruagent server -> health.state=$mcp_state tools=$mcp_tools command_effective=$mcp_effective"
+# 7. CLEAN STOP through the daemon's own channel, forced kill only as a reported fallback.
 #    A POSIX counter loop, not seq: BSD/macOS seq is not universal.
 mkdir -p "$root/data"
 printf 'smoke-archive: stop requested' >"$root/data/daemon.stop"

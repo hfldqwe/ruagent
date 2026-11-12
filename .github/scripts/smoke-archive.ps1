@@ -211,7 +211,53 @@ try {
         Write-Output ("runtime $rt : probe -> " + $probeBody.Substring(0, [Math]::Min(140, $probeBody.Length)))
     }
 
-    # 5. CLEAN STOP: the request file is the daemon's own channel (a console-less process has
+    # 6. THE PLATFORM'S OWN MCP SERVER MUST BE HEALTHY, AND ITS COMMAND MUST BE A REAL PATH (t81).
+    #    Same reasoning as the .sh twin: this is the one place that runs the SHIPPED shape, and the
+    #    0.1.9 bug -- every agent losing the platform's tools because the health gate pinged a
+    #    configured bare name -- was green here. On Windows the reading was additionally masked by
+    #    CreateProcess searching the binary's own directory for a sibling `ruagent.exe`.
+    $mcpBody = ''
+    try {
+        $mcpBody = (Invoke-WebRequest -Uri "$base/api/v1/mcp" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop).Content
+    } catch {
+        $mcpBody = $_.ErrorDetails.Message
+        if (-not $mcpBody) { $mcpBody = $_.Exception.Message }
+    }
+    $mcpParsed = $null
+    try { $mcpParsed = $mcpBody | ConvertFrom-Json } catch { }
+    $mcpOwn = $null
+    if ($mcpParsed -and $mcpParsed.servers) {
+        $mcpOwn = $mcpParsed.servers | Where-Object { $_.name -eq 'ruagent' } | Select-Object -First 1
+    }
+    if (-not $mcpOwn) {
+        Stop-With "GET /api/v1/mcp does not list the platform's own MCP server (name ruagent), so no agent can be given the platform's tools: $($mcpBody.Substring(0, [Math]::Min(300, $mcpBody.Length)))"
+    }
+    $mcpState = "$($mcpOwn.health.state)"
+    $mcpTools = $mcpOwn.health.tools
+    $mcpError = "$($mcpOwn.health.error)"
+    $mcpEffective = "$($mcpOwn.command_effective)"
+    if ($mcpState -ne 'ok') {
+        Write-Output 'injection-gate lines from the daemon log (this is the path that drops the platform tools):'
+        if (Test-Path $outLog) {
+            Get-Content $outLog | Where-Object { $_ -match 'excluded from injection' } | Select-Object -Last 5
+            Write-Output 'daemon log tail:'
+            Get-Content $outLog -Tail 12
+        }
+        Stop-With "the platform's OWN MCP server is not healthy (health.state=$mcpState, error=$mcpError): the health gate drops it from injection and EVERY agent loses the platform's tools. That is the 0.1.9 shape -- it must be pinged through the same command resolution injection uses, never by its configured bare name."
+    }
+    # ConvertFrom-Json hands back Int32 OR Int64 depending on the size, and a JSON null comes back as
+    # $null; a type test on [int] therefore rejected a perfectly good `tools: 32` (measured). Parse the
+    # TEXT and require a positive integer.
+    $mcpToolsNum = 0
+    $mcpToolsOk = [int]::TryParse("$mcpTools", [ref]$mcpToolsNum) -and $mcpToolsNum -gt 0
+    if (-not $mcpToolsOk) {
+        Stop-With "GET /api/v1/mcp reports no usable tool COUNT for the platform's own server (tools=$mcpTools), so a healthy state proves nothing: $($mcpBody.Substring(0, [Math]::Min(300, $mcpBody.Length)))"
+    }
+    if (-not [System.IO.Path]::IsPathRooted($mcpEffective)) {
+        Stop-With "command_effective for the platform's own server is not an absolute path ($mcpEffective): the report must name the command that will ACTUALLY be spawned, not the configured bare name -- that field is what makes this class of bug visible, so it may not be dropped."
+    }
+    Write-Output "mcp: ruagent server -> health.state=$mcpState tools=$mcpTools command_effective=$mcpEffective"
+    # 7. CLEAN STOP: the request file is the daemon's own channel (a console-less process has
     #    no Ctrl-C). A forced stop is the fallback and is reported, never silent.
     $stopFile = Join-Path $root 'data/daemon.stop'
     New-Item -ItemType Directory -Force (Split-Path $stopFile) | Out-Null

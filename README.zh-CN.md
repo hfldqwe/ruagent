@@ -185,6 +185,13 @@ curl -s -X PATCH localhost:8787/api/v1/runtimes/dsh \
 卡片也会从「找不到命令」变成「命令可解析」。你不需要三个都装，也不需要它们都在 PATH 上：
 把某个运行时的 `command` 改成二进制全路径同样成立。
 
+**唯一不需要你安装的是平台自己的 MCP server**：它由 daemon 用自己的可执行文件启动，所以
+`mcp.toml` 里写着裸名 `ruagent` 也没关系，PATH 上可以什么都没有；`GET /api/v1/mcp` 同时给出
+配置值（`command`）与**实际会启动的命令**（`command_effective`）。0.1.9 让**健康检查**也问
+同一个问题——在此之前它按配置的裸名去 ping，判成 `down`，然后被从注入里剔除，结果是运行时
+都连着、但每个 agent 都拿不到平台工具。如果日志里出现 `mcp health check failed — server
+excluded from injection`，就是这个形状。
+
 运行时还需要一个**已知 harness**（`claude-code`、`opencode`、`dsh`、`mock`），它决定
 挂哪个 ACP 适配器。名字不必等于 harness：名字自定义时请显式给 `harness`。
 

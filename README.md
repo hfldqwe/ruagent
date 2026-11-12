@@ -203,6 +203,15 @@ makes `claude`'s `npx` resolvable — and the same line becomes `starts (stage: 
 card in the panel stops saying “command not found”. You do not need all three, and they do not
 have to be on `PATH`: pointing a runtime's `command` at the binary's full path counts too.
 
+**The platform's own MCP server is the one thing you never have to install.** It is started
+from the daemon's own executable, so `mcp.toml` may keep the bare name `ruagent` and nothing
+has to be on `PATH`; `GET /api/v1/mcp` reports both the configured value (`command`) and the
+one that is actually started (`command_effective`). 0.1.9 made the **health check** ask that
+same question — before it, the server was pinged under its configured bare name, marked `down`,
+and then dropped from injection, which left every agent without the platform's tools while the
+runtimes connected fine. If you ever see `mcp health check failed — server excluded from
+injection` in the log, that is the shape to look for.
+
 A runtime also needs a **known harness** (`claude-code`, `opencode`, `dsh`,
 `mock`) — that is what decides which ACP adapter lands on it. The name does not
 have to be the harness: give `harness` explicitly when you name it something else.
