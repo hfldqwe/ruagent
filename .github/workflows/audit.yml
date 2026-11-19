@@ -118,8 +118,9 @@ jobs:
         with:
           toolchain: "1.95.0"
       # F6 GUARD: the toolchain pin has ONE authority (rust-toolchain.toml). This fails when
-      # a workflow toolchain input disagrees with it, and REPORTS the carriers that are still
-      # unpinned (e2e.yml:69, release.yml:132) rather than hiding them.
+      # a workflow toolchain input disagrees with it or drops it. Every carrier is ENFORCED
+      # now (ci.yml, audit.yml, release.yml, and e2e.yml since issue #74 item 2), so there is
+      # no WARN class left: a dropped input FAILS instead of being reported.
       - name: "Guard: the toolchain pin must match rust-toolchain.toml"
         run: bash .github/scripts/check-toolchain-pin.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)

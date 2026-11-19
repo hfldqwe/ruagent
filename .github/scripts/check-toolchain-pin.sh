@@ -17,12 +17,12 @@
 #   * nothing was parsed at all -- an empty scan must not print the same success as a clean
 #     one, which is the lesson of the t29 audit (a guard blind exactly where its parser was).
 #
-# ENFORCED vs REPORTED. ci.yml, audit.yml and release.yml are ENFORCED -- release.yml since
-# ruagent-issues-56-59 t43 pinned its build step, which was the carrier where a floating
-# install is worst: a tag publishes bytes that a compiled gate is supposed to have proved.
-# e2e.yml:69 still omits the input. It is REPORTED as WARN on every run (never silently
-# dropped) and becomes enforced the moment it is pinned -- add it to ENFORCED below and
-# nothing else needs to change.
+# ENFORCED vs REPORTED. EVERY carrier is now ENFORCED: ci.yml, audit.yml, release.yml --
+# release.yml since ruagent-issues-56-59 t43 pinned its build step, which was the carrier
+# where a floating install is worst: a tag publishes bytes that a compiled gate is supposed
+# to have proved -- and e2e.yml, pinned by issue #74 item 2, which was the last one omitting
+# the input. None of them is REPORTED as WARN any more: a dropped input or a disagreeing
+# value FAILS the run, so the ENFORCED list below is the whole set of carriers.
 #
 # usage: check-toolchain-pin.sh [repo-root]
 #   the optional root exists so the negative control can run against a COPY of the tree
@@ -32,7 +32,7 @@ set -uo pipefail
 
 root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 authority="$root/rust-toolchain.toml"
-ENFORCED="ci.yml audit.yml release.yml"
+ENFORCED="ci.yml audit.yml release.yml e2e.yml"
 
 want="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' "$authority")"
 if [ -z "$want" ]; then

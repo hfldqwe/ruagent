@@ -66,7 +66,15 @@ jobs:
       E2E_BASE_URL: http://127.0.0.1:8891
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (2026-07-16)
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN still floats -- see the report)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-03; the TOOLCHAIN is PINNED by the input below, not floating)
+        with:
+          # t40 audit F6, extended to this file by issue #74 item 2: the action takes its
+          # toolchain from this input and never from the toml, so an omitted input installs
+          # the action default (stable) and this job floats -- a zero-diff commit could then
+          # go red on a new lint under `-D warnings`. 1.95.0 is the same value as
+          # rust-toolchain.toml, and .github/scripts/check-toolchain-pin.sh lists e2e.yml as
+          # ENFORCED (it runs from ci.yml and audit.yml), so the two carriers cannot drift.
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (2026-08-06)
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

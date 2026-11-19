@@ -19,8 +19,12 @@
 #      INSTALLS, which the action takes from this input, never from this file.
 #   3. .github/workflows/audit.yml: the same input (t40; that job used to omit it and
 #      floated on the action default, i.e. on whatever stable was that day).
-#   NOT YET PINNED: e2e.yml:69 and release.yml:132 still omit the input. The guard below
-#   reports them as WARN on every run, and enforcing them needs only pinning them.
+#   4. .github/workflows/release.yml and .github/workflows/e2e.yml: the same input.
+#      release.yml has been pinned since ruagent-issues-56-59 t43 (a floating install there
+#      is worst: a tag publishes bytes a compiled gate is supposed to have proved) and
+#      e2e.yml since issue #74 item 2 -- it was the last carrier omitting the input.
+#   NOTHING FLOATS NOW: the guard below lists all four carriers as ENFORCED, so a dropped
+#   input or a value that disagrees with this file FAILS it instead of being reported.
 #
 # THE GUARD: bash .github/scripts/check-toolchain-pin.sh FAILS when a carrier disagrees
 # with this file, or drops its input, so the carriers cannot drift apart silently. It runs
