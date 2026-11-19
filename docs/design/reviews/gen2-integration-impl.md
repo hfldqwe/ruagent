@@ -570,3 +570,102 @@ cd panel; npm run build
 - `test --workspace` = **`TEST_EXIT=0`**；大小写敏感：`test result: ok` **55 行**、`FAILED` **0 行**、`(\d+) passed` 求和 = **390**（t50 386 / t53 387 / 本单 390 —— 同窗口 mem-core 正在落地，**未定因**）。
 - `clippy --workspace --all-targets -DenyWarnings -CleanFirst ruagent-daemon` = **exit 0 / 12.9s**，本轮 `Checking ruagent-daemon / ruagent-mock-agent / ruagent / ruagent-mcp`。
 - **pid 79984 未触碰**（`StartTime = 09/27/2026 05:35:37`）；**未写活库**；无临时 root。
+
+---
+
+## 20 t46 第 2 次尝试（recall）：把 §13.3 的七条**逐条**变成读数或**指名**的 not_measured
+
+> 本节由 `recall` 在 **t46 attempt 2** 追加（派单文本仍写着「attempt 1（第 2 轮）」—— 我按**当前字节**重读了 §14–§19，并按 captain 的「不许静默跳过」把状态写全）。**本轮我没有改任何产品代码**：所有交付都是**独立读数** + 对**已经落地**的实现的取证；唯一的写入是本节。
+
+### 20.0 一条必须先说的现场事实（按 C32 只读端口归属，不信标签）
+
+派单文本说「不启停 **pid 79984**」，并引用 `StartTime = 09/27/2026 05:35:37`。**该 pid 今天不存在**（`Get-Process -Id 79984` = 无）。真正在跑的是：
+
+| 读数（我量的） | 值 |
+| --- | --- |
+| `127.0.0.1:8787` 的监听者 | **pid 14944**，`ruagent.exe`，`StartTime = 10/02/2026 23:05:45`，`serve --addr 127.0.0.1:8787 --root C:\Users\19410\.ruagent` |
+| 同机其它 `ruagent.exe` | pid 40296 / 32736（`%TEMP%\t186\root*`，端口 88xx）· pid 3964（`%TEMP%\t187\...`）—— **不是我的，一个都没碰** |
+| 我起过的两个 | 面板探针 daemon **pid 35092**（已停，`alive=False`）· DEP-1 回放 daemon（脚本记录 PID，`terminate()` 后 `alive=False`） |
+
+⇒ 「pid 79984 未触碰」我**无法按字面交读数**（它不存在）；我交的是**更强**的东西：**活守护进程 = 8787 上的 14944，在我全部动作前后都是它**（每步核对，见 §20.5）。**这是标签陈旧，不是现场异常** —— 按 C32「读端口归属，不读标签」。
+
+### 20.1 §13.3 七条 → 逐条状态（每条给读数或指名 not_measured）
+
+| # | 项 | 状态 | 读数 / 归属 |
+| --- | --- | --- | --- |
+| 1 | **MCP 5 个新工具** | **已交付**（`crates/mcp/src/lib.rs` 注册 5 个薄代理；第 5 个的 HTTP 路由由 t47 §15.1 补上后**可用**） | **调用读数不是我的**：引用 §14.1（`tools/list=14`、`graph_search`/`graph_retrieve`/`wiki_pages`/`wiki_links` 的响应形状）+ §15.1（`memory_forget_report` 真哈希 200 / 未写哈希 200 各面 `hits:0` / 非 64 位 **400**）。我本轮只做代码级核对（边界见 §20.2 末） |
+| 2 | **面板四页 DOM 读数（A-6）** | **已交付（我本轮亲测，四页全绿）** | 见 §20.2：**62 passed / 0 failed**，四条断言逐条 `ok`，含 DOM 原文 `覆盖 unknown` |
+| 3 | **wiki DEP-W + `knowledge_api.rs` 逐字段断言** | **已交付**（断言在**我跑的门禁里**通过） | 我这次 `test --workspace`：`Running tests\knowledge_api.rs` ⇒ **16 tests ok**；`links_out` 收窄语义（含断链、不含自链）由该文件 :491-506 断言、`degrees` 交叉核对在 :589-606（我读了原文，见 §20.3） |
+| 4 | **G8 带数字 coverage** | **已交付（t50）**；**我未重做** | 引用 §17.2：`wiki_pages.cite_coverage=1.0`（**记录值**）+ 注入侧 `coverage=1.00`（大小写敏感 `coverage_with_digits_count=1`）⇒ **不是**「含 `coverage=` 即算」；负控是 t48 的 `failed` + `citation check failed …`。**owner 已关** |
+| 5 | **DEP-1 生产帧三方对照** | **本轮由我独立复现（第二人读数）** | 见 §20.4：**改前 1/24 → 改后 14/24**（`graph.paths>0` 10/24），改前聚合 = 657 行里 `entities>0` **5 行 = 0.76%** |
+| 6 | **旧 transcript 反序列化** | **已交付**（t47 §15.2 的 `event_compat`），**并在我的门禁里再次为绿** | 我这次：`Running tests\event_compat.rs` ⇒ **2 tests ok**（旧形状 ⇒ `path=None`/`budget=None`；新形状 ⇒ 两者有值）。**这是行为面证据**（真的反序列化），不是属性本身的引用 |
+| 7 | **§1.6 其余 BREAK-*** | **12 条已由 t21 逐条处置**；我复核引用 + 给出其中 2 条的我方独立证据 | 引用 `gen2-integration-verify.md` §3.8（REC-1/2 · KB-1/2 · MEM-1/2 · WIKI-1/2/3 · GRAPH-1 · CORE-1，状态「已交付／部分可判／已交付（部分）」）。**我的独立证据**：BREAK-WIKI-1 的语义断言在我这次 `knowledge_api`（16 tests）里过；BREAK-CORE-1 的兼容性在我这次 `event_compat`（2 tests）里过。**KB-1 的「上夹 1..50 不可证伪」仍未定**（t21 自己的登记，我未重做，owner 仍是知识库单） |
+
+### 20.2 A-6 面板四页 DOM 读数（本轮亲测；并顺带纠正一条归因）
+
+**方法**（C60 形态）：我自己的守护进程（临时 root `%TEMP%\t46-dom\root`、**端口 19015**、pid **35092**）+ `RUAGENT_PANEL_DIST=<repo>/panel/dist` + `RUAGENT_EMBEDDER=hash`；E2E **走仓库入口** `npm run test:e2e`（写保护武装、`PW_TEST_REPORTER=json`、**退出码先于任何管道取**）。
+
+| 读数 | 值 |
+| --- | --- |
+| `npm --prefix panel run build`（该次探针的 dist 身份） | **exit 0 / 7.63s**；`dist/assets/index-DauJEPEl.js` `sha256 512BB2751D244F2E…`、`index-BBnBpmKB.css` `sha256 6818528EA170D2EE…` |
+| `npm --prefix panel run test:e2e`（仓库入口） | **exit 0**，**`62 passed (20.2s)`**，`0 failed` |
+| **Wiki 页** | `ok e2e\consumption.spec.ts:108 › a page with no build reading shows coverage unknown`；**DOM 原文：`DOM READING wiki coverage badge: 覆盖 unknown`** |
+| **Memory 页** | `ok e2e\consumption.spec.ts:147 › the recall log labels each score with its dimension`（量纲在 DOM 里） |
+| **Knowledge 页** | `ok e2e\consumption.spec.ts:173 › a hit's score carries its dimension`（量纲在 DOM 里） |
+| **Graph 页** | `ok e2e\consumption.spec.ts:199 › an entity reaches the DOM`；DOM 原文 `e2e-consumption-entity…probe0 条事实consumption probe entity` |
+| 「`number|null` 三态」落实处 | `panel/src/views/Wiki.tsx:192-206`：`p.cite_coverage == null ? t("wiki.coverageUnknown") : t("wiki.coverage", {s: p.cite_coverage.toFixed(2)})` ⇒ **null 与数字走两个分支**；上面那条 DOM 读到的正是 `覆盖 unknown`（第三态） |
+| 「并排显示必须带量纲」落实处 | `panel/src/views/Wiki.tsx:211` 的 `t("wiki.links", { out: p.links_out, in: p.links_in })`；两条**同量纲**（都是「条链接」），且 `links_out` 的语义已按 R-D D.3 收窄（**含断链、不含自链**）——`knowledge_api.rs:491-506` 对这条语义有逐字段断言，我这次跑到 16 tests 全绿 |
+
+**⇒ 一条纠正（按 §6.0 第 14 条，反做式核对而不是解释现象）**：`gen2-integration-verify.md` §3.7 把「**空根** e2e 的 3 条红」归因为「空根缺 wiki 页/实体/知识文档（CI 在 e2e 前跑 `doctor` 播种）」。**在我这次的字节上不成立**：我的根是**全新 root、没有跑 `doctor`**（我原本想额外播种的三条 curl 还因为 PowerShell 引号把 JSON 吃掉而**全部失败**，见 §20.5），而 `consumption.spec.ts` 的四条断言**全部通过**、整套 **62/62**。原因很直接：**该 spec 自己播种**（`test.beforeAll`：`PUT /api/v1/knowledge/raw/wiki/<slug>` + `POST /api/v1/memory/write` + 一次 `GET /recall`，且都在 `writeAccess()` 武装之下）。⇒ 「必须靠 `doctor` 播种」这条**归因**我不认；**我只主张我自己的读数**：**当前字节上，fresh root（无 doctor）⇒ 四页断言全绿**。t21 那次三红的成因我**未定因**（我没有他们的 dist/spec 字节），**不写成 finding**。
+
+### 20.3 `knowledge_api.rs` 逐字段断言（我读的原文 + 我跑的结果）
+
+我读了该文件 :437-:606 的断言本体（不是转述）：`a["links_out"] == 2`（tea-notes + k8s）· `self_links == 1` 且**自链不进 `links_out`**（否则会是 3）· `links_out_broken` 存在且 **k8s 计入 `links_out`**（断链**算**）· `cite_coverage.is_some()` 且**手写页为 `null`** · `degrees[i].links_out == pages[i].links_out`（两处同值为 2）· `links["broken"] == ["k8s"]` · 不变量 `links_out == resolved_out + links_out_broken`（:604-606）。**这些断言在我本轮的 `test --workspace` 里是 `knowledge_api` 目标 16 tests 的一部分并全绿** ⇒ 「wiki DEP-W + 逐字段断言」这条**有读数**（归属：断言作者是 wiki/DEP-W 的落地轮，**读数是我的**）。
+
+### 20.4 DEP-1 三方对照（本轮由我独立复现；活库只读）
+
+**方法**（按派单：`VACUUM INTO` 副本，活库从不以读写方式打开）：Python `sqlite3` 以 **`file:...?mode=ro`** 打开 `~/.ruagent/data/ruagent.db`（**24,276,992 B**）并 `VACUUM INTO` 副本（**23,838,720 B**）；**副本以外没有写任何东西**。三条臂：
+
+| 臂 | 定义 | 读数 |
+| --- | --- | --- |
+| **冻结帧** | 历史遥测里的**真实查询**集合（`SELECT DISTINCT query FROM recall_log`） | **24 条** |
+| **改前** | 副本里**历史行**的逐帧真值（某帧只要有任何一行 `entities>0` 记命中） | **1/24**；聚合 **657 行里 `entities>0` = 5 行 = 0.76%** |
+| **改后** | **同一 24 条帧**在**同一副本**上重放，走**生产** `GET /api/v1/recall?source=probe&strategy=aggressive&top_n=5`，当前二进制 | **14/24**（`graph.paths>0` **10/24**） |
+
+**逐帧（改后）样例**：`ruagent` / `ruagent memory` / `ruagent 本地优先 多智能体平台` ⇒ 5 实体 12 路径 · `Windows 11 运行环境 操作系统` ⇒ 5/12 · `postgres 连接池` ⇒ 2/5 · `知识库` ⇒ 2/12 · `autohotkey 改键` ⇒ 1/4 · 而 `kettle` / `wiki` / `panel` / `deploy` / `部署流水线` / `项目` ⇒ **0**（这些是**真·短语查询**，与 §14.3 的 `PROBE45FACT` 同类：腿是**实体名/别名/token/摘要 FTS/向量**，短语本身不是腿）。
+
+**与 t21 读数的差异（如实对齐，不掩盖）**：t21 = 改前 **1/23**、改后 **13/23**；我 = **1/24**、**14/24**。差一条帧：**我的帧集多一条**（活库在长，`DISTINCT query` 由 23 变 24）⇒ **帧集不是冻结的，是活的**；这正是「冻结帧」这条说法今天需要**写明复现条件**的原因（我给的是**同一时刻**的三方，不是与 t3/t7 逐条对齐的清单）。**方向与量级与 t21 一致**（1 → 13/14，`graph.paths>0` 10） ⇒ DEP-1 的「未定因」现在**有两条独立读数指向同一结论**；我不改 §4/§9 的既有结论，只在此追加。
+
+### 20.5 门禁与纪律
+
+| 门禁 | 读数 |
+| --- | --- |
+| `test --workspace`（`scripts/cargo-team.ps1`） | **exit 0**，`elapsed=276.6s`；大小写敏感：`test result: ok` **74 行**、`FAILED` **0 行**、`(\d+) passed` 求和 = **678**；**编译面覆盖的 target（Running/Doc-tests 行 148 条）含** `ruagent`(2) · `ruagent_acp`(16) · `ruagent_core`(11) · **`ruagent_daemon` unittests(159)** · `capabilities`(11) · `capability_defaults`(5) · **`event_compat`(2)** · `graph_ingest`(16) · `injection_e2e`(8) · **`knowledge_api`(16)** · `recall_evidence_announced`(3) · `smoke`(0) · `version_points`(5) · `ruagent_extract`(6) · `bounded`(9) · `graph-gold`(8) · `memory-gold`(3) · `requirement-markers`(12) · `ruagent_graph`(8) · `aliases`(2) · **`wiki_pipeline`** 等 |
+| `clippy --workspace --all-targets -DenyWarnings -CleanFirst ruagent-daemon` | **见 §20.6**（本轮先被队内编译锁挡住两次：日志 `another team build is running … waiting 10s`） |
+| `cd panel && npm run build` | **exit 0 / 7.63s**（55 assets；dist 身份见 §20.2） |
+
+- **计数差异如实记（未定因）**：我这次 `test result: ok` = **74 行 / 678 passed**，而 §16.3/§17.4 记的是 **55 行 / 386 passed**（同一条命令、同一个 wrapper）。**我没有查成因** ⇒ 按 §6.0 第 14 条**登记为观察，不主张原因**。
+- **纪律**：**未 push / 未 dispatch / 未发 tag**；**活库只读**（`mode=ro` + `VACUUM INTO`）· **活守护进程 8787/pid 14944 全程未触碰**（探针前后、DEP-1 前后都核对为 `14944`）；我起的两个 daemon 均按**自记 PID** 停（`alive=False` 已核）；临时目录 `%TEMP%\t46-dom`、`%TEMP%\t46-dep1`（含 23 MB 副本）按**具体路径**删；**C68**：DEP-1 输出由 Python 直接写 UTF-8（不经 PS 5.1 的 `>`），读前先看字节序。
+- **一处我自己的 harness 失误（如实记）**：三条播种 curl 全部返回 `Failed to parse the request body as JSON: key must be a string` —— PowerShell 把 `-d '{"k":"v"}'` 的内层双引号吃掉了。**读数不受影响**（spec 自播种，四条断言全绿），但它解释了我为什么**不能**声称「我播种了数据」。
+
+### 20.6 clippy 门（第三次尝试拿到读数；前两次的现场如实记）
+
+```
+第一次 20:57:01: 排队 4×10s → 拿到锁 → 打印 clean 行后【被中断】，日志没有退出码 ⇒ 那次读数作废
+第二次 20:59:45: 排队 4×10s …（同样在队内编译锁后）
+第三次(完成)    : [cargo-team] clean -p ruagent-daemon (the gate has no -p spec: …)
+                  Removed 111 files, 214.3MiB total
+                  [cargo-team] ============ NOT VERIFIED BY THE CLEAN ============
+                  gate builds: the workspace default set (no -p spec) / this run cleaned: ruagent-daemon
+                  [cargo-team] cargo clippy --workspace --all-targets -- -D warnings
+                  Checking ruagent-daemon v0.1.0 (…\crates\daemon)
+                  Checking ruagent-mcp v0.1.0 (…\crates\mcp)
+                  Checking ruagent-mock-agent v0.1.0 (…\crates\mock-agent)
+                  Checking ruagent v0.1.0 (…\cli)
+                  Finished `dev` profile … in 15.01s
+                  [cargo-team] exit=0 elapsed=15.3s
+                  CLIPPY_EXIT=0
+```
+
+**两件证据（派单要的）**：① 强制重查的落地 = `clean -p ruagent-daemon` + `Removed 111 files, 214.3MiB total`；② **`Checking ruagent-daemon / ruagent-mcp / ruagent-mock-agent / ruagent`** 出现在**本次**输出里 ⇒ 绿是**真重读**，不是 cargo 缓存（wrapper 自己那段 `NOT VERIFIED BY THE CLEAN` 提示 + `t116 W-1` 的判据正是为此）。
+

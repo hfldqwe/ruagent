@@ -95,9 +95,9 @@
 
 | 对照 | 行数 | 判定变化 | 失败集 |
 | --- | --- | --- | --- |
-| 半 A（home,board,memory,knowledge,graph,agents） | 54 | **无** | `[6, 7]` → `[6, 7]` |
+| 半 A（home,board,memory,knowledge,graph,agents） | 54 | **无**（`VERDICT CHANGED: none`） | `[6, 7]` → `[6, 7]` |
 | 半 B（chat,sessions,runtimes,stats,settings,inbox） | 54 | **只有 12：FAIL → PASS** | `[2, 6, 7, 12, 18]` → `[2, 6, 7, 18]` |
-| **全部 12 条路由 × 两档的逐元素计算样式** | 24 组快照 | <!-- EQUIV --> | 我碰过的文件是 `index.css`（全站）+ `App.tsx`（外壳）+ `Settings.tsx`（#settings）⇒ 覆盖全部 12 条路由 |
+| **全部 12 条路由 × 两档的逐元素计算样式** | 24 组快照 / **8918 个可见元素** | **0 处差异**（每个可见元素的 41 个计算属性 + `getBoundingClientRect` 四元组逐项相同） | 我碰过的文件是 `index.css`（全站）+ `App.tsx`（外壳）+ `Settings.tsx`（#settings）⇒ 覆盖全部 12 条路由 |
 
 **旁报（不是我的行，别算进来）**：当前字节上 **行 2**（`stats/dark=0.98%**，门槛 ≥1.0%）与 **行 18**（`chat/dark=命中区 地板<24px 1 · 内容区<32px 2/≤10 ✓`）在我**两臂都红**、且两臂**逐字相同** ⇒ **与本单无关、也不是本单造成的**（我 20:14 的 `t184` 臂上这两行还是绿的 ⇒ 中间有别的单的改动或脏仪器在起作用；我**没有**去改它们）。请 captain 决定归属。
 
@@ -119,8 +119,9 @@
 
 **做法**：探针在**每个路由 × 两档**上把**全部可见元素**按 DOM 顺序快照 41 个计算属性 + `getBoundingClientRect`（rect 四元组），
 - **配对对照**：修前臂（冻结 `dist-pre`）↔ 修后臂（冻结 `dist-post2`），**24 组**；隐藏元素（antd 的 portal/测量行）被排除，因为它们的数量会在两次运行间变化、会把索引整体错位（这一点我踩过一次，见 §9 第 1 条）。
-- **它确实能红**：<!-- MUT -->
-  另外**第一次**的负控（`.row.between { justify-content: flex-start }` / `.flush { margin: 3px }`，无 `!important`）**没有生效**（只有 1 处 React 生成 id 的噪声差异）⇒ 我**没有**把它当作通过，而是换成带 `!important` 的强变异并让探针**自己打印**变异已应用（诚实登记）。
+- **它确实能红**：把两个被搬运的类**在浏览器里**改掉声明（`.row.between{justify-content:flex-start!important}.flush{margin:17px!important}`，只注入样式表、**不动仓库**）⇒ 同一份对照报出 **450 处差异**，并且**逐项精确命中**：`justifyContent` **13** 处（= DOM 里 `.row.between` 的 **13** 个）+ `marginTop/Right/Bottom/Left` 各 **14** 处（= `.flush` 的 **14** 个）+ 由此传播的 `rect`/`width`/`height` ⇒ **断言能失败，且失败的位置正是我搬过的元素**。
+  另外登记**两次没生效的尝试**（都如实算「未通过」，不算绿）：① 变异放在**环境变量**里 ⇒ WSL interop 没把它带进 node 进程（我用「直接读计算值」的实验确认了这一点）；② 变异字符串**带空格** ⇒ 我的 node 桥接**按空格拆参数**，`process.argv[6]` 只剩下 `.row.between` ⇒ 注入的是残缺 CSS。改成 **argv + 无空格 CSS** 后才生效。
+  顺带一条**独立核对**：DOM 里 `.row.between` = **13** 个、`.flush` = **14** 个 —— 与 §0/§1 的归属（13 个 `.row` 的行内 `space-between` + 14 个 `margin:0` 的段落）**逐数对上**。
 
 **这条负控抓到的东西**：第一次的 `.pad0`（§2）—— 页面高度 +100px、257 处 rect 位移、`paddingTop/paddingBottom` 各 17/11 处 ⇒ 我判定「**搬运不等价**」并改成 `.row.tight.pad0` 才继续；**不是**先报绿再想。
 
@@ -141,7 +142,7 @@
 | **仪器** worktree | `sha256 = 99f9ed14b36e2d2f3d70bd679cef59eac0f7c0856104686f8a473df1fa7185ed`，**脏**（`M panel/tools/design-audit.mjs`，mtime **2026-10-04 20:10:13**，`t169` 的编辑）· blob `HEAD: = ed25988ac13d9c33298b186c8fef212ed0146be6` |
 | 修前臂产物 | 冻结 `dist-pre`：`index-CMorSDAz.js` · `index-2tcemk4l.css` |
 | 修后臂产物（中间一次，含 `.pad0` 错误） | `dist-post`：`index-Cq8sMf1a.js` · `index-BB6jYr6k.css`（sha 前缀 `1c21b51f96d56332`） |
-| **最终臂产物** | 冻结 `dist-post2`：<!-- DIST2 --> |
+| **最终臂产物** | 冻结 `dist-post2`：`index-C3qaG-gm.js` · `index-BBnBpmKB.css`（sha 前缀 `6818528ea170d2ee`）—— §3/§4/§6 的全部读数都属于这一份 |
 | 服务证明 | 每个臂的守护进程日志都有 `INFO ruagent_daemon::api: serving the web panel dist=<我的冻结目录>`，且首页引用的 chunk 与该目录一致（**不靠 `health=200` 判断是谁在服务** —— `t184` 的教训） |
 
 ## 9 未覆盖什么 / 诚实登记

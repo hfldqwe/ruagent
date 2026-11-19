@@ -135,15 +135,19 @@ against `v0.1.1` passes.
 
 ## Known gaps
 
-* **Intel Macs are not published.** macOS ships as `aarch64-apple-darwin` (Apple silicon) from `v0.1.2`; the
-  x86_64 macOS target is absent because no run has produced one, and an untested target is not a download to
-  offer. Adding it means a matrix entry plus its packaging and smoke steps, proven first through the dry-run
-  dispatch above.
+* **Intel Macs are not published, and the reason is a dependency, not an omission.** macOS ships as
+  `aarch64-apple-darwin` (Apple silicon) from `v0.1.2`; the x86_64 macOS target cannot be built at all:
+  `ort-sys@2.0.0-rc.13` publishes no prebuilt ONNX runtime for `x86_64-apple-darwin` and the link step dies
+  (`error: build script logged errors => exit 101`, measured in release dispatch run 43238636506 -- the other
+  three targets in that same run went green). Adding the matrix row is therefore not the work; choosing among
+  "compile the embedder out for that target", "move to an `ort` whose prebuilt set includes it" and "build ONNX
+  Runtime from source" is. Tracked in issue #78, with `release.yml`'s own comment carrying the same account.
 * **`v0.1.1` archives report `ruagent 0.1.0`** in `--version`, per the miss described above; the version was
   bumped to `0.1.1` afterwards, so every release from now on matches its tag.
-* **`e2e.yml` still takes the action's default toolchain.** `ci.yml`, `audit.yml` and `release.yml` pin
-  `1.95.0` and `check-toolchain-pin.sh` fails on a mismatch; `e2e.yml` is outside that list and is reported
-  as a WARN on every run rather than failing silently.
+* **Every workflow pins the toolchain.** `ci.yml`, `audit.yml`, `release.yml` and `e2e.yml` all pass
+  `toolchain: "1.95.0"` -- the same value as `rust-toolchain.toml` -- and `check-toolchain-pin.sh` lists all
+  four as ENFORCED, so a dropped input or a disagreeing value fails rather than being reported as a WARN.
+  (`e2e.yml` was the last carrier outside that list; issue #74 item 2 pinned it.)
 * **The download itself can be truncated on this network.** A `gh release download` of the 97 MB `v0.1.0`
   asset produced a 3.2 MB file that was not a zip, while the API reported the full 97,274,294 bytes -- a
   transport truncation, NOT a corrupt asset. Check `sha256sum` against `SHA256SUMS` before concluding that a
