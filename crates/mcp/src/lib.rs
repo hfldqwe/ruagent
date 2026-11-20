@@ -687,6 +687,12 @@ impl PlatformTools {
         if let Some(prompt) = params.prompt.as_deref() {
             body.insert("prompt".to_string(), serde_json::json!(prompt));
         }
+        // P2.1: same rule as `agent` — only what the caller sent goes on the wire. An absent origin
+        // means "no conversation is waiting" (panel/script dispatch), which is a MEANING, not a
+        // value to invent here.
+        if let Some(origin) = params.origin_chat_id.as_deref() {
+            body.insert("origin_chat_id".to_string(), serde_json::json!(origin));
+        }
         let resp = json_of(
             self.http.post(&url).json(&serde_json::Value::Object(body)),
             what,
@@ -3170,6 +3176,10 @@ pub struct TaskDispatchParams {
     pub agent: Option<String>,
     #[schemars(description = "Prompt override for this attempt; omitted = the task's own intent.")]
     pub prompt: Option<String>,
+    #[schemars(
+        description = "WHICH CONVERSATION this work belongs to (P2.1 of docs/plans/2026-11-20-primary-supervisor-design.md): the chat id, when you are dispatching from inside a conversation and want the answer reported BACK into it once the whole task is terminal. The daemon then wakes that conversation ONE time with the cluster's conclusion (agent names, the task title, the result or the failure — and, if it failed, the one automatic retry it tried first). OMIT IT when the caller is not a chat (a script, the panel, a test): nobody is waiting to be woken, and the run is not attributed to any conversation. The report is a platform event, not a user message."
+    )]
+    pub origin_chat_id: Option<String>,
 }
 
 /// The parameters of `run_get`.

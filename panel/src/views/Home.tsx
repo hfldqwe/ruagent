@@ -11,9 +11,16 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Button, Card } from "antd";
-import { api, isRoleAgent, type MemoryRow, type PrimaryInfo, type SessionRecord } from "../api";
+import {
+  api,
+  isRoleAgent,
+  type MemoryRow,
+  type PrimaryInfo,
+  type RunReceipt,
+  type SessionRecord,
+} from "../api";
 import { useI18n } from "../i18n";
-import { ErrorState, ReadoutStrip, RelTime, Spinner } from "../ui";
+import { ErrorState, ReadoutStrip, RelTime, Spinner, StatusDot } from "../ui";
 import { Icon, type IconName } from "../icons";
 import { SOURCE_LABEL, msToIso, sourceHue } from "./Sessions";
 import { CreateTaskModal } from "./CreateTaskModal";
@@ -44,6 +51,17 @@ interface Dash {
    *  answers the other six endpoints but not this one would be reported
    *  OFFLINE while it is plainly online — the same class of lie as "0 agents". */
   frontDoorErr: unknown;
+  /** THE RECEIPTS (P1 of docs/plans/2026-11-20-primary-supervisor-design.md §3):
+   *  the runs that finished / failed most recently, anywhere in the platform —
+   *  `GET /api/v1/runs?status=completed|failed&limit=…`.
+   *
+   *  `null` = not answered yet (or the read failed, which `failed` names). An
+   *  EMPTY ARRAY is a real, definite answer: "nothing has finished yet" — and
+   *  that is what the blocks say, in words. They never render the number 0 in
+   *  place of it, for the same reason the gauges render an em dash: "0" is a
+   *  reading, and there is no reading here to give. */
+  recentDone: Maybe<RunReceipt[]>;
+  recentFailed: Maybe<RunReceipt[]>;
   /** endpoints that did not answer; their gauges read em dash, never 0. */
   failed: string[];
 }
@@ -61,6 +79,8 @@ const BLANK: Dash = {
   embedder: null,
   frontDoor: null,
   frontDoorErr: null,
+  recentDone: null,
+  recentFailed: null,
   failed: [],
 };
 
@@ -69,6 +89,10 @@ const STORES = ["profile", "observation", "procedure", "lesson"] as const;
  *  (view-home.md §4 density cap). */
 const RECENT_CAP = 8;
 const PREVIEW_CAP = 3;
+/** How many receipts each block shows. Smaller than `RECENT_CAP`: a receipt row is
+ *  a pointer to a task, and the newest few are the whole point — the full list is
+ *  one route (`GET /api/v1/runs`) and one click (`查看全部`) away. */
+const RECEIPTS_CAP = 5;
 
 /** The dash a gauge shows when its number could not be read. */
 const NA = "—";
@@ -94,6 +118,88 @@ function DashHead({
       <span className="grow" />
       {actions}
     </div>
+  );
+}
+
+/**
+ * THE RECEIPTS — "what finished / what failed, just now, anywhere in the platform".
+ *
+ * WHY HERE (P1 of docs/plans/2026-11-20-primary-supervisor-design.md §3): the user's
+ * own complaint was "switching between windows and several agents is exhausting", and
+ * before this the platform could not answer "who is done" without opening each task in
+ * turn — every run was a window you had to go back to. This is the dashboard saying it
+ * once, for all of them.
+ *
+ * IT IS ONE COMPONENT, RENDERED TWICE (finished / failed), because the two blocks must
+ * not drift: same three states, same row anatomy, same empty wording. The difference is
+ * the `status` filter the caller passed to `GET /api/v1/runs` and the empty sentence.
+ *
+ * THE THREE STATES ARE NOT INTERCHANGEABLE:
+ *   unreadable (`null`) -> `home.runs.unreadable`: this read did not answer. NOT
+ *                          "nothing yet" — an unread fact is not an empty one
+ *                          (MASTER §12 row 20, the rule the gauges follow).
+ *   empty ([])          -> the block SAYS "还没有…" in words. It never renders the
+ *                          number 0 in its place: 0 is a reading, and a reader who
+ *                          sees 0 has been told something nobody measured.
+ *   rows                -> task title, agent NAME, when, and — for a failure — the
+ *                          cause. The row is a button back to the task, because a
+ *                          receipt that cannot be opened is a dead end.
+ */
+function ReceiptZone({
+  title,
+  runs,
+  empty,
+  onOpenTask,
+  onNav,
+}: {
+  title: string;
+  runs: Maybe<RunReceipt[]>;
+  /** The DEFINITE empty sentence for this block. Passed as TEXT (not as a key) so the
+   *  translation call that resolves it is a LITERAL at the call site: that is what
+   *  `panel/e2e/i18n-check.mjs` can verify, and a key handed through a variable is a
+   *  translation nothing checks. (A literal spelled inside a comment is scanned too —
+   *  that is how this sentence came to be written without one.) */
+  empty: string;
+  onOpenTask: (id: string) => void;
+  onNav: (hash: string) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <section className="zone">
+      <DashHead
+        title={title}
+        actions={
+          <Button type="text" size="small" onClick={() => onNav("board")}>
+            {t("home.recent.viewAll")}
+          </Button>
+        }
+      />
+      {runs === null ? (
+        <p className="muted micro">{t("home.runs.unreadable")}</p>
+      ) : runs.length === 0 ? (
+        <p className="muted">{empty}</p>
+      ) : (
+        runs.map((r) => (
+          <button
+            key={r.id}
+            className="row-btn"
+            onClick={() => onOpenTask(r.task_id)}
+            title={r.error}
+          >
+            <StatusDot status={r.status} />
+            <span className="title">{r.task_title}</span>
+            <span className="tag">{r.agent}</span>
+            {r.error ? (
+              <span className="muted micro truncated">{r.error}</span>
+            ) : null}
+            <span className="grow" />
+            <span className="time">
+              <RelTime iso={r.updated_at} />
+            </span>
+          </button>
+        ))
+      )}
+    </section>
   );
 }
 
@@ -280,6 +386,19 @@ export function Home({
         .knowledgeDocs()
         .then((d) => patch({ docs: d.documents.length, embedder: d.embedder }, "knowledge"))
         .catch(() => markFailed("knowledge")),
+      // THE RECEIPTS, through the SAME pair. They are two reads of ONE endpoint
+      // (the same route, two `status` values), each settling on its own: a failed
+      // read of "recently failed" must not take the "recently finished" block down
+      // with it, and `patch`/`markFailed` is already the mechanism that guarantees
+      // that (one endpoint's failure leaves the rest of the page standing).
+      api
+        .runs({ status: "completed", limit: RECEIPTS_CAP })
+        .then((p) => patch({ recentDone: p.runs }, "runs-done"))
+        .catch(() => markFailed("runs-done")),
+      api
+        .runs({ status: "failed", limit: RECEIPTS_CAP })
+        .then((p) => patch({ recentFailed: p.runs }, "runs-failed"))
+        .catch(() => markFailed("runs-failed")),
       // The front door rides the SAME window as the six above (one cadence per
       // page) but settles itself: it has its own failure text and must not move
       // the platform dot, so it does not go through patch/markFailed — see
@@ -409,6 +528,23 @@ export function Home({
 
       <div className="dash-grid">
         <Card size="small" className="dash-main">
+          {/* The receipts sit FIRST in the main column: "what just happened" is the
+              question this page exists to answer, and before P1 it had no answer at
+              all outside of opening each task. */}
+          <ReceiptZone
+            title={t("home.runs.done.title")}
+            runs={dash.recentDone}
+            empty={t("home.runs.done.empty")}
+            onOpenTask={onOpenTask}
+            onNav={onNav}
+          />
+          <ReceiptZone
+            title={t("home.runs.failed.title")}
+            runs={dash.recentFailed}
+            empty={t("home.runs.failed.empty")}
+            onOpenTask={onOpenTask}
+            onNav={onNav}
+          />
           <section className="zone">
             <DashHead
               title={t("home.recent.title")}

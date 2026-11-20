@@ -13,7 +13,7 @@ use ruagent_core::{Run, RunId, RunStatus, Task, TaskCreator, TaskStatus};
 use ruagent_knowledge::rrf::WeightError;
 use ruagent_store::migrations::DISTILL_LOG_COLUMNS;
 use ruagent_store::{DeleteSession, TranscriptLine, transcript_path};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::config::DaemonConfig;
@@ -164,6 +164,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/tasks/{id}/pipeline", post(start_pipeline))
         .route("/api/v1/tasks/{id}/judge", post(judge_task))
         .route("/api/v1/tasks/{id}/land", post(land_task))
+        // P1 receipts layer (docs/plans/2026-11-20-primary-supervisor-design.md §3):
+        // EVERY run, filtered and paged through the shared envelope. Until this route
+        // existed, a run was reachable only through its task and through `/runs/{id}`,
+        // so "what just happened anywhere in the platform" had no answer at all
+        // (docs/design/async-entry-audit.md §2.2, §4 step 1).
+        .route("/api/v1/runs", get(list_runs))
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/select", post(select_run))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
@@ -3350,6 +3356,21 @@ struct StartRunRequest {
     /// mode) / `effort` (thinking level), applied after session/new.
     #[serde(default)]
     options: std::collections::BTreeMap<String, String>,
+    /// WHICH CONVERSATION asked for this run (P2.1 of
+    /// docs/plans/2026-11-20-primary-supervisor-design.md §3).
+    ///
+    /// Absent means "dispatched by the panel or an external client": nobody is
+    /// waiting to be woken, because the caller is already looking at the answer.
+    /// Present names the chat that should be told when this run's cluster reaches a
+    /// terminal state.
+    ///
+    /// `#[serde(default)]` on purpose — it makes the field ADDITIVE on the wire, so a
+    /// dispatcher that sends it to a daemon that predates the column is not refused,
+    /// and one written before this field existed still deserializes here.
+    ///
+    /// The value rides `RunLaunch::origin_chat_id` into `runs.origin_chat_id` (P2.1).
+    #[serde(default)]
+    origin_chat_id: Option<String>,
 }
 
 /// The agent for the no-cascade fallback: the first ENABLED card of the REGISTRY the run resolves
@@ -3660,6 +3681,12 @@ async fn start_run(
         },
         (None, None) => WorkspaceSpec::Fresh,
     };
+    // P2.1: the conversation that asked for this run rides the launch, not the task —
+    // attribution belongs to the DISPATCH (one task can be dispatched by a chat and later
+    // re-dispatched from the board, and that second dispatch has nobody to wake). The
+    // receiver (`RunLaunch::origin_chat_id`, the `runs.origin_chat_id` column and the
+    // completion hook) belongs to the P2 owner; this line is the whole contribution of
+    // this entrance, and an absent value stays `None` = "nobody is waiting".
     let run = state
         .mgr
         .start_run(
@@ -3671,6 +3698,7 @@ async fn start_run(
             crate::runs::RunLaunch {
                 routed: Some(decision),
                 options: req.options,
+                origin_chat_id: req.origin_chat_id,
                 ..Default::default()
             },
         )
@@ -3688,9 +3716,18 @@ struct FanOutRequest {
     /// (issue #36): mode / effort.
     #[serde(default)]
     options: std::collections::BTreeMap<String, String>,
+    /// WHICH CONVERSATION asked for this fan-out (P2.1). EVERY branch records the SAME
+    /// value (`start_fanout` clones it per run) — that is what lets the completion hook
+    /// report once for the whole fan-out instead of once per branch.
+    #[serde(default)]
+    origin_chat_id: Option<String>,
 }
 
 /// Fan-out compare (design §5.2): same prompt to N agents in parallel.
+///
+/// THE ORIGIN IS ONE VALUE FOR N BRANCHES: every branch is a run of the SAME task
+/// (`orchestrator::plan` clones it), so "the cluster is terminal" and "the fan-out is
+/// done" are the same question, and the completion hook wakes the asking chat once.
 async fn start_fanout(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -3714,6 +3751,9 @@ async fn start_fanout(
             prompt,
             req.repo.map(std::path::PathBuf::from),
             req.options,
+            // EVERY branch carries the same conversation: the completion hook aggregates by
+            // task, so N branches report once. Passing it per branch instead would be N wakeups.
+            req.origin_chat_id.clone(),
         )
         .await?;
     Ok(Json(serde_json::json!({ "runs": runs })))
@@ -3723,6 +3763,13 @@ async fn start_fanout(
 struct PipelineRequest {
     steps: Vec<PipelineStepDto>,
     prompt: Option<String>,
+    /// WHICH CONVERSATION asked for this pipeline (P2.1). The SHAPE it must survive is
+    /// not the fan-out's: `start_pipeline` creates a SUB-TASK per step
+    /// (`runs.rs`'s `plan` loop, `orchestrator::plan`), so each step is its own task and
+    /// its own run — every one of them records this value, and "when do I report?" stays
+    /// the completion hook's question about the task tree, not this entrance's.
+    #[serde(default)]
+    origin_chat_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3732,6 +3779,9 @@ struct PipelineStepDto {
 }
 
 /// Pipeline (design §5.2): sequential sub-tasks with bounded handoff.
+///
+/// Every step's run records the asking conversation: the steps are separate tasks, so
+/// attribution has to be copied into each one rather than inherited from the parent.
 async fn start_pipeline(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -3755,7 +3805,10 @@ async fn start_pipeline(
             prompt: s.prompt,
         })
         .collect();
-    let task_ids = state.mgr.start_pipeline(&task, steps, base_prompt).await?;
+    let task_ids = state
+        .mgr
+        .start_pipeline(&task, steps, base_prompt, req.origin_chat_id.clone())
+        .await?;
     Ok(Json(serde_json::json!({ "tasks": task_ids })))
 }
 
@@ -3765,6 +3818,11 @@ struct JudgeRequest {
     /// Restrict judging to these runs; default = every completed run
     /// with a result.
     run_ids: Option<Vec<String>>,
+    /// WHICH CONVERSATION asked for the verdict (P2.1). A judge run is a run of its own
+    /// on a judge SUB-TASK (`start_judge` builds it), so the attribution belongs on THAT
+    /// run — the task whose branches are being compared is not where the verdict lives.
+    #[serde(default)]
+    origin_chat_id: Option<String>,
 }
 
 /// Fan-out judge (design §5.2/§5.3): a NORMAL run that reviews the
@@ -3838,7 +3896,7 @@ async fn judge_task(
     }
     let run = state
         .mgr
-        .start_judge(&task, &req.agent, &candidates)
+        .start_judge(&task, &req.agent, &candidates, req.origin_chat_id.clone())
         .await?;
     Ok(Json(serde_json::json!({ "judge_run": run })))
 }
@@ -3934,6 +3992,233 @@ async fn land_task(
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({ "landed": hash })))
+}
+
+// ---------------------------------------------------------------------------
+// P1: the receipts layer — "what has just happened, anywhere in the platform"
+// (docs/plans/2026-11-20-primary-supervisor-design.md §3 P1;
+//  docs/design/async-entry-audit.md §2.2 and §4 step 1)
+// ---------------------------------------------------------------------------
+
+/// The filter set of `GET /api/v1/runs`.
+#[derive(Deserialize)]
+struct ListRunsQuery {
+    /// ONE `RunStatus` spelling, exact. An unknown value is a 400 and never a
+    /// silently ignored filter: a typo that answers "everything" looks exactly like
+    /// a successful filtered read (see `parse_run_status`).
+    #[serde(default)]
+    status: Option<String>,
+    /// Only runs whose `updated_at` is at or after this instant. Unix milliseconds
+    /// or any instant spelling `ruagent_graph::parse_ts` accepts — see
+    /// [`parse_since_ms`], which owns that decision in ONE place.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// One run's RECEIPT: everything needed to answer "did this work finish, and did it
+/// work" without opening the run, its task or its transcript.
+///
+/// WHY `agent` IS A NAME AND `agent_id` STILL RIDES ALONG (the same ruling
+/// `task_dispatch` already made, `crates/mcp/src/lib.rs` `describe_agent`): the
+/// registry id is what a run RECORDS and what every other run face answers with
+/// (`Json<Run>`'s `params.agent`), while the name is what a human reads. Keeping both
+/// is what lets a caller link to the agent page (`agent_id`) without printing a ULID
+/// at the user (`agent`) — and it makes the translation auditable instead of magic:
+/// when the registry no longer holds the id, `agent` falls back to the id ITSELF,
+/// which `agent_id` is then equal to. That equality is the honest reading for
+/// "no card with this id any more", not a name that looks like one.
+#[derive(Serialize)]
+struct RunReceipt {
+    id: String,
+    task_id: String,
+    task_title: String,
+    agent: String,
+    agent_id: String,
+    status: RunStatus,
+    /// `status.is_terminal()` — the ONE predicate (core's, not a copy here), because
+    /// `WaitingPermission` is an ACTIVE state that has no writer yet (§6 of the plan)
+    /// and a second "is it done" test in this file is how the two would drift.
+    finished: bool,
+    /// RFC3339, the same shape `Json<Run>` answers with. The filter reads it as unix
+    /// ms (`since`), the wire carries the instant; one value, two renderings.
+    updated_at: chrono::DateTime<chrono::Utc>,
+    /// PRESENT ONLY when the run recorded a failure cause. A key that is always there
+    /// and usually null trains a reader to skip it; its absence means "nothing failed
+    /// here", which is a fact about the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// One run row, receipt-shaped. The name lookup is a linear scan of the registry
+/// because the registry is one card per agent and the page is small — a map built per
+/// request would be the same work with more moving parts.
+fn run_receipt(run: Run, task_title: &str, cards: &[ruagent_core::AgentCard]) -> RunReceipt {
+    let card = cards.iter().find(|c| c.id == run.params.agent);
+    RunReceipt {
+        id: run.id.to_string(),
+        task_id: run.task_id.to_string(),
+        task_title: task_title.to_string(),
+        agent: card
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| run.params.agent.to_string()),
+        agent_id: run.params.agent.to_string(),
+        status: run.status,
+        finished: run.status.is_terminal(),
+        updated_at: run.updated_at,
+        error: run.error,
+    }
+}
+
+/// `GET /api/v1/runs?status=&since=&limit=&offset=` — every run, newest activity first,
+/// through the daemon's ONE pagination envelope.
+///
+/// THE SIX ENDPOINT SHAPE comes from `list_tasks` above, not from anything new: the
+/// filtered set is read once, counted (`total` = the filter's match count), sliced here,
+/// and wrapped by `page("runs", …)`. No second paging implementation, and `truncated`
+/// therefore means the same thing it means on `/tasks`.
+///
+/// WHY THE SET IS BUILT FROM TASK ROWS INSTEAD OF ONE `SELECT … FROM runs`: the store's
+/// run readers are `get_run`, `list_runs_for_task`, `list_runs_by_status` and the
+/// `agent_stats` aggregate — there is no all-runs reader, and `crates/store/src/lib.rs`
+/// belongs to another implementer in this change (the plan's §4 ownership table says so
+/// explicitly, and two people adding functions to one file is a guaranteed conflict).
+/// So the page is composed from readers that ALREADY exist: the task list (which also
+/// SUMMARISES the title this route must report) and each task's runs. `DELETE /tasks/{id}`
+/// deletes its runs in the same transaction, so this composition is COMPLETE — no run
+/// row can exist without the task row this loop visits.
+///
+/// The cost is one reader call per task (25 on the live database, single-user scale), and
+/// the request this route serves is polled at the panel's 10 s cadence, not per keystroke.
+/// A single paged reader is still the right end state; the signature is written out in
+/// the P1 handover note rather than added here.
+async fn list_runs(
+    State(state): State<AppState>,
+    Query(q): Query<ListRunsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(s) => Some(parse_run_status(s).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unknown status `{s}` (queued|spawning|running|waiting_permission|\
+                 completed|failed|cancelled|interrupted)"
+            ))
+        })?),
+    };
+    let since_ms = match q.since.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_since_ms(raw).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "since `{raw}` is neither unix milliseconds nor an RFC3339 instant"
+            ))
+        })?),
+    };
+
+    let db = state.mgr.db();
+    let cards = state.mgr.agents();
+    let mut receipts: Vec<RunReceipt> = Vec::new();
+    for task in db.list_tasks(None).await? {
+        for run in db.list_runs_for_task(task.id).await? {
+            if status.is_some_and(|want| run.status != want) {
+                continue;
+            }
+            // `updated_at`, not `created_at`: a run created two hours ago and finished a
+            // minute ago is what "just happened" means, and it is the column the spec
+            // names.
+            //
+            // WHAT `updated_at` IS, MEASURED (this is the audit's §5 item 2, answered):
+            // only a STATE TRANSITION writes it — `runs.rs`'s `insert_run` (the queued
+            // row) plus `update_run` at spawning/running/terminal/cancel
+            // (`runs.rs:754/759/766`, `:822/847/906/946`, `:1688/1700/1792/1812`). The
+            // event stream does NOT touch the row (`append_event` appends JSONL only), and
+            // the P2 completion hook runs AFTER the terminal `update_run`
+            // (`runs.rs:1890`) without writing again. So `since` means "whose STATUS
+            // changed at or after this instant" — not "which was active since": a long run
+            // that is still `running` has not moved this column since it started, and a
+            // caller asking "what happened in the last minute" gets exactly the
+            // transitions, not a heartbeat.
+            if since_ms.is_some_and(|since| run.updated_at.timestamp_millis() < since) {
+                continue;
+            }
+            receipts.push(run_receipt(run, &task.title, &cards));
+        }
+    }
+    // Newest activity first, and ID as the tie-break: two runs written in the same
+    // millisecond (a fan-out does exactly that) must page deterministically, otherwise
+    // `offset` can show one row twice and hide another.
+    receipts.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.id.as_str().cmp(a.id.as_str()))
+    });
+    let total = receipts.len() as i64;
+    let (limit, offset) = page_bounds(q.limit, q.offset, 200, 1_000);
+    let runs: Vec<RunReceipt> = receipts
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(Json(page(
+        "runs",
+        serde_json::json!(runs),
+        total,
+        limit,
+        offset,
+    )))
+}
+
+/// The `RunStatus` a `?status=` value names, or `None` for a value that names none.
+///
+/// DELIBERATELY NOT `ruagent_store`'s `run_status_from_str`: that one is the READER's
+/// mapping and it maps anything unrecognised to `Queued` (a row's status text has to
+/// become SOME variant), which is right for reading a row and wrong for a filter — it
+/// would turn `?status=complete` (a typo for `completed`) into a successful read of the
+/// queued runs. A caller's typo must be a 400 here, which is the design's own rule.
+fn parse_run_status(s: &str) -> Option<RunStatus> {
+    match s {
+        "queued" => Some(RunStatus::Queued),
+        "spawning" => Some(RunStatus::Spawning),
+        "running" => Some(RunStatus::Running),
+        "waiting_permission" => Some(RunStatus::WaitingPermission),
+        "completed" => Some(RunStatus::Completed),
+        "failed" => Some(RunStatus::Failed),
+        "cancelled" => Some(RunStatus::Cancelled),
+        "interrupted" => Some(RunStatus::Interrupted),
+        _ => None,
+    }
+}
+
+/// `since=` as unix milliseconds, from EITHER spelling the platform already uses.
+///
+/// WHY BOTH, with the evidence: the textual form is the daemon's own convention for an
+/// instant parameter — `GET /graph/retrieve?as_of=` and `POST /graph/fact`'s `valid_at`
+/// both go through `ruagent_graph::parse_ts`, which is reused here verbatim so this
+/// route cannot accept a spelling the graph entrance refuses (or refuse one it
+/// accepts). The integer form is the PANEL's convention — `SessionRecord.updated_at`
+/// and every chat timestamp on the wire are unix ms — and a receipts layer that is
+/// polled from that panel should not demand a reformat of a number it already holds.
+///
+/// A ten-digit integer is the same instant in SECONDS, and it is accepted as such on
+/// purpose: reading `1780000000` as milliseconds would place the filter in 1970-01 and
+/// return every row, a wrong answer that looks exactly like a correct one. A value that
+/// is neither an integer nor an instant is `None`, which the handler turns into a 400
+/// for the same reason.
+fn parse_since_ms(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        // 1e9..1e11 in milliseconds is 1970-01-12 .. 1973-03-03, a range this platform
+        // has no runs in; in seconds it is 2001-09-09 .. 5138-11-16, which is every
+        // instant a person would type.
+        return Some(if (1_000_000_000..100_000_000_000).contains(&n) {
+            n.saturating_mul(1000)
+        } else {
+            n
+        });
+    }
+    ruagent_graph::parse_ts(s).map(|dt| dt.timestamp_millis())
 }
 
 async fn get_run(
@@ -11307,6 +11592,540 @@ mod tests {
                 .collect::<Vec<_>>(),
             shape,
             "the alias opt-in adds its own top-level key and nothing else: {with_aliases}"
+        );
+
+        report_test_root_left_behind(&root);
+    }
+
+    /// P1 (docs/plans/2026-11-20-primary-supervisor-design.md §3): `GET /api/v1/runs` —
+    /// the receipts layer, one reading at a time.
+    ///
+    /// WHAT THIS PINS: the SHARED envelope (the same four keys `/tasks` answers with —
+    /// a second page shape would have to differ in its keys, and that is the failing
+    /// assertion), newest-activity-first ordering, the `status` filter, `since` in BOTH
+    /// spellings the platform already uses (unix ms from the panel, RFC3339 from every
+    /// daemon-side instant parameter) as the SAME filter, `offset` moving the page,
+    /// `truncated` true only on the cut page, the `agent`/`agent_id` pair (a NAME with
+    /// the id it came from), `finished` following core's terminal predicate rather than
+    /// a second "is it done" test, `error` present only where a run recorded a cause,
+    /// and an EMPTY answer that is an empty ARRAY with a normal envelope — never a
+    /// stand-in reading.
+    ///
+    /// THE TWO 400s ARE PART OF THE CONTRACT: `?status=complete` (a typo for
+    /// `completed`) and a `since` that is neither unit must fail loudly. A filter that
+    /// silently matches everything looks exactly like a successful filtered read.
+    #[tokio::test]
+    async fn the_receipts_route_lists_every_run_filtered_and_paged() {
+        let (app, db, root) = harness().await;
+
+        // The seeded runs must name an agent the REGISTRY holds, so the name
+        // resolution is exercised instead of its "no card with this id" fallback.
+        let (st, agents, raw) = hit(&app, "GET", "/api/v1/agents").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let card = agents["agents"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("the seeded registry holds at least one agent");
+        let agent_name = card["name"].as_str().expect("an agent name").to_string();
+        let agent_id: ruagent_core::AgentId = card["id"]
+            .as_str()
+            .expect("an agent id")
+            .parse()
+            .expect("a uuid agent id");
+
+        // Two tasks, so `task_title` is a real lookup and not a coincidence.
+        let mut tasks: Vec<(ruagent_core::TaskId, String)> = Vec::new();
+        for title in ["receipts-a", "receipts-b"] {
+            let (st, v, raw) = send_json(
+                &app,
+                "POST",
+                "/api/v1/tasks",
+                Some(serde_json::json!({ "title": title, "intent": "receipts" })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+            tasks.push((
+                v["id"].as_str().expect("a task id").parse().expect("uuid"),
+                title.to_string(),
+            ));
+        }
+
+        // Five runs, one minute apart, NEWEST FIRST in `plan` — so the ordering
+        // assertion cannot pass by an accident of insertion order. Statuses straddle
+        // core's terminal predicate, and two of them carry a failure cause.
+        let now = chrono::Utc::now();
+        let plan: [(RunStatus, Option<&str>, i64); 5] = [
+            (RunStatus::Failed, Some("the harness exited 1"), 0),
+            (RunStatus::Completed, None, 1),
+            (RunStatus::Running, None, 2),
+            (RunStatus::Interrupted, Some("daemon restarted mid-run"), 3),
+            (RunStatus::Queued, None, 4),
+        ];
+        let mut seeded: Vec<(String, i64)> = Vec::new();
+        for (i, (status, error, age_min)) in plan.into_iter().enumerate() {
+            let mut run = Run::new(
+                tasks[i % tasks.len()].0,
+                ruagent_core::RunParams::for_agent(agent_id),
+            );
+            run.status = status;
+            run.error = error.map(str::to_string);
+            run.updated_at = now - chrono::Duration::minutes(age_min);
+            run.created_at = run.updated_at - chrono::Duration::minutes(30);
+            db.insert_run(&run).await.unwrap();
+            seeded.push((run.id.to_string(), run.updated_at.timestamp_millis()));
+        }
+
+        let (st, all, raw) = hit(&app, "GET", "/api/v1/runs").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        println!("READING P1 [runs] {all}");
+
+        // 1. THE SHARED ENVELOPE, key for key (`list_tasks`'s shape, not a new one).
+        let mut keys: Vec<String> = all
+            .as_object()
+            .expect("an envelope is an object")
+            .keys()
+            .filter(|k| k.as_str() != "runs")
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "limit".to_string(),
+                "offset".to_string(),
+                "total".to_string(),
+                "truncated".to_string()
+            ],
+            "{all}"
+        );
+        assert_eq!(all["total"], 5, "{all}");
+        assert_eq!(all["limit"], 200, "the default page size: {all}");
+        assert_eq!(all["offset"], 0, "{all}");
+        assert_eq!(all["truncated"], false, "{all}");
+
+        // 2. NEWEST ACTIVITY FIRST (`updated_at desc`), and every seeded run is here.
+        let ids: Vec<String> = all["runs"]
+            .as_array()
+            .expect("runs is an array")
+            .iter()
+            .map(|r| r["id"].as_str().expect("a run id").to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            seeded.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            "updated_at desc: {all}"
+        );
+
+        // 3. THE ROW SHAPE, read on three rows that must not look alike.
+        let failed = &all["runs"][0];
+        assert_eq!(failed["status"], "failed", "{all}");
+        assert_eq!(failed["finished"], true, "failed is terminal: {all}");
+        assert_eq!(failed["error"], "the harness exited 1", "{all}");
+        assert_eq!(failed["agent"], agent_name.as_str(), "{all}");
+        assert_eq!(failed["agent_id"], agent_id.to_string(), "{all}");
+        assert_eq!(failed["task_id"], tasks[0].0.to_string(), "{all}");
+        assert_eq!(failed["task_title"], tasks[0].1.as_str(), "{all}");
+        assert!(
+            failed["updated_at"]
+                .as_str()
+                .is_some_and(|t| t.contains('T')),
+            "updated_at is an RFC3339 instant, the shape Json<Run> answers with: {all}"
+        );
+        let completed = &all["runs"][1];
+        assert_eq!(completed["status"], "completed", "{all}");
+        assert_eq!(completed["finished"], true, "{all}");
+        assert!(
+            completed.as_object().expect("a row").get("error").is_none(),
+            "no failure cause means NO error key, not a null one: {completed}"
+        );
+        let running = &all["runs"][2];
+        assert_eq!(running["status"], "running", "{all}");
+        assert_eq!(
+            running["finished"], false,
+            "an ACTIVE status is not finished: {all}"
+        );
+        // `waiting_permission` is an empty state in this repo but an ACTIVE one, so it
+        // must not read as finished either (plan §6: a terminal-exhaustive test).
+        let interrupted = &all["runs"][3];
+        assert_eq!(
+            interrupted["finished"], true,
+            "interrupted is terminal: {all}"
+        );
+
+        // 4. THE STATUS FILTER, and the typo that must not look like a success.
+        let (st, one, raw) = hit(&app, "GET", "/api/v1/runs?status=interrupted").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(one["total"], 1, "{one}");
+        assert_eq!(one["runs"][0]["id"], seeded[3].0.as_str(), "{one}");
+        let (st, _v, raw) = hit(&app, "GET", "/api/v1/runs?status=complete").await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "a typo must be refused, not ignored: {raw}"
+        );
+        assert!(
+            raw.contains("completed"),
+            "the 400 names the vocabulary it will accept: {raw}"
+        );
+
+        // 5. `since` IS ONE FILTER IN TWO SPELLINGS: unix ms (the panel's unit), the
+        //    same instant as RFC3339 (the daemon's own instant parameters), and the
+        //    same instant in SECONDS (accepted rather than read as 1970).
+        let boundary_ms = seeded[2].1; // the `running` run's updated_at
+        let (st, ms_rows, raw) =
+            hit(&app, "GET", &format!("/api/v1/runs?since={boundary_ms}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(boundary_ms)
+            .expect("a real instant")
+            .to_rfc3339();
+        let (st, rfc_rows, raw2) = hit(
+            &app,
+            "GET",
+            &format!("/api/v1/runs?since={}", urlencoding(&rfc)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw2}");
+        let (st, sec_rows, raw3) = hit(
+            &app,
+            "GET",
+            &format!("/api/v1/runs?since={}", boundary_ms / 1000),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw3}");
+        println!("READING P1 [since] ms={ms_rows} | rfc3339={rfc_rows} | seconds={sec_rows}");
+        assert_eq!(
+            ms_rows["total"], 3,
+            "three runs at or after the boundary: {ms_rows}"
+        );
+        assert_eq!(
+            rfc_rows["runs"], ms_rows["runs"],
+            "both spellings are ONE filter: {rfc_rows} vs {ms_rows}"
+        );
+        assert_eq!(
+            sec_rows["runs"], ms_rows["runs"],
+            "a ten-digit value is seconds, not 1970: {sec_rows} vs {ms_rows}"
+        );
+        let (st, _v, raw) = hit(&app, "GET", "/api/v1/runs?since=yesterday-ish").await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "an unparseable filter must be refused, not dropped: {raw}"
+        );
+        assert!(raw.contains("since"), "{raw}");
+
+        // 6. THE PAGE: `offset` moves it, `total` stays the FILTER's count, and
+        //    `truncated` is true exactly where rows were left out.
+        let (st, page1, raw) = hit(&app, "GET", "/api/v1/runs?limit=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let (st, page2, raw2) = hit(&app, "GET", "/api/v1/runs?limit=2&offset=2").await;
+        assert_eq!(st, StatusCode::OK, "{raw2}");
+        let (st, page3, raw3) = hit(&app, "GET", "/api/v1/runs?limit=2&offset=4").await;
+        assert_eq!(st, StatusCode::OK, "{raw3}");
+        assert_eq!(
+            page1["total"], 5,
+            "total is the filter's match count: {page1}"
+        );
+        assert_eq!(page1["runs"].as_array().map(Vec::len), Some(2), "{page1}");
+        assert_eq!(page2["runs"].as_array().map(Vec::len), Some(2), "{page2}");
+        assert_eq!(page3["runs"].as_array().map(Vec::len), Some(1), "{page3}");
+        assert_eq!(page1["truncated"], true, "{page1}");
+        assert_eq!(page2["truncated"], true, "{page2}");
+        assert_eq!(
+            page3["truncated"], false,
+            "a page that ends at the last row is not truncated: {page3}"
+        );
+        assert_eq!(page2["offset"], 2, "{page2}");
+        let page1_ids: Vec<&str> = page1["runs"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["id"].as_str().expect("a run id"))
+            .collect();
+        let page2_ids: Vec<&str> = page2["runs"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["id"].as_str().expect("a run id"))
+            .collect();
+        assert!(
+            page1_ids.iter().all(|id| !page2_ids.contains(id)),
+            "page two must not repeat page one: {page1_ids:?} {page2_ids:?}"
+        );
+
+        // 7. AN EMPTY ANSWER IS AN EMPTY ARRAY WITH A NORMAL ENVELOPE — the panel is
+        //    what renders "还没有"; the route must not dress emptiness up as a reading.
+        let (st, none, raw) = hit(&app, "GET", "/api/v1/runs?status=waiting_permission").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(none["total"], 0, "{none}");
+        assert_eq!(
+            none["runs"].as_array().map(Vec::len),
+            Some(0),
+            "an empty ARRAY, not a missing key and not a number: {none}"
+        );
+        assert_eq!(none["truncated"], false, "{none}");
+
+        report_test_root_left_behind(&root);
+    }
+
+    /// Percent-encode the characters an RFC3339 instant carries that a query string
+    /// would otherwise read as its own syntax (`+` in a `+08:00` offset is a space).
+    fn urlencoding(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                '+' => "%2B".to_string(),
+                ':' => "%3A".to_string(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    /// P2.1: the TOPOLOGY dispatches carry `origin_chat_id` onto the runs they create, and
+    /// the fan-out's branches are ONE cluster (one `task_id`, one origin).
+    ///
+    /// WHAT THIS PINS, one reading at a time:
+    ///   * `/fanout`, `/pipeline` and `/judge` ACCEPT the field — it is additive on the
+    ///     wire, so a dispatcher that sends it must not get a 4xx on a request that used
+    ///     to work;
+    ///   * every FAN-OUT branch's run reads back `origin_chat_id` == the chat that asked.
+    ///     ONE value for N branches is the whole reason a five-way fan-out reports once:
+    ///     the branches are runs of the SAME `task_id` (`orchestrator::plan` clones the
+    ///     task), so "the cluster is terminal" and "the fan-out is done" are one question.
+    ///     A per-branch origin would make it N wake-ups, and a branch with NO origin would
+    ///     make it zero — both are the failure this route exists to prevent;
+    ///   * a fan-out of two agents produces TWO runs on the SAME `task_id`, read from the
+    ///     response and re-read from `GET /tasks/{id}` (a branch that quietly created its
+    ///     own sub-task would also fragment the cluster);
+    ///   * the branches show up in `GET /api/v1/runs` (the receipts layer sees fan-out
+    ///     members, not just single dispatches);
+    ///   * `/pipeline`: every STEP's run carries the same origin. The steps are separate
+    ///     SUB-TASKS (`orchestrator::plan`), so the attribution has to be copied into each
+    ///     run — this asserts the copy, NOT that they aggregate into one report (the
+    ///     pipeline's sequential semantics report per step, and the wake-up policy is the
+    ///     completion hook's, tested by `supervise`'s own e2e);
+    ///   * `/judge`: the JUDGE run — a run of its own on a judge sub-task — carries it.
+    #[tokio::test]
+    async fn the_topology_dispatches_carry_the_origin_onto_every_run_they_create() {
+        // Two runnable cards, because `FanOut` refuses fewer than two agents
+        // (`orchestrator::plan`, `FanOutTooSmall`).
+        //
+        // WHY THE CARD'S `command` IS THIS TEST BINARY, and not `mock-agent`: `start_run`
+        // resolves the card's program SYNCHRONOUSLY (`ruagent_acp::resolve_program`), and a
+        // BARE NAME there is looked up on the PATH -- a property of the machine, not of the
+        // code under test (measured: `program `mock-agent` for agent `alpha` not found on
+        // PATH`, a 500 from the fan-out before a single run existed). An ABSOLUTE path is
+        // accepted as-is, and this is the one absolute path a lib test is guaranteed to
+        // have: its own executable. That is all this fixture needs, because what it asserts
+        // is ATTRIBUTION -- the run row and its `origin_chat_id` -- not that a harness
+        // speaks ACP; `crates/mock-agent/tests/e2e_daemon.rs` is where a real mock agent is
+        // launched (from the package that owns that binary, which is what makes
+        // `env!("CARGO_BIN_EXE_ruagent-mock-agent")` available there and not here).
+        // TOML literal string (`'…'`), so Windows backslashes need no escaping.
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let command = exe.display();
+        let agents = format!(
+            "[agent.alpha]\nharness = \"mock\"\ncommand = '{command}'\ndescription = \"a\"\nenabled = true\n\n\
+             [agent.beta]\nharness = \"mock\"\ncommand = '{command}'\ndescription = \"b\"\nenabled = true\n"
+        );
+        let (app, db, root) = harness_with_agents(Some(&agents)).await;
+
+        let (st, task, raw) = send_json(
+            &app,
+            "POST",
+            "/api/v1/tasks",
+            Some(serde_json::json!({
+                "title": "p21 fanout",
+                "intent": "two agents, one conversation waiting",
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        let task_id = task["id"].as_str().expect("a task id").to_string();
+
+        let origin = "chat-p21-fanout";
+        let (st, fanout, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/tasks/{task_id}/fanout"),
+            Some(serde_json::json!({
+                "agents": ["alpha", "beta"],
+                "prompt": "say something",
+                "origin_chat_id": origin,
+            })),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the additive field must not turn a working fan-out into a 4xx: {raw}"
+        );
+        let branches = fanout["runs"]
+            .as_array()
+            .expect("the fan-out answers its runs");
+        assert_eq!(branches.len(), 2, "one run per agent: {fanout}");
+
+        // ONE TASK for every branch — the cluster the completion hook aggregates on.
+        for b in branches {
+            assert_eq!(
+                b["task_id"],
+                task_id.as_str(),
+                "a fan-out branch runs on the SAME task (a sub-task per branch would \
+                 wake the user once per branch): {fanout}"
+            );
+        }
+        let (st, detail, raw) = hit(&app, "GET", &format!("/api/v1/tasks/{task_id}")).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(
+            detail["runs"].as_array().map(Vec::len),
+            Some(2),
+            "both branches are runs of THIS task: {detail}"
+        );
+
+        // The receipts layer sees them too (no task-by-task hunt). NO status filter:
+        // a freshly inserted run is `queued` only until the supervisor picks it up, so
+        // filtering on it would make this assertion race the daemon for no gain.
+        let (st, receipts, raw) = hit(&app, "GET", "/api/v1/runs?limit=200").await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        for b in branches {
+            let id = b["id"].as_str().expect("a run id");
+            assert!(
+                receipts["runs"]
+                    .as_array()
+                    .expect("rows")
+                    .iter()
+                    .any(|r| r["id"] == id),
+                "a fan-out member must appear in GET /api/v1/runs: {receipts}"
+            );
+        }
+
+        // EVERY branch reads back exactly the chat that asked. One value for N branches
+        // is the invariant; a `None` here means "nobody will be told", a different value
+        // means "somebody else will be told", and both are silent failures of the thing
+        // this route exists for.
+        let mut origins: Vec<String> = Vec::new();
+        for b in branches {
+            let id = b["id"].as_str().expect("a run id");
+            let (st, row, raw) = hit(&app, "GET", &format!("/api/v1/runs/{id}")).await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+            assert_eq!(
+                row["origin_chat_id"], origin,
+                "every fan-out branch must record the chat that asked: {row}"
+            );
+            origins.push(
+                row["origin_chat_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        println!(
+            "READING P2.1 [fanout origin] branches={} same_task=true origins={origins:?}",
+            branches.len()
+        );
+
+        // `/pipeline`: every STEP's run carries the same origin. The steps are separate
+        // sub-tasks started by a background driver (`runs.rs`), so the runs appear a few
+        // milliseconds AFTER the POST answers with their task ids — hence a BOUNDED wait
+        // rather than an assertion that the background work already happened.
+        let (st, pipe, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/tasks/{task_id}/pipeline"),
+            Some(serde_json::json!({
+                "steps": [{ "agent": "alpha" }, { "agent": "beta" }],
+                "prompt": "step one, then step two",
+                "origin_chat_id": origin,
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the field is additive here too: {raw}");
+        let step_tasks: Vec<String> = pipe["tasks"]
+            .as_array()
+            .expect("the pipeline answers its task ids")
+            .iter()
+            .map(|t| t.as_str().expect("a task id").to_string())
+            .collect();
+        assert_eq!(step_tasks.len(), 2, "one sub-task per step: {pipe}");
+        let mut seen_steps = 0usize;
+        // A PIPELINE IS SEQUENTIAL: step 2's run is created only after step 1 reaches a
+        // terminal state, and a step that does not COMPLETE stops the chain
+        // (`cancel_unstarted` in `runs.rs`) — so this fixture, whose "agent" is a test
+        // binary that cannot speak ACP, legitimately ends after step 1. What must hold for
+        // every step whose run EXISTS is the attribution, so the loop asserts exactly that
+        // and then reports how many steps actually got a run.
+        for step_task in &step_tasks {
+            let mut row = serde_json::Value::Null;
+            for _ in 0..120 {
+                let (st, detail, raw) =
+                    hit(&app, "GET", &format!("/api/v1/tasks/{step_task}")).await;
+                assert_eq!(st, StatusCode::OK, "{raw}");
+                if let Some(r) = detail["runs"].as_array().and_then(|rows| rows.first()) {
+                    row = r.clone();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            if row.is_null() {
+                continue; // a step the chain never reached (the previous one did not complete)
+            }
+            assert_eq!(
+                row["origin_chat_id"], origin,
+                "a pipeline step is its own sub-task, so the origin has to be COPIED into \
+                 its run: {row}"
+            );
+            seen_steps += 1;
+        }
+        assert!(
+            seen_steps >= 1,
+            "at least the FIRST step's run must exist and carry the origin (waited 3s each)"
+        );
+        println!(
+            "READING P2.1 [pipeline origin] planned_steps={} runs_seen={seen_steps} \
+             each_carries_origin=true",
+            step_tasks.len()
+        );
+
+        // `/judge`: the judge is a run of its own on a judge sub-task. It needs two
+        // COMPLETED candidates with results, so those are seeded first (the fan-out
+        // branches above cannot provide them here: no harness actually runs in this
+        // process).
+        let agent_id: ruagent_core::AgentId = {
+            let (st, agents, raw) = hit(&app, "GET", "/api/v1/agents").await;
+            assert_eq!(st, StatusCode::OK, "{raw}");
+            agents["agents"]
+                .as_array()
+                .expect("agents")
+                .iter()
+                .find(|c| c["name"] == "alpha")
+                .and_then(|c| c["id"].as_str())
+                .expect("the alpha card")
+                .parse()
+                .expect("a uuid agent id")
+        };
+        let task_uuid: ruagent_core::TaskId = task_id.parse().expect("a task id");
+        for result in ["the first answer", "the second answer"] {
+            let mut run = Run::new(task_uuid, ruagent_core::RunParams::for_agent(agent_id));
+            run.status = RunStatus::Completed;
+            run.result = Some(result.to_string());
+            db.insert_run(&run).await.unwrap();
+        }
+        let (st, judged, raw) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/tasks/{task_id}/judge"),
+            Some(serde_json::json!({ "agent": "beta", "origin_chat_id": origin })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the field is additive here too: {raw}");
+        assert_eq!(
+            judged["judge_run"]["origin_chat_id"], origin,
+            "the judge run answers to the chat that asked for the verdict: {judged}"
+        );
+        // The judge task is NOT the parent task: the attribution belongs to the run that
+        // produces the verdict, not to the branches being judged.
+        assert_ne!(
+            judged["judge_run"]["task_id"],
+            task_id.as_str(),
+            "a judge run lives on its own sub-task: {judged}"
         );
 
         report_test_root_left_behind(&root);

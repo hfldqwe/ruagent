@@ -128,6 +128,18 @@ pub struct RunParams {
     /// faithfully (design §8.3 crash row).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// When this attempt is a SELF-HEAL retry, the run it is healing.
+    ///
+    /// P2.3 of `docs/plans/2026-11-20-primary-supervisor-design.md`: the completion hook
+    /// may retry a failed cluster ONCE on a different agent, and the retry's own hook must
+    /// be able to see that the budget is spent — otherwise every failed attempt would heal
+    /// the previous one for ever. This is that reading, and it belongs to the attempt
+    /// (an execution parameter) rather than to the task.
+    ///
+    /// `None` on every run a human, the panel or `task_dispatch` started, and on every row
+    /// written before this field existed (`#[serde(default)]`, and the column is JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_heal_of: Option<RunId>,
 }
 
 impl RunParams {
@@ -140,6 +152,7 @@ impl RunParams {
             max_tokens: None,
             options: Default::default(),
             prompt: None,
+            self_heal_of: None,
         }
     }
 }
@@ -149,6 +162,18 @@ impl RunParams {
 pub struct Run {
     pub id: RunId,
     pub task_id: TaskId,
+    /// WHICH CONVERSATION dispatched this attempt (P2.1 of
+    /// `docs/plans/2026-11-20-primary-supervisor-design.md`).
+    ///
+    /// `None` = the panel, the CLI or an external client started it: whoever asked is already
+    /// looking at the answer, so nothing is woken. `Some(chat id)` = a chat dispatched it and
+    /// that chat is told when this run's CLUSTER (every run of the same `task_id`) reaches a
+    /// terminal state — see the completion hook in `daemon::runs::supervise`.
+    ///
+    /// Stored as the chat's own id string rather than a typed handle: chats are identified by
+    /// `RunId` in the daemon, and `core` has no chat type to depend on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_chat_id: Option<String>,
     pub params: RunParams,
     pub status: RunStatus,
     /// The ACP session id reported by the agent, once established.
@@ -176,6 +201,7 @@ impl Run {
         Self {
             id: RunId::generate(),
             task_id,
+            origin_chat_id: None,
             params,
             status: RunStatus::Queued,
             acp_session_id: None,

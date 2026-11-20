@@ -18,6 +18,7 @@
 //!   option ids at chat start.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -378,10 +379,145 @@ pub enum ChatDelete {
     NotFound,
 }
 
+/// THE LIVE CHAT MANAGERS, one per daemon root (P2.3/P2.2).
+///
+/// WHY A PROCESS-WIDE REGISTRY AND NOT A FIELD ON `RunManager`: the completion hook runs inside a
+/// supervisor task (`runs::supervise`) that holds the RunManager and NOT the ChatManager, and the
+/// two managers are constructed by two different code paths (`lib.rs` builds the RunManager first;
+/// the api/mock-agent/test harnesses build the ChatManager first). Neither constructor can be
+/// handed the other without a wiring line at every composition root, and a report channel that
+/// exists only when somebody remembered a line is exactly the silent-drop failure this design
+/// exists to remove.
+///
+/// KEYED BY `root` because that is what really separates two daemons inside one process — the test
+/// harnesses run many, each under its own private root, and each must talk only to its own chats.
+/// WEAK because the run path must not keep a closed manager (and its agent children) alive; the
+/// list is pruned on every registration and every lookup, so it cannot grow without bound.
+///
+/// The lookup is the WHOLE mechanism: `notify_chat` below is the only way in, and when there is no
+/// manager for the root the caller gets an error it logs (never a silent no-op).
+static LIVE_MANAGERS: Mutex<Vec<(PathBuf, std::sync::Weak<ChatManager>)>> = Mutex::new(Vec::new());
+
+/// The live manager for one daemon root, if any (latest registration wins — a restarted daemon
+/// under the same root supersedes the previous Arc).
+fn live_manager(root: &std::path::Path) -> Option<Arc<ChatManager>> {
+    let mut all = LIVE_MANAGERS.lock().expect("chat managers lock");
+    all.retain(|(_, weak)| weak.strong_count() > 0);
+    all.iter()
+        .rev()
+        .find(|(registered, _)| registered == root)
+        .and_then(|(_, weak)| weak.upgrade())
+}
+
+/// P2.2's entry point for the RUN PATH: deliver one platform event into `chat_id`.
+///
+/// `text` is the report body; the platform marker is applied in [`deliver_or_queue`], which is the
+/// one place that decides "send now" vs "queue", so a caller cannot forget it.
+///
+/// Errors are the caller's to log (`runs::wake_in_background` does, naming chat and run): no live
+/// manager for this root, a `chat_id` that is not a chat id, or a chat that has since been deleted
+/// or closed.
+pub async fn notify_chat(root: &std::path::Path, chat_id: &str, text: String) -> Result<()> {
+    let Some(manager) = live_manager(root) else {
+        anyhow::bail!(
+            "no live chat manager for this daemon root, so the platform event could not be \
+             delivered"
+        );
+    };
+    let id: RunId = chat_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("`{chat_id}` is not a chat id"))?;
+    manager.notify(id, text).await
+}
+
+/// Apply the platform marker: this turn is the PLATFORM talking, not the user.
+///
+/// The marker is the daemon's own, not a new convention — `USER_TEXT_SENTINEL` plus its reader
+/// `sessions::user_text` define "the user's words" as what FOLLOWS the sentinel, so appending it
+/// to a prompt WE wrote states the truth about that turn: there is no user text in it.
+/// `distill::platform_prompt` already does exactly this for the unattended jobs; the wake-up report
+/// is the same kind of turn, so it wears the same marker rather than inventing a second one.
+fn platform_event(text: &str) -> String {
+    format!("{text}{USER_TEXT_SENTINEL}")
+}
+
+/// THE ONE PLACE the send-now/queue decision is made (P2.2): a chat that is mid-turn QUEUES the
+/// platform event instead of dropping it, and every other path sends.
+///
+/// The `generating` flag is the criterion, in exactly one location, for both callers (`notify` and
+/// the turn-end drain), so "may I send" cannot mean two things.
+async fn deliver_or_queue(
+    db: &ruagent_store::Db,
+    embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
+    queue: &Arc<Mutex<HashMap<RunId, VecDeque<String>>>>,
+    chat: &Chat,
+    text: String,
+) -> Result<()> {
+    if chat.is_generating() {
+        let mut q = queue.lock().expect("notification queue");
+        let entry = q.entry(chat.id).or_default();
+        entry.push_back(text);
+        let depth = entry.len();
+        // SAID OUT LOUD, because the queue is in memory: the design accepts losing it on a
+        // restart (§6) but forbids pretending that did not happen.
+        tracing::warn!(
+            chat_id = %chat.id,
+            depth,
+            "platform event queued: this chat is mid-turn, so the report goes out when the turn \
+             ends. THE QUEUE IS IN PROCESS MEMORY ONLY — a daemon restart before then loses it \
+             (accepted for this version, and this is the line that says so)"
+        );
+        return Ok(());
+    }
+    chat.send_prompt(db, embedder, platform_event(&text)).await
+}
+
+/// Deliver the next queued platform event for one chat, if any (called when a turn ends).
+async fn drain_one_notification(
+    db: &ruagent_store::Db,
+    embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
+    queue: &Arc<Mutex<HashMap<RunId, VecDeque<String>>>>,
+    chat: &Chat,
+) {
+    let next = {
+        let mut q = queue.lock().expect("notification queue");
+        match q.get_mut(&chat.id) {
+            Some(pending) => pending.pop_front(),
+            None => None,
+        }
+    };
+    let Some(text) = next else { return };
+    let Some(embedder) = embedder else {
+        tracing::warn!(
+            chat_id = %chat.id,
+            "a queued platform event is being dropped: this manager has no embedder, so a prompt \
+             cannot be sent"
+        );
+        return;
+    };
+    if let Err(e) = deliver_or_queue(db, embedder, queue, chat, text).await {
+        tracing::warn!(
+            chat_id = %chat.id,
+            error = %e,
+            "a queued platform event could NOT be delivered when the turn ended"
+        );
+    }
+}
+
 pub struct ChatManager {
     db: ruagent_store::Db,
     root: PathBuf,
     chats: Arc<Mutex<HashMap<RunId, Chat>>>,
+    /// P2.2: platform events that arrived while this chat was mid-turn, waiting for the turn to
+    /// end. ONE entry per chat, a queue, because the alternative the design rejects is dropping
+    /// the report (`丢弃 = 静默丢汇报, 正是本设计要消灭的失败模式`).
+    ///
+    /// IT LIVES IN PROCESS MEMORY, ON PURPOSE AND WITH A COST: a daemon restart before the turn
+    /// ends loses whatever is queued — the design accepts that loss for the first version (§6) and
+    /// requires it to be SAID, which is what `deliver_or_queue` logs at the moment it queues. The
+    /// queue is per ChatManager (per daemon root), so two daemons in one process cannot see each
+    /// other's, and it dies with the manager like the chats themselves.
+    notifications: Arc<Mutex<HashMap<RunId, VecDeque<String>>>>,
     /// The agent child each live chat was ATTRIBUTED at start (issue #60).
     ///
     /// HOW ATTRIBUTION WORKS, and why it is deliberately timid: the ACP child is
@@ -609,6 +745,7 @@ impl ChatManager {
             db,
             root,
             chats: Arc::new(Mutex::new(HashMap::new())),
+            notifications: Arc::new(Mutex::new(HashMap::new())),
             children: Arc::new(Mutex::new(HashMap::new())),
             last_reclaim: Arc::new(Mutex::new(None)),
             park_ask,
@@ -624,6 +761,13 @@ impl ChatManager {
             )),
         });
         this.spawn_idle_reaper();
+        // P2.3/P2.2: make this manager reachable for the run path's completion reports. See
+        // `LIVE_MANAGERS` for why this is a process-wide registry and not a field on RunManager.
+        {
+            let mut all = LIVE_MANAGERS.lock().expect("chat managers lock");
+            all.retain(|(_, weak)| weak.strong_count() > 0);
+            all.push((this.root.clone(), Arc::downgrade(&this)));
+        }
         this
     }
 
@@ -1085,14 +1229,24 @@ impl ChatManager {
         // terminal event, not by a timer and not by watching the clock.
         // Stopped covers a normal turn and a cancelled one; Error is the
         // other way a turn ends. Every other event leaves the flag alone.
+        //
+        // P2.2 rides here: the SAME instant that says "the turn is over" is the instant a queued
+        // platform event may go out, so the queue has no timer of its own. The decision (send vs
+        // queue again) still lives in `deliver_or_queue` — this site only asks it once.
         {
             let mut sub = chat.session.subscribe();
             let generating = chat.generating.clone();
+            let db = self.db.clone();
+            let embedder = self.embedder.clone();
+            let queue = Arc::clone(&self.notifications);
+            let chat_for_queue = chat.clone();
             tokio::spawn(async move {
                 loop {
                     match sub.recv().await {
                         Ok(RunEvent::Stopped { .. }) | Ok(RunEvent::Error { .. }) => {
                             generating.store(false, std::sync::atomic::Ordering::SeqCst);
+                            drain_one_notification(&db, embedder.clone(), &queue, &chat_for_queue)
+                                .await;
                         }
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -1164,6 +1318,71 @@ impl ChatManager {
     /// at boot, after both managers exist.
     pub fn set_ask_dropper(&self, f: AskDropper) {
         *self.drop_asks.lock().expect("drop_asks lock") = Some(f);
+    }
+
+    /// P2.2: deliver a PLATFORM EVENT to one conversation — the daemon's report to the agent that
+    /// dispatched the work, not a user message.
+    ///
+    /// Semantics, all three forced by the design:
+    /// - the chat is mid-turn → the report is QUEUED (one queue per chat) and goes out when the
+    ///   turn ends; dropping it would be the silent loss the design exists to remove;
+    /// - the chat is gone (deleted, or closed and reaped) → recorded at WARN and swallowed, with
+    ///   NO retry: there is no session to deliver into, and retrying cannot create one;
+    /// - a delivery error is returned to the caller, which logs it naming the chat and the run —
+    ///   a lost report must never also be a lost run or a panic.
+    pub async fn notify(&self, chat_id: RunId, text: String) -> Result<()> {
+        let Some(chat) = self.chat(chat_id) else {
+            // Not live. Say which of the two it is: a chat that never existed (or was deleted) is
+            // a different fact from one that was merely closed/idle-reaped.
+            let id = chat_id.to_string();
+            let known: Result<bool> = self
+                .db
+                .call_flat(move |conn| {
+                    conn.query_row("SELECT 1 FROM chats WHERE id = ?1", [id], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .map(|_| true)
+                    // `QueryReturnedNoRows` is the answer "no such chat", not a store failure.
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                        other => Err(other),
+                    })
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"));
+            match known {
+                Ok(true) => tracing::warn!(
+                    chat_id = %chat_id,
+                    "platform event dropped: the chat exists in history but has no live session \
+                     (closed or idle-reaped); a report cannot start a turn, and this is NOT retried"
+                ),
+                Ok(false) => tracing::warn!(
+                    chat_id = %chat_id,
+                    "platform event dropped: the chat no longer exists (deleted); this is NOT \
+                     retried"
+                ),
+                Err(e) => tracing::warn!(
+                    chat_id = %chat_id,
+                    error = %e,
+                    "platform event dropped: the chat is not live and the history could not be \
+                     read to say which kind of gone it is; not retried"
+                ),
+            }
+            return Ok(());
+        };
+        // The embedder a prompt needs: the one this manager was built with, else the knowledge
+        // handle's (the daemon's ONE, t260). Neither = a manager that cannot send a prompt at all,
+        // which is said rather than attempted.
+        let Some(embedder) = self.embedder.clone().or_else(|| {
+            self.knowledge_handle()
+                .map(|k| std::sync::Arc::clone(&k.embedder()))
+        }) else {
+            anyhow::bail!(
+                "this ChatManager has no embedder, so a platform event cannot be turned into a \
+                 prompt (the chat was not told)"
+            );
+        };
+        deliver_or_queue(&self.db, embedder, &self.notifications, &chat, text).await
     }
 
     /// Hand the manager the ONE knowledge handle the daemon built at boot.
@@ -3226,6 +3445,128 @@ mod generating_tests {
                 .unwrap()
                 .active
         );
+    }
+
+    /// P2.2: a platform event that arrives while the chat is MID-TURN is QUEUED, not dropped, and
+    /// it goes out when the turn ends — through the SAME decision (`deliver_or_queue`) that sends
+    /// immediately when the chat is idle.
+    ///
+    /// Three readings, because the design's failure mode here is silence:
+    /// 1. mid-turn: the report is in the queue and NO turn was started under the running one;
+    /// 2. the turn-ending watcher clears `generating` and drains, so the report goes out by itself
+    ///    (this test drives a REAL turn with the echo agent rather than calling the drain);
+    /// 3. what the chat then holds is the report, wearing the platform marker.
+    #[tokio::test]
+    async fn a_platform_event_arriving_mid_turn_is_queued_and_delivered_when_the_turn_ends() {
+        let Some(mock) = mock_agent() else {
+            panic!("mock agent binary not built next to the test exe");
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ruagent-notify-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = ruagent_store::Db::open(root.join("data").join("ruagent.db")).unwrap();
+        let embedder: Arc<dyn ruagent_knowledge::embed::Embedder> =
+            Arc::new(ruagent_knowledge::embed::HashEmbedder::default());
+        // The embedder is part of the CONSTRUCTOR here on purpose: a platform event becomes a
+        // PROMPT, and a manager without one cannot deliver it (`notify` says so instead of
+        // pretending).
+        let chats = ChatManager::new(
+            db.clone(),
+            root.clone(),
+            Arc::new(|_, _| {}),
+            crate::config::McpConfig::default(),
+            crate::distill::AutoDistill::default(),
+            Some(Arc::clone(&embedder)),
+            crate::distill::AgentRegistry::default(),
+        );
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000002",
+            "name": "mock",
+            "harness": "mock",
+            "command": format!("{} --behavior echo", mock.display()),
+            "description": "test",
+            "model": null,
+            "reasoning_effort": null,
+            "context_window": null,
+            "mcp_profile": null,
+            "models": [],
+            "tags": [],
+            "enabled": true
+        }))
+        .expect("agent card");
+        let chat = chats.start(&card, None, None).await.expect("start chat");
+        let id = chat.id;
+        let transcript = chats.transcript_path(id);
+        let reports = || {
+            ruagent_store::read_transcript(&transcript)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|line| match line.event {
+                    ruagent_core::RunEvent::UserMessage { text } if text.contains("平台事件") => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let queued = || {
+            chats
+                .notifications
+                .lock()
+                .expect("notification queue")
+                .get(&id)
+                .map(|q| q.len())
+                .unwrap_or(0)
+        };
+
+        // (1) MID-TURN. The flag is set to the state `send_prompt` leaves behind; what is under
+        // test is the QUEUE decision, not the flag (that one has its own test just below).
+        chat.generating
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        chats
+            .notify(id, "【平台事件】你派出去的活全部完成了".to_string())
+            .await
+            .expect("a mid-turn notify must not be an error");
+        assert_eq!(queued(), 1, "the report must be QUEUED, not dropped");
+        assert!(
+            reports().is_empty(),
+            "a mid-turn chat must not be interrupted by the report"
+        );
+
+        // (2) A REAL TURN ENDS: the echo prompt's Stopped event makes the watcher clear
+        // `generating` and drain the queue by itself — no timer, no manual drain call.
+        chat.send_prompt(&db, Arc::clone(&embedder), "hello".into())
+            .await
+            .expect("send prompt");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut delivered = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            delivered = reports();
+            if !delivered.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // (3) It went out, and it wears the marker.
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the queued report must be delivered exactly once when the turn ends, got {delivered:?}"
+        );
+        assert_eq!(
+            delivered[0],
+            platform_event("【平台事件】你派出去的活全部完成了"),
+            "the delivered turn is the report WITH the platform marker, or the platform's words \
+             become the user's"
+        );
+        assert_eq!(queued(), 0, "the queue must be empty once it has been sent");
     }
 
     /// generating tracks the RUN; active tracks the LIFETIME. Both halves of

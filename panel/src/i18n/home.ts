@@ -61,6 +61,13 @@ export const zh: Record<string, string> = {
   "home.frontDoor.noneCta": "去 Agents 页设一个",
   "home.frontDoor.err": "读不到主智能体",
   "home.frontDoor.err.hint": "这不等于「没有主智能体」——只是这次没读到，所以这里不作任何判断。",
+  // 回执（P1）：一个地方看到全世界刚刚发生了什么。空态说的是「还没有」，
+  // 不是「0 条」——0 是一个读数，而这里没有读数可给。
+  "home.runs.done.title": "最近完成",
+  "home.runs.failed.title": "最近失败",
+  "home.runs.done.empty": "还没有完成过的运行。",
+  "home.runs.failed.empty": "还没有失败过的运行。",
+  "home.runs.unreadable": "这一项没读到——不等于「没有」，所以这里不下结论。",
 };
 
 export const en: Record<string, string> = {
@@ -120,4 +127,12 @@ export const en: Record<string, string> = {
   "home.frontDoor.noneCta": "Pick one on the Agents page",
   "home.frontDoor.err": "Cannot read the primary agent",
   "home.frontDoor.err.hint": "That is not the same as \"there is no primary\" — this read failed, so no claim is made here.",
+  // The receipts (P1): one place that answers "what just happened, anywhere".
+  // The empty state says "nothing yet", never "0 runs" — 0 is a reading, and
+  // there is no reading here to give.
+  "home.runs.done.title": "Recently finished",
+  "home.runs.failed.title": "Recently failed",
+  "home.runs.done.empty": "Nothing has finished yet.",
+  "home.runs.failed.empty": "No run has failed yet.",
+  "home.runs.unreadable": "This reading did not answer — which is not the same as “none”, so nothing is claimed here.",
 };

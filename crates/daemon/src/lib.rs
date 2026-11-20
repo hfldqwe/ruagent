@@ -17,6 +17,7 @@ pub mod registry;
 pub mod runs;
 pub mod sessions;
 pub mod skills;
+pub mod watchdog;
 pub mod wiki;
 
 use std::net::SocketAddr;
@@ -512,25 +513,30 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
     }
     tracing::info!(count = agents.len(), "agent registry loaded");
 
-    // Crash recovery (design §8.3): orphans from a previous daemon are
-    // marked interrupted; their transcripts survive for inspection.
-    let mut recovered = 0usize;
-    for status in [
-        RunStatus::Queued,
-        RunStatus::Spawning,
-        RunStatus::Running,
-        RunStatus::WaitingPermission,
-    ] {
-        for mut run in db.list_runs_by_status(status).await? {
-            run.status = RunStatus::Interrupted;
-            run.error = Some("daemon restarted mid-run".into());
-            run.updated_at = chrono::Utc::now();
-            db.update_run(&run).await?;
-            recovered += 1;
-        }
-    }
-    if recovered > 0 {
-        tracing::warn!(count = recovered, "runs marked interrupted by restart");
+    // Crash recovery (design §8.3): orphans from a previous daemon are marked
+    // interrupted; their transcripts survive for inspection.
+    //
+    // P0 CONSISTENCY: `Interrupted` is a TERMINAL state, so the CLUSTERS those
+    // runs belonged to have to be finalized exactly the way a live run's ending is
+    // — otherwise every task that happened to be running when the daemon restarted
+    // stays `InProgress` for ever, and the board goes back to lying about work
+    // nobody is doing. That is the same defect `supervise`'s P0 fixed on the run
+    // path, arriving through the boot path instead.
+    //
+    // The finalize half needs the manager, which does not exist yet, so the runs
+    // are collected here and finished after it is built (see
+    // `finalize_interrupted_clusters` below).
+    let interrupted = interrupt_live_runs(&db).await?;
+    if !interrupted.is_empty() {
+        tracing::warn!(
+            count = interrupted.len(),
+            tasks = interrupted
+                .iter()
+                .map(|r| r.task_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "runs marked interrupted by restart"
+        );
     }
 
     let agents_cards = agents.clone();
@@ -668,6 +674,32 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
     chats.set_capabilities(config.capabilities.clone());
     mgr.set_capabilities(chats.capabilities_handle());
 
+    // P0 (the boot half): the clusters the restart killed are finalized through the
+    // SAME hook a live run's ending uses — `runs::finish_cluster`, one judgement
+    // for "is the whole cluster terminal", which decides the task write-back.
+    //
+    // ⚠ THIS PATH DOES NOT SPEND TOKENS, and that is a measured decision, not an
+    // oversight. The first version passed `allow_self_heal = true` here, on the
+    // user's directive (「出问题优先自己解决」). Verification then measured what it
+    // actually cost: after a restart the self-heal DOES start a fresh run, and the
+    // report it would eventually send is DROPPED — the chat has no live session any
+    // more (`WARN platform event dropped: the chat exists in history but has no live
+    // session … NOT retried`). A round of the user's tokens bought a sentence nobody
+    // received. So the boot path passes `false`:
+    //   * the task IS written back (`Pending`, re-dispatchable) and the run already
+    //     carries `daemon restarted mid-run` as its `error`, so the board tells the
+    //     truth and a person can see WHY without paying again;
+    //   * a LIVE ending still self-heals (`runs.rs`, `finish_cluster(…, true)`)
+    //     because there the chat still has a session to deliver into.
+    // If a future increment makes the platform event durable across restarts, this
+    // `false` is the line to revisit — not before.
+    //
+    // NOTHING in this call can abort the boot: `finish_cluster` returns `()` and
+    // WARNs its own failures (with task_id + run_id), and the loop below has no
+    // `?`. A daemon that refuses to start because one task's write-back failed
+    // would be the same anti-pattern this whole increment is repairing.
+    finalize_interrupted_clusters(&mgr, &interrupted).await;
+
     {
         let kb_scanner = knowledge.clone();
         // t4: the KB → graph sweep rides THIS loop (design §13.1) — no new
@@ -738,6 +770,44 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
     // the panel shows the state.
     state.config.mcp.health.spawn_loop(state.config.mcp.clone());
 
+    // -----------------------------------------------------------------------
+    // P3: the watchdog tick (docs/plans/2026-11-20-primary-supervisor-design.md
+    // §P3). The daemon's OWN timer that STARTS A ROUND rather than checking a
+    // pulse — the audit (§2.6) found four timers and not one of them reaching an
+    // agent.
+    //
+    // WHY ITS OWN LOOP, next to the 60 s knowledge scan rather than inside it:
+    // two features sharing one `loop` share one failure mode and one `?`, and
+    // the next reader cannot tell which one to edit. Its cadence comes from
+    // `policy.toml` (`[watchdog] interval`), never a constant here — and the
+    // loop's FIRST act is `sleep`, so a daemon that is restarted (the launcher's
+    // `watch` does exactly that when the health check fails) cannot spend a round
+    // per boot.
+    //
+    // The gate is the LIVE capability plane (`watchdog`), read on every round by
+    // the loop itself, so `PUT /api/v1/capabilities` needs no restart; the
+    // `[watchdog]` section is read once, at boot, exactly like `[distill]`.
+    // -----------------------------------------------------------------------
+    match watchdog::Watchdog::from_config(
+        Arc::clone(&state.mgr),
+        Arc::clone(&state.config),
+        state.chats.capabilities_handle(),
+    ) {
+        Ok(Some(wd)) => {
+            tokio::spawn(async move { wd.run().await });
+        }
+        // `[watchdog] enabled = false` — the shipped default, and the one that
+        // matters: a round spends the user's tokens.
+        Ok(None) => {}
+        // An invalid section is SAID OUT LOUD and then never used: half a
+        // watchdog is a watchdog that spends tokens on the wrong thing.
+        Err(e) => tracing::warn!(
+            error = %e,
+            "watchdog disabled: [watchdog] is not usable, so no round will start — fix \
+             config/policy.toml (or remove `enabled = true`)"
+        ),
+    }
+
     let app = api::router(state);
 
     // t76 / audit A-3: refuse a non-loopback bind that nobody asked for.
@@ -805,6 +875,93 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
             tracing::error!(error = %e, "the server stopped with an error");
             Err(anyhow::Error::new(e).context("serving the API"))
         }
+    }
+}
+
+/// Boot's crash sweep (design §8.3): every non-terminal run becomes
+/// `Interrupted`, and the runs it changed are RETURNED so the caller can finalize
+/// the clusters they belong to once the manager exists.
+///
+/// WHY THE TWO HALVES ARE SEPARATE: marking a run is a pure store write, but
+/// finalizing its cluster needs the `RunManager` (it may self-heal, and it reports
+/// to the chat that dispatched the work). The manager is built a few statements
+/// later, so the boot sequence marks first and finalizes after — the order the
+/// real supervisor uses too (`update_run` → `finish_cluster`).
+///
+/// The `?` here is NOT the anti-pattern the finalize half avoids: a database that
+/// cannot mark a live run as dead is a boot-blocking fault, and this is exactly
+/// the behaviour this sweep has always had. What must never abort the boot is one
+/// TASK's write-back, and that half cannot fail (see
+/// [`finalize_interrupted_clusters`]).
+async fn interrupt_live_runs(db: &Db) -> Result<Vec<ruagent_core::Run>> {
+    let mut interrupted = Vec::new();
+    for status in [
+        RunStatus::Queued,
+        RunStatus::Spawning,
+        RunStatus::Running,
+        RunStatus::WaitingPermission,
+    ] {
+        for mut run in db.list_runs_by_status(status).await? {
+            run.status = RunStatus::Interrupted;
+            run.error = Some("daemon restarted mid-run".into());
+            run.updated_at = chrono::Utc::now();
+            db.update_run(&run).await?;
+            interrupted.push(run);
+        }
+    }
+    Ok(interrupted)
+}
+
+/// Finalize the clusters a restart killed — once per DISTINCT task, through the
+/// one hook that owns that judgement.
+///
+/// `runs::finish_cluster` is the implementation (P0 + P2.3): it re-reads the
+/// cluster, decides "is every attempt terminal", writes the task back through its
+/// exhaustive terminal mapping, and — only if a chat dispatched the work — reports
+/// to that chat. Re-implementing a subset here would be the second judgement the
+/// design forbids ("two criteria, two truths"), so this function does not look at
+/// statuses at all; it only makes sure each task is asked about ONCE.
+///
+/// CONSEQUENCES, stated rather than discovered later:
+/// * the write-back is the SAME mapping a live run gets, so a restart-interrupted
+///   task goes back to `Pending` (re-dispatchable), not to some boot-only state;
+/// * a cluster that a chat dispatched may SELF-HEAL here (one retry, preferring a
+///   different agent) — that is P2's 「出问题优先自己解决」 applied at boot, and it
+///   spends tokens; a panel/CLI-dispatched cluster (`origin_chat_id` absent) only
+///   gets the write-back;
+/// * every failure is a `WARN` with task_id + run_id, from inside `finish_cluster`.
+///
+/// Takes and drops no lock, holds nothing across the awaits beyond the manager
+/// reference, and cannot panic out: each iteration is a plain `await` on a
+/// function that returns `()`.
+async fn finalize_interrupted_clusters(
+    mgr: &Arc<runs::RunManager>,
+    interrupted: &[ruagent_core::Run],
+) {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut tasks = 0usize;
+    for run in interrupted {
+        if !seen.insert(run.task_id) {
+            // Another attempt of the same cluster was already asked about: one
+            // cluster, one judgement (a fan-out the restart killed must NOT write
+            // the task back once per member).
+            continue;
+        }
+        tasks += 1;
+        // `false` = NO self-heal on this path. Measured (verifier, 2026-11-20): a restart DID
+        // start the cluster's one automatic retry, and the report that retry would eventually send
+        // was dropped — the chat has no live session after a restart (`WARN platform event
+        // dropped`). That is tokens spent for a sentence nobody receives. The state write-back
+        // still happens here, and why the work died is already on the run's `error`
+        // (`daemon restarted mid-run`), so the board tells the truth without paying again.
+        runs::finish_cluster(mgr, run.task_id, run, false).await;
+    }
+    if tasks > 0 {
+        tracing::info!(
+            tasks,
+            runs = interrupted.len(),
+            "cluster write-back attempted for the runs the restart interrupted"
+        );
     }
 }
 
@@ -1474,5 +1631,165 @@ pub(crate) mod test_cleanup {
                 never
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_sweep_tests {
+    use super::*;
+    use ruagent_core::{AgentId, Run, RunParams, Task, TaskCreator, TaskStatus};
+
+    /// P0 ON THE BOOT PATH: a task whose run the restart killed must not stay
+    /// `InProgress`. The two halves are asserted separately, because the GAP is the
+    /// distance between them: after the marking half the board still says 进行中
+    /// (that is the bug), and after the finalize half it says the work is
+    /// re-dispatchable.
+    #[tokio::test]
+    async fn a_restart_puts_an_interrupted_task_back_to_pending() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let task = Task::new("half done", "finish the thing", TaskCreator::Human);
+        db.insert_task(&task).await.expect("insert task");
+        db.update_task_status(task.id, TaskStatus::InProgress)
+            .await
+            .expect("the task a live run holds");
+        let mut run = Run::new(task.id, RunParams::for_agent(AgentId::generate()));
+        run.status = RunStatus::Running;
+        db.insert_run(&run).await.expect("insert run");
+
+        // (1) the marking half, exactly as boot runs it.
+        let interrupted = interrupt_live_runs(&db).await.expect("the sweep");
+        assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+        assert_eq!(interrupted[0].task_id, task.id);
+        assert_eq!(
+            db.get_run(run.id).await.expect("read").expect("row").status,
+            RunStatus::Interrupted,
+            "the run is terminal after the sweep"
+        );
+        // THE GAP, asserted so it cannot come back: marking alone leaves the board
+        // lying about a task nobody is working on.
+        assert_eq!(
+            db.get_task(task.id)
+                .await
+                .expect("read")
+                .expect("row")
+                .status,
+            TaskStatus::InProgress,
+            "marking a run interrupted does NOT write the task back — that is why the \
+             finalize half exists"
+        );
+
+        // (2) the finalize half, through the manager (no agents: no self-heal, no
+        // wake-up, because this run carries no origin chat).
+        let mgr = Arc::new(runs::RunManager::new(
+            db.clone(),
+            std::env::temp_dir().join("ruagent-restart-sweep"),
+            Vec::new(),
+            ruagent_policy::PolicyConfig::default().to_policy(),
+            config::McpConfig::default(),
+        ));
+        finalize_interrupted_clusters(&mgr, &interrupted).await;
+
+        let after = db.get_task(task.id).await.expect("read").expect("row");
+        assert_ne!(
+            after.status,
+            TaskStatus::InProgress,
+            "the board must not keep saying 进行中 after a restart: {after:?}"
+        );
+        assert_eq!(
+            after.status,
+            TaskStatus::Pending,
+            "an interrupted attempt puts the work item back in the queue, not into Done"
+        );
+        // The "why it did not work last time" reading is on the RUN, which is where
+        // `get_task` shows it.
+        assert!(
+            db.get_run(run.id)
+                .await
+                .expect("read")
+                .expect("row")
+                .error
+                .is_some(),
+            "the interrupted run keeps its cause"
+        );
+    }
+
+    /// ONE CLUSTER, ONE JUDGEMENT: a restart that kills three attempts of one task
+    /// must ask `finish_cluster` about that task exactly once. Counted through the
+    /// store's single writer, because that is what a second write-back would show.
+    #[tokio::test]
+    async fn a_cluster_killed_by_a_restart_is_finalized_once() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let task = Task::new("fan-out", "three attempts", TaskCreator::Human);
+        db.insert_task(&task).await.expect("insert task");
+        db.update_task_status(task.id, TaskStatus::InProgress)
+            .await
+            .expect("in progress");
+        for status in [RunStatus::Running, RunStatus::Running, RunStatus::Queued] {
+            let mut run = Run::new(task.id, RunParams::for_agent(AgentId::generate()));
+            run.status = status;
+            db.insert_run(&run).await.expect("insert run");
+        }
+
+        let interrupted = interrupt_live_runs(&db).await.expect("the sweep");
+        assert_eq!(interrupted.len(), 3, "every non-terminal attempt, no more");
+
+        let mgr = Arc::new(runs::RunManager::new(
+            db.clone(),
+            std::env::temp_dir().join("ruagent-restart-sweep"),
+            Vec::new(),
+            ruagent_policy::PolicyConfig::default().to_policy(),
+            config::McpConfig::default(),
+        ));
+        finalize_interrupted_clusters(&mgr, &interrupted).await;
+        // Called again with the same slice: the task is already Pending, and the
+        // second pass is a no-op rather than a second write (the hook is
+        // idempotent by construction — it compares the task status it finds).
+        finalize_interrupted_clusters(&mgr, &interrupted).await;
+
+        assert_eq!(
+            db.get_task(task.id)
+                .await
+                .expect("read")
+                .expect("row")
+                .status,
+            TaskStatus::Pending
+        );
+        for run in db.list_runs_for_task(task.id).await.expect("runs") {
+            assert_eq!(run.status, RunStatus::Interrupted, "{}", run.id);
+        }
+    }
+
+    /// A sweep with nothing to do must not fabricate work: no runs, no write-backs.
+    #[tokio::test]
+    async fn a_clean_restart_finalizes_nothing() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let task = Task::new("done already", "i", TaskCreator::Human);
+        db.insert_task(&task).await.expect("insert");
+        db.update_task_status(task.id, TaskStatus::Done)
+            .await
+            .expect("done");
+        let mut run = Run::new(task.id, RunParams::for_agent(AgentId::generate()));
+        run.status = RunStatus::Completed;
+        db.insert_run(&run).await.expect("insert");
+
+        let interrupted = interrupt_live_runs(&db).await.expect("the sweep");
+        assert!(interrupted.is_empty(), "{interrupted:?}");
+        let mgr = Arc::new(runs::RunManager::new(
+            db.clone(),
+            std::env::temp_dir().join("ruagent-restart-sweep"),
+            Vec::new(),
+            ruagent_policy::PolicyConfig::default().to_policy(),
+            config::McpConfig::default(),
+        ));
+        finalize_interrupted_clusters(&mgr, &interrupted).await;
+        assert_eq!(
+            db.get_task(task.id)
+                .await
+                .expect("read")
+                .expect("row")
+                .status,
+            TaskStatus::Done,
+            "a completed task is not touched by a restart sweep"
+        );
     }
 }

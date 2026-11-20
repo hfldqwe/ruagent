@@ -92,6 +92,11 @@ pub enum CapabilityId {
     SessionExtractRules,
     KnowledgeIngestGraph,
     DistillSession,
+    /// P3: the periodic round (docs/plans/2026-11-20-primary-supervisor-design.md
+    /// §P3). Added after the eleven design rows, so its position in `ALL` — and
+    /// therefore in every API row list — is at the END and the existing order is
+    /// untouched.
+    Watchdog,
 }
 
 impl CapabilityId {
@@ -108,6 +113,7 @@ impl CapabilityId {
         CapabilityId::SessionExtractRules,
         CapabilityId::KnowledgeIngestGraph,
         CapabilityId::DistillSession,
+        CapabilityId::Watchdog,
     ];
 
     /// The stable config/API id. NEVER rename one: it is a user-facing key in
@@ -125,6 +131,7 @@ impl CapabilityId {
             CapabilityId::SessionExtractRules => "session_extract_rules",
             CapabilityId::KnowledgeIngestGraph => "knowledge_ingest_graph",
             CapabilityId::DistillSession => "distill_session",
+            CapabilityId::Watchdog => "watchdog",
         }
     }
 }
@@ -314,7 +321,7 @@ pub struct CapabilitySpec {
     pub gates: &'static str,
 }
 
-/// The registry: 11 rows, one per `CapabilityId::ALL` entry, same order.
+/// The registry: 12 rows, one per `CapabilityId::ALL` entry, same order.
 const SPECS: &[CapabilitySpec] = &[
     CapabilitySpec {
         id: CapabilityId::MemoryInjectChat,
@@ -446,9 +453,22 @@ const SPECS: &[CapabilitySpec] = &[
         defaults: CapabilityOptions::NONE,
         gates: "auto-distill on session close (crates/daemon/src/chat.rs)",
     },
+    CapabilitySpec {
+        id: CapabilityId::Watchdog,
+        description: "A periodic agent round: the daemon starts a run on its own timer, with no user message behind it (spends model tokens). Configured by [watchdog] in policy.toml.",
+        tier: Tier::Llm,
+        default_enabled: false,
+        // New in P3 (docs/plans/2026-11-20-primary-supervisor-design.md §P3), not
+        // in the capability-plane increment this field was introduced with — the
+        // flag's operative meaning is unchanged: NEW, therefore default OFF (L4).
+        new_in_this_increment: true,
+        options: &[],
+        defaults: CapabilityOptions::NONE,
+        gates: "the watchdog tick (crates/daemon/src/watchdog.rs)",
+    },
 ];
 
-/// The registry: 11 rows, one per `CapabilityId::ALL` entry, same order.
+/// The registry: 12 rows, one per `CapabilityId::ALL` entry, same order.
 pub fn specs() -> &'static [CapabilitySpec] {
     SPECS
 }
@@ -1117,8 +1137,8 @@ mod tests {
         assert_eq!(specs().len(), CapabilityId::ALL.len());
         assert_eq!(
             specs().len(),
-            11,
-            "the design registers eleven capabilities"
+            12,
+            "eleven capability-plane rows + `watchdog` (P3, appended last)"
         );
         for (i, id) in CapabilityId::ALL.iter().enumerate() {
             assert_eq!(
@@ -1456,7 +1476,13 @@ mod tests {
         let v = serde_json::to_value(&resp).expect("response serializes");
         assert_eq!(v["table_present"], true);
         assert_eq!(v["config_file"], "/tmp/policy.toml");
-        assert_eq!(v["capabilities"].as_array().map(Vec::len), Some(11));
+        // Rows == REGISTRY IDS, the relation rather than a number: a row that goes
+        // missing or is invented fails here without anyone remembering to bump a
+        // literal (P3's `watchdog` row is what exposed the old `Some(11)`).
+        assert_eq!(
+            v["capabilities"].as_array().map(Vec::len),
+            Some(CapabilityId::ALL.len())
+        );
         assert_eq!(v["conflicts"], serde_json::json!([]));
     }
 

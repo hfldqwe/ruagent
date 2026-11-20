@@ -156,6 +156,21 @@ pub struct RunLaunch {
     /// ContextInjected, not as user speech): a retry's crash snapshot
     /// rides here, keeping session previews and distillation clean.
     pub context_prefix: Option<String>,
+    /// WHICH CONVERSATION ASKED FOR THIS ATTEMPT (P2.1 of
+    /// `docs/plans/2026-11-20-primary-supervisor-design.md` §3).
+    ///
+    /// `None` = the panel, the CLI or an external client: whoever asked is looking at the answer
+    /// already, so the completion hook wakes nobody. `Some(chat id)` = a chat dispatched it, and
+    /// that chat is told once when the whole CLUSTER (same `task_id`) is terminal.
+    ///
+    /// It is a field of the LAUNCH rather than of the task because attribution belongs to the
+    /// dispatch, not to the work item: one task can be dispatched by a chat and later re-dispatched
+    /// from the board, and the second dispatch has nobody to wake.
+    pub origin_chat_id: Option<String>,
+    /// P2.3: set when THIS attempt is the cluster's ONE self-heal retry, naming the attempt it
+    /// heals. Read back by the completion hook to prove the budget is spent (see
+    /// `RunParams::self_heal_of`).
+    pub self_heal_of: Option<RunId>,
 }
 
 /// One harness's concurrency gate (design §8.3): a counting semaphore
@@ -378,7 +393,7 @@ impl RunManager {
 
     /// Tier 2: let the approver agent decide a parked ask (design SS9.2).
     /// Fail-closed: any failure leaves the ask parked for the human.
-    async fn run_approver(&self, ask: PendingPermission) -> Result<()> {
+    async fn run_approver(self: &Arc<Self>, ask: PendingPermission) -> Result<()> {
         let approver = self
             .policy
             .approver
@@ -669,8 +684,12 @@ impl RunManager {
     }
 
     /// Create and start a run of `task` on the named agent.
+    ///
+    /// `self: &Arc<Self>` (not `&self`) because the supervisor task this method spawns can carry
+    /// the manager: the completion hook needs `retry_run` and `start_run`, and a spawn is `'static`.
+    /// Every caller in the daemon and the tests already holds an `Arc<RunManager>`.
     pub async fn start_run(
-        &self,
+        self: &Arc<Self>,
         task: &Task,
         agent_name: &str,
         prompt: String,
@@ -691,6 +710,11 @@ impl RunManager {
         let context_prefix = launch.context_prefix.clone();
 
         let mut run = Run::new(task.id, RunParams::for_agent(card.id));
+        // P2.1/P2.3: attribution and the self-heal marker are decided at DISPATCH and ride the row
+        // (the column and the params JSON), so the completion hook of a LATER attempt (a heal
+        // retry) reads the same two facts without a second table.
+        run.origin_chat_id = launch.origin_chat_id.clone();
+        run.params.self_heal_of = launch.self_heal_of;
         // Canonical session-option defaults (issue #36): mode / effort.
         // The ROLE's defaults apply to runs too — the same contract
         // chats have. Without this, a specialist registered with
@@ -769,6 +793,10 @@ impl RunManager {
         // waited on its harness gate must see the configuration that is in force
         // when it actually starts.
         let capabilities = self.capabilities_handle();
+        // The manager rides the supervisor (P2.3): the completion hook needs the registry (agent
+        // id → NAME for the wake-up text) and `retry_run` (self-heal), and the supervisor is a
+        // 'static task. Same reason `knowledge`/`capabilities` ride.
+        let mgr_for_supervisor = Arc::clone(self);
         // The gate permit rides the supervisor: it releases when the
         // run reaches any terminal state (design §8.3). A queued run
         // waits for the gate here — cancellable — before it consumes
@@ -885,6 +913,7 @@ impl RunManager {
             }
 
             let result = supervise(
+                mgr_for_supervisor,
                 db.clone(),
                 root,
                 broadcast,
@@ -931,47 +960,82 @@ impl RunManager {
     /// the crashed attempt's workspace (half-written work survives),
     /// and a context snapshot from its transcript so the agent knows
     /// where it died instead of starting from zero.
-    pub async fn retry_run(&self, run_id: RunId) -> Result<Run> {
-        let old = self
-            .db
-            .get_run(run_id)
-            .await?
-            .with_context(|| format!("run {run_id} not found"))?;
-        anyhow::ensure!(
-            old.status.is_retryable(),
-            "only failed, interrupted or cancelled runs can be retried (this one is {:?})",
-            old.status
-        );
-        let task = self
-            .db
-            .get_task(old.task_id)
-            .await?
-            .with_context(|| format!("task {} for retry not found", old.task_id))?;
-        let card = self
-            .agents()
-            .into_iter()
-            .find(|c| c.id == old.params.agent)
-            .with_context(|| "the retried run's agent is no longer registered")?;
+    ///
+    /// THE HUMAN/PANEL/HTTP ENTRANCE. The completion hook's self-heal goes through
+    /// [`Self::retry_run_inner`] with the two P2.3 arguments, so both paths create their new
+    /// attempt in exactly one place.
+    pub async fn retry_run(self: &Arc<Self>, run_id: RunId) -> Result<Run> {
+        self.retry_run_inner(run_id, None, false).await
+    }
 
-        // The original ask: recorded as-is even though the retry
-        // composes context onto it (chained retries must not grow it).
-        let original = old
-            .params
-            .prompt
-            .clone()
-            .unwrap_or_else(|| task.intent.clone());
-        // The crash snapshot rides as CONTEXT (ContextInjected), not as
-        // user speech — session previews and distillation stay clean.
-        let context_prefix = retry_context(&self.transcripts_dir(), &old);
-        // The workspace carries the crashed attempt's half-written
-        // work: the retry continues in place.
-        let workspace = old
-            .workspace
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .map(WorkspaceSpec::Cwd)
-            .unwrap_or(WorkspaceSpec::Fresh);
-        self.start_run(
+    /// The one retry implementation.
+    ///
+    /// `agent_override` — run the new attempt on THIS agent instead of the dead one's (P2.3:
+    /// self-heal prefers a different agent, because retrying the same agent that just died is
+    /// often the same failure again).
+    /// `self_heal` — this attempt IS the cluster's heal: it is recorded on the attempt
+    /// (`RunParams::self_heal_of`) so the NEXT completion hook can see the budget is spent, and its
+    /// `Routed` event says so in the existing run-event stream (P2.3's "leave a trace": no new
+    /// event type, no second log, and a reader of the timeline can see the daemon tried).
+    ///
+    /// RETURNED AS AN EXPLICITLY BOXED `Pin<Box<dyn Future + Send>>`, not as an `async fn`.
+    /// `start_run` → `supervise` → [`finish_cluster`] → here → `start_run` is a genuine recursion (a
+    /// self-heal launches a new attempt, whose own hook runs when it ends), and with opaque
+    /// `async fn` types the compiler cannot PROVE the outer supervisor task is `Send` — it reports
+    /// the peer's spawn as unsendable instead. One box, at the definition, cuts the cycle in the
+    /// type system with no change to what happens at runtime.
+    fn retry_run_inner<'a>(
+        self: &'a Arc<Self>,
+        run_id: RunId,
+        agent_override: Option<&'a str>,
+        self_heal: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Run>> + Send + 'a>> {
+        Box::pin(async move {
+            let old = self
+                .db
+                .get_run(run_id)
+                .await?
+                .with_context(|| format!("run {run_id} not found"))?;
+            anyhow::ensure!(
+                old.status.is_retryable(),
+                "only failed, interrupted or cancelled runs can be retried (this one is {:?})",
+                old.status
+            );
+            let task = self
+                .db
+                .get_task(old.task_id)
+                .await?
+                .with_context(|| format!("task {} for retry not found", old.task_id))?;
+            let card = match agent_override {
+                Some(name) => self
+                    .agent(name)
+                    .with_context(|| format!("self-heal agent `{name}` is not registered"))?,
+                None => self
+                    .agents()
+                    .into_iter()
+                    .find(|c| c.id == old.params.agent)
+                    .with_context(|| "the retried run's agent is no longer registered")?,
+            };
+
+            // The original ask: recorded as-is even though the retry
+            // composes context onto it (chained retries must not grow it).
+            let original = old
+                .params
+                .prompt
+                .clone()
+                .unwrap_or_else(|| task.intent.clone());
+            // The crash snapshot rides as CONTEXT (ContextInjected), not as
+            // user speech — session previews and distillation stay clean.
+            let context_prefix = retry_context(&self.transcripts_dir(), &old);
+            // The workspace carries the crashed attempt's half-written
+            // work: the retry continues in place.
+            let workspace = old
+                .workspace
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .map(WorkspaceSpec::Cwd)
+                .unwrap_or(WorkspaceSpec::Fresh);
+            self.start_run(
             &task,
             &card.name,
             original.clone(),
@@ -981,25 +1045,41 @@ impl RunManager {
                 routed: Some(RoutingDecision {
                     agents: vec![card.id],
                     source: RouteSource::Explicit,
-                    rationale: Some(format!("retry of run {run_id}")),
+                    rationale: Some(if self_heal {
+                        format!(
+                            "self-heal (the cluster's one automatic retry) of failed run {run_id}, \
+                             on a different agent"
+                        )
+                    } else {
+                        format!("retry of run {run_id}")
+                    }),
                 }),
                 options: old.params.options.clone(),
                 original_prompt: Some(original),
                 context_prefix,
+                // P2.1: a heal retry answers to the SAME conversation — the chat that asked for the
+                // work asked for the work, not for one attempt at it.
+                origin_chat_id: old.origin_chat_id.clone(),
+                self_heal_of: self_heal.then_some(run_id),
             },
         )
         .await
+        })
     }
 
     /// Fan out: same prompt to N agents in parallel on one task
     /// (design §5.2). Every run records its routing provenance.
     pub async fn start_fanout(
-        &self,
+        self: &Arc<Self>,
         task: &Task,
         agents: &[String],
         prompt: String,
         repo: Option<PathBuf>,
         options: std::collections::BTreeMap<String, String>,
+        // WHICH CONVERSATION asked for this (issue: one front door). Every branch of the fan-out
+        // carries the SAME value, which is what makes the cluster report once instead of once per
+        // branch: the completion hook aggregates by task, and all branches share this task.
+        origin_chat_id: Option<String>,
     ) -> Result<Vec<Run>> {
         let topology = Topology::FanOut {
             agents: agents.to_vec(),
@@ -1030,6 +1110,7 @@ impl RunManager {
                     RunLaunch {
                         routed: Some(decision),
                         options: options.clone(),
+                        origin_chat_id: origin_chat_id.clone(),
                         ..Default::default()
                     },
                 )
@@ -1046,6 +1127,10 @@ impl RunManager {
         task: &Task,
         steps: Vec<PipelineStep>,
         base_prompt: String,
+        // The conversation that asked for the pipeline. Each step is its own sub-task, so the
+        // completion hook reports per step (a pipeline is sequential by definition); what this
+        // value guarantees is that the reports reach THAT conversation instead of nobody.
+        origin_chat_id: Option<String>,
     ) -> Result<Vec<ruagent_core::TaskId>> {
         let topology = Topology::Pipeline { steps };
         let plan = ruagent_orchestrator::plan(task, &topology)?;
@@ -1092,6 +1177,7 @@ impl RunManager {
                         WorkspaceSpec::Fresh,
                         RunLaunch {
                             routed: Some(decision),
+                            origin_chat_id: origin_chat_id.clone(),
                             ..Default::default()
                         },
                     )
@@ -1136,6 +1222,8 @@ impl RunManager {
         task: &Task,
         judge_agent: &str,
         candidates: &[JudgeCandidate],
+        // The conversation that asked for the judgement (same reason as start_fanout).
+        origin_chat_id: Option<String>,
     ) -> Result<Run> {
         let card = self
             .agent(judge_agent)
@@ -1177,6 +1265,7 @@ impl RunManager {
                 WorkspaceSpec::Fresh,
                 RunLaunch {
                     routed: Some(decision),
+                    origin_chat_id: origin_chat_id.clone(),
                     ..Default::default()
                 },
             )
@@ -1405,8 +1494,13 @@ async fn reclaim_run_child(
 }
 
 /// transcript, applies the permission policy, and finalizes state.
+///
+/// `mgr` rides along because the completion hook needs the registry (agent id → NAME for the
+/// wake-up text) and `retry_run` (the P2.3 self-heal). `db`/`root` stay their own parameters: they
+/// are what this function's other twenty-odd uses already read.
 #[allow(clippy::too_many_arguments)]
 async fn supervise(
+    mgr: Arc<RunManager>,
     db: Db,
     root: PathBuf,
     broadcast: broadcast::Sender<StreamMsg>,
@@ -1791,16 +1885,440 @@ async fn supervise(
     if !result_text.is_empty() {
         run.result = Some(result_text);
     }
+    // P0: A TERMINAL NON-SUCCESS MUST SAY WHY. Cancelled and interrupted runs often reach here
+    // with `error` empty, and the run row is the only "why" carrier the task view has
+    // (`get_task` returns task + runs). Before this, the board showed a task that was merely
+    // "in progress" with nothing to read anywhere.
+    if run.status.is_terminal() && run.status != RunStatus::Completed && run.error.is_none() {
+        run.error = Some(
+            match run.status {
+                RunStatus::Cancelled => "the run was cancelled before it produced an answer",
+                RunStatus::Interrupted => "the run was interrupted (daemon restart or lost child)",
+                _ => "the run ended without reporting a cause",
+            }
+            .to_string(),
+        );
+    }
     transcript.flush()?;
     db.update_run(&run).await?;
-    if run.status == RunStatus::Completed {
-        db.update_task_status(task_id, TaskStatus::Done).await?;
-    }
+    // P0 + P2.3: the task write-back and the completion hook, in that order and behind ONE
+    // judgement ("is the whole cluster terminal"). This replaces the old
+    // `if run.status == Completed { update_task_status(Done) }`, which left a failed run's task
+    // "in progress" for ever.
+    // A LIVE ending may self-heal: the chat that dispatched this work still has a session, so a
+    // retry's eventual report has somewhere to land.
+    finish_cluster(&mgr, task_id, &run, true).await;
     let _ = broadcast.send(StreamMsg::Finished {
         run_id: run.id,
         status: run.status,
     });
     Ok(())
+}
+
+/// P0's TERMINAL MAPPING, exhaustive on purpose.
+///
+/// WHY A `match` OVER EVERY VARIANT rather than `if status == Completed`: that is exactly the
+/// shape this replaces (`runs.rs`' finalize used to write `Done` only for `Completed`), so every
+/// other terminal state silently meant "write nothing" and the board said 进行中 about a run that
+/// was dead. With this mapping a NEW `RunStatus` variant fails to compile here instead of becoming
+/// a silent fourth truth.
+///
+/// `WaitingPermission` IS NON-TERMINAL, deliberately. It is an empty state today — nothing in the
+/// tree ever writes it (the inbox's "waiting for permission" is joined in at read time from the
+/// in-memory pending map) — and the predicate must not depend on that staying true: an attempt
+/// parked on a human decision has NOT finished, and calling it terminal would make a cluster
+/// announce itself while one of its attempts is still alive.
+fn task_status_for(status: RunStatus) -> Option<TaskStatus> {
+    match status {
+        RunStatus::Queued
+        | RunStatus::Spawning
+        | RunStatus::Running
+        | RunStatus::WaitingPermission => None,
+        RunStatus::Completed => Some(TaskStatus::Done),
+        RunStatus::Failed | RunStatus::Interrupted | RunStatus::Cancelled => {
+            Some(TaskStatus::Pending)
+        }
+    }
+}
+
+/// P0 + P2.3, at ONE site, behind ONE judgement.
+///
+/// A CLUSTER is every run of one `task_id` (design §2): a fan-out, a retry and a re-dispatch of
+/// one work item are the same cluster, because they are the same thing being attempted. The single
+/// criterion below — "is every attempt terminal?" — answers both questions the design asks:
+///
+/// 1. **P0, the board must not lie.** While an attempt is live the task stays `InProgress` (that
+///    is what "in progress" means); once they are ALL terminal the task is written back
+///    exhaustively: `Completed` → `Done`, and `Failed`/`Interrupted`/`Cancelled` → `Pending` (the
+///    work item is alive again and can be re-dispatched) with the failing attempt's own `error`
+///    left as the "why it did not work last time" reading (`update_run` above, and the sentence
+///    filled in when a cancellation reported nothing).
+/// 2. **P2.3, the conversation that dispatched it is told — once.** An intermediate result is the
+///    normal shape of a fan-out, so it is not news and costs no model turn. Storm suppression is
+///    therefore the aggregation itself: there is NO timer and NO minimum interval here, and adding
+///    one would be a second criterion for the same question (two criteria, two truths).
+///
+/// A failure makes one attempt at SELF-HEAL (the design's 「出问题优先自己解决」): ONE retry of the
+/// newest retryable failure, preferring a DIFFERENT agent, recorded on the attempt itself
+/// (`RunParams::self_heal_of` + a `Routed` event whose rationale says so) so the next hook sees the
+/// budget is spent. Only when that budget is gone is the failure reported — and the report says how
+/// many attempts were made and what the last failure was.
+///
+/// KNOWN WINDOW, not a second truth: two attempts of one cluster that reach terminal within the
+/// same read can both see "all terminal" and both report. Nothing here tries to hide that; the
+/// consequence is a duplicate sentence in the chat, and the alternative (a claim table / a timer)
+/// would be the second criterion the design forbids.
+pub(crate) async fn finish_cluster(
+    mgr: &Arc<RunManager>,
+    task_id: ruagent_core::TaskId,
+    run: &Run,
+    // Whether this call may start the cluster's one automatic retry (the self-heal). It is a
+    // PARAMETER and not a second criterion: the decision "is the cluster terminal" stays in one
+    // place below; this only says whether the caller is entitled to spend tokens.
+    //
+    // WHO PASSES FALSE: the boot-time sweep in `lib.rs`. Measured (verifier, 2026-11-20): after a
+    // restart the self-heal DOES start a fresh run, and the report it would eventually send is
+    // DROPPED, because the chat has no live session any more (`WARN platform event dropped`). So a
+    // restart spent a round of the user's tokens to produce a sentence nobody received. Paying and
+    // not being told is the worst of the available shapes; the state write-back still happens, and
+    // the reason the work died is already visible on the run's `error`
+    // (`daemon restarted mid-run`).
+    allow_self_heal: bool,
+) {
+    let runs = match mgr.db().list_runs_for_task(task_id).await {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::warn!(
+                task_id = %task_id,
+                run_id = %run.id,
+                error = %e,
+                "completion hook could not read the cluster: the task status was NOT written back \
+                 and nothing was reported"
+            );
+            return;
+        }
+    };
+
+    // (1) INTERMEDIATE RESULT. Some attempt of this cluster is still live: the task genuinely IS
+    // in progress, and there is nothing to report yet.
+    if let Some(live) = runs.iter().find(|r| !r.status.is_terminal()) {
+        tracing::debug!(
+            task_id = %task_id,
+            run_id = %run.id,
+            live_run = %live.id,
+            live_status = ?live.status,
+            "cluster still has a live attempt; no write-back, no report"
+        );
+        return;
+    }
+
+    // (2) P0: the task write-back, now that every attempt has ended.
+    let task = match mgr.db().get_task(task_id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            tracing::warn!(
+                task_id = %task_id,
+                run_id = %run.id,
+                "completion hook found no task row for the cluster; nothing written back"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                task_id = %task_id,
+                run_id = %run.id,
+                error = %e,
+                "completion hook could not read the task; nothing written back"
+            );
+            return;
+        }
+    };
+    if task.status == TaskStatus::Cancelled {
+        // A HUMAN decided this work item is off. An automatic write-back must not resurrect it
+        // into Pending (which is re-dispatchable), and there is nobody to wake about a cancelled
+        // task. Said out loud instead of silently skipped.
+        tracing::info!(
+            task_id = %task_id,
+            run_id = %run.id,
+            "the task was cancelled by a human; the run's terminal state is NOT written back \
+             onto it and no report is sent"
+        );
+        return;
+    }
+    // Every attempt is terminal (1), so every attempt has a target (the mapping is exhaustive);
+    // a length mismatch would mean an unmapped status, which is said out loud rather than
+    // guessed at.
+    let targets: Vec<TaskStatus> = runs
+        .iter()
+        .filter_map(|r| task_status_for(r.status))
+        .collect();
+    if targets.len() != runs.len() {
+        tracing::warn!(
+            task_id = %task_id,
+            run_id = %run.id,
+            attempts = runs.len(),
+            mapped = targets.len(),
+            "a terminal run status has no task mapping; the task status was left alone"
+        );
+        return;
+    }
+    let target = if targets.iter().all(|t| *t == TaskStatus::Done) {
+        TaskStatus::Done
+    } else {
+        TaskStatus::Pending
+    };
+    if task.status != target {
+        match mgr.db().update_task_status(task_id, target).await {
+            Ok(()) => tracing::info!(
+                task_id = %task_id,
+                run_id = %run.id,
+                from = ?task.status,
+                to = ?target,
+                attempts = runs.len(),
+                "task status written back from the run's terminal state"
+            ),
+            Err(e) => tracing::warn!(
+                task_id = %task_id,
+                run_id = %run.id,
+                target = ?target,
+                error = %e,
+                "WRITING THE RUN'S TERMINAL STATE BACK TO THE TASK FAILED: the board keeps \
+                 showing the old status"
+            ),
+        }
+    }
+
+    // (3) P2.3: is anybody waiting to hear about it? No origin chat = the panel/CLI/an external
+    // client dispatched this, and that caller is already looking at the answer.
+    //
+    // THE ORIGIN IS READ FROM THE ATTEMPT THAT ENDED THE CLUSTER, not from whichever member
+    // happens to carry one (`runs` is created_at ASC, so that is the LAST row). The difference is
+    // real: a task first dispatched from a chat and later re-dispatched from the board has one
+    // attributed and one unattributed attempt, and the panel's dispatch must not wake a
+    // conversation the user did not write in — that is P2.1's rule, applied at the cluster level.
+    // A self-heal retry INHERITS its dead attempt's origin, so it keeps answering to the same chat.
+    let Some(chat_id) = runs.last().and_then(|r| r.origin_chat_id.clone()) else {
+        return;
+    };
+    let cards = mgr.agents();
+    let failed: Vec<&Run> = runs
+        .iter()
+        .filter(|r| r.status != RunStatus::Completed)
+        .collect();
+
+    if failed.is_empty() {
+        let text = cluster_success_report(&task, &runs, &cards);
+        wake_in_background(mgr, &chat_id, text, run);
+        return;
+    }
+
+    // (4) SELF-HEAL, one attempt per cluster.
+    let healed_already = runs.iter().any(|r| r.params.self_heal_of.is_some());
+    if allow_self_heal
+        && !healed_already
+        && let Some(dead) = failed.iter().rev().find(|r| r.status.is_retryable())
+    {
+        let alternative = different_agent(&cards, dead.params.agent);
+        if alternative.is_none() {
+            // P2.4: say it instead of pretending a swap happened.
+            tracing::warn!(
+                task_id = %task_id,
+                run_id = %dead.id,
+                agent = %agent_name(&cards, dead.params.agent),
+                "self-heal: the registry has no OTHER enabled agent, so the retry stays on the \
+                 same one (the report to the chat will say so)"
+            );
+        }
+        // BOXED BY THE FUNCTION ITSELF (`retry_run_inner` returns a boxed future): the async
+        // recursion start_run → supervise → finish_cluster → here → start_run cannot otherwise be
+        // proven `Send`. See that function's doc comment.
+        let heal_attempt = mgr.retry_run_inner(dead.id, alternative.as_deref(), true);
+        match heal_attempt.await {
+            Ok(heal) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = %run.id,
+                    healed_run = %dead.id,
+                    heal_run = %heal.id,
+                    from_agent = %agent_name(&cards, dead.params.agent),
+                    to_agent = %agent_name(&cards, heal.params.agent),
+                    "self-heal: started the cluster's one automatic retry; the report waits for it"
+                );
+                // The heal attempt is live again, so this cluster is NOT finished: it reports when
+                // it ends, through this same hook.
+                return;
+            }
+            Err(e) => {
+                // The retry could not be started. Falling through is deliberate: the cluster IS
+                // terminal, and a failure that cannot be retried must still be reported.
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = %dead.id,
+                    error = %e,
+                    "self-heal: the automatic retry could NOT be started; reporting the failure as \
+                     it stands"
+                );
+            }
+        }
+    }
+
+    // (5) Report the failure, saying what was tried.
+    let text = cluster_failure_report(&task, &runs, &cards, healed_already);
+    wake_in_background(mgr, &chat_id, text, run);
+}
+
+/// The id→NAME direction, for text a human reads. A run records `params.agent` (a registry id);
+/// every sentence in the report names the agent the way the user knows it — the same contract
+/// `task_dispatch`'s reply already follows. Missing from the registry is reported, not hidden.
+fn agent_name(cards: &[AgentCard], id: ruagent_core::AgentId) -> String {
+    cards
+        .iter()
+        .find(|c| c.id == id)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| format!("{id} (no card with this id is in the registry any more)"))
+}
+
+/// The agent a self-heal should move to: an ENABLED card that is not the one that just failed,
+/// or `None` when there is no other (P2.3: 「注册表里有可用者才换」). `RunManager::agents()` is
+/// name-sorted, so this is deterministic rather than "whichever the map yielded first".
+fn different_agent(cards: &[AgentCard], failed: ruagent_core::AgentId) -> Option<String> {
+    cards
+        .iter()
+        .find(|c| c.enabled && c.id != failed)
+        .map(|c| c.name.clone())
+}
+
+/// One attempt's line in a report: who, how it ended, and what to read.
+fn report_member(cards: &[AgentCard], run: &Run) -> String {
+    let name = agent_name(cards, run.params.agent);
+    let healer = if run.params.self_heal_of.is_some() {
+        "（自愈重试）"
+    } else {
+        ""
+    };
+    match run.status {
+        RunStatus::Completed => {
+            let what = run
+                .result
+                .as_deref()
+                .map(|r| snippet(r, 300))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "（没有输出）".to_string());
+            format!("  · {name}{healer} — 成功：{what}")
+        }
+        _ => {
+            let why = run
+                .error
+                .as_deref()
+                .map(|e| snippet(e, 300))
+                .unwrap_or_else(|| "（没有记下原因）".to_string());
+            format!("  · {name}{healer} — {:?}：{why}", run.status)
+        }
+    }
+}
+
+/// The all-success report: which agents, which work item, and the result to read.
+fn cluster_success_report(task: &Task, runs: &[Run], cards: &[AgentCard]) -> String {
+    let mut out = format!(
+        "【平台事件】你派出去的活全部完成了（这是平台自动汇报，不是用户说的话）。\n\n任务：{}\n",
+        task.title
+    );
+    for run in runs {
+        out.push_str(&report_member(cards, run));
+        out.push('\n');
+    }
+    if runs.len() > 1 {
+        out.push_str(&format!(
+            "\n（同一个任务的 {} 个尝试全部结束。）",
+            runs.len()
+        ));
+    }
+    out
+}
+
+/// The failure report. P2.3 requires it to say HOW MANY attempts were made and what the LAST
+/// failure was — "我试了 N 次，最后失败原因是 …" — and P2.4 requires it to admit when there was no
+/// other agent to move to instead of implying a swap that never happened.
+fn cluster_failure_report(
+    task: &Task,
+    runs: &[Run],
+    cards: &[AgentCard],
+    healed_already: bool,
+) -> String {
+    let last_error = runs
+        .iter()
+        .rev()
+        .find(|r| r.status != RunStatus::Completed)
+        .and_then(|r| r.error.as_deref())
+        .map(|e| snippet(e, 400))
+        .unwrap_or_else(|| "（没有记下原因）".to_string());
+    let mut out = format!(
+        "【平台事件】你派出去的活没能做成（这是平台自动汇报，不是用户说的话）。\n\n任务：{}\n",
+        task.title
+    );
+    for run in runs {
+        out.push_str(&report_member(cards, run));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n我试了 {} 次{}，最后一次失败原因是：{last_error}\n",
+        runs.len(),
+        if healed_already {
+            "（含 1 次自愈重试）"
+        } else {
+            ""
+        }
+    ));
+    // Did the heal actually MOVE to another agent? Read it off the attempts themselves: the
+    // registry may have had nobody else, and the honest sentence is then "同一个 agent".
+    if healed_already {
+        let healed: Vec<&Run> = runs
+            .iter()
+            .filter(|r| r.params.self_heal_of.is_some())
+            .collect();
+        let stayed = healed.iter().any(|heal| {
+            runs.iter().any(|r| {
+                Some(r.id) == heal.params.self_heal_of && r.params.agent == heal.params.agent
+            })
+        });
+        if stayed {
+            out.push_str(
+                "（自愈时注册表里只有一个可用 agent，所以是用同一个 agent 重试的，不是换了一个。）\n",
+            );
+        }
+    }
+    out
+}
+
+/// Bound a multi-line agent output to one readable line.
+fn snippet(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        flat
+    } else {
+        let cut: String = flat.chars().take(max_chars).collect();
+        format!("{cut}…")
+    }
+}
+
+/// Hand the report to the chat — in a spawned task, so a slow chat can never delay this run's
+/// `Finished` broadcast, and P2.4's rule holds: a delivery failure is a WARN naming the chat and
+/// the run, never a panic and never a silent drop.
+fn wake_in_background(mgr: &Arc<RunManager>, chat_id: &str, text: String, run: &Run) {
+    let root = mgr.root();
+    let chat_id = chat_id.to_string();
+    let run_id = run.id;
+    tokio::spawn(async move {
+        if let Err(e) = crate::chat::notify_chat(&root, &chat_id, text).await {
+            tracing::warn!(
+                chat_id = %chat_id,
+                run_id = %run_id,
+                error = %e,
+                "the completion report could NOT be delivered to the chat; the run itself is \
+                 unaffected (this is a lost report, not a lost run)"
+            );
+        }
+    });
 }
 
 /// Append to the transcript and produce the envelope line for broadcast.

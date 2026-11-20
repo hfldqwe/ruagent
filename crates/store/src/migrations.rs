@@ -37,6 +37,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0029_resolution_dismissed.sql"),
     include_str!("migrations/0030_distill_coverage.sql"),
     include_str!("migrations/0031_distill_refused.sql"),
+    include_str!("migrations/0032_runs_origin_chat.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.
@@ -1087,17 +1088,23 @@ mod tests {
             31,
             "0031 must be MIGRATIONS[30]: the ALTER-only refusal-count migration"
         );
-        assert_eq!(
-            v31 + 1,
-            MIGRATIONS.len(),
-            "0031 must be the NEWEST script; THIS test pins the head literal, so a              migration appended after it has to move the literal below"
+        // 0032 IS APPENDED AFTER 0031, and this fixture is built from take(v31) on purpose:
+        // what this test covers is the step INTO 0031. The head literal moved to whichever test
+        // covers the newest step (0032 today, see
+        // `the_origin_chat_column_upgrades_an_old_database_and_reapplies_cleanly`).
+        assert!(
+            MIGRATIONS.len() > v31 + 1,
+            "0032 must be appended after 0031, so this fixture is not the newest step"
         );
         assert_eq!(
             SCHEMA_VERSION,
             MIGRATIONS.len() as i64,
             "SCHEMA_VERSION must be MIGRATIONS.len()"
         );
-        assert_eq!(SCHEMA_VERSION, 31, "0031 makes the head thirty-one");
+        assert_eq!(
+            SCHEMA_VERSION, 32,
+            "0032 makes the head thirty-two (0031 made it thirty-one)"
+        );
 
         // ---- 1. a database as it was BEFORE 0031 ----------------------------
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1251,6 +1258,187 @@ mod tests {
         );
     }
 
+    /// P2.1 (`docs/plans/2026-11-20-primary-supervisor-design.md` §3): `runs` learns WHICH
+    /// CONVERSATION dispatched an attempt, so a chat can be told its cluster finished.
+    ///
+    /// Same three properties every additive migration here is pinned by, plus the head literal
+    /// (which moved here because 0032 is now the newest step):
+    ///
+    /// 1. **an old database upgrades, and its history stays UNKNOWN.** The fixture is built by
+    ///    the SAME runner (`apply_one` for 1..=31) around a run row written the way a pre-0032
+    ///    daemon wrote one, so the only path exercised is the one a real installation takes. The
+    ///    row's own values survive, the row COUNT does not move, and the new column reads NULL — a
+    ///    `DEFAULT ''` would have made every historical run claim a conversation named the empty
+    ///    string, which is the opposite of "nobody recorded an origin".
+    /// 2. **re-applying 0032 is a no-op.** SQLite has no `ADD COLUMN IF NOT EXISTS`; this rests on
+    ///    the runner's `pragma_table_info` guard, and the negative control below proves the
+    ///    unguarded statement IS an error — otherwise the clean re-apply proves nothing.
+    /// 3. **the head follows the array.** `SCHEMA_VERSION == MIGRATIONS.len()`, and the literal
+    ///    (32) lives HERE because this is the newest step.
+    #[test]
+    fn the_origin_chat_column_upgrades_an_old_database_and_reapplies_cleanly() {
+        const NEW_COLUMN: &str = "origin_chat_id";
+
+        let v32 = MIGRATIONS
+            .iter()
+            .position(|s| s.contains("ADD COLUMN origin_chat_id"))
+            .expect("0032's script must be embedded in MIGRATIONS");
+        assert_eq!(
+            v32 + 1,
+            32,
+            "0032 must be MIGRATIONS[31]: the ALTER-only origin-chat migration"
+        );
+        assert_eq!(
+            v32 + 1,
+            MIGRATIONS.len(),
+            "0032 must be the NEWEST script; THIS test pins the head literal, so a migration \
+             appended after it has to move the literal below"
+        );
+        assert_eq!(
+            SCHEMA_VERSION,
+            MIGRATIONS.len() as i64,
+            "SCHEMA_VERSION must be MIGRATIONS.len()"
+        );
+        assert_eq!(SCHEMA_VERSION, 32, "0032 makes the head thirty-two");
+
+        // ---- 1. a database as it was BEFORE 0032 ----------------------------
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_ledger(&conn).unwrap();
+        for (i, script) in MIGRATIONS.iter().take(v32).enumerate() {
+            apply_one(&mut conn, (i + 1) as i64, script).unwrap();
+        }
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            31,
+            "the fixture must NOT have seen 0032"
+        );
+        assert!(
+            !columns(&conn, "runs").iter().any(|c| c == NEW_COLUMN),
+            "the fixture is wrong: runs.{NEW_COLUMN} already exists before 0032"
+        );
+        // A pre-0032 daemon's write, spelled with exactly the columns that existed then.
+        conn.execute(
+            "INSERT INTO runs (id, task_id, agent, params, status, created_at, updated_at)
+             VALUES ('r-old', 't-old', 'a-old', '{}', 'failed',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_where(&conn, "SELECT COUNT(*) FROM runs"), 1);
+
+        // ---- 2. upgrade through the runner's own path -----------------------
+        apply(&mut conn).unwrap();
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION must follow MIGRATIONS.len() onto the new head"
+        );
+        assert!(
+            columns(&conn, "runs").iter().any(|c| c == NEW_COLUMN),
+            "0032 must have added runs.{NEW_COLUMN}"
+        );
+        let (notnull, dflt) = conn
+            .prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('runs')")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|(name, _, _)| name == NEW_COLUMN)
+            .map(|(_, notnull, dflt)| (notnull, dflt))
+            .expect("0032's column must exist after the upgrade");
+        assert_eq!(
+            notnull, 0,
+            "runs.{NEW_COLUMN} must be NULLABLE: NULL is how a pre-0032 run says 'no chat \
+             dispatched this', and NOT NULL would have backfilled it"
+        );
+        assert!(
+            dflt.is_none(),
+            "runs.{NEW_COLUMN} must have NO default, got {dflt:?}"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM runs WHERE origin_chat_id IS NULL"
+            ),
+            1,
+            "the pre-0032 row must read 'no origin recorded', NOT a fabricated empty chat id"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM runs"),
+            1,
+            "an ALTER-only migration must neither drop nor duplicate a row"
+        );
+        // The row's OWN values survive the upgrade.
+        let (status, agent): (String, String) = conn
+            .query_row(
+                "SELECT status, agent FROM runs WHERE id = 'r-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(agent, "a-old");
+
+        // A row written AFTER the migration can STATE its origin.
+        conn.execute(
+            "INSERT INTO runs (id, task_id, agent, params, status, origin_chat_id,
+                               created_at, updated_at)
+             VALUES ('r-new', 't-new', 'a-new', '{}', 'completed', 'chat-1',
+                     '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let stated: Option<String> = conn
+            .query_row(
+                "SELECT origin_chat_id FROM runs WHERE id = 'r-new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stated.as_deref(),
+            Some("chat-1"),
+            "a post-0032 run must be able to STATE the conversation that dispatched it"
+        );
+
+        // ---- 3. the SAME script, re-applied ---------------------------------
+        let before = schema_snapshot(&conn);
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version >= ?1",
+            rusqlite::params![(v32 + 1) as i64],
+        )
+        .unwrap();
+        apply(&mut conn).unwrap_or_else(|e| {
+            panic!("re-applying 0032 must be a no-op, not duplicate column name: {e}")
+        });
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "a re-applied ADDITIVE migration must leave the schema IDENTICAL"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM runs"),
+            2,
+            "the re-apply must not duplicate rows"
+        );
+
+        // NEGATIVE CONTROL, in-process and without touching any shared source: the SAME statement,
+        // run unguarded, IS an error.
+        let unguarded = conn.execute_batch("ALTER TABLE runs ADD COLUMN origin_chat_id TEXT;");
+        assert!(
+            unguarded.is_err(),
+            "the unguarded ALTER must fail, or the guard is untested"
+        );
+    }
+
     /// t3 / issue #58: the ledger learns WHICH MESSAGES an attempt read.
     ///
     /// 0028 gave `distill_log` the NUMERIC half of issue #48's coverage
@@ -1275,8 +1463,7 @@ mod tests {
     /// 3. **the head follows the array, and the literal moves with each newest
     ///    step.** The contract is `SCHEMA_VERSION == MIGRATIONS.len()`; the pin on
     ///    the LITERAL lives in whichever test covers the newest migration, which
-    ///    since 0031 is the_refusal_count_upgrades_an_old_database_and_reapplies_cleanly
-    ///    below. What THIS test pins is that 0030 is MIGRATIONS[29] and that its own
+    ///    since 0032 is `the_origin_chat_column_upgrades_an_old_database_and_reapplies_cleanly`. What THIS test pins is that 0030 is MIGRATIONS[29] and that its own
     ///    step (into 30) works on a database that pre-dates it.
     #[test]
     fn the_coverage_columns_upgrade_an_old_database_and_reapply_cleanly() {
@@ -1309,8 +1496,8 @@ mod tests {
             "SCHEMA_VERSION must be MIGRATIONS.len()"
         );
         assert_eq!(
-            SCHEMA_VERSION, 31,
-            "0031 makes the head thirty-one (0030 made it thirty)"
+            SCHEMA_VERSION, 32,
+            "0032 makes the head thirty-two (0031 made it thirty-one, 0030 made it thirty)"
         );
 
         // ---- 1. a database as it was BEFORE 0030 ----------------------------

@@ -141,6 +141,13 @@ pub struct PolicyConfig {
     pub distill: DistillConfig,
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
+    /// `[watchdog]`: an agent round on a timer
+    /// (docs/plans/2026-11-20-primary-supervisor-design.md §P3). Off by default —
+    /// a round spends the user's model tokens. This section says WHAT to run and
+    /// HOW OFTEN; the `watchdog` capability in the plane is the cost gate, and a
+    /// round runs only when both agree.
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
     /// `[capabilities]`: `None` = the table is ABSENT (legacy mode — every
     /// gate passes through, so the default configuration behaves exactly as
     /// it did before the plane existed). `Some({})` = present and empty
@@ -219,6 +226,169 @@ pub struct DistillConfig {
     /// Also extract entities/relations into the graph. None (absent key)
     /// means the default, true — memories-only deployments opt out.
     pub graph: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// `[watchdog]` — one agent round on a timer (P3)
+// ---------------------------------------------------------------------------
+
+/// The interval used when `[watchdog] interval` is absent. Deliberately
+/// conservative: one model round per quarter hour is already a real spend.
+pub const DEFAULT_WATCHDOG_INTERVAL: &str = "15m";
+
+/// `[watchdog]` — the platform starting work when nobody is typing
+/// (docs/plans/2026-11-20-primary-supervisor-design.md §P3).
+///
+/// TWO GATES, and they are not redundant. This section says WHAT to run and HOW
+/// OFTEN; `[capabilities.watchdog]` is the cost gate every token-spending
+/// capability in this daemon passes through (default OFF, and an `llm`-tier
+/// `PUT` needs `confirm_cost`). A round runs only when both say yes — see
+/// `ruagent_daemon::watchdog`, which is the only reader.
+///
+/// No `deny_unknown_fields` here on purpose: the section's problems are reported
+/// at BOOT as a WARN that switches the feature off (an invalid interval, both
+/// `prompt` and `task`, or neither), and a hard parse error would instead refuse
+/// to boot a daemon whose other 99% works. `[distill]` tolerates removed keys for
+/// the same reason.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WatchdogConfig {
+    /// Off by default, and a hard requirement: a round spends the user's tokens.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often a round starts: `"90s"`, `"15m"`, `"2h"`. The unit is REQUIRED
+    /// ([`parse_watchdog_interval`] refuses a bare number, because `15` meaning
+    /// seconds or minutes is exactly the ambiguity that burns an account).
+    /// Absent = [`DEFAULT_WATCHDOG_INTERVAL`].
+    pub interval: Option<String>,
+    /// Agent NAME; absent = the platform's own routing cascade decides who runs
+    /// the round (the same cascade a dispatched task goes through).
+    pub agent: Option<String>,
+    /// The prompt of every round. Exactly one of `prompt` / `task`.
+    pub prompt: Option<String>,
+    /// An EXISTING task id to dispatch a run of, instead of a fresh prompt —
+    /// the watchdog then works on that task's current intent, so editing the
+    /// task changes the next round.
+    pub task: Option<String>,
+}
+
+/// What one round launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogTarget {
+    /// `[watchdog].prompt`: a standing intent the watchdog owns.
+    Prompt(String),
+    /// `[watchdog].task`: an existing task, dispatched again each round.
+    Task(String),
+}
+
+/// A VALID `[watchdog]`, resolved: what to run, how often, and whether the
+/// agent was named or the cascade decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogRound {
+    pub interval: std::time::Duration,
+    pub target: WatchdogTarget,
+    pub agent: Option<String>,
+}
+
+/// Why a `[watchdog]` section cannot be run. Every variant names the value that
+/// was refused: the daemon logs it and switches the feature OFF, so the message
+/// is the whole remedy the user gets.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WatchdogConfigError {
+    #[error(
+        "[watchdog] interval `{0}` has no unit: write 90s, 15m or 2h — a bare number is \
+         ambiguous between seconds and minutes"
+    )]
+    IntervalWithoutUnit(String),
+    #[error("[watchdog] interval `{0}` is not a whole number followed by s, m or h")]
+    IntervalNotANumber(String),
+    #[error(
+        "[watchdog] interval `{0}` is zero: a round that fires immediately would spend tokens in \
+         a tight loop"
+    )]
+    ZeroInterval(String),
+    #[error("[watchdog] enabled = true but neither `prompt` nor `task` is set: nothing to run")]
+    NoTarget,
+    #[error(
+        "[watchdog] enabled = true but BOTH `prompt` and `task` are set: they are alternatives, \
+         not a pair — remove one"
+    )]
+    BothTargets,
+}
+
+impl WatchdogConfig {
+    /// The resolved round, or `Ok(None)` when the watchdog is OFF (the shipped
+    /// default). `Err` = this configuration is invalid — the caller MUST log it
+    /// and leave the feature off rather than run half of it.
+    ///
+    /// A section that is `enabled = false` is never validated: nothing runs, so
+    /// there is nothing to refuse. The moment it is switched on, the body has to
+    /// be whole.
+    pub fn round(&self) -> Result<Option<WatchdogRound>, WatchdogConfigError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let interval = parse_watchdog_interval(
+            self.interval
+                .as_deref()
+                .unwrap_or(DEFAULT_WATCHDOG_INTERVAL),
+        )?;
+        // A blank `prompt = ""` is not a prompt: it is an empty round that would
+        // start an agent with nothing to do, so it counts as absent.
+        let prompt = self
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let task = self
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let target = match (prompt, task) {
+            (Some(p), None) => WatchdogTarget::Prompt(p.to_string()),
+            (None, Some(t)) => WatchdogTarget::Task(t.to_string()),
+            (None, None) => return Err(WatchdogConfigError::NoTarget),
+            (Some(_), Some(_)) => return Err(WatchdogConfigError::BothTargets),
+        };
+        Ok(Some(WatchdogRound {
+            interval,
+            target,
+            agent: self
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        }))
+    }
+}
+
+/// `"90s"` / `"15m"` / `"2h"` -> a [`Duration`]. The unit is not optional: this
+/// is the one place a user can spend money by guessing.
+pub fn parse_watchdog_interval(text: &str) -> Result<std::time::Duration, WatchdogConfigError> {
+    let t = text.trim();
+    let Some(unit) = t.chars().last() else {
+        return Err(WatchdogConfigError::IntervalNotANumber(t.to_string()));
+    };
+    // `unit.len_utf8()` is 1 for every accepted suffix; a multi-byte last char
+    // never reaches the slice because it falls into the refusal arm below.
+    let (digits, per_unit) = match unit.to_ascii_lowercase() {
+        's' => (&t[..t.len() - 1], 1u64),
+        'm' => (&t[..t.len() - 1], 60),
+        'h' => (&t[..t.len() - 1], 3_600),
+        _ => return Err(WatchdogConfigError::IntervalWithoutUnit(t.to_string())),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| WatchdogConfigError::IntervalNotANumber(t.to_string()))?;
+    if n == 0 {
+        return Err(WatchdogConfigError::ZeroInterval(t.to_string()));
+    }
+    let secs = n
+        .checked_mul(per_unit)
+        .ok_or_else(|| WatchdogConfigError::IntervalNotANumber(t.to_string()))?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 /// `[permissions]` section.
@@ -484,5 +654,142 @@ action = "explode"
             .unwrap_err()
             .to_string();
         assert!(err.contains("weigth"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // [watchdog] (P3)
+    // -----------------------------------------------------------------------
+
+    /// The shipped default, and the one that matters most: a watchdog that
+    /// spends the user's tokens must not be on because a section is absent.
+    #[test]
+    fn watchdog_is_off_by_default_and_in_every_disabled_spelling() {
+        let bare = PolicyConfig::parse("[permissions]\ndefault = \"ask\"\n").unwrap();
+        assert_eq!(bare.watchdog.round(), Ok(None), "no section = off");
+
+        // An explicit `enabled = false` is off even when the body is whole...
+        let off = PolicyConfig::parse(
+            "[watchdog]\nenabled = false\ninterval = \"5m\"\nprompt = \"sweep the board\"\n",
+        )
+        .unwrap();
+        assert_eq!(off.watchdog.round(), Ok(None));
+
+        // ...and even when it is BROKEN: a switch that is off cannot misbehave,
+        // so a disabled section is not validated (nothing to report yet).
+        let broken_but_off = PolicyConfig::parse(
+            "[watchdog]\nenabled = false\ninterval = \"0\"\nprompt = \"a\"\ntask = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(broken_but_off.watchdog.round(), Ok(None));
+    }
+
+    #[test]
+    fn watchdog_resolves_prompt_and_task_as_alternatives() {
+        let prompt = PolicyConfig::parse(
+            "[watchdog]\nenabled = true\nprompt = \"  look for failing runs  \"\n",
+        )
+        .unwrap()
+        .watchdog
+        .round()
+        .expect("valid")
+        .expect("on");
+        assert_eq!(
+            prompt.target,
+            WatchdogTarget::Prompt("look for failing runs".into()),
+            "the prompt is trimmed, not silently used with its padding"
+        );
+        assert_eq!(
+            prompt.interval,
+            std::time::Duration::from_secs(15 * 60),
+            "the absent interval is the conservative default"
+        );
+        assert_eq!(prompt.agent, None, "no agent named = the cascade decides");
+
+        let task = PolicyConfig::parse(
+            "[watchdog]\nenabled = true\ninterval = \"2h\"\ntask = \"01abc\"\nagent = \"dsh\"\n",
+        )
+        .unwrap()
+        .watchdog
+        .round()
+        .expect("valid")
+        .expect("on");
+        assert_eq!(task.target, WatchdogTarget::Task("01abc".into()));
+        assert_eq!(task.interval, std::time::Duration::from_secs(7_200));
+        assert_eq!(task.agent.as_deref(), Some("dsh"));
+    }
+
+    /// The three invalid shapes the design names, each refused WITH ITS REASON,
+    /// because the daemon's only remedy is to log the message and switch off.
+    #[test]
+    fn watchdog_refuses_an_incomplete_or_contradictory_body() {
+        let none = PolicyConfig::parse("[watchdog]\nenabled = true\n")
+            .unwrap()
+            .watchdog
+            .round()
+            .unwrap_err();
+        assert_eq!(none, WatchdogConfigError::NoTarget);
+        assert!(none.to_string().contains("nothing to run"), "{none}");
+
+        let both =
+            PolicyConfig::parse("[watchdog]\nenabled = true\nprompt = \"a\"\ntask = \"b\"\n")
+                .unwrap()
+                .watchdog
+                .round()
+                .unwrap_err();
+        assert_eq!(both, WatchdogConfigError::BothTargets);
+        assert!(both.to_string().contains("remove one"), "{both}");
+
+        // A blank body is the same as a missing one: it would start an agent
+        // with nothing to do.
+        let blank = PolicyConfig::parse("[watchdog]\nenabled = true\nprompt = \"   \"\n")
+            .unwrap()
+            .watchdog
+            .round()
+            .unwrap_err();
+        assert_eq!(blank, WatchdogConfigError::NoTarget);
+    }
+
+    #[test]
+    fn watchdog_interval_requires_a_unit_and_refuses_zero() {
+        // Units, and the case-insensitivity of the suffix.
+        for (text, secs) in [("90s", 90), ("15m", 900), ("2h", 7_200), ("30S", 30)] {
+            assert_eq!(
+                parse_watchdog_interval(text),
+                Ok(std::time::Duration::from_secs(secs)),
+                "{text}"
+            );
+        }
+        // A bare number is REFUSED rather than guessed: `15` is either 15
+        // seconds (a token firehose) or 15 minutes (sane), and the two differ by
+        // 60x.
+        let bare = parse_watchdog_interval("15").unwrap_err();
+        assert_eq!(bare, WatchdogConfigError::IntervalWithoutUnit("15".into()));
+        assert!(bare.to_string().contains("ambiguous"), "{bare}");
+
+        // Zero, in both spellings, and the message says what it would do.
+        assert_eq!(
+            parse_watchdog_interval("0s").unwrap_err(),
+            WatchdogConfigError::ZeroInterval("0s".into())
+        );
+        assert_eq!(
+            parse_watchdog_interval("0").unwrap_err(),
+            WatchdogConfigError::IntervalWithoutUnit("0".into())
+        );
+        assert!(
+            parse_watchdog_interval("0m")
+                .unwrap_err()
+                .to_string()
+                .contains("tight loop")
+        );
+
+        // Garbage never becomes a default silently.
+        assert_eq!(
+            parse_watchdog_interval("m").unwrap_err(),
+            WatchdogConfigError::IntervalNotANumber("m".into())
+        );
+        assert_eq!(
+            parse_watchdog_interval("1.5h").unwrap_err(),
+            WatchdogConfigError::IntervalNotANumber("1.5h".into())
+        );
     }
 }

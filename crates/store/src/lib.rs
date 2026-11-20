@@ -233,13 +233,14 @@ impl Db {
         let r = run.clone();
         self.call(move |conn| {
             conn.execute(
-                "INSERT INTO runs (id, task_id, agent, params, status, acp_session_id, workspace,
-                                   context_used, context_size, cost_usd, error, result, stop_reason,
-                                   created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO runs (id, task_id, origin_chat_id, agent, params, status,
+                                   acp_session_id, workspace, context_used, context_size,
+                                   cost_usd, error, result, stop_reason, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     r.id.to_string(),
                     r.task_id.to_string(),
+                    r.origin_chat_id,
                     r.params.agent.to_string(),
                     serde_json::to_string(&r.params).expect("RunParams serializes"),
                     run_status_to_str(r.status),
@@ -293,8 +294,9 @@ impl Db {
     pub async fn get_run(&self, id: ruagent_core::RunId) -> Result<Option<Run>, DbError> {
         self.call(move |conn| -> Result<Option<Run>, rusqlite::Error> {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
-                        context_used, context_size, cost_usd, error, result, stop_reason, created_at, updated_at
+                "SELECT id, task_id, origin_chat_id, agent, params, status, acp_session_id,
+                        workspace, context_used, context_size, cost_usd, error, result,
+                        stop_reason, created_at, updated_at
                  FROM runs WHERE id = ?1",
             )?;
             let mut rows = stmt.query([id.to_string()])?;
@@ -314,8 +316,9 @@ impl Db {
     ) -> Result<Vec<Run>, DbError> {
         self.call(move |conn| -> Result<Vec<Run>, rusqlite::Error> {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
-                        context_used, context_size, cost_usd, error, result, stop_reason, created_at, updated_at
+                "SELECT id, task_id, origin_chat_id, agent, params, status, acp_session_id,
+                        workspace, context_used, context_size, cost_usd, error, result,
+                        stop_reason, created_at, updated_at
                  FROM runs WHERE task_id = ?1 ORDER BY created_at ASC",
             )?;
             let rows = stmt
@@ -331,8 +334,9 @@ impl Db {
     pub async fn list_runs_by_status(&self, status: RunStatus) -> Result<Vec<Run>, DbError> {
         self.call(move |conn| -> Result<Vec<Run>, rusqlite::Error> {
             let mut stmt = conn.prepare(
-                "SELECT id, task_id, agent, params, status, acp_session_id, workspace,
-                        context_used, context_size, cost_usd, error, result, stop_reason, created_at, updated_at
+                "SELECT id, task_id, origin_chat_id, agent, params, status, acp_session_id,
+                        workspace, context_used, context_size, cost_usd, error, result,
+                        stop_reason, created_at, updated_at
                  FROM runs WHERE status = ?1 ORDER BY created_at ASC",
             )?;
             let rows = stmt
@@ -514,6 +518,8 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
         id: id.parse().map_err(conv)?,
         task_id: task_id.parse().map_err(conv)?,
+        // 0032: NULL = no chat dispatched this attempt (the panel/CLI/external case).
+        origin_chat_id: row.get("origin_chat_id")?,
         params: serde_json::from_str(&params).map_err(conv)?,
         status: run_status_from_str(&status),
         acp_session_id: row.get("acp_session_id")?,

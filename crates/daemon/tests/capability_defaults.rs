@@ -9,7 +9,8 @@
 //! ship without, namely that the shipped configuration does exactly what the
 //! platform did before the plane existed.
 //!
-//! The 11-id list below is written out ON PURPOSE, in the design's spelling.
+//! The 12-id list below is written out ON PURPOSE, in the design's spelling
+//! (eleven capability-plane rows + `watchdog`, which P3 appended last).
 //! A registry that quietly grows, loses or renames a row would otherwise pass
 //! every other test in this repository: everything else reads the registry.
 
@@ -151,7 +152,7 @@ fn all_numeric_fields_are_dead(name: &str, me: u32) -> bool {
 
 /// The design's registry (§5.4/§6), sorted, spelled exactly as the config file
 /// and the HTTP API spell it.
-const DESIGN_IDS: [&str; 11] = [
+const DESIGN_IDS: [&str; 12] = [
     "distill_session",
     "knowledge_ingest_graph",
     "memory_inject_chat",
@@ -163,6 +164,9 @@ const DESIGN_IDS: [&str; 11] = [
     "recall_leg_memory_semantic",
     "recall_leg_wiki",
     "session_extract_rules",
+    // P3 (docs/plans/2026-11-20-primary-supervisor-design.md §P3): the periodic
+    // round. Appended, so no existing id moved.
+    "watchdog",
 ];
 
 fn fresh_root(tag: &str) -> std::path::PathBuf {
@@ -185,7 +189,7 @@ fn plane_of(toml_text: &str) -> CapabilityPlane {
 /// unique, non-empty and spelled as the design spells them, and the L4
 /// implications over the whole registry.
 #[test]
-fn the_registry_is_conformant_and_carries_the_designs_eleven_ids() {
+fn the_registry_is_conformant_and_carries_every_design_id() {
     assert_eq!(specs().len(), CapabilityId::ALL.len());
     assert_eq!(specs().len(), DESIGN_IDS.len());
     for (i, id) in CapabilityId::ALL.iter().enumerate() {
@@ -265,6 +269,9 @@ fn a_fresh_root_is_legacy_mode_and_every_gate_passes_through() {
     assert!(!cfg.capabilities.enabled(CapabilityId::KnowledgeIngestGraph));
     // The llm tier is off as well (L4) — today `[distill].auto` is false.
     assert!(!cfg.capabilities.enabled(CapabilityId::DistillSession));
+    // P3: and so is the watchdog, which would otherwise start spending the user's
+    // tokens on a timer nobody asked for.
+    assert!(!cfg.capabilities.enabled(CapabilityId::Watchdog));
     report_test_root_left_behind(&dir);
 }
 
@@ -351,6 +358,11 @@ fn the_default_configuration_starts_no_new_work() {
         CapabilityId::KnowledgeIngestGraph,
         CapabilityId::SessionExtractRules,
         CapabilityId::DistillSession,
+        // P3: the watchdog STARTS A RUN on its own timer, which is the most
+        // expensive thing any capability here can do — it must be off in a
+        // shipped root, and `[watchdog] enabled` is false by default on top of
+        // that (two gates, both shut).
+        CapabilityId::Watchdog,
     ] {
         assert!(
             !plane.enabled(id),

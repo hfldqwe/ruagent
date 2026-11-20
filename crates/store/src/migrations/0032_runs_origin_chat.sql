@@ -1,0 +1,19 @@
+-- P2.1 of docs/plans/2026-11-20-primary-supervisor-design.md (2026-11-20).
+--
+-- WHICH CONVERSATION DISPATCHED THIS RUN. `runs.task_id` already answers "which work item",
+-- and that is the CLUSTER key (a fan-out, a retry and a re-dispatch of one task are the same
+-- cluster). It never answered "who is waiting to hear about it", so a chat that handed work to
+-- a specialist had no way to be told the work finished: `Chat::send_prompt` had exactly one
+-- caller (the HTTP handler) and nothing in the daemon could push a turn into a conversation.
+--
+-- NULL IS THE COMMON CASE AND IT MEANS SOMETHING: the panel, the CLI and `task_dispatch`
+-- without an origin are dispatches made by somebody who is already looking at the answer, so
+-- the completion hook does nothing for them. Only a chat-dispatched run wakes a chat.
+--
+-- NULLABLE, NO DEFAULT, deliberately: a `DEFAULT ''` would make every historical row claim a
+-- conversation named the empty string, and "dispatched by nobody" is not the same reading as
+-- "dispatched by a chat whose id we lost".
+--
+-- No index: the read path is `WHERE task_id = ?` (list_runs_for_task, already the cluster
+-- query the hook uses), never `WHERE origin_chat_id = ?`.
+ALTER TABLE runs ADD COLUMN origin_chat_id TEXT;

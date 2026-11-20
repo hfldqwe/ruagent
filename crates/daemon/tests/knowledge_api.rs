@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use ruagent_daemon::api::AppState;
+use ruagent_daemon::capability::CapabilityId;
 use ruagent_daemon::config::DaemonConfig;
 use ruagent_daemon::runs::RunManager;
 use ruagent_store::Db;
@@ -1976,7 +1977,14 @@ async fn the_panel_sees_every_declared_key_and_a_write_does_not_materialize_defa
         ],
         "the pre-existing row keys, unmoved"
     );
-    assert_eq!(fresh["capabilities"].as_array().map(Vec::len), Some(11));
+    // Rows == REGISTRY IDS, not a number someone has to remember to bump: the
+    // assertion is the relation (every id has a row, no row is invented), so the
+    // next capability added to `CapabilityId::ALL` is covered by construction.
+    // P3 (`watchdog`) is what caught the previous literal here at 11 vs 12.
+    assert_eq!(
+        fresh["capabilities"].as_array().map(Vec::len),
+        Some(CapabilityId::ALL.len())
+    );
     assert_eq!(fresh["conflicts"], serde_json::json!([]));
 
     let seed = serde_json::json!({

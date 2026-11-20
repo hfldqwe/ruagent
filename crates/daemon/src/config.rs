@@ -911,6 +911,18 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 # graph = false          # memories only — skip entity/relation extraction
 #                        # (default true: memories + graph)
 #
+# Watchdog (docs/plans/2026-11-20-primary-supervisor-design.md §P3): one agent
+# round on a timer — the platform doing work while nobody is typing. It starts a
+# real run on a real agent, so it is OFF unless you say otherwise, and it needs
+# the `watchdog` capability as well as soon as a [capabilities] table exists.
+# [watchdog]
+# enabled = false
+# interval = "15m"       # 90s / 15m / 2h — the unit is required; 0 is refused
+# agent = "dsh"          # optional: omit and the routing cascade decides
+# prompt = """Look at the last few hours of runs and report anything that failed."""
+#                        # exactly one of `prompt` and `task`:
+# task = "01J..."        #   or dispatch an EXISTING task by id, every round
+#
 # Capability plane (docs/plans/capability-plugins-design.md).
 # ABSENT [capabilities] table = today's behaviour, every gate passes through.
 # The moment the table EXISTS, the registry defaults apply: llm-tier
@@ -928,6 +940,10 @@ const DEFAULT_POLICY_TOML: &str = r#"# ruagent permission policy (M1: determinis
 #
 # [capabilities.distill_session]
 # enabled = true                  # unattended ACP extraction on session close
+#
+# [capabilities.watchdog]
+# enabled = true                  # let [watchdog] above start its rounds
+#                                 # (llm tier: PUT needs confirm_cost = true)
 #
 # [capabilities.recall_leg_wiki]
 # enabled = false                 # switch one recall leg off

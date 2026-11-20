@@ -217,6 +217,49 @@ export interface Run {
   waiting_permission?: { tool_call_id: string; title: string } | null;
 }
 
+/** One run's RECEIPT — a row of `GET /api/v1/runs` (P1 of
+ *  docs/plans/2026-11-20-primary-supervisor-design.md §3), not a `Run`.
+ *
+ *  WHY A SECOND TYPE: this row answers "did the work finish, and did it work" and
+ *  therefore carries the things a list needs — the TASK's title, the agent's NAME —
+ *  instead of the heavy fields a run detail holds (params, transcript, workspace).
+ *  Reusing `Run` here would have meant inventing those two in the view, which is
+ *  where a page starts guessing.
+ *
+ *  `agent` IS THE NAME, `agent_id` the registry id it was translated from: the
+ *  run records an id, a human reads a name, and the pair keeps the translation
+ *  auditable. When the registry no longer holds the id, `agent` falls back to the
+ *  id ITSELF — so `agent === agent_id` is the honest reading for "no such card
+ *  any more", not a name that happens to look like one.
+ *
+ *  `error` IS ABSENT (not null) when nothing failed: the daemon omits the key, so
+ *  `r.error !== undefined` is the "this run recorded a cause" reading. */
+export interface RunReceipt {
+  id: string;
+  task_id: string;
+  task_title: string;
+  agent: string;
+  agent_id: string;
+  status: string;
+  /** The daemon's OWN terminal predicate (`status.is_terminal()`), not a guess
+   *  re-derived here — one authority per question. */
+  finished: boolean;
+  updated_at: string;
+  error?: string;
+}
+
+/** `GET /api/v1/runs` — the daemon's shared paging envelope, whose meaning is
+ *  fixed by `page()` in `crates/daemon/src/api.rs`: `total` is the FILTER's match
+ *  count before `limit`/`offset`, and `truncated` is true only when rows were left
+ *  out of THIS page. */
+export interface RunsPage {
+  runs: RunReceipt[];
+  total: number;
+  limit: number;
+  offset: number;
+  truncated: boolean;
+}
+
 export interface PendingPermission {
   run_id: string;
   tool_call_id: string;
@@ -1631,6 +1674,30 @@ export const api = {
   cancelRun: (runId: string) => post(`/api/v1/runs/${runId}/cancel`),
   retryRun: (runId: string) =>
     post(`/api/v1/runs/${runId}/retry`).then((r) => r.json() as Promise<Run>),
+  /** EVERY run, newest activity first — the receipts layer (P1 of
+   *  docs/plans/2026-11-20-primary-supervisor-design.md §3).
+   *
+   *  WHY THIS EXISTS: until it did, a run was reachable only through its task, so
+   *  "what just finished, anywhere" had no answer and every run was a window the
+   *  user had to go back and look at.
+   *
+   *  `status` is ONE spelling, exact (`completed`, `failed`, `running`, …): the
+   *  daemon answers 400 for a value that names no status instead of ignoring the
+   *  filter, so a typo fails loudly rather than returning everything.
+   *
+   *  `since` accepts unix milliseconds (this panel's own unit) OR an RFC3339
+   *  instant; both are ONE filter on `updated_at`. */
+  runs: (
+    q: { status?: string; since?: number | string; limit?: number; offset?: number } = {},
+  ) => {
+    const p = new URLSearchParams();
+    if (q.status) p.set("status", q.status);
+    if (q.since !== undefined) p.set("since", String(q.since));
+    if (q.limit !== undefined) p.set("limit", String(q.limit));
+    if (q.offset !== undefined) p.set("offset", String(q.offset));
+    const qs = p.toString();
+    return get<RunsPage>(`/api/v1/runs${qs ? `?${qs}` : ""}`);
+  },
 
   // permissions
   pendingPermissions: () =>
