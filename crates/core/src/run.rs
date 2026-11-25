@@ -7,6 +7,22 @@ use crate::usage::ContextUsage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// The environment variable the daemon sets on the agent process of a run that a CONVERSATION
+/// dispatched (P6 of `docs/plans/2026-11-23-reports-never-lost.md`).
+///
+/// Its value is the run's `origin_chat_id` — "which conversation is this work for". The agent does
+/// not know it any other way, and the platform MCP server (which the agent spawns for its session,
+/// and which therefore INHERITS the agent's environment) is where `task_dispatch` reads it, so a
+/// piece of work dispatched from inside a chat records that chat and the report can be delivered.
+///
+/// IT IS NOT SET when the run has no origin (the panel, the CLI, an external client): injecting an
+/// empty string would make "no conversation" indistinguishable from "a conversation with an empty
+/// id". Its absence IS the meaning.
+///
+/// The consumer is `crates/mcp/src/lib.rs` (`CHAT_ID_ENV` there is a documented copy of this name:
+/// that crate deliberately does not depend on `ruagent-core`).
+pub const CHAT_ID_ENV: &str = "RUAGENT_CHAT_ID";
+
 /// Lifecycle of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +156,26 @@ pub struct RunParams {
     /// written before this field existed (`#[serde(default)]`, and the column is JSON).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_heal_of: Option<RunId>,
+    /// WHICH HUMAN DISPATCH of this task this attempt belongs to (P5 of
+    /// `docs/plans/2026-11-23-reports-never-lost.md`). `0` = the first dispatch of the task;
+    /// every later dispatch a human, the panel or `task_dispatch` starts gets the next number, and
+    /// every attempt of ONE dispatch (a fan-out's branches, a self-heal of it) carries the same
+    /// number.
+    ///
+    /// WHY THE NUMBER EXISTS: "has this task already been healed?" used to be answered by «does any
+    /// attempt of this task carry `self_heal_of`?», which stays true for ever after the first heal.
+    /// So a task that a human re-dispatched a second or third time — precisely the sign that they
+    /// want it to succeed — got no automatic retry at all. The budget belongs to a DISPATCH, not to
+    /// the work item: one automatic retry per generation (`daemon::runs::heal_budget_spent`).
+    ///
+    /// BACKWARD COMPATIBILITY, SAID OUT LOUD because the behaviour change is invisible otherwise:
+    /// rows written before this field existed read `None` here, and `None` is treated as «a
+    /// generation that cannot be told apart from the current one», i.e. a pre-versioning heal
+    /// attempt still counts as this generation's spent budget. That direction is deliberate and
+    /// conservative — old clusters keep EXACTLY today's behaviour (no extra heal), because a
+    /// silent extra round of the user's tokens is the expensive way to be wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_epoch: Option<u32>,
 }
 
 impl RunParams {
@@ -153,6 +189,7 @@ impl RunParams {
             options: Default::default(),
             prompt: None,
             self_heal_of: None,
+            dispatch_epoch: None,
         }
     }
 }

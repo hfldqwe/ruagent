@@ -38,6 +38,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0030_distill_coverage.sql"),
     include_str!("migrations/0031_distill_refused.sql"),
     include_str!("migrations/0032_runs_origin_chat.sql"),
+    include_str!("migrations/0033_chat_reports.sql"),
 ];
 
 /// The highest version any database can be at: `MIGRATIONS.len()`.
@@ -553,6 +554,9 @@ mod tests {
             "wiki_citations",
             "wiki_graph_readings",
             "wiki_corrections",
+            // 0033: the platform report OUTBOX (P4). A table with no foreign key and no trigger,
+            // assembled only from the roles its own migration documents.
+            "chat_reports",
             // 0027: the alias index. A VIRTUAL TABLE is a `table` row in
             // sqlite_master, so it is asserted beside the real ones -- and it is
             // what makes a folded name searchable (graph's `search_entities`).
@@ -1102,8 +1106,8 @@ mod tests {
             "SCHEMA_VERSION must be MIGRATIONS.len()"
         );
         assert_eq!(
-            SCHEMA_VERSION, 32,
-            "0032 makes the head thirty-two (0031 made it thirty-one)"
+            SCHEMA_VERSION, 33,
+            "0033 makes the head thirty-three (0032 made it thirty-two, 0031 thirty-one)"
         );
 
         // ---- 1. a database as it was BEFORE 0031 ----------------------------
@@ -1273,8 +1277,10 @@ mod tests {
     /// 2. **re-applying 0032 is a no-op.** SQLite has no `ADD COLUMN IF NOT EXISTS`; this rests on
     ///    the runner's `pragma_table_info` guard, and the negative control below proves the
     ///    unguarded statement IS an error — otherwise the clean re-apply proves nothing.
-    /// 3. **the head follows the array.** `SCHEMA_VERSION == MIGRATIONS.len()`, and the literal
-    ///    (32) lives HERE because this is the newest step.
+    /// 3. **the head follows the array.** `SCHEMA_VERSION == MIGRATIONS.len()`. The LITERAL pin has
+    ///    moved on to whichever test covers the newest step (0033 today, see
+    ///    `the_chat_report_outbox_upgrades_an_old_database_and_reapplies_cleanly`); what THIS test
+    ///    keeps is that 0032 is MIGRATIONS[31] and that a later step was appended after it.
     #[test]
     fn the_origin_chat_column_upgrades_an_old_database_and_reapplies_cleanly() {
         const NEW_COLUMN: &str = "origin_chat_id";
@@ -1288,18 +1294,15 @@ mod tests {
             32,
             "0032 must be MIGRATIONS[31]: the ALTER-only origin-chat migration"
         );
-        assert_eq!(
-            v32 + 1,
-            MIGRATIONS.len(),
-            "0032 must be the NEWEST script; THIS test pins the head literal, so a migration \
-             appended after it has to move the literal below"
+        assert!(
+            MIGRATIONS.len() > v32 + 1,
+            "0033 must be appended after 0032, so this fixture is not the newest step"
         );
         assert_eq!(
             SCHEMA_VERSION,
             MIGRATIONS.len() as i64,
             "SCHEMA_VERSION must be MIGRATIONS.len()"
         );
-        assert_eq!(SCHEMA_VERSION, 32, "0032 makes the head thirty-two");
 
         // ---- 1. a database as it was BEFORE 0032 ----------------------------
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1439,6 +1442,180 @@ mod tests {
         );
     }
 
+    /// P4.1 (`docs/plans/2026-11-23-reports-never-lost.md` §1): the chat report OUTBOX — one row
+    /// per sentence the platform owes a conversation that had no live session to receive it.
+    ///
+    /// The same three properties every migration here is pinned by, plus the head literal (which
+    /// moved HERE because 0033 is now the newest step):
+    ///
+    /// 1. **an old database upgrades, and it owes nothing it cannot say.** The fixture is built by
+    ///    the SAME runner (`apply_one` for 1..=32) around a `chats` row written the way a pre-0033
+    ///    daemon wrote one, so the only path exercised is the one a real installation takes. The
+    ///    table is ABSENT before the upgrade (a fixture that already had it would be testing
+    ///    nothing), the chat row survives, and after the upgrade the table is empty — a migration
+    ///    that backfilled a report would be inventing a sentence nobody wrote.
+    /// 2. **re-applying 0033 is a no-op.** `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
+    ///    EXISTS` are idempotent in SQLite itself, but the QUIET half matters more: the re-apply
+    ///    must not duplicate the rows the outbox is carrying. The negative control below proves an
+    ///    unguarded `CREATE TABLE` IS an error, so the clean re-apply is a reading and not a
+    ///    tautology.
+    /// 3. **`delivered_at` is the criterion the table exists for**, asserted directly: the row the
+    ///    daemon writes is PENDING, and the only way it stops being pending is that column being
+    ///    set. A test that only checked the column names would pass on a table nothing could query.
+    #[test]
+    fn the_chat_report_outbox_upgrades_an_old_database_and_reapplies_cleanly() {
+        let v33 = MIGRATIONS
+            .iter()
+            .position(|s| s.contains("CREATE TABLE IF NOT EXISTS chat_reports"))
+            .expect("0033's script must be embedded in MIGRATIONS");
+        assert_eq!(
+            v33 + 1,
+            33,
+            "0033 must be MIGRATIONS[32]: the chat report outbox"
+        );
+        assert_eq!(
+            v33 + 1,
+            MIGRATIONS.len(),
+            "0033 must be the NEWEST script; THIS test pins the head literal, so a migration \
+             appended after it has to move the literal below"
+        );
+        assert_eq!(
+            SCHEMA_VERSION,
+            MIGRATIONS.len() as i64,
+            "SCHEMA_VERSION must be MIGRATIONS.len()"
+        );
+        assert_eq!(SCHEMA_VERSION, 33, "0033 makes the head thirty-three");
+
+        // ---- 1. a database as it was BEFORE 0033 ----------------------------
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_ledger(&conn).unwrap();
+        for (i, script) in MIGRATIONS.iter().take(v33).enumerate() {
+            apply_one(&mut conn, (i + 1) as i64, script).unwrap();
+        }
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            32,
+            "the fixture must NOT have seen 0033"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='chat_reports'"
+            ),
+            0,
+            "the fixture is wrong: chat_reports already exists before 0033"
+        );
+        // A pre-0033 daemon's conversation: the row a report would have been addressed to.
+        conn.execute(
+            "INSERT INTO chats (id, agent, runtime, model, title, created_at, updated_at, cwd)
+             VALUES ('c-old', 'talker', 'mock', NULL, 'a conversation', 1, 1, NULL)",
+            [],
+        )
+        .unwrap();
+
+        // ---- 2. upgrade through the runner's own path -----------------------
+        apply(&mut conn).unwrap();
+        assert_eq!(
+            count_where(&conn, "SELECT MAX(version) FROM schema_migrations"),
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION must follow MIGRATIONS.len() onto the new head"
+        );
+        assert_eq!(
+            columns(&conn, "chat_reports"),
+            vec![
+                "id",
+                "chat_id",
+                "run_id",
+                "text",
+                "created_at",
+                "delivered_at",
+                "attempts",
+            ],
+            "0033's column set IS the outbox contract (chat.rs and api.rs read it positionally \
+             through this order)"
+        );
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_chat_reports_pending'"
+            ),
+            1,
+            "the pending read (WHERE chat_id = ? AND delivered_at IS NULL) needs its index"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM chat_reports"),
+            0,
+            "a migration must not invent a report: an empty outbox is the truth of a database \
+             that has never had one"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM chats"),
+            1,
+            "0033 touches no existing row"
+        );
+
+        // The shape the daemon writes, and the criterion it reads back.
+        conn.execute(
+            "INSERT INTO chat_reports (chat_id, run_id, text, created_at, delivered_at, attempts)
+             VALUES ('c-old', 'r-1', 'the work finished', '2026-01-02T00:00:00Z', NULL, 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM chat_reports WHERE delivered_at IS NULL"
+            ),
+            1,
+            "a freshly written report is PENDING — the whole point of the table"
+        );
+        conn.execute(
+            "UPDATE chat_reports SET delivered_at = '2026-01-02T00:00:01Z', attempts = 1 \
+             WHERE chat_id = 'c-old'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            count_where(
+                &conn,
+                "SELECT COUNT(*) FROM chat_reports WHERE delivered_at IS NULL"
+            ),
+            0,
+            "delivered_at is the ONLY way a report stops being owed"
+        );
+
+        // ---- 3. the SAME script, re-applied ---------------------------------
+        let before = schema_snapshot(&conn);
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version >= ?1",
+            rusqlite::params![(v33 + 1) as i64],
+        )
+        .unwrap();
+        apply(&mut conn).unwrap_or_else(|e| {
+            panic!("re-applying 0033 must be a no-op, not `table chat_reports already exists`: {e}")
+        });
+        assert_eq!(
+            before,
+            schema_snapshot(&conn),
+            "a re-applied CREATE-ONLY migration must leave the schema IDENTICAL"
+        );
+        assert_eq!(
+            count_where(&conn, "SELECT COUNT(*) FROM chat_reports"),
+            1,
+            "the re-apply must not duplicate (or drop) the reports already in the outbox"
+        );
+
+        // NEGATIVE CONTROL, in-process and without touching any shared source: the same
+        // `CREATE TABLE` without `IF NOT EXISTS`, run unguarded, IS an error — so the clean
+        // re-apply above is the runner's probe doing its job.
+        let unguarded = conn.execute_batch("CREATE TABLE chat_reports (id INTEGER PRIMARY KEY);");
+        assert!(
+            unguarded.is_err(),
+            "the unguarded CREATE TABLE must fail, or the guard is untested"
+        );
+    }
+
     /// t3 / issue #58: the ledger learns WHICH MESSAGES an attempt read.
     ///
     /// 0028 gave `distill_log` the NUMERIC half of issue #48's coverage
@@ -1463,7 +1640,7 @@ mod tests {
     /// 3. **the head follows the array, and the literal moves with each newest
     ///    step.** The contract is `SCHEMA_VERSION == MIGRATIONS.len()`; the pin on
     ///    the LITERAL lives in whichever test covers the newest migration, which
-    ///    since 0032 is `the_origin_chat_column_upgrades_an_old_database_and_reapplies_cleanly`. What THIS test pins is that 0030 is MIGRATIONS[29] and that its own
+    ///    since 0033 is `the_chat_report_outbox_upgrades_an_old_database_and_reapplies_cleanly`. What THIS test pins is that 0030 is MIGRATIONS[29] and that its own
     ///    step (into 30) works on a database that pre-dates it.
     #[test]
     fn the_coverage_columns_upgrade_an_old_database_and_reapply_cleanly() {
@@ -1496,8 +1673,8 @@ mod tests {
             "SCHEMA_VERSION must be MIGRATIONS.len()"
         );
         assert_eq!(
-            SCHEMA_VERSION, 32,
-            "0032 makes the head thirty-two (0031 made it thirty-one, 0030 made it thirty)"
+            SCHEMA_VERSION, 33,
+            "0033 makes the head thirty-three (0032 made it thirty-two, 0031 thirty-one, 0030 thirty)"
         );
 
         // ---- 1. a database as it was BEFORE 0030 ----------------------------

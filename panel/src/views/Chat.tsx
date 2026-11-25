@@ -50,6 +50,26 @@ import {
 import { Markdown } from "./lazy-markdown";
 import { msToIso } from "./Sessions";
 
+/** P4.4 (docs/plans/2026-11-23-reports-never-lost.md §1): how many reports a rail row should
+ *  SHOW as still owed — a three-state answer, and the three states are the whole point.
+ *
+ *  The daemon sends `pending_reports` per conversation, and it can be `null`: that is "the
+ *  outbox could not be read", NOT zero. Rendering it as 0 would make the panel claim every
+ *  report was delivered about a table nobody read — the same rule `Runtimes.tsx`'s
+ *  `modelChipState` states for a failed probe ("unknown is not zero"), applied to unread
+ *  messages instead of a model list. So:
+ *    unknown (null / undefined / not a finite number) -> nothing at all;
+ *    0                                                -> nothing (a reading: all delivered);
+ *    > 0                                              -> the number.
+ *
+ *  Kept as a pure function, like `modelChipState`, so the rule is reviewable and testable
+ *  without a DOM. */
+export function pendingReportBadge(n: number | null | undefined): number | null {
+  if (n === null || n === undefined) return null;
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.trunc(n);
+}
+
 /** Deterministic per-workspace hue — the workspace tree reads at a glance
  * (each project keeps its colour across visits).
  *
@@ -2167,6 +2187,10 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                     const harness = agents?.find((a) => a.name === h.runtime)?.harness;
                     const meta = h.session_key ? index[h.session_key] : undefined;
                     const label = h.title || h.preview || t("sessions.untitled");
+                    // P4.4: the unread-report count, decided in ONE pure function (three states:
+                    // unknown is not zero). `null` from the daemon means "the outbox could not be
+                    // read", and that renders NOTHING rather than a fabricated 0.
+                    const unread = pendingReportBadge(h.pending_reports);
                     return (
                       <div
                         key={h.id}
@@ -2196,6 +2220,16 @@ export function Chat({ initialAgent }: { initialAgent?: string }) {
                           <span className="micro muted truncated chat-session-agent">
                             {h.agent}
                           </span>
+                          {/* P4.4: how many platform reports this conversation is still owed.
+                              Nothing at all when unknown or zero — see `pendingReportBadge`. */}
+                          {unread !== null ? (
+                            <span
+                              className="chat-unread"
+                              title={t("chat.pendingReports", { n: unread })}
+                            >
+                              {unread}
+                            </span>
+                          ) : null}
                           <span className="time truncated">
                             <RelTime iso={msToIso(h.updated_at)} />
                           </span>

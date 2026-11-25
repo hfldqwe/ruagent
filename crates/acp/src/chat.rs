@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOptionValue, SessionConfigSelectOptions, SessionNotification,
     SetSessionConfigOptionRequest, TextContent,
 };
-use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, LineDirection};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, LineDirection};
 use ruagent_core::RunEvent;
 use tokio::sync::mpsc;
 
@@ -154,6 +154,20 @@ pub struct ChatOptions {
     /// Best-effort initial model selection (`session/set_config_option`,
     /// config id `model`). Must be a value the agent advertises.
     pub model: Option<String>,
+    /// Extra environment variables for the spawned agent — ADDED to the daemon's own, never a
+    /// replacement (same contract as [`crate::run::RunOptions::env`]).
+    ///
+    /// WHY THE CONVERSATION ITSELF NEEDS THIS: the agent the user is talking to is the one that
+    /// dispatches work (`task_dispatch`). Without `RUAGENT_CHAT_ID` in its environment it cannot
+    /// say which conversation the work belongs to, so the dispatched run has no origin and its
+    /// report reaches nobody — which is the exact failure P6 exists to remove, and the run-side
+    /// injection alone does not cover it (the chat's own process is a DIFFERENT process from the
+    /// runs it dispatches).
+    ///
+    /// Empty is the normal shape for the non-conversation callers (the runtime probe, the
+    /// distill job): they belong to no conversation, and the variable must be ABSENT rather than
+    /// empty.
+    pub env: Vec<(String, String)>,
 }
 
 /// Commands into a live chat session.
@@ -240,9 +254,16 @@ pub fn start_chat(
     opts: ChatOptions,
     ask_tx: mpsc::UnboundedSender<PermissionAsk>,
 ) -> Result<ChatSession, AcpError> {
-    let agent =
-        AcpAgent::from_args(std::iter::once(opts.program.clone()).chain(opts.args.iter().cloned()))
-            .map_err(|e| AcpError::Command(format!("{}: {e}", opts.program)))?;
+    // Built from the launch configuration rather than `from_args` (which has no way to say
+    // anything about the environment) — the same shape `run.rs` uses for a run, so the chat's
+    // agent and the runs it dispatches carry the conversation identically.
+    // `AcpAgentConfig::envs` ADDS to the inherited environment; it never clears it, which is what
+    // keeps PATH, the system proxy and `RUAGENT_URL` working for the child.
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(opts.program.clone())
+            .args(opts.args.iter().cloned())
+            .envs(opts.env.iter().map(|(k, v)| (k.clone(), v.clone()))),
+    );
     let agent = agent.with_debug(|line, dir| {
         if dir == LineDirection::Stderr {
             tracing::debug!(target: "ruagent::acp::stderr", "{line}");

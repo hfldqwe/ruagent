@@ -678,26 +678,32 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
     // SAME hook a live run's ending uses — `runs::finish_cluster`, one judgement
     // for "is the whole cluster terminal", which decides the task write-back.
     //
-    // ⚠ THIS PATH DOES NOT SPEND TOKENS, and that is a measured decision, not an
-    // oversight. The first version passed `allow_self_heal = true` here, on the
-    // user's directive (「出问题优先自己解决」). Verification then measured what it
-    // actually cost: after a restart the self-heal DOES start a fresh run, and the
-    // report it would eventually send is DROPPED — the chat has no live session any
-    // more (`WARN platform event dropped: the chat exists in history but has no live
-    // session … NOT retried`). A round of the user's tokens bought a sentence nobody
-    // received. So the boot path passes `false`:
-    //   * the task IS written back (`Pending`, re-dispatchable) and the run already
-    //     carries `daemon restarted mid-run` as its `error`, so the board tells the
-    //     truth and a person can see WHY without paying again;
-    //   * a LIVE ending still self-heals (`runs.rs`, `finish_cluster(…, true)`)
-    //     because there the chat still has a session to deliver into.
-    // If a future increment makes the platform event durable across restarts, this
-    // `false` is the line to revisit — not before.
+    // ⚠ THIS PATH SPENDS TOKENS AGAIN, AND THAT IS NOW THE RIGHT TRADE (P4.5,
+    // `docs/plans/2026-11-23-reports-never-lost.md` §P4.5). History, because the reason for the
+    // previous `false` is still a real failure mode:
+    //   * v0.1.10 passed `true`, on the user's directive (「出问题优先自己解决」). Independent
+    //     verification then measured what it cost: after a restart the self-heal DID start a fresh
+    //     run, and the report it would eventually send was DROPPED — the chat had no live session
+    //     any more (`WARN platform event dropped: the chat exists in history but has no live
+    //     session … NOT retried`). A round of the user's tokens bought a sentence nobody received,
+    //     so the line was turned OFF: the task write-back still happened (and the run already
+    //     carries `daemon restarted mid-run` as its `error`), just without paying again.
+    //   * P4 removed the reason. A platform event is now written to the `chat_reports` outbox BEFORE
+    //     anything is attempted (0033 + `ChatManager::notify`), and a conversation that was never
+    //     resumed gets it back on `POST /api/v1/chat/{id}/resume` — one report per resume, the rest
+    //     one per turn end. So a restart can no longer buy a sentence nobody receives: the sentence
+    //     is on disk until it is delivered.
+    //   * The ORDER of this change is deliberate and was demanded by the spec: P4.2 (store-then-
+    //     deliver) and P4.3 (deliver on resume) had to land and be verified FIRST, because turning
+    //     this on before them is 「又花钱又没话说」. The test that authorizes this line is
+    //     `crates/daemon/tests/chat_reports_outbox.rs::
+    //      a_restart_heals_the_cluster_and_the_report_arrives_when_the_conversation_does`: restart →
+    //     one self-heal → the conversation comes back → THE REPORT IS REALLY THERE. If that test is
+    //     ever removed, this `true` must go back to `false` with it.
     //
-    // NOTHING in this call can abort the boot: `finish_cluster` returns `()` and
-    // WARNs its own failures (with task_id + run_id), and the loop below has no
-    // `?`. A daemon that refuses to start because one task's write-back failed
-    // would be the same anti-pattern this whole increment is repairing.
+    // NOTHING in this call can abort the boot: `finish_cluster` returns `()` and WARNs its own
+    // failures (with task_id + run_id), and the loop below has no `?`. A daemon that refuses to start
+    // because one task's write-back failed would be the same anti-pattern this increment repairs.
     finalize_interrupted_clusters(&mgr, &interrupted).await;
 
     {
@@ -893,7 +899,14 @@ pub async fn serve_with_remote(root: PathBuf, addr: SocketAddr, allow_remote: bo
 /// the behaviour this sweep has always had. What must never abort the boot is one
 /// TASK's write-back, and that half cannot fail (see
 /// [`finalize_interrupted_clusters`]).
-async fn interrupt_live_runs(db: &Db) -> Result<Vec<ruagent_core::Run>> {
+///
+/// PUBLIC FOR THE OUTBOX ACCEPTANCE (`docs/plans/2026-11-23-reports-never-lost.md` §5.4): "restart →
+/// one self-heal → the report is really there when the conversation comes back" can only be
+/// asserted by a test that can run the boot's recovery without owning a process. The pair
+/// (this + [`finalize_interrupted_clusters`]) is called by the boot below IN THIS ORDER, and the
+/// test calls the same two functions in the same order — so the test exercises the implementation
+/// instead of a second copy of it.
+pub async fn interrupt_live_runs(db: &Db) -> Result<Vec<ruagent_core::Run>> {
     let mut interrupted = Vec::new();
     for status in [
         RunStatus::Queued,
@@ -925,16 +938,19 @@ async fn interrupt_live_runs(db: &Db) -> Result<Vec<ruagent_core::Run>> {
 /// CONSEQUENCES, stated rather than discovered later:
 /// * the write-back is the SAME mapping a live run gets, so a restart-interrupted
 ///   task goes back to `Pending` (re-dispatchable), not to some boot-only state;
-/// * a cluster that a chat dispatched may SELF-HEAL here (one retry, preferring a
-///   different agent) — that is P2's 「出问题优先自己解决」 applied at boot, and it
-///   spends tokens; a panel/CLI-dispatched cluster (`origin_chat_id` absent) only
-///   gets the write-back;
+/// * a cluster that a chat dispatched DOES self-heal here since P4.5 (one retry, preferring a
+///   different agent) — that is P2's 「出问题优先自己解决」 applied at boot; it spends tokens, and
+///   the report it produces is now DURABLE (`chat_reports`), which is what makes spending them
+///   defensible. A panel/CLI-dispatched cluster (`origin_chat_id` absent) only gets the write-back;
 /// * every failure is a `WARN` with task_id + run_id, from inside `finish_cluster`.
 ///
 /// Takes and drops no lock, holds nothing across the awaits beyond the manager
 /// reference, and cannot panic out: each iteration is a plain `await` on a
 /// function that returns `()`.
-async fn finalize_interrupted_clusters(
+///
+/// PUBLIC for the same reason as [`interrupt_live_runs`]: it is the code a restart runs, and the
+/// outbox acceptance has to be able to run it (see that function's note).
+pub async fn finalize_interrupted_clusters(
     mgr: &Arc<runs::RunManager>,
     interrupted: &[ruagent_core::Run],
 ) {
@@ -948,13 +964,21 @@ async fn finalize_interrupted_clusters(
             continue;
         }
         tasks += 1;
-        // `false` = NO self-heal on this path. Measured (verifier, 2026-11-20): a restart DID
-        // start the cluster's one automatic retry, and the report that retry would eventually send
-        // was dropped — the chat has no live session after a restart (`WARN platform event
-        // dropped`). That is tokens spent for a sentence nobody receives. The state write-back
-        // still happens here, and why the work died is already on the run's `error`
-        // (`daemon restarted mid-run`), so the board tells the truth without paying again.
-        runs::finish_cluster(mgr, run.task_id, run, false).await;
+        // `true` = the cluster MAY self-heal on this path (P4.5). WHAT CHANGED, and why the
+        // previous `false` is now wrong:
+        //   * v0.1.10 passed `false` on a MEASUREMENT (verifier, 2026-11-20): a restart did start
+        //     the cluster's one automatic retry, and the report that retry would eventually send was
+        //     DROPPED — the chat had no live session after a restart (`WARN platform event
+        //     dropped`). Tokens spent for a sentence nobody receives, so the boot stopped paying.
+        //   * Since P4 the report is DURABLE: `ChatManager::notify` writes it into `chat_reports`
+        //     (0033) BEFORE any delivery is attempted, a chat with no session keeps it pending, and
+        //     `POST /api/v1/chat/{id}/resume` delivers it — one per resume. So what a restart now
+        //     buys is the retry AND the sentence; the reason for `false` is gone, not overruled.
+        // The authorization for flipping this line is the test named in the boot comment above
+        // (`chat_reports_outbox::a_restart_heals_the_cluster_and_the_report_arrives_when_the_conversation_does`),
+        // and the spec demands P4.2/P4.3 land and be verified BEFORE it, because the other order
+        // is 又花钱又没话说.
+        runs::finish_cluster(mgr, run.task_id, run, true).await;
     }
     if tasks > 0 {
         tracing::info!(

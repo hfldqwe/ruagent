@@ -197,6 +197,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/chat/{id}/stop", post(chat_stop))
         .route("/api/v1/chat/{id}/handoff", post(chat_handoff))
         .route("/api/v1/chat/{id}/resume", post(chat_resume))
+        // P4.4: THE READ SIDE OF THE REPORT OUTBOX — what this conversation is still owed, with the
+        // report bodies. `?pending=1` (the default reading for a user) lists only undelivered rows;
+        // without it the same rows plus what was already delivered, so "did my report go out?" has
+        // an answer a person can read instead of a log line.
+        .route("/api/v1/chat/{id}/reports", get(chat_reports))
         .route("/api/v1/chat/{id}/events", get(chat_events))
         .route(
             "/api/v1/chat/{id}",
@@ -2950,6 +2955,9 @@ async fn probe_command(card: &ruagent_core::AgentCard) -> ProbeReport {
         cwd,
         mcp_servers: Vec::new(),
         model: None,
+        // A PROBE, not a conversation: it exists to answer "can this runtime start at all".
+        // Nothing it does is attributable to a person, so no chat id is injected.
+        env: Vec::new(),
     };
     let (ask_tx, _ask_rx) = tokio::sync::mpsc::unbounded_channel();
     let session = match ruagent_acp::start_chat(opts, ask_tx) {
@@ -7461,12 +7469,81 @@ async fn chat_resume(
         .resume_chat(id, &card)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // P4.3, told to the caller: a resume delivers AT MOST ONE owed report, so the panel needs to
+    // know how many are still waiting (it renders that number on the rail row). `null` is a real
+    // answer here too: the count could not be read, and "unknown" is not zero.
+    let pending_reports = match state
+        .mgr
+        .db()
+        .pending_chat_report_count(&chat.id.to_string())
+        .await
+    {
+        Ok(n) => serde_json::json!(n),
+        Err(e) => {
+            tracing::warn!(
+                chat_id = %chat.id,
+                error = %e,
+                "the resume succeeded but the number of reports still owed could not be read; the \
+                 response says `null` (unknown) rather than 0"
+            );
+            serde_json::Value::Null
+        }
+    };
     Ok(Json(serde_json::json!({
         "id": chat.id.to_string(),
         "agent": chat.agent,
         "runtime": chat.runtime,
         "model": chat.model,
         "cwd": chat.cwd.as_ref().map(|p| p.display().to_string()),
+        "pending_reports": pending_reports,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ChatReportsQuery {
+    /// `1`/`true` = only the reports still OWED. Any other value (or none) includes the delivered
+    /// ones, which is the diagnostic view.
+    #[serde(default)]
+    pending: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// P4.4's read: the platform reports this conversation holds.
+///
+/// WHY THIS EXISTS even though the panel only renders a count: a count is not the thing. When a
+/// user says "my task finished and nobody told me", the question is WHICH sentence is sitting in the
+/// outbox — and that must be answerable over the API, with the body, without a log file. `text` is
+/// the row as stored: no platform marker (the marker is applied when the prompt is built).
+async fn chat_reports(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ChatReportsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id: RunId = id
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid chat id"))?;
+    // `pending` is explicit about what it means: only `1`/`true` narrow the list, so a typo
+    // (`?pending=yes`) returns MORE rows rather than silently hiding delivered ones.
+    let pending_only = matches!(q.pending.as_deref(), Some("1") | Some("true"));
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let rows = state
+        .chats
+        .db()
+        .chat_reports(&id.to_string(), pending_only, limit)
+        .await
+        .map_err(|e| ApiError::internal(format!("reading the report outbox: {e}")))?;
+    let pending = state
+        .chats
+        .db()
+        .pending_chat_report_count(&id.to_string())
+        .await
+        .map_err(|e| ApiError::internal(format!("counting the report outbox: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "reports": rows,
+        "pending": pending,
+        "pending_only": pending_only,
+        "limit": limit,
     })))
 }
 

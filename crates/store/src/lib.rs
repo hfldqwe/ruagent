@@ -742,11 +742,23 @@ impl Db {
     /// title UPDATE; there is no periodic re-index of it. See
     /// ChatManager::delete for the full check.
     ///
+    /// WHAT IT ALSO REMOVES NOW (P4.3): the chat's rows in the report outbox
+    /// (`chat_reports`, 0033). A deleted conversation can never be resumed, so a report
+    /// parked for it is undeliverable for ever -- keeping it would be permanent
+    /// accumulation of sentences nobody can ever read. This is the same shape as
+    /// `delete_task` removing the task's runs: the row goes, the things that answer to
+    /// it go. BOTH DELETES ARE IN THIS ONE WRITER CLOSURE, so a crash cannot leave the
+    /// reports behind with the chat gone.
+    ///
     /// Returns true when a row was removed, false when the id was absent --
     /// so a repeated delete is an idempotent no-op.
     pub async fn delete_chat(&self, id: &str) -> Result<bool, DbError> {
         let id = id.to_string();
         self.call(move |conn| {
+            // Reports FIRST: if the `chats` delete succeeded and this one failed, the
+            // outbox would keep rows addressed to a conversation that no longer exists,
+            // and nothing would ever look at them again.
+            let _ = conn.execute("DELETE FROM chat_reports WHERE chat_id = ?1", [&id]);
             let n = conn
                 .execute("DELETE FROM chats WHERE id = ?1", [&id])
                 .unwrap_or(0);
@@ -796,6 +808,224 @@ impl Db {
             }
             let _ = conn.execute("DELETE FROM session_archives WHERE key = ?1", [&key]);
             DeleteSession::Deleted
+        })
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat report outbox (P4: docs/plans/2026-11-23-reports-never-lost.md §1)
+// ---------------------------------------------------------------------------
+
+/// The most UNDELIVERED reports ONE conversation keeps.
+///
+/// WHY A CAP AT ALL: a report is only ever consumed by a resume, and a conversation nobody
+/// reopens would otherwise accumulate one row per finished piece of work for ever. 50 is
+/// "everything a person would plausibly read back" and small enough that the table cannot
+/// grow without bound on a machine that never opens the panel.
+///
+/// WHY IT IS A CAP AND NOT A RETRY BUDGET: `attempts` counts DELIVERY ATTEMPTS (`delivered_at
+/// IS NULL` is the only "still owed" criterion), and a report that failed five times is still
+/// owed. Exceeding this cap DROPS THE OLDEST PENDING ROW and the caller is told which one, in
+/// a WARN that names it -- silent loss is the failure mode this whole increment removes.
+pub const CHAT_REPORTS_CAP: i64 = 50;
+
+/// One row of the chat report outbox: a sentence the platform owes a conversation.
+///
+/// `text` is the READABLE body. It does NOT carry the platform marker
+/// (`chat::USER_TEXT_SENTINEL`): the marker is applied at delivery time by the one function that
+/// builds the prompt, so the stored bytes are what the platform wants to say, not a prompt
+/// fragment with a daemon-specific sentinel baked in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChatReport {
+    pub id: i64,
+    pub chat_id: String,
+    /// Which run prompted this report, when the caller knew. `None` is a legitimate value: not
+    /// every platform event comes from a run.
+    pub run_id: Option<String>,
+    pub text: String,
+    /// RFC3339, this repo's format.
+    pub created_at: String,
+    /// `None` = still owed. This column is THE ONLY delivered criterion.
+    pub delivered_at: Option<String>,
+    /// How many DELIVERY ATTEMPTS this row has had, for diagnosis only.
+    ///
+    /// IT COUNTS SUCCESSFUL ATTEMPTS TOO, and that is deliberate: the acceptance reads
+    /// `attempts >= 1` on a row that WAS delivered, and `attempts = 0` on one that was delivered
+    /// would make the counter look unset. So the meaning is "how many times this sentence was
+    /// handed to the session", and `delivered_at IS NULL AND attempts > 0` is "it has failed to go
+    /// out at least once". NOT a retry budget: see [`CHAT_REPORTS_CAP`].
+    pub attempts: i64,
+}
+
+/// What one enqueue wrote, and which rows the cap had to push out to make room for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnqueuedReport {
+    pub id: i64,
+    /// Rows the cap dropped, OLDEST first. Empty is the normal answer. The caller is expected to
+    /// say so in a WARN naming the ids: a cap that fires silently is the same class of loss as
+    /// the dropped platform event this table exists to fix.
+    pub dropped: Vec<i64>,
+}
+
+impl Db {
+    /// Write one report into the outbox, enforcing [`CHAT_REPORTS_CAP`] in the SAME writer
+    /// operation.
+    ///
+    /// ONE CLOSURE, DELIBERATELY: the insert and the trim are one unit of work, so a crash
+    /// between them cannot leave the outbox over its cap (and the next insert would trim it
+    /// anyway, but then the WARN would name the wrong row).
+    ///
+    /// A NEW report is always `delivered_at = NULL`, `attempts = 0` -- the honest state of a
+    /// sentence nobody has been told yet. Whoever delivers it sets `delivered_at`.
+    pub async fn enqueue_chat_report(
+        &self,
+        chat_id: &str,
+        run_id: Option<&str>,
+        text: &str,
+    ) -> Result<EnqueuedReport, DbError> {
+        let chat_id = chat_id.to_string();
+        let run_id = run_id.map(|r| r.to_string());
+        let text = text.to_string();
+        self.call_flat(move |conn| {
+            conn.execute(
+                "INSERT INTO chat_reports (chat_id, run_id, text, created_at, delivered_at, attempts)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 0)",
+                rusqlite::params![chat_id, run_id, text, Utc::now().to_rfc3339()],
+            )?;
+            let id = conn.last_insert_rowid();
+
+            let over: i64 = conn.query_row(
+                "SELECT COUNT(*) - ?2 FROM chat_reports
+                  WHERE chat_id = ?1 AND delivered_at IS NULL",
+                rusqlite::params![&chat_id, CHAT_REPORTS_CAP],
+                |r| r.get(0),
+            )?;
+            let mut dropped = Vec::new();
+            if over > 0 {
+                let victims: Vec<i64> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id FROM chat_reports
+                          WHERE chat_id = ?1 AND delivered_at IS NULL
+                          ORDER BY id ASC LIMIT ?2",
+                    )?;
+                    stmt.query_map(rusqlite::params![&chat_id, over], |r| r.get(0))?
+                        .collect::<Result<Vec<i64>, _>>()?
+                };
+                for victim in victims {
+                    conn.execute("DELETE FROM chat_reports WHERE id = ?1", [victim])?;
+                    dropped.push(victim);
+                }
+            }
+            Ok(EnqueuedReport { id, dropped })
+        })
+        .await
+    }
+
+    /// The chat's reports, oldest first (`id` ascending = the order they were earned).
+    ///
+    /// `pending_only` is the read every recovery path makes; `false` is the diagnostic view
+    /// (`GET /api/v1/chat/{id}/reports` without `?pending=1`), which also shows what was
+    /// delivered and how many attempts it took.
+    pub async fn chat_reports(
+        &self,
+        chat_id: &str,
+        pending_only: bool,
+        limit: i64,
+    ) -> Result<Vec<ChatReport>, DbError> {
+        let chat_id = chat_id.to_string();
+        let limit = limit.clamp(1, 500);
+        self.call_flat(move |conn| {
+            let sql = if pending_only {
+                "SELECT id, chat_id, run_id, text, created_at, delivered_at, attempts
+                   FROM chat_reports WHERE chat_id = ?1 AND delivered_at IS NULL
+                  ORDER BY id ASC LIMIT ?2"
+            } else {
+                "SELECT id, chat_id, run_id, text, created_at, delivered_at, attempts
+                   FROM chat_reports WHERE chat_id = ?1
+                  ORDER BY id ASC LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params![chat_id, limit], |r| {
+                    Ok(ChatReport {
+                        id: r.get(0)?,
+                        chat_id: r.get(1)?,
+                        run_id: r.get(2)?,
+                        text: r.get(3)?,
+                        created_at: r.get(4)?,
+                        delivered_at: r.get(5)?,
+                        attempts: r.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// How many reports one chat is still owed.
+    pub async fn pending_chat_report_count(&self, chat_id: &str) -> Result<i64, DbError> {
+        let chat_id = chat_id.to_string();
+        self.call_flat(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM chat_reports WHERE chat_id = ?1 AND delivered_at IS NULL",
+                [&chat_id],
+                |r| r.get(0),
+            )
+        })
+        .await
+    }
+
+    /// How many reports EVERY chat is still owed, for the conversation list's unread number.
+    ///
+    /// One query for the whole list rather than one per row: the list route renders up to 500
+    /// conversations, and a per-row read would be 500 writer round-trips for a badge.
+    pub async fn pending_chat_report_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>, DbError> {
+        self.call_flat(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chat_id, COUNT(*) FROM chat_reports
+                  WHERE delivered_at IS NULL GROUP BY chat_id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows.into_iter().collect())
+        })
+        .await
+    }
+
+    /// Record that a report HAS been delivered. THE only transition out of "still owed".
+    ///
+    /// The `delivered_at IS NULL` guard makes this idempotent and keeps the FIRST delivery time:
+    /// a second delivery of the same row (the duplicate-sentence window `runs::finish_cluster`
+    /// documents) must not rewrite when the user was first told.
+    pub async fn mark_chat_report_delivered(&self, id: i64) -> Result<(), DbError> {
+        let now = Utc::now().to_rfc3339();
+        self.call_flat(move |conn| {
+            conn.execute(
+                "UPDATE chat_reports SET delivered_at = ?2
+                  WHERE id = ?1 AND delivered_at IS NULL",
+                rusqlite::params![id, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Count one DELIVERY ATTEMPT (diagnosis only -- the row stays owed unless it was delivered).
+    ///
+    /// Called by the delivery path immediately before it hands the body to the session, so a
+    /// failed send is counted and a successful one leaves `attempts >= 1`.
+    pub async fn note_chat_report_attempt(&self, id: i64) -> Result<(), DbError> {
+        self.call_flat(move |conn| {
+            conn.execute(
+                "UPDATE chat_reports SET attempts = attempts + 1 WHERE id = ?1",
+                [id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1415,6 +1645,136 @@ mod tests {
             disagreements.is_empty(),
             "the index and the LIKE scan must agree on every 2-character Han substring: \
              {disagreements:?}"
+        );
+    }
+
+    /// P4.1/P4.4: the report outbox's three rules, at the layer that owns them.
+    ///
+    /// 1. `delivered_at` is the ONLY delivered criterion — a row stops being owed exactly when
+    ///    that column is set, and `attempts` moves without changing that answer.
+    /// 2. the per-chat cap drops the OLDEST PENDING row and NAMES it, so the caller can say so.
+    /// 3. a deleted chat takes its outbox rows with it (the `DELETE /tasks/{id}` shape).
+    #[tokio::test]
+    async fn the_report_outbox_keeps_the_oldest_reports_until_delivered_and_caps_per_chat() {
+        let db = Db::open_in_memory().unwrap();
+
+        // (1) a fresh report is PENDING, and its body is stored verbatim.
+        let first = db
+            .enqueue_chat_report("chat-a", Some("run-1"), "【平台事件】the work finished")
+            .await
+            .unwrap();
+        assert!(first.dropped.is_empty());
+        assert_eq!(db.pending_chat_report_count("chat-a").await.unwrap(), 1);
+        let rows = db.chat_reports("chat-a", true, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, first.id);
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(rows[0].delivered_at, None, "a new report is owed");
+        assert_eq!(rows[0].attempts, 0);
+
+        // `attempts` is DIAGNOSIS: it moves, and the row is still owed.
+        db.note_chat_report_attempt(first.id).await.unwrap();
+        db.note_chat_report_attempt(first.id).await.unwrap();
+        let after_attempts = db.chat_reports("chat-a", true, 10).await.unwrap();
+        assert_eq!(after_attempts[0].attempts, 2);
+        assert_eq!(
+            after_attempts[0].delivered_at, None,
+            "counting attempts must not mark a report delivered — `delivered_at` is the only \
+             criterion"
+        );
+
+        // Delivered = the one transition, and it keeps the FIRST delivery time.
+        db.mark_chat_report_delivered(first.id).await.unwrap();
+        let delivered_at = db.chat_reports("chat-a", false, 10).await.unwrap()[0]
+            .delivered_at
+            .clone();
+        assert!(delivered_at.is_some(), "the report is no longer owed");
+        assert_eq!(db.pending_chat_report_count("chat-a").await.unwrap(), 0);
+        assert!(
+            db.chat_reports("chat-a", true, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the pending view must not return a delivered row"
+        );
+        db.mark_chat_report_delivered(first.id).await.unwrap();
+        assert_eq!(
+            db.chat_reports("chat-a", false, 10).await.unwrap()[0].delivered_at,
+            delivered_at,
+            "a second delivery must not rewrite when the user was first told"
+        );
+
+        // (2) the cap: fill N + 3, and the OLDEST PENDING rows are the ones that go.
+        let mut ids = Vec::new();
+        for i in 0..CHAT_REPORTS_CAP {
+            ids.push(
+                db.enqueue_chat_report("chat-b", None, &format!("report {i}"))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        assert_eq!(
+            db.pending_chat_report_count("chat-b").await.unwrap(),
+            CHAT_REPORTS_CAP
+        );
+        let mut dropped = Vec::new();
+        for i in 0..3 {
+            let out = db
+                .enqueue_chat_report("chat-b", None, &format!("overflow {i}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                out.dropped.len(),
+                1,
+                "each overflow insert makes room for exactly one row"
+            );
+            dropped.extend(out.dropped);
+        }
+        assert_eq!(
+            dropped,
+            ids[0..3].to_vec(),
+            "the cap must drop the OLDEST PENDING rows, in id order, and report WHICH"
+        );
+        assert_eq!(
+            db.pending_chat_report_count("chat-b").await.unwrap(),
+            CHAT_REPORTS_CAP,
+            "the cap is a ceiling on PENDING rows"
+        );
+        let surviving = db.chat_reports("chat-b", true, 500).await.unwrap();
+        assert_eq!(surviving.first().map(|r| r.id), Some(ids[3]));
+        assert!(
+            surviving.iter().all(|r| !dropped.contains(&r.id)),
+            "a dropped row must be gone from the table, not merely skipped"
+        );
+        // The cap is PER CHAT, not per database.
+        assert_eq!(db.pending_chat_report_count("chat-a").await.unwrap(), 0);
+        let counts = db.pending_chat_report_counts().await.unwrap();
+        assert_eq!(counts.get("chat-b"), Some(&CHAT_REPORTS_CAP));
+        assert!(
+            !counts.contains_key("chat-a"),
+            "a paid-up chat has no entry"
+        );
+
+        // (3) deleting the chat takes the outbox with it, in the same operation.
+        db.enqueue_chat_report("chat-c", None, "one report")
+            .await
+            .unwrap();
+        db.call_flat(|conn| {
+            conn.execute(
+                "INSERT INTO chats (id, agent, runtime, model, title, created_at, updated_at, cwd)
+                 VALUES ('chat-c', 'talker', 'mock', NULL, NULL, 1, 1, NULL)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(db.delete_chat("chat-c").await.unwrap());
+        assert_eq!(
+            db.chat_reports("chat-c", false, 100).await.unwrap().len(),
+            0,
+            "a deleted conversation's reports are undeliverable and must not be kept"
         );
     }
 }

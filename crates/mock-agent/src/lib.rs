@@ -25,8 +25,17 @@ pub const BEHAVIORS: &[&str] = &[
     "judge",
     "scripted",
     "configdump",
+    "envdump",
     "slowreply",
 ];
+
+/// The environment variable the daemon sets on an agent process that a CONVERSATION dispatched
+/// (P6 of `docs/plans/2026-11-23-reports-never-lost.md`).
+///
+/// A LITERAL COPY of `ruagent_core::CHAT_ID_ENV`: this test asset depends on nothing but the ACP
+/// schema, and the tests that use `--behavior envdump` assert on the DAEMON's own value, so a
+/// drift between the two shows up as a failing reading rather than as a silent pass.
+pub const CHAT_ID_ENV: &str = "RUAGENT_CHAT_ID";
 
 // ---------------------------------------------------------------------------
 // Advertised session options (model / mode / reasoning effort): mirrors
@@ -136,6 +145,13 @@ pub enum Behavior {
     /// Reply with the current session-option values (`k=v` pairs) —
     /// proves whether `session/set_config_option` took effect.
     ConfigDump,
+    /// Reply with the conversation this PROCESS was told it works for
+    /// ([`CHAT_ID_ENV`]), this process's pid, and what a CHILD process
+    /// sees — the reading P6 needs: the daemon's injection arrives, the
+    /// variable is ABSENT (not empty) when the run has no origin, and a
+    /// child inherits it (which is how the platform MCP server, spawned by
+    /// the agent, learns it too).
+    EnvDump,
     /// Hold the prompt for 10s before replying EndTurn — the
     /// interception window for cancellation tests. A `$/cancel_request`
     /// during the wait is answered immediately with the standard
@@ -239,9 +255,69 @@ impl Behavior {
             "judge" => Some(Behavior::Judge),
             "scripted" => Some(Behavior::Scripted),
             "configdump" => Some(Behavior::ConfigDump),
+            "envdump" => Some(Behavior::EnvDump),
             "slowreply" => Some(Behavior::SlowReply),
             _ => None,
         }
+    }
+}
+
+/// What `--behavior envdump` replies (P6).
+///
+/// Three readings in one line, because they answer three different questions and a test that
+/// conflated them could pass for the wrong reason:
+/// * `env RUAGENT_CHAT_ID=<...>` — did the daemon's injection reach THIS process? `<unset>` means the
+///   variable is absent, which is what a run without an origin must produce (never `<>`, never `""`).
+/// * `pid=<n>` — which process answered, so a test can show whether two runs shared one process.
+/// * `child=<...>` — what a CHILD of this process sees. That inheritance is the whole mechanism: the
+///   agent spawns the platform MCP server, which is where `task_dispatch` reads the value.
+pub fn env_dump_reply() -> String {
+    format!(
+        "env {}={} pid={} child={}",
+        CHAT_ID_ENV,
+        env_value(CHAT_ID_ENV),
+        std::process::id(),
+        child_env_value(CHAT_ID_ENV)
+    )
+}
+
+/// `<value>` when set, `<unset>` when the variable does not exist at all.
+fn env_value(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) => format!("<{v}>"),
+        Err(_) => "<unset>".to_string(),
+    }
+}
+
+/// The same question asked of a CHILD process, through the platform's own shell.
+fn child_env_value(name: &str) -> String {
+    // Windows' `echo %UNSET%` prints the literal `%UNSET%`, so an unset variable is recognised by
+    // the expansion having failed rather than by empty output.
+    #[cfg(windows)]
+    let (program, args) = (
+        "cmd",
+        vec!["/c".to_string(), "echo".to_string(), format!("%{name}%")],
+    );
+    #[cfg(not(windows))]
+    let (program, args) = (
+        "sh",
+        vec!["-c".to_string(), format!("printf %s \"${{{name}}}\"")],
+    );
+    match std::process::Command::new(program).args(&args).output() {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            #[cfg(windows)]
+            let unset = text.is_empty() || text == format!("%{name}%");
+            #[cfg(not(windows))]
+            let unset = text.is_empty();
+            if unset {
+                "<unset>".to_string()
+            } else {
+                format!("<{text}>")
+            }
+        }
+        Ok(out) => format!("<error: exit {}>", out.status),
+        Err(e) => format!("<error: {e}>"),
     }
 }
 
@@ -289,7 +365,34 @@ mod tests {
         assert_eq!(Behavior::parse("judge"), Some(Behavior::Judge));
         assert_eq!(Behavior::parse("scripted"), Some(Behavior::Scripted));
         assert_eq!(Behavior::parse("slowreply"), Some(Behavior::SlowReply));
+        assert_eq!(Behavior::parse("envdump"), Some(Behavior::EnvDump));
         assert_eq!(Behavior::parse("nope"), None);
+    }
+
+    /// P6's instrument, read on a process whose environment does NOT carry the variable: the reply
+    /// says `<unset>` (an absent variable), names its own pid, and reports what a child sees. The
+    /// daemon-side readings that matter — the variable present, and absent without an origin — are
+    /// taken on real spawned processes in `crates/daemon/tests/chat_origin_env.rs`.
+    #[test]
+    fn env_dump_reports_absence_as_unset_not_as_empty() {
+        let reply = env_dump_reply();
+        assert!(
+            reply.starts_with(&format!("env {CHAT_ID_ENV}=")),
+            "the instrument must name the variable it asked about: {reply}"
+        );
+        assert!(
+            reply.contains("pid="),
+            "the pid identifies the process: {reply}"
+        );
+        assert!(
+            reply.contains("child="),
+            "inheritance is half the mechanism: {reply}"
+        );
+        assert!(
+            !reply.contains("=<unset> child=<error"),
+            "the child probe must work on this platform (it drives the platform's own shell): \
+             {reply}"
+        );
     }
 
     #[test]

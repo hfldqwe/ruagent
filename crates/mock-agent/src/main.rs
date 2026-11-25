@@ -307,6 +307,17 @@ async fn main() -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         }
+                        Behavior::EnvDump => {
+                            // P6: what this process was told about the conversation it works for,
+                            // and what a child of it sees (inheritance is the mechanism).
+                            notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(
+                                    ruagent_mock_agent::env_dump_reply(),
+                                )),
+                            )))?;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
                         Behavior::SlowReply => {
                             // The 10s wait must run off the dispatch loop:
                             // an inline await would block it, and the

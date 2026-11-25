@@ -1481,6 +1481,10 @@ impl Distiller {
                 cwd: workspace,
                 mcp_servers: vec![],
                 model: None,
+                // A distiller belongs to NO conversation: it runs for the platform, on work that
+                // is already over. The variable must be ABSENT rather than empty, so this is the
+                // honest value (same reasoning as the panel/CLI-dispatched run in `runs.rs`).
+                env: Vec::new(),
             },
             ask_tx,
         )

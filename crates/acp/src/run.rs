@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest,
     WriteTextFileResponse,
 };
-use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, LineDirection};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, LineDirection};
 use ruagent_core::RunEvent;
 use tokio::sync::mpsc;
 
@@ -34,6 +34,19 @@ pub struct RunOptions {
     /// (issue #36): `mode` (permission mode) / `effort` (thinking),
     /// mapped onto the agent's advertised options.
     pub options: Vec<(String, String)>,
+    /// Environment variables set on the AGENT PROCESS (P6 of
+    /// `docs/plans/2026-11-23-reports-never-lost.md`).
+    ///
+    /// The daemon fills this with the run's conversation (`RUAGENT_CHAT_ID`, see
+    /// [`ruagent_core::CHAT_ID_ENV`]) so that the agent — and every process it spawns, notably the
+    /// platform MCP server that answers `task_dispatch` — knows which conversation the work belongs
+    /// to. Empty is the normal shape for a run the panel or the CLI started: there is nobody to
+    /// report to, and the variable must be ABSENT rather than empty.
+    ///
+    /// These are ADDED to the daemon's own environment, never a replacement: `Command::envs` leaves
+    /// inherited variables alone, which is what keeps PATH, the system proxy and `RUAGENT_URL`
+    /// working for the child.
+    pub env: Vec<(String, String)>,
 }
 
 /// Split a command line into program + args on whitespace.
@@ -70,9 +83,15 @@ pub async fn run_once(
     // fixed by the ACP library).
     let mcp_failure_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let mcp_failure_in = mcp_failure_slot.clone();
-    let agent =
-        AcpAgent::from_args(std::iter::once(opts.program.clone()).chain(opts.args.iter().cloned()))
-            .map_err(|e| AcpError::Command(format!("{}: {e}", opts.program)))?;
+    // Built from the launch configuration rather than `from_args` (which has no way to say
+    // anything about the environment): the program and its arguments are already split by the
+    // adapter, and `env` is the P6 injection. `AcpAgentConfig::envs` adds to the inherited
+    // environment; it never clears it.
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(opts.program.clone())
+            .args(opts.args.iter().cloned())
+            .envs(opts.env.iter().map(|(k, v)| (k.clone(), v.clone()))),
+    );
     // Surface agent stderr in our logs — invaluable for diagnosing
     // harness startup failures (npx downloads, auth, config).
     let agent = agent.with_debug(|line, dir| {

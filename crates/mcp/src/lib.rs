@@ -665,7 +665,7 @@ impl PlatformTools {
     }
 
     #[tool(
-        description = "Dispatch a task: start ONE run of <task_id> at an agent. WHEN: the user wants work PERFORMED now by an agent (the task exists -- task_create made it), or you are handing a piece of your own plan to a specialist instead of doing it yourself. agent is the agent's NAME; OMIT IT to let the daemon's routing cascade choose (project/title rules -> routing.toml's default -> the primary agent -> the first enabled card). COST: THIS SPENDS THE USER'S MODEL TOKENS -- it starts a real run with a real agent, and there is no dry-run flag. Say it out loud first (which task, and which agent if you are naming one) and only then dispatch. IT DOES NOT WAIT FOR THE WORK: the reply is the run id, its current status and the agent the daemon RESOLVED -- reported by NAME, because you and the user know agents by name while the run stores a registry id. Read progress with run_get. WHO RUNS IT IS THE DAEMON'S DECISION: when you omit agent this tool sends no agent field at all and does not guess a default here -- a guess would silently replace the user's routing."
+        description = "Dispatch a task: start ONE run of <task_id> at an agent. WHEN: the user wants work PERFORMED now by an agent (the task exists -- task_create made it), or you are handing a piece of your own plan to a specialist instead of doing it yourself. agent is the agent's NAME; OMIT IT to let the daemon's routing cascade choose (project/title rules -> routing.toml's default -> the primary agent -> the first enabled card). COST: THIS SPENDS THE USER'S MODEL TOKENS -- it starts a real run with a real agent, and there is no dry-run flag. Say it out loud first (which task, and which agent if you are naming one) and only then dispatch. IT DOES NOT WAIT FOR THE WORK: the reply is the run id, its current status and the agent the daemon RESOLVED -- reported by NAME, because you and the user know agents by name while the run stores a registry id. Read progress with run_get. WHO RUNS IT IS THE DAEMON'S DECISION: when you omit agent this tool sends no agent field at all and does not guess a default here -- a guess would silently replace the user's routing. REPORTING BACK: the conversation you are running in is attached to the work AUTOMATICALLY (the daemon exports it to this process as RUAGENT_CHAT_ID and this tool forwards it), so you do not have to know your own chat id and normally must not pass origin_chat_id at all; an explicit origin_chat_id you DO pass wins over it. A run started with no conversation behind it (the panel, the CLI, a script) carries no such variable, so the work it dispatches is reported to nobody -- that is correct, because nobody is waiting."
     )]
     async fn task_dispatch(
         &self,
@@ -687,10 +687,22 @@ impl PlatformTools {
         if let Some(prompt) = params.prompt.as_deref() {
             body.insert("prompt".to_string(), serde_json::json!(prompt));
         }
-        // P2.1: same rule as `agent` — only what the caller sent goes on the wire. An absent origin
-        // means "no conversation is waiting" (panel/script dispatch), which is a MEANING, not a
-        // value to invent here.
-        if let Some(origin) = params.origin_chat_id.as_deref() {
+        // P2.1 + P6: the conversation this work belongs to. The CALLER's value wins; when the caller
+        // sent none, the daemon's own export (`RUAGENT_CHAT_ID`, set on the agent process of a run a
+        // chat dispatched and inherited by this server) fills it in. That default is the whole point
+        // of P6: an agent has no idea which conversation it is in, so "you fill it in yourself" was
+        // a field nobody ever filled — and unattributed work is work nobody is told about.
+        //
+        // Still built the same way — nothing is inserted unless there IS a value, because an absent
+        // origin means "nobody is waiting" and is a MEANING, not a default to invent.
+        let origin = params
+            .origin_chat_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(chat_id_from_env);
+        if let Some(origin) = origin.as_deref() {
             body.insert("origin_chat_id".to_string(), serde_json::json!(origin));
         }
         let resp = json_of(
@@ -705,7 +717,7 @@ impl PlatformTools {
         let agent = self
             .describe_agent(resp.get("params").and_then(|p| p.get("agent")))
             .await;
-        dispatched_to_text(what, &resp, &agent)
+        dispatched_to_text(what, &resp, &agent, origin.as_deref())
     }
 
     #[tool(
@@ -2638,11 +2650,41 @@ fn task_created_to_text(resp: &serde_json::Value) -> Result<String, rmcp::ErrorD
     Ok(out)
 }
 
+/// The environment variable the daemon sets on the agent process of a run a CONVERSATION
+/// dispatched, naming that conversation (P6 of `docs/plans/2026-11-23-reports-never-lost.md`).
+///
+/// A COPY of the producer's name — `ruagent_core::CHAT_ID_ENV` — for the same reason
+/// `TERMINAL_RUN_STATUSES` below is a copy: this crate speaks HTTP and the environment, and
+/// deliberately does not depend on `ruagent-core`. The value is the run's `origin_chat_id`. The
+/// daemon skips the variable entirely when the run has no origin, so ABSENCE means "no conversation
+/// is waiting", and this side must not treat absence as an empty id.
+const CHAT_ID_ENV: &str = "RUAGENT_CHAT_ID";
+
+/// The conversation THIS process is working for, as the daemon exported it.
+///
+/// The chain, and why one variable is enough: the daemon sets it when it spawns the agent for a
+/// chat-dispatched run → the agent inherits it and passes it to every process it starts → the
+/// platform MCP server (which the AGENT spawns for its session) is one of those processes, and this
+/// function is where it is read. An empty value is treated as absent: the daemon never writes one
+/// (an empty id is not a conversation), so a `RUAGENT_CHAT_ID=` in the environment is a shell
+/// accident rather than an attribution.
+fn chat_id_from_env() -> Option<String> {
+    std::env::var(CHAT_ID_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// A dispatched run, with the agent named rather than identified (t53).
 fn dispatched_to_text(
     what: &str,
     resp: &serde_json::Value,
     agent: &str,
+    // The conversation the request carried (an explicit argument or the daemon's export), so the
+    // reply can say whether this work has anybody waiting for it. P6 made that no longer the
+    // caller's job, and that is exactly why the reading has to come back: an agent that believes it
+    // reported, when in fact it dispatched on behalf of nobody, is the failure this line prevents.
+    origin: Option<&str>,
 ) -> Result<String, rmcp::ErrorData> {
     let run_id = field_str(what, resp, "id")?;
     let task_id = resp.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -2658,6 +2700,12 @@ fn dispatched_to_text(
     {
         out.push_str(&format!("  prompt: {}\n", clip(prompt, 120)));
     }
+    out.push_str(&match origin {
+        Some(chat_id) => format!(
+            "  belongs to conversation: {chat_id} -- the daemon will report this work's outcome back to it once the whole task is over, so you do not have to poll it to the end.\n"
+        ),
+        None => "  belongs to NO conversation: nobody is waiting to be told when this ends (this is a panel/CLI/script context, not a chat).\n".to_string(),
+    });
     out.push_str(
         "The run is ASYNCHRONOUS: this call returned as soon as the daemon accepted it, and the work is still going. Read it with run_get(run_id) -- a first reading of queued, spawning or running is normal, not a failure.\n",
     );
@@ -3177,7 +3225,7 @@ pub struct TaskDispatchParams {
     #[schemars(description = "Prompt override for this attempt; omitted = the task's own intent.")]
     pub prompt: Option<String>,
     #[schemars(
-        description = "WHICH CONVERSATION this work belongs to (P2.1 of docs/plans/2026-11-20-primary-supervisor-design.md): the chat id, when you are dispatching from inside a conversation and want the answer reported BACK into it once the whole task is terminal. The daemon then wakes that conversation ONE time with the cluster's conclusion (agent names, the task title, the result or the failure — and, if it failed, the one automatic retry it tried first). OMIT IT when the caller is not a chat (a script, the panel, a test): nobody is waiting to be woken, and the run is not attributed to any conversation. The report is a platform event, not a user message."
+        description = "WHICH CONVERSATION this work belongs to. YOU NORMALLY DO NOT SET THIS: the daemon exports the conversation this process is working for (RUAGENT_CHAT_ID) and the tool forwards it, so the work is attributed even though you cannot know your own chat id. Pass a value only to attribute the work to a DIFFERENT conversation than the one you are in -- an explicit value wins. When you are running with no conversation behind you (the panel, the CLI, a script), there is no variable and no origin: the work is attributed to nobody and nobody is woken, which is correct because nobody is waiting. The daemon then wakes the conversation ONE time with the cluster's conclusion (agent names, the task title, the result or the failure -- and, if it failed, the automatic retries it tried first). The report is a platform event, not a user message."
     )]
     pub origin_chat_id: Option<String>,
 }

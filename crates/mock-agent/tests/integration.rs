@@ -17,6 +17,7 @@ fn mock_opts(behavior: &str) -> RunOptions {
         mcp_servers: vec![],
         prompt: "hello mock".into(),
         options: vec![],
+        env: vec![],
     }
 }
 

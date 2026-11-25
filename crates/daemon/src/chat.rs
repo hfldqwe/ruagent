@@ -363,6 +363,16 @@ pub struct ChatHistoryEntry {
     pub generating: bool,
     pub message_count: Option<u32>,
     pub preview: Option<String>,
+    /// How many platform reports this conversation is still OWED (P4.4): rows in `chat_reports`
+    /// whose `delivered_at IS NULL`.
+    ///
+    /// THREE STATES ON PURPOSE, and the panel's rail must keep them apart — the same rule
+    /// `Runtimes.tsx`'s `modelChipState` states for a failed probe ("unknown is not zero"):
+    /// * `Some(0)` — a reading, and the answer is "nothing pending": no badge;
+    /// * `Some(n)` — a reading, and the panel shows the number;
+    /// * `None` — the outbox could not be read. NOT zero: a badge would then claim "all delivered"
+    ///   about a table nobody read, so the rail says nothing at all.
+    pub pending_reports: Option<i64>,
     /// Sessions-index key of the transcript (the shared viewer route).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
@@ -377,6 +387,30 @@ pub enum ChatDelete {
     Deleted { was_live: bool },
     /// No such row -- an idempotent no-op, not an error.
     NotFound,
+}
+
+/// One platform event on its way into a conversation: the OUTBOX ROW's id and the body.
+///
+/// WHY THE ID RIDES WITH THE TEXT (P4.2). Delivering a report and recording that it was delivered
+/// are the same act, so the two travel together: the queue entry carries the row it belongs to, and
+/// whoever hands the body to `send_prompt` marks THAT row `delivered_at`. Without the id the drain
+/// path would have to guess which row it had just sent — which is how a second truth starts.
+#[derive(Debug, Clone)]
+struct OutboxEvent {
+    /// `chat_reports.id` — the row this body IS.
+    id: i64,
+    /// The body, WITHOUT the platform marker (applied at delivery, see [`platform_event`]).
+    text: String,
+}
+
+/// What happened to one platform event when it reached [`deliver_or_queue`]: the two answers the
+/// one send/queue criterion can give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Handed to the session as a prompt. The outbox row is now delivered.
+    Sent,
+    /// The chat is mid-turn: queued in memory for the turn's end. The outbox row stays PENDING.
+    Queued,
 }
 
 /// THE LIVE CHAT MANAGERS, one per daemon root (P2.3/P2.2).
@@ -444,62 +478,131 @@ fn platform_event(text: &str) -> String {
 /// THE ONE PLACE the send-now/queue decision is made (P2.2): a chat that is mid-turn QUEUES the
 /// platform event instead of dropping it, and every other path sends.
 ///
-/// The `generating` flag is the criterion, in exactly one location, for both callers (`notify` and
-/// the turn-end drain), so "may I send" cannot mean two things.
+/// The `generating` flag is the criterion, in exactly one location, for all three callers
+/// (`notify`, the turn-end drain and `resume_chat`'s replay), so "may I send" cannot mean two
+/// things.
+///
+/// THE MEMORY QUEUE IS AN ACCELERATION, THE OUTBOX IS THE TRUTH (P4.2). This function is handed an
+/// [`OutboxEvent`] — a row that is ALREADY on disk — and its job is only to get that body into the
+/// session sooner rather than later:
+/// * `Sent` → the row is marked `delivered_at` HERE, so every caller records the same fact the same
+///   way and nobody has to remember to;
+/// * `Queued` → the row stays PENDING and the queue entry carries its id. A restart before the turn
+///   ends now loses only the QUEUE: the row is still in `chat_reports`, and the next resume (or the
+///   next turn's end) delivers it. That is the failure this table exists to survive.
 async fn deliver_or_queue(
     db: &ruagent_store::Db,
     embedder: std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>,
-    queue: &Arc<Mutex<HashMap<RunId, VecDeque<String>>>>,
+    queue: &Arc<Mutex<HashMap<RunId, VecDeque<OutboxEvent>>>>,
     chat: &Chat,
-    text: String,
-) -> Result<()> {
+    event: OutboxEvent,
+) -> Result<Delivery> {
     if chat.is_generating() {
         let mut q = queue.lock().expect("notification queue");
         let entry = q.entry(chat.id).or_default();
-        entry.push_back(text);
+        entry.push_back(event);
         let depth = entry.len();
-        // SAID OUT LOUD, because the queue is in memory: the design accepts losing it on a
-        // restart (§6) but forbids pretending that did not happen.
+        // Said out loud, and the sentence CHANGED with P4: the old one admitted losing the event
+        // on a restart, which is no longer true — the row on disk is what survives.
         tracing::warn!(
             chat_id = %chat.id,
             depth,
             "platform event queued: this chat is mid-turn, so the report goes out when the turn \
-             ends. THE QUEUE IS IN PROCESS MEMORY ONLY — a daemon restart before then loses it \
-             (accepted for this version, and this is the line that says so)"
+             ends. The queue itself is in process memory only; the OUTBOX ROW behind it is on \
+             disk and stays pending until it is actually delivered"
         );
-        return Ok(());
+        return Ok(Delivery::Queued);
     }
-    chat.send_prompt(db, embedder, platform_event(&text)).await
+    // A DELIVERY ATTEMPT BEGINS HERE, and it is COUNTED BEFORE THE SEND: a send that fails must
+    // still be counted (that is the diagnosis "this report would not go out"), and a send that
+    // succeeds must leave `attempts >= 1` — the reading the acceptance asks for on a delivered row.
+    // ONE place counts, so `attempts` cannot mean "failures" at one call site and "attempts" at
+    // another. Queueing above is NOT an attempt: nothing was handed to the session.
+    if let Err(e) = db.note_chat_report_attempt(event.id).await {
+        tracing::warn!(
+            chat_id = %chat.id,
+            report = event.id,
+            error = %e,
+            "a delivery attempt could not be counted on its outbox row (diagnosis only: the \
+             delivery itself proceeds)"
+        );
+    }
+    chat.send_prompt(db, embedder, platform_event(&event.text))
+        .await?;
+    // SENT == DELIVERED, recorded on the row through the ONE criterion (`delivered_at`). A failure
+    // to write that down is said out loud and is NOT a lost report: the row stays pending, so a
+    // later resume delivers it a second time. A duplicate sentence beats a silent loss — the same
+    // trade `runs::finish_cluster` documents for its own duplicate window.
+    if let Err(e) = db.mark_chat_report_delivered(event.id).await {
+        tracing::warn!(
+            chat_id = %chat.id,
+            report = event.id,
+            error = %e,
+            "the platform event WAS delivered but its outbox row could not be marked delivered; \
+             it stays pending, so a later resume may deliver it again"
+        );
+    }
+    Ok(Delivery::Sent)
 }
 
-/// Deliver the next queued platform event for one chat, if any (called when a turn ends).
+/// Deliver the platform event this chat already owes from its QUEUE, if any (called when a turn
+/// ends).
+///
+/// ONE SOURCE, AT MOST ONE EVENT PER TURN END: the IN-MEMORY queue — the report that arrived while
+/// the turn was in flight (`deliver_or_queue` put it there, and this is the end of that turn). The
+/// report is on disk at the same time, so delivering it here marks its row done.
+///
+/// THE OUTBOX IS NOT A SECOND SOURCE HERE. It was, and that was measured to be wrong: this function
+/// runs when a turn ends and every delivery starts a turn, so falling back to "the oldest pending
+/// row" made each delivery trigger the next one — a self-draining loop that spends a paid turn per
+/// report with nobody watching (up to the 50-row cap). Replaying the outbox belongs to a PERSON
+/// opening the conversation (`resume_chat`, exactly one report per resume).
+///
+/// A failure is not retried in this turn: the row keeps its `attempts` increment and waits for the
+/// next resume.
 async fn drain_one_notification(
     db: &ruagent_store::Db,
     embedder: Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>>,
-    queue: &Arc<Mutex<HashMap<RunId, VecDeque<String>>>>,
+    queue: &Arc<Mutex<HashMap<RunId, VecDeque<OutboxEvent>>>>,
     chat: &Chat,
 ) {
-    let next = {
+    let queued = {
         let mut q = queue.lock().expect("notification queue");
         match q.get_mut(&chat.id) {
             Some(pending) => pending.pop_front(),
             None => None,
         }
     };
-    let Some(text) = next else { return };
+    // ONLY THE IN-MEMORY QUEUE. This is a correction, measured rather than preferred
+    // (independent verification, 2026-11-25): the first version ALSO fell back to the oldest
+    // pending outbox row here, as "the recovery path". Every delivered report is a full
+    // `send_prompt`, i.e. a turn, and this function runs when a turn ENDS — so the fallback made
+    // each delivery trigger the next one. Measured with 3 parked reports: `resume` returned
+    // `pending=2`, and the conversation then drained itself to `pending=0` with nobody watching,
+    // up to the per-chat cap of 50 = 50 paid turns nobody asked for. The recovery path belongs to
+    // a PERSON deciding to open the conversation (`resume_chat`, one report), not to a loop.
+    //
+    // What still works: a report that arrived while this chat was mid-turn is on disk AND in the
+    // queue, so the queue pop above delivers it and marks the row done — no fallback needed.
+    let Some(event) = queued else { return };
     let Some(embedder) = embedder else {
+        // NOT a loss any more: the row is on disk and a chat that gets an embedder (or a resume
+        // that does) will deliver it.
         tracing::warn!(
             chat_id = %chat.id,
-            "a queued platform event is being dropped: this manager has no embedder, so a prompt \
-             cannot be sent"
+            report = event.id,
+            "a platform event could not be delivered when the turn ended: this manager has no \
+             embedder, so a prompt cannot be sent. The outbox row STAYS PENDING"
         );
         return;
     };
-    if let Err(e) = deliver_or_queue(db, embedder, queue, chat, text).await {
+    if let Err(e) = deliver_or_queue(db, embedder, queue, chat, event.clone()).await {
         tracing::warn!(
             chat_id = %chat.id,
+            report = event.id,
             error = %e,
-            "a queued platform event could NOT be delivered when the turn ended"
+            "a platform event could NOT be delivered when the turn ended; it stays pending (its \
+             `attempts` already counts this try) and the next resume or turn end will try again"
         );
     }
 }
@@ -512,12 +615,16 @@ pub struct ChatManager {
     /// end. ONE entry per chat, a queue, because the alternative the design rejects is dropping
     /// the report (`丢弃 = 静默丢汇报, 正是本设计要消灭的失败模式`).
     ///
-    /// IT LIVES IN PROCESS MEMORY, ON PURPOSE AND WITH A COST: a daemon restart before the turn
-    /// ends loses whatever is queued — the design accepts that loss for the first version (§6) and
-    /// requires it to be SAID, which is what `deliver_or_queue` logs at the moment it queues. The
-    /// queue is per ChatManager (per daemon root), so two daemons in one process cannot see each
+    /// IT LIVES IN PROCESS MEMORY — AND SINCE P4 THAT IS ONLY AN ACCELERATION, NOT THE TRUTH. Every
+    /// entry here is one row of `chat_reports` (0033) that is still `delivered_at IS NULL`; the
+    /// queue exists so the report goes out the moment the turn ends instead of waiting for a resume.
+    /// Losing it (a restart, a close) loses the SPEED-UP only: the row is on disk, so the next
+    /// resume or turn end delivers it. Before P4 this field WAS the truth, and a restart therefore
+    /// lost the report — see `notify`'s no-session branch, which is where that used to happen.
+    ///
+    /// The queue is per ChatManager (per daemon root), so two daemons in one process cannot see each
     /// other's, and it dies with the manager like the chats themselves.
-    notifications: Arc<Mutex<HashMap<RunId, VecDeque<String>>>>,
+    notifications: Arc<Mutex<HashMap<RunId, VecDeque<OutboxEvent>>>>,
     /// The agent child each live chat was ATTRIBUTED at start (issue #60).
     ///
     /// HOW ATTRIBUTION WORKS, and why it is deliberately timid: the ACP child is
@@ -1011,6 +1118,12 @@ impl ChatManager {
     /// prior conversation handed over as context on the next prompt.
     /// Session switching, ChatGPT-style: click a past conversation and
     /// keep talking.
+    ///
+    /// P4.3: THIS IS THE ONE PLACE A REPLAY IS STARTED. A session that has just come back to life is
+    /// the only moment a report parked while the chat had no session can be delivered, so this is
+    /// where the oldest pending outbox row goes out (ONE, not all — see
+    /// [`ChatManager::deliver_one_pending_report`]). Every later report is picked up by the turn-end
+    /// drain, which is the same criterion on a live chat.
     pub async fn resume_chat(&self, id: RunId, card: &AgentCard) -> Result<Chat> {
         if self.chat(id).is_some() {
             anyhow::bail!("chat is live — attach instead of resuming");
@@ -1043,16 +1156,30 @@ impl ChatManager {
         } else {
             Some(resume_block(&tail))
         };
-        self.start_inner(
-            card,
-            None,
-            &label,
-            true,
-            handoff,
-            Some(id),
-            cwd.map(PathBuf::from),
-        )
-        .await
+        let chat = self
+            .start_inner(
+                card,
+                None,
+                &label,
+                true,
+                handoff,
+                Some(id),
+                cwd.map(PathBuf::from),
+            )
+            .await?;
+        // THE IN-MEMORY QUEUE OF A CHAT THAT IS NOT LIVE IS STALE, AND DROPPING IT HERE IS WHAT
+        // KEEPS ONE REPORT FROM ARRIVING TWICE. Every queued entry is also a `chat_reports` row that
+        // is still pending, and the delivery below reads the OLDEST such row — so a leftover entry
+        // from the closed session would be drained at the next turn's end and deliver again what
+        // this resume has already delivered. The outbox is the truth; the queue is a shortcut that
+        // expired with the session (a chat with no session has no turn to end, so nothing else will
+        // ever drain it).
+        self.forget_queued_reports(id);
+        // AFTER the session exists, never before: a replay into a session that is still coming up
+        // is the same lost report this whole increment is about. Best-effort by design — the
+        // resume itself succeeded, and a report that could not be delivered stays pending.
+        self.deliver_one_pending_report(&chat).await;
+        Ok(chat)
     }
 
     /// The spawn path shared by chats and probes. `label` is the history
@@ -1133,6 +1260,12 @@ impl ChatManager {
                 cwd: workspace,
                 mcp_servers: mcp,
                 model: model.clone(),
+                // P6, the half that makes `task_dispatch` work without the agent being told
+                // anything: the CONVERSATION's own process must know which conversation it is.
+                // The run side (`runs.rs`) injects this for dispatched work; without this line
+                // the agent the user talks to dispatches into a void — no origin on the run, so
+                // no report back to the person who asked.
+                env: vec![(ruagent_core::CHAT_ID_ENV.to_string(), id.to_string())],
             },
             ask_tx,
         )
@@ -1320,20 +1453,31 @@ impl ChatManager {
         *self.drop_asks.lock().expect("drop_asks lock") = Some(f);
     }
 
-    /// P2.2: deliver a PLATFORM EVENT to one conversation — the daemon's report to the agent that
-    /// dispatched the work, not a user message.
+    /// P2.2 + P4.2: deliver a PLATFORM EVENT to one conversation — the daemon's report to the agent
+    /// that dispatched the work, not a user message.
     ///
-    /// Semantics, all three forced by the design:
-    /// - the chat is mid-turn → the report is QUEUED (one queue per chat) and goes out when the
-    ///   turn ends; dropping it would be the silent loss the design exists to remove;
-    /// - the chat is gone (deleted, or closed and reaped) → recorded at WARN and swallowed, with
-    ///   NO retry: there is no session to deliver into, and retrying cannot create one;
-    /// - a delivery error is returned to the caller, which logs it naming the chat and the run —
-    ///   a lost report must never also be a lost run or a panic.
+    /// ORDER IS THE POINT (P4.2, `docs/plans/2026-11-23-reports-never-lost.md` §1): the report is
+    /// written into the outbox FIRST and only then is delivery attempted. So:
+    /// * the WRITE fails → this returns `Err`, and the caller logs it: that is the one case where
+    ///   the report really was not recorded;
+    /// * the write succeeds and DELIVERY fails → the row stays pending and this returns `Ok`. The
+    ///   report is not lost, it is waiting; pretending otherwise would make the run path log a
+    ///   "lost report" that is sitting in the database.
+    ///
+    /// Three shapes, one criterion (`generating`, inside [`deliver_or_queue`]):
+    /// * chat live + idle → persist, send, mark delivered;
+    /// * chat live + mid-turn → persist, queue in memory, mark delivered when the turn ends;
+    /// * chat NOT live → persist and STOP. There is no session to deliver into, and the report is
+    ///   no longer dropped: `resume_chat` delivers it (one per resume) and
+    ///   `drain_one_notification` delivers one per turn end after that.
+    ///
+    /// A chat that was DELETED is the one case that is not persisted: its outbox rows are removed by
+    /// `delete` (P4.3), so a row written here would be undeliverable for ever.
     pub async fn notify(&self, chat_id: RunId, text: String) -> Result<()> {
         let Some(chat) = self.chat(chat_id) else {
             // Not live. Say which of the two it is: a chat that never existed (or was deleted) is
-            // a different fact from one that was merely closed/idle-reaped.
+            // a different fact from one that was merely closed/idle-reaped — and the two get
+            // DIFFERENT treatment now.
             let id = chat_id.to_string();
             let known: Result<bool> = self
                 .db
@@ -1351,38 +1495,213 @@ impl ChatManager {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"));
             match known {
-                Ok(true) => tracing::warn!(
-                    chat_id = %chat_id,
-                    "platform event dropped: the chat exists in history but has no live session \
-                     (closed or idle-reaped); a report cannot start a turn, and this is NOT retried"
-                ),
+                // THE FIX, third branch of P4.2: a closed/idle-reaped conversation KEEPS the
+                // report, on disk, and gets it back when it is resumed.
+                Ok(true) => {
+                    let row = self
+                        .db
+                        .enqueue_chat_report(&chat_id.to_string(), None, &text)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "the platform event could not be written to the report outbox, so \
+                                 it is lost (this chat has no live session and nothing was \
+                                 recorded): {e}"
+                            )
+                        })?;
+                    self.say_what_the_cap_dropped(chat_id, &row.dropped);
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        report = row.id,
+                        "platform event STORED in the report outbox: the chat exists in history but \
+                         has no live session (closed or idle-reaped), so nothing can start a turn \
+                         now. It will be delivered when the conversation is resumed — this is the \
+                         case that used to be dropped"
+                    );
+                }
+                // A deleted conversation: P4.3 removed its outbox rows, and a row written here
+                // would never be looked at again. Not persisted, and said.
                 Ok(false) => tracing::warn!(
                     chat_id = %chat_id,
-                    "platform event dropped: the chat no longer exists (deleted); this is NOT \
+                    "platform event dropped: the chat no longer exists (deleted), so there is no \
+                     conversation to report into and its outbox rows are gone by design. NOT \
                      retried"
                 ),
-                Err(e) => tracing::warn!(
-                    chat_id = %chat_id,
-                    error = %e,
-                    "platform event dropped: the chat is not live and the history could not be \
-                     read to say which kind of gone it is; not retried"
-                ),
+                // Cannot tell. KEEP THE REPORT: the side that does not lose a sentence wins, and a
+                // stray row for a conversation that turns out to be gone is bounded by the cap.
+                Err(e) => {
+                    let row = self
+                        .db
+                        .enqueue_chat_report(&chat_id.to_string(), None, &text)
+                        .await;
+                    match row {
+                        Ok(row) => {
+                            self.say_what_the_cap_dropped(chat_id, &row.dropped);
+                            tracing::warn!(
+                                chat_id = %chat_id,
+                                report = row.id,
+                                error = %e,
+                                "the chat is not live and its history could not be read to say \
+                                 whether it still exists; the report was STORED in the outbox \
+                                 anyway, and a resume will deliver it if the conversation is real"
+                            );
+                        }
+                        Err(write_err) => tracing::warn!(
+                            chat_id = %chat_id,
+                            read_error = %e,
+                            write_error = %write_err,
+                            "the chat is not live, its history was unreadable, AND the report could \
+                             not be written to the outbox: this one really is lost"
+                        ),
+                    }
+                }
             }
             return Ok(());
         };
-        // The embedder a prompt needs: the one this manager was built with, else the knowledge
-        // handle's (the daemon's ONE, t260). Neither = a manager that cannot send a prompt at all,
-        // which is said rather than attempted.
-        let Some(embedder) = self.embedder.clone().or_else(|| {
-            self.knowledge_handle()
-                .map(|k| std::sync::Arc::clone(&k.embedder()))
-        }) else {
+
+        // THE REPORT IS ON DISK BEFORE ANYTHING IS ATTEMPTED (P4.2's order).
+        let row = self
+            .db
+            .enqueue_chat_report(&chat_id.to_string(), None, &text)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "the platform event could not be written to the report outbox, so it was not \
+                     recorded and NOT attempted: {e}"
+                )
+            })?;
+        self.say_what_the_cap_dropped(chat_id, &row.dropped);
+
+        let event = OutboxEvent { id: row.id, text };
+        match self.deliver_event(&chat, event.clone()).await {
+            // Sent or queued: either way the row is accounted for (delivered now, or delivered when
+            // the turn ends — the queue entry carries the id).
+            Ok(Delivery::Sent) | Ok(Delivery::Queued) => Ok(()),
+            // A FAILED DELIVERY IS NOT A LOST REPORT: the row is pending and a resume delivers it.
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    report = event.id,
+                    error = %e,
+                    "the platform event could not be delivered to the LIVE chat; it stays PENDING \
+                     in the outbox (its `attempts` already counts this try) and a resume (or the \
+                     next turn end) will deliver it"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The one WARN a cap trigger owes its reader: the report that was pushed out, by id.
+    fn say_what_the_cap_dropped(&self, chat_id: RunId, dropped: &[i64]) {
+        for id in dropped {
+            tracing::warn!(
+                chat_id = %chat_id,
+                report = id,
+                cap = ruagent_store::CHAT_REPORTS_CAP,
+                "report outbox FULL for this chat: the OLDEST pending report was dropped to make \
+                 room for a new one. Silent loss is what this table exists to remove, so the id is \
+                 named here"
+            );
+        }
+    }
+
+    /// Drop whatever is queued in memory for one chat, WITHOUT touching the outbox.
+    ///
+    /// The queue holds acceleration copies of rows that are still pending, so forgetting it loses
+    /// nothing: the rows are delivered by `resume_chat` / the turn-end drain. It is called when a
+    /// session ends in a way that leaves no turn to end (`resume_chat`, whose own replay would
+    /// otherwise duplicate the entry; and `delete`, where there is no conversation left to tell).
+    fn forget_queued_reports(&self, id: RunId) -> usize {
+        self.notifications
+            .lock()
+            .expect("notification queue")
+            .remove(&id)
+            .map(|queued| queued.len())
+            .unwrap_or(0)
+    }
+
+    /// Deliver ONE outbox event to a live chat through [`deliver_or_queue`], recording a failed
+    /// attempt on the row.
+    ///
+    /// THE ONE GATE: every caller that starts a turn from a report goes through here, so "may I
+    /// send" is `deliver_or_queue`'s `generating` check and never a second rule in a caller.
+    async fn deliver_event(&self, chat: &Chat, event: OutboxEvent) -> Result<Delivery> {
+        let Some(embedder) = self.embedder() else {
             anyhow::bail!(
                 "this ChatManager has no embedder, so a platform event cannot be turned into a \
                  prompt (the chat was not told)"
             );
         };
-        deliver_or_queue(&self.db, embedder, &self.notifications, &chat, text).await
+        deliver_or_queue(&self.db, embedder, &self.notifications, chat, event).await
+    }
+
+    /// The embedder a prompt needs: the one this manager was built with, else the knowledge
+    /// handle's (the daemon's ONE, t260). Neither = a manager that cannot send a prompt at all.
+    fn embedder(&self) -> Option<std::sync::Arc<dyn ruagent_knowledge::embed::Embedder>> {
+        self.embedder.clone().or_else(|| {
+            self.knowledge_handle()
+                .map(|k| std::sync::Arc::clone(&k.embedder()))
+        })
+    }
+
+    /// P4.3: deliver the OLDEST report this conversation is still owed, and STOP (one per resume).
+    ///
+    /// WHY ONE AND NOT ALL (a ruling from the lead on this increment, and the reason is money):
+    /// every delivery is a full `send_prompt`, i.e. a model turn. A conversation holding five
+    /// reports would answer a single resume with five monologues from the main agent — legal
+    /// (`deliver_or_queue` would queue them) but wrong. The remaining rows are picked up by the
+    /// next resume, or one per turn end while the user is actually in the conversation
+    /// (`drain_one_notification`).
+    ///
+    /// A FAILURE CHANGES NOTHING BUT `attempts`: the row stays pending, this WARNs with the count
+    /// still owed, and it does NOT retry here — the next resume tries again.
+    async fn deliver_one_pending_report(&self, chat: &Chat) {
+        let pending = match self.db.chat_reports(&chat.id.to_string(), true, 1).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = %chat.id,
+                    error = %e,
+                    "the report outbox could not be read after this chat was resumed; nothing was \
+                     replayed and the rows stay pending"
+                );
+                return;
+            }
+        };
+        let Some(row) = pending.into_iter().next() else {
+            return;
+        };
+        let event = OutboxEvent {
+            id: row.id,
+            text: row.text,
+        };
+        let outcome = self.deliver_event(chat, event.clone()).await;
+        match outcome {
+            Ok(delivery) => tracing::info!(
+                chat_id = %chat.id,
+                report = event.id,
+                ?delivery,
+                "a report the platform owed this conversation was delivered on resume"
+            ),
+            Err(e) => {
+                let still_owed = self
+                    .db
+                    .pending_chat_report_count(&chat.id.to_string())
+                    .await
+                    .unwrap_or(-1);
+                tracing::warn!(
+                    chat_id = %chat.id,
+                    report = event.id,
+                    still_owed,
+                    error = %e,
+                    "the report this conversation is owed could NOT be delivered on resume. It \
+                     stays PENDING (its `attempts` already counts this try) and the next resume \
+                     tries again; NO retry happens in this turn, and the rest of the outbox is not \
+                     attempted"
+                );
+            }
+        }
     }
 
     /// Hand the manager the ONE knowledge handle the daemon built at boot.
@@ -1625,6 +1944,18 @@ impl ChatManager {
         // the broadcast sender is what ends attached SSE streams -- they get
         // the terminal end event from the Err(_) arm in chat_events.
         self.close(id);
+        // Whatever was queued for it dies with it: P4.3 removes this conversation's OUTBOX rows in
+        // the same writer closure as the `chats` row (`Db::delete_chat`), so a queued copy would be
+        // the only thing left claiming a deleted conversation is owed a report.
+        let queued = self.forget_queued_reports(id);
+        if queued > 0 {
+            tracing::warn!(
+                chat_id = %id,
+                queued,
+                "this conversation was deleted with platform events still queued for it: the queue \
+                 entries and their outbox rows are gone with it (that is what a delete means)"
+            );
+        }
         let removed = self.db.delete_chat(&id.to_string()).await?;
         Ok(if removed {
             ChatDelete::Deleted { was_live }
@@ -2031,6 +2362,7 @@ impl ChatManager {
                         generating: false,
                         message_count: None,
                         preview: None,
+                        pending_reports: None,
                         session_key,
                     }
                 },
@@ -2081,6 +2413,21 @@ impl ChatManager {
                 .map(|(id, c)| (id.to_string(), c.is_generating()))
                 .collect()
         };
+        // P4.4: the unread number per row, ONE read for the whole list. A read FAILURE leaves every
+        // row `None` ("unknown"), never `Some(0)` — the rail must not claim "all delivered" about a
+        // table nobody could read.
+        let pending: Option<HashMap<String, i64>> = match self.db.pending_chat_report_counts().await
+        {
+            Ok(counts) => Some(counts),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "the report outbox counts could not be read for the conversation list; the \
+                     rows will report `pending_reports: null` (unknown), not 0"
+                );
+                None
+            }
+        };
         for e in &mut entries {
             if let Some(key) = &e.session_key
                 && let Some((count, preview)) = index.get(key)
@@ -2114,6 +2461,9 @@ impl ChatManager {
             }
             e.active = live.contains_key(&e.id);
             e.generating = live.get(&e.id).copied().unwrap_or(false);
+            e.pending_reports = pending
+                .as_ref()
+                .map(|counts| counts.get(&e.id).copied().unwrap_or(0));
         }
         entries
     }

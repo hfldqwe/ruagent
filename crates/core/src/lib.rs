@@ -20,6 +20,6 @@ pub use event::{
 };
 pub use id::{AgentId, RunId, TaskId};
 pub use routing::{RouteSource, RoutingDecision};
-pub use run::{Run, RunParams, RunStatus, StopReason};
+pub use run::{CHAT_ID_ENV, Run, RunParams, RunStatus, StopReason};
 pub use task::{EdgeKind, Task, TaskCreator, TaskEdge, TaskStatus};
 pub use usage::ContextUsage;

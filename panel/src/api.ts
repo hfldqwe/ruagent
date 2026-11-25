@@ -146,6 +146,16 @@ export interface ChatHistoryEntry {
   cwd?: string | null;
   message_count: number | null;
   preview: string | null;
+  /** How many platform reports this conversation is still OWED (P4,
+   *  docs/plans/2026-11-23-reports-never-lost.md §1): the daemon's outbox
+   *  rows whose `delivered_at` is still null — a report the platform has not
+   *  managed to put in front of anyone yet (the chat had no live session).
+   *
+   *  THREE STATES, and the rail must keep them apart (see `pendingReportBadge`):
+   *  a number is a reading, `0` is a reading that says "all delivered", and
+   *  `null` / absent is "the outbox could not be read" — which must NOT render
+   *  as 0. */
+  pending_reports?: number | null;
   /** Sessions-index key of the transcript (the shared viewer). */
   session_key?: string;
 }
@@ -2050,8 +2060,34 @@ export const api = {
           agent: string;
           runtime: string;
           model: string | null;
+          /** P4.3: reports STILL owed after this resume delivered one (a resume
+           *  delivers at most one, so the rail's number can be shown right away).
+           *  `null` = the count could not be read — not zero. */
+          pending_reports?: number | null;
         }>,
     ),
+  /** P4.4: the platform reports this conversation holds, with their bodies.
+   *  `pending` narrows the list to the ones still OWED — the question a user
+   *  actually asks ("my task finished and nobody told me"). The bodies are the
+   *  rows as stored: no platform marker (that is applied when the prompt is
+   *  built), so they read as ordinary text. */
+  chatReports: (id: string, pending = true, limit = 50) =>
+    get<{
+      reports: {
+        id: number;
+        chat_id: string;
+        run_id: string | null;
+        text: string;
+        created_at: string;
+        delivered_at: string | null;
+        attempts: number;
+      }[];
+      pending: number;
+      pending_only: boolean;
+      limit: number;
+    }>(
+      `/api/v1/chat/${id}/reports?${pending ? "pending=1&" : ""}limit=${limit}`,
+    ).then((r) => r.reports),
   chatHandoff: (id: string, agent: string) =>
     post(`/api/v1/chat/${id}/handoff`, { agent }).then(
       (r) =>

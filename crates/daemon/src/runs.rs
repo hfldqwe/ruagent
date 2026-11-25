@@ -139,6 +139,32 @@ pub enum WorkspaceSpec {
     Worktree { repo: PathBuf },
 }
 
+/// Which HUMAN DISPATCH of a task a launch belongs to (P5 of
+/// `docs/plans/2026-11-23-reports-never-lost.md`).
+///
+/// The value that lands on the attempt is `RunParams::dispatch_epoch`; this type is only about WHO
+/// decides it, and the two cases must not be conflated:
+///
+/// * [`Self::New`] — a dispatch a human (or the panel, or `task_dispatch`) just made. `start_run`
+///   numbers it from the cluster: the count of non-self-heal attempts already on the task. That
+///   number is what gives the dispatch its ONE automatic retry.
+/// * [`Self::Of`] — this attempt belongs to a generation that already exists, so the caller carries
+///   its number forward. Two things use it: a self-heal (same generation as the attempt it heals,
+///   otherwise its own failure would look like a fresh dispatch and heal again, and again) and every
+///   member of one fan-out (one dispatch, one generation — numbering each branch separately would
+///   hand the Nth branch a budget of its own, which is the bug P5 fixes wearing a new costume).
+///
+/// `Of(None)` is a legacy, un-versioned generation: rows written before `RunParams::dispatch_epoch`
+/// existed. See that field's comment for why `None` is the conservative direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DispatchEpoch {
+    /// A NEW dispatch: `start_run` numbers it from the cluster.
+    #[default]
+    New,
+    /// An EXISTING generation, carried forward (`None` = legacy/un-versioned).
+    Of(Option<u32>),
+}
+
 /// How to launch one run beyond task/agent/prompt/workspace: routing
 /// provenance and canonical session-option defaults (issue #36).
 #[derive(Default)]
@@ -171,6 +197,10 @@ pub struct RunLaunch {
     /// heals. Read back by the completion hook to prove the budget is spent (see
     /// `RunParams::self_heal_of`).
     pub self_heal_of: Option<RunId>,
+    /// P5: which human dispatch this attempt belongs to (see [`DispatchEpoch`]). `New` is the
+    /// default because a launch that says nothing is a fresh dispatch — the panel, the API, the
+    /// watchdog and `task_dispatch` all reach here through it.
+    pub dispatch_epoch: DispatchEpoch,
 }
 
 /// One harness's concurrency gate (design §8.3): a counting semaphore
@@ -715,6 +745,15 @@ impl RunManager {
         // retry) reads the same two facts without a second table.
         run.origin_chat_id = launch.origin_chat_id.clone();
         run.params.self_heal_of = launch.self_heal_of;
+        // P5: WHICH HUMAN DISPATCH is this attempt part of. Two sources, never both: a launch that
+        // already belongs to a generation carries its number (`DispatchEpoch::Of`); anything else
+        // is a new dispatch and is numbered here, from the cluster, BEFORE the row is written — so
+        // an attempt's generation is decided once and is visible on the row to every later reader
+        // (the completion hook, the report, an operator reading `params`).
+        run.params.dispatch_epoch = match launch.dispatch_epoch {
+            DispatchEpoch::Of(epoch) => epoch,
+            DispatchEpoch::New => Some(self.next_dispatch_epoch(task.id).await?),
+        };
         // Canonical session-option defaults (issue #36): mode / effort.
         // The ROLE's defaults apply to runs too — the same contract
         // chats have. Without this, a specialist registered with
@@ -955,6 +994,29 @@ impl RunManager {
         Ok(returned)
     }
 
+    /// The generation number for a NEW human dispatch of `task_id` (P5): how many NON-self-heal
+    /// attempts the task already has, counted from zero.
+    ///
+    /// Counting attempts rather than reusing a stored counter keeps this a derivation instead of a
+    /// second truth: the cluster's own rows are the ledger, and an attempt that is started but whose
+    /// insert fails cannot leave a number behind. The cost is one read of a task's runs before each
+    /// dispatch, which the completion hook already does on every attempt.
+    ///
+    /// A pre-versioning attempt (no `dispatch_epoch`) is counted here exactly like a versioned one —
+    /// it WAS a dispatch somebody made. What it is not allowed to do is grant a heal budget: see
+    /// [`heal_budget_spent`].
+    async fn next_dispatch_epoch(&self, task_id: ruagent_core::TaskId) -> Result<u32> {
+        let runs = self
+            .db
+            .list_runs_for_task(task_id)
+            .await
+            .with_context(|| format!("counting the dispatches of task {task_id}"))?;
+        Ok(runs
+            .iter()
+            .filter(|r| r.params.self_heal_of.is_none())
+            .count() as u32)
+    }
+
     /// One-click retry of a dead run (design §8.3 crash row): a new
     /// run on the same task with the same agent and options, reusing
     /// the crashed attempt's workspace (half-written work survives),
@@ -1061,6 +1123,15 @@ impl RunManager {
                 // work asked for the work, not for one attempt at it.
                 origin_chat_id: old.origin_chat_id.clone(),
                 self_heal_of: self_heal.then_some(run_id),
+                // P5: a HEAL belongs to the generation it heals — it is the same human dispatch
+                // trying again, and giving it a number of its own would let its failure heal
+                // itself again, for ever. A HUMAN retry (the one-click button) is a new dispatch by
+                // definition and is numbered from the cluster like any other.
+                dispatch_epoch: if self_heal {
+                    DispatchEpoch::Of(old.params.dispatch_epoch)
+                } else {
+                    DispatchEpoch::New
+                },
             },
         )
         .await
@@ -1085,6 +1156,10 @@ impl RunManager {
             agents: agents.to_vec(),
         };
         let plan = ruagent_orchestrator::plan(task, &topology)?;
+        // P5: ONE dispatch, ONE generation. The branches are members of a single human ask, so the
+        // number is computed here and handed to all of them; letting each branch count itself
+        // would give the Nth branch a generation of its own, i.e. one heal budget per branch.
+        let dispatch_epoch = DispatchEpoch::Of(Some(self.next_dispatch_epoch(task.id).await?));
         let mut runs = Vec::new();
         for planned in &plan.runs {
             let card = self
@@ -1111,6 +1186,7 @@ impl RunManager {
                         routed: Some(decision),
                         options: options.clone(),
                         origin_chat_id: origin_chat_id.clone(),
+                        dispatch_epoch,
                         ..Default::default()
                     },
                 )
@@ -1587,6 +1663,31 @@ async fn supervise(
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<RunEvent>();
     let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<PermissionAsk>();
 
+    // P6 of `docs/plans/2026-11-23-reports-never-lost.md`: the conversation this run answers to
+    // rides the AGENT PROCESS's environment, because the agent cannot otherwise know it. The
+    // platform MCP server is spawned BY the agent for its session, so it inherits this — that is
+    // where `task_dispatch` reads it (`crates/mcp/src/lib.rs`), and that is what makes a piece of
+    // work dispatched from inside a chat carry the chat's id instead of `null`.
+    //
+    // ABSENT, NOT EMPTY, when the run has no origin (the panel, the CLI, an external client): an
+    // empty value would make "nobody is waiting" indistinguishable from "a conversation with an
+    // empty id", and `task_dispatch` deliberately does not invent an origin.
+    //
+    // What is NOT done here, and cannot be: removing a variable the daemon itself inherited. If the
+    // daemon was started BY an agent process of some other platform, `RUAGENT_CHAT_ID` would already
+    // be in its environment and would reach this child too. `AcpAgentConfig` adds variables, it does
+    // not clear the environment (clearing it would take PATH, the system proxy and `RUAGENT_URL`
+    // with it), so that leak is left visible rather than papered over.
+    let mut agent_env: Vec<(String, String)> = Vec::new();
+    if let Some(chat_id) = run
+        .origin_chat_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        agent_env.push((ruagent_core::CHAT_ID_ENV.to_string(), chat_id.to_string()));
+    }
+
     let opts = RunOptions {
         program: spec.program.clone(),
         args: spec.args.clone(),
@@ -1599,6 +1700,7 @@ async fn supervise(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        env: agent_env,
     };
     // The user_message event carries the ORIGINAL ask only — injected
     // memory and retry context ride separately (ContextInjected / the
@@ -1964,6 +2066,12 @@ fn task_status_for(status: RunStatus) -> Option<TaskStatus> {
 /// budget is spent. Only when that budget is gone is the failure reported — and the report says how
 /// many attempts were made and what the last failure was.
 ///
+/// THE BUDGET IS PER HUMAN DISPATCH (P5 of `docs/plans/2026-11-23-reports-never-lost.md`, see
+/// [`heal_budget_spent`]): the retry heals the generation that is ending (`params.dispatch_epoch`),
+/// so a task that was re-dispatched after a failure gets a fresh automatic retry instead of being
+/// told — wrongly — that it already had one. A cluster can therefore hold one heal PER GENERATION,
+/// which is why the report counts the heals instead of assuming there was one.
+///
 /// KNOWN WINDOW, not a second truth: two attempts of one cluster that reach terminal within the
 /// same read can both see "all terminal" and both report. Nothing here tries to hide that; the
 /// consequence is a duplicate sentence in the chat, and the alternative (a claim table / a timer)
@@ -2112,8 +2220,15 @@ pub(crate) async fn finish_cluster(
         return;
     }
 
-    // (4) SELF-HEAL, one attempt per cluster.
-    let healed_already = runs.iter().any(|r| r.params.self_heal_of.is_some());
+    // (4) SELF-HEAL, one automatic retry per HUMAN DISPATCH GENERATION (P5 of
+    // `docs/plans/2026-11-23-reports-never-lost.md`).
+    //
+    // The budget used to be counted per CLUSTER ("does any attempt of this task carry
+    // `self_heal_of`?"), which stays true for ever after the first heal — so a task a human
+    // re-dispatched a second and third time got no automatic retry at all, exactly when the
+    // re-dispatch was the sign they wanted it done. The question is now asked per GENERATION: the
+    // heal of the dispatch that is ending, and nothing earlier.
+    let healed_already = heal_budget_spent(&runs, run);
     if allow_self_heal
         && !healed_already
         && let Some(dead) = failed.iter().rev().find(|r| r.status.is_retryable())
@@ -2140,9 +2255,10 @@ pub(crate) async fn finish_cluster(
                     run_id = %run.id,
                     healed_run = %dead.id,
                     heal_run = %heal.id,
+                    dispatch_epoch = ?heal.params.dispatch_epoch,
                     from_agent = %agent_name(&cards, dead.params.agent),
                     to_agent = %agent_name(&cards, heal.params.agent),
-                    "self-heal: started the cluster's one automatic retry; the report waits for it"
+                    "self-heal: started this dispatch's one automatic retry; the report waits for it"
                 );
                 // The heal attempt is live again, so this cluster is NOT finished: it reports when
                 // it ends, through this same hook.
@@ -2165,6 +2281,35 @@ pub(crate) async fn finish_cluster(
     // (5) Report the failure, saying what was tried.
     let text = cluster_failure_report(&task, &runs, &cards, healed_already);
     wake_in_background(mgr, &chat_id, text, run);
+}
+
+/// Whether the generation that is ENDING has already spent its one automatic retry (P5 of
+/// `docs/plans/2026-11-23-reports-never-lost.md`).
+///
+/// The budget belongs to a HUMAN DISPATCH, not to the work item: one automatic retry per dispatch
+/// (`RunParams::dispatch_epoch`), so
+///
+/// * generation 0 fails → one heal; that heal fails → reported (its own row is generation 0 too);
+/// * a human re-dispatches → generation 1, which has a budget again;
+/// * within ONE generation the heal's own row blocks a second heal, which is what keeps this from
+///   degrading into "heal for ever".
+///
+/// THE COMPATIBILITY RULE LIVES HERE: a heal attempt written before `dispatch_epoch` existed has
+/// `None` and cannot be attributed to a generation, so `is_none_or` below counts it as this one — an
+/// old cluster behaves exactly as it did before P5 and gets NO extra budget. The same is true of an ending attempt with no epoch (a run that was already live when the daemon was
+/// upgraded): nothing can be attributed, so nothing is spent twice. Both directions are the
+/// conservative one, because the expensive way to be wrong here is a silent extra round of tokens.
+fn heal_budget_spent(runs: &[Run], ending: &Run) -> bool {
+    // The attempt that is ending the cluster names the generation. Without one (a row written
+    // before the field existed) nothing can be attributed, so ANY heal in the cluster counts.
+    let Some(current) = ending.params.dispatch_epoch else {
+        return runs.iter().any(|r| r.params.self_heal_of.is_some());
+    };
+    runs.iter().any(|r| {
+        r.params.self_heal_of.is_some()
+            // `is_none_or(..)`: an un-versioned heal counts as this generation.
+            && r.params.dispatch_epoch.is_none_or(|heal| heal == current)
+    })
 }
 
 /// The id→NAME direction, for text a human reads. A run records `params.agent` (a registry id);
@@ -2260,13 +2405,21 @@ fn cluster_failure_report(
         out.push_str(&report_member(cards, run));
         out.push('\n');
     }
+    // HOW MANY HEALS, read off the attempts rather than inferred from `healed_already`: since P5 a
+    // cluster can hold one heal per dispatch generation (a task re-dispatched twice and failed twice
+    // has two), and "含 1 次自愈重试" would then be a false sentence in a report whose whole job is
+    // to say what was tried.
+    let heals = runs
+        .iter()
+        .filter(|r| r.params.self_heal_of.is_some())
+        .count();
     out.push_str(&format!(
         "\n我试了 {} 次{}，最后一次失败原因是：{last_error}\n",
         runs.len(),
-        if healed_already {
-            "（含 1 次自愈重试）"
-        } else {
-            ""
+        match heals {
+            0 => String::new(),
+            1 => "（含 1 次自愈重试）".to_string(),
+            n => format!("（含 {n} 次自愈重试）"),
         }
     ));
     // Did the heal actually MOVE to another agent? Read it off the attempts themselves: the
